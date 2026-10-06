@@ -56,7 +56,7 @@ import { commandScope, confinementScope, seatbeltBackend } from "../harness/sand
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
-import { processScope } from "../util/proc.ts";
+import { CommandError, ProcessTerminationError, processScope } from "../util/proc.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -246,6 +246,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       return "queued";
     }
     const verifiedSha = ctx.state.lastVerifiedSha;
+    const terminationBlocked =
+      !!processScope.getStore()?.terminationError ||
+      ctx.state.needsHumanReason?.startsWith(ProcessTerminationError.prefix);
     const verifiedFailure =
       verifiedSha &&
       ctx.repo.kind === "github" &&
@@ -265,7 +268,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (verifiedFailure) {
+    if (verifiedFailure && !terminationBlocked) {
       try {
         ctx.state.needsHumanReason = message;
         await ctx.save("needs-human");
@@ -291,6 +294,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       }
     } else if (
       e instanceof NeedsHumanError &&
+      !terminationBlocked &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
       !ctx.state.pendingRebaseSha
@@ -981,6 +985,13 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         await ctx.save("implementation-ready");
       }
       ctx.checkCancelled();
+      const terminationError = processScope.getStore()?.terminationError;
+      if (terminationError) {
+        ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
+        ctx.state.needsHumanReason = terminationError.message;
+        await ctx.save();
+        throw new NeedsHumanError(`Implement round ${round} failed: ${terminationError.message}`);
+      }
       const sha =
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha)
@@ -1105,7 +1116,11 @@ async function oneRound(
         );
       } finally {
         // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-        await discardChanges(cwd);
+        await discardChanges(cwd).catch((error: unknown) => {
+          if (ctx.state.implementerIssue && error instanceof CommandError)
+            throw new WorktreeCleanError(error.message, { cause: error });
+          throw error;
+        });
       }
       for (const c of cmp.filter((c) => c.firstAttempt)) {
         ctx.store.addEvent({

@@ -1,12 +1,125 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 export const processScope = new AsyncLocalStorage<{
   signal: AbortSignal;
   killGraceMs: number;
   children: Map<ChildProcess, Promise<void>>;
   scratchDirs: Set<string>;
+  terminationError?: ProcessTerminationError;
 }>();
+
+export class ProcessTerminationError extends Error {
+  static readonly prefix = "Invocation termination could not be confirmed";
+}
+
+/** A failed shutdown blocks subsequent commands, including worktree cleanup. */
+export function assertProcessesStopped(): void {
+  const error = processScope.getStore()?.terminationError;
+  if (error) throw error;
+}
+
+/** Scoped inspection backend for deterministic shutdown tests. */
+export const processInspection = new AsyncLocalStorage<
+  (withEnvironment: boolean, marker: string, pids?: number[]) => Promise<string>
+>();
+
+async function markedProcesses(marker: string, attempt = 0): Promise<number[]> {
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("Process ownership cannot be determined");
+  const env = { ...process.env };
+  delete env.LIMITLESS_INVOCATION;
+  env.LIMITLESS_PROCESS_SCAN = marker;
+  const inspect = (withEnvironment: boolean, pids?: number[]) => {
+    const injected = processInspection.getStore();
+    if (injected) return injected(withEnvironment, marker, pids);
+    return new Promise<string>((resolve, reject) => {
+      execFile(
+        "/bin/ps",
+        [
+          ...(withEnvironment ? [process.platform === "darwin" ? "-E" : "eww"] : []),
+          "-ww",
+          ...(pids ? ["-p", pids.join(",")] : ["-U", String(uid)]),
+          "-o",
+          "pid=,uid=,stat=,command=",
+        ],
+        { env, timeout: 2000, maxBuffer: 32 * 1024 * 1024 },
+        (error, stdout) =>
+          error && !(pids && error.code === 1 && !stdout.trim())
+            ? reject(new Error("Process environment inspection failed"))
+            : resolve(stdout),
+      );
+    });
+  };
+  const rows = (output: string) =>
+    output
+      .trim()
+      .split("\n")
+      .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/));
+  const environments = rows(await inspect(true));
+  if (
+    !environments.some(
+      (row) =>
+        row && Number(row[2]) === uid && row[4]?.split(/\s+/).includes(`LIMITLESS_PROCESS_SCAN=${marker}`),
+    )
+  )
+    throw new Error("Process environment inspection could not be confirmed");
+  const token = `LIMITLESS_INVOCATION=${marker}`;
+  const candidates = environments.filter(
+    (row) =>
+      row && Number(row[2]) === uid && !row[3]?.startsWith("Z") && row[4]?.split(/\s+/).includes(token),
+  );
+  if (!candidates.length) return [];
+  const commands = rows(
+    await inspect(
+      false,
+      candidates.map((row) => Number(row?.[1])),
+    ),
+  );
+  let changed = false;
+  const pids = candidates.flatMap((row) => {
+    const command = commands.find((cmd) => cmd?.[1] === row?.[1] && Number(cmd?.[2]) === uid);
+    if (!command || command[3]?.startsWith("Z")) return [];
+    const args = command[4] ?? "";
+    const full = row?.[4] ?? "";
+    // ps appends the environment to argv. A marker appearing only in argv is unmarked.
+    if (!args || !full.startsWith(args)) {
+      changed = true;
+      return [];
+    }
+    return full.slice(args.length).split(/\s+/).includes(token) ? [Number(row?.[1])] : [];
+  });
+  if (!changed) return pids;
+  // A shell may exec between snapshots; never signal it based on mismatched argv.
+  if (attempt < 3) return markedProcesses(marker, attempt + 1);
+  throw new Error("Process arguments changed during inspection");
+}
+
+async function stopMarkedProcesses(marker: string, graceMs: number): Promise<void> {
+  const started = performance.now();
+  const termed = new Set<number>();
+  let empty = false;
+  for (;;) {
+    const pids = await markedProcesses(marker);
+    // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
+    if (!pids.length && empty) return;
+    empty = !pids.length;
+    if (performance.now() - started >= graceMs + 10_000)
+      throw new Error(`Marked processes still alive: ${pids.join(", ")}`);
+    for (const pid of pids) {
+      const signal = termed.has(pid) && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
+      if (signal === "SIGTERM" && termed.has(pid)) continue;
+      try {
+        process.kill(pid, signal);
+        termed.add(pid);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+    await Bun.sleep(10);
+  }
+}
 
 export interface ProcOptions {
   cmd: string[];
@@ -62,33 +175,31 @@ function lineSplitter(onLine?: (line: string) => void) {
 }
 
 /**
- * Run a child process in its own process group so cancellation kills the whole tree
- * (agent CLIs spawn shells, MCP servers and test runners).
+ * Mark a child and its descendants so shutdown also finds detached, reparented processes.
  */
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
+  assertProcessesStopped();
   const scope = processScope.getStore();
   if (scope)
     opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
   if (scope) opts.signal?.throwIfAborted();
   const started = Date.now();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
+    const marker = randomUUID();
     const child = spawn(bin, args, {
       cwd: opts.cwd,
-      env: opts.env,
+      env: { ...opts.env, LIMITLESS_INVOCATION: marker },
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    let resolveStopped: (() => void) | undefined;
     scope?.children.set(
       child,
-      new Promise<void>((resolve) =>
-        child.once("close", async () => {
-          await descendantsStopped;
-          scope.children.delete(child);
-          resolve();
-        }),
-      ),
+      new Promise<void>((resolve) => {
+        resolveStopped = resolve;
+      }),
     );
 
     const limit = opts.tailLimit ?? DEFAULT_TAIL;
@@ -109,62 +220,38 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const out = lineSplitter(opts.onStdoutLine);
     const err = lineSplitter(opts.onStderrLine);
 
-    const killTree = (sig: NodeJS.Signals) => {
-      if (child.pid === undefined) return;
-      try {
-        process.kill(-child.pid, sig);
-        return true;
-      } catch {
+    let shutdown: Promise<void> | undefined;
+    let terminationError: ProcessTerminationError | undefined;
+    const terminate = () => {
+      shutdown ??= (async () => {
         try {
-          child.kill(sig);
-        } catch {
-          // already gone
+          if (child.pid !== undefined) await stopMarkedProcesses(marker, scope?.killGraceMs ?? 100);
+        } catch (error) {
+          terminationError = new ProcessTerminationError(
+            `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
+            { cause: error },
+          );
+          if (scope) scope.terminationError = terminationError;
+          // The directly spawned child is ours even if process discovery is unavailable.
+          child.kill("SIGKILL");
+          settled = true;
+          finishTimers();
+          resolveStopped?.();
+          reject(terminationError);
+        } finally {
+          // Shutdown is confirmed or explicitly failed; inherited pipes cannot delay reporting it.
+          child.stdin.destroy();
+          child.stdout.destroy();
+          child.stderr.destroy();
         }
-      }
-      return false;
-    };
-    let descendantsStopped = Promise.resolve();
-    child.once("exit", () => {
-      // Exit precedes close: background children may still hold the stdio pipes open.
-      const killed = killTree("SIGKILL");
-      descendantsStopped = (async () => {
-        if (!killed || child.pid === undefined) return;
-        const deadline = performance.now() + 10_000;
-        let nextKill = performance.now() + 1_000;
-        while (performance.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 5));
-          try {
-            process.kill(-child.pid, 0);
-          } catch {
-            return;
-          }
-          if (performance.now() >= nextKill) {
-            killTree("SIGKILL");
-            nextKill = performance.now() + 1_000;
-          }
-        }
-        // An unkillable descendant must not hold close (or the run) open indefinitely.
-        killTree("SIGKILL");
-        child.stdin.destroy();
-        child.stdout.destroy();
-        child.stderr.destroy();
       })();
-    });
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const terminate = (graceMs = 5_000) => {
-      if (killTimer) return;
-      killTree("SIGTERM");
-      killTimer = setTimeout(() => killTree("SIGKILL"), graceMs);
-      killTimer.unref?.();
+      return shutdown;
     };
+    child.once("exit", terminate);
 
     const onAbort = () => {
       cancelled = true;
-      if (scope) {
-        clearTimeout(killTimer);
-        killTimer = undefined;
-      }
-      terminate(scope?.killGraceMs);
+      void terminate();
     };
     if (opts.signal) {
       if (opts.signal.aborted) onAbort();
@@ -194,6 +281,12 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       );
     }
 
+    const finishTimers = () => {
+      for (const t of timers) clearTimeout(t);
+      if (idleTimer) clearInterval(idleTimer);
+      opts.signal?.removeEventListener("abort", onAbort);
+    };
+
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -214,13 +307,16 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     child.on("close", async (code, sig) => {
       if (settled) return;
       settled = true;
-      clearTimeout(killTimer);
       out.flush();
       err.flush();
-      for (const t of timers) clearTimeout(t);
-      if (idleTimer) clearInterval(idleTimer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      await descendantsStopped;
+      finishTimers();
+      await terminate();
+      if (terminationError) {
+        reject(terminationError);
+        return;
+      }
+      scope?.children.delete(child);
+      resolveStopped?.();
       resolve({
         exitCode: code,
         signal: sig,

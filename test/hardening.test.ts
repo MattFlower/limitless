@@ -1,6 +1,6 @@
 // Regression tests for defects found by the cross-vendor (Codex) review of the M1 core.
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,13 @@ import { parseNameStatus, resolveRepo } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
-import { processScope, runProcess, sh } from "../src/util/proc.ts";
+import {
+  ProcessTerminationError,
+  processInspection,
+  processScope,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 
@@ -72,7 +78,8 @@ describe("process handling", () => {
     writeFileSync(
       child,
       `const fs = require("node:fs"); process.on("SIGTERM", () => {});
-      setInterval(() => { fs.mkdirSync(${JSON.stringify(scratch)}, {recursive:true}); }, 5);`,
+      setInterval(() => { fs.mkdirSync(${JSON.stringify(scratch)}, {recursive:true}); }, 5);
+      setTimeout(() => process.exit(), 15000);`,
     );
     writeFileSync(
       parent,
@@ -93,50 +100,219 @@ describe("process handling", () => {
     expect(existsSync(scratch)).toBe(false);
   });
 
-  test("surviving descendants are signalled again and cannot hold invocation cleanup open", async () => {
+  test.each(["normal", "error", "cancelled", "timeout", "stuck"])(
+    "detached reparented writer is gone before cleanup on %s",
+    async (ending) => {
+      const pidFile = join(dir, "detached-pid");
+      const ready = join(dir, "writer-ready");
+      const writer = join(dir, "writer.js");
+      const launcher = join(dir, "launcher.js");
+      const parent = join(dir, "parent.js");
+      writeFileSync(
+        writer,
+        `const fs = require("node:fs");
+        process.on("SIGTERM", () => {});
+        fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+        setInterval(() => fs.appendFileSync(${JSON.stringify(ready)}, "x"), 5);
+        setTimeout(() => process.exit(), 15000);`,
+      );
+      writeFileSync(
+        launcher,
+        `require("node:child_process").spawn(process.execPath,
+        [${JSON.stringify(writer)}], {detached:true, stdio:"ignore"}).unref();`,
+      );
+      writeFileSync(
+        parent,
+        `const {spawn} = require("node:child_process"); const fs = require("node:fs");
+        const launcher = spawn(process.execPath, [${JSON.stringify(launcher)}], {stdio:"ignore"});
+        launcher.on("exit", () => {
+          const timer = setInterval(() => {
+            if (!fs.existsSync(${JSON.stringify(ready)})) return;
+            clearInterval(timer); console.log(process.env.LIMITLESS_INVOCATION);
+            ${ending === "normal" || ending === "error" ? `process.exit(${ending === "error" ? 3 : 0});` : "setInterval(() => {}, 1000);"}
+          }, 5);
+        });`,
+      );
+      const env = { ...process.env };
+      delete env.LIMITLESS_INVOCATION;
+      const control = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        env,
+        stdio: "ignore",
+      });
+      let argumentControl: ChildProcess | undefined;
+      const controller = new AbortController();
+      let writerPid: number | undefined;
+      let cleanup = false;
+      try {
+        const res = await runProcess({
+          cmd: [process.execPath, parent],
+          cwd: dir,
+          env: env as Record<string, string>,
+          signal: controller.signal,
+          onStdoutLine: (marker) => {
+            writerPid = Number(readFileSync(pidFile, "utf8"));
+            argumentControl = spawn(
+              process.execPath,
+              ["-e", "setInterval(() => {}, 1000)", `LIMITLESS_INVOCATION=${marker}`],
+              { env, stdio: "ignore" },
+            );
+            if (ending === "cancelled" || ending === "stuck") controller.abort(new Error(ending));
+          },
+          timeoutMs: ending === "timeout" ? 1500 : undefined,
+        });
+        // A real wall timeout must be the reason the invocation ended.
+        if (ending === "timeout") expect(res.timedOut).toBe(true);
+        if (ending === "cancelled" || ending === "stuck") expect(res.cancelled).toBe(true);
+        if (ending === "normal" || ending === "error") expect(res.exitCode).toBe(ending === "error" ? 3 : 0);
+        expect(writerPid).toBeGreaterThan(0);
+        await (async () => {
+          expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+          expect(control.pid).toBeGreaterThan(0);
+          expect(process.kill(control.pid ?? 0, 0)).toBe(true);
+          expect(argumentControl?.pid).toBeGreaterThan(0);
+          expect(process.kill(argumentControl?.pid ?? 0, 0)).toBe(true);
+          cleanup = true;
+          rmSync(ready);
+        })();
+        expect(cleanup).toBe(true);
+      } finally {
+        controller.abort();
+        control.kill("SIGKILL");
+        argumentControl?.kill("SIGKILL");
+        await new Promise<void>((resolve) => control.once("close", () => resolve()));
+        if (existsSync(pidFile)) {
+          try {
+            process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+          } catch {}
+        }
+      }
+    },
+  );
+
+  test.each([false, true])(
+    "inspection selects exact markers and uid, excluding argv matches (exec race: %s)",
+    async (changing) => {
+      const children = Array.from({ length: 3 }, () =>
+        spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }),
+      );
+      const [writer, control, foreign] = children;
+      const uid = process.getuid?.() ?? 0;
+      const kill = process.kill.bind(process);
+      const signalled: number[] = [];
+      let plainInspections = 0;
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (signal === "SIGTERM" || signal === "SIGKILL") signalled.push(pid);
+        return kill(pid, signal);
+      });
+      try {
+        await processInspection.run(
+          async (withEnvironment, marker) => {
+            const writerCommand =
+              changing && withEnvironment && plainInspections === 0 ? "starting" : "writer";
+            if (!withEnvironment) plainInspections++;
+            const alive = (child: ChildProcess | undefined) => {
+              if (!child?.pid) return false;
+              try {
+                return kill(child.pid, 0);
+              } catch {
+                return false;
+              }
+            };
+            return [
+              `${process.pid} ${uid} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+              ...(alive(writer)
+                ? [
+                    `${writer?.pid} ${uid} S ${writerCommand}${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`,
+                  ]
+                : []),
+              `${control?.pid} ${uid} S control LIMITLESS_INVOCATION=${marker}${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}-other OTHER_LIMITLESS_INVOCATION=${marker}` : ""}`,
+              `${foreign?.pid} ${uid + 1} S foreign${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`,
+            ].join("\n");
+          },
+          () =>
+            runProcess({
+              cmd: ["/bin/sh", "-c", "exit 0"],
+              cwd: dir,
+              env: process.env as Record<string, string>,
+            }),
+        );
+        expect(signalled.length).toBeGreaterThan(0);
+        expect(signalled.every((pid) => pid === writer?.pid)).toBe(true);
+        expect(kill(control?.pid ?? 0, 0)).toBe(true);
+        expect(kill(foreign?.pid ?? 0, 0)).toBe(true);
+      } finally {
+        killSpy.mockRestore();
+        for (const child of children) child.kill("SIGKILL");
+        await Promise.all(
+          children.map((child) =>
+            child.exitCode !== null || child.signalCode !== null
+              ? Promise.resolve()
+              : new Promise<void>((resolve) => child.once("close", () => resolve())),
+          ),
+        );
+      }
+    },
+  );
+
+  test("surviving descendants block cleanup and report termination failure", async () => {
     const children = new Map<ChildProcess, Promise<void>>();
     const kill = process.kill.bind(process);
-    let groupPid: number | undefined;
+    const writer = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     let kills = 0;
+    const signals: (string | number | undefined)[] = [];
     const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-      // Simulate an unkillable descendant only in this invocation's own group.
-      if (signal === "SIGKILL" && [...children.keys()].some((child) => child.pid === -pid)) {
-        groupPid = -pid;
+      if (pid === writer.pid && (signal === "SIGTERM" || signal === "SIGKILL")) {
         kills++;
+        signals.push(signal);
         return true;
       }
       return kill(pid, signal);
     });
     const started = performance.now();
     try {
-      const result = await processScope.run(
-        {
-          signal: new AbortController().signal,
-          killGraceMs: 0,
-          children,
-          scratchDirs: new Set(),
-        },
+      await processInspection.run(
+        async (withEnvironment, marker) =>
+          `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n` +
+          `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
         () =>
-          runProcess({
-            // The parent exits normally; sleep keeps the group's stdout/stderr pipes open.
-            cmd: ["/bin/sh", "-c", "sleep 30 & exit 0"],
-            cwd: dir,
-            env: process.env as Record<string, string>,
-          }),
+          processScope.run(
+            {
+              signal: new AbortController().signal,
+              killGraceMs: 0,
+              children,
+              scratchDirs: new Set(),
+            },
+            async () => {
+              const invocation = runProcess({
+                cmd: ["/bin/sh", "-c", "exit 0"],
+                cwd: dir,
+                env: process.env as Record<string, string>,
+              });
+              await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
+              expect(processScope.getStore()?.terminationError?.message).toContain(
+                "Marked processes still alive",
+              );
+              let cleanup = false;
+              try {
+                await sh(["/bin/sh", "-c", "touch cleanup-started"], { cwd: dir });
+                cleanup = true;
+              } catch (error) {
+                expect(error).toBeInstanceOf(ProcessTerminationError);
+              }
+              expect(cleanup).toBe(false);
+              expect(existsSync(join(dir, "cleanup-started"))).toBe(false);
+            },
+          ),
       );
-      expect(result.exitCode).toBe(0);
       expect(kills).toBeGreaterThan(1);
+      expect(signals.slice(0, 2)).toEqual(["SIGTERM", "SIGKILL"]);
       expect(performance.now() - started).toBeLessThan(15_000);
-      expect(children.size).toBe(0);
-      expect(groupPid).toBeGreaterThan(0);
-      expect(kill(-(groupPid ?? 0), 0)).toBe(true);
+      expect(children.size).toBe(1);
+      expect(kill(writer.pid ?? 0, 0)).toBe(true);
     } finally {
       killSpy.mockRestore();
-      if (groupPid !== undefined) {
-        try {
-          kill(-groupPid, "SIGKILL");
-        } catch {}
-      }
+      writer.kill("SIGKILL");
+      await new Promise<void>((resolve) => writer.once("close", () => resolve()));
     }
   }, 20_000);
 
@@ -401,6 +577,76 @@ describe("pipeline hardening", () => {
       await Bun.sleep(25);
     }
   }
+
+  test("an unconfirmed shutdown fails the implement round without starting cleanup or another round", () =>
+    processInspection.run(
+      async (_withEnvironment, marker) =>
+        `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+      async () => {
+        const repo = await setupRepo({ "a.txt": "a\n" });
+        let implementCalls = 0;
+        const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
+        const f = new Factory(cfg, {
+          confinement: fakeConfinement,
+          providers,
+          models,
+          policy,
+          harnesses: {
+            fake: fakeHarness(async (spec) => {
+              if (role(spec.prompt) === "triage")
+                return {
+                  structured: {
+                    title: "t",
+                    task_class: "feature",
+                    complexity: "small",
+                    risk: "low",
+                    ambiguity: "low",
+                    blocking_questions: [],
+                    summary: "s",
+                    suggested_profile: "quick",
+                  },
+                };
+              implementCalls++;
+              return processInspection.run(
+                async () => {
+                  throw new Error("cannot inspect marked descendant");
+                },
+                async () => {
+                  await runProcess({
+                    cmd: ["/bin/sh", "-c", "exit 0"],
+                    cwd: spec.cwd,
+                    env: process.env as Record<string, string>,
+                  });
+                  return {};
+                },
+              );
+            }),
+          },
+        });
+        f.start();
+        try {
+          const run = await f.createRun({ repo, prompt: "change a" });
+          expect(await waitDone(f, run.id)).toBe("needs_human");
+          expect(implementCalls).toBe(1);
+          expect(f.store.getRun(run.id)?.error).toContain("Invocation termination could not be confirmed");
+          expect(f.store.getRunState<{ feedback: string }>(run.id)?.feedback).toContain(
+            "cannot inspect marked descendant",
+          );
+          expect(f.store.listInvocations(run.id).find((i) => i.role === "implement")).toMatchObject({
+            status: "error",
+            error: expect.stringContaining("cannot inspect marked descendant"),
+          });
+          expect(f.store.listStages(run.id).find((s) => s.name === "implement")).toMatchObject({
+            status: "failed",
+            round: 0,
+          });
+          expect(f.store.listStages(run.id).some((s) => s.name === "gates" && s.round === 0)).toBe(false);
+        } finally {
+          await f.stop();
+          f.store.close();
+        }
+      },
+    ));
 
   test("a verifier that skips criteria cannot pass, and an 'approve' with a blocker is a rejection", async () => {
     const repo = await setupRepo({ "a.txt": "a\n" });

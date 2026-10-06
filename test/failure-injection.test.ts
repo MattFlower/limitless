@@ -428,7 +428,7 @@ for (const [name, failure] of Object.entries(failures))
     });
   }
 
-for (const failures of [0, 1, 2])
+for (const failures of [0, 1, 2, 3])
   test(`stalled implementer's writer stops before cleanup (${failures} clean failures)`, async () => {
     const invocationSecret = "PRIVATE_REPEATED_COMMAND_377";
     const cleanupSecret = "PRIVATE_WORKTREE_PATH_377";
@@ -457,7 +457,13 @@ if [ -f '${active}' ]; then
       if kill -0 "$(cat '${pidFile}')" 2>/dev/null; then touch '${alive}'; fi
       echo clean >> '${calls}'
       attempts=$(grep -c '^clean$' '${calls}')
-      if [ "$attempts" -le ${failures} ]; then echo 'warning: could not lstat node_modules/writer/${cleanupSecret}' >&2; exit 1; fi;;
+      if [ "$attempts" -le ${Math.min(failures, 2)} ]; then
+        ${failures === 3 ? "touch clean-residue" : ":"}
+        echo 'warning: could not lstat node_modules/writer/${cleanupSecret}' >&2; exit 1
+      fi;;
+    (*" clean -fdq")
+      echo discard >> '${calls}'
+      if [ ${failures} -eq 3 ]; then echo 'warning: could not lstat node_modules/writer/${cleanupSecret}' >&2; exit 1; fi;;
   esac
 fi
 exec '${realGit}' "$@"
@@ -466,6 +472,28 @@ exec '${realGit}' "$@"
     );
     const oldPath = process.env.PATH;
     process.env.PATH = `${bin}:${oldPath}`;
+    const writerScript = join(root, "writer.js");
+    const parentScript = join(root, "parent.js");
+    writeFileSync(
+      writerScript,
+      `const fs = require("node:fs");
+      process.on("SIGTERM", () => {}); fs.mkdirSync("node_modules", {recursive:true});
+      setInterval(() => fs.appendFileSync("node_modules/.ci-check-final.log", "writing\\n"), 5);
+      setTimeout(() => process.exit(), 15000);`,
+    );
+    writeFileSync(
+      parentScript,
+      `const fs = require("node:fs");
+      const child = require("node:child_process").spawn(process.execPath,
+        [${JSON.stringify(writerScript)}], {detached:true, stdio:"ignore"});
+      child.unref(); fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+      process.on("SIGTERM", () => process.exit(0));
+      const timer = setInterval(() => {
+        if (fs.existsSync("node_modules/.ci-check-final.log")) {
+          clearInterval(timer); console.log("ready"); setInterval(() => {}, 1000);
+        }
+      }, 5);`,
+    );
     let writerPid: number | undefined;
     const attempts: { state: RunState | null; prompt: string }[] = [];
     const f = factory(undefined, async (s) => {
@@ -479,11 +507,7 @@ exec '${realGit}' "$@"
       writeFileSync(join(s.cwd, ".gitignore"), "node_modules/\n");
       const stalled = new AbortController();
       const result = await runProcess({
-        cmd: [
-          "/bin/sh",
-          "-c",
-          `mkdir -p node_modules; (trap '' TERM; while :; do echo writing >> node_modules/.ci-check-final.log; sleep 0.01; done) >/dev/null 2>&1 & echo $! > '${pidFile}'; trap 'exit 0' TERM; while [ ! -s node_modules/.ci-check-final.log ]; do sleep 0.01; done; echo ready; wait`,
-        ],
+        cmd: [process.execPath, parentScript],
         cwd: s.cwd,
         env: process.env as Record<string, string>,
         signal: AbortSignal.any([s.signal, stalled.signal]),
@@ -511,9 +535,10 @@ exec '${realGit}' "$@"
         "reset",
         "clean",
         ...(failures ? ["clean"] : []),
+        ...(failures === 3 ? ["reset", "discard"] : []),
       ]);
       expect(attempts[1]?.prompt).toContain("stuck: repeated shell call");
-      if (failures === 2) {
+      if (failures >= 2) {
         expect(attempts[1]?.state?.feedback).toContain("Worktree cleanup failed after retry");
         expect(attempts[1]?.prompt).toContain("could not lstat node_modules/writer");
         const warning = f.store

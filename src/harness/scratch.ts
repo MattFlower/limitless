@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { assertProcessesStopped } from "../util/proc.ts";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -59,6 +60,7 @@ export function scratchParent(scratchDir: string): string {
 }
 
 export function removeScratch(scratchDir: string): void {
+  assertProcessesStopped();
   const root = basename(scratchDir) === SCRATCH_NAME ? dirname(scratchDir) : scratchDir;
   const remove = () => rmSync(root, { recursive: true, force: true });
   try {
