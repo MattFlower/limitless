@@ -418,11 +418,13 @@ test("a pinned merge whose head moved is refused", async () => {
   writeFileSync(join(root, "gh.hang"), ""); // hold the merge while the head moves underneath it
   const q = queue();
   const entry = q.request({ target: pr.run.id });
-  await waitFor(() => store.getLandEntry(entry.id)?.state === "merging");
+  await waitFor(() => ghCalls("pr merge").some((call) => call.includes("--match-head-commit")));
   const pinned = store.getLandEntry(entry.id)?.pushedSha ?? head;
   await q.stop();
   rmSync(join(root, "gh.hang"));
-  await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
+  const moved = await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
+  ci = () => null;
+  observe(1, moved, "PENDING");
   queue();
   await settle();
   expect(
@@ -430,8 +432,10 @@ test("a pinned merge whose head moved is refused", async () => {
       .filter((c) => c.includes("--match-head-commit"))
       .at(-1),
   ).toContain(`--match-head-commit ${pinned}`);
-  expect(ghCalls("pr merge").at(-1)).toContain("--disable-auto");
-  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "merge failed" });
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: "head moved after approval",
+  });
   expect(store.getRun(pr.run.id)?.merged).toBe(false);
   expect(existsSync(join(root, "gh.merged-1"))).toBe(false);
 });
