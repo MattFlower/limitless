@@ -39,6 +39,7 @@ import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+import { truncationEncodings } from "./privacy-support.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -371,6 +372,17 @@ describe("audit allowances and attribute rules", () => {
 });
 
 describe("private strings", () => {
+  test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {
+    const entries = [{ value: "private-prospect.example", entry: 3 }];
+    const text = encode(entries[0]?.value ?? "");
+    // Include every cutoff after the first complete encoded character, including partial escapes.
+    for (let cut = encode("p").length; cut < text.length; cut++)
+      expect(privateMatches(`Public: ${text.slice(0, cut)}`, entries, true)).toEqual(entries);
+    expect(privateMatches("Public: ＰＲＩＶＡＴＥ-pro", entries, true)).toEqual(entries);
+    expect(privateMatches("Public: private-pro", entries)).toEqual([]);
+    expect(privateMatches("Public: private-pro unrelated", entries, true)).toEqual([]);
+  });
+
   test.each([
     ["double URL", "%2573ecret-host.example"],
     ["Unicode-escaped percent", "\\u002573ecret-host.example"],

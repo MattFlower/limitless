@@ -14,3 +14,22 @@ export const privacyTexts = ["secret-host.example", "privacy-test-credential"].f
     nested,
   ];
 });
+
+const percent = (value: string) =>
+  [...value].map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`).join("");
+export const truncationEncodings = [
+  ["plain", (value: string) => value],
+  ["URL", percent],
+  ["double URL", (value: string) => encodeURIComponent(percent(value))],
+  ["Unicode-escaped percent", (value: string) => percent(value).replaceAll("%", "\\u0025")],
+  [
+    "mixed",
+    (value: string) =>
+      [...value]
+        .map(
+          (c, i) =>
+            [c, percent(c), encodeURIComponent(percent(c)), percent(c).replaceAll("%", "\\u0025")][i % 4],
+        )
+        .join(""),
+  ],
+] as const;

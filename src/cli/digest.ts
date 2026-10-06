@@ -123,12 +123,29 @@ async function printDigest(
     for (const line of lines) deps.print(line);
     return;
   }
-  const safeQuote = (value: string) => quote(privacy(value));
+  const safeQuote = (value: string, truncated = false, limit?: number) => {
+    const safe = privacy(value, truncated);
+    return quote(limit === undefined ? safe : [...safe].slice(0, limit).join(""));
+  };
   const rows = groups.map((g) =>
-    [...g.items.values()].map(
-      (item) =>
-        `${g.label}: #${item.id} run=${safeQuote(item.runId ?? "unknown")} ${safeQuote(item.title)} ${safeQuote(item.summary)}`,
-    ),
+    [...g.items.values()].map((item) => {
+      const state = current.get(item.runId ?? "");
+      const run = state?.detail.run;
+      // The feed title is already clipped. Recover even the Store's prompt-derived title.
+      const firstLine = run?.prompt?.split("\n")[0];
+      const title = run?.title === firstLine?.slice(0, 80) ? firstLine : run?.title;
+      const summary =
+        item.kind === "run.question"
+          ? (state?.detail.questions.find((q) => q.answer === null)?.question ?? run?.error)
+          : item.kind === "run.failed" || item.kind === "run.needs_human"
+            ? run?.error
+            : item.kind === "land.blocked"
+              ? state?.land?.reason
+              : item.kind === "run.pr_opened" && typeof item.data.prUrl === "string"
+                ? item.data.prUrl
+                : undefined;
+      return `${g.label}: #${item.id} run=${safeQuote(item.runId ?? "unknown")} ${safeQuote(title ?? item.title, title === undefined, 200)} ${safeQuote(summary ?? item.summary, summary == null, 500)}`;
+    }),
   );
   // Interleave categories so a busy input queue cannot hide blocked lands or review requests.
   const items = Array.from({ length: Math.max(...rows.map((r) => r.length)) }, (_, i) =>

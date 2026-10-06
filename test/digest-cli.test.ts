@@ -7,7 +7,7 @@ import type { FeedItem, FeedPage } from "../src/core/types.ts";
 import { parseFeedParams } from "../src/feed.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { feedStore } from "./feed-support.ts";
-import { privacyTexts } from "./privacy-support.ts";
+import { privacyTexts, truncationEncodings } from "./privacy-support.ts";
 
 let configDir: string;
 let previousConfigDir: string | undefined;
@@ -253,9 +253,8 @@ function storeApi(f: ReturnType<typeof feedStore>, requests: string[]) {
   };
 }
 
-function openPr(f: ReturnType<typeof feedStore>, title: string) {
+function openPr(f: ReturnType<typeof feedStore>, title: string, prUrl = "https://github.com/o/r/pull/1") {
   const run = f.run(title);
-  const prUrl = "https://github.com/o/r/pull/1";
   const sha = "a".repeat(40);
   f.store.updateRun(run.id, { status: "succeeded", prUrl });
   f.store.observePrHead(prUrl, sha);
@@ -285,6 +284,75 @@ test("digest redacts protected titles and registered credentials through a real 
     expect(text).not.toContain("Private Prospect");
     expect(text).not.toContain("digest-test-secret-value");
     expect(lines.filter((line) => line.includes('"[withheld: private text]"'))).toHaveLength(2);
+  } finally {
+    f.close();
+  }
+});
+
+test.each(truncationEncodings)(
+  "digest protects full sources and truncated-only %s values",
+  async (_name, encode) => {
+    const f = feedStore();
+    const secret = `digest-credential-${"x".repeat(283 - "digest-credential-".length)}`;
+    writeFileSync(join(configDir, "private-strings.txt"), "private-prospect.example\n");
+    registerCredential("DIGEST_LONG_CREDENTIAL", secret);
+    try {
+      for (const protectedText of ["private-prospect.example", secret]) {
+        const encoded = encode(protectedText);
+        const run = f.run(`${".".repeat(180)}${encoded}`);
+        f.store.updateRun(run.id, { status: "failed", error: `${".".repeat(480)}${encoded}` });
+        const fallback = f.run("Safe fallback title");
+        f.store.updateRun(fallback.id, { status: "failed" });
+        // This historical feed copy is the only surviving source for the summary.
+        f.store.db
+          .query("UPDATE feed SET summary = ? WHERE run_id = ?")
+          .run(`${".".repeat(480)}${encoded}`.slice(0, 500), fallback.id);
+      }
+      const lines: string[] = [];
+      await digestCommand([], {}, { api: storeApi(f, []), print: (line) => lines.push(line) });
+      expect(lines[1]).toBe("Needs you: 4; PRs awaiting review: 0; Blocked lands: 0");
+      expect(lines.slice(2)).toHaveLength(4);
+      for (const line of lines.slice(2)) {
+        expect(line).toEndWith('"[withheld: private text]"');
+        expect(line).not.toContain(".".repeat(10));
+      }
+    } finally {
+      f.close();
+    }
+  },
+);
+
+test("digest filters full titles and PR URLs even when private text begins after the feed cutoff", async () => {
+  const f = feedStore();
+  try {
+    writeFileSync(join(configDir, "private-strings.txt"), "private-prospect.example\n");
+    openPr(
+      f,
+      `${".".repeat(220)}private-prospect.example`,
+      `https://github.com/o/r/pull/1?${".".repeat(500)}private-prospect.example`,
+    );
+    const lines: string[] = [];
+    await digestCommand([], {}, { api: storeApi(f, []), print: (line) => lines.push(line) });
+    expect(lines[2]).toEndWith('"[withheld: private text]" "[withheld: private text]"');
+    expect(lines[2]).not.toContain(".".repeat(10));
+  } finally {
+    f.close();
+  }
+});
+
+test("digest filters the full prompt-derived title before the Store's 80-character cap", async () => {
+  const f = feedStore();
+  try {
+    writeFileSync(join(configDir, "private-strings.txt"), "private-prospect.example\n");
+    const run = f.store.createRun(f.repo(), {
+      repo: "local/feed",
+      prompt: `${".".repeat(70)}private-prospect.example`,
+    });
+    f.store.updateRun(run.id, { status: "failed" });
+    const lines: string[] = [];
+    await digestCommand([], {}, { api: storeApi(f, []), print: (line) => lines.push(line) });
+    expect(lines[2]).toContain('"[withheld: private text]"');
+    expect(lines[2]).not.toContain(".".repeat(10));
   } finally {
     f.close();
   }

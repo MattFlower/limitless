@@ -49,15 +49,29 @@ const decoded = (text: string) =>
     .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
     // Diagnostics may JSON-quote a field's literal Unicode escapes.
     .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-export function privateMatches(text: string, entries: PrivateStrings): PrivateStrings {
-  let layers = text;
+/** A clipped value also protects any trailing fragment of a private string. */
+export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
+  const layers = [text];
   for (let round = 0; round < 5; round++) {
     const next = decoded(text);
     if (next === text) {
-      const normalized = normalize(layers);
-      return entries.filter(({ value }) => normalized.includes(normalize(value)));
+      const normalized = layers.map(normalize);
+      return entries.filter(({ value }) => {
+        const protectedText = normalize(value);
+        return normalized.some((layer) => {
+          if (layer.includes(protectedText)) return true;
+          if (!truncated) return false;
+          // A cutoff can split an escape or a UTF-8 percent sequence, hiding the decoded tail.
+          const tails = [layer, layer.replace(/(?:%[0-9a-f]?|\\+u[0-9a-f]{0,3}|\\+|\ufffd)+$/i, "")];
+          return tails.some((tail) => {
+            for (let length = 1; length < protectedText.length && length <= tail.length; length++)
+              if (tail.endsWith(protectedText.slice(0, length))) return true;
+            return false;
+          });
+        });
+      });
     }
-    layers += `\n${next}`;
+    layers.push(next);
     text = next;
   }
   // Entry zero marks unsafe decoding, including when the denylist is empty.

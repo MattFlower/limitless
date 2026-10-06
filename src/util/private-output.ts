@@ -1,15 +1,15 @@
 import { loadPrivateStrings, privateMatches } from "../gates/private.ts";
 import { redactCredentials, registeredCredentials } from "./proc.ts";
 
-export type OutputPrivacy = (text: string) => string;
+export type OutputPrivacy = (text: string, truncated?: boolean) => string;
 
 /** A missing filter means the policy is unreadable: callers must omit free text. */
 export function loadOutputPrivacy(): OutputPrivacy | null {
   try {
     const entries = loadPrivateStrings();
-    return (text) => {
+    return (text, truncated = false) => {
       const protectedEntries = [...entries, ...registeredCredentials().map((value) => ({ value, entry: 0 }))];
-      return privateMatches(text, protectedEntries).length
+      return privateMatches(text, protectedEntries, truncated).length
         ? "[withheld: private text]"
         : redactCredentials(text);
     };
