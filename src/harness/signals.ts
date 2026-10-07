@@ -1,12 +1,20 @@
 import type { AgentEvent } from "./types.ts";
 
 const unquote = (s: string) => {
-  const value = s.replace(/^(['"])([\s\S]*)\1$/, "$2");
-  return s.startsWith('"') ? value.replace(/\\(["\\$`])/g, "$1") : value;
+  return s.replace(/"((?:\\.|[^"\\])*)"|'([^']*)'/g, (_, double: string | undefined, single: string) =>
+    double === undefined ? single : double.replace(/\\(["\\$`])/g, "$1"),
+  );
 };
 const HEREDOC = /<<-?\s*(['"]?)(\w+)\1([^\n]*)\n([\s\S]*?)\n\2(?:\n|$)/g;
 const SH = /^(?:ba|z|da|k)?sh$/;
 const JS = /^(?:node|bun|nodejs)$/;
+const WRAPPERS = new Map([
+  ["timeout", /^(?:-[ks]|--kill-after|--signal)$/],
+  ["nice", /^(?:-n|--adjustment)$/],
+  ["time", /^(?:-[fo]|--format|--output)$/],
+  ["watch", /^(?:-n|--interval)$/],
+  ["stdbuf", /^(?:-[ioe]|--input|--output|--error)$/],
+]);
 const jsSignal = (code: string) =>
   /(?<![\w$.])process\s*\.\s*kill\s*\(/.test(
     code.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, ""),
@@ -25,7 +33,7 @@ export function signalCommand(command: string, depth = 0): boolean {
     return `${rest}\n`;
   });
   if (found) return true;
-  const tokens = command.match(/"(?:\\.|[^"\\])*"|'[^']*'|[;&|()\n]+|[^\s;&|()]+/g) ?? [];
+  const tokens = command.match(/(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s;&|()"'])+|[;&|()\n]+/g) ?? [];
   let start = true;
   let piped = false;
   for (let i = 0; i < tokens.length; i++) {
@@ -42,16 +50,30 @@ export function signalCommand(command: string, depth = 0): boolean {
       continue;
     }
     if (!start) continue;
+    if (name === "command" && /^-[vV]$/.test(tokens[i + 1] ?? "")) {
+      start = false;
+      continue;
+    }
+    const takesValue = WRAPPERS.get(name);
+    if (takesValue) {
+      while (tokens[i + 1]?.startsWith("-")) {
+        const option = tokens[++i] ?? "";
+        if (option === "--") break;
+        if (takesValue.test(option)) i++;
+      }
+      if (name === "timeout") i++; // The duration precedes the wrapped command.
+      continue;
+    }
     if (name === "xargs") {
       piped = true;
       continue;
     }
-    if (piped && /^(?:-n|-P|-I|-L)$/.test(token)) {
+    if (piped && /^(?:-n|-P|-I|-L|-a|-d|-E|-s)$/.test(token)) {
       i++;
       continue;
     }
     if (
-      /^(?:exec|command|env|sudo|nohup|xargs|if|then|do|!)$/.test(name) ||
+      /^(?:exec|command|env|sudo|nohup|xargs|if|then|do|!|\{|\})$/.test(name) ||
       /^\w+=/.test(token) ||
       token.startsWith("-")
     )
@@ -59,18 +81,25 @@ export function signalCommand(command: string, depth = 0): boolean {
     start = false;
     if (/^(?:pkill|killall)$/.test(name)) return true;
     const end = tokens.findIndex((t, n) => n > i && /^[;&|()\n]+$/.test(t));
-    const operands = tokens.slice(i + 1, end < 0 ? undefined : end);
+    const operands = tokens.slice(i + 1, end < 0 ? undefined : end).map(unquote);
     if (
       name === "kill" &&
       !operands.some((t) => /^-[lL]$/.test(t)) &&
-      (piped || operands.some((t) => /^-?(?:\d+$|[$%])/.test(unquote(t))))
+      !operands.some(
+        (t, n) =>
+          /^(?:-0|-s0|--signal=0)$/.test(t) || (/^(?:-s|--signal)$/.test(t) && operands[n + 1] === "0"),
+      ) &&
+      (piped || operands.some((t) => /^-?(?:\d+$|[$%])/.test(t)))
     )
       return true;
     const code = (flag: RegExp) => {
       // Skip interpreter options (and the values of those that take one) up to the code argument.
       for (let j = i + 1; tokens[j]?.startsWith("-"); j++) {
-        if (flag.test(tokens[j] ?? "")) return unquote(tokens[j + 1] ?? "");
-        if (/^(?:-[roO]|--require|--import|--loader)$/.test(tokens[j] ?? "")) j++;
+        const option = unquote(tokens[j] ?? "");
+        const equals = option.indexOf("=");
+        if (equals >= 0 && flag.test(option.slice(0, equals))) return option.slice(equals + 1);
+        if (flag.test(option)) return unquote(tokens[j + 1] ?? "");
+        if (/^(?:-[roO]|--require|--import|--loader)$/.test(option)) j++;
       }
       return "";
     };

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { implementPrompt } from "../src/pipeline/prompts.ts";
+import { FACTORY_PREAMBLE, implementPrompt } from "../src/pipeline/prompts.ts";
 
 for (const round of [0, 1]) {
   for (const hasHoldout of [true, false]) {
@@ -53,4 +53,10 @@ test("merge resolution still prohibits all Git", () => {
   });
   expect(prompt).toContain("Do not run Git. Edit files only; the factory stages and commits the merge.");
   expect(prompt).not.toContain("status, diff and log are fine");
+});
+
+test("every factory role receives the shared-machine process rule", () => {
+  expect(FACTORY_PREAMBLE).toMatch(/never signal processes you did not start/i);
+  expect(FACTORY_PREAMBLE).toContain("never pkill/killall by name");
+  expect(FACTORY_PREAMBLE).toContain("other runs and the user share this machine");
 });

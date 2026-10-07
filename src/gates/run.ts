@@ -52,10 +52,7 @@ export interface GateHooks {
 }
 
 const OUTPUT_TAIL = 6_000;
-const launchFailure = (output: string) =>
-  /sandbox[_ -](?:apply|init|initialization).*?(?:not permitted|failed)|signal confinement (?:not|unavailable|preflight|incompatible)/i.test(
-    output,
-  );
+const launchFailure = (output: string) => output.includes("sandbox_apply: Operation not permitted");
 const confinementFailed = (r?: GateResult): boolean =>
   !!r && (!!r.confinementError || launchFailure(r.output) || confinementFailed(r.firstAttempt));
 

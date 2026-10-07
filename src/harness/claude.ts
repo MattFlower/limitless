@@ -244,11 +244,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     );
   }
   if (Object.keys(fastSettings).length && spec.noTools) args.push("--settings", JSON.stringify(fastSettings));
-  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined (tool-enabled) invocation
+  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined editor
   // cannot store a transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
-  const ephemeral = !spec.noTools;
+  const ephemeral = spec.mode === "edit" && !spec.noTools;
   if (ephemeral && spec.resumeSessionId)
-    throw new Error("Confined Claude invocations do not persist sessions and cannot resume one");
+    throw new Error("Confined Claude editors do not persist sessions and cannot resume one");
   if (spec.privateSession || ephemeral) args.push("--no-session-persistence");
   if (spec.noTools) {
     args.push("--tools", "");
@@ -294,15 +294,11 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const keyFile = t.backend && `${tmpdir()}/limitless-${sessionId}.key`;
   const args = buildClaudeArgs(spec, sessionId, keyFile);
   const editing = spec.mode === "edit" && !spec.noTools;
-  const roots = spec.noTools
-    ? null
-    : editing
-      ? writeRoots(spec.cwd, validateScratch(spec))
-      : { write: [validateScratch(spec)], protect: [realpathSync(spec.cwd)] };
+  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec)) : null;
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
   const runner: typeof runProcess = (opts) =>
-    roots ? runSandboxed(opts, roots, processRunner, undefined, undefined, !editing) : processRunner(opts);
+    roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
   appendFileSync(spec.logPath, redactCredentials(`# claude ${t.model} ${new Date().toISOString()}\n`));
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   // Agent tool read isolation for this key file is tracked in #335.
@@ -387,8 +383,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     fastModeDisabledReason: parser.fastModeDisabledReason,
     finalText: parser.finalText || parser.lastAssistantText,
     structured: parser.structured,
-    // An unpersisted session cannot be resumed, so it is not advertised as one.
-    sessionId: spec.noTools ? (parser.sessionId ?? (spec.resumeSessionId || sessionId)) : null,
+    sessionId: parser.sessionId ?? (spec.resumeSessionId || sessionId),
     usage: parser.usage,
     numTurns: parser.numTurns,
     costUsd: metered ? cost : 0,

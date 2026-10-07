@@ -273,15 +273,29 @@ test("signal warnings persist with invocation linkage, feed once, remain private
     expect(invocation?.status).toBe("ok");
     expect(warnings.every((event) => event.invocationId === invocation?.id)).toBe(true);
     const feed = allItems(memory).filter((item) => item.kind === "run.warning");
-    expect(feed).toHaveLength(2);
-    expect(feed.map((item) => item.data.eventId)).toEqual(warnings.map((event) => event.id));
-    expect(new Set(feed.map((item) => item.data.toolCallId)).size).toBe(2);
+    expect(feed).toHaveLength(1);
+    expect(feed[0]?.data.eventId).toBe(warnings[0]?.id);
+    expect(memory.db.query("SELECT dedupe_key FROM feed WHERE kind = 'run.warning'").all()).toEqual([
+      { dedupe_key: `run.warning:${run.id}:${invocation?.id}` },
+    ]);
+    expect(memory.countEvents(run.id, "signal_attempt")).toBe(2);
     const report = buildReport(ctx, true);
     expect(report).toContain("2 process signal attempt(s)");
     expect(report).toContain("every gate below passed");
     expect(JSON.stringify({ warnings, feed, report })).not.toMatch(/secret-marker|private-call|pkill/);
     expect(ctx.state.feedback).toBeNull();
     expect(ctx.state.round).toBe(0);
+    await ctx.invoke({
+      stage,
+      role: "triage",
+      prompt: "test",
+      mode: "readonly",
+      complexity: "small",
+      privateOutput: true,
+    });
+    expect(allItems(memory).filter((item) => item.kind === "run.warning")).toHaveLength(2);
+    expect(memory.countEvents(run.id, "signal_attempt")).toBe(4);
+    expect(buildReport(ctx, true)).toContain("4 process signal attempt(s)");
   } finally {
     memory.close();
   }

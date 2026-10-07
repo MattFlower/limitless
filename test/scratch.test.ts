@@ -13,16 +13,16 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { buildClaudeArgs, runClaude as productionClaude } from "../src/harness/claude.ts";
+import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
   type CanaryClasses,
   CodexReaderProbe,
   canaryRoots,
-  runCodex as productionCodex,
   type ReaderProbeOptions,
+  runCodex,
 } from "../src/harness/codex.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
+import { ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
@@ -36,26 +36,6 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
 import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
-
-const simulatedOuter =
-  (runner: typeof runProcess): typeof runProcess =>
-  async (opts) => {
-    if (opts.cmd[0] === "/bin/sh" && opts.cmd[4]?.startsWith("limitless-started-")) {
-      opts.onStdoutLine?.(opts.cmd[4]);
-      return runner({ ...opts, cmd: opts.cmd.slice(5) });
-    }
-    return runner(opts);
-  };
-const runCodex: typeof productionCodex = (spec, runner, probe) => {
-  if (!runner) throw new Error("These tests require an injected CLI");
-  return confinementScope.run(fakeConfinement, () => productionCodex(spec, simulatedOuter(runner), probe));
-};
-const runClaude: typeof productionClaude = (spec, runner) => {
-  if (!runner) throw new Error("These tests require an injected CLI");
-  return spec.mode === "edit"
-    ? productionClaude(spec, runner)
-    : confinementScope.run(fakeConfinement, () => productionClaude(spec, simulatedOuter(runner)));
-};
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -1511,20 +1491,6 @@ test("claude editors confine Bash and native edits to the same roots; project se
   expect(() => buildClaudeArgs({ ...spec, resumeSessionId: "s-1" }, "s")).toThrow("cannot resume");
 });
 
-test("claude tool-enabled readers run under the same read-only config boundary: no transcript, no resume", () => {
-  const { spec } = editFixture();
-  const target = { ...spec.target, provider: "claude" };
-  for (const confineReads of [false, true]) {
-    const reader = { ...spec, mode: "readonly" as const, confineReads, target };
-    expect(buildClaudeArgs(reader, "session")).toContain("--no-session-persistence");
-    expect(() => buildClaudeArgs({ ...reader, resumeSessionId: "s-1" }, "s")).toThrow("cannot resume");
-  }
-  // A no-tools call runs outside the outer profile, so it keeps a persistent, resumable session.
-  const plain = { ...spec, mode: "readonly" as const, noTools: true, target };
-  expect(buildClaudeArgs(plain, "session")).not.toContain("--no-session-persistence");
-  expect(buildClaudeArgs({ ...plain, resumeSessionId: "s-1" }, "s").slice(-2)).toEqual(["--resume", "s-1"]);
-});
-
 /** A fake `codex sandbox` honouring (or, when leaky, ignoring) the editor profile's most specific entry. */
 function editCodex(
   behaviour: "enforcing" | "leaky" | "timeout" | "admin-leak" | "common-leak" = "enforcing",
@@ -1588,6 +1554,45 @@ test("codex editors run only after a probe writes cwd and scratch and is denied 
   fake.cli.path = `${CODEX}-alternate`;
   await runCodex(spec, fake.runner, fake.probe);
   expect(fake.sandboxes()).toHaveLength(18);
+});
+
+test("CLI sandboxes run directly when outer confinement refuses; Claude editors fail closed", async () => {
+  const { spec } = editFixture();
+  let preflights = 0;
+  const backend = {
+    ...fakeConfinement,
+    verify: async () => {
+      preflights++;
+      throw new ConfinementError("Write confinement unavailable");
+    },
+  };
+  await confinementScope.run(backend, async () => {
+    for (const mode of ["edit", "readonly"] as const) {
+      const fake = editCodex();
+      const result = await runCodex({ ...spec, mode }, fake.runner, fake.probe);
+      expect(result.status).toBe("ok");
+      expect(fake.execs()).toHaveLength(1);
+      expect(fake.execs()[0]?.[0]).toBe(mode === "edit" ? CODEX : "codex");
+    }
+    const calls: string[][] = [];
+    const runner = async (opts: ProcOptions) => {
+      calls.push(opts.cmd);
+      opts.onStdoutLine?.(
+        '{"type":"result","subtype":"success","result":"ok","session_id":"reader-session"}',
+      );
+      return procResult;
+    };
+    const reader = { ...spec, mode: "readonly" as const, resumeSessionId: "reader-session" };
+    const result = await runClaude(reader, runner);
+    expect(result.status).toBe("ok");
+    expect(result.sessionId).toBe("reader-session");
+    expect(calls[0]?.[0]).toBe("claude");
+    expect(calls[0]).not.toContain("--no-session-persistence");
+    expect(preflights).toBe(0);
+    await expect(runClaude(spec, runner)).rejects.toBeInstanceOf(ConfinementError);
+    expect(preflights).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
 });
 
 for (const behaviour of ["leaky", "timeout", "admin-leak", "common-leak"] as const)

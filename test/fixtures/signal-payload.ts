@@ -28,8 +28,13 @@ if (process.argv[2] === "marker") {
   };
   const owned = await start();
   if (process.env.SIGNAL_WAIT === "1") {
-    console.log(`owned:${owned.pid}`);
-    await owned.closed;
+    owned.child.kill("SIGTERM");
+    const [, signal] = await owned.closed;
+    if (signal !== "SIGTERM") throw new Error("owned PID signal failed");
+    console.log("owned-terminated");
+    const waiting = await start();
+    console.log(`owned:${waiting.pid}`);
+    await waiting.closed;
   } else {
     try {
       for (const key of ["SIGNAL_OUTSIDE", "SIGNAL_SIBLING"]) {

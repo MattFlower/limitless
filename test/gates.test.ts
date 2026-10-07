@@ -1184,11 +1184,7 @@ test("signal confinement covers setup, checks and baseline/regression retries; f
       await expect(productionGates(cwd, cfg, signal)).rejects.toThrow("Signal confinement");
       expect(calls).toHaveLength(3);
     });
-    for (const diagnostic of [
-      "Signal confinement not verified",
-      "sandbox_init: failed",
-      "Sandbox initialization failed: Operation not permitted",
-    ]) {
+    for (const diagnostic of ["sandbox_apply: Operation not permitted"]) {
       const failed: GateRun = {
         setupOk: true,
         setup: [],
@@ -1211,26 +1207,31 @@ test("signal confinement covers setup, checks and baseline/regression retries; f
   }
 });
 
-test("passing offline refusal smoke output does not turn its enclosing gate into an operational failure", async () => {
-  const result = await runGates(
-    process.cwd(),
-    {
-      source: "none",
-      setup: [],
-      protectedPaths: [],
-      checks: [
-        {
-          name: "signal-smoke",
-          run: `"${process.execPath}" test "${join(import.meta.dir, "signal-confinement.test.ts")}"`,
-          timeoutSec: 30,
-        },
-      ],
-    },
-    new AbortController().signal,
-  );
-  expect(result.checks[0]?.ok).toBe(true);
-  expect(compareGates(null, result)[0]).toMatchObject({ verdict: "new_pass", blocking: false });
-}, 35_000);
+test("passing checks can print sandbox research and caught signal-probe errors", async () => {
+  const cwd = tempDir({});
+  try {
+    const result = await runGates(
+      cwd,
+      {
+        source: "none",
+        setup: [],
+        protectedPaths: [],
+        checks: [
+          {
+            name: "diagnostics",
+            run: 'echo "warn: sandbox initialization failed, retrying"; echo "Signal confinement not verified"; exit 0',
+          },
+        ],
+      },
+      new AbortController().signal,
+    );
+    expect(result.checks[0]?.ok).toBe(true);
+    expect(result.checks[0]?.confinementError).toBeFalsy();
+    expect(compareGates(null, result)[0]).toMatchObject({ verdict: "new_pass", blocking: false });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("private policy rejects broken lists and repository aliases; normalizes both sides", () => {
   const root = mkdtempSync(join(tmpdir(), "private-policy-"));

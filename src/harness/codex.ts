@@ -15,8 +15,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
-import { agentEnv, type ProcOptions, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
-import { runSandboxed } from "./sandbox.ts";
+import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import {
   createScratch,
   readConfinement,
@@ -811,13 +810,7 @@ export async function runCodex(
   });
 
   appendFileSync(spec.logPath, redactCredentials(`# codex ${t.model} ${new Date().toISOString()}\n`));
-  const roots = () =>
-    editing
-      ? writeRoots(spec.cwd, validateScratch(spec))
-      : { write: [validateScratch(spec)], protect: [spec.cwd] };
-  const proc = await (spec.noTools
-    ? processRunner
-    : (opts: ProcOptions) => runSandboxed(opts, roots(), processRunner, undefined, undefined, true))({
+  const proc = await processRunner({
     cmd: args,
     cwd: spec.cwd,
     env: agentEnv(scratchEnv(spec)),

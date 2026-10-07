@@ -11,6 +11,7 @@ import {
 } from "../src/harness/codex.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
+import { signalCommand } from "../src/harness/signals.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -508,11 +509,51 @@ for (const [name, Parser] of [
     const parser = new Parser((event) => events.push(event));
     for (const line of fixture(`${name}-signals.jsonl`)) parser.feed(line);
     const warnings = events.filter((event) => event.type === "warning");
-    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 16 }, (_, i) => `signal-${i}`));
+    expect(warnings.map((event) => event.id)).toEqual([
+      ...Array.from({ length: 16 }, (_, i) => `signal-${i}`),
+      "signal-captured",
+    ]);
+    expect(warnings.filter((event) => event.id === "signal-captured")).toHaveLength(1);
     expect(JSON.stringify(warnings)).not.toContain("marker");
     expect(events.filter((event) => event.type === "tool_result").length).toBeGreaterThan(10);
   });
 }
+
+test("signal detection recognizes wrappers and ignores process polls and command lookup", () => {
+  for (const command of [
+    "timeout 5 pkill -f x",
+    "timeout --signal TERM -k 2 5 pkill -f x",
+    "nice pkill x",
+    "nice -n 5 pkill x",
+    "time pkill x",
+    "time -o timing.log pkill x",
+    "watch pkill x",
+    "watch -n 2 pkill x",
+    "watch -d pkill x",
+    "stdbuf -o L pkill x",
+    "stdbuf --input 0 --error L pkill x",
+    "{ pkill x; }",
+    "node --eval='process.kill(1)'",
+    'bun --print="process.kill(1)"',
+    "xargs -a pids kill",
+    "xargs -d , -E stop -s 100 kill",
+  ])
+    expect(signalCommand(command)).toBe(true);
+  for (const command of [
+    "command -v pkill",
+    "command -V pkill",
+    "kill -0 123",
+    "kill -s 0 123",
+    "kill -0 $pid && echo running",
+    "xargs -a pids kill -0",
+    "node --eval='console.log(\"process.kill(1)\")'",
+    String.raw`/bin/zsh -lc "cat > f.ts <<'EOF'
+const re = /"'^(?:pkill|killall)$'"/;
+EOF
+bun run typecheck"`,
+  ])
+    expect(signalCommand(command)).toBe(false);
+});
 
 test("Claude edit denies named process signals and broadcast kill as backstops", async () => {
   await withScratch(process.cwd(), async (scratchDir) => {

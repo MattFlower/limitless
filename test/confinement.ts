@@ -8,7 +8,6 @@ export function recordingConfinement() {
     verify: async (roots, opts) => {
       calls.push({ roots, opts });
     },
-    nested: async () => {},
     wrap: (cmd) => cmd,
   };
   return { backend, calls };

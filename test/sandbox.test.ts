@@ -434,19 +434,45 @@ test("a write-enforcing backend must also prove signals; signal-only leaks and i
   }
 });
 
-test("nested compatibility requires effective signal canaries after the inner profile, not successful startup alone", async () => {
-  const calls: ProcOptions[] = [];
-  const runner = async (opts: ProcOptions) => {
-    calls.push(opts);
-    if (opts.cmd[1] === "-p") {
-      writeFileSync(opts.cmd.at(-2) ?? "", "ok");
-      return proc({ stdout: "verified" });
-    }
-    return proc({ stdout: "nested" });
-  };
-  await expect(
-    verifySeatbelt(runner, "/bin/sh", "darwin", { write: [work], protect: [] }, undefined, true),
-  ).rejects.toThrow("Signal confinement");
-  expect(calls).toHaveLength(2);
-  expect(calls[1]?.cmd[2]).toContain('"$1" -p "$2" "$1" -p "(version 1)(allow default)" /bin/sh -c');
+test("wrapped payload diagnostics are ordinary output after the startup handshake", async () => {
+  const { backend } = recordingConfinement();
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const result = await runSandboxed(
+    {
+      cmd: ["fake-cli"],
+      cwd: work,
+      env: agentEnv(),
+      onStdoutLine: (line) => stdout.push(line),
+      onStderrLine: (line) => stderr.push(line),
+    },
+    { write: [work], protect: [] },
+    async (opts) => {
+      const token = opts.cmd[4] ?? "";
+      opts.onStdoutLine?.(token);
+      opts.onStdoutLine?.("sandbox_init: profile failed");
+      opts.onStderrLine?.("sandbox_init: profile failed");
+      return proc({
+        stdout: `${token}\nsandbox_init: profile failed\n`,
+        stderr: "sandbox_init: profile failed",
+      });
+    },
+    undefined,
+    backend,
+  );
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toBe("sandbox_init: profile failed\n");
+  expect(stdout).toEqual(["sandbox_init: profile failed"]);
+  expect(stderr).toEqual(["sandbox_init: profile failed"]);
+});
+
+test("unavailable confinement errors keep their original reason without noisy wrapping", async () => {
+  try {
+    await verifySeatbelt(undefined, undefined, "linux");
+    throw new Error("expected confinement refusal");
+  } catch (error) {
+    expect(error).toBeInstanceOf(ConfinementError);
+    expect(String(error)).toContain("Write confinement unavailable: linux has no Seatbelt");
+    expect(String(error)).not.toMatch(/preflight failed: Error:|also required/);
+  }
 });

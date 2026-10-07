@@ -1,147 +1,112 @@
 # Signal confinement (#293)
 
-Research recorded 2026-10-04 (UTC, checked with `date -u`) before enforcement changes.
-Host: macOS 27.0.1 / 26A434, Bun 1.4.2, codex-cli 0.159.2,
-Claude Code 2.1.288. This worker itself is sandboxed.
+Research began 2026-10-04; revised 2026-10-07 (UTC, checked with `date -u`).
+The real-host evidence below was reported in PR #368's review, rather than
+re-run by this sandboxed factory worker. Host: unsandboxed macOS 27.0.1
+(26A434), codex-cli 0.160.0, Claude CLI 2.1.290.
 
 ## Evidence and choice
 
-Run `bun scripts/probe-signal-targets.ts` offline. It starts only `true` under each
-profile, then attempts a second sandbox. On this host all eight cases exit 71:
-`sandbox-exec: sandbox_apply: Operation not permitted`. No payload started. Even
-`codex sandbox macos --help` reaches that error here. These are **nesting-denied**
-results, not evidence that a signal filter worked. No authenticated CLI was run.
+On the reported host, `bun scripts/probe-signal-targets.ts` returned exit 0 for
+all four non-nested targets (`self`, `pgrp`, `children`, `same-sandbox`) and
+exit 71 for every nested case (`sandbox-exec: sandbox_apply: Operation not
+permitted`). A nested sandbox_apply succeeds only when the outer profile is
+exactly `(version 1)(allow default)`. Adding `(deny file-write*)`, `(deny signal)`
+or an allow-signal rule makes the inner application fail with exit 71.
+The earlier eight exit-71 results came from the factory worker's enclosing
+sandbox; they did not establish host support or effective signal enforcement.
 
-Seatbelt's target selectors have different purposes:
-
-| Target | Intended scope | Decision |
+| Target | Scope | Decision |
 | --- | --- | --- |
-| self | Current process | Allow (self-signaling is needed by runtimes). |
-| pgrp | Members of the sender's process group | Do not grant: group membership is not an isolation boundary. |
-| children | Sender's children | Do not rely on it for descendants that fork/exec/reparent or sibling tools. |
-| same-sandbox | Processes inheriting the same sandbox instance | Candidate run boundary; verify independent instances are separated, even with identical profile bytes. |
+| self | Current process | Allow for runtime self-signaling. |
+| pgrp | Sender's process group | Do not grant: group membership is not an isolation boundary. |
+| children | Sender's children | Do not rely on it for descendants or sibling tools. |
+| same-sandbox | Processes inheriting one sandbox instance | Use as the invocation boundary, with effective canaries. |
 
-The installed `/System/Library/Sandbox/Profiles/bsd.sb` uses `target self`;
-`cryptex-session-base.sb` uses `target children`. Acceptance of all four spellings
-before sandbox_apply is observed; their runtime behavior here is **unverified**.
-The chosen outer policy denies `signal` except self and same-sandbox. Forked tools
-and interpreters must inherit it. Every launch must prove actual denial to an
-outside owned process and an independently confined sibling, and termination of
-an owned descendant. A missing, ineffective or inconclusive probe fails closed,
-including a cancelled probe that printed its success marker.
-This is an invocation boundary, which is stricter than a run boundary.
+The outer policy denies signals except self and same-sandbox. Every launch
+proves denial to an outside test-owned PID and an independently confined sibling
+with identical profile bytes, and termination of an owned descendant. Missing,
+ineffective, interrupted or inconclusive probes fail closed. On the reported
+host the non-nested signal canary passes for Claude editors and gates. The
+offline substitute smoke also exercised their OS enforcement: a marker-name
+signal killed the owned marker while outside and sibling markers survived;
+a direct signal to the outside PID was denied with EPERM.
 
-`runProcess` already starts a detached process group and cleans that group on
-cancellation/timeouts. Keep that supervision. `setsid`/process groups alone do
-not stop `kill(other_same_user_pid, SIGTERM)`; only the kernel policy can do so.
+`runProcess` starts a detached process group and cleans that group on timeout
+or cancellation. Keep that supervision. A process group/session alone cannot
+prevent signaling another same-user PID; a kernel policy provides that boundary.
 
 ## CLI composition
 
-[Claude's sandbox documentation](https://code.claude.com/docs/en/sandboxing) says
-macOS uses Seatbelt and distinguishes Bash sandboxing from native tools. #233
-already disables the internal sandbox for editors and wraps the entire CLI;
-retain that configuration and its write roots. Readers keep their internal
-read/write restrictions, including denyRead and confineReads. Do not disable them
-to make nesting work. Add an outer boundary for **every tool-enabled reader**,
-including readers without confineReads, and require a nested sandbox preflight.
-Codex retains its existing named filesystem profiles and capability probes, plus
-the outer boundary and nesting preflight. The nesting preflight repeats the
-signal canaries with a maximally permissive inner profile on the attacking process:
-even that profile must not widen the outer signal policy. Starting a nested `echo`
-alone would not establish composition. Actual CLI startup failures remain failures,
-with no unsandboxed retry. On this host both
-reader composition and Codex composition are refused before agent execution.
-No claim of effective CLI signal isolation is made from that refusal.
+Claude editors and gates run inside the factory's outer Seatbelt profile.
+#233 disables Claude editors' internal Bash sandbox to avoid nesting, while
+retaining the mandatory outer write boundary covering native tools as well.
+Editors keep session persistence disabled and cannot resume. Claude readers
+retain their CLI sandbox and session behavior. Codex in every mode retains its
+CLI sandbox, named filesystem profiles and existing capability probes. Neither
+Codex nor Claude readers receives the outer wrapper or its Seatbelt preflight.
+Combining those CLI sandboxes into one outer profile is follow-up #369.
 
-The outer boundary keeps `HOME` and `CLAUDE_CONFIG_DIR` read-only (they hold the
-persistent login), so no confined Claude invocation can write a transcript. #233
-already ran editors with `--no-session-persistence`; every tool-enabled reader now
-does the same, refuses `resumeSessionId` before launch, and returns a null
-`sessionId` so callers do not try to resume a session that was never stored.
-No-tools calls run outside the boundary and keep resumable sessions. Granting
-writes to the shared configuration directory was rejected.
+Codex 0.160.0 already embeds a deny-default base policy with
+`(allow signal (target same-sandbox))`. The review reported a live offline check
+with no model call, using the equivalent of:
 
-Claude edit arguments add deny patterns for pkill, killall, and kill -9 -1.
-These are bypassable convenience rules; interpreters remain inside Seatbelt.
-[Codex rules](https://developers.openai.com/codex/rules) support forbidden prefixes
-in discovered `.rules` files, which this adapter deliberately disables with
-`--ignore-rules`. The [configuration reference](https://developers.openai.com/codex/config-reference)
-places `rules.prefix_rules` in administrator requirements, not ordinary invocation
-config. No verified invocation-local rule mechanism preserving `--ignore-rules`
-was found for the installed CLI. Do not re-enable user/project rules or modify
-machine-wide requirements. The prompt and kernel boundary are its backstops.
+```sh
+codex sandbox \
+  -c 'default_permissions="limitless-editor"' \
+  -c 'permissions={limitless-editor={filesystem={"/"="read","<dir>"="write"},network={enabled=true}}}' \
+  -- /bin/sh -c '<pkill test-owned marker; kill -TERM test-owned outside-pid>'
+```
 
-## Reproduction and release validation
+The marker-name attempt returned `pkill: Cannot get process list`; the direct
+kill returned EPERM and the outside marker survived. Start that outside marker
+detached in its own process group: `codex sandbox` signals its own process group
+on exit. All targets and cleanup handles in such a check must be test-owned.
 
-`bun test test/signal-confinement.test.ts` exercises production adapters with
-local substitutes and gate commands; `bun scripts/probe-signal-targets.ts` records
-platform support. All processes are test-owned, use random markers, readiness
-handshakes, bounded waits, and retained handles/PIDs for cleanup. Unsupported or
-nested-denied checks must report refusal, never a successful OS isolation claim.
-Never run a broadcast signal such as `kill -9 -1` on this machine.
+Claude CLI 2.1.290's reader sandbox embeds the same
+`(allow signal (target same-sandbox))` under deny default, according to the
+review's binary profile strings. This reader policy was not live-tested.
 
-Optional authenticated validation, separately for Claude and Codex: on an
-unrestricted macOS host, use the same fixture/markers as the offline test and
-replace only the substitute executable with the installed harness. Keep the
-production adapter, scratch, profile and probes. Ask the agent to run the fixture's
-marker attempt and direct-PID attempt, then start and terminate its own marked
-child. Observe outside/sibling liveness and owned-child termination from the
-supervisor. Use a 60-second invocation timeout and the fixture's handle cleanup.
-If a deny rule rejects pkill, record that as a backstop result and use the fixture's
-direct-PID interpreter case for kernel evidence. Do not weaken permissions to
-get a successful run. Record CLI/OS versions and distinguish refused startup,
-denied tool call, and observed effective confinement. This paid check is optional
-and was not performed by the worker.
+The four 2026-10-03 incidents were all Claude calls. The 09:56:02 and 11:47:16
+EDT calls that killed the deploy gate and land-pr check came from claude/opus
+implement (edit) invocations, which this PR confines. The 11:16:58 and 11:21:26
+calls came from a claude/sonnet verify reader inside the CLI's own sandbox.
+The incident evidence therefore does not establish a Codex signal escape, nor
+prove the installed reader sandbox's effective isolation at that earlier time.
 
-## Worker acceptance notes
+Claude arguments retain deny patterns for pkill, killall and kill -9 -1 as
+bypassable backstops. Codex rules use discovered `.rules` files, disabled by this
+adapter's `--ignore-rules`; no verified invocation-local equivalent preserving
+that setting was found. Do not modify machine-wide requirements or enable
+project rules. Every factory role receives the shared-machine process rule,
+and implement/repair prompts retain their existing guidance.
 
-For the pre-existing integration tests inside a restricted worker, use
-`LIMITLESS_CONFINED=1 bun run check`, the same marker production gates already set.
-That marker skips existing tests which require an unrestricted host; the new
-signal smoke does **not** skip. It calls the real backend and checks refusal before
-its substitute payload can start. Portable lifecycle tests inject the existing
-recording backend so their descendant cleanup assertions still execute.
+## Reproduction and validation
 
-Expected refusal output from a passing smoke deliberately omits the raw
-`sandbox_apply` diagnostic: the enclosing gate must distinguish an expected test
-outcome from a real startup failure. The standalone target probe above retains
-that diagnostic for research. A gate integration test runs the smoke as a child
-and checks that it remains a successful gate. Actual startup diagnostics remain
-blocking, including diagnostics followed by enough output to truncate the tail.
+`bun test test/signal-confinement.test.ts` exercises Claude edit and gate
+adapters with offline substitutes. All processes are test-owned, use random
+markers, readiness handshakes, bounded waits and retained handles/PIDs for
+cleanup. Where Seatbelt is available outside a confined gate, startup refusal
+fails the smoke: successful startup and owned-marker termination are required.
+Gate timeout/cancel tests likewise require enforcement and owned-descendant
+cleanup. Unsupported or already-confined environments can verify explicit
+refusal before payload startup, without claiming OS enforcement.
 
-Warning fixtures cover executable shell and JavaScript inputs, denied and
-completion-only calls, duplicate records, comments, heredocs, assistant prose,
-file edits, tool output, and printed/searched literals. Interpreter options before
-the code argument are skipped (`node --input-type=module -e …`, `node -r m -e …`,
-`bash -e -o pipefail -c …`). A heredoc is scanned as code only when its command word
-is a shell (`bash <<EOF`) or a JavaScript runtime (`node <<'JS'`); other heredocs
-(`cat > file <<EOF`) are literal data, and text after the delimiter on the same line
-(`<<EOF && kill 123`) is still examined. Private invocations retain
-only an opaque tool-call identifier and a fixed warning message. Warnings are
-persisted with invocation linkage; the additive feed trigger deduplicates by
-invocation/tool id, and reports contain a command-free warning count. Implement
-and repair already share `implementPrompt`; both retain the shared-machine rule.
+The non-nested canary verifies the policy on each production launch. Probe
+errors propagate as ConfinementError; ordinary agent output mentioning sandbox
+initialization is not evidence that the enclosing boundary failed. Gates retain
+the existing exact startup diagnostic `sandbox_apply: Operation not permitted`
+as a blocking operational error even when it appears before output truncation.
 
-The production delta stays below 250 added plus deleted lines, including the new detector
-and additive SQL migration, excluding this document, tests, fixtures and probes.
-Count tracked changes against the implementation base instead of HEAD:
-`git diff --numstat 50e74bfd1831592896d03da21b2c49fe1cfcc4e5 -- src ui`.
-The current total is 248 added plus deleted production lines, including SQL.
-No authenticated live-model smoke was run. Effective OS enforcement and CLI
-compatibility still need the optional unrestricted-host validation described above.
+Fixtures cover executable shell/JavaScript inputs, sanitized captured CLI
+shapes, denied and completion-only calls, duplicate records, comments, heredocs,
+assistant prose, file edits, tool output and printed/searched literals. Direct
+unit cases cover adjacent shell quoting, common wrappers and non-signaling
+`kill -0` polls. Private invocations keep a fixed warning message with invocation
+linkage. Each flagged call remains an event and contributes to the report count;
+the unshipped additive trigger produces one feed item per invocation, independent
+of redacted tool ids.
 
-The worker repeated the offline target probe: all eight launches still
-refuse with exit 71 before their payload starts. The smoke now gives gates their
-own startup marker in the test checkout: an invocation's earlier scratch is outside
-the gate's write allowance. The substitute also recognizes the plain `codex`
-executable used by default readers, with a harmless launch regression test, so
-offline acceptance never falls through to an installed CLI. The standalone smoke
-passes all seven cases, and all ten factory-reported delivery failures pass with
-their original assertions and deadlines. Frozen installation, lint and typecheck
-also pass. A cancelled signal probe is now rejected even if it printed the success
-marker; the injectable-backend regression verifies the payload never launches.
-Two committed startup-marker leftovers were removed. The tracked-text check
-excludes Git-recorded working-tree deletions until the factory commits them and
-continues inspecting every surviving tracked file. The marker uses the repository's
-existing confined-gate test behavior; no skip condition was added or weakened.
-Effective OS enforcement remains unexercised.
+No paid model call or authenticated live smoke was performed by this worker.
+The Codex check and real-host outer-policy results above are reported review
+evidence; reader policy evidence comes only from binary strings.
