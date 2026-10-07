@@ -141,8 +141,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   landing when a listed string appears, and it redacts its own diagnostics.
 - Call `redactCredentials` at every boundary where secret-bearing text leaves the process or is
   stored: logs, events, errors, PR comments, digests, MCP results, commit metadata, branch names
-  and tags, and text sent to a model. Nothing applies it automatically, and error and retry paths
-  need it as much as the normal path (#318, #367, #394). It replaces registered credentials
+  and tags, and text sent to a model. The CLI harnesses redact agent events and invocation results,
+  but process execution and event storage don't, and error and retry paths need it as much as the
+  normal path (#318, #367, #394). It replaces registered credentials
   literally, so decode before you redact and redact before you truncate, or an encoded or cut-off
   secret slips through.
 
