@@ -3034,6 +3034,34 @@ test("text scripts may be executable, edited, added or chmodded without a binary
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
 });
 
+test("opaque executables need a binary allowance even without NUL bytes", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "replaced.sh"), "#!/usr/bin/env bash\necho ok\n", { mode: 0o755 });
+  writeFileSync(join(work, "flipped.bin"), Buffer.from([0xff, 0xfe, 0xfd, 0xfc]));
+  await commitAll(work, "executables base");
+  const revision = await headSha(work);
+  // A DOS program that terminates (INT 20h), opaque bytes, and a script replaced by program bytes.
+  writeFileSync(join(work, "exit.com"), Buffer.from([0xcd, 0x20]), { mode: 0o755 });
+  writeFileSync(join(work, "replaced.sh"), Buffer.from([0x4d, 0x5a, 0xcd, 0x20]));
+  chmodSync(join(work, "flipped.bin"), 0o755);
+  await commitAll(work, "opaque executables");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths?.sort()).toEqual(["exit.com", "flipped.bin", "replaced.sh"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+});
+
+test("an image that loses its executable bit while its content changes needs a binary allowance", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "icon.png"), mediaFixture("png"), { mode: 0o755 });
+  await commitAll(work, "executable image");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "icon.png"), mediaFixture("png", 1));
+  chmodSync(join(work, "icon.png"), 0o644);
+  await commitAll(work, "edited, no longer executable");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths).toEqual(["icon.png"]);
+});
+
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
     "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
