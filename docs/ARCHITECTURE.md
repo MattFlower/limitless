@@ -253,7 +253,8 @@ detection, per-invocation budget, process-group kill on cancel.
   Codex uses a probed filesystem profile; Claude additionally runs entirely inside a factory
   Seatbelt profile, covering native edits and overriding implicit CLI grants. Claude's internal
   Bash sandbox is disabled for editors because macOS cannot nest Seatbelt; Bash remains inside
-  the mandatory, probed outer boundary. Reader sandbox settings are unchanged. Project/local
+  the mandatory, probed outer boundary. The outer profile also denies signals except to the process
+  itself and the same sandbox, and every launch runs a signal canary. Reader sandbox settings are unchanged. Project/local
   settings, hooks and external MCP servers are disabled.
   Claude retains the original HOME and CLAUDE_CONFIG_DIR for its persistent authentication
   identity, including the macOS Keychain service. Credentials are never copied to scratch.

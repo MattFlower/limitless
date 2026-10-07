@@ -22,6 +22,7 @@ import {
   type ReaderProbeOptions,
   runCodex,
 } from "../src/harness/codex.ts";
+import { ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
@@ -34,7 +35,7 @@ import {
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
 import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
-import { seatbeltSkip } from "./confinement.ts";
+import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -1555,6 +1556,45 @@ test("codex editors run only after a probe writes cwd and scratch and is denied 
   expect(fake.sandboxes()).toHaveLength(18);
 });
 
+test("CLI sandboxes run directly when outer confinement refuses; Claude editors fail closed", async () => {
+  const { spec } = editFixture();
+  let preflights = 0;
+  const backend = {
+    ...fakeConfinement,
+    verify: async () => {
+      preflights++;
+      throw new ConfinementError("Write confinement unavailable");
+    },
+  };
+  await confinementScope.run(backend, async () => {
+    for (const mode of ["edit", "readonly"] as const) {
+      const fake = editCodex();
+      const result = await runCodex({ ...spec, mode }, fake.runner, fake.probe);
+      expect(result.status).toBe("ok");
+      expect(fake.execs()).toHaveLength(1);
+      expect(fake.execs()[0]?.[0]).toBe(mode === "edit" ? CODEX : "codex");
+    }
+    const calls: string[][] = [];
+    const runner = async (opts: ProcOptions) => {
+      calls.push(opts.cmd);
+      opts.onStdoutLine?.(
+        '{"type":"result","subtype":"success","result":"ok","session_id":"reader-session"}',
+      );
+      return procResult;
+    };
+    const reader = { ...spec, mode: "readonly" as const, resumeSessionId: "reader-session" };
+    const result = await runClaude(reader, runner);
+    expect(result.status).toBe("ok");
+    expect(result.sessionId).toBe("reader-session");
+    expect(calls[0]?.[0]).toBe("claude");
+    expect(calls[0]).not.toContain("--no-session-persistence");
+    expect(preflights).toBe(0);
+    await expect(runClaude(spec, runner)).rejects.toBeInstanceOf(ConfinementError);
+    expect(preflights).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
+});
+
 for (const behaviour of ["leaky", "timeout", "admin-leak", "common-leak"] as const)
   test(`a ${behaviour} editor probe never starts exec`, async () => {
     const { spec } = editFixture();
@@ -1642,6 +1682,10 @@ test.skipIf(process.platform !== "darwin")(
       let probes = 0;
       let payloads = 0;
       const outcome = await runClaude({ ...spec, fast }, async (opts) => {
+        if (opts.cmd[0] === "/bin/sh") {
+          probes++;
+          return { ...procResult, stdout: "signals-verified" };
+        }
         expect(opts.cmd[0]).toBe("/usr/bin/sandbox-exec");
         const profile = opts.cmd[2] ?? "";
         for (const path of [cwd, scratchDir, admin]) expect(profile).toContain(`(subpath "${path}")`);
@@ -1653,7 +1697,7 @@ test.skipIf(process.platform !== "darwin")(
           return { ...procResult, stdout: "verified" };
         }
         payloads++;
-        expect(probes).toBe(1);
+        expect(probes).toBe(2);
         expect(opts.cmd[opts.cmd.indexOf("--setting-sources") + 1]).toBe("");
         expect(opts.cmd).toContain("--strict-mcp-config");
         expect(opts.env.CLAUDE_CONFIG_DIR).toBe(process.env.CLAUDE_CONFIG_DIR);
@@ -1687,6 +1731,7 @@ test.skipIf(process.platform !== "darwin")(
     try {
       for (const exitCode of [0, 1]) {
         const result = await runClaude(spec, async (opts) => {
+          if (opts.cmd[0] === "/bin/sh") return { ...procResult, stdout: "signals-verified" };
           if (!opts.cmd.includes("claude")) {
             writeFileSync(opts.cmd.at(-2) ?? "", "ok");
             return { ...procResult, stdout: "verified" };

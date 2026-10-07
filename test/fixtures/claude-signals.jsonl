@@ -1,0 +1,86 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-0", "name": "Bash", "input": {"command": "pkill -f marker"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-0", "name": "Bash", "input": {"command": "pkill -f marker"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-0", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-1", "name": "Bash", "input": {"command": "/usr/bin/killall marker"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-1", "name": "Bash", "input": {"command": "/usr/bin/killall marker"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-1", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-2", "name": "Bash", "input": {"command": "kill -TERM 123"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-2", "name": "Bash", "input": {"command": "kill -TERM 123"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-2", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-3", "name": "Bash", "input": {"command": "printf 123 | xargs kill"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-3", "name": "Bash", "input": {"command": "printf 123 | xargs kill"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-3", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-4", "name": "Bash", "input": {"command": "xargs -n 1 /bin/kill -9"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-4", "name": "Bash", "input": {"command": "xargs -n 1 /bin/kill -9"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-4", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-5", "name": "Bash", "input": {"command": "bash -lc \"/usr/bin/pkill -f marker\""}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-5", "name": "Bash", "input": {"command": "bash -lc \"/usr/bin/pkill -f marker\""}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-5", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-6", "name": "Bash", "input": {"command": "echo ready && /bin/kill -9 -123"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-6", "name": "Bash", "input": {"command": "echo ready && /bin/kill -9 -123"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-6", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-7", "name": "Bash", "input": {"command": "env MARKER=x sh -c 'kill \"$child\"'"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-7", "name": "Bash", "input": {"command": "env MARKER=x sh -c 'kill \"$child\"'"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-7", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-8", "name": "Bash", "input": {"command": "node -e 'process.kill(123, \"SIGTERM\")'"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-8", "name": "Bash", "input": {"command": "node -e 'process.kill(123, \"SIGTERM\")'"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-8", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-9", "name": "Bash", "input": {"command": "bun --eval 'const x = 1; process.kill(x)'"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-9", "name": "Bash", "input": {"command": "bun --eval 'const x = 1; process.kill(x)'"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "signal-9", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-10", "name": "Bash", "input": {"command": "echo \"pkill -f marker\""}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-10", "name": "Bash", "input": {"command": "echo \"pkill -f marker\""}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-10", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-11", "name": "Bash", "input": {"command": "printf \"%s\" \"kill 123\""}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-11", "name": "Bash", "input": {"command": "printf \"%s\" \"kill 123\""}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-11", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-12", "name": "Bash", "input": {"command": "rg \"process.kill(123)\" src"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-12", "name": "Bash", "input": {"command": "rg \"process.kill(123)\" src"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-12", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-13", "name": "Bash", "input": {"command": "grep -e killall file"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-13", "name": "Bash", "input": {"command": "grep -e killall file"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-13", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-14", "name": "Bash", "input": {"command": "node -e 'console.log(\"process.kill(123)\")'"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-14", "name": "Bash", "input": {"command": "node -e 'console.log(\"process.kill(123)\")'"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-14", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-15", "name": "Bash", "input": {"command": "node -e 'otherprocess.kill(123); obj.process.kill(123)'"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-15", "name": "Bash", "input": {"command": "node -e 'otherprocess.kill(123); obj.process.kill(123)'"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-15", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-16", "name": "Bash", "input": {"command": "echo kill 123"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-16", "name": "Bash", "input": {"command": "echo kill 123"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-16", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-17", "name": "Bash", "input": {"command": "cat <<EOF\nkill 123\nEOF\n"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-17", "name": "Bash", "input": {"command": "cat <<EOF\nkill 123\nEOF\n"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-17", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-18", "name": "Bash", "input": {"command": "kill -l; echo 123"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-18", "name": "Bash", "input": {"command": "kill -l; echo 123"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-18", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-19", "name": "Bash", "input": {"command": "echo \"killall marker; kill 123\""}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-19", "name": "Bash", "input": {"command": "echo \"killall marker; kill 123\""}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-19", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-20", "name": "Bash", "input": {"command": "/bin/echo /usr/bin/pkill"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-20", "name": "Bash", "input": {"command": "/bin/echo /usr/bin/pkill"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-20", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-21", "name": "Bash", "input": {"command": "true # kill 123"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "literal-21", "name": "Bash", "input": {"command": "true # kill 123"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "literal-21", "content": "Denied: kill 123", "is_error": true}]}}
+{"type": "assistant", "message": {"content": [{"type": "text", "text": "kill 123"}, {"type": "tool_use", "id": "edit", "name": "Write", "input": {"command": "kill 123", "content": "process.kill(123)"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "comment", "name": "Bash", "input": {"command": "echo safe # pkill -f marker; kill 123"}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "signal-10", "name": "Bash", "input": {"command": "bash -lc \"kill \\\"$PID\\\"\""}}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "escaped-literal", "name": "Bash", "input": {"command": "node -e \"console.log(\\\"process.kill(123)\\\")\""}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"signal-11","name":"Bash","input":{"command":"node --input-type=module -e 'process.kill(123)'"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"signal-11","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"signal-12","name":"Bash","input":{"command":"node <<'JS'\nprocess.kill(123)\nJS\n"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"signal-12","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"signal-13","name":"Bash","input":{"command":"bash -e -o pipefail -c \"pkill -f marker\""}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"signal-13","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"signal-14","name":"Bash","input":{"command":"FOO=1 /bin/bash -s <<EOF\nkillall marker\nEOF\n"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"signal-14","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"signal-15","name":"Bash","input":{"command":"cat <<EOF > notes.txt && kill 123\nhi\nEOF\n"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"signal-15","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"literal-22","name":"Bash","input":{"command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"literal-22","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"literal-23","name":"Bash","input":{"command":"node --version && node -r ./x.js -e \"console.log(1)\""}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"literal-23","content":"ok"}]}}
+{"type":"assistant","message":{"id":"message-captured","type":"message","role":"assistant","model":"placeholder-model","content":[{"type":"tool_use","id":"captured-1","name":"Bash","input":{"command":"pkill -f \"bun test\"; ls test | head -80"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"placeholder-session","uuid":"placeholder-message"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"captured-1","content":"placeholder-output","is_error":false}]},"parent_tool_use_id":null,"session_id":"placeholder-session","uuid":"placeholder-result"}

@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Factory } from "../src/app.ts";
 import type { EvalStatus, FeedItem, FeedKind } from "../src/core/types.ts";
-import type { Store } from "../src/db/store.ts";
+import { Store } from "../src/db/store.ts";
+import { ClaudeStreamParser } from "../src/harness/claude.ts";
+import { fakeHarness } from "../src/harness/fake.ts";
+import type { AgentEvent } from "../src/harness/types.ts";
+import { RunContext } from "../src/pipeline/context.ts";
+import { buildReport } from "../src/pipeline/report.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { allItems } from "./feed-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -220,4 +225,78 @@ test("resuming a finished eval after its item was pruned records no second compl
   store.createEvalRun(input, [], { request: {} }, failed.id);
   expect(store.getEvalRun(failed.id)?.status).toBe("interrupted");
   expect(allItems(store)).toEqual([]);
+});
+
+test("signal warnings persist with invocation linkage, feed once, remain private and do not change success", async () => {
+  const memory = new Store(":memory:");
+  try {
+    const repo = memory.upsertRepo({
+      slug: "local/signals",
+      kind: "local",
+      localPath: f.repo,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = memory.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const stage = memory.startStage(run.id, "triage");
+    const events: AgentEvent[] = [];
+    const parser = new ClaudeStreamParser((event) => events.push(event));
+    for (const id of ["private-call-one", "private-call-two"]) {
+      const call = JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id, name: "Bash", input: { command: "pkill -f secret-marker" } }],
+        },
+      });
+      parser.feed(call);
+      parser.feed(call);
+    }
+    const ctx = new RunContext(
+      { ...f.factory.deps, store: memory, harnesses: { fake: fakeHarness(() => ({ events, text: "ok" })) } },
+      run,
+      repo,
+      new AbortController().signal,
+    );
+    const outcome = await ctx.invoke({
+      stage,
+      role: "triage",
+      prompt: "test",
+      mode: "readonly",
+      complexity: "small",
+      privateOutput: true,
+    });
+    expect(outcome.result.status).toBe("ok");
+    const warnings = memory.listEvents(run.id).filter((event) => event.level === "warn");
+    expect(warnings).toHaveLength(2);
+    const invocation = memory.listInvocations(run.id)[0];
+    expect(invocation?.status).toBe("ok");
+    expect(warnings.every((event) => event.invocationId === invocation?.id)).toBe(true);
+    const feed = allItems(memory).filter((item) => item.kind === "run.warning");
+    expect(feed).toHaveLength(1);
+    expect(feed[0]?.data.eventId).toBe(warnings[0]?.id);
+    expect(memory.db.query("SELECT dedupe_key FROM feed WHERE kind = 'run.warning'").all()).toEqual([
+      { dedupe_key: `run.warning:${run.id}:${invocation?.id}` },
+    ]);
+    expect(memory.countEvents(run.id, "signal_attempt")).toBe(2);
+    const report = buildReport(ctx, true);
+    expect(report).toContain("2 process signal attempt(s)");
+    expect(report).toContain("every gate below passed");
+    expect(JSON.stringify({ warnings, feed, report })).not.toMatch(/secret-marker|private-call|pkill/);
+    expect(ctx.state.feedback).toBeNull();
+    expect(ctx.state.round).toBe(0);
+    await ctx.invoke({
+      stage,
+      role: "triage",
+      prompt: "test",
+      mode: "readonly",
+      complexity: "small",
+      privateOutput: true,
+    });
+    expect(allItems(memory).filter((item) => item.kind === "run.warning")).toHaveLength(2);
+    expect(memory.countEvents(run.id, "signal_attempt")).toBe(4);
+    expect(buildReport(ctx, true)).toContain("4 process signal attempt(s)");
+  } finally {
+    memory.close();
+  }
 });
