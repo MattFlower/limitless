@@ -3019,6 +3019,70 @@ test("executable image additions and mode-only changes need a binary allowance",
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
 
+test("text scripts may be executable, edited, added or chmodded without a binary allowance", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "edited.sh"), "#!/usr/bin/env bash\necho one\n", { mode: 0o755 });
+  writeFileSync(join(work, "flipped.sh"), "#!/usr/bin/env bash\necho two\n");
+  await commitAll(work, "scripts base");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "edited.sh"), "#!/usr/bin/env bash\necho one changed\n");
+  writeFileSync(join(work, "added.sh"), "#!/usr/bin/env bash\necho three\n", { mode: 0o755 });
+  chmodSync(join(work, "flipped.sh"), 0o755);
+  await commitAll(work, "script edits and modes");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths ?? []).toEqual([]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+});
+
+test("opaque executables need a binary allowance even without NUL bytes", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "replaced.sh"), "#!/usr/bin/env bash\necho ok\n", { mode: 0o755 });
+  writeFileSync(join(work, "flipped.bin"), Buffer.from([0xff, 0xfe, 0xfd, 0xfc]));
+  await commitAll(work, "executables base");
+  const revision = await headSha(work);
+  // A DOS program that terminates (INT 20h), opaque bytes, and a script replaced by program bytes.
+  writeFileSync(join(work, "exit.com"), Buffer.from([0xcd, 0x20]), { mode: 0o755 });
+  writeFileSync(join(work, "replaced.sh"), Buffer.from([0x4d, 0x5a, 0xcd, 0x20]));
+  chmodSync(join(work, "flipped.bin"), 0o755);
+  await commitAll(work, "opaque executables");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths?.sort()).toEqual(["exit.com", "flipped.bin", "replaced.sh"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+});
+
+test("an image that loses its executable bit while its content changes needs a binary allowance", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "icon.png"), mediaFixture("png"), { mode: 0o755 });
+  await commitAll(work, "executable image");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "icon.png"), mediaFixture("png", 1));
+  chmodSync(join(work, "icon.png"), 0o644);
+  await commitAll(work, "edited, no longer executable");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths).toEqual(["icon.png"]);
+});
+
+test("a rename that drops the executable bit is a mode transition of the original file", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "icon.png"), mediaFixture("png"), { mode: 0o755 });
+  writeFileSync(join(work, "exit.com"), Buffer.from([0xcd, 0x20]), { mode: 0o755 });
+  writeFileSync(join(work, "tool.sh"), "#!/usr/bin/env bash\necho ok\n", { mode: 0o755 });
+  await commitAll(work, "executables before rename");
+  const revision = await headSha(work);
+  for (const [from, to] of [
+    ["icon.png", "renamed.png"],
+    ["exit.com", "renamed.com"],
+    ["tool.sh", "renamed.sh"],
+  ] as const) {
+    renameSync(join(work, from), join(work, to));
+    chmodSync(join(work, to), 0o644);
+  }
+  await commitAll(work, "renamed, no longer executable");
+  const diff = await diffSince(work, revision);
+  // The script is reviewable text; the image and the program are not.
+  expect(diff.binaryPaths?.sort()).toEqual(["renamed.com", "renamed.png"]);
+});
+
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
     "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
