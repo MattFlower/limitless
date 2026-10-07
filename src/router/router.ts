@@ -1,7 +1,7 @@
 import type { Complexity, Effort, ModelSelection, Role } from "../core/types.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy } from "./catalog.ts";
-import { originExclusion } from "./origins.ts";
+import { OriginExcludedError, originExclusion } from "./origins.ts";
 import type { ProviderTracker } from "./providers.ts";
 import { formatTarget, parseTarget, resolveTarget, transportError } from "./targets.ts";
 
@@ -136,6 +136,14 @@ export class Router {
 
   model(id: string): ModelDef | undefined {
     return this.models.get(id);
+  }
+
+  /** Targets can outlive catalog edits while waiting for a provider slot. */
+  assertOriginEligible(modelId: string): void {
+    if (this.excludeOrigins === undefined) return;
+    const { model } = this.resolve(modelId);
+    const reason = originExclusion(model, this.excludeOrigins);
+    if (reason) throw new OriginExcludedError(reason);
   }
 
   checkpointIdentity = (reference: string): string => {

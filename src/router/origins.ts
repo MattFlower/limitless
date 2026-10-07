@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { ModelDef } from "./catalog.ts";
 
+export class OriginExcludedError extends Error {}
+
 export function parseExcludeOrigins(raw: Record<string, unknown>): string[] | undefined {
   return z.object({ exclude_origins: z.array(z.string().min(1)).optional() }).parse(raw.routing ?? {})
     .exclude_origins;

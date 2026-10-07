@@ -15,10 +15,11 @@ export const proposalFields: ChatProposalFields = {
   title: "Useful feature",
 };
 
-export function chatFixture(opts: { openaiBaseUrl?: string } = {}) {
+export function chatFixture(opts: { openaiBaseUrl?: string; excludeOrigins?: string[] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "limitless-chat-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
   cfg.secrets = {};
+  if (opts.excludeOrigins !== undefined) cfg.raw.routing = { exclude_origins: opts.excludeOrigins };
   const specs: AgentSpec[] = [];
   const harnessCalls: string[] = [];
   const respond = (name: string) =>

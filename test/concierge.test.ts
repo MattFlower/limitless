@@ -5,6 +5,7 @@ import { DEFAULT_POLICY } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { chatFixture, proposalFields } from "./chat-support.ts";
+import { deferred } from "./evals-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 let f: ReturnType<typeof chatFixture>;
@@ -15,6 +16,50 @@ afterEach(() => {
   f.close();
 });
 const send = (text = "Help me") => f.factory.concierge.submit("one", { type: "text", text });
+test.each([true, false])("queued chat checks current origins (exclusions=%s)", async (excluded) => {
+  f.close();
+  f = chatFixture({ excludeOrigins: excluded ? ["CN"] : undefined });
+  const { factory } = f;
+  const model = factory.router.model("fake/chat");
+  if (!model) throw new Error("missing chat model");
+  factory.catalog.add({ ...model, id: "dynamic", origin: "US", baseOrigin: "US" });
+  factory.routing.setCell("chat", "default", ["fake/dynamic"]);
+  const release = await factory.tracker.acquire("fake", new AbortController().signal);
+  const waiting = deferred<void>();
+  const acquire = factory.tracker.acquire.bind(factory.tracker);
+  const spy = spyOn(factory.tracker, "acquire").mockImplementation((id, signal) => {
+    waiting.resolve();
+    return acquire(id, signal);
+  });
+  try {
+    const pending = send();
+    await waiting.promise;
+    expect(f.specs).toHaveLength(0);
+    factory.catalog.patch("fake/dynamic", { origin: "CN", baseOrigin: "CN" });
+    release();
+    const history = await pending;
+    const reason = "origin excluded (CN; baseOrigin=CN)";
+    expect(history.messages.at(-1)).toMatchObject(
+      excluded
+        ? { role: "assistant", content: reason, outcome: { error: true } }
+        : { role: "assistant", content: "Hello" },
+    );
+    expect(f.specs.map((s) => s.target.modelId)).toEqual(excluded ? [] : ["fake/dynamic"]);
+    expect(factory.tracker.status("fake")?.inFlight).toBe(0);
+    const call = factory.store.db
+      .query<{ result_json: string }, []>("SELECT result_json FROM chat_calls")
+      .get();
+    expect(JSON.parse(call?.result_json ?? "null")).toMatchObject(
+      excluded ? { status: "error", error: reason } : { status: "ok" },
+    );
+    f.reopen();
+    expect(f.factory.concierge.history("one").messages.at(-1)).toEqual(history.messages.at(-1));
+  } finally {
+    spy.mockRestore();
+    release();
+  }
+});
+
 test("chat reports and persists origin exclusions without invoking a harness", async () => {
   const model = f.factory.router.model("fake/chat");
   if (!model) throw new Error("missing chat model");

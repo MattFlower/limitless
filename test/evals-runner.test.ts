@@ -10,6 +10,7 @@ import { selectHarness } from "../src/harness/select.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { StoredReviewSchema, TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
@@ -17,6 +18,118 @@ import { attributionEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
+
+test.each([true, false])("queued eval checks current origins (exclusions=%s)", async (excluded) => {
+  const f = await evalFixture([], [], {} as Policy, excluded ? ["CN"] : undefined);
+  const model = f.factory.router.model("candidate-b");
+  if (!model) throw new Error("missing candidate");
+  f.factory.catalog.add({ ...model, id: "dynamic", origin: "US", baseOrigin: "US" });
+  const release = await f.factory.tracker.acquire("provider-b", new AbortController().signal);
+  const waiting = deferred<void>();
+  const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
+  const spy = spyOn(f.factory.tracker, "acquire").mockImplementation((id, signal) => {
+    waiting.resolve();
+    return acquire(id, signal);
+  });
+  try {
+    const run = f.factory.evals.submit({
+      role: "triage",
+      models: ["provider-b/dynamic"],
+      caseIds: ["a"],
+      k: 1,
+    });
+    await waiting.promise;
+    expect(f.calls).toHaveLength(0);
+    f.factory.catalog.patch("provider-b/dynamic", { origin: "CN", baseOrigin: "CN" });
+    release();
+    await f.factory.evals.wait(run.id);
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(excluded ? [] : ["provider-b/dynamic"]);
+    expect(f.factory.store.listEvalTrials(run.id)).toMatchObject([
+      excluded
+        ? { status: "error", pass: false, details: { reason: "origin excluded (CN; baseOrigin=CN)" } }
+        : { status: "ok", pass: true },
+    ]);
+    expect(f.factory.tracker.status("provider-b")?.inFlight).toBe(0);
+  } finally {
+    spy.mockRestore();
+    release();
+    await f.close();
+  }
+});
+
+test.each(["finder", "verifier"] as const)("queued panel %s checks current origins", async (member) => {
+  const f = await evalFixture(
+    [],
+    [{ id: "panel-member", label: "Panel", harness: "fake", billing: "free", maxConcurrent: 1 }],
+    {} as Policy,
+    ["CN"],
+  );
+  const { factory } = f;
+  const model = factory.router.model("candidate-a");
+  if (!model) throw new Error("missing candidate");
+  for (const [provider, id, vendor] of [
+    ["openrouter", "primary", "other"],
+    ["panel-member", "dynamic", "qwen"],
+    ["openrouter", "verifier", "openai"],
+  ])
+    factory.catalog.add({ ...model, provider, id, vendor, origin: "US", baseOrigin: "US" });
+  const release = await factory.tracker.acquire("panel-member", new AbortController().signal);
+  const waiting = deferred<void>();
+  const acquire = factory.tracker.acquire.bind(factory.tracker);
+  const spy = spyOn(factory.tracker, "acquire").mockImplementation((id, signal) => {
+    if (id === "panel-member") waiting.resolve();
+    return acquire(id, signal);
+  });
+  try {
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({ role: "review", version: 1, cases: [{ ...reviewCase, base: f.sha, head }] }),
+    );
+    f.respond((s) => ({
+      structured:
+        s.target.modelId === "openrouter/primary" || member === "finder" ? reviewOutput() : { results: [] },
+      costUsd: 0.25,
+    }));
+    const run = factory.evals.submit({
+      role: "review",
+      k: 1,
+      systems: [
+        {
+          name: "panel",
+          mode: "panel",
+          implementerReport: "include",
+          finders: [
+            { target: "openrouter/primary", prompt: "standard" },
+            ...(member === "finder"
+              ? [{ target: "panel-member/dynamic", prompt: "standard", local: true }]
+              : []),
+          ],
+          verifier: { target: member === "verifier" ? "panel-member/dynamic" : "openrouter/verifier" },
+        },
+      ],
+    });
+    await waiting.promise;
+    factory.catalog.patch("panel-member/dynamic", { origin: "CN", baseOrigin: "CN" });
+    release();
+    await factory.evals.wait(run.id);
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(["openrouter/primary"]);
+    expect(factory.store.listEvalTrials(run.id)).toMatchObject([
+      {
+        status: "error",
+        pass: false,
+        costUsd: 0.25,
+        details: { reason: "origin excluded (CN; baseOrigin=CN)" },
+      },
+    ]);
+    expect(factory.tracker.status("panel-member")?.inFlight).toBe(0);
+    expect(factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    spy.mockRestore();
+    release();
+    await f.close();
+  }
+});
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
