@@ -1,4 +1,6 @@
 import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi";
+import { realpathSync } from "node:fs";
+import { sep } from "node:path";
 
 // libproc and KERN_PROCARGS2 are also what macOS ps uses. Unlike ps, these calls
 // don't require launching a setuid executable (which worker sandboxes deny).
@@ -16,12 +18,35 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
   },
 });
 
+/** Roots are canonicalized at invocation start; cwd inspection is lazy for older processes. */
+export function hiddenDarwinProcessMember(
+  pid: number,
+  born: number,
+  started: number,
+  directories: readonly string[],
+  readCwd: () => { path: string } | { errno: number },
+): boolean {
+  if (born < started) return false;
+  const cwd = readCwd();
+  if ("errno" in cwd) {
+    if (cwd.errno === 3 /* ESRCH */) return false;
+    throw new Error(`Process cwd inspection failed for ${pid} (errno ${cwd.errno})`);
+  }
+  const path = realpathSync(cwd.path);
+  // A detached platform tool that chdirs outside these roots and writes by absolute
+  // path cannot be recognized. WorktreeCleanError then becomes a round failure.
+  return directories.some(
+    (directory) =>
+      path === directory || path.startsWith(directory.endsWith(sep) ? directory : `${directory}${sep}`),
+  );
+}
+
 export function markedDarwinProcesses(
   uid: number,
   marker: string,
   group: number,
-  known: ReadonlySet<number> = new Set(),
-  started = 0,
+  started: number,
+  directories: readonly string[],
 ): number[] {
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
@@ -36,14 +61,14 @@ export function markedDarwinProcesses(
   const token = Buffer.from(`\0LIMITLESS_INVOCATION=${marker}\0`);
   const inheritedToken = Buffer.from(`\0LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1\0`);
   const marked: number[] = [];
-  const parents = new Map<number, number>();
-  const sessions = new Map<number, number>();
-  const unmarked = new Set<number>();
-  const hidden: number[] = [];
   const bsd = new Uint8Array(136); // proc_bsdinfo includes the process birth time
+  const vnode = new Uint8Array(2352); // proc_vnodepathinfo: two vnode_info_path structs
+  const errno = () => {
+    const address = symbols.__error();
+    return address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);
+  };
   const gone = () => {
-    const errno = symbols.__error();
-    return errno !== null && new Int32Array(toArrayBuffer(errno, 0, 4))[0] === 3 /* ESRCH */;
+    return errno() === 3 /* ESRCH */;
   };
   for (const pid of processes.subarray(0, count / 4)) {
     if (!pid) continue;
@@ -60,8 +85,6 @@ export function markedDarwinProcesses(
       if (gone()) continue;
       throw new Error(`Process session inspection failed for ${pid}`);
     }
-    sessions.set(pid, session);
-    parents.set(pid, info[1] ?? 0);
     const mib = new Int32Array([1 /* CTL_KERN */, 49 /* KERN_PROCARGS2 */, pid]);
     size[0] = BigInt(args.byteLength);
     if (symbols.sysctl(ptr(mib), mib.length, ptr(args), ptr(size), null, 0) !== 0) {
@@ -84,16 +107,14 @@ export function markedDarwinProcesses(
     }
     // Read only NUL-delimited environment entries: argv and other variables cannot match.
     const environment = Buffer.from(args.buffer, 0, length);
-    // SIP omits environment data for platform tools such as sh/sleep. Members of the
-    // session we created still inherit our marker; detached sessions need an exact match.
+    // SIP omits environment data for platform tools. Our session/group still proves
+    // membership; detached tools need birth time and cwd evidence instead.
     if (
       environment.includes(token, offset - 1) ||
       environment.includes(inheritedToken, offset - 1) ||
-      (offset === length && session === group)
+      (offset === length && (session === group || info[2] === group))
     )
       marked.push(pid);
-    else if (offset === length && known.has(pid))
-      throw new Error(`Cannot inspect environment of marked process ${pid}`);
     else if (offset === length) {
       if (
         symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength
@@ -103,32 +124,22 @@ export function markedDarwinProcesses(
       }
       const view = new DataView(bsd.buffer);
       const born = Number(view.getBigUint64(120, true)) * 1000 + Number(view.getBigUint64(128, true)) / 1000;
-      // A process born before this invocation cannot have inherited its fresh marker.
-      if (born < started) unmarked.add(pid);
-      else hidden.push(pid);
-    } else unmarked.add(pid);
-  }
-  const hasUnmarkedAncestor = (pid: number) => {
-    const visited = new Set<number>();
-    let ancestor = parents.get(pid);
-    while (ancestor && !visited.has(ancestor) && !unmarked.has(ancestor) && !marked.includes(ancestor)) {
-      visited.add(ancestor);
-      ancestor = parents.get(ancestor);
+      if (
+        hiddenDarwinProcessMember(pid, born, started, directories, () => {
+          if (
+            symbols.proc_pidinfo(pid, 9 /* PROC_PIDVNODEPATHINFO */, 0, ptr(vnode), vnode.byteLength) !==
+            vnode.byteLength
+          )
+            return { errno: errno() };
+          // pvi_cdir.vip_path follows the 152-byte vnode_info, with MAXPATHLEN = 1024.
+          const path = Buffer.from(vnode.buffer, 152, 1024);
+          const end = path.indexOf(0);
+          if (end <= 0) throw new Error(`Invalid process cwd for ${pid}`);
+          return { path: path.toString("utf8", 0, end) };
+        })
+      )
+        marked.push(pid);
     }
-    return ancestor !== undefined && unmarked.has(ancestor);
-  };
-  // An unrelated live session member proves membership for its orphaned shells,
-  // including ones that changed group. Concurrent commands keep separate sessions.
-  const unmarkedSessions = new Set(
-    [...sessions].flatMap(([pid, session]) =>
-      unmarked.has(pid) || (hidden.includes(pid) && hasUnmarkedAncestor(pid)) ? [session] : [],
-    ),
-  );
-  for (const pid of hidden) {
-    // A new orphan with no unrelated ancestor or session member has lost the evidence
-    // needed to establish membership. Never signal it or authorize cleanup.
-    if (!hasUnmarkedAncestor(pid) && !unmarkedSessions.has(sessions.get(pid) ?? 0))
-      throw new Error(`Cannot establish invocation membership of process ${pid}: environment is hidden`);
   }
   return marked;
 }

@@ -1,7 +1,16 @@
 // Regression tests for defects found by the cross-vendor (Codex) review of the M1 core.
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -321,7 +330,7 @@ describe("process handling", () => {
   );
 
   test.skipIf(process.platform !== "darwin").each([false, true])(
-    "macOS native inspection handles a withheld orphan environment (known marked: %s)",
+    "macOS native inspection ignores an older hidden orphan (inherited marker: %s)",
     async (marked) => {
       const { markedDarwinProcesses } = await import("../src/util/processes-darwin.ts");
       const pidFile = join(dir, "hidden-pid");
@@ -342,27 +351,11 @@ describe("process handling", () => {
           await Bun.sleep(10);
         pid = Number(readFileSync(pidFile, "utf8"));
         expect(pid).toBeGreaterThan(0);
-        if (marked) {
-          const known = new Set([pid]);
-          expect(() =>
-            markedDarwinProcesses(
-              process.getuid?.() ?? 0,
-              "hidden-writer",
-              launcher.pid ?? 0,
-              known,
-              Date.now(),
-            ),
-          ).toThrow(`Cannot inspect environment of marked process ${pid}`);
-        } else
-          expect(
-            markedDarwinProcesses(
-              process.getuid?.() ?? 0,
-              "hidden-writer",
-              launcher.pid ?? 0,
-              new Set(),
-              Date.now(),
-            ),
-          ).not.toContain(pid);
+        expect(
+          markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, Date.now(), [
+            realpathSync(dir),
+          ]),
+        ).not.toContain(pid);
         const result = await runProcess({
           cmd: [process.execPath, "-e", "process.exit(0)"],
           cwd: dir,
@@ -381,97 +374,80 @@ describe("process handling", () => {
     },
   );
 
-  test.skipIf(process.platform !== "darwin").each([false, true])(
-    "an unrelated session owns its new hidden shell after the leader exits (new group: %s)",
-    async (newGroup) => {
-      const pidFile = join(dir, "control-shell-pid");
-      const ready = join(dir, "control-shell-ready");
-      const launcher = join(dir, "control-shell-launcher.js");
-      const member = join(dir, "control-member.js");
-      const memberPidFile = join(dir, "control-member-pid");
-      const trigger = join(dir, "control-go");
-      writeFileSync(
-        launcher,
-        `${newGroup ? 'const {dlopen, FFIType} = require("bun:ffi"); if (dlopen("/usr/lib/libSystem.B.dylib", {setpgid:{args:[FFIType.i32, FFIType.i32], returns:FFIType.i32}}).symbols.setpgid(0,0) !== 0) throw Error("setpgid failed");' : ""}
-        require("node:child_process").spawn("/bin/sh",
-      ["-c", 'printf "%s" "$$" > "$1"; while [ -d "$2" ]; do :; done', "sh",
-        ${JSON.stringify(pidFile)}, ${JSON.stringify(dir)}], {stdio:"ignore"}).unref();`,
-      );
-      writeFileSync(
-        member,
-        `const fs = require("node:fs");
-        fs.writeFileSync(${JSON.stringify(memberPidFile)}, String(process.pid));
-        const timer = setInterval(() => {
-          if (!fs.existsSync(${JSON.stringify(dir)})) process.exit(0);
-          if (!fs.existsSync(${JSON.stringify(trigger)})) return;
-          clearInterval(timer);
-          require("node:child_process").spawn(process.execPath, [${JSON.stringify(launcher)}],
-            {stdio:"ignore"}).on("exit", () => {
-              setInterval(() => {
-                if (fs.existsSync(${JSON.stringify(pidFile)})) fs.writeFileSync(${JSON.stringify(ready)}, "");
-              }, 5);
-            });
-        }, 5);
-        setTimeout(() => process.exit(), 15000);`,
-      );
-      const leader = spawn(
-        process.execPath,
-        [
-          "-e",
-          `require("node:child_process").spawn(process.execPath, [${JSON.stringify(member)}], {stdio:"ignore"}).unref();`,
-        ],
-        { detached: true, stdio: "ignore" },
-      );
+  test.skipIf(process.platform !== "darwin").each(["outside", "sibling"])(
+    "a new hidden platform process in a %s cwd is never signalled",
+    async (location) => {
+      const outside =
+        location === "sibling" ? `${dir}-sibling` : mkdtempSync(join(tmpdir(), "limitless-control-"));
+      mkdirSync(outside, { recursive: true });
+      const release = join(dir, "release");
+      let control: ChildProcess | undefined;
+      const kill = process.kill.bind(process);
+      const signals: number[] = [];
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (signal === "SIGTERM" || signal === "SIGKILL") signals.push(pid);
+        return kill(pid, signal);
+      });
       try {
-        await new Promise<void>((resolve) => leader.once("close", () => resolve()));
-        const deadline = Date.now() + 3000;
-        while (
-          (!existsSync(memberPidFile) || !readFileSync(memberPidFile, "utf8").trim()) &&
-          Date.now() < deadline
-        )
-          await Bun.sleep(10);
-        const memberPid = Number(readFileSync(memberPidFile, "utf8"));
-        expect(memberPid).toBeGreaterThan(0);
-        expect(() => process.kill(leader.pid ?? 0, 0)).toThrow();
         const result = await runProcess({
           cmd: [
             process.execPath,
             "-e",
-            `console.log("start"); setInterval(() => {
-            if (require("node:fs").existsSync(${JSON.stringify(ready)})) process.exit(0);
+            `console.log("ready"); setInterval(() => {
+            if (require("node:fs").existsSync(${JSON.stringify(release)})) process.exit(0);
           }, 5);`,
           ],
           cwd: dir,
           env: process.env as Record<string, string>,
           onStdoutLine: () => {
-            // The hidden orphan starts AFTER the invocation. Only an unrelated
-            // group member survives to prove that the shell belongs to another tree.
-            writeFileSync(trigger, "");
+            // Spawn only after the invocation is running, in a separate session without its marker.
+            control = spawn("/bin/sleep", ["15"], { cwd: outside, detached: true, stdio: "ignore", env: {} });
+            control.once("spawn", () => writeFileSync(release, ""));
           },
           timeoutMs: 3000,
         });
         expect(result.exitCode).toBe(0);
         expect(result.timedOut).toBe(false);
-        expect(process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toBe(true);
-        expect(process.kill(memberPid, 0)).toBe(true);
+        expect(control?.pid).toBeGreaterThan(0);
+        expect(signals).not.toContain(control?.pid);
+        expect(kill(control?.pid ?? 0, 0)).toBe(true);
       } finally {
-        for (const file of [pidFile, memberPidFile]) {
-          if (existsSync(file)) {
-            const pid = Number(readFileSync(file, "utf8"));
-            if (pid > 0) {
-              try {
-                process.kill(pid, "SIGKILL");
-              } catch {}
-            }
-          }
+        killSpy.mockRestore();
+        if (control) {
+          control.kill("SIGKILL");
+          await new Promise<void>((resolve) => control?.once("close", () => resolve()));
         }
-        leader.kill("SIGKILL");
+        rmSync(outside, { recursive: true, force: true });
       }
     },
   );
 
+  test.skipIf(process.platform !== "darwin")(
+    "hidden cwd membership uses canonical roots and fails closed",
+    async () => {
+      const { hiddenDarwinProcessMember } = await import("../src/util/processes-darwin.ts");
+      const nested = join(dir, "nested");
+      mkdirSync(nested);
+      const alias = join(dir, "alias");
+      symlinkSync(nested, alias);
+      const roots = [realpathSync(dir)];
+      expect(hiddenDarwinProcessMember(42, 100, 100, roots, () => ({ path: dir }))).toBe(true);
+      expect(hiddenDarwinProcessMember(42, 101, 100, roots, () => ({ path: alias }))).toBe(true);
+      expect(
+        hiddenDarwinProcessMember(42, 99, 100, roots, () => {
+          throw new Error("must not inspect older cwd");
+        }),
+      ).toBe(false);
+      expect(hiddenDarwinProcessMember(42, 101, 100, roots, () => ({ errno: 3 }))).toBe(false);
+      for (const errno of [1, 5, 22])
+        expect(() => hiddenDarwinProcessMember(42, 101, 100, roots, () => ({ errno }))).toThrow(
+          "Process cwd inspection failed for 42",
+        );
+    },
+  );
+
   test.skipIf(process.platform !== "darwin").each(["normal", "error", "cancelled", "timeout", "stuck"])(
-    "a detached reparented shell with a hidden environment blocks cleanup on %s",
+    "a detached reparented shell with a hidden environment is stopped on %s",
     async (ending) => {
       const pidFile = join(dir, "shell-pid");
       const output = join(dir, "shell-output");
@@ -501,30 +477,26 @@ describe("process handling", () => {
         await processScope.run(
           { signal: controller.signal, killGraceMs: 0, children: new Map(), scratchDirs: new Set() },
           async () => {
-            await expect(
-              runProcess({
-                cmd: [process.execPath, parent],
-                cwd: dir,
-                env: process.env as Record<string, string>,
-                timeoutMs: ending === "timeout" ? 1500 : undefined,
-                onStdoutLine: () => {
-                  if (ending === "cancelled" || ending === "stuck") controller.abort(new Error(ending));
-                },
-              }),
-            ).rejects.toBeInstanceOf(ProcessTerminationError);
-            expect(processScope.getStore()?.terminationError?.message).toContain(
-              "Cannot establish invocation membership",
-            );
-            // The writer's environment is withheld by SIP. Its PID alone cannot authorize
-            // a signal, and a still-writing process must never be followed by git clean.
+            const result = await runProcess({
+              cmd: [process.execPath, parent],
+              cwd: dir,
+              env: process.env as Record<string, string>,
+              timeoutMs: ending === "timeout" ? 1500 : undefined,
+              onStdoutLine: () => {
+                if (ending === "cancelled" || ending === "stuck") controller.abort(new Error(ending));
+              },
+            });
+            expect(result.exitCode).toBe(ending === "normal" ? 0 : ending === "error" ? 3 : null);
+            expect(result.cancelled).toBe(ending === "cancelled" || ending === "stuck");
+            expect(result.timedOut).toBe(ending === "timeout");
+            expect(processScope.getStore()?.terminationError).toBeUndefined();
             const writerPid = Number(readFileSync(pidFile, "utf8"));
             expect(writerPid).toBeGreaterThan(0);
-            expect(process.kill(writerPid, 0)).toBe(true);
+            expect(() => process.kill(writerPid, 0)).toThrow();
             expect(process.kill(control.pid ?? 0, 0)).toBe(true);
-            await expect(
-              sh(["/bin/sh", "-c", "touch shell-cleanup-started"], { cwd: dir }),
-            ).rejects.toBeInstanceOf(ProcessTerminationError);
-            expect(existsSync(join(dir, "shell-cleanup-started"))).toBe(false);
+            rmSync(output);
+            await Bun.sleep(30);
+            expect(existsSync(output)).toBe(false);
           },
         );
       } finally {
@@ -540,21 +512,21 @@ describe("process handling", () => {
     },
   );
 
-  test.skipIf(process.platform !== "darwin")(
-    "a detached hidden shell writer must stop writing before cleanup",
-    async () => {
+  test.skipIf(process.platform !== "darwin").each(["cwd", "scratch"])(
+    "a detached hidden shell ignoring TERM stops writing in %s before cleanup",
+    async (location) => {
+      const scratch = mkdtempSync(join(tmpdir(), "limitless-scratch-"));
+      const writerCwd = location === "scratch" ? scratch : dir;
       const pidFile = join(dir, "transient-pid");
-      const ready = join(dir, "transient-ready");
-      const stop = join(dir, "transient-stop");
       const output = join(dir, "transient-output");
       const launcher = join(dir, "transient-launcher.js");
       const parent = join(dir, "transient-parent.js");
       writeFileSync(
         launcher,
         `require("node:child_process").spawn("/bin/sh",
-      ["-c", 'printf "%s" "$$" > "$1"; while [ ! -e "$2" ]; do printf x >> "$3"; done', "sh",
-        ${JSON.stringify(pidFile)}, ${JSON.stringify(stop)}, ${JSON.stringify(output)}],
-        {detached:true, stdio:"ignore"}).unref();`,
+      ["-c", 'trap "" TERM; printf "%s" "$$" > "$1"; while [ -d "$2" ]; do printf x >> "$3"; done', "sh",
+        ${JSON.stringify(pidFile)}, ${JSON.stringify(writerCwd)}, ${JSON.stringify(output)}],
+        {cwd:${JSON.stringify(writerCwd)}, detached:true, stdio:"ignore"}).unref();`,
       );
       writeFileSync(
         parent,
@@ -564,37 +536,50 @@ describe("process handling", () => {
           if (fs.existsSync(${JSON.stringify(output)})) { console.log("ready"); process.exit(0); }
         }, 5); });`,
       );
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      const kill = process.kill.bind(process);
+      const signals: { pid: number; signal: string | number | undefined }[] = [];
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        signals.push({ pid, signal });
+        return kill(pid, signal);
+      });
       try {
-        const result = await runProcess({
-          cmd: [process.execPath, parent],
-          cwd: dir,
-          env: process.env as Record<string, string>,
-          onStdoutLine: () => {
-            writeFileSync(ready, "");
-            timer = setTimeout(() => writeFileSync(stop, ""), 300);
+        const result = await processScope.run(
+          {
+            signal: new AbortController().signal,
+            killGraceMs: 20,
+            children: new Map(),
+            scratchDirs: new Set([scratch]),
           },
-        });
+          () =>
+            runProcess({
+              cmd: [process.execPath, parent],
+              cwd: dir,
+              env: process.env as Record<string, string>,
+            }),
+        );
         expect(result.exitCode).toBe(0);
-        expect(existsSync(stop)).toBe(true);
-        expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow();
+        const writerPid = Number(readFileSync(pidFile, "utf8"));
+        const writerSignals = signals.filter(({ pid }) => pid === writerPid).map(({ signal }) => signal);
+        expect(writerSignals[0]).toBe("SIGTERM");
+        expect(writerSignals.slice(1)).toContain("SIGKILL");
+        expect(writerSignals.slice(1).every((signal) => signal === "SIGKILL")).toBe(true);
+        expect(() => kill(writerPid, 0)).toThrow();
         expect(readFileSync(output).length).toBeGreaterThan(0);
-        // This cleanup callback can run only once the previously ambiguous PID is gone.
+        // Simulate worktree cleanup immediately after invocation shutdown is confirmed.
         rmSync(output);
-        rmSync(ready);
         await Bun.sleep(30);
         expect(existsSync(output)).toBe(false);
-        expect(existsSync(ready)).toBe(false);
       } finally {
-        if (timer) clearTimeout(timer);
+        killSpy.mockRestore();
         if (existsSync(pidFile)) {
           const pid = Number(readFileSync(pidFile, "utf8"));
           if (pid > 0) {
             try {
-              process.kill(pid, "SIGKILL");
+              kill(pid, "SIGKILL");
             } catch {}
           }
         }
+        rmSync(scratch, { recursive: true, force: true });
       }
     },
   );

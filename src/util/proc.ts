@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 
 export const processScope = new AsyncLocalStorage<{
@@ -30,8 +31,8 @@ const inspectionPlatform = process.platform;
 async function markedProcesses(
   marker: string,
   group: number,
-  known: Set<number>,
   started: number,
+  directories: readonly string[],
   attempt = 0,
 ): Promise<number[]> {
   const uid = process.getuid?.();
@@ -41,13 +42,13 @@ async function markedProcesses(
   const nativeProcesses = async () => {
     const { markedDarwinProcesses } = await import("./processes-darwin.ts");
     try {
-      return markedDarwinProcesses(uid, marker, group, known, started);
+      return markedDarwinProcesses(uid, marker, group, started, directories);
     } catch (error) {
-      // Exec races and short-lived hidden orphans can make membership temporarily
-      // unprovable. Keep cleanup blocked while allowing a bounded window to settle.
-      if (attempt >= 200) throw error;
+      // KERN_PROCARGS2 can return EIO/EINVAL while a process is exec'ing. Require
+      // a complete snapshot, but give these transient states time to settle.
+      if (attempt >= 10) throw error;
       await Bun.sleep(10);
-      return markedProcesses(marker, group, known, started, attempt + 1);
+      return markedProcesses(marker, group, started, directories, attempt + 1);
     }
   };
   if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
@@ -140,7 +141,7 @@ async function markedProcesses(
     return pids;
   }
   // A shell may exec between snapshots; never signal it based on mismatched argv.
-  if (attempt < 3) return markedProcesses(marker, group, known, started, attempt + 1);
+  if (attempt < 3) return markedProcesses(marker, group, started, directories, attempt + 1);
   throw new Error("Process arguments changed during inspection");
 }
 
@@ -149,15 +150,15 @@ async function stopMarkedProcesses(
   child: ChildProcess,
   graceMs: number,
   invokedAt: number,
+  directories: readonly string[],
 ): Promise<void> {
   const group = child.pid;
   if (group === undefined) return;
   const started = performance.now();
   const termed = new Set<number>();
-  const known = new Set([group]);
   let empty = false;
   for (;;) {
-    const pids = await markedProcesses(marker, group, known, invokedAt);
+    const pids = await markedProcesses(marker, group, invokedAt, directories);
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
     const exited = child.exitCode !== null || child.signalCode !== null;
     if (!pids.length && empty && exited) return;
@@ -167,7 +168,6 @@ async function stopMarkedProcesses(
         `Marked processes still alive: ${[...new Set([...pids, ...(!exited ? [group] : [])])].join(", ")}`,
       );
     for (const pid of pids) {
-      known.add(pid);
       const signal = termed.has(pid) && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
       if (signal === "SIGTERM" && termed.has(pid)) continue;
       try {
@@ -251,6 +251,11 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
     const marker = randomUUID();
+    // Capture canonical roots before spawning: cleanup may later remove scratch paths.
+    const directories =
+      inspectionPlatform === "darwin"
+        ? [opts.cwd, ...(scope?.scratchDirs ?? [])].map((directory) => realpathSync(directory))
+        : [];
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
@@ -299,6 +304,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
               started,
+              directories,
             );
         } catch (error) {
           terminationError = new ProcessTerminationError(
