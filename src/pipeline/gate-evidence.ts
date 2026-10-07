@@ -17,19 +17,20 @@ export function gateTestCommand(command: string, scripts: Record<string, string>
   return expanded && /^[\w./-]+(?: [\w./:=@-]+)*$/.test(expanded) ? expanded : null;
 }
 
-const gateClaim = (text: string): boolean =>
-  /(?<![\w./-])gates?[\s:-]+(?:runs?|stages?|checks?|results?|evidence)(?![\w./-])|\bverified\s+by\s+(?:the\s+)?gates?\b|\bfactory[\s-]+gates?\b/i.test(
-    text.replace(/[`*_~]/g, ""),
+// Conservative: any standalone mention of gates (not a path segment), or of the factory's
+// repository/CI checks, is treated as gate-dependent. A false positive only blocks a criterion.
+const gateClaim = (text: string): boolean => {
+  const plain = text.replace(/[`*_~]/g, "");
+  return (
+    /(?<![\w./-])gat(?:e|es|ed|ing)(?![\w/]|\.\w)/i.test(plain) ||
+    /\b(?:repository|factory(?:['’]s)?|ci)[\s:-]+(?:checks?|runs?|results?|records?|pipelines?)\b/i.test(
+      plain,
+    ) ||
+    /\bverified\s+by\s+(?:the\s+)?(?:factory|repository|ci)\b/i.test(plain)
   );
-const stripCitations = (text: string): string => {
-  const retained = text
-    .split(/\r?\n/)
-    .filter((line) => !gateClaim(line))
-    .join("\n")
-    .trim();
-  // A citation split over multiple lines must not survive line-by-line stripping.
-  return gateClaim(retained) ? "" : retained;
 };
+// Drop the whole field: a citation split over lines would leave fragments behind line-by-line stripping.
+const stripCitations = (text: string): string => (gateClaim(text) ? "" : text.trim());
 
 function sanitizeGateClaims(verify: Verify): Verify {
   return {
