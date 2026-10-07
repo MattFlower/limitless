@@ -516,6 +516,18 @@ export interface DiffInfo {
   attributeUnmatched?: string[];
 }
 
+/** Text a reviewer can read in a diff: strict UTF-8 without control bytes beyond whitespace. */
+function reviewableText(bytes: Buffer): boolean {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return false;
+  }
+  for (const byte of bytes)
+    if (byte === 0x7f || (byte < 0x20 && ![9, 10, 12, 13].includes(byte))) return false;
+  return true;
+}
+
 export async function diffSince(
   cwd: string,
   baseSha: string,
@@ -547,18 +559,25 @@ export async function diffSince(
   const origins = new Map(files.map((file) => [file.path, file.from]));
   const changes: { path: string; from?: string; modeRequiresAllowance: boolean }[] = [];
   const entries = raw.stdout.split("\0");
+  // The raw diff has no renames: a rename's source is a deletion carrying the original mode.
+  const deletedModes = new Map<string, string>();
+  for (let i = 0; i + 1 < entries.length; i += 2)
+    if (entries[i]?.split(" ").at(-1)?.startsWith("D"))
+      deletedModes.set(entries[i + 1] ?? "", entries[i]?.split(" ")[0] ?? "");
   for (let i = 0; i + 1 < entries.length; i += 2) {
-    const [oldMode, newMode, oldOid, newOid] = entries[i]?.split(" ") ?? [];
+    const [rawOldMode, newMode] = entries[i]?.split(" ") ?? [];
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
     blobs.set(path, entries[i]?.split(" ")[3] ?? "");
     const from = origins.get(path);
+    const oldMode = (from && from !== path ? deletedModes.get(from) : undefined) ?? rawOldMode;
     changes.push({
       path,
       ...(from ? { from } : status.startsWith("A") ? {} : { from: path }),
-      modeRequiresAllowance: newMode === "100755" || (oldMode !== `:${newMode}` && oldOid === newOid),
+      // Any executable bit, and any mode transition of an existing path (gaining or losing it).
+      modeRequiresAllowance: newMode === "100755" || (oldMode !== ":000000" && oldMode !== `:${newMode}`),
     });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
@@ -745,7 +764,10 @@ async function attributeInfo(
     (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
   const headPointers = new Map<string, string>();
-  const contents = new Map<string, { pointer: string | null; forbidden: boolean; binary: boolean }>();
+  const contents = new Map<
+    string,
+    { pointer: string | null; forbidden: boolean; binary: boolean; reviewable: boolean }
+  >();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
@@ -832,6 +854,7 @@ async function attributeInfo(
           pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
           forbidden: isForbiddenFormat("", bytes),
           binary: bytes.includes(0) || bytes.includes(Buffer.from("%PDF-")),
+          reviewable: reviewableText(bytes),
         });
         at = end + size + 2;
       }
@@ -955,7 +978,10 @@ async function attributeInfo(
     const binaryPaths = changes
       .filter(
         ({ path, from, modeRequiresAllowance }) =>
-          modeRequiresAllowance ||
+          // An executable bit or mode change needs an allowance unless the path holds plain,
+          // reviewable text (a script); media and opaque bytes, NUL-free or not, still do.
+          (modeRequiresAllowance &&
+            (INERT_MEDIA_PATH.test(path) || !contents.get(afterText.blobs.get(path) ?? "")?.reviewable)) ||
           (matches.has(path) &&
             (!afterText.raw.has(path) || headPointers.has(path)) &&
             (beforeText.text.has(from ?? "") || !inert.has(path))),
