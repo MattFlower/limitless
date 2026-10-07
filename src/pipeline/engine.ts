@@ -23,7 +23,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { worktreeGit, worktreeGitScope } from "../git/command.ts";
+import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   checkoutCommitted,
@@ -56,7 +56,7 @@ import { commandScope, confinementScope, seatbeltBackend } from "../harness/sand
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
-import { processScope } from "../util/proc.ts";
+import { assertProcessesStopped, CommandError, ProcessTerminationError, processScope } from "../util/proc.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -215,6 +215,14 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
+    const terminationError = processScope.getStore()?.terminationError;
+    if (terminationError && ctx.state.needsHumanReason !== terminationError.message) {
+      ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
+      ctx.state.needsHumanReason = terminationError.message;
+      // Shutdown can re-queue this run. Persist the cleanup block even with an aborted
+      // signal, so a fresh process scope on resume cannot start another round.
+      deps.store.setRunState(runId, ctx.state);
+    }
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
@@ -247,6 +255,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       return "queued";
     }
     const verifiedSha = ctx.state.lastVerifiedSha;
+    const terminationBlocked =
+      !!processScope.getStore()?.terminationError ||
+      ctx.state.needsHumanReason?.startsWith(ProcessTerminationError.prefix);
     const verifiedFailure =
       verifiedSha &&
       ctx.repo.kind === "github" &&
@@ -266,7 +277,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (verifiedFailure) {
+    if (verifiedFailure && !terminationBlocked) {
       try {
         ctx.state.needsHumanReason = message;
         await ctx.save("needs-human");
@@ -292,6 +303,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       }
     } else if (
       e instanceof NeedsHumanError &&
+      !terminationBlocked &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
       !ctx.state.pendingRebaseSha
@@ -816,7 +828,7 @@ async function buildLoop(ctx: RunContext): Promise<void> {
 const HOLDOUT_TOOL_CALLS = 40;
 
 /**
- * Run `fn` in a private export of the recorded base commit, removed afterwards whatever the outcome.
+ * Run `fn` in a private export of the recorded base commit, removed after confirmed shutdown.
  * Holdout runs alongside implement, so it must never see the worktree the implementer is editing.
  */
 async function withBaseSnapshot<T>(
@@ -833,6 +845,7 @@ async function withBaseSnapshot<T>(
     await exportCommit(worktree, baseSha, base, ctx.signal);
     return await fn(base);
   } finally {
+    assertProcessesStopped();
     rmSync(snapshot, { recursive: true, force: true });
   }
 }
@@ -982,6 +995,15 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         await ctx.save("implementation-ready");
       }
       ctx.checkCancelled();
+      const terminationError = processScope.getStore()?.terminationError;
+      if (terminationError) {
+        // An unkillable writer or failed inspection needs a human: retrying another
+        // round alongside processes whose shutdown is unconfirmed is unsafe.
+        ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
+        ctx.state.needsHumanReason = terminationError.message;
+        await ctx.save();
+        throw new NeedsHumanError(`Implement round ${round} failed: ${terminationError.message}`);
+      }
       const sha =
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha)
@@ -1060,7 +1082,7 @@ async function oneRound(
   }
 
   // --- gates
-  const comparison = await ctx.stage(
+  const checks = ctx.stage(
     "gates",
     (stage) =>
       commandScope(cwd, async () => {
@@ -1070,7 +1092,7 @@ async function oneRound(
         let testScripts: Record<string, string> = {};
         let baseTimeout = false;
         try {
-          await checkoutCommitted(cwd);
+          await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
           testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
           let after = await runGates(cwd, gates, ctx.signal, events);
           ctx.checkCancelled();
@@ -1110,7 +1132,11 @@ async function oneRound(
           );
         } finally {
           // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-          await discardChanges(cwd);
+          await discardChanges(cwd).catch((error: unknown) => {
+            if (ctx.state.implementerIssue && error instanceof CommandError)
+              throw new WorktreeCleanError(error.message, { cause: error });
+            throw error;
+          });
         }
         for (const c of cmp.filter((c) => c.firstAttempt)) {
           ctx.store.addEvent({
@@ -1150,6 +1176,18 @@ async function oneRound(
       })(),
     round,
   );
+  const comparison = await checks.catch(async (error: unknown) => {
+    ctx.checkCancelled();
+    if (!(error instanceof WorktreeCleanError) || !ctx.state.implementerIssue) throw error;
+    ctx.state.feedback = redactPrivate(
+      `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`,
+      privateStrings(),
+    );
+    ctx.log(ctx.state.feedback, "warn");
+    await ctx.save();
+    return null;
+  });
+  if (comparison === null) return false;
 
   // --- audit
   const diff = await changeDiff();

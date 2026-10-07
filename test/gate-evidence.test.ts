@@ -453,12 +453,10 @@ test.each(["wrong-content", "zero-tests-truncated", "noisy-pass"])(
     const cwd = mkdtempSync(join(tmpdir(), "limitless-gate-evidence-"));
     try {
       writeFileSync(join(cwd, "farewell.txt"), "hello\n");
-      const reporter =
-        'Bun.spawn(["bun", "-e", \'await Bun.stdin.text(); console.error("x".repeat(8000))\'], { stdin: "pipe", stdout: "ignore", stderr: "inherit" }).unref();\n';
-      writeFileSync(join(cwd, "empty.test.ts"), reporter);
+      writeFileSync(join(cwd, "empty.test.ts"), "");
       writeFileSync(
         join(cwd, "passing.test.ts"),
-        `import { test, expect } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n${reporter}`,
+        `import { test, expect } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n`,
       );
       const command =
         kind === "wrong-content"
@@ -476,6 +474,14 @@ test.each(["wrong-content", "zero-tests-truncated", "noisy-pass"])(
           new AbortController().signal,
         ),
       );
+      expect(run.checks[0]?.ok).toBe(true);
+      const check = run.checks[0];
+      if (kind !== "wrong-content" && check) {
+        // The summary was streamed; drop it from the retained tail, as later output would. Only
+        // the streamed coverage may decide (descendants can no longer write after the command).
+        expect(check.testCoverage?.summary).toBeDefined();
+        check.output = "x".repeat(6000);
+      }
       const evidence = {
         stageId: 12,
         sha,
@@ -484,11 +490,6 @@ test.each(["wrong-content", "zero-tests-truncated", "noisy-pass"])(
           testCommand: gateTestCommand(check.result.command, {}),
         })),
       };
-      expect(run.checks[0]?.ok).toBe(true);
-      if (kind !== "wrong-content") {
-        expect(run.checks[0]?.output).not.toMatch(/\d+ pass/);
-        expect(run.checks[0]?.output.length).toBe(6000);
-      }
       const privateHoldout = {
         scenarios: [
           {
