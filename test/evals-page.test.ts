@@ -125,6 +125,9 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
         inputTokens: 0,
         outputTokens: 0,
         cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        // The first call shows the cached share of its prompt.
+        ...(id === 0 ? { inputTokens: 1000, cacheReadTokens: 3000, cacheWriteTokens: 500 } : {}),
         numTurns: 1,
         sessionId: null,
         error: null,
@@ -157,10 +160,15 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     expect(legacyHtml).toContain("does not recognize");
     expect(legacyHtml).toContain("codex/luna → unknown model (legacy) · low");
     expect(legacyHtml).not.toContain("→ null");
-    expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(10);
+    expect(invocationHtml).toContain('<th class="num">Cache hit</th>');
+    expect(invocationHtml).toContain(
+      'title="3.0k cached, 500 written, 1.0k not cached of 4.5k prompt tokens"',
+    );
+    expect(invocationHtml).toContain("66.7%");
+    expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(11);
     expect(
       renderToString(() => InvocationsTable({ invocations: [], selectedId: null, onSelect: () => {} })),
-    ).toContain('colspan="10"');
+    ).toContain('colspan="11"');
     const rows = [evidence("triage"), evidence("review"), evidence("verify")];
     const html = renderToString(() => EvalsView({ data: response(rows) }));
     for (const text of [

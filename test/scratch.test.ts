@@ -1301,6 +1301,7 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
     const cwd = mkdtempSync(join(tmpdir(), "env-test-"));
     const parent = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
     const paths: string[] = [];
+    const keyFiles: string[] = [];
     try {
       for (const run of [runClaude, runCodex]) {
         await withScratch(cwd, async (scratchDir) => {
@@ -1311,7 +1312,11 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
             expect(opts.env).toMatchObject(scratchEnv(spec));
             expect(opts.env.GH_TOKEN).toBe("limitless-agents-have-no-github-access");
             if (run === runClaude) {
-              expect(opts.env.ANTHROPIC_AUTH_TOKEN).toBe("backend-only-token");
+              // The backend key reaches the CLI through its key helper, never the agent environment.
+              expect(Object.values(opts.env)).not.toContain("backend-only-token");
+              const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+              keyFiles.push(JSON.parse(String(settings.apiKeyHelper).replace(/^cat /, "")));
+              expect(readFileSync(keyFiles.at(-1) ?? "", "utf8")).toBe("backend-only-token");
               expect(opts.env.CLAUDE_CODE_TMPDIR).toBe(dirname(scratchDir));
               expect(join(opts.env.CLAUDE_CODE_TMPDIR ?? "", SCRATCH_NAME)).toBe(scratchDir);
             } else expect(opts.env.CLAUDE_CODE_TMPDIR).toBeUndefined();
@@ -1332,6 +1337,8 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
       }
       expect(paths[0]).not.toBe(paths[1]);
       for (const path of paths) expect(existsSync(dirname(path))).toBe(false);
+      expect(keyFiles).toHaveLength(1);
+      for (const keyFile of keyFiles) expect(existsSync(keyFile)).toBe(false);
       expect({ TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }).toEqual(parent);
     } finally {
       rmSync(cwd, { recursive: true, force: true });

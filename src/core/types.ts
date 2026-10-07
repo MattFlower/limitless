@@ -20,6 +20,9 @@ export const TERMINAL_STATUSES: readonly RunStatus[] = [
   "resolved",
 ];
 
+/** The most runs one `GET /api/runs?ids=` request may name. */
+export const MAX_RUN_IDS = 200;
+
 export type Profile = "auto" | "quick" | "standard" | "deep";
 export type ResolvedProfile = Exclude<Profile, "auto">;
 
@@ -65,6 +68,10 @@ export type Role =
   | "verify"
   | "summarize"
   | "chat";
+
+export const RUN_ROLES = ["triage", "spec", "holdout", "implement", "review", "verify"] as const;
+export type RunRole = (typeof RUN_ROLES)[number];
+export type RunModels = Partial<Record<RunRole, string[]>>;
 
 export type Vendor =
   | "anthropic"
@@ -118,6 +125,7 @@ export interface Repo {
 }
 
 export interface Run {
+  models?: RunModels;
   flow?: "build" | "verify-change";
   id: string;
   repoId: string;
@@ -200,13 +208,15 @@ export interface Invocation {
   provider: string;
   model: string;
   effort: RecordedEffort | null;
-  modelId: string; // catalog id, e.g. "claude/sonnet"
+  modelId: string; // catalog id, e.g. "claude/opus"
   status: InvocationStatus;
   costUsd: number;
   costEquivUsd: number;
+  /** Uncached input; `cacheReadTokens` and `cacheWriteTokens` carry the rest of the prompt. */
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  cacheWriteTokens: number;
   numTurns: number;
   sessionId: string | null;
   error: string | null;
@@ -256,11 +266,55 @@ export interface ArtifactMeta {
 }
 
 export interface RunDetail {
+  stoppingStage?: StageName | null;
+  blockingFindings?: string[];
+  prSnapshot?: {
+    state?: string;
+    headRefOid?: string;
+    isDraft?: boolean;
+    mergeable?: string | null;
+    ci?: string | null;
+  } | null;
+  worktreePath?: string | null;
   run: Run;
   stages: Stage[];
   invocations: Invocation[];
   questions: Question[];
   artifacts: ArtifactMeta[];
+  /** For a run with a PR: its latest approval and the review rounds applied to it. */
+  review?: { approval: ReviewApproval | null; approvedAt?: number; rounds: ReviewRound[] };
+}
+
+export interface ReviewFinding {
+  severity: "blocker" | "major" | "minor" | "nit";
+  title: string;
+  file?: string;
+  line?: number;
+  detail: string;
+}
+
+/** `POST /api/runs/:id/review`; `reviewedSha` must be the PR's current head. */
+export interface ReviewVerdict {
+  verdict: "changes" | "approve";
+  reviewedSha: string;
+  findings?: ReviewFinding[];
+  reviewer?: string;
+}
+
+/** The latest approval of a PR; `stale` once its head is seen anywhere else or changes are requested. */
+export interface ReviewApproval {
+  sha: string;
+  stale: boolean;
+}
+
+export interface ReviewRound {
+  runId: string;
+  round: number;
+  status: RunStatus;
+  reviewedSha: string;
+  deliveredSha: string | null;
+  findings: ReviewFinding[];
+  createdAt?: number;
 }
 
 export interface QuotaWindow {
@@ -268,7 +322,20 @@ export interface QuotaWindow {
   resetsAt: number | null; // epoch ms
 }
 
+export interface ModelDiscovery {
+  served: string[] | null;
+  observedAt: number | null;
+  servedNotInCatalog: string[];
+  catalogNotServed: string[];
+  observations: { model: string; firstSeen: number; lastSeen: number }[];
+}
+
+export type QuotaMode = "windows" | "unlimited";
+
 export interface ProviderStatus {
+  discovery?: ModelDiscovery;
+  quota?: QuotaMode;
+  kind?: string;
   fast?: boolean;
   supportsFast?: boolean;
   fastModeUnavailableReason?: string | null;
@@ -317,11 +384,14 @@ export interface QuotaAlert {
   utilization: number | null;
   resetsAt: number | null;
   severity: "warning" | "exhausted";
+  /** Missing on older alerts whose origin cannot be determined. */
+  source?: "window" | "rejection" | null;
   routing: string;
   createdAt: number;
 }
 
 export interface CreateRunRequest {
+  models?: RunModels;
   dependsOn?: string[];
   repo: string;
   prompt: string;
@@ -343,6 +413,8 @@ export interface CreateRunRequest {
 /** Messages pushed on the global SSE stream. */
 export type StreamMessage =
   | ChatStreamMessage
+  | { kind: "routing"; change: RoutingChange }
+  | { kind: "catalog" }
   | { kind: "run"; run: Run }
   | { kind: "stage"; stage: Stage }
   | { kind: "invocation"; invocation: Invocation }
@@ -350,16 +422,66 @@ export type StreamMessage =
   | { kind: "provider"; provider: ProviderStatus }
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question }
-  | { kind: "feed"; item: FeedItem };
+  | { kind: "feed"; item: FeedItem }
+  | { kind: "github_pr"; url: string };
+
+export type RoutingCell = Complexity | "default";
+export interface OperatorRoutingCell {
+  role: Role;
+  cell: RoutingCell;
+  groups: string[];
+  note: string | null;
+  updatedAt: number;
+  updatedBy: string;
+}
+export interface RoutingChange {
+  id: number;
+  key: string;
+  oldValue: string[] | null;
+  newValue: string[] | null;
+  note: string | null;
+  at: number;
+  by: string;
+}
 
 export type FeedKind =
   | "run.warning"
   | "run.gate_timeout_retry"
+  | LandFeedKind
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"
   | "daemon.started"
+  | `review.${"round_started" | "round_delivered" | "approved"}`
   | GitHubFeedKind;
+export type LandFeedKind = "land.queued" | "land.landed" | "land.blocked";
+/** Where an approved pull request is in the land queue; the active states are resumed on restart. */
+export type LandState = "queued" | "checking" | "waiting_ci" | "merging" | "landed" | "blocked" | "cancelled";
+export const ACTIVE_LAND_STATES: readonly LandState[] = ["queued", "checking", "waiting_ci", "merging"];
+
+export interface LandEntry {
+  id: number;
+  runId: string;
+  repo: string;
+  prUrl: string;
+  baseBranch: string;
+  headBranch: string;
+  /** The approved head: only it, or a base merge of it, may land. */
+  approvedSha: string;
+  state: LandState;
+  /** The commit the queue pushed (the merge commit, or the approved one when it needed no merge). */
+  pushedSha: string | null;
+  /** Failed workflow attempts for the single durable CI rerun. */
+  ciRerun: string | null;
+  /** Where this land's check output was written. */
+  logPath: string | null;
+  attempts: number;
+  reason: string | null;
+  createdAt: number;
+  updatedAt: number;
+  finishedAt: number | null;
+}
 export type GitHubFeedKind =
+  | `ci.${"main_red" | "needs_fix"}`
   | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
   | "github.access_problem";
 /** A factory PR the poller observes; `delivered` (0/1): a run waits on its merge; `data`: its saved state. */
@@ -368,6 +490,25 @@ export type TrackedPr = { url: string; repo: string; runId: string; delivered: n
   data: string | null;
 };
 export type GitHubAccessProblem = { repo: string; reason: string; detail: string; since: number };
+export type CiFailure = {
+  prUrl: string;
+  sha: string;
+  signature: string;
+  check: string;
+  line: string;
+  image: string | null;
+  rerunMarker: string | null;
+  rerunJob?: { id: number; runId: number; attempt: number; name: string } | null;
+  rerunRetryAt?: number | null;
+  rerunRetryUsed?: number;
+  outcome:
+    | "failed"
+    | "rerun_requested"
+    | "rerun_rejected"
+    | "rerunning"
+    | "failed_again"
+    | "failed_then_passed";
+};
 export interface FeedItem {
   id: number;
   ts: number;
@@ -391,6 +532,7 @@ export interface DrainState {
 }
 
 export interface HealthResponse extends DrainState {
+  gateSlots?: { occupied: number; limit: number; holders: string[] };
   ok: boolean;
   uptimeMs: number;
   sha: string;
@@ -615,6 +757,9 @@ export interface EvalTrial {
     invocationStatus?: InvocationStatus;
     /** `[triage] decision_confidence` a decision-model trial ran with. */
     decisionConfidence?: number;
+    /** Prompt tokens read from and written to the provider's cache; absent on legacy trials. */
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
     /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */

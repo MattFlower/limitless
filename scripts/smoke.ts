@@ -5,12 +5,15 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
 import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
+import { resolveCatalog } from "../src/router/config-catalog.ts";
+import { discoversModels, servedIds } from "../src/router/discovery.ts";
 import { resolveTarget } from "../src/router/targets.ts";
 import { processScope, sh } from "../src/util/proc.ts";
 
@@ -325,7 +328,10 @@ export async function reportChecks(
     budgetMs: SMOKE_BUDGET_MS,
     ...options,
     onStart: (check) => print(`${check.name.padEnd(width)}  RUN`),
-    onRow: (row) => print(formatRow(row, width)),
+    onRow: (row) => {
+      print(formatRow(row, width));
+      options.onRow?.(row);
+    },
   });
   return exitCode(rows);
 }
@@ -342,18 +348,18 @@ const schema = {
 };
 
 /** Cheapest first; equal prices keep catalog order (stable sort), as free-first routing does. */
-function modelsByPrice(provider: string): ModelDef[] {
-  const models = MODELS.filter((m) => m.provider === provider).sort(
-    (a, b) => a.price.input + a.price.output - b.price.input - b.price.output,
-  );
+function modelsByPrice(provider: string, catalog = MODELS): ModelDef[] {
+  const models = catalog
+    .filter((m) => m.provider === provider && m.source !== "runtime")
+    .sort((a, b) => a.price.input + a.price.output - b.price.input - b.price.output);
   if (models.length === 0) throw new Error(`no catalog model for ${provider}`);
   return models;
 }
 
-function cheapestModel(provider: string): ModelDef {
+function cheapestModel(provider: string, catalog = MODELS): ModelDef {
   // On metered providers, ":free" variants are rate-limited and queue unpredictably; checking the
   // contract with the cheapest paid model costs a fraction of a cent and gives stable timing.
-  const models = modelsByPrice(provider);
+  const models = modelsByPrice(provider, catalog);
   const paid = models.filter((m) => !m.model.endsWith(":free"));
   const model = paid[0] ?? models[0];
   if (!model) throw new Error(`no catalog model for ${provider}`);
@@ -860,16 +866,55 @@ async function providerAvailability(
   }
 }
 
+export function catalogChecks(
+  providers: ProviderDef[],
+  models: ModelDef[],
+  secrets: Record<string, string>,
+  fetchHealth = fetch,
+): SmokeCheck[] {
+  return providers.filter(discoversModels).map((provider) => ({
+    name: `${provider.id} catalog`,
+    run: async () => {
+      if (provider.apiKeySecret && !secrets[provider.apiKeySecret])
+        return { status: "skip", reason: `missing ${provider.apiKeySecret}` };
+      const token = provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey;
+      let response: Response;
+      try {
+        response = await fetchHealth(provider.healthUrl ?? "", {
+          signal: AbortSignal.timeout(3000),
+          headers: token ? { authorization: `Bearer ${token}` } : {},
+        });
+      } catch {
+        return fail("health probe failed", "health");
+      }
+      if (!response.ok) return fail(`health probe returned HTTP ${response.status}`, "health");
+      try {
+        const served = servedIds(await response.json());
+        const missing = models.filter((m) => m.provider === provider.id && !served.includes(m.model));
+        return missing.length
+          ? {
+              status: "fail",
+              reason: `Not served by ${provider.id}: ${missing.map((m) => `${m.id} (${m.model})`).join(", ")}; served: ${served.join(", ") || "(empty)"}`,
+            }
+          : { status: "pass", reason: `served: ${served.join(", ")}` };
+      } catch {
+        return { status: "fail", reason: "invalid model list: expected data[].id" };
+      }
+    },
+  }));
+}
+
 export function backendChecks(
   secrets: Record<string, string>,
   fetchHealth = fetch,
   check = liveCheck,
   decide = decisionsCheck,
+  catalog = { providers: PROVIDERS, models: MODELS },
 ): SmokeCheck[] {
   const checks: SmokeCheck[] = [];
   for (const id of ["omlx", "twilight", "openrouter"]) {
-    const provider = PROVIDERS.find((p) => p.id === id);
-    if (!provider) throw new Error(`missing provider ${id}`);
+    const provider = catalog.providers.find((p) => p.id === id);
+    if (!provider) continue;
     for (const kind of id === "omlx" ? (["structured", "edit"] as const) : (["structured"] as const))
       checks.push({
         name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
@@ -881,7 +926,7 @@ export function backendChecks(
             runClaude,
             targetFor(
               provider,
-              cheapestModel(id),
+              cheapestModel(id, catalog.models),
               provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey,
             ),
             kind,
@@ -890,8 +935,8 @@ export function backendChecks(
         },
       });
   }
-  const typesafe = PROVIDERS.find((p) => p.id === "typesafe");
-  if (!typesafe?.apiKeySecret) throw new Error("missing provider typesafe");
+  const typesafe = catalog.providers.find((p) => p.id === "typesafe");
+  if (!typesafe?.apiKeySecret) return checks;
   const key = typesafe.apiKeySecret;
   checks.push({
     name: "typesafe decisions",
@@ -899,13 +944,17 @@ export function backendChecks(
     run: async (signal) => {
       const unavailable = await providerAvailability(typesafe, secrets, fetchHealth);
       if (unavailable) return unavailable;
-      return decide(targetFor(typesafe, cheapestModel("typesafe"), secrets[key]), runDecisions, signal);
+      return decide(
+        targetFor(typesafe, cheapestModel("typesafe", catalog.models), secrets[key]),
+        runDecisions,
+        signal,
+      );
     },
   });
   return checks;
 }
 
-export async function main(): Promise<number> {
+export async function main(print = console.log, options: RunOptions = {}): Promise<number> {
   const index = process.argv.indexOf("--models");
   if (index >= 0) {
     const references = process.argv[index + 1];
@@ -923,14 +972,20 @@ export async function main(): Promise<number> {
           liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
       };
     });
-    return reportChecks(checks);
+    return reportChecks(checks, print, options);
   }
-  const { secrets } = loadConfig();
+  const cfg = loadConfig();
+  const { secrets } = cfg;
+  const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
+  const store = new Store(cfg.paths.db);
+  const runtime = store.runtimeModels();
+  const enabled = catalog.providers.filter((p) => store.getProviderEnabledOverride(p.id) !== false);
+  store.close();
   const checks: SmokeCheck[] = [];
   for (const id of ["claude", "codex"]) {
-    const provider = PROVIDERS.find((p) => p.id === id);
-    if (!provider) throw new Error(`missing provider ${id}`);
-    let target = targetFor(provider, cheapestModel(id));
+    const provider = enabled.find((p) => p.id === id);
+    if (!provider) continue;
+    let target = targetFor(provider, cheapestModel(id, catalog.models));
     const harness = id === "claude" ? runClaude : runCodex;
     for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify", "confine"] as const) {
       checks.push({
@@ -938,13 +993,13 @@ export async function main(): Promise<number> {
         // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
         timeoutMs:
           id === "codex" && kind === "structured"
-            ? 60_000 * modelsByPrice(id).length + 30_000
+            ? 60_000 * modelsByPrice(id, catalog.models).length + 30_000
             : kind === "verify" || kind === "confine"
               ? 120_000
               : 90_000,
         run: async (signal) => {
           if (id === "codex" && kind === "structured") {
-            const selected = await checkCodexModels(modelsByPrice(id), (model) =>
+            const selected = await checkCodexModels(modelsByPrice(id, catalog.models), (model) =>
               liveCheck(harness, targetFor(provider, model), kind, signal),
             );
             target = targetFor(provider, selected.model);
@@ -955,8 +1010,14 @@ export async function main(): Promise<number> {
       });
     }
   }
-  checks.push(...backendChecks(secrets));
-  return reportChecks(checks);
+  checks.push(
+    ...backendChecks(secrets, fetch, liveCheck, decisionsCheck, {
+      providers: enabled,
+      models: catalog.models,
+    }),
+  );
+  checks.push(...catalogChecks(enabled, [...catalog.models, ...runtime], secrets));
+  return reportChecks(checks, print, options);
 }
 
 if (import.meta.main) process.exitCode = await main();

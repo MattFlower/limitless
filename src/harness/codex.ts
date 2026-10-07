@@ -15,7 +15,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
-import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
+import { agentEnv, type ProcOptions, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
   createScratch,
@@ -36,6 +36,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  protectCredentials,
   redactJsonLine,
   type Usage,
 } from "./types.ts";
@@ -742,6 +743,7 @@ export async function runCodex(
   processRunner = runProcess,
   readerProbe = codexReaderProbe,
 ): Promise<AgentResult> {
+  spec = protectCredentials(spec);
   const t = spec.target;
   const editing = spec.mode === "edit" && !spec.noTools;
   const confined = editing || (spec.confineReads && spec.mode === "readonly" && !spec.noTools);
@@ -808,7 +810,7 @@ export async function runCodex(
     spec.onEvent(ev);
   });
 
-  appendFileSync(spec.logPath, `# codex ${t.model} ${new Date().toISOString()}\n`);
+  appendFileSync(spec.logPath, redactCredentials(`# codex ${t.model} ${new Date().toISOString()}\n`));
   const roots = () =>
     editing
       ? writeRoots(spec.cwd, validateScratch(spec))
@@ -825,7 +827,7 @@ export async function runCodex(
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
       appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
-      parser.feed(line);
+      parser.feed(redactJsonLine(line, redactCredentials));
     },
     onStderrLine: (line) => {
       appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
@@ -866,7 +868,9 @@ export async function runCodex(
   // Success requires a clean exit AND a completed turn; anything else is a failure with a reason.
   let failure: string | null = parser.failed;
   if (!failure && proc.exitCode !== 0) {
-    failure = proc.stderr.trim().slice(-2000) || `codex exited with ${proc.exitCode ?? proc.signal}`;
+    failure =
+      redactCredentials(proc.stderr).trim().slice(-2000) ||
+      `codex exited with ${proc.exitCode ?? proc.signal}`;
   }
   if (!failure && !parser.completed) failure = "codex exited without completing its turn";
   if (failure) {

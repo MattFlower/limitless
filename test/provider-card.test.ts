@@ -78,6 +78,24 @@ test("OpenRouter card keeps one budget gauge and reports only material differenc
     updatedAt: 1_000_000,
   };
   const html = renderToString(() => ProviderCard({ provider: status }));
+  const discovered = renderToString(() =>
+    ProviderCard({
+      provider: {
+        ...status,
+        id: "local",
+        discovery: {
+          served: ["new-build"],
+          observedAt: 100,
+          observations: [],
+          servedNotInCatalog: ["new-build"],
+          catalogNotServed: ["local/old"],
+        },
+      },
+    }),
+  );
+  expect(discovered).toContain("Catalog models not served by local: local/old");
+  expect(discovered).toContain('role="alert"');
+  expect(discovered).toContain("Served models not in catalog: new-build");
   expect(html).not.toContain('role="switch"');
   for (const id of ["codex", "claude"]) {
     const card = renderToString(() =>
@@ -236,6 +254,14 @@ test("provider card renders each window's label, bar, and full-width details in 
   }
   expect(html.match(/class="gauge-details"/g)).toHaveLength(3);
   expect(html).not.toContain("Confined readers");
+  expect(html).not.toContain("No limit (configured)");
+  for (const windows of [status.windows, {}]) {
+    const unlimited = renderToString(() =>
+      ProviderCard({ provider: { ...status, quota: "unlimited", windows } }),
+    );
+    expect(unlimited).toContain("No limit (configured)");
+    if (Object.keys(windows).length) expect(unlimited).toContain("73%");
+  }
 
   const codex = (confinement: ProviderStatus["confinement"]) =>
     renderToString(() => ProviderCard({ provider: { ...status, id: "codex", label: "Codex", confinement } }))

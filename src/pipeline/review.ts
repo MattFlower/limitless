@@ -442,6 +442,7 @@ export function combined(results: AgentResult[], last: AgentResult, structured: 
       output: sum((r) => r.usage.output),
       cacheRead: sum((r) => r.usage.cacheRead),
       cacheWrite: sum((r) => r.usage.cacheWrite),
+      cacheWrite1h: sum((r) => r.usage.cacheWrite1h ?? 0),
     },
   };
 }

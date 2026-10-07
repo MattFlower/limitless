@@ -15,6 +15,7 @@ import {
   backendChecks,
   type CheckResult,
   type Clock,
+  catalogChecks,
   checkCodexModels,
   confineLiveCheck,
   decisionsCheck,
@@ -32,7 +33,7 @@ import {
 import { deploy } from "../src/cli/service.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
-import { MODELS } from "../src/router/catalog.ts";
+import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
 const result: AgentResult = {
@@ -48,6 +49,42 @@ const result: AgentResult = {
   quota: null,
 };
 const now = () => performance.now();
+
+test("catalog smoke authenticates, names stale entries and served IDs, and handles malformed and unreachable lists", async () => {
+  const provider = PROVIDERS.find((p) => p.id === "omlx");
+  if (!provider) throw new Error("missing local provider");
+  const model = {
+    ...MODELS[0],
+    id: "omlx/old",
+    provider: "omlx",
+    model: "old-backend",
+  } as (typeof MODELS)[number];
+  let payload: unknown = { data: [{ id: "new-backend" }] };
+  let status = 200;
+  const fake = (async (_url, init) => {
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer smoke-key");
+    return Response.json(payload, { status });
+  }) as typeof fetch;
+  const checks = catalogChecks(
+    [provider, ...PROVIDERS.filter((p) => ["claude", "codex", "openrouter"].includes(p.id))],
+    [model],
+    { OMLX_API_KEY: "smoke-key" },
+    fake,
+  );
+  expect(checks).toHaveLength(1);
+  const run = () => checks[0]?.run(new AbortController().signal);
+  const missing = await run();
+  expect(missing).toMatchObject({ status: "fail" });
+  expect(missing?.reason).toContain("omlx/old (old-backend)");
+  expect(missing?.reason).toContain("served: new-backend");
+  expect(missing?.transient).toBeUndefined();
+  payload = { data: [{ id: "old-backend" }] };
+  expect(await run()).toMatchObject({ status: "pass" });
+  payload = { wrong: [] };
+  expect(await run()).toMatchObject({ status: "fail", reason: "invalid model list: expected data[].id" });
+  status = 503;
+  expect(await run()).toMatchObject({ status: "fail", transient: "health" });
+});
 const noDelay = async () => {};
 
 test("smoke runner reports every injected outcome and fails after an exception", async () => {
@@ -594,6 +631,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
   try {
     await expect(
       deploy(7400, "feature", true, {
+        leaseClient: async () => ({ id: "lease", acquired: true }),
         releaseDir: dir,
         lockPath: join(dir, "deploy.lock"),
         command,
@@ -736,7 +774,7 @@ test("oMLX smoke rows skip unavailable providers and fail attempted bad edits", 
   }) as typeof fetch;
   const check: typeof liveCheck = async (_harness, target, kind) => {
     invocations++;
-    expect(target.model).toBe("Qwen3.8-Flash-Next-REAP-288-MLX-4bit");
+    expect(target.model).toBe("Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp");
     expect(target.backend).toEqual({ baseUrl: "http://127.0.0.1:8989", authToken: "key" });
     return liveCheck(async () => ({ ...result, structured: { smoke: "ready" } }), target, kind);
   };
@@ -1058,7 +1096,7 @@ process.exitCode = await confinementScope.run(fakeConfinement, main);
         process.execPath,
         ...(timed || ownTimeout || mode === "completed" || mode === "probe"
           ? [entry]
-          : [confinedEntry, "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
+          : [confinedEntry, "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet-5.5@low"]),
       ],
       {
         env: {

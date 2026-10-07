@@ -1,0 +1,1 @@
+ALTER TABLE runs ADD COLUMN models_json TEXT NOT NULL DEFAULT '{}';

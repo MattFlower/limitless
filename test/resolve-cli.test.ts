@@ -1,22 +1,26 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseRunModels } from "../src/core/run-models.ts";
 
 type Seen = { method: string; path: string; type: string | null; body: unknown };
 
-async function cli(args: string[], respond: () => Response) {
+async function cli(args: string[], respond: (path: string) => Response, command = "resolve") {
   const seen: Seen[] = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
       const text = await req.text();
       const path = new URL(req.url).pathname;
-      seen.push({ method: req.method, path, type: req.headers.get("content-type"), body: JSON.parse(text) });
-      return respond();
+      const body = text ? JSON.parse(text) : null;
+      seen.push({ method: req.method, path, type: req.headers.get("content-type"), body });
+      return respond(path);
     },
   });
   try {
     const child = Bun.spawn(
-      [process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "resolve", ...args],
+      [process.execPath, join(import.meta.dir, "../src/cli/main.ts"), command, ...args],
       {
         env: { ...process.env, LIMITLESS_URL: `http://127.0.0.1:${server.port}` },
         stdout: "pipe",
@@ -33,6 +37,49 @@ async function cli(args: string[], respond: () => Response) {
     server.stop();
   }
 }
+
+test("run and retry send repeatable --model chains, show displays them", async () => {
+  const flags = [
+    "--model",
+    "implement=omlx/qwen-flash",
+    "--model",
+    "review=claude/opus@high|codex/sol,codex/luna",
+  ];
+  const models = { implement: ["omlx/qwen-flash"], review: ["claude/opus@high|codex/sol", "codex/luna"] };
+  const reply = () => Response.json({ id: "new", repoSlug: "o/r", status: "queued" });
+  const run = await cli(["Do it", "--repo", "o/r", ...flags], reply, "run");
+  expect(run.exit).toBe(0);
+  expect(run.seen[0]?.body).toMatchObject({ models });
+  const retry = await cli(["run 1", ...flags], reply, "retry");
+  expect(retry.exit).toBe(0);
+  expect(retry.seen[0]).toMatchObject({ path: "/api/runs/run%201/retry", body: { models } });
+  const inherit = await cli(["run 1"], reply, "retry");
+  expect(inherit.seen[0]?.body).toEqual({});
+  expect(() => parseRunModels(["chat=codex/sol"])).toThrow("Invalid --model");
+  expect(() => parseRunModels(["review=codex/sol", "review=claude/opus"])).toThrow("Duplicate");
+  const shown = await cli(
+    ["run 1"],
+    () =>
+      Response.json({
+        run: {
+          id: "run 1",
+          title: "Test",
+          repoSlug: "o/r",
+          status: "queued",
+          costUsd: 0,
+          costEquivUsd: 0,
+          models,
+        },
+        stages: [],
+        invocations: [],
+        questions: [],
+      }),
+    "show",
+  );
+  expect(shown.exit).toBe(0);
+  expect(shown.stdout).toContain("Model experiment: implement = omlx/qwen-flash");
+  expect(shown.stdout).toContain("review = claude/opus@high|codex/sol, codex/luna");
+});
 
 test("resolve posts the kind, ref and note once and reports the outcome or the daemon's error", async () => {
   const ok = await cli(
@@ -66,4 +113,58 @@ test("resolve posts the kind, ref and note once and reports the outcome or the d
   expect(usage.exit).not.toBe(0);
   expect(usage.stderr).toContain("usage: limitless resolve");
   expect(usage.seen).toEqual([]);
+});
+
+test("review posts findings as a changes verdict, or approves the head the factory last delivered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "review-cli-"));
+  try {
+    const findings = [{ severity: "major", title: "Handle empty input", detail: "It crashes." }];
+    const file = join(dir, "findings.json");
+    writeFileSync(file, JSON.stringify(findings));
+    const sha = "a".repeat(40);
+    const round = await cli(
+      ["r1", "--changes", file, "--sha", sha],
+      () => Response.json({ round: { id: "r2", title: "Review round 1: Add" } }, { status: 201 }),
+      "review",
+    );
+    expect(round.exit).toBe(0);
+    expect(round.stdout).toContain("Review round queued: r2");
+    expect(round.seen).toEqual([
+      {
+        method: "POST",
+        path: "/api/runs/r1/review",
+        type: "application/json",
+        body: { verdict: "changes", reviewedSha: sha, findings, reviewer: expect.any(String) },
+      },
+    ]);
+
+    const delivered = "c".repeat(40);
+    const detail = {
+      run: { headSha: "b".repeat(40) },
+      review: { rounds: [{ deliveredSha: delivered }, {}] },
+    };
+    const approve = await cli(
+      ["r1", "--approve"],
+      (path) =>
+        Response.json(path.endsWith("/review") ? { approval: { sha: delivered, stale: false } } : detail),
+      "review",
+    );
+    expect(approve.exit).toBe(0);
+    expect(approve.stdout).toContain(`Approved ${delivered}`);
+    expect(
+      approve.seen.map((s) => [s.method, s.path, (s.body as { reviewedSha?: string } | null)?.reviewedSha]),
+    ).toEqual([
+      ["GET", "/api/runs/r1", undefined],
+      ["POST", "/api/runs/r1/review", delivered],
+    ]);
+
+    for (const args of [["r1"], ["r1", "--approve", "--changes", file]]) {
+      const usage = await cli(args, () => Response.json({}), "review");
+      expect(usage.exit).not.toBe(0);
+      expect(usage.stderr).toContain("limitless review <run> --changes <findings.json> | --approve");
+      expect(usage.seen).toEqual([]);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

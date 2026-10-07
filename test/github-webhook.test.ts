@@ -11,6 +11,7 @@ import { Store } from "../src/db/store.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import type { GitHubClient } from "../src/integrations/github-poller.ts";
 import { type IntegrationDeps, type Integrations, mountIntegrations } from "../src/integrations/index.ts";
+import { LandQueue } from "../src/land/queue.ts";
 
 const fixture = (name: string): string => readFileSync(join(import.meta.dir, "data", name), "utf8").trim();
 let dir: string;
@@ -49,7 +50,8 @@ const noGitHub: GitHubClient = async (path, body) => {
 
 /** Mounts with fake GitHub, gh and tool probes unless a test overrides one. */
 function mount(deps: IntegrationDeps = {}): Promise<Integrations> {
-  return mountIntegrations({ cfg, store } as Factory, {
+  const land = new LandQueue({ store, paths: cfg.paths, log: () => {} });
+  return mountIntegrations({ cfg, store, land } as Factory, {
     toolVersions: async () => [],
     gh: async () => {},
     prClient: async () => null,
@@ -332,6 +334,44 @@ test("maps all Dependabot actions to quick existing-branch delivery", async () =
     expect(r.prompt).toContain("Run the repository gates and fix breakages");
     expect(r.prompt).toContain('"body": "Do not test"');
   }
+});
+
+test("reopen observations require a verified delivery and matching owner, actor and base repository", async () => {
+  cfg.githubOwner = "MattFlower";
+  const repo = store.getRepoBySlug("MattFlower/limitless");
+  if (!repo) throw new Error("missing repo");
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "factory PR" });
+  const prUrl = "https://github.com/MattFlower/limitless/pull/18";
+  store.observeGithubPrState(prUrl, "CLOSED", Date.now() - 8 * 86_400_000);
+  store.updateRun(run.id, { prUrl, prClosedUnmerged: true });
+  const h = handler();
+  const payload = {
+    action: "reopened",
+    repository: { full_name: repo.slug },
+    sender: { login: "MattFlower" },
+    pull_request: { number: 18, state: "open", base: { repo: { full_name: repo.slug } } },
+  };
+  const rejected = [
+    payload,
+    { ...payload, sender: { login: "attacker" } },
+    { ...payload, repository: { full_name: "other/limitless" } },
+    { ...payload, pull_request: { ...payload.pull_request, base: { repo: { full_name: "other/r" } } } },
+    { ...payload, pull_request: { ...payload.pull_request, state: "closed" } },
+    { ...payload, action: "synchronize" },
+  ];
+  for (const [i, body] of rejected.entries()) {
+    await h(request(JSON.stringify(body), `rejected-${i}`, i !== 0, "pull_request"));
+    expect(store.githubPrExpired(prUrl)).toBe(true);
+    expect(store.getRun(run.id)?.prClosedUnmerged).toBe(true);
+  }
+  const delivery = () => request(JSON.stringify(payload), "reopen", true, "pull_request");
+  expect((await h(delivery())).status).toBe(200);
+  expect(store.githubPrExpired(prUrl)).toBe(false);
+  expect(store.getRun(run.id)?.prClosedUnmerged).toBe(false);
+  expect(requests).toEqual([]);
+  store.updateRun(run.id, { prClosedUnmerged: true });
+  await h(delivery());
+  expect(store.getRun(run.id)?.prClosedUnmerged).toBe(true);
 });
 
 test.each([

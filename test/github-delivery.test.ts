@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Repo } from "../src/core/types.ts";
-import { pushExistingBranch } from "../src/git/repos.ts";
+import { pushBranch, pushExistingBranch } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -46,9 +46,27 @@ test("pushes verified descendant only to existing head and refuses moved head", 
   writeFileSync(join(work, "file.txt"), "fixed\n");
   await git(work, "add", ".");
   await git(work, "commit", "-qm", "fix");
-  await pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base);
   const updated = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  // Publication scans `updated`; a later local HEAD must not change what gets pushed.
+  writeFileSync(join(work, "file.txt"), "unscanned change\n");
+  await git(work, "commit", "-qam", "unscanned");
+  await pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base, undefined, undefined, updated);
   expect((await git(work, "ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).stdout).toContain(updated);
   expect((await git(work, "ls-remote", bare, "refs/heads/main")).stdout).toBe("");
   await expect(pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base)).rejects.toThrow("moved");
+});
+
+test.each(["remote", "existing", "local"])("%s delivery never follows tags or notes", async (kind) => {
+  const base = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  writeFileSync(join(work, "file.txt"), "changed\n");
+  await git(work, "commit", "-qam", "safe change");
+  const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  await git(work, "config", "push.followTags", "true");
+  await git(work, "tag", "-am", "synthetic tag", "secret-host.example");
+  await git(work, "notes", "add", "-m", "synthetic note");
+  const branch = kind === "existing" ? "dependabot/npm/pkg-2" : "delivered";
+  if (kind === "existing") await pushExistingBranch(repo, work, branch, base);
+  else await pushBranch(kind === "local" ? { ...repo, kind: "local", localPath: bare } : repo, work, branch);
+  expect((await git(bare, "rev-parse", `refs/heads/${branch}`)).stdout.trim()).toBe(head);
+  expect((await git(bare, "for-each-ref", "refs/tags", "refs/notes")).stdout).toBe("");
 });

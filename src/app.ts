@@ -1,7 +1,7 @@
 import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
-import type { CreateRunRequest, Question, Run } from "./core/types.ts";
+import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { Store } from "./db/store.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -15,21 +15,20 @@ import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import { seatbeltBackend } from "./harness/sandbox.ts";
-import type { Harness } from "./harness/types.ts";
+import { type Harness, protectCredentials } from "./harness/types.ts";
+import { getGitHubPr } from "./integrations/github-notifier.ts";
+import { type LandDeps, LandQueue } from "./land/queue.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
-import {
-  DEFAULT_POLICY,
-  MODELS,
-  type ModelDef,
-  type Policy,
-  PROVIDERS,
-  type ProviderDef,
-} from "./router/catalog.ts";
-import { loadPolicy } from "./router/policy.ts";
+import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
+import { resolveCatalog } from "./router/config-catalog.ts";
+import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
+import { RuntimeCatalog } from "./router/runtime-catalog.ts";
+import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
+import { redactCredentialData } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
@@ -53,12 +52,18 @@ export interface FactoryOptions {
   fetch?: typeof fetch;
   providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
   healthFetch?: typeof fetch;
+  /** Overrides for the land queue's GitHub reader, clock and CI limits (tests inject fakes). */
+  land?: Omit<LandDeps, "store" | "paths">;
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
-  readonly policy: Policy;
+  readonly routing: RuntimePolicy;
+  readonly catalog: RuntimeCatalog;
+  get policy(): Policy {
+    return this.router.getPolicy();
+  }
   readonly models: ModelDef[];
   readonly evalSettings: ReturnType<typeof evalSettings>;
   readonly evals: EvalRunner;
@@ -66,6 +71,7 @@ export class Factory {
   readonly tracker: ProviderTracker;
   readonly router: Router;
   readonly scheduler: Scheduler;
+  readonly land: LandQueue;
   readonly deps: EngineDeps;
   readonly startedAt = Date.now();
   readonly bootId = crypto.randomUUID();
@@ -83,19 +89,26 @@ export class Factory {
   ) {
     this.bootSha = opts.bootSha ?? "unknown";
     gateSlots.setLimit(cfg.maxConcurrentGates);
-    this.models = opts.models ?? MODELS;
+    const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
+    this.store = opts.store ?? new Store(cfg.paths.db);
+    this.models = [...(opts.models ?? catalog.models)];
     this.evalSettings = evalSettings(cfg.raw);
-    this.providerDefs = (opts.providers ?? PROVIDERS).map((provider) => ({
+    this.providerDefs = (opts.providers ?? catalog.providers).map((provider) => ({
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
+    for (const model of this.store.runtimeModels()) {
+      if (this.models.some((m) => m.id === model.id)) throw new Error(`catalog collision: ${model.id}`);
+      if (!this.providerDefs.some((p) => p.id === model.provider))
+        throw new Error(`unknown provider ${model.provider}`);
+      this.models.push(model);
+    }
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, console.warn);
-    this.policy =
-      opts.policy ??
-      (opts.policyPath === undefined
-        ? DEFAULT_POLICY
-        : loadPolicy(opts.policyPath, this.models, this.providerDefs));
-    this.store = opts.store ?? new Store(cfg.paths.db);
+    const code = opts.policy ?? DEFAULT_POLICY;
+    const evals =
+      opts.policy || opts.policyPath === undefined
+        ? {}
+        : readPolicy(opts.policyPath, this.models, this.providerDefs);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
     this.tracker = new ProviderTracker(
@@ -109,7 +122,27 @@ export class Factory {
       opts.providerTimer,
       opts.healthFetch,
     );
-    this.router = new Router(this.tracker, this.policy, this.models, cfg.preferProviders);
+    this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
+    this.tracker.setModels(this.models);
+    this.routing = new RuntimePolicy(
+      this.store,
+      this.router,
+      this.models,
+      this.providerDefs,
+      cfg.preferProviders,
+      code,
+      evals,
+    );
+    this.catalog = new RuntimeCatalog(
+      this.store,
+      this.models,
+      this.providerDefs,
+      this.router,
+      this.tracker,
+      this.routing,
+    );
+    if (!opts.models && !opts.providers)
+      validatePolicy(this.router.getPolicy(), this.models, this.providerDefs);
     this.tracker.setRoutingDescription((provider, exhausted) =>
       this.router.describeFallback(provider, exhausted),
     );
@@ -133,7 +166,7 @@ export class Factory {
           name,
           (async (spec) => {
             const fast = spec.fast ?? this.tracker.isFast(spec.target.provider);
-            const result = await harness({ ...spec, fast });
+            const result = redactCredentialData(await harness(protectCredentials({ ...spec, fast })));
             this.tracker.observeFast(spec.target.provider, fast, result);
             return result;
           }) satisfies Harness,
@@ -142,6 +175,15 @@ export class Factory {
     };
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
+    this.land = new LandQueue({
+      store: this.store,
+      paths: cfg.paths,
+      polling: cfg.githubPoll,
+      ciReruns: cfg.githubCiReruns,
+      client: getGitHubPr,
+      confinement: this.deps.confinement,
+      ...opts.land,
+    });
     this.concierge = new Concierge(this);
   }
 
@@ -167,7 +209,7 @@ export class Factory {
         ),
       policy: this.policy,
       models: this.models,
-      providers: this.providerDefs,
+      providers: this.providerDefs.map(({ apiKey: _key, ...p }) => p),
       runs: evidence.map(({ run, trials }) => ({
         ...run,
         costUsd: trials.reduce((n, t) => n + t.costUsd, 0),
@@ -178,6 +220,9 @@ export class Factory {
 
   start(): void {
     if (this.gcInterval) return;
+    for (const note of this.cfg.catalog?.notes ?? []) console.error(`[providers] ${note}`);
+    for (const p of this.tracker.all())
+      if (p.reason?.startsWith("missing key ")) console.error(`[providers] ${p.id}: ${p.reason}`);
     this.store.daemonStarted(this.bootId, version, this.bootSha);
     // UI development against seeded data must never launch real (paid) runs.
     if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;
@@ -206,7 +251,7 @@ export class Factory {
     this.gcInterval = null;
     await this.gcInFlight;
     this.tunnels.stop();
-    await Promise.all([this.scheduler.stop(), this.evals.stop()]);
+    await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
   }
 
   gc(dryRun = false): Promise<GcResult> {
@@ -233,7 +278,9 @@ export class Factory {
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
-    const repo = await resolveRepo(this.store, req.repo);
+    if (req.models !== undefined)
+      req = { ...req, models: validateRunModels(req.models, this.models, this.providerDefs) };
+    const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
       : this.store.createRun(repo, req, verifiedGitHubWebhook);
@@ -249,12 +296,13 @@ export class Factory {
     return this.scheduler.cancel(id, by);
   }
 
-  async retryRun(id: string): Promise<Run> {
+  async retryRun(id: string, models?: RunModels): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
     return this.createRun(
       {
         repo: run.repoSlug,
+        models: models === undefined ? run.models : models,
         prompt: run.prompt,
         dependsOn: run.dependsOn,
         title: run.title,

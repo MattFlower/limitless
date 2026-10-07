@@ -15,6 +15,7 @@ import type {
   Role,
   Run,
   RunEvent,
+  RunRole,
   Stage,
   StageName,
 } from "../core/types.ts";
@@ -31,8 +32,9 @@ import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
-import type { RouteConstraints, Router } from "../router/router.ts";
-import { recordEffort } from "../router/targets.ts";
+import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
+import { formatTarget, recordEffort } from "../router/targets.ts";
+import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
@@ -61,6 +63,8 @@ export interface RunState {
   parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
+  /** A review round's chosen base tip, saved before it is merged into the PR branch. */
+  reviewBaseSha?: string;
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
   phase: Phase;
@@ -84,6 +88,7 @@ export interface RunState {
   answers: string[];
   round: number;
   implementer?: {
+    policyRevision?: string;
     targetId?: string;
     effort?: ModelSelection["effort"];
     modelId: string;
@@ -251,6 +256,7 @@ export class RunContext {
   private readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
+  private readonly pinnedStages = new Map<number, string[]>();
   readonly runDir: string;
   previewUrl?: string;
   state: RunState;
@@ -406,7 +412,12 @@ export class RunContext {
         }
         return output;
       });
-      this.store.finishStage(stage.id, "succeeded", summary);
+      const chain = this.pinnedStages.get(stage.id);
+      this.store.finishStage(
+        stage.id,
+        "succeeded",
+        summary + (chain ? `; pinned chain: ${chain.join(", ")}` : ""),
+      );
       return value;
     } catch (e) {
       if (e instanceof SimulatedTermination) {
@@ -415,10 +426,11 @@ export class RunContext {
       }
       const cancelled =
         e instanceof CancelledError || e instanceof SimulatedTermination || this.signal.aborted;
+      const chain = this.pinnedStages.get(stage.id);
       this.store.finishStage(
         stage.id,
         cancelled ? "cancelled" : "failed",
-        (e as Error).message.slice(0, 500),
+        (e as Error).message.slice(0, 500) + (chain ? `; pinned chain: ${chain.join(", ")}` : ""),
       );
       throw cancelled && !(e instanceof SimulatedTermination) ? new CancelledError() : e;
     } finally {
@@ -433,13 +445,32 @@ export class RunContext {
   async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
     const { router, tracker, store, harnesses } = this.deps;
     const { shadow } = opts;
+    const chain = shadow ? undefined : this.run.models?.[opts.role as RunRole];
+    const failures = new Map<string, string>();
     const health = shadow ? undefined : tracker;
     const signal = shadow?.signal ?? this.signal;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     const busy = new Set<string>();
     let waitMs = 0;
     let lastFailure: string | null = null;
-    let specIdRetried = false;
+    const specIdRetried = new Set<string>();
+    const exhaustPinned = (decision: RouteDecision, deadline = false): never => {
+      const skipped = [
+        ...decision.skipped,
+        ...decision.candidates.map((target) => ({
+          modelId: target.targetId ?? target.modelId,
+          reason:
+            busy.has(target.provider) ||
+            (tracker.status(target.provider)?.inFlight ?? 0) >=
+              (tracker.status(target.provider)?.maxConcurrent ?? Infinity)
+              ? "busy until the deadline"
+              : "invocation deadline expired",
+        })),
+      ];
+      const message = `No model available for ${opts.role}; pinned chain: ${chain?.join(", ")}. Skipped: ${skipped.map((s) => `${s.modelId} (${failures.get(s.modelId) ?? s.reason})`).join(", ")}.${deadline ? " Invocation deadline expired." : ""} Retry with another chain or resolve this run.`;
+      store.askQuestion(this.run.id, message);
+      throw new NoCapacityError(message);
+    };
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
     let lastResort: InvokeOutcome | null = null;
     const useLastResort = (outcome: InvokeOutcome, why: string) => {
@@ -451,27 +482,36 @@ export class RunContext {
     };
 
     const left = () => (opts.deadline === undefined ? Number.POSITIVE_INFINITY : opts.deadline - Date.now());
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let attempt = 0; attempt < (chain ? Infinity : 6); attempt++) {
       this.checkCancelled();
       if (signal.aborted) throw new CancelledError();
-      if (left() <= 0)
+      if (!chain && left() <= 0)
         throw new NoCapacityError(
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
         );
+      const revision = router.policyRevision;
+      const cellRevision = router.cellRevision(opts.role, opts.complexity);
       const decision = router.route(
         opts.role,
         opts.complexity,
-        this.routingConstraints({ ...opts.constraints, exclude: tried }),
+        this.routingConstraints({
+          ...opts.constraints,
+          exclude: tried,
+          ...(chain ? { chain, ...(opts.role === "verify" ? { excludeModels: undefined } : {}) } : {}),
+        }),
         !shadow,
       );
+      if (chain && left() <= 0) exhaustPinned(decision, true);
       const candidates = decision.candidates;
       let target =
         candidates.find((t) => {
           const status = tracker.status(t.provider);
           return !busy.has(t.provider) || (status && status.inFlight < status.maxConcurrent);
         }) ?? candidates[0];
-      if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
+      if (!target && lastResort && !chain)
+        return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
+        if (chain) exhaustPinned(decision);
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
         if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
         throw new NoCapacityError(
@@ -508,15 +548,17 @@ export class RunContext {
         admission = { provider: target.provider, release: free };
       } else {
         const provider = target.provider;
+        const admissionSignal = AbortSignal.any([this.signal, revision]);
         admission = await (allBusy
-          ? tracker.acquireFirst(providers, this.signal, limit, onWait)
+          ? tracker.acquireFirst(providers, admissionSignal, limit, onWait)
           : tracker
-              .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
+              .acquire(provider, admissionSignal, busy.has(provider) ? 0 : limit, (ahead) =>
                 onWait(provider, ahead),
               )
               .then((release) => release && { provider, release })
         ).catch((error: unknown) => {
           this.checkCancelled();
+          if (revision.aborted) return null;
           throw error;
         });
       }
@@ -526,7 +568,14 @@ export class RunContext {
       if (this.signal.aborted || left() <= 0) {
         release?.();
         this.checkCancelled();
+        if (chain) exhaustPinned(decision, true);
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
+      }
+      if (revision.aborted) {
+        release?.();
+        busy.clear();
+        attempt--;
+        continue;
       }
       if (!release) {
         busy.add(target.provider);
@@ -534,11 +583,23 @@ export class RunContext {
         continue;
       }
       const ready = shadow ? tracker.isAvailable(target.provider) : await tracker.preflight(target.provider);
+      if (revision.aborted) {
+        release();
+        busy.clear();
+        attempt--;
+        continue;
+      }
       if (!ready || tracker.modelUnavailableReason(target.modelId)) {
         release();
         tried.push({ modelId: target.modelId, effort: target.effort ?? null });
         attempt--;
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
+        failures.set(
+          target.targetId ?? target.modelId,
+          tracker.unavailableReason(target.provider) ??
+            tracker.modelUnavailableReason(target.modelId) ??
+            "no capacity after provider refresh",
+        );
         continue;
       }
       if (this.signal.aborted) release();
@@ -556,8 +617,10 @@ export class RunContext {
         throw new Error(`No harness registered for ${harnessName}`);
       }
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
+      const previousImplementer = this.state.implementer;
       if (opts.role === "implement") {
         this.state.implementer = {
+          policyRevision: cellRevision,
           modelId: target.modelId,
           targetId: target.targetId,
           effort: target.effort ?? null,
@@ -567,6 +630,7 @@ export class RunContext {
         try {
           await this.save();
         } catch (error) {
+          this.state.implementer = previousImplementer;
           release();
           throw error;
         }
@@ -588,6 +652,35 @@ export class RunContext {
         invocationId: invocation.id,
         skipped: decision.skipped,
       });
+      if (chain) {
+        this.pinnedStages.set(opts.stage.id, chain);
+        const c = opts.constraints;
+        const avoidedVendor = [c?.avoidVendor ?? [], c?.preferNotVendor ?? []].flat().includes(target.vendor);
+        const avoidedModel = [
+          ...(c?.preferNotModels ?? []),
+          ...(opts.role === "verify" ? (c?.excludeModels ?? []) : []),
+        ].some((id) => router.checkpointIdentity(id) === router.checkpointIdentity(target.modelId));
+        if (avoidedVendor || avoidedModel)
+          this.log(
+            `${opts.role} used ${opts.role === "holdout" ? "the spec author's" : "the implementer's"} vendor/checkpoint (${target.vendor}, ${target.targetId ?? target.modelId}) because this run pinned it`,
+            "warn",
+          );
+      }
+      let dispatched = false;
+      const dispatch = () => {
+        // Persist tried history without yielding between recording it and starting the harness.
+        if (
+          opts.role === "implement" &&
+          !this.state.triedImplementers.some(
+            (ref) =>
+              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) === target.targetId,
+          )
+        ) {
+          this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
+          store.setRunState(this.run.id, this.state);
+        }
+        dispatched = true;
+      };
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
@@ -640,11 +733,31 @@ export class RunContext {
         this.checkCancelled();
         const stream = await this.faults.hit("harness:stream", faultContext, this.signal);
         this.checkCancelled();
-        if (stream) result = parseFakeStream(stream, spec.onEvent);
-        else if (!noTools) {
+        // Saving state, preparing redaction and fault hooks can also yield before the model call.
+        if (revision.aborted) {
+          store.updateInvocation(invocation.id, {
+            status: "cancelled",
+            error: "routing changed before model call",
+            finishedAt: Date.now(),
+          });
+          tried.pop();
+          busy.clear();
+          attempt--;
+          continue;
+        }
+        if (stream) {
+          dispatch();
+          result = parseFakeStream(stream, spec.onEvent);
+        } else if (!noTools) {
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
-          result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
-        } else result = await harness(spec);
+          result = await withScratch(spec.cwd, (scratchDir) => {
+            dispatch();
+            return harness({ ...spec, scratchDir });
+          });
+        } else {
+          dispatch();
+          result = await harness(spec);
+        }
       } catch (e) {
         if (e instanceof SimulatedTermination) {
           this.termination = e;
@@ -663,6 +776,10 @@ export class RunContext {
           quota: null,
         };
       } finally {
+        if (!dispatched && revision.aborted && opts.role === "implement") {
+          this.state.implementer = previousImplementer;
+          store.setRunState(this.run.id, this.state);
+        }
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         const checkout = shadow?.cwd ?? this.state.worktreePath;
@@ -691,15 +808,17 @@ export class RunContext {
             };
       }
 
+      result = redactCredentialData(result);
       const updated = store.updateInvocation(invocation.id, {
         status: result.status,
         fastModeState: result.fastModeState ?? null,
         fastModeDisabledReason: result.fastModeDisabledReason ?? null,
         costUsd: result.costUsd,
         costEquivUsd: result.costEquivUsd,
-        inputTokens: result.usage.input + result.usage.cacheWrite,
+        inputTokens: result.usage.input,
         outputTokens: result.usage.output,
         cacheReadTokens: result.usage.cacheRead,
+        cacheWriteTokens: result.usage.cacheWrite,
         numTurns: result.numTurns,
         sessionId: result.sessionId,
         // A failed confinement probe ran before the agent, so its error holds no private output.
@@ -729,6 +848,13 @@ export class RunContext {
                 : result.error,
         });
       this.run = store.refreshRunTotals(this.run.id);
+      if (result.status !== "ok")
+        failures.set(
+          target.targetId ?? target.modelId,
+          opts.privateOutput
+            ? result.status
+            : `${result.status}: ${redact?.(result.error ?? "already tried") ?? result.error ?? "already tried"}`,
+        );
 
       if (this.termination) throw this.termination;
       if (cause) throw cause;
@@ -781,10 +907,16 @@ export class RunContext {
         continue;
       }
       if (opts.role === "spec" && invalidSpecId) {
-        if (specIdRetried) throw new Error(result.error ?? invalidSpecId);
-        specIdRetried = true;
-        opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${invalidSpecId}\n${result.error}` };
-        tried.pop();
+        const id = target.targetId ?? target.modelId;
+        if (!specIdRetried.has(id)) {
+          specIdRetried.add(id);
+          opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${invalidSpecId}\n${result.error}` };
+          tried.pop();
+          continue;
+        }
+        failures.set(id, `validation failed: ${invalidSpecId}`);
+        lastFailure = `${id}: validation failed: ${invalidSpecId}`;
+        this.log(`${id} returned invalid spec criterion IDs twice; trying next model`, "warn");
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {

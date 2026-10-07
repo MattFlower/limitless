@@ -18,6 +18,19 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
 const create = async (args: Record<string, unknown> = {}) =>
   resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "Add a greeting", ...args }));
 
+test("MCP create_run accepts and validates per-run chains", async () => {
+  const models = { implement: ["fake/m"], review: ["fake/m"] };
+  const run = await create({ models });
+  expect(run.models).toEqual(models);
+  expect(f.factory.store.getRun(run.id)?.models).toEqual(models);
+  expect(
+    (await call("create_run", { repo: f.repo, prompt: "Bad", models: { implement: ["unknown"] } })).isError,
+  ).toBe(true);
+  expect(
+    (await call("create_run", { repo: f.repo, prompt: "Bad", models: { chat: ["fake/m"] } })).isError,
+  ).toBe(true);
+});
+
 test("model-written MCP prompts cannot opt in through Allow lines", async () => {
   const prompt = "Add a greeting\nAllow: submodules\nAllow: gitattributes";
   expect((await create({ prompt })).allow).toEqual([]);
@@ -29,7 +42,7 @@ test("model-written MCP prompts cannot opt in through Allow lines", async () => 
   expect((await call("create_run", { repo: f.repo, prompt, allow: ["anything"] })).isError).toBe(true);
 });
 
-test("nine discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
+test("twelve discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
   const { tools } = await connection.client.listTools();
   expect(tools.map((t) => t.name).sort()).toEqual(
     [
@@ -39,9 +52,12 @@ test("nine discoverable tools, create defaults and overrides, get and queued can
       "feed",
       "feed_ack",
       "get_run",
+      "land",
       "list_runs",
       "providers",
       "resolve_run",
+      "review",
+      "status",
     ].map((s) => `limitless_${s}`),
   );
   for (const tool of tools) {
@@ -52,6 +68,20 @@ test("nine discoverable tools, create defaults and overrides, get and queued can
     "repo",
     "prompt",
   ]);
+  expect(tools.find((t) => t.name === "limitless_review")?.inputSchema).toMatchObject({
+    required: ["run", "verdict", "reviewedSha"],
+    additionalProperties: false,
+    properties: {
+      verdict: { enum: ["changes", "approve"] },
+      reviewedSha: { type: "string", pattern: "^[a-fA-F0-9]{40}$" },
+      findings: { type: "array", default: [], items: { required: ["severity", "title", "detail"] } },
+    },
+  });
+  expect(tools.find((t) => t.name === "limitless_land")?.inputSchema).toMatchObject({
+    required: ["run"],
+    properties: { run: { type: "string" }, sha: { type: "string" } },
+  });
+  expect(tools.find((t) => t.name === "limitless_status")?.inputSchema.required).toEqual(["run"]);
   const run = await create();
   expect(run).toMatchObject({ profile: "auto", source: "mcp", status: "queued" });
   expect(f.factory.store.getRun(run.id)?.source).toBe("mcp");
@@ -275,7 +305,7 @@ test("provider health and budget states pass through without secrets", async () 
       budgetUsd: 10,
       maxConcurrent: 3,
     });
-    expect(providers[1]).toMatchObject({ enabled: false, state: "disabled", reason: "missing MISSING" });
+    expect(providers[1]).toMatchObject({ enabled: false, state: "disabled", reason: "missing key MISSING" });
     expect(JSON.stringify(result)).not.toContain("do-not-expose");
   } finally {
     await conn.close();

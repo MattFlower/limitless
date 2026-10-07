@@ -11,6 +11,7 @@ import type {
   Run,
   RunDetail,
   RunEvent,
+  RunModels,
   RunStatus,
   StreamMessage,
 } from "../src/core/types.ts";
@@ -63,9 +64,12 @@ export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>("/api/health", { signal: AbortSignal.timeout(5000) });
 }
 
-export function listRuns(opts: { status?: RunStatus[]; limit?: number } = {}): Promise<Run[]> {
+export function listRuns(
+  opts: { status?: RunStatus[]; limit?: number; ids?: string[] } = {},
+): Promise<Run[]> {
   const qs = new URLSearchParams();
   if (opts.status?.length) qs.set("status", opts.status.join(","));
+  if (opts.ids?.length) qs.set("ids", opts.ids.join(","));
   if (opts.limit) qs.set("limit", String(opts.limit));
   const q = qs.toString();
   return request<Run[]>(`/api/runs${q ? `?${q}` : ""}`);
@@ -83,8 +87,18 @@ export function cancelRun(id: string): Promise<{ cancelled: boolean }> {
   return request(`/api/runs/${id}/cancel`, { method: "POST" });
 }
 
-export function retryRun(id: string): Promise<Run> {
-  return request<Run>(`/api/runs/${id}/retry`, { method: "POST" });
+export function retryRun(id: string, models?: RunModels): Promise<Run> {
+  return request<Run>(`/api/runs/${id}/retry`, {
+    method: "POST",
+    ...(models ? { body: JSON.stringify({ models }) } : {}),
+  });
+}
+
+export function resolveRun(
+  id: string,
+  input: { kind: "done_elsewhere" | "superseded" | "wont_do"; ref?: string; note?: string },
+): Promise<Run> {
+  return request<Run>(`/api/runs/${id}/resolve`, { method: "POST", body: JSON.stringify(input) });
 }
 
 export function answerRun(id: string, answer: string, questionId?: number): Promise<Question[]> {
@@ -152,26 +166,52 @@ export function getRepos(): Promise<Repo[]> {
   return request<Repo[]>("/api/repos");
 }
 
+const CLOSED = 2; // EventSource.CLOSED
+
+/**
+ * The browser's EventSource retries a dropped connection itself, but gives up for good on an HTTP
+ * error, such as a reverse proxy's 502 while the daemon restarts; reopen it after a pause then.
+ */
+function openEventStream(
+  url: string,
+  onData: (data: string) => void,
+  onConnected: (connected: boolean) => void,
+): () => void {
+  let source: EventSource;
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  const open = () => {
+    source = new EventSource(url);
+    source.onopen = () => onConnected(true);
+    source.onerror = () => {
+      onConnected(false);
+      if (source.readyState === CLOSED) retry = setTimeout(open, 3000);
+    };
+    source.onmessage = (ev) => onData(ev.data);
+  };
+  open();
+  return () => {
+    clearTimeout(retry);
+    source.close();
+  };
+}
+
+const streamMessages = (onMessage: (msg: StreamMessage) => void) => (data: string) => {
+  try {
+    onMessage(JSON.parse(data) as StreamMessage);
+  } catch {
+    // ignore malformed frame
+  }
+};
+
 /**
  * Open the global SSE stream (run/stage/invocation/provider/question — events are excluded).
- * The browser's native EventSource retries on drop; `onConnected` tracks readyState for a UI
- * indicator.
+ * `onConnected` tracks the connection for a UI indicator; every reconnect reports `true` again.
  */
 export function openGlobalStream(
   onMessage: (msg: StreamMessage) => void,
   onConnected: (connected: boolean) => void,
 ): () => void {
-  const source = new EventSource("/api/stream");
-  source.onopen = () => onConnected(true);
-  source.onerror = () => onConnected(false);
-  source.onmessage = (ev) => {
-    try {
-      onMessage(JSON.parse(ev.data) as StreamMessage);
-    } catch {
-      // ignore malformed frame
-    }
-  };
-  return () => source.close();
+  return openEventStream("/api/stream", streamMessages(onMessage), onConnected);
 }
 
 /** Per-run SSE stream: replays the event backlog after `after`, then streams live. */
@@ -181,17 +221,7 @@ export function openRunStream(
   onMessage: (msg: StreamMessage) => void,
   onConnected: (connected: boolean) => void,
 ): () => void {
-  const source = new EventSource(`/api/runs/${runId}/stream?after=${after}`);
-  source.onopen = () => onConnected(true);
-  source.onerror = () => onConnected(false);
-  source.onmessage = (ev) => {
-    try {
-      onMessage(JSON.parse(ev.data) as StreamMessage);
-    } catch {
-      // ignore malformed frame
-    }
-  };
-  return () => source.close();
+  return openEventStream(`/api/runs/${runId}/stream?after=${after}`, streamMessages(onMessage), onConnected);
 }
 
 export function getChat(id: string): Promise<import("../src/core/types.ts").ChatConversation> {
@@ -214,14 +244,14 @@ export function openChatStream(
   onMessage: (message: import("../src/core/types.ts").ChatMessage) => void,
   onConnected: (connected: boolean) => void,
 ): () => void {
-  const source = new EventSource(`/api/chat/${encodeURIComponent(id)}/stream?after=${after}`);
-  source.onopen = () => onConnected(true);
-  source.onerror = () => onConnected(false);
-  source.onmessage = (event) => {
-    const update = JSON.parse(event.data) as import("../src/core/types.ts").ChatStreamMessage;
-    if (update.kind === "chat" && update.message.conversationId === id) onMessage(update.message);
-  };
-  return () => source.close();
+  return openEventStream(
+    `/api/chat/${encodeURIComponent(id)}/stream?after=${after}`,
+    (data) => {
+      const update = JSON.parse(data) as import("../src/core/types.ts").ChatStreamMessage;
+      if (update.kind === "chat" && update.message.conversationId === id) onMessage(update.message);
+    },
+    onConnected,
+  );
 }
 
 export function getEvalPolicy(): Promise<import("../src/evals/policy.ts").EvalPolicyResponse> {
@@ -230,3 +260,24 @@ export function getEvalPolicy(): Promise<import("../src/evals/policy.ts").EvalPo
 export function getEvalReport(id: string): Promise<import("../src/evals/stats.ts").EvalReport> {
   return request(`/api/evals/${encodeURIComponent(id)}`);
 }
+
+export type RoutingSnapshot = ReturnType<import("../src/router/runtime-policy.ts").RuntimePolicy["snapshot"]>;
+export type CatalogSnapshot = ReturnType<
+  import("../src/router/runtime-catalog.ts").RuntimeCatalog["snapshot"]
+>;
+export const getRouting = () => request<RoutingSnapshot>("/api/routing");
+export const getCatalog = () => request<CatalogSnapshot>("/api/catalog");
+export const getRoutingPreview = (role: string, complexity: string) =>
+  request<import("../src/router/router.ts").RoutePreview[]>(
+    `/api/routing/preview?${new URLSearchParams({ role, complexity })}`,
+  );
+export const updateRouting = (key: string, method: "PUT" | "DELETE", value?: object) =>
+  request<RoutingSnapshot>(`/api/routing/${key}`, {
+    method,
+    ...(value ? { body: JSON.stringify(value) } : {}),
+  });
+export const updateCatalog = (method: "POST" | "PATCH" | "DELETE", id?: string, value?: object) =>
+  request<CatalogSnapshot>(`/api/catalog/models${id ? `/${encodeURIComponent(id)}` : ""}`, {
+    method,
+    ...(value ? { body: JSON.stringify(value) } : {}),
+  });

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
-import { assertExistingBranchDelivery } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, type FactoryBranchGrant } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
   AuthPasskey,
@@ -10,6 +10,7 @@ import type {
   ChatOrigin,
   ChatProposal,
   ChatProposalFields,
+  CiFailure,
   CreateRunRequest,
   EvalRun,
   EvalTrial,
@@ -18,12 +19,20 @@ import type {
   FeedItem,
   FeedPage,
   GitHubAccessProblem,
+  GitHubFeedKind,
   Invocation,
   InvocationStatus,
+  LandEntry,
+  LandFeedKind,
+  OperatorRoutingCell,
   Question,
   QuotaAlert,
   Repo,
   ResolutionKind,
+  ReviewApproval,
+  ReviewFinding,
+  ReviewRound,
+  RoutingChange,
   Run,
   RunDetail,
   RunEvent,
@@ -35,13 +44,23 @@ import type {
   StreamMessage,
   TrackedPr,
 } from "../core/types.ts";
-import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
+import {
+  ACTIVE_LAND_STATES,
+  DEFAULT_EVAL_CONCURRENCY,
+  MAX_RUN_IDS,
+  TERMINAL_STATUSES,
+} from "../core/types.ts";
+import type { RunState } from "../pipeline/context.ts";
+import type { ModelDef } from "../router/catalog.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
 type Listener = (msg: StreamMessage) => void;
 
 const MAX_EVENT_DATA = 16_000;
+
+/** A run id as `newId()` makes it: lowercase base 36. */
+const RUN_ID = /^[0-9a-z]{1,32}$/;
 
 export function newId(prefix = ""): string {
   const time = Date.now().toString(36);
@@ -55,7 +74,20 @@ function json(v: unknown): string | null {
 
 const FEED_SELECT =
   "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
-type GitHubFeedInput = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
+type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
+type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
+const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
+  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
+  log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
+  finished_at AS finishedAt FROM land_entries`;
+const LAND_PATCH_COLUMNS: Record<string, string> = {
+  state: "state",
+  pushedSha: "pushed_sha",
+  ciRerun: "ci_rerun",
+  logPath: "log_path",
+  attempts: "attempts",
+  reason: "reason",
+};
 const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
@@ -169,6 +201,7 @@ const toRun = (r: Row): Run => ({
   finishedAt: (r.finished_at as number) ?? null,
   priority: r.priority as number,
   ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
+  models: parse(r.models_json, {}),
   allow: AUDIT_ALLOWANCES.filter((kind) => parse<unknown[]>(r.audit_allow, []).includes(kind)),
 });
 
@@ -203,6 +236,7 @@ const toInvocation = (r: Row): Invocation => ({
   inputTokens: r.input_tokens as number,
   outputTokens: r.output_tokens as number,
   cacheReadTokens: r.cache_read_tokens as number,
+  cacheWriteTokens: r.cache_write_tokens as number,
   numTurns: r.num_turns as number,
   sessionId: (r.session_id as string) ?? null,
   error: (r.error as string) ?? null,
@@ -296,6 +330,7 @@ export interface InvocationPatch {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   numTurns?: number;
   sessionId?: string | null;
   error?: string | null;
@@ -311,6 +346,7 @@ const INVOCATION_PATCH_COLUMNS: Record<keyof InvocationPatch, string> = {
   inputTokens: "input_tokens",
   outputTokens: "output_tokens",
   cacheReadTokens: "cache_read_tokens",
+  cacheWriteTokens: "cache_write_tokens",
   numTurns: "num_turns",
   sessionId: "session_id",
   error: "error",
@@ -910,19 +946,38 @@ export class Store {
 
   // Provenance is an internal argument, never taken from the public request object.
   createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
-    assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
+    if (req.sourceRef?.kind === "review-round")
+      throw new Error("review rounds are created only by a review verdict");
+    return this.insertRun(repo, req, verifiedGitHubWebhook);
+  }
+
+  /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */
+  private insertRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    verifiedGitHubWebhook: boolean,
+    round?: { prUrl: string; grant: FactoryBranchGrant },
+  ): Run {
+    assertExistingBranchDelivery(
+      repo,
+      { ...req, githubWebhookVerified: verifiedGitHubWebhook },
+      round?.grant,
+    );
     const id = newId();
     const dependsOn = this.validateDependencies(req.dependsOn, id);
     const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     // Composed/model prompts cannot grant allowances; these sources use explicit options only.
     const composed =
-      verifiedGitHubWebhook || ["github", "mcp"].includes(req.source ?? "") || !!req.sourceRef?.proposalId;
+      verifiedGitHubWebhook ||
+      !!round ||
+      ["github", "mcp"].includes(req.source ?? "") ||
+      !!req.sourceRef?.proposalId;
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -944,10 +999,184 @@ export class Store {
         dependency.finishedAt ?? null,
         req.noBaselineCache === true ? 1 : 0,
         json(allow),
+        round?.prUrl ?? null,
+        json(req.models ?? {}),
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
     return run;
+  }
+
+  // ---- review rounds and approvals -------------------------------------------
+
+  /**
+   * Creates a round run with the record that authorizes it, at most one in flight and `cap` in all
+   * per PR. Over the cap it creates nothing and leaves `owner` needs_human instead.
+   */
+  createReviewRound(
+    repo: Repo,
+    owner: Run,
+    review: { prUrl: string; reviewedSha: string; findings: ReviewFinding[]; cap: number },
+    request: (round: number) => CreateRunRequest,
+  ): { run: Run } | { active: ReviewRound } | { limited: Run } {
+    return this.chatTransaction(() => {
+      const rounds = this.reviewRounds(review.prUrl);
+      const active = rounds.find((r) => !TERMINAL_STATUSES.includes(r.status));
+      if (active) return { active };
+      // The newest verdict wins: changes requested now outrank an earlier approval, even over the cap.
+      this.db
+        .query("UPDATE review_approvals SET stale_reason = ? WHERE pr_url = ? AND stale_reason IS NULL")
+        .run(`changes requested at ${review.reviewedSha}`, review.prUrl);
+      if (rounds.length >= review.cap)
+        return {
+          limited: this.updateRun(owner.id, { status: "needs_human", error: "review round limit reached" }),
+        };
+      const round = rounds.length + 1;
+      const grant = { owner, prUrl: review.prUrl, head: review.reviewedSha };
+      const run = this.insertRun(repo, request(round), false, { prUrl: review.prUrl, grant });
+      this.db
+        .query(
+          "INSERT INTO review_rounds (run_id, source_run_id, pr_url, round, reviewed_sha, findings, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          run.id,
+          owner.id,
+          review.prUrl,
+          round,
+          review.reviewedSha,
+          JSON.stringify(review.findings),
+          Date.now(),
+        );
+      return { run };
+    });
+  }
+
+  /** The review handler's record for `runId`, which alone authorizes it to push onto `owner`'s PR branch. */
+  reviewRound(
+    runId: string,
+  ): { owner: Run; prUrl: string; round: number; reviewedSha: string; findings: ReviewFinding[] } | null {
+    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, reviewed_sha AS reviewedSha, findings
+      FROM review_rounds WHERE run_id = ?`;
+    const row = this.db.query(sql).get(runId) as {
+      sourceRunId: string;
+      prUrl: string;
+      round: number;
+      reviewedSha: string;
+      findings: string;
+    } | null;
+    const owner = row && this.getRun(row.sourceRunId);
+    if (!row || !owner) return null;
+    const { prUrl, round, reviewedSha } = row;
+    return { owner, prUrl, round, reviewedSha, findings: parse(row.findings, []) };
+  }
+
+  reviewRounds(prUrl: string): ReviewRound[] {
+    const sql = `SELECT rr.run_id AS runId, rr.round, runs.status, rr.reviewed_sha AS reviewedSha,
+        rr.delivered_sha AS deliveredSha, rr.findings, rr.created_at AS createdAt
+      FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
+    return (this.db.query(sql).all(prUrl) as Row[]).map((r) => ({
+      ...(r as unknown as ReviewRound),
+      findings: parse(r.findings, []),
+    }));
+  }
+
+  markRoundDelivered(runId: string, sha: string): void {
+    this.db
+      .query("UPDATE review_rounds SET delivered_sha = ? WHERE run_id = ? AND delivered_sha IS NULL")
+      .run(sha, runId);
+    this.publishFeed();
+  }
+
+  /** `findings_resolved` counts the findings of the PR's delivered rounds. */
+  recordApproval(runId: string, prUrl: string, sha: string, reviewer: string): ReviewApproval {
+    this.db
+      .query(
+        `INSERT INTO review_approvals (run_id, pr_url, sha, reviewer, findings_resolved, created_at)
+        SELECT ?1, ?2, ?3, ?4, coalesce(sum(json_array_length(findings)), 0), ?5
+        FROM review_rounds WHERE pr_url = ?2 AND delivered_sha IS NOT NULL`,
+      )
+      .run(runId, prUrl, sha, reviewer, Date.now());
+    this.publishFeed();
+    return this.approvalFor(prUrl) as ReviewApproval;
+  }
+
+  approvalFor(prUrl: string): ReviewApproval | null {
+    const row = this.db
+      .query("SELECT sha, stale_reason FROM review_approvals WHERE pr_url = ? ORDER BY id DESC LIMIT 1")
+      .get(prUrl) as Row | null;
+    return row ? { sha: row.sha as string, stale: row.stale_reason !== null } : null;
+  }
+
+  /** The last head seen on a PR, and its version (0 before any). */
+  prHead(prUrl: string): { sha: string; version: number } | null {
+    return this.db.query("SELECT sha, version FROM pr_heads WHERE pr_url = ?").get(prUrl) as {
+      sha: string;
+      version: number;
+    } | null;
+  }
+
+  /**
+   * Records a head seen on a PR; an approval of any other commit goes stale. With `since`, the
+   * version read before looking, the observation is refused (false) while a round is pushing to the
+   * PR or once the epoch has moved on at all, even to the same head: a head recorded when a push
+   * began is only what the push intended, so agreeing with it proves nothing.
+   */
+  observePrHead(prUrl: string, head: string, since?: number): boolean {
+    return this.db.transaction(() => {
+      const last = this.prHead(prUrl);
+      if (since !== undefined && (this.pushingTo(prUrl) || (last ? last.version : 0) !== since)) return false;
+      if (last?.sha !== head) this.writePrHead(prUrl, head, null);
+      this.staleApprovals(prUrl, head);
+      return true;
+    })();
+  }
+
+  /** A round's push begins: earlier lookups are overtaken and approvals of other heads go stale. */
+  beginPrPush(prUrl: string, head: string, runId: string): void {
+    this.db.transaction(() => {
+      this.writePrHead(prUrl, head, runId);
+      this.staleApprovals(prUrl, head);
+    })();
+  }
+
+  /** It ends with `head` on the remote (null: unknown): the epoch moves on again, past any lookup made meanwhile. */
+  endPrPush(prUrl: string, head: string | null): void {
+    this.db.transaction(() => {
+      if (head === null)
+        this.db
+          .query(
+            "UPDATE pr_heads SET version = version + 1, observed_at = ?, pushing = NULL WHERE pr_url = ?",
+          )
+          .run(Date.now(), prUrl);
+      else {
+        this.writePrHead(prUrl, head, null);
+        this.staleApprovals(prUrl, head);
+      }
+    })();
+  }
+
+  /** A round run, not yet finished, recorded as pushing to the PR (a crash can leave one behind). */
+  private pushingTo(prUrl: string): boolean {
+    const sql = `SELECT 1 FROM pr_heads h JOIN runs ON runs.id = h.pushing
+      WHERE h.pr_url = ? AND runs.status NOT IN (${TERMINAL_STATUSES.map(() => "?").join(", ")})`;
+    return this.db.query(sql).get(prUrl, ...TERMINAL_STATUSES) !== null;
+  }
+
+  private writePrHead(prUrl: string, head: string, pushing: string | null): void {
+    this.db
+      .query(
+        `INSERT INTO pr_heads (pr_url, sha, version, observed_at, pushing) VALUES (?1, ?2, 1, ?3, ?4)
+        ON CONFLICT (pr_url) DO UPDATE SET sha = ?2, version = version + 1, observed_at = ?3, pushing = ?4`,
+      )
+      .run(prUrl, head, Date.now(), pushing);
+  }
+
+  private staleApprovals(prUrl: string, head: string): void {
+    this.db
+      .query(
+        "UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2 WHERE pr_url = ?1 AND stale_reason IS NULL AND sha <> ?2",
+      )
+      .run(prUrl, head);
   }
 
   private validateDependencies(input: unknown, candidateId: string): string[] {
@@ -1049,9 +1278,15 @@ export class Store {
     return row ? toRun(row) : null;
   }
 
-  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string } = {}): Run[] {
+  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string; ids?: string[] } = {}): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
+    if (opts.ids) {
+      if (opts.ids.length > MAX_RUN_IDS || !opts.ids.every((id) => RUN_ID.test(id)))
+        throw new Error(`ids must list at most ${MAX_RUN_IDS} valid run ids`);
+      where.push(`runs.id IN (${opts.ids.map(() => "?").join(",")})`);
+      params.push(...opts.ids);
+    }
     if (opts.status?.length) {
       where.push(`runs.status IN (${opts.status.map(() => "?").join(",")})`);
       params.push(...opts.status);
@@ -1109,6 +1344,8 @@ export class Store {
     if (sets.length)
       this.db.query(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     const run = this.getRun(id) as Run;
+    if (run.prUrl && patch.prClosedUnmerged !== undefined)
+      this.observeGithubPrState(run.prUrl, patch.prClosedUnmerged ? "CLOSED" : "OPEN");
     this.publish({ kind: "run", run });
     if (patch.merged) this.supersedeByIssue(run);
     return run;
@@ -1183,7 +1420,7 @@ export class Store {
         `UPDATE runs SET
            cost_usd = (SELECT COALESCE(SUM(cost_usd),0) FROM invocations WHERE run_id = ?1),
            cost_equiv_usd = (SELECT COALESCE(SUM(cost_equiv_usd),0) FROM invocations WHERE run_id = ?1),
-           tokens_in = (SELECT COALESCE(SUM(input_tokens + cache_read_tokens),0) FROM invocations WHERE run_id = ?1),
+           tokens_in = (SELECT COALESCE(SUM(input_tokens + cache_read_tokens + cache_write_tokens),0) FROM invocations WHERE run_id = ?1),
            tokens_out = (SELECT COALESCE(SUM(output_tokens),0) FROM invocations WHERE run_id = ?1)
          WHERE id = ?1`,
       )
@@ -1205,12 +1442,57 @@ export class Store {
   getRunDetail(id: string): RunDetail | null {
     const run = this.getRun(id);
     if (!run) return null;
+    const approval = run.prUrl && this.approvalFor(run.prUrl);
+    const approvalTime =
+      approval &&
+      (this.db
+        .query(
+          "SELECT created_at AS createdAt FROM review_approvals WHERE pr_url = ? ORDER BY id DESC LIMIT 1",
+        )
+        .get(run.prUrl) as { createdAt: number } | null);
+    const latest = this.listArtifacts(id).findLast((a) => a.kind === "review");
+    const review = parse<{ blocking?: { title?: string }[] }>(this.getArtifact(id, latest?.name ?? ""), {});
+    const state = this.getRunState<RunState>(id);
+    const stages = this.listStages(id);
+    // Draft delivery failures are secondary; the run retains the original stopping error.
+    const evidence = stages.filter(
+      (s) =>
+        s.name !== "deliver" ||
+        s.status !== "failed" ||
+        (!!run.error && s.summary === run.error.slice(0, 500)),
+    );
+    const latestStages = new Map(evidence.map((s) => [s.name, s]));
+    const blocked = [
+      ["verify", state?.lastVerify?.overall === "fail"],
+      ["review", state?.lastReview?.verdict === "request_changes"],
+      ["audit", state?.lastAudit?.some((f) => f.severity === "block")],
+      ["gates", state?.lastGates?.some((g) => g.blocking)],
+    ] as const;
+    const stopping = evidence.findLast(
+      (s) =>
+        latestStages.get(s.name) === s &&
+        (s.status === "failed" || blocked.some(([name, blocks]) => blocks && name === s.name)),
+    );
     return {
+      stoppingStage: stopping?.name ?? blocked.find(([, blocks]) => blocks)?.[0] ?? null,
+      blockingFindings: Array.isArray(review?.blocking)
+        ? review.blocking.flatMap((f) => (typeof f?.title === "string" ? [f.title] : []))
+        : [],
+      prSnapshot: parse<RunDetail["prSnapshot"]>(run.prUrl && this.githubPrData(run.prUrl), null),
       run,
       stages: this.listStages(id),
       invocations: this.listInvocations(id),
       questions: this.listQuestions(id),
       artifacts: this.listArtifacts(id),
+      ...(run.prUrl
+        ? {
+            review: {
+              approval: approval || null,
+              ...(approvalTime ? { approvedAt: approvalTime.createdAt } : {}),
+              rounds: this.reviewRounds(run.prUrl),
+            },
+          }
+        : {}),
     };
   }
 
@@ -1529,6 +1811,150 @@ export class Store {
     );
   }
 
+  runtimeModels(): ModelDef[] {
+    return this.db
+      .query<{ definition_json: string }, []>("SELECT definition_json FROM runtime_models ORDER BY rowid")
+      .all()
+      .map((row) => JSON.parse(row.definition_json) as ModelDef);
+  }
+
+  writeRuntimeModel(id: string, model: ModelDef | null, note: string | null = null): void {
+    this.db.transaction(() => {
+      const old = this.db
+        .query<{ definition_json: string }, [string]>(
+          "SELECT definition_json FROM runtime_models WHERE id = ?",
+        )
+        .get(id);
+      const value = model === null ? null : JSON.stringify(model);
+      if (model) this.db.query("INSERT OR REPLACE INTO runtime_models VALUES (?, ?)").run(id, value);
+      else this.db.query("DELETE FROM runtime_models WHERE id = ?").run(id);
+      this.db
+        .query("INSERT INTO catalog_history (model_id, old_json, new_json, note, at) VALUES (?, ?, ?, ?, ?)")
+        .run(id, old?.definition_json ?? null, value, note, Date.now());
+    })();
+  }
+
+  catalogHistory() {
+    return this.db
+      .query<Row, []>("SELECT * FROM catalog_history ORDER BY id DESC LIMIT 100")
+      .all()
+      .map((row) => ({
+        id: row.id as number,
+        modelId: row.model_id as string,
+        oldValue: parse<ModelDef | null>(row.old_json, null),
+        newValue: parse<ModelDef | null>(row.new_json, null),
+        note: row.note as string | null,
+        at: row.at as number,
+      }));
+  }
+
+  publishCatalog(): void {
+    this.publish({ kind: "catalog" });
+  }
+
+  writeDiscovery(provider: string, served: string[] | null, at: number): void {
+    this.db.transaction(() => {
+      if (served !== null) {
+        for (const model of served)
+          this.db
+            .query(`INSERT INTO served_models VALUES (?, ?, ?, ?)
+            ON CONFLICT(provider, model) DO UPDATE SET last_seen = excluded.last_seen`)
+            .run(provider, model, at, at);
+      }
+      this.db
+        .query(`INSERT INTO model_discovery VALUES (?, ?, ?)
+        ON CONFLICT(provider) DO UPDATE SET served_json = excluded.served_json,
+        observed_at = CASE WHEN excluded.served_json IS NULL THEN observed_at ELSE excluded.observed_at END`)
+        .run(provider, served === null ? null : JSON.stringify(served), served === null ? null : at);
+    })();
+  }
+
+  discovery(provider: string) {
+    const row = this.db
+      .query<{ served_json: string | null; observed_at: number | null }, [string]>(
+        "SELECT served_json, observed_at FROM model_discovery WHERE provider = ?",
+      )
+      .get(provider);
+    return {
+      served: row?.served_json ? (JSON.parse(row.served_json) as string[]) : null,
+      observedAt: row?.observed_at ?? null,
+      observations: this.db
+        .query<{ model: string; firstSeen: number; lastSeen: number }, [string]>(
+          "SELECT model, first_seen AS firstSeen, last_seen AS lastSeen FROM served_models WHERE provider = ? ORDER BY model",
+        )
+        .all(provider),
+    };
+  }
+
+  routingCells(): OperatorRoutingCell[] {
+    return this.db
+      .query<Row, []>("SELECT * FROM routing_cells ORDER BY role, cell")
+      .all()
+      .map((row) => ({
+        role: row.role as OperatorRoutingCell["role"],
+        cell: row.cell as OperatorRoutingCell["cell"],
+        groups: JSON.parse(row.groups_json as string) as string[],
+        note: row.note as string | null,
+        updatedAt: row.updated_at as number,
+        updatedBy: row.updated_by as string,
+      }));
+  }
+
+  routingPrefer(): string[] | null {
+    const row = this.db.query<Row, []>("SELECT providers_json FROM routing_prefer WHERE id = 1").get();
+    return row ? (JSON.parse(row.providers_json as string) as string[]) : null;
+  }
+
+  routingHistory(): RoutingChange[] {
+    return this.db
+      .query<Row, []>("SELECT * FROM routing_history ORDER BY id DESC")
+      .all()
+      .map((row) => ({
+        id: row.id as number,
+        key: row.key as string,
+        oldValue: parse<string[] | null>(row.old_json, null),
+        newValue: parse<string[] | null>(row.new_json, null),
+        note: row.note as string | null,
+        at: row.at as number,
+        by: row.actor as string,
+      }));
+  }
+
+  writeRouting(key: string, value: string[] | null, note: string | null, by: string): RoutingChange {
+    return this.db.transaction(() => {
+      const at = Date.now();
+      const [role, cell] = key.split(".");
+      const old =
+        key === "prefer"
+          ? this.routingPrefer()
+          : (this.routingCells().find((r) => r.role === role && r.cell === cell)?.groups ?? null);
+      if (key === "prefer") {
+        if (value === null) this.db.query("DELETE FROM routing_prefer WHERE id = 1").run();
+        else
+          this.db
+            .query("INSERT OR REPLACE INTO routing_prefer VALUES (1, ?, ?, ?, ?)")
+            .run(JSON.stringify(value), note, at, by);
+      } else {
+        if (value === null)
+          this.db.query("DELETE FROM routing_cells WHERE role = ? AND cell = ?").run(role ?? "", cell ?? "");
+        else
+          this.db
+            .query("INSERT OR REPLACE INTO routing_cells VALUES (?, ?, ?, ?, ?, ?)")
+            .run(role ?? "", cell ?? "", JSON.stringify(value), note, at, by);
+      }
+      const result = this.db
+        .query(
+          "INSERT INTO routing_history (key, old_json, new_json, note, at, actor) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(key, json(old), json(value), note, at, by);
+      return { id: Number(result.lastInsertRowid), key, oldValue: old, newValue: value, note, at, by };
+    })();
+  }
+
+  publishRouting(change: RoutingChange): void {
+    this.publish({ kind: "routing", change });
+  }
+
   // ---- provider state ------------------------------------------------------
 
   listAlerts(now = Date.now()): QuotaAlert[] {
@@ -1544,6 +1970,7 @@ export class Store {
       utilization: (r.utilization as number) ?? null,
       resetsAt: (r.resets_at as number) ?? null,
       severity: r.severity as QuotaAlert["severity"],
+      source: (r.source as QuotaAlert["source"]) ?? null,
       routing: r.routing as string,
       createdAt: r.created_at as number,
     }));
@@ -1553,13 +1980,20 @@ export class Store {
     const boundary = alert.resetsAt ?? 0;
     const previous = this.db
       .query(
-        "SELECT severity, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
+        "SELECT severity, source, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
       )
       .get(alert.provider, alert.window, boundary) as Row | null;
     const current: QuotaAlert = previous
       ? {
           ...alert,
           severity: previous.severity === "exhausted" ? "exhausted" : alert.severity,
+          // Telemetry must not erase a rejection or disambiguate an older exhausted alert.
+          source:
+            previous.source === "rejection" || alert.source === "rejection"
+              ? "rejection"
+              : previous.severity === "exhausted" && previous.source == null
+                ? null
+                : alert.source,
           createdAt: previous.created_at as number,
         }
       : alert;
@@ -1571,8 +2005,8 @@ export class Store {
     const inserted =
       this.db
         .query(
-          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, routing, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, source, routing, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           current.provider,
@@ -1581,17 +2015,19 @@ export class Store {
           current.resetsAt,
           current.utilization,
           current.severity,
+          current.source ?? null,
           current.routing,
           current.createdAt,
         ).changes > 0;
     if (!inserted)
       this.db
         .query(
-          "UPDATE quota_alerts SET utilization = ?, severity = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
+          "UPDATE quota_alerts SET utilization = ?, severity = ?, source = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
         )
         .run(
           current.utilization,
           current.severity,
+          current.source ?? null,
           current.routing,
           current.provider,
           current.window,
@@ -1745,20 +2181,222 @@ export class Store {
       .run(key, JSON.stringify(value));
   }
 
+  // ---- land queue ----------------------------------------------------------
+
+  createLandEntry(entry: {
+    runId: string;
+    repo: string;
+    prUrl: string;
+    baseBranch: string;
+    headBranch: string;
+    approvedSha: string;
+  }): LandEntry {
+    const now = Date.now();
+    let id: number;
+    try {
+      const res = this.db
+        .query(
+          `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+        )
+        .run(
+          entry.runId,
+          entry.repo,
+          entry.prUrl,
+          entry.baseBranch,
+          entry.headBranch,
+          entry.approvedSha,
+          now,
+          now,
+        );
+      id = Number(res.lastInsertRowid);
+    } catch (error) {
+      // The partial unique index holds at most one in-flight entry per PR.
+      if (String(error).includes("land_entries.pr_url")) throw new Error("PR is already in the land queue");
+      throw error;
+    }
+    return this.getLandEntry(id) as LandEntry;
+  }
+
+  getLandEntry(id: number): LandEntry | null {
+    return (this.db.query(`${LAND_SELECT} WHERE id = ?`).get(id) as LandEntry | null) ?? null;
+  }
+
+  latestLandEntry(runId: string, prUrl: string | null): LandEntry | null {
+    return (
+      (this.db
+        .query(`${LAND_SELECT} WHERE run_id = ? OR pr_url = ? ORDER BY id DESC LIMIT 1`)
+        .get(runId, prUrl) as LandEntry | null) ?? null
+    );
+  }
+
+  listLandEntries(opts: { repo?: string; active?: boolean; limit?: number } = {}): LandEntry[] {
+    const where: string[] = [];
+    const params: string[] = [];
+    if (opts.repo) {
+      where.push("repo = ?");
+      params.push(opts.repo);
+    }
+    if (opts.active) {
+      where.push(`state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")})`);
+      params.push(...ACTIVE_LAND_STATES);
+    }
+    params.push(String(opts.limit ?? 100));
+    const sql = `${LAND_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY id LIMIT ?`;
+    return this.db.query(sql).all(...params) as LandEntry[];
+  }
+
+  /**
+   * The oldest entry this repository may start now, claimed by moving it into `checking`. A queued
+   * entry is free; one already in flight is only taken when its claim has gone quiet for `staleMs`,
+   * so a live heartbeat keeps its owner while a crashed process expires. The
+   * claim is a compare-and-swap on `attempts`, so two queues racing for one row see one winner, and
+   * `land_entries_one_running` refuses a second entry while one runs for the repository.
+   */
+  claimLandEntry(repo: string, staleMs: number, owner: string, now = Date.now()): LandEntry | null {
+    try {
+      return (
+        this.db.transaction(() => {
+          const row = this.db
+            .query(
+              `${LAND_SELECT} WHERE repo = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')
+                 AND (state = 'queued' OR claim_heartbeat_at IS NULL OR claim_heartbeat_at <= ?) ORDER BY id LIMIT 1`,
+            )
+            .get(repo, now - staleMs) as Row | null;
+          if (!row) return null;
+          const claimed = this.db
+            .query(
+              `UPDATE land_entries SET state = 'checking', attempts = attempts + 1, updated_at = ?, claim_owner = ?, claim_heartbeat_at = ?
+               WHERE id = ? AND attempts = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')`,
+            )
+            .run(now, owner, now, row.id as number, row.attempts as number).changes;
+          return claimed ? this.getLandEntry(row.id as number) : null;
+        })() ?? null
+      );
+    } catch (error) {
+      // The partial unique index names its column, not the index, when it refuses the update.
+      if (String(error).includes("land_entries_one_running") || String(error).includes("land_entries.repo"))
+        return null;
+      throw error;
+    }
+  }
+
+  /** Renew only the claim this queue owns; loss of ownership aborts its worker. */
+  heartbeatLandClaim(id: number, owner: string, now = Date.now()): boolean {
+    return (
+      this.db
+        .query(`UPDATE land_entries SET claim_heartbeat_at = ? WHERE id = ? AND claim_owner = ?
+      AND state IN ('checking', 'waiting_ci', 'merging')`)
+        .run(now, id, owner).changes === 1
+    );
+  }
+
+  /** Only this queue's stopped workers may be freed, never another process's live claims. */
+  releaseLandClaims(owner: string): number {
+    return this.db
+      .query(`UPDATE land_entries SET claim_owner = NULL, claim_heartbeat_at = NULL
+        WHERE claim_owner = ? AND state IN ('checking', 'waiting_ci', 'merging')`)
+      .run(owner).changes;
+  }
+
+  updateLandEntry(
+    id: number,
+    patch: Partial<Pick<LandEntry, "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">>,
+  ): LandEntry {
+    const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
+    sets.push("updated_at = ?");
+    values.push(Date.now());
+    if (patch.state && !ACTIVE_LAND_STATES.includes(patch.state)) {
+      sets.push("finished_at = ?");
+      values.push(Date.now());
+    }
+    this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
+    return this.getLandEntry(id) as LandEntry;
+  }
+
+  /** Feed items for the queue: the PR URL, the SHA and, when it failed, the reason. */
+  landFeed(kind: LandFeedKind, entry: LandEntry, summary: string, data: Record<string, unknown> = {}): void {
+    this.db.transaction(() =>
+      this.addFeedItems([
+        {
+          kind,
+          runId: entry.runId,
+          repo: entry.repo,
+          summary,
+          data: { url: entry.prUrl, sha: entry.approvedSha, ...data },
+          key: String(entry.id),
+        },
+      ]),
+    )();
+    this.publishFeed();
+  }
+
+  /** The newest run that opened `pr`: a pull request URL, or its number (`7`). */
+  runForPr(pr: string): Run | null {
+    const number = /^\d+$/.test(pr);
+    const row = this.db
+      .query(
+        `${RUN_SELECT} WHERE runs.pr_url ${number ? "LIKE ?" : "= ?"} COLLATE NOCASE ORDER BY runs.created_at DESC LIMIT 1`,
+      )
+      .get(number ? `%/pull/${pr}` : pr) as Row | null;
+    return row ? toRun(row) : null;
+  }
+
   // ---- GitHub poller -------------------------------------------------------
 
+  ciFailures(prUrl: string, sha: string): CiFailure[] {
+    return this.db
+      .query<
+        Omit<CiFailure, "rerunJob"> & { rerunJob: string | null },
+        [string, string]
+      >(`SELECT pr_url AS prUrl, sha, signature,
+      check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker,
+      rerun_job AS rerunJob, rerun_retry_at AS rerunRetryAt, rerun_retry_used AS rerunRetryUsed
+      FROM ci_failures WHERE pr_url = ? AND sha = ?`)
+      .all(prUrl, sha)
+      .map((f) => ({ ...f, rerunJob: f.rerunJob ? JSON.parse(f.rerunJob) : null }));
+  }
+
+  recordCiFailure(f: CiFailure): void {
+    this.db
+      .query(`INSERT INTO ci_failures (pr_url, sha, signature, check_name, error_line, runner_image)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
+      .run(f.prUrl, f.sha, f.signature, f.check, f.line, f.image);
+  }
+
+  /** One claim per PR head, before the POST; refusals and lost responses retain it. */
+  claimCiRerun(f: CiFailure, marker: string, job: NonNullable<CiFailure["rerunJob"]>): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?, rerun_job = ?
+      WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0
+      AND NOT EXISTS (SELECT 1 FROM ci_failures WHERE pr_url = ? AND sha = ? AND rerun_claimed = 1)
+      AND NOT EXISTS (SELECT 1 FROM land_entries WHERE pr_url = ? AND pushed_sha = ? AND ci_rerun IS NOT NULL)`)
+        .run(marker, JSON.stringify(job), f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
+        .changes === 1
+    );
+  }
+
+  finishCiFailure(f: CiFailure, outcome: CiFailure["outcome"]): void {
+    this.db
+      .query("UPDATE ci_failures SET outcome = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
+      .run(outcome, f.prUrl, f.sha, f.signature);
+  }
+
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
-  githubTracked(): TrackedPr[] {
+  githubTracked(now = Date.now()): TrackedPr[] {
     const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
+      LEFT JOIN github_pr_expiry e ON e.url = r.pr_url
       WHERE repos.kind = 'github' AND r.pr_url IS NOT NULL
         AND NOT r.merged AND r.delivery_branch IS NULL AND coalesce(g.data ->> 'state', '') <> 'MERGED'
+        AND (e.closed_at IS NULL OR e.closed_at >= ?1 - 604800000)
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
         AND (r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000
-          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED')
+          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED' OR e.reopened_at >= ?1 - 604800000)
       GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
-    return (this.db.query(sql).all(Date.now()) as TrackedPr[]).filter((pr) => {
+    return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
       const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
       return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
     });
@@ -1769,20 +2407,64 @@ export class Store {
     return query.get(url)?.data ?? null;
   }
 
-  /** Advance a PR's saved state (when given) and write feed items in one transaction. */
-  saveGithubPr(pr: TrackedPr | null, terminal = false, items: GitHubFeedInput[] = []): void {
+  githubPrExpired(url: string, now = Date.now()): boolean {
+    const row = this.db
+      .query<{ closed_at: number | null }, [string]>("SELECT closed_at FROM github_pr_expiry WHERE url = ?")
+      .get(url);
+    return row?.closed_at != null && row.closed_at < now - 604800000;
+  }
+
+  /** Wake polling for known PRs even after closed snapshots have expired. */
+  reopenGithubPr(url: string): void {
+    const runs = this.db
+      .query<{ id: string }, [string]>("SELECT id FROM runs WHERE pr_url = ? COLLATE NOCASE AND NOT merged")
+      .all(url);
+    for (const run of runs) this.updateRun(run.id, { prClosedUnmerged: false });
+  }
+
+  /** Reconciliation/reopen observations retain the poller's other saved fields. */
+  observeGithubPrState(url: string, state: string, now = Date.now()): void {
     this.db.transaction(() => {
-      const save = this.db.query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)");
-      if (pr) save.run(pr.url, pr.nodeId, pr.data, terminal);
-      const insert =
-        this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
-        VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
-      for (const { kind, runId, repo, summary, data, key } of items) {
-        const title = `${kind}: ${String(data.url ?? repo)}`;
-        insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
+      this.db
+        .query(`INSERT INTO github_pr_expiry (url, closed_at) VALUES (?, ?)
+      ON CONFLICT(url) DO UPDATE SET reopened_at = CASE WHEN ? = 'OPEN' AND github_pr_expiry.closed_at IS NOT NULL
+        THEN ? ELSE github_pr_expiry.reopened_at END, closed_at = CASE WHEN ? = 'CLOSED'
+        THEN coalesce(github_pr_expiry.closed_at, excluded.closed_at) ELSE NULL END`)
+        .run(url, state === "CLOSED" ? now : null, state, now, state);
+      this.db
+        .query("UPDATE github_prs SET data = json_set(data, '$.state', ?) WHERE url = ?")
+        .run(state, url);
+    })();
+  }
+
+  /** Advance a PR's saved state (when given) and write feed items in one transaction. */
+  saveGithubPr(
+    pr: TrackedPr | null,
+    terminal = false,
+    items: GitHubFeedInput[] = [],
+    now = Date.now(),
+  ): void {
+    this.db.transaction(() => {
+      const save = this.db.query(`INSERT INTO github_prs (url, node_id, data, terminal) VALUES (?, ?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET node_id = excluded.node_id, data = excluded.data, terminal = excluded.terminal`);
+      if (pr) {
+        save.run(pr.url, pr.nodeId, pr.data, terminal);
+        const state = pr.data && (JSON.parse(pr.data) as { state?: string }).state;
+        if (state) this.observeGithubPrState(pr.url, state, now);
       }
+      this.addFeedItems(items);
     })();
     this.publishFeed();
+    if (pr) this.publish({ kind: "github_pr", url: pr.url });
+  }
+
+  private addFeedItems(items: FeedInsert[]): void {
+    const insert = this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
+      VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
+    for (const { kind, runId, repo, summary, data, key } of items) {
+      const title = `${kind}: ${String(data.url ?? repo)}`;
+      insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
+    }
   }
 
   /** Open (once per episode) or clear a repository's access problem; `head` is the last known PR head. */

@@ -61,6 +61,12 @@ test("default prints usable setup without writing; --write installs only the ski
   });
   expect(text).toContain(`/plugin marketplace add ${JSON.stringify(join(repositoryRoot, "integrations"))}`);
   expect(text).toContain("/plugin install limitless@limitless-local");
+  const hook = JSON.parse(text.split("acknowledging:\n")[1] ?? "");
+  expect(hook.hooks.SessionStart[0].hooks[0]).toEqual({
+    type: "command",
+    command: `bun '${join(repositoryRoot, "src/cli/main.ts")}' digest --consumer claude`,
+  });
+  expect(text).toContain("never installed automatically");
   const destination = join(dir, ".agents/skills/limitless/SKILL.md");
   installIntegrations({ home: dir, write: true, print: (s) => output.push(s) });
   expect(readFileSync(destination, "utf8")).toBe(
@@ -110,7 +116,7 @@ test("CLI resolves assets from another working directory and never writes withou
   expect(snapshot(dir)).toEqual(before);
 });
 
-test("paths with spaces and quotes stay in one launch argument; cached plugin uses stable repo", () => {
+test("paths with spaces and quotes stay in one launch argument; cached plugin uses stable repo", async () => {
   const root = join(dir, "stable checkout 'quoted'");
   cpSync(join(repositoryRoot, "integrations"), join(root, "integrations"), { recursive: true });
   const output: string[] = [];
@@ -128,6 +134,24 @@ test("paths with spaces and quotes stay in one launch argument; cached plugin us
     "mcp",
   ]);
   expect(existsSync(join(dir, "agent home/.agents/skills/limitless/SKILL.md"))).toBe(true);
+  const hook = JSON.parse(text.split("acknowledging:\n")[1] ?? "");
+  const proc = Bun.spawn(
+    ["sh", "-c", `bun() { printf '%s\\n' "$@"; }; ${hook.hooks.SessionStart[0].hooks[0].command}`],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  expect(code).toBe(0);
+  expect(stderr).toBe("");
+  expect(stdout.trim().split("\n")).toEqual([
+    join(root, "src/cli/main.ts"),
+    "digest",
+    "--consumer",
+    "claude",
+  ]);
 });
 
 test("bundled marketplace resolves plugin, skills match, and documented TOML parses", () => {

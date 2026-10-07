@@ -45,6 +45,7 @@ export interface GateComparison {
 }
 
 export interface GateHooks {
+  holder?: string;
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
   /** Fires once when every gate slot is busy and this call has to queue. */
   onWait?: (slots: number) => void;
@@ -95,7 +96,7 @@ export async function runGates(
   signal: AbortSignal,
   hooks: GateHooks = {},
 ): Promise<GateRun> {
-  const release = await gateSlots.acquire(signal, hooks.onWait);
+  const release = await gateSlots.acquire(signal, hooks.onWait, hooks.holder ?? basename(cwd));
   try {
     return await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
   } finally {
@@ -143,7 +144,7 @@ export async function retryBaselineFailures(
       ? cfg.checks.find((k) => k.name === r.name && k.run === r.command)
       : undefined;
   if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
-  const release = await gateSlots.acquire(signal, onWait);
+  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
   try {
     const checks: GateResult[] = [];
     for (const r of run.checks) {
@@ -237,7 +238,7 @@ export async function retryRegressions(
       ? cfg.checks.find((k) => k.name === c.name && k.run === c.result.command)
       : undefined;
   if (!cmp.some(retryable)) return cmp;
-  const release = await gateSlots.acquire(signal, onWait);
+  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
   try {
     const out: GateComparison[] = [];
     for (const c of cmp) {

@@ -2,13 +2,25 @@ import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { z } from "zod";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
+import type { PrivateStrings } from "../gates/private.ts";
+import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { emptyHookFlags, NO_BIG_FILES, recordWorktree, worktreeGit, worktreeGitScope } from "./command.ts";
+import {
+  emptyHookFlags,
+  emptyTreeId,
+  NO_BIG_FILES,
+  recordWorktree,
+  worktreeGit,
+  worktreeGitScope,
+} from "./command.ts";
 
+const BRANCH_PUSH = ["git", "push", "--no-follow-tags"];
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
 /** Retry policy for GitHub and remote git (tests shorten it). */
@@ -108,8 +120,9 @@ export function slugify(text: string, max = 40): string {
   );
 }
 
+type MergePolicy = Repo["mergePolicy"];
 /** Resolve "owner/name", a GitHub URL, or a local path into a registered repo. */
-export async function resolveRepo(store: Store, input: string): Promise<Repo> {
+export async function resolveRepo(store: Store, input: string, merge: MergePolicy = "auto"): Promise<Repo> {
   const trimmed = input.trim();
   const existing = store.getRepoBySlug(trimmed);
   if (existing) return existing;
@@ -150,7 +163,7 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
     url: info.sshUrl,
     localPath: null,
     defaultBranch: info.defaultBranchRef?.name ?? "main",
-    mergePolicy: "auto",
+    mergePolicy: merge,
   });
 }
 
@@ -477,6 +490,8 @@ export interface DiffFile {
 
 export interface DiffInfo {
   patch: string;
+  /** Private-string entries found in changed content the patch shows as binary. */
+  privateHits?: { path: string; entry: number }[];
   files: DiffFile[];
   stat: string;
   added: number;
@@ -502,6 +517,7 @@ export async function diffSince(
   baseSha: string,
   env?: Record<string, string>,
   threeDot = false,
+  privateStrings: PrivateStrings = [],
 ): Promise<DiffInfo> {
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
   // Committed .gitmodules settings must not hide gitlinks from audit inputs.
@@ -512,7 +528,7 @@ export async function diffSince(
     diff("--name-status", "-M", range),
     diff("--stat", range),
     diff("--numstat", range),
-    diff("--raw", "-z", "--no-renames", range),
+    diff("--raw", "-z", "--no-renames", "--no-abbrev", range),
   ]);
   let added = 0;
   let removed = 0;
@@ -523,23 +539,169 @@ export async function diffSince(
   }
   const files = parseNameStatus(names.stdout);
   const gitlinks: string[] = [];
+  const blobs = new Map<string, string>();
   const origins = new Map(files.map((file) => [file.path, file.from]));
-  const changes: { path: string; from?: string }[] = [];
+  const changes: { path: string; from?: string; modeRequiresAllowance: boolean }[] = [];
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2) {
+    const [oldMode, newMode, oldOid, newOid] = entries[i]?.split(" ") ?? [];
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
+    blobs.set(path, entries[i]?.split(" ")[3] ?? "");
     const from = origins.get(path);
-    changes.push({ path, ...(from ? { from } : status.startsWith("A") ? {} : { from: path }) });
+    changes.push({
+      path,
+      ...(from ? { from } : status.startsWith("A") ? {} : { from: path }),
+      modeRequiresAllowance: newMode === "100755" || (oldMode !== `:${newMode}` && oldOid === newOid),
+    });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
-  return { patch: patch.stdout, files, stat: stat.stdout, added, removed, gitlinks, ...inspection };
+  const privateHits: { path: string; entry: number }[] = [];
+  if (privateStrings.length) {
+    // Binary content is absent from the patch; stream each blob rather than forcing a text diff.
+    const ids = [...blobs].filter(([path]) => !gitlinks.includes(path)).map(([, oid]) => oid);
+    const hits = await blobPrivateEntries(cwd, env, ids, privateStrings);
+    const numstatZ = await diff("--numstat", "-z", "--no-renames", range);
+    for (const line of numstatZ.stdout.split("\0")) {
+      const path = line.match(/^(?:\d+|-)\t(?:\d+|-)\t([\s\S]+)$/)?.[1];
+      const blob = path === undefined ? undefined : blobs.get(path);
+      if (path !== undefined && blob && !/^0+$/.test(blob))
+        for (const entry of hits.filter(([id]) => id === blob).map(([, entry]) => entry))
+          privateHits.push({ path, entry });
+    }
+  }
+  return {
+    patch: patch.stdout,
+    files,
+    stat: stat.stdout,
+    added,
+    removed,
+    gitlinks,
+    privateHits,
+    ...inspection,
+  };
 }
 
-const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;
+export async function blobPrivateEntries(
+  cwd: string,
+  env: Record<string, string> | undefined,
+  blobs: string[],
+  privateStrings: PrivateStrings,
+): Promise<[string, number][]> {
+  const ids = [...new Set(blobs.filter((id) => !/^0*$/.test(id)))];
+  // Inspect the object that will be published, never a local replacement.
+  const batch = ["git", "--no-replace-objects", "cat-file", "--batch"];
+  const opts = { cwd, env, stdin: ids.map((id) => `${id}\n`).join(""), timeoutMs: attributeLimits.timeoutMs };
+  const { stdout } = await sh(batch, { ...opts, encoding: "latin1" });
+  const decoder = new TextDecoder();
+  const found: [string, number][] = [];
+  let at = 0;
+  for (const id of ids) {
+    const end = stdout.indexOf("\n", at);
+    const header = stdout.slice(at, end);
+    const size = Number(/ blob (\d+)$/.exec(header)?.[1]);
+    if (end < 0 || header !== `${id} blob ${size}` || stdout[end + size + 1] !== "\n")
+      throw new privacy.PrivateError("Cannot inspect binary blob; publication blocked");
+    const text = decoder.decode(Buffer.from(stdout.slice(end + 1, end + 1 + size), "latin1"));
+    at = end + size + 2;
+    const lfs = lfsPointer(text);
+    const content = lfs ? text + (await lfsPayload(cwd, env, lfs)) : text.includes("\0") ? text : "";
+    for (const { entry } of privacy.privateMatches(content, privateStrings)) found.push([id, entry]);
+  }
+  return [...found];
+}
+
+/** The local payload of an LFS pointer. Payloads are never fetched, so a missing one blocks. */
+async function lfsPayload(cwd: string, env: Record<string, string> | undefined, pointer: string) {
+  const bytes = await localLfsPayload(cwd, env, pointer);
+  if (bytes) return bytes.toString("utf8");
+  throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
+}
+
+async function localLfsPayload(cwd: string, env: Record<string, string> | undefined, pointer: string) {
+  const oid = pointer.match(/^oid sha256:([a-f0-9]{64})$/m)?.[1] ?? "";
+  const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd, env });
+  const path = resolve(cwd, common.stdout.trim(), "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  const stat = await fs.promises.stat(path).catch(() => undefined);
+  if (!stat?.isFile() || stat.size !== Number(pointer.match(/^size (\d+)$/m)?.[1])) return undefined;
+  const bytes = await fs.promises.readFile(path).catch(() => undefined);
+  if (bytes && pointer.endsWith(`oid sha256:${Bun.SHA256.hash(bytes, "hex")}\nsize ${bytes.length}\n`))
+    return bytes;
+  return undefined;
+}
+
+/** Checks raw commits and patches (and optionally the index), not the net diff. */
+export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
+  const log = [
+    "git",
+    "--no-replace-objects",
+    "-c",
+    "i18n.logOutputEncoding=UTF-8",
+    "log",
+    "--encoding=UTF-8",
+  ];
+  const identities = await worktreeGit([...log, "-z", "--format=%an%x00%ae%x00%cn%x00%ce", range], {
+    cwd,
+  });
+  const fields = ["author name", "author email", "committer name", "committer email"];
+  identities.stdout.split("\0").forEach((value, i) => {
+    privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
+  });
+  const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
+  for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
+    const raw = await worktreeGit(["git", "--no-replace-objects", "cat-file", "commit", sha], {
+      cwd,
+      encoding: "latin1",
+    });
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(raw.stdout, "latin1"));
+    } catch {
+      throw new privacy.PrivateError("Published commit is not valid UTF-8; publication blocked");
+    }
+    const headers = text.slice(0, text.indexOf("\n\n"));
+    if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
+      throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
+    privacy.checkPrivateText(text, "Published commit object", entries);
+  }
+  const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
+  const blobs: string[] = [];
+  for (const args of [
+    [...log, "-m", "--format=%B", range],
+    ...(staged ? [["git", "diff", "--cached"]] : []),
+  ]) {
+    const { stdout } = await worktreeGit([...args, ...flags], { cwd });
+    privacy.checkPrivateText(stdout, "Published content", entries);
+    for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
+  }
+  const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
+  if (hit) throw new privacy.PrivateError(privacy.privateReason("Published blob", hit[1]));
+}
+
+function lfsPointer(text: string): string | null {
+  const normalized = text.trim().replaceAll("\r\n", "\n").replaceAll(/\n\n+/g, "\n");
+  if (!/^(?:version https?:|oid sha256:|ext-\d-)/.test(normalized)) return null;
+  const extensions = normalized.match(/^ext-.*$/gm) ?? [];
+  const priorities = extensions.map((line) => line.slice(4, 5));
+  const validExtensions = extensions.every((line) => /^ext-\d-\w[^ ]* sha256:[a-f0-9]{64}$/.test(line));
+  const core = normalized.replaceAll(/^ext-.*\n/gm, "");
+  const match =
+    /^version (?:https:\/\/(?:git-lfs|hawser)\.github\.com\/spec\/v1|http:\/\/git-media\.io\/v\/2)\noid sha256:([a-f0-9]{64})\nsize (\+?\d+)$/.exec(
+      core,
+    );
+  if (
+    !match?.[1] ||
+    !Number.isSafeInteger(Number(match[2])) ||
+    !validExtensions ||
+    new Set(priorities).size !== priorities.length ||
+    /\nsize [^\n]+\n/.test(normalized)
+  )
+    throw new privacy.PrivateError("Malformed LFS pointer; publication blocked");
+  return `oid sha256:${match[1]}\nsize ${Number(match[2])}\n`;
+}
 /** Deadline for attribute queries and content classification; missing it blocks the audit. */
 export const attributeLimits = { timeoutMs: 60_000 };
 
@@ -548,7 +710,7 @@ async function attributeInfo(
   env: Record<string, string> | undefined,
   range: string,
   base: string,
-  changes: { path: string; from?: string }[],
+  changes: { path: string; from?: string; modeRequiresAllowance: boolean }[],
 ): Promise<Partial<DiffInfo>> {
   // Attribute files must be inspected even if binary or renamed into place.
   const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
@@ -571,15 +733,15 @@ async function attributeInfo(
     }
     return result;
   };
-  // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
-  // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
+  // Git supplies an initial classification; verify apparent text across the complete blob.
+  // The empty attribute source prevents repository attributes from deciding what is text.
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
   let emptyTree: Promise<string> | undefined;
   const emptyTreeOf = () =>
-    (emptyTree ??= git(["hash-object", "-t", "tree", "--stdin"], "").then(({ stdout }) => stdout.trim()));
+    (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
-  const basePointers = new Set<string>();
-  const pointers = new Map<string, boolean>();
+  const headPointers = new Map<string, string>();
+  const contents = new Map<string, { pointer: string | null; forbidden: boolean; binary: boolean }>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
@@ -592,7 +754,8 @@ async function attributeInfo(
   /** `raw` is every text path; `text` excludes LFS pointers standing in for binary files. */
   const textAt = async (tree: string, pathspecs: string[], seen = matches) => {
     const raw = new Set<string>();
-    if (!pathspecs.length) return { raw, text: raw };
+    const blobs = new Map<string, string>();
+    if (!pathspecs.length) return { raw, text: raw, blobs };
     const empty = await emptyTreeOf();
     // A fresh index per query lets classifications run concurrently.
     const index = join(scratch, `index-${indexes++}`);
@@ -609,54 +772,79 @@ async function attributeInfo(
     rmSync(index, { force: true });
     // Raw entries (blob id, then path) precede the numstat entries. Looking blobs up by id
     // avoids a tree walk per `tree:path`, which dominates audits of many thousand files.
-    const blobs = new Map<string, string>();
     const entries = out.stdout.split("\0");
     for (let i = 0; i < entries.length; i++) {
-      const blob = entries[i]?.match(/^:\d+ \d+ \S+ (\S+) /);
-      if (blob?.[1]) {
-        blobs.set(entries[++i] ?? "", blob[1]);
+      const blob = entries[i]?.match(/^:\d+ (\d+) \S+ (\S+) /);
+      if (blob?.[2]) {
+        const path = entries[++i] ?? "";
+        // Gitlinks name commits in another repository, not blobs we can inspect here.
+        if (blob[1] !== "160000") blobs.set(path, blob[2]);
         continue;
       }
       const match = entries[i]?.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
-      if (match?.[2]) {
+      if (match?.[2] && blobs.has(match[2])) {
         seen.add(match[2]);
         if (match[1] !== "-") raw.add(match[2]);
       }
     }
-    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const text = new Set(raw);
+    // Inspect bytes with length framing: a blob may contain embedded NULs or multi-byte text.
     const candidates = [...raw];
-    if (candidates.length) {
-      const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
-      const sizes = (
-        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
-      ).stdout.split("\n");
-      // The shortest strict pointer is 126 bytes; ordinary small text needs no blob read.
-      const sized = candidates.flatMap((path, i) => {
-        const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
-        const size = Number(bytes);
-        return size >= 126 && size <= 200 ? [{ path, oid }] : [];
+    const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
+    const sizes = candidates.length
+      ? (await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)).stdout.split("\n")
+      : [];
+    const sized = candidates.map((path, i) => {
+      const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
+      const size = Number(bytes);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error("Cannot inspect blob size");
+      return { path, oid, size };
+    });
+    const unread = [...new Map(sized.map((entry) => [entry.oid, entry])).values()].filter(
+      ({ oid }) => !contents.has(oid),
+    );
+    while (unread.length) {
+      const batch = [];
+      let bytes = 0;
+      do {
+        const next = unread.shift();
+        if (!next) break;
+        batch.push(next);
+        bytes += next.size;
+      } while (unread.length && bytes + (unread[0]?.size ?? 0) < MEDIA_LIMIT);
+      const result = await worktreeGit(["git", "cat-file", "--batch", "-Z"], {
+        cwd,
+        env,
+        encoding: "latin1",
+        stdin: batch.map(({ oid }) => `${oid}\0`).join(""),
+        timeoutMs: Math.max(1, deadline - Date.now()),
       });
-      // One read for every blob not classified yet. These are text blobs of at most 200 bytes,
-      // so they hold no NUL and -Z output splits unambiguously; any misparse reads as no pointer.
-      const unread = [...new Set(sized.map(({ oid }) => oid))].filter((oid) => !pointers.has(oid));
-      if (unread.length) {
-        const records = (
-          await git(["cat-file", "--batch", "-Z"], unread.map((oid) => `${oid}\0`).join(""))
-        ).stdout.split("\0");
-        for (const [i, oid] of unread.entries())
-          pointers.set(
-            oid,
-            (records[2 * i] ?? "").startsWith(`${oid} blob `) && LFS_POINTER.test(records[2 * i + 1] ?? ""),
-          );
+      let at = 0;
+      for (const { oid, size } of batch) {
+        const end = result.stdout.indexOf("\0", at);
+        if (result.stdout.slice(at, end) !== `${oid} blob ${size}` || result.stdout[end + size + 1] !== "\0")
+          throw new Error("Cannot inspect complete blob");
+        const bytes = Buffer.from(result.stdout.slice(end + 1, end + 1 + size), "latin1");
+        contents.set(oid, {
+          pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
+          forbidden: isForbiddenFormat("", bytes),
+          binary: bytes.includes(0) || bytes.includes(Buffer.from("%PDF-")),
+        });
+        at = end + size + 2;
       }
-      for (const { path, oid } of sized)
-        if (pointers.get(oid)) {
-          if (tree === base) basePointers.add(path);
-          if (!SOURCE_PATH.test(path)) text.delete(path);
-        }
+      if (at !== result.stdout.length) throw new Error("Unexpected blob batch output");
     }
-    return { raw, text };
+    for (const { path, oid } of sized) {
+      if (contents.get(oid)?.forbidden || contents.get(oid)?.binary || /\.pdf$/i.test(path)) raw.delete(path);
+    }
+    const text = new Set(raw);
+    for (const { path, oid } of sized) {
+      const pointer = contents.get(oid)?.pointer;
+      if (pointer) {
+        if (tree === "HEAD") headPointers.set(path, pointer);
+        if (!SOURCE_PATH.test(path)) text.delete(path);
+      }
+    }
+    return { raw, text, blobs };
   };
   const textAtEither = async (pathspecs: string[], seen: Set<string>) => {
     const [before, after] = await Promise.all([
@@ -722,6 +910,38 @@ async function attributeInfo(
       );
     };
     const existing = await existingRules();
+    const inert = new Set<string>();
+    const eligible = changes.filter(
+      ({ path, from }) =>
+        matches.has(path) &&
+        (!afterText.raw.has(path) || headPointers.has(path)) &&
+        INERT_MEDIA_PATH.test(path) &&
+        !beforeText.text.has(from ?? ""),
+    );
+    for (const { path } of eligible) {
+      const pointer = headPointers.get(path);
+      if (pointer) {
+        const size = Number(pointer.match(/^size (\d+)$/m)?.[1]);
+        if (size > 0 && size <= MEDIA_LIMIT) {
+          const bytes = await localLfsPayload(cwd, env, pointer);
+          if (bytes && isInertMedia(path, bytes)) inert.add(path);
+        }
+        continue;
+      }
+      const oid = afterText.blobs.get(path);
+      if (!oid) continue;
+      const size = Number((await git(["cat-file", "-s", oid])).stdout.trim());
+      // Large or unreadable media remains opaque; never validate a truncated subprocess tail.
+      if (!Number.isSafeInteger(size) || size <= 0 || size > MEDIA_LIMIT) continue;
+      const result = await worktreeGit(["git", "cat-file", "blob", oid], {
+        cwd,
+        env,
+        encoding: "latin1",
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
+      if (result.stdout.length === size && isInertMedia(path, Buffer.from(result.stdout, "latin1")))
+        inert.add(path);
+    }
     // Hidden paths are a subset of the changes classified above.
     const textPaths = hidden
       .filter(
@@ -730,11 +950,11 @@ async function attributeInfo(
       .map((change) => change.path);
     const binaryPaths = changes
       .filter(
-        ({ path, from }) =>
-          matches.has(path) &&
-          !afterText.raw.has(path) &&
-          !basePointers.has(from ?? "") &&
-          (beforeText.text.has(from ?? "") || !BINARY_PATH.test(path)),
+        ({ path, from, modeRequiresAllowance }) =>
+          modeRequiresAllowance ||
+          (matches.has(path) &&
+            (!afterText.raw.has(path) || headPointers.has(path)) &&
+            (beforeText.text.has(from ?? "") || !inert.has(path))),
       )
       .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
@@ -752,7 +972,7 @@ async function attributeInfo(
       attributePatch,
       attributes,
       textPaths,
-      headTextPaths: [...afterText.raw],
+      headTextPaths: [...afterText.text],
       existingRuleKeys,
       attributeMatches,
       binaryPaths,
@@ -825,6 +1045,7 @@ export async function pushBranch(
         "--no-follow-tags",
         `--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse -c receive.autogc=false ${receiveHooks} receive-pack`,
         repo.localPath,
+        // Branch-only refspecs exclude git notes.
         `${sha}:refs/heads/${branch}`,
       ],
       {
@@ -837,7 +1058,7 @@ export async function pushBranch(
     return;
   }
   if (!repo.url) return;
-  await remoteSh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
+  await remoteSh([...BRANCH_PUSH, "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -869,6 +1090,7 @@ export async function pushExistingBranch(
   baseSha: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  sha = "HEAD",
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
@@ -876,13 +1098,13 @@ export async function pushExistingBranch(
   const ref = `refs/heads/${branch}`;
   const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, sha], {
     cwd,
     allowFail: true,
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await remoteSh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `${sha}:${ref}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -969,20 +1191,26 @@ export async function findPullRequest(
   return url.startsWith("http") ? url : null;
 }
 
-/** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
+/**
+ * Merge now if possible; if branch protection requires checks, enable auto-merge instead.
+ * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`), `body`
+ * is the squash message the factory reviewed, and `auto: false` never arms auto-merge, which would
+ * let a later push land unchecked.
+ */
 export async function mergePullRequest(
   prUrl: string,
   cwd: string,
-  title?: string,
+  sha: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
+  opts: { body?: string; title?: string; auto?: boolean } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
-  // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
-  const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
+  let blocked = false;
   const landed = async () => {
     const view = ["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"];
     const merged = (await sh(view, { cwd, signal })).stdout.trim() === "MERGED";
@@ -993,8 +1221,23 @@ export async function mergePullRequest(
     withGitHubRetry(
       async () => {
         if (unsure && (await landed())) return "merged" as const;
+        blocked = true;
+        const view = ["gh", "pr", "view", prUrl, "--json", "title,body,headRefOid"];
+        const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
+        const data = schema.parse(JSON.parse((await sh(view, { cwd, signal })).stdout));
+        if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
+        const rawTitle = opts.title ?? data.title;
+        if (!rawTitle.trim()) throw new Error("missing merge subject");
+        const title = number ? `${rawTitle} (#${number})` : rawTitle;
+        const body = opts.body ?? data.body;
+        privacy.checkPrivateText(`${title}\n${body}`, "PR text", entries);
+        blocked = false;
+        const subject =
+          opts.body !== undefined
+            ? ["--match-head-commit", sha, "--subject", title, "--body-file", "-"]
+            : ["--subject", title, "--body", body, "--match-head-commit", sha];
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
-        return sh(cmd, { cwd, signal }).then(
+        return sh(cmd, { cwd, signal, stdin: body }).then(
           () => "ok" as const,
           async (e) => {
             if (signal?.aborted || !isTransient(e)) throw e;
@@ -1011,11 +1254,17 @@ export async function mergePullRequest(
     });
   const now = await merge([]);
   if (now === "ok" || now === "merged") return "merged";
+  if (blocked || opts.auto === false) return now;
   // As on main, fall back to auto-merge; it shares the budget and reconciles an unsure merge first.
   const auto = await merge(["--auto"]);
   if (auto === "merged") return "merged";
   if (auto === "ok") return "auto";
   return now === "unavailable" || auto === "unavailable" ? "unavailable" : "failed";
+}
+
+/** Turn off a PR's auto-merge, so no later push can land without the factory checking it. */
+export async function disableAutoMerge(prUrl: string, cwd: string, signal?: AbortSignal): Promise<void> {
+  await sh(["gh", "pr", "merge", prUrl, "--disable-auto"], { cwd, signal, allowFail: true });
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */
@@ -1183,7 +1432,7 @@ async function stageEvalRepo(
     mkdirSync(path, { recursive: true });
     await sh(["git", "init", "-q", path], opts);
     if (snapshot) pins = await pushSnapshot(cache, base, head, path, signal);
-    else await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
+    else await sh([...BRANCH_PUSH, "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
   });
   await rejectContamination(path, labels, signal);
   return pins;
@@ -1236,7 +1485,7 @@ async function pushSnapshot(
     const snapshotBase = await commit(base, "Snapshot base");
     const snapshotHead = await commit(head, "Snapshot head", snapshotBase);
     await sh(
-      ["git", "push", "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
+      [...BRANCH_PUSH, "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
       opts,
     );
     return [snapshotBase, snapshotHead];

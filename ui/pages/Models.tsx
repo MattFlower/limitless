@@ -131,51 +131,9 @@ export const Models: Component = () => {
 
       <div>
         <div class="section-label">Routing policy</div>
-        <div class="card card-pad stack" style={{ gap: "14px" }}>
-          <Show when={catalog()} fallback={<span class="text-faint mono">loading…</span>}>
-            {(c) => (
-              <For each={Object.entries(c().policy)}>
-                {([role, byComplexity]) => (
-                  <div>
-                    <div
-                      class="mono text-accent"
-                      style={{ "font-size": "12.5px", "font-weight": "600", "margin-bottom": "6px" }}
-                    >
-                      {role}
-                    </div>
-                    <table class="table">
-                      <thead>
-                        <tr>
-                          <th>Complexity</th>
-                          <th>Ordered candidate groups</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={Object.entries(byComplexity ?? {})}>
-                          {([complexity, groups]) => (
-                            <tr>
-                              <td class="mono text-dim">{complexity}</td>
-                              <td class="mono">
-                                <For each={groups}>
-                                  {(g, i) => (
-                                    <span>
-                                      {i() > 0 ? <span class="text-faint"> → </span> : null}
-                                      <span class="chip-tag">{g}</span>
-                                    </span>
-                                  )}
-                                </For>
-                              </td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </For>
-            )}
-          </Show>
-        </div>
+        <a class="btn" href="/setup">
+          Configure routing, fallbacks and models in Setup
+        </a>
       </div>
     </div>
   );

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { loadPrivateStrings } from "../src/gates/private.ts";
 import {
   createPullRequest,
   GitHubUnavailableError,
@@ -188,6 +189,76 @@ async function run(f: Factory) {
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
   return r.id;
 }
+
+test.each(["disabled", "quota", "rejected"])(
+  "an unavailable pinned implementer stops with its chain and reason: %s",
+  async (reason) => {
+    const f = factory(undefined, (s) => {
+      if (s.mode !== "edit") return answer(s);
+      return reason === "quota"
+        ? { status: "quota", error: "quota exhausted" }
+        : { status: "error", error: "model not found" };
+    });
+    if (reason === "disabled") f.tracker.setEnabled("b", false);
+    const run = await f.createRun({
+      repo: source,
+      prompt: "Change",
+      profile: "standard",
+      models: { implement: ["b"] },
+    });
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(reason === "disabled" ? [] : ["b"]);
+    const question = f.store.listQuestions(run.id).at(-1)?.question ?? "";
+    expect(question).toContain("implement; pinned chain: b");
+    expect(question).toContain("b@high (");
+    expect(question).toContain(reason === "rejected" ? "model not found" : reason);
+  },
+);
+test.each(["unavailable", "rejected"])(
+  "pinned verifier exhaustion redacts private holdout details: %s",
+  async (reason) => {
+    const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    const f = factory(undefined, (s) => {
+      if (s.prompt.startsWith("Write holdout checks"))
+        return {
+          structured: {
+            scenarios: [{ ...holdout.scenarios[0], steps: `send ${secret}` }],
+          },
+        };
+      if (s.prompt.startsWith("You are the acceptance"))
+        return reason === "unavailable"
+          ? { status: "unavailable", error: `failed on ${secret}` }
+          : { status: "error", error: `model not found while checking ${secret}` };
+      return answer(s);
+    });
+    const run = await f.createRun({
+      repo: source,
+      prompt: "Change",
+      profile: "standard",
+      models: { verify: ["b"] },
+    });
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    const invocations = f.store.listInvocations(run.id).filter((i) => i.role === "verify");
+    expect(invocations.map((i) => i.modelId)).toEqual(["b"]);
+    const question = f.store.listQuestions(run.id).at(-1)?.question ?? "";
+    expect(question).toContain("verify; pinned chain: b");
+    expect(question).toContain(reason === "unavailable" ? "unavailable" : "model not found");
+    expect(question).toContain("[private detail]");
+    for (const value of [
+      question,
+      f.store.getRun(run.id)?.error,
+      JSON.stringify(invocations),
+      JSON.stringify(f.store.listStages(run.id)),
+      JSON.stringify(f.store.listEvents(run.id)),
+    ])
+      expect(value).not.toContain(secret);
+  },
+);
 async function settled(f: Factory, id: string) {
   await wait(() => !f.scheduler.activeRunIds.includes(id) && f.store.getRun(id)?.status !== "queued");
 }
@@ -856,6 +927,7 @@ function fakeGh(pr: string) {
 import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
 const file=${JSON.stringify(pr)}, cmd=process.argv.slice(2).join(" "), state=()=>existsSync(file+".merged")?"MERGED":"OPEN";
 appendFileSync(file+".calls",cmd+"\\n");
+appendFileSync(file+".args",JSON.stringify(process.argv.slice(2))+"\\n");
 const q=existsSync(file+".fail")?JSON.parse(readFileSync(file+".fail","utf8")):[];
 const fail=q[0]&&cmd.startsWith(q[0].on)?q.shift():null;
 writeFileSync(file+".fail",JSON.stringify(q));
@@ -866,7 +938,13 @@ if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"
 if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
 if(process.argv[3]==="merge") writeFileSync(file+".merged","");
 if(process.argv[3]==="view") {
-  if(process.argv.includes("headRefOid")) {
+  if(process.argv.includes("title,body,headRefOid")) {
+    const texts=existsSync(file+".text")?JSON.parse(readFileSync(file+".text","utf8")):[];
+    const data=texts.shift();
+    writeFileSync(file+".text",JSON.stringify(texts));
+    const head=Bun.spawnSync(["/usr/bin/git","rev-parse","HEAD"]);
+    out(JSON.stringify(data??{title:"T",body:"B",headRefOid:head.exitCode===0?head.stdout.toString().trim():"a".repeat(40)}));
+  } else if(process.argv.includes("headRefOid")) {
     const head=Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(join(root, "remote.git"))},"rev-parse","refs/heads/pr-head"]);
     out(JSON.stringify({headRefOid:head.stdout.toString().trim()}));
   } else out(process.argv.includes("--jq") ? state() : JSON.stringify({state:state(),url:readFileSync(file,"utf8")}));
@@ -929,7 +1007,7 @@ for (const operation of [
         merge: "gh pr merge *",
         "auto-merge": "gh pr merge *--auto*",
         "existing-head": "git ls-remote *",
-        "existing-push": "git push --force-with-lease=*",
+        "existing-push": "git push --no-follow-tags --force-with-lease=*",
         comment: "gh pr comment *",
         comments: "gh api *",
         draft: "gh pr create *--draft*",
@@ -1829,7 +1907,8 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   // A healthy push that takes longer than the budget left still completes on its own timeout.
   writeFileSync(
     join(root, "bin", "git"),
-    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = config ]; then exec /usr/bin/git "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    // The wrapper's own lookups (version, config, repository) reach real git; anything else is the push.
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\ncase "$command" in config|rev-parse|var|--version) exec /usr/bin/git "$@";; esac\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
     {
       mode: 0o755,
     },
@@ -1845,6 +1924,89 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
     // With the budget spent, the next call's first attempt still runs (as on main); only retries stop.
     await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(2);
+  } finally {
+    await restore();
+  }
+});
+
+test.each([
+  "title",
+  "body",
+  "subject",
+  "moved",
+  "invalid",
+  "missing",
+  "lookup-failed",
+  "malformed",
+  "clean",
+  "auto",
+  "auto-body",
+  "auto-subject",
+  "auto-moved",
+  "retry-body",
+  "retry-moved",
+  "retry-clean",
+])("daemon checks fresh squash text and head: %s", async (scenario) => {
+  const pr = join(root, "pr");
+  const url = "https://forge.example/test/repo/pull/1";
+  const restore = fakeGh(pr);
+  const config = join(root, "config");
+  mkdirSync(config);
+  writeFileSync(
+    join(config, "private-strings.txt"),
+    scenario.endsWith("subject") ? "Checked subject (#1)" : "secret-host.example",
+  );
+  const sha = "a".repeat(40);
+  const safe = { title: "Checked subject", body: "Complete body\n\nLast paragraph\n", headRefOid: sha };
+  const changed = { ...safe };
+  if (scenario.endsWith("body")) changed.body = "secret-host.example";
+  if (scenario === "title") changed.title = "secret-host.example";
+  if (scenario.endsWith("moved")) changed.headRefOid = "b".repeat(40);
+  if (scenario === "invalid") changed.headRefOid = "invalid";
+  const fallback = scenario.startsWith("auto");
+  const retry = scenario.startsWith("retry");
+  const initial = scenario === "auto-subject" ? { ...safe, title: "Initially safe" } : safe;
+  // Earlier PR text was safe; the final lookup can observe an edit or a moved head.
+  writeFileSync(pr, url);
+  writeFileSync(
+    `${pr}.text`,
+    JSON.stringify([
+      ...(fallback || retry ? [initial] : []),
+      scenario === "missing" ? {} : scenario === "malformed" ? "not an object" : changed,
+    ]),
+  );
+  if (fallback || retry)
+    writeFileSync(
+      `${pr}.fail`,
+      JSON.stringify([{ on: "pr merge", err: retry ? bad502 : "checks required" }]),
+    );
+  if (scenario === "lookup-failed")
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr view", err: "lookup denied" }]));
+  try {
+    const outcome = await mergePullRequest(url, root, sha, undefined, undefined, loadPrivateStrings(config));
+    const success = ["clean", "auto", "retry-clean"].includes(scenario);
+    expect(outcome).toBe(success ? (fallback ? "auto" : "merged") : "failed");
+    const calls: string[][] = readFileSync(`${pr}.args`, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const merges = calls.filter((args) => args[1] === "merge");
+    expect(merges).toHaveLength(success ? (fallback || retry ? 2 : 1) : fallback || retry ? 1 : 0);
+    for (const args of merges) {
+      expect(args.slice(args.indexOf("--subject"))).toEqual([
+        "--subject",
+        scenario === "auto-subject" ? "Initially safe (#1)" : "Checked subject (#1)",
+        "--body",
+        safe.body,
+        "--match-head-commit",
+        sha,
+      ]);
+    }
+    if (scenario === "auto") expect(merges[1]).toContain("--auto");
+    for (let i = 0; i < calls.length; i++) {
+      if (calls[i]?.[1] === "merge")
+        expect(calls[i - 1]).toEqual(["pr", "view", url, "--json", "title,body,headRefOid"]);
+    }
   } finally {
     await restore();
   }
@@ -1868,7 +2030,9 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
     await expect(createPullRequest(repo, opts)).rejects.toThrow("HTTP 422");
     expect(ghCalls(pr, "pr create")).toHaveLength(3);
     writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", err: bad502, landed: true }]));
-    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "a".repeat(40))).toBe(
+      "merged",
+    );
     expect(ghCalls(pr, "pr merge")).toHaveLength(1);
     // The landed merge is found even though the first state lookup also hit a 502.
     rmSync(`${pr}.merged`);
@@ -1880,13 +2044,15 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
         { on: "pr view", err: bad502 },
       ]),
     );
-    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "a".repeat(40))).toBe(
+      "merged",
+    );
     expect(ghCalls(pr, "pr merge")).toHaveLength(2);
-    expect(ghCalls(pr, "pr view")).toHaveLength(lookups + 2);
+    expect(ghCalls(pr, "pr view")).toHaveLength(lookups + 3);
     // Exhausting the immediate merge still falls back to auto-merge, as on main.
     rmSync(`${pr}.merged`);
     writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr merge", err: bad502 })));
-    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("auto");
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "a".repeat(40))).toBe("auto");
     expect(ghCalls(pr, "pr merge").filter((c) => c.includes("--auto"))).toHaveLength(1);
     // A healthy merge slower than the budget left is not cut off, so it needs no reconciling.
     rmSync(`${pr}.merged`);
@@ -1895,9 +2061,9 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
     writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", landed: true, delay: 300 }]));
     const budget = { leftMs: 100 };
     const url = "https://github.com/test/repo/pull/1";
-    expect(await mergePullRequest(url, root, "T", undefined, budget)).toBe("merged");
+    expect(await mergePullRequest(url, root, "a".repeat(40), undefined, budget)).toBe("merged");
     expect(ghCalls(pr, "pr merge")).toHaveLength(merges + 1);
-    expect(ghCalls(pr, "pr view")).toHaveLength(views);
+    expect(ghCalls(pr, "pr view")).toHaveLength(views + 1);
   } finally {
     await restore();
   }

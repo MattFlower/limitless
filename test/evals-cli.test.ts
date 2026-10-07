@@ -519,9 +519,61 @@ test("policy CLI without overrides regenerates every evidenced cell", async () =
   await evalCommand(["policy"], { write: true }, io);
   const written = JSON.parse(files.get("routing/policy.json") ?? "{}");
   expect(written.implement.medium[0]).toBe(subscription);
-  expect(written.implement.large).toEqual(["codex/astra@high", "codex/sol-6.1@high", "claude/opus"]);
+  expect(written.implement.large).toEqual(["codex/sol-6.1@high", "claude/opus"]);
   expect(files.get("routing/EVIDENCE.md")).toContain("Update implement.medium:");
   expect(files.get("routing/EVIDENCE.md")).not.toContain("pinned by owner decision");
+});
+
+test("policy CLI never writes a model that eval history names but the catalog no longer lists", async () => {
+  const { evidence, local, subscription, response } = await import("./evals-policy-support.ts");
+  const { MODELS } = await import("../src/router/catalog.ts");
+  const removed = "codex/astra@high";
+  const cells = ["trivial", "small", "medium"] as const;
+  const implement = evidence("implement", [subscription, removed], { id: "implement-run" });
+  implement.trials.forEach((t, i) => {
+    t.details.complexity = cells[i % 3];
+  });
+  const rows = [evidence("triage", [local, removed]), implement];
+  const root = join(import.meta.dir, "..");
+  const run = async (models: typeof MODELS) => {
+    const data = response(rows, { models });
+    const files = new Map([["routing/policy.json", readFileSync(join(root, "routing/policy.json"), "utf8")]]);
+    const io = {
+      api: async <T>() => structuredClone(data) as T,
+      print: () => {},
+      wait: async () => {},
+      files: {
+        read: async (path: string) => files.get(path) ?? null,
+        write: async (path: string, text: string) => void files.set(path, text),
+      },
+    };
+    await evalCommand(["policy"], { write: true }, io);
+    return { data, files };
+  };
+  const { files } = await run(MODELS);
+  const written = files.get("routing/policy.json") ?? "";
+  expect(written).not.toContain("codex/astra");
+  expect(JSON.parse(written).triage.default).toEqual([local]);
+  for (const cell of cells) expect(JSON.parse(written).implement[cell]).toEqual([subscription]);
+  const report = files.get("routing/EVIDENCE.md") ?? "";
+  expect(report).toContain(`| ${removed}; run=triage-run;`);
+  expect(report).toContain("ineligible: codex/astra is not in the model catalog");
+  // A daemon older than this change still lists the model and proposes it; the CLI refuses to write.
+  const astra = {
+    id: "codex/astra",
+    provider: "codex",
+    model: "gpt-6-astra",
+    vendor: "openai",
+    origin: "US",
+    baseOrigin: "US",
+    supportedEfforts: ["high"],
+    tier: 5,
+    effort: "high",
+    price: { input: 10, output: 50 },
+  } satisfies (typeof MODELS)[number];
+  const older = response(rows, { models: [...MODELS, astra] });
+  expect(older.evaluation.generated.triage?.default).toEqual([local, removed]);
+  await expect(run([...MODELS, astra])).rejects.toThrow("GPT-6 Astra was removed from routing on 2026-10-04");
 });
 
 test("policy CLI pins a cell with no completed evidence without inventing candidates", async () => {

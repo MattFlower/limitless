@@ -1,10 +1,11 @@
 import type { ZodType } from "zod";
 import type { Billing, ConfinementProbe, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
+import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import type { DecisionDecline, DecisionTask } from "./decisions.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
 export interface ModelTarget {
-  modelId: string; // catalog id, e.g. "claude/sonnet"
+  modelId: string; // catalog id, e.g. "claude/opus"
   provider: string; // "claude" | "codex" | "openrouter" | "mtplx" | "twilight" | "typesafe"
   harness: "claude" | "codex" | "decisions" | "fake";
   model: string; // backend model name passed to the CLI / API
@@ -83,6 +84,8 @@ export interface Usage {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  /** The subset of `cacheWrite` priced at the 1-hour cache rate; absent when the stream has no breakdown. */
+  cacheWrite1h?: number;
 }
 
 export interface AgentResult {
@@ -111,9 +114,9 @@ export type Harness = (spec: AgentSpec) => Promise<AgentResult>;
 
 /** Redact string values before persisting a structured CLI event. */
 export function redactJsonLine(line: string, redact?: (text: string) => string): string {
-  if (!redact) return line;
+  redact ??= redactCredentials;
   try {
-    return JSON.stringify(JSON.parse(line), (_key, value: unknown) =>
+    return JSON.stringify(redactCredentialData(JSON.parse(line)), (_key, value: unknown) =>
       typeof value === "string" ? redact(value) : value,
     );
   } catch {
@@ -121,16 +124,22 @@ export function redactJsonLine(line: string, redact?: (text: string) => string):
   }
 }
 
+export const protectCredentials = (spec: AgentSpec): AgentSpec => ({
+  ...spec,
+  onEvent: (event) => spec.onEvent(redactCredentialData(event)),
+  redactOutput: (text) => redactCredentials(spec.redactOutput?.(text) ?? text),
+});
+
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 export function priceOf(usage: Usage, price: ModelTarget["price"]): number {
   if (!price) return 0;
   const cacheRead = price.cacheRead ?? price.input * 0.1;
+  // A 1-hour write costs twice the input rate; without the breakdown every write is a 5-minute one.
+  const write1h = Math.min(usage.cacheWrite1h ?? 0, usage.cacheWrite);
+  const cacheWrite = (usage.cacheWrite - write1h) * price.input * 1.25 + write1h * price.input * 2;
   return (
-    (usage.input * price.input +
-      usage.cacheWrite * price.input * 1.25 +
-      usage.cacheRead * cacheRead +
-      usage.output * price.output) /
+    (usage.input * price.input + cacheWrite + usage.cacheRead * cacheRead + usage.output * price.output) /
     1_000_000
   );
 }

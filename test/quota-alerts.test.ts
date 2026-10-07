@@ -84,6 +84,91 @@ afterEach(() => {
 
 const alerts = (): QuotaAlert[] => store.listAlerts(now);
 
+test("unlimited windows are informational while CLI quota rejections still alert", () => {
+  factory = new Factory(factory.cfg, {
+    store,
+    providers: providers.map((p) => ({ ...p, quota: "unlimited" })),
+    models,
+    policy,
+    clock: () => now,
+  });
+  const reset = now + 500_000;
+  factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.99, resetsAt: reset } });
+  expect(alerts()).toEqual([]);
+  const exhaustedUntil = now + 100_000;
+  factory.tracker.record("claude", "quota", { exhaustedUntil });
+  expect(alerts()).toMatchObject([
+    { provider: "claude", window: "hard_limit", severity: "exhausted", resetsAt: exhaustedUntil },
+  ]);
+  factory.tracker.observeWindows("claude", { five_hour: { utilization: 1, resetsAt: reset } });
+  expect(alerts()).toHaveLength(1);
+  now = exhaustedUntil;
+  factory.scheduler.tick();
+  expect(alerts()).toEqual([]);
+});
+
+for (const knownReset of [false, true]) {
+  test(`switching to unlimited clears telemetry alerts and preserves rejections (${knownReset ? "known" : "unknown"} reset)`, () => {
+    const reset = knownReset ? now + 500_000 : null;
+    factory.tracker.observeWindows("claude", { rejected: { utilization: 1, resetsAt: reset } });
+    factory.tracker.record("claude", "quota", { exhaustedUntil: now + 100_000 });
+    // Later telemetry on the same boundary must not erase the rejection's origin.
+    factory.tracker.observeWindows("claude", { rejected: { utilization: 0.95, resetsAt: reset } });
+    factory.tracker.observeWindows("claude", {
+      five_hour: { utilization: 0.7, resetsAt: reset },
+      seven_day: { utilization: 0.9, resetsAt: reset },
+    });
+    factory.tracker.record("codex", "quota", { exhaustedUntil: now + 100_000 });
+    for (const severity of ["warning", "exhausted"] as const) {
+      store.putAlert({
+        provider: "claude",
+        window: `legacy_${severity}`,
+        utilization: 0.9,
+        resetsAt: reset,
+        severity,
+        routing: "legacy alert",
+        createdAt: now,
+      });
+    }
+    expect(alerts()).toHaveLength(6);
+    expect(alerts().find((alert) => alert.window === "rejected")?.source).toBe("rejection");
+    // Fresh telemetry cannot establish whether an older exhausted alert was a rejection.
+    factory.tracker.observeWindows("claude", {
+      legacy_exhausted: { utilization: 0.9, resetsAt: reset },
+    });
+    expect(alerts().find((alert) => alert.window === "legacy_exhausted")).toMatchObject({
+      severity: "exhausted",
+      source: null,
+    });
+    store.close();
+    store = new Store(factory.cfg.paths.db);
+    factory = new Factory(factory.cfg, {
+      store,
+      providers: providers.map((p) => ({ ...p, quota: "unlimited" })),
+      models,
+      policy,
+      clock: () => now,
+    });
+    const remaining = ["hard_limit", "legacy_exhausted", "rejected"];
+    expect(
+      alerts()
+        .map((alert) => alert.window)
+        .sort(),
+    ).toEqual(remaining);
+    expect(factory.tracker.isAvailable("claude")).toBe(false);
+    factory.tracker.observeWindows("claude", {
+      five_hour: { utilization: 1, resetsAt: reset },
+      seven_day: { utilization: 1, resetsAt: reset },
+    });
+    expect(
+      alerts()
+        .map((alert) => alert.window)
+        .sort(),
+    ).toEqual(remaining);
+    expect(factory.tracker.status("claude")?.windows.five_hour?.utilization).toBe(1);
+  });
+}
+
 test("threshold, exhaustion, and reset produce one alert per window with live updates", () => {
   const changes: StreamMessage[] = [];
   const unsubscribe = store.subscribe((msg) => changes.push(msg));

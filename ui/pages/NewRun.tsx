@@ -1,8 +1,9 @@
 import { useNavigate } from "@solidjs/router";
 import type { Component } from "solid-js";
 import { createSignal, For, onMount, Show } from "solid-js";
-import type { Profile } from "../../src/core/types.ts";
+import type { Profile, RunModels } from "../../src/core/types.ts";
 import { createRun, getRepos } from "../api.ts";
+import { RunModelPicker } from "../components/RunModelPicker.tsx";
 
 const PROFILES: { id: Profile; desc: string }[] = [
   { id: "auto", desc: "Let triage size the task and pick a profile automatically." },
@@ -18,6 +19,7 @@ export const NewRun: Component = () => {
   const [prompt, setPrompt] = createSignal("");
   const [title, setTitle] = createSignal("");
   const [profile, setProfile] = createSignal<Profile>("auto");
+  const [models, setModels] = createSignal<RunModels>({});
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -39,6 +41,7 @@ export const NewRun: Component = () => {
         ...(title().trim() ? { title: title().trim() } : {}),
         profile: profile(),
         source: "ui",
+        models: models(),
       });
       navigate(`/runs/${run.id}`);
     } catch (err) {
@@ -113,6 +116,11 @@ export const NewRun: Component = () => {
             </For>
           </div>
         </div>
+
+        <details open={error()?.startsWith("models") || undefined}>
+          <summary>Models (optional)</summary>
+          <RunModelPicker models={models()} onChange={setModels} error={error()} />
+        </details>
 
         <Show when={error()}>
           <div class="error-box">{error()}</div>

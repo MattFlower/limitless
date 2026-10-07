@@ -14,11 +14,28 @@ test("providers CLI shows rounded utilization and independent reading ages", asy
           state: "ok",
           reason: null,
           maxConcurrent: 5,
+          discovery: { servedNotInCatalog: ["new-backend"], catalogNotServed: ["claude/old"] },
           windows: {
             five_hour: { utilization: 0.721, resetsAt: now + 60_000, observedAt: now - 12 * 60_000 },
             seven_day: { utilization: 1, resetsAt: null, observedAt: null },
             future: { utilization: 0, resetsAt: null, observedAt: now + 60_000 },
           },
+        },
+        {
+          id: "work",
+          state: "ok",
+          reason: null,
+          maxConcurrent: 1,
+          quota: "unlimited",
+          windows: {},
+        },
+        {
+          id: "work-observed",
+          state: "ok",
+          reason: null,
+          maxConcurrent: 1,
+          quota: "unlimited",
+          windows: { five_hour: { utilization: 0.99, observedAt: now } },
         },
       ]),
   });
@@ -43,6 +60,13 @@ test("providers CLI shows rounded utilization and independent reading ages", asy
     expect(stdout).toContain("seven_day 100% (as of unknown)");
     expect(stdout).toContain("future 0% (as of just now)");
     expect(stdout).toContain("maxConcurrent 5");
+    expect(stdout).toContain("served-not-in-catalog: new-backend");
+    expect(stdout).toContain("catalog-not-served: claude/old");
+    expect(stdout.split("\n").find((line) => line.startsWith("claude"))).not.toContain("No limit");
+    expect(stdout.split("\n").find((line) => line.startsWith("work "))).toContain("No limit (configured)");
+    expect(stdout.split("\n").find((line) => line.startsWith("work-observed"))).toContain(
+      "No limit (configured) five_hour 99%",
+    );
   } finally {
     server.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -123,6 +147,40 @@ test("fast CLI sends boolean on/off and reports invalid arguments and provider e
           expect(output).toContain(`${id}: fast ${value}`);
         }
       }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("providers CLI reports missing named credentials when listing and enabling", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-missing-cli-"));
+  try {
+    const preload = join(dir, "missing.ts");
+    writeFileSync(
+      preload,
+      `globalThis.fetch = async (input, init) => {
+      const provider = { id: "custom", state: "disabled", reason: "missing key EXAMPLE_KEY", maxConcurrent: 4, windows: {} };
+      return Response.json(init?.method === "POST" ? provider : [provider]);
+    };`,
+    );
+    for (const args of [[], ["enable", "custom"]]) {
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "--preload",
+          preload,
+          join(import.meta.dir, "../src/cli/main.ts"),
+          "providers",
+          ...args,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const output = await new Response(child.stdout).text();
+      expect(await child.exited).toBe(0);
+      expect(output).toContain("missing key EXAMPLE_KEY");
+      expect(output).toContain("disabled");
+      expect(output).not.toContain("never-publish-sentinel");
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });

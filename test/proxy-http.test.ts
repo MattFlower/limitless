@@ -43,7 +43,7 @@ test("config validates LAN settings; exact binds share routes, stop together and
   const f = await fixture();
   try {
     const configDir = join(f.home, "config");
-    mkdirSync(configDir);
+    mkdirSync(configDir, { recursive: true });
     const config = (toml: string) => {
       writeFileSync(join(configDir, "config.toml"), `[server]\n${toml}`);
       return loadConfig({ home: join(f.home, "data"), configDir });
@@ -176,6 +176,38 @@ test("resolve is loopback-only even through a trusted proxy with valid Host and 
       ).status,
     ).toBe(200);
     expect(store.getRun(run.id)?.resolution?.kind).toBe("done_elsewhere");
+  } finally {
+    await f.close();
+  }
+});
+
+test("every SSE stream asks a reverse proxy not to buffer or transform it", async () => {
+  const f = await fixture();
+  try {
+    Object.assign(f.factory.cfg, { auth: "proxy", trustedProxies: [proxy], publicOrigins: [origin] });
+    const routes = createHttpRoutes(f.factory);
+    for (const [pattern, path, params] of [
+      ["/api/stream", "/api/stream", {}],
+      ["/api/runs/:id/stream", "/api/runs/abc/stream", { id: "abc" }],
+      ["/api/chat/:conversationId/stream", "/api/chat/one/stream", { conversationId: "one" }],
+    ] as const) {
+      const abort = new AbortController();
+      const response = await (routes[pattern] as Route)(
+        requestWithParams(
+          `http://localhost:7400${path}`,
+          { headers: { host: new URL(origin).host }, signal: abort.signal },
+          params,
+        ),
+        peer(proxy),
+      );
+      abort.abort();
+      expect([
+        path,
+        response.headers.get("content-type"),
+        response.headers.get("cache-control"),
+        response.headers.get("x-accel-buffering"),
+      ]).toEqual([path, "text/event-stream", "no-cache, no-transform", "no"]);
+    }
   } finally {
     await f.close();
   }

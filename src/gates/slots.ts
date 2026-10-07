@@ -9,6 +9,12 @@ export function defaultGateSlots(cores = availableParallelism()): number {
 export class Semaphore {
   private max = 1;
   private active = 0;
+  private holders = new Map<() => void, string>();
+  private leases = new Map<string, (release: boolean) => boolean>();
+
+  snapshot() {
+    return { occupied: this.holders.size, limit: this.max, holders: [...this.holders.values()] };
+  }
   private readonly waiters: (() => void)[] = [];
 
   constructor(limit: number) {
@@ -25,11 +31,17 @@ export class Semaphore {
   }
 
   /** Resolves with a release function; `onWait` fires once when the caller has to queue. */
-  async acquire(signal: AbortSignal, onWait?: (limit: number) => void): Promise<() => void> {
+  async acquire(
+    signal: AbortSignal,
+    onWait?: (limit: number) => void,
+    holder = "gate",
+    running = false,
+  ): Promise<() => void> {
     signal.throwIfAborted();
-    if (this.active < this.max && !this.waiters.length) this.active++;
+    if (running || (this.active < this.max && !this.waiters.length)) this.active++;
     else {
       onWait?.(this.max);
+      signal.throwIfAborted();
       await new Promise<void>((resolve, reject) => {
         const wake = () => {
           signal.removeEventListener("abort", abort);
@@ -45,12 +57,54 @@ export class Semaphore {
       });
     }
     let released = false;
-    return () => {
+    const release = () => {
       if (released) return;
       released = true;
+      this.holders.delete(release);
       this.active--;
       this.drain();
     };
+    this.holders.set(release, holder);
+    if (signal.aborted) release();
+    signal.throwIfAborted();
+    return release;
+  }
+
+  async lease(
+    name: string,
+    immediate = false,
+    timer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
+    clear = clearTimeout,
+    running = false,
+  ): Promise<string> {
+    const id = crypto.randomUUID(),
+      controller = new AbortController();
+    let release: (() => void) | undefined, expiry: ReturnType<typeof setTimeout>;
+    const touch = (done: boolean) => {
+      clear(expiry);
+      if (done) {
+        this.leases.delete(id);
+        controller.abort();
+        release?.();
+      } else expiry = timer(() => touch(true), 30_000);
+      return !!release;
+    };
+    this.leases.set(id, touch);
+    touch(false);
+    void this.acquire(controller.signal, undefined, name, running).then(
+      (free) => {
+        release = free;
+        if (controller.signal.aborted) touch(true);
+      },
+      () => touch(true),
+    );
+    await Promise.resolve();
+    if (immediate && !release) touch(true);
+    return id;
+  }
+
+  heartbeat(id: string, release = false): boolean | undefined {
+    return this.leases.get(id)?.(release);
   }
 
   private drain(): void {

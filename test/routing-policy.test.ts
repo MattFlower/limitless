@@ -4,13 +4,51 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { Store } from "../src/db/store.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
+import { exportProviders, resolveCatalog } from "../src/router/config-catalog.ts";
 import { loadPolicy, validatePolicy } from "../src/router/policy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
 import { evalFixture } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { customModel, providerFixture } from "./provider-config-support.ts";
+import { identitySnapshot } from "./routing-identity-support.ts";
+
+test("runtime models stay out of escalation and free widening unless explicitly named", () => {
+  const fixture = providerFixture([], "OMLX_API_KEY=fake-key\n");
+  const store = new Store(":memory:");
+  const factory = new Factory(fixture.load(), { store });
+  try {
+    factory.catalog.add({ ...customModel, provider: "codex", id: "experimental", tier: 5 });
+    factory.catalog.add({ ...customModel, provider: "omlx", id: "experimental", tier: 5, effort: undefined });
+    factory.tracker.setHealthy("omlx", true);
+    expect(
+      factory.router
+        .route("implement", "small", { minTier: 5 })
+        .candidates.some((m) => m.modelId.endsWith("/experimental")),
+    ).toBe(false);
+    for (const billing of ["free_first", "free_only"] as const)
+      expect(
+        factory.router
+          .route("triage", "small", { billing })
+          .candidates.some((m) => m.modelId === "omlx/experimental"),
+      ).toBe(false);
+    for (const id of ["omlx/experimental", "codex/experimental"]) {
+      expect(factory.router.route("triage", "small", { chain: [id] }).candidates[0]?.modelId).toBe(id);
+      factory.routing.setCell("triage", "small", [id]);
+      expect(factory.router.route("triage", "small").candidates[0]?.modelId).toBe(id);
+    }
+    factory.routing.setCell("implement", "small", ["omlx/experimental"]);
+    expect(factory.router.route("implement", "small", { minTier: 5 }).candidates[0]?.modelId).toBe(
+      "omlx/experimental",
+    );
+  } finally {
+    store.close();
+    fixture.close();
+  }
+});
 
 test("policy files: absent, empty, partial, pipe groups, complexity preservation and immutable defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "policy-"));
@@ -48,6 +86,8 @@ test("policy files: absent, empty, partial, pipe groups, complexity preservation
     }
     writeFileSync(path, '{"triage":{"default":["codex/luna|no/model"]}}');
     expect(() => loadPolicy(path, MODELS)).toThrow('unknown model ID \\"no/model\\"');
+    writeFileSync(path, '{"implement":{"large":["codex/astra@high","claude/opus"]}}');
+    expect(() => loadPolicy(path, MODELS)).toThrow("GPT-6 Astra was removed from routing on 2026-10-04");
     writeFileSync(path, '{"triage":{"default":["codex/luna||mtplx/qwen-27b"]}}');
     expect(() => loadPolicy(path, MODELS)).toThrow("empty model ID");
   } finally {
@@ -230,4 +270,18 @@ test("the default local model comes first among free oMLX models", () => {
     "omlx/qwen-flash",
     "omlx/qwen-27b",
   ]);
+});
+
+test("frozen pre-PR identity and export preserve all routing decisions", async () => {
+  const baseline = await Bun.file(join(import.meta.dir, "fixtures/routing-identity.json")).json();
+  for (const decision of baseline.decisionTable) {
+    decision.candidates = decision.candidates.map((i: number) => baseline.candidateTable[i]);
+    decision.skipped = decision.skipped.map((i: number) => baseline.skippedTable[i]);
+  }
+  for (const row of baseline.snapshot.decisions) row.decision = baseline.decisionTable[row.decision];
+  expect(identitySnapshot(resolveCatalog())).toEqual(baseline.snapshot);
+  const exported = resolveCatalog(
+    (Bun.TOML.parse(exportProviders(resolveCatalog())) as Record<string, unknown>).providers,
+  );
+  expect(identitySnapshot(exported)).toEqual(baseline.snapshot);
 });

@@ -3,10 +3,55 @@ import { expect, test } from "bun:test";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AuditAllowance, CreateRunRequest } from "../src/core/types.ts";
+import { Factory } from "../src/app.ts";
+import { loadConfig } from "../src/config.ts";
+import type { AuditAllowance, CreateRunRequest, Run } from "../src/core/types.ts";
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
+import { customModel } from "./provider-config-support.ts";
+
+test("runtime catalog and discovery upgrade legacy databases and restore before operator policy", () => {
+  temporary((directory, path) => {
+    legacyDatabase(path);
+    const cfg = loadConfig({ home: directory, configDir: directory });
+    let store = new Store(path);
+    const factory = new Factory(cfg, { store });
+    factory.catalog.add({ ...customModel, provider: "codex", id: "experiment" });
+    factory.routing.setCell("triage", "default", ["codex/experiment@high"]);
+    store.writeDiscovery("omlx", ["first", "second"], 100);
+    store.writeDiscovery("omlx", ["second"], 200);
+    store.close();
+    const previous = new Database(path);
+    expect(previous.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
+      value: "unchanged",
+    });
+    previous.exec("INSERT INTO settings VALUES ('rollback', 'works')");
+    previous.close();
+    store = new Store(path);
+    try {
+      const restored = new Factory(cfg, { store });
+      expect(restored.router.route("triage", "small").candidates[0]?.targetId).toBe("codex/experiment@high");
+      expect(restored.catalog.snapshot().models.find((m) => m.id === "codex/experiment")?.source).toBe(
+        "runtime",
+      );
+      expect(store.discovery("omlx")).toEqual({
+        served: ["second"],
+        observedAt: 200,
+        observations: [
+          { model: "first", firstSeen: 100, lastSeen: 100 },
+          { model: "second", firstSeen: 100, lastSeen: 200 },
+        ],
+      });
+      expect(restored.tracker.status("omlx")?.discovery?.served).toBeNull();
+      expect(store.db.query("SELECT value FROM settings WHERE key = 'rollback'").get()).toEqual({
+        value: "works",
+      });
+    } finally {
+      store.close();
+    }
+  });
+});
 
 function temporary(testBody: (directory: string, path: string) => void): void {
   const directory = mkdtempSync(join(tmpdir(), "limitless-migrations-"));
@@ -31,6 +76,39 @@ function legacyDatabase(path: string): void {
   db.close();
 }
 
+test("model chains upgrade legacy runs, persist on reopen and preserve prior-schema reads and writes", () => {
+  temporary((_directory, path) => {
+    legacyDatabase(path);
+    const legacy = new Database(path);
+    legacy.exec("INSERT INTO repos (id, slug, kind, created_at) VALUES ('repo', 'local', 'local', 1)");
+    legacy.exec(
+      "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES ('old', 'repo', 'old', 'old', 'cli', 'queued', 1)",
+    );
+    legacy.close();
+    let store = new Store(path);
+    expect(store.getRun("old")?.models).toEqual({});
+    const repo = store.getRepo("repo");
+    if (!repo) throw new Error("missing repo");
+    const models = { implement: ["codex/sol@high", "claude/opus"], review: ["claude/opus|codex/sol"] };
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "experiment", models });
+    store.close();
+    // Prior-release SQL names only its known columns, so the default handles its inserts.
+    const previous = new Database(path);
+    expect(previous.query("SELECT title, prompt FROM runs WHERE id = ?").get(run.id)).toEqual({
+      title: "experiment",
+      prompt: "experiment",
+    });
+    previous.exec(
+      "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES ('rollback', 'repo', 'rollback', 'rollback', 'cli', 'queued', 2)",
+    );
+    previous.close();
+    store = new Store(path);
+    expect(store.getRun(run.id)?.models).toEqual(models);
+    expect(store.getRun("rollback")?.models).toEqual({});
+    store.close();
+  });
+});
+
 const legacyRows = (db: Database) => db.query("SELECT * FROM schema_migrations ORDER BY version").all();
 const fileNames = (db: Database) =>
   (db.query("SELECT name FROM applied_migrations ORDER BY rowid").all() as { name: string }[]).map(
@@ -43,6 +121,37 @@ test("the legacy migration array is frozen", () => {
 
 test("repository migration files are validly named", () => {
   expect(() => migrationNames(MIGRATION_DIR)).not.toThrow();
+});
+
+test("operator routing migration upgrades an existing DB and permits previous-release reopen", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-operator-routing.sql"),
+    });
+    let previous = new Store(path, before);
+    previous.setSetting("sentinel", "unchanged");
+    const legacy = legacyRows(previous.db);
+    previous.close();
+    const current = new Store(path);
+    current.writeRouting("triage.default", ["codex/sol"], "live", "tester");
+    current.writeRouting("prefer", ["codex"], null, "tester");
+    expect(legacyRows(current.db)).toEqual(legacy);
+    current.close();
+    previous = new Store(path, before);
+    expect(previous.getSetting("sentinel", "")).toBe("unchanged");
+    previous.setSetting("rollback", "works");
+    previous.close();
+    const reopened = new Store(path);
+    expect(reopened.getSetting("rollback", "")).toBe("works");
+    expect(reopened.routingCells()).toMatchObject([
+      { role: "triage", cell: "default", groups: ["codex/sol"] },
+    ]);
+    expect(reopened.routingPrefer()).toEqual(["codex"]);
+    expect(reopened.routingHistory()).toHaveLength(2);
+    reopened.close();
+  });
 });
 
 test("fresh Store applies legacy and file migrations and reopens without new records", () => {
@@ -81,8 +190,18 @@ test("upgrading an existing database applies only new files and leaves legacy tr
 
 test("a previous release can still open the database (deploy rollback)", () => {
   temporary((directory, path) => {
-    writeFileSync(join(directory, "20260927T1500-added.sql"), "CREATE TABLE added (id INTEGER);");
-    new Store(path, directory).close();
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-github-closed-expiry.sql"),
+    });
+    const old = new Store(path, before);
+    const url = "https://github.com/o/r/pull/1";
+    old.db
+      .query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)")
+      .run(url, "node", JSON.stringify({ state: "CLOSED" }), 1);
+    old.close();
+    new Store(path).close();
     // The pre-file-migration Store.migrate(): version-keyed table, legacy array only.
     const db = new Database(path);
     db.exec(
@@ -94,7 +213,70 @@ test("a previous release can still open the database (deploy rollback)", () => {
       ),
     );
     expect(MIGRATIONS.filter((m) => !applied.has(m.version))).toEqual([]);
+    expect(() =>
+      db
+        .query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)")
+        .run(url, "node", JSON.stringify({ state: "OPEN" }), 0),
+    ).not.toThrow();
+    expect(db.query("SELECT closed_at, reopened_at FROM github_pr_expiry WHERE url = ?").get(url)).toEqual({
+      closed_at: expect.any(Number),
+      reopened_at: null,
+    });
     db.close();
+    // Every shipped file migration, including the additive cache-write column, applies in turn.
+    const shipped = new Store(path);
+    shipped.close();
+    const after = new Database(path);
+    after.exec(
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    );
+    const stillApplied = new Set(
+      (after.query("SELECT version FROM schema_migrations").all() as { version: number }[]).map(
+        (r) => r.version,
+      ),
+    );
+    expect(MIGRATIONS.filter((m) => !stillApplied.has(m.version))).toEqual([]);
+    expect(after.query("SELECT input_tokens, cache_read_tokens FROM invocations LIMIT 0").all()).toEqual([]);
+    after.close();
+  });
+});
+
+test("invocations recorded before cache writes were stored read as zero writes", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-invocation-cache-write-tokens.sql"),
+    });
+    const old = new Store(path, before);
+    const repo = old.upsertRepo({
+      slug: "local/legacy",
+      kind: "local",
+      localPath: directory,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = old.createRun(repo, { repo: repo.slug, prompt: "legacy" });
+    const invocation = old.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "claude",
+      provider: "claude",
+      model: "m",
+      modelId: "claude/m",
+    });
+    old.updateInvocation(invocation.id, { status: "ok", inputTokens: 10, cacheReadTokens: 20 });
+    old.close();
+
+    const store = new Store(path);
+    expect(store.listInvocations(run.id)[0]).toMatchObject({
+      inputTokens: 10,
+      cacheReadTokens: 20,
+      cacheWriteTokens: 0,
+    });
+    store.close();
   });
 });
 
@@ -266,6 +448,53 @@ test("the baseline cache ships as one migration with no unused table", () => {
   });
 });
 
+test("the previous release opens the migrated database and can still write runs and invocations", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    // The shipped migrations minus the land queue: exactly what the last release knows.
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-land-queue.sql"),
+    });
+    new Store(path).close(); // the new release applies every file, including the land queue
+    const store = new Store(path, before);
+    const repo = store.upsertRepo({
+      slug: "owner/name",
+      kind: "github",
+      url: "git@github.com:owner/name.git",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "old release work" });
+    const invocation = store.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "claude-cli",
+      provider: "claude",
+      model: "claude-opus-5",
+      modelId: "claude/opus",
+    });
+    store.updateInvocation(invocation.id, { status: "ok", finishedAt: Date.now() });
+    store.updateRun(run.id, { status: "succeeded", prUrl: "https://github.com/owner/name/pull/1" });
+    store.close();
+    const tables = (db: Database) =>
+      (
+        db
+          .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'land_entries'")
+          .all() as unknown[]
+      ).length;
+    const reopened = new Database(path);
+    expect(tables(reopened)).toBe(1); // the land queue's table is additive: the old release ignores it
+    reopened.close();
+    const again = new Store(path, before);
+    expect(again.getRun(run.id)?.status).toBe("succeeded");
+    expect(again.listInvocations(run.id)[0]).toMatchObject({ status: "ok", role: "implement" });
+    again.close();
+  });
+});
+
 test("audit allowances persist from requester text and options; legacy runs allow nothing", () => {
   temporary((_directory, path) => {
     let store = new Store(path);
@@ -321,5 +550,59 @@ test("audit allowances persist from requester text and options; legacy runs allo
     store = new Store(path);
     expect(store.getRun(legacy)?.allow).toEqual([]);
     store.close();
+  });
+});
+
+test("after the review-round migration the previous release still opens the database and writes runs", () => {
+  temporary((directory, path) => {
+    const current = new Store(path);
+    const repo = current.upsertRepo({
+      slug: "o/r",
+      kind: "github",
+      url: "unused",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const prUrl = "https://github.com/o/r/pull/1";
+    const sha = "a".repeat(40);
+    const owner = current.createRun(repo, { repo: repo.slug, prompt: "feature" });
+    current.updateRun(owner.id, { status: "succeeded", branch: "limitless/feature", prUrl });
+    current.createReviewRound(
+      repo,
+      current.getRun(owner.id) as Run,
+      { prUrl, reviewedSha: sha, findings: [], cap: 3 },
+      (round) => ({
+        repo: repo.slug,
+        prompt: "apply findings",
+        baseBranch: "limitless/feature",
+        deliveryBranch: "limitless/feature",
+        sourceRef: { kind: "review-round", runId: owner.id, round, prUrl, reviewedSha: sha },
+      }),
+    );
+    current.recordApproval(owner.id, prUrl, sha, "reviewer");
+    current.close();
+    // The previous release ships every migration file except this one.
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, { recursive: true, filter: (src) => !src.endsWith("-review-rounds.sql") });
+    const previous = new Store(path, before);
+    const run = previous.createRun(repo, { repo: repo.slug, prompt: "after a rollback" });
+    previous.createInvocation({
+      runId: run.id,
+      stageId: previous.startStage(run.id, "implement").id,
+      role: "implement",
+      harness: "fake",
+      provider: "a",
+      model: "a",
+      modelId: "a",
+    });
+    previous.updateRun(run.id, { status: "succeeded", prUrl: "https://github.com/o/r/pull/2" });
+    previous.close();
+    const reopened = new Store(path);
+    expect(reopened.getRun(run.id)).toMatchObject({ status: "succeeded" });
+    expect(reopened.listInvocations(run.id)).toHaveLength(1);
+    expect(reopened.reviewRounds(prUrl)).toMatchObject([{ round: 1, reviewedSha: sha }]);
+    expect(reopened.approvalFor(prUrl)).toEqual({ sha, stale: false });
+    reopened.close();
   });
 });

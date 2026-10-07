@@ -20,7 +20,9 @@ and delivers a pull request — while spending as little of your paid AI capacit
    the implementer's family, possibly its own model in a fresh session (recorded in the panel
    record); nothing it reports blocks until a verifier that did not raise it confirms it.
 3. **Spend is a first-class dimension.** Every invocation records tokens, $ (metered) and
-   $-equivalent (subscription). Routing picks the cheapest model that is *capable enough* for the
+   $-equivalent (subscription); cached and cache-written prompt tokens are kept apart from uncached
+   input, and writes are priced by their cache duration (1.25× input for 5 minutes, 2× for an hour).
+   Routing picks the cheapest model that is *capable enough* for the
    role, and quota headroom on subscriptions is tracked from live rate-limit telemetry.
 4. **Fresh context per stage, state on disk.** Each stage starts a fresh agent session that reads
    artifacts (spec, plan, feedback) from files; nothing important lives only in a context window
@@ -159,8 +161,8 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 
 | Tier | Subscription (sunk cost) | Metered / free |
 |---|---|---|
-| 5 | Claude Fable 5.1, Claude Opus 5.5, GPT-6 Astra | (OpenRouter frontier — last resort) |
-| 4 | Claude Sonnet 5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
+| 5 | Claude Opus 5.5 | (OpenRouter frontier — last resort) |
+| 4 | Claude Sonnet 5.5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
 | 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, opt-in), twilight llama.cpp models |
 
@@ -174,7 +176,7 @@ Limitless defaults to 4 concurrent oMLX requests; override in `config.toml` with
 max_concurrent = 8
 ```
 
-The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
 `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first routing
 among free models the policy does not name, take catalog order, so they use Flash. Tool-free roles accept
 `omlx/qwen-flash@none` / `omlx/qwen-flash@high` to turn thinking off/on; compare them with
@@ -215,8 +217,9 @@ runAgent(spec: AgentSpec): AsyncIterable<AgentEvent> & { result: Promise<AgentRe
 
 - **claude-cli** spawns the official `claude -p --output-format stream-json`. Using the official
   binary with your own login is the supported way to automate a Claude subscription (research/03 §1).
-  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` /
-  `ANTHROPIC_AUTH_TOKEN` — all of them speak the Anthropic Messages API. Factory runs use
+  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` and an
+  `apiKeyHelper` that reads a per-invocation 0600 key file, so the backend key never enters the
+  agent's or its tools' environment — all of them speak the Anthropic Messages API. Factory runs use
   `--setting-sources project` + an explicit `--settings` so your personal hooks/plugins don't
   fire inside factory runs.
 - **codex-cli** spawns `codex exec --json` (sandbox `workspace-write`), then reads the session
@@ -293,17 +296,39 @@ detection, per-invocation budget, process-group kill on cancel.
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,
 `invocations`, `events`, `artifacts`, `questions`, `provider_state`, `inbox` (webhook dedupe +
-audit), `chat_messages`, `settings`. The frozen legacy migrations and timestamped SQL files are applied at startup.
+audit), `chat_messages`, `settings`, `land_entries` (the approved-PR queue). The frozen legacy
+migrations and timestamped SQL files are applied at startup.
 
 On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
-current stage (the worktree is preserved; Claude sessions can be resumed).
+current stage (the worktree is preserved; Claude sessions can be resumed). Land entries left in
+flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps waiting on the recorded
+commit, and `merging` first asks GitHub whether the PR already merged.
+
+### Landing (the land queue)
+
+`limitless land <run|pr>` (or `POST /api/land`) approves a pull request for landing: the approval is
+the run's recorded review approval, or an explicit `--sha` that must be the PR's current head. Only
+the approved SHA — plus a base merge the factory itself made — may land. One entry lands at a time
+per repository, oldest first, and the claim that gives a repository to one queue is a store
+transaction (`claimLandEntry`, one running land per repository), so a restart resumes and two queues
+cannot check the same repository at once.
+
+Each entry checks out the approved head from the bare cache, merges the base in when it has moved,
+runs the repository's checks (from the base commit's `.limitless.toml`) in one gate slot with the
+output written to `<runs>/<run>/land-<entry>.log`, pushes any merge commit with a lease on the
+approved head, and waits for CI on exactly that commit — moved by the poller's `pr.ci_passed` /
+`pr.ci_failed` items, with a timed read for a restart and for polling being off. A transient CI
+failure is re-run once. The squash-merge is pinned with `--match-head-commit` and carries the
+reviewed title and body; it never arms auto-merge. A conflict, a failing check, a moved head, red CI
+or CI that never finishes blocks the entry with a reason and merges nothing; a cancel or a shutdown
+aborts in-flight git, gates and `gh` calls through one signal.
 
 ## 8. Interfaces
 
 | Surface | What it does |
 |---|---|
 | **Web UI** (SolidJS) | Mission control: live runs, queue, quota gauges, spend; run detail with stage timeline, invocations (model/cost/tokens/duration), live event log, spec/diff/review/verdict artifacts, questions, cancel/retry; chat to start runs. Loopback needs no sign-in; through the LAN proxy it takes a passkey (or password) and a long-lived session cookie ([OPERATIONS](OPERATIONS.md#signing-in)). |
-| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
+| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `land` (queue, list, cancel), `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
 | **Chat concierge** | Shared by UI chat and Discord: turns free text into a confirmed run, answers status questions. Runs on a local model when available. |
 | **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; CI failure on a factory PR → fix run. |
 | **Discord** | `/build`, `/runs`, `/show`, `/cancel`; one thread per run with progress, questions and the final report. |

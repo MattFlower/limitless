@@ -11,11 +11,19 @@ import { Models } from "./pages/Models.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { Providers } from "./pages/Providers.tsx";
 import { RunDetail } from "./pages/RunDetail.tsx";
+import { Setup } from "./pages/Setup.tsx";
 import { live } from "./store.ts";
 
 const Shell: Component<RouteSectionProps> = (props) => (
   <>
     <NavBar />
+    <Show when={live.gateSlots()}>
+      {(slots) => (
+        <div role="status">
+          Gate slots: {slots().occupied}/{slots().limit} {slots().holders.join(", ")}
+        </div>
+      )}
+    </Show>
     <Show when={live.draining()}>
       <div class="draining-banner" role="status">
         Draining for deployment: active runs continue; new runs are queued until scheduling resumes.
@@ -33,6 +41,7 @@ render(
       <Route path="/new" component={NewRun} />
       <Route path="/evals" component={Evals} />
       <Route path="/evals/:id" component={EvalDetail} />
+      <Route path="/setup" component={Setup} />
       <Route path="/models" component={Models} />
       <Route path="/providers" component={Providers} />
       <Route path="/chat" component={Chat} />

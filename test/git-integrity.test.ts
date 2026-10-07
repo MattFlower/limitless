@@ -1,31 +1,36 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { parseAllow } from "../src/core/allow.ts";
 import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
+import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
 import { recordWorktree, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   addDetachedWorktree,
   attributeLimits,
+  blobPrivateEntries,
   checkoutCommitted,
+  checkPrivateRange,
   commitAll,
   createWorktree,
   diffSince,
@@ -38,7 +43,7 @@ import {
   resetTo,
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -50,6 +55,18 @@ let work: string;
 let base: string;
 const original = 'test("ok", () => {});\n';
 const edited = 'test.skip("ok", () => {});\n';
+const mediaBytes = JSON.parse(
+  readFileSync(new URL("./fixtures/media/files.json", import.meta.url), "utf8"),
+) as Record<string, string>;
+const mediaRegressions = JSON.parse(
+  readFileSync(new URL("./fixtures/media/regressions.json", import.meta.url), "utf8"),
+) as Record<string, string>;
+const mediaFixture = (extension: string, variant = 0) => {
+  const file = `${variant}.${extension.toLowerCase().replace("jpeg", "jpg")}`;
+  const encoded = mediaBytes[file] ?? mediaRegressions[file];
+  if (!encoded) throw new Error(`Missing media fixture: ${file}`);
+  return Buffer.from(encoded, "base64");
+};
 const git = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd });
 const factory = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work });
 
@@ -88,6 +105,41 @@ async function audited(files = ["sample.test.ts"]) {
     expect(await readFileAt(work, "HEAD", file)).toBe(edited);
   }
 }
+
+test.each([false, true])(
+  "private strings in binary or -diff content block (replacement: %s)",
+  async (replace) => {
+    const configDir = join(dir, "config");
+    mkdirSync(configDir);
+    writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
+    writeFileSync(join(work, ".gitattributes"), "*.dat -diff\n");
+    writeFileSync(join(work, "hidden.dat"), "SECRET-HOST.EXAMPLE\n");
+    // The entry straddles a 64 KiB stream chunk boundary.
+    const blob = Buffer.alloc(200_000);
+    blob.write("secret-host.example", 65_530);
+    writeFileSync(join(work, "blob.bin"), blob);
+    await commitAll(work, "hidden content");
+    if (replace) {
+      const original = (await git(work, "rev-parse", "HEAD:blob.bin")).stdout.trim();
+      const clean = (
+        await sh(["git", "hash-object", "-w", "--stdin"], { cwd: work, stdin: "clean\0" })
+      ).stdout.trim();
+      await git(work, "replace", original, clean);
+      expect((await git(work, "cat-file", "blob", original)).stdout).toBe("clean\0");
+    }
+    // Without a denylist no blob is read.
+    expect((await diffSince(work, base)).privateHits).toEqual([]);
+    const diff = await diffSince(work, base, undefined, false, loadPrivateStrings(configDir));
+    expect(diff.privateHits).toContainEqual({ path: "blob.bin", entry: 1 });
+    expect(diff.patch).not.toContain("secret-host.example");
+    const findings = auditDiff(diff, { configDir, taskClass: null, protectedPaths: [] }).filter(
+      (f) => f.rule === "private-string",
+    );
+    expect(findings.map((f) => f.file).sort()).toEqual(["blob.bin", "hidden.dat"]);
+    expect(findings.every((f) => f.severity === "block")).toBe(true);
+    expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+  },
+);
 
 test("committed -diff attributes cannot hide skipped tests, while 500 KB binaries stay compact", async () => {
   writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.png diff\n");
@@ -142,11 +194,7 @@ test("committed nested repositories and changed gitlink commits block, but reque
       file: "nested repo",
       detail: expect.stringContaining("nested repo: nested repository contents are absent from the diff"),
     });
-    expect(
-      auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["submodules"] }).some(
-        (f) => f.rule === "gitlink",
-      ),
-    ).toBe(false);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["submodules"] })).toEqual([]);
   };
   await assertGitlink(base);
   writeFileSync(join(nested, "hidden.test.ts"), `${edited}// next\n`);
@@ -899,6 +947,243 @@ test("hook discovery fails closed on invalid config and honors cancellation even
   expect(readFileSync(global, "utf8")).toBe("[invalid\n");
 });
 
+test("hooks that arrive between cached factory commands are still blanked", async () => {
+  const marker = join(dir, "hook-ran");
+  const hook = (name: string) =>
+    `[hook "${name}"]\n\tcommand = echo ${name} >> '${marker}'\n\tevent = pre-commit\n\tevent = reference-transaction\n`;
+  let round = 0;
+  const commit = async () => {
+    writeFileSync(join(work, "sample.test.ts"), `round ${++round}\n`);
+    expect(await commitAll(work, `round ${round}`)).not.toBeNull();
+    expect(existsSync(marker)).toBe(false);
+  };
+  await commit();
+  // An include added to the shared config, then a hook added to the included file alone.
+  writeFileSync(join(dir, "added.inc"), "[x]\n\ty = 1\n");
+  await git(work, "config", "--add", "include.path", join(dir, "added.inc"));
+  await commit();
+  writeFileSync(join(dir, "added.inc"), hook("added"));
+  await commit();
+  // An include whose target only appears later.
+  await git(work, "config", "--add", "include.path", join(dir, "later.inc"));
+  await commit();
+  writeFileSync(join(dir, "later.inc"), hook("later"));
+  await commit();
+  // Conditional includes that start to apply without their file changing.
+  writeFileSync(join(dir, "branch.inc"), hook("branch"));
+  await git(work, "config", "includeIf.onbranch:hooked/**.path", join(dir, "branch.inc"));
+  await commit();
+  // Switched through the wrapper: a plain `git checkout` would itself run the planted hooks.
+  await factory("checkout", "-q", "-b", "hooked/x");
+  await commit();
+  writeFileSync(join(dir, "remote.inc"), hook("remote"));
+  await git(
+    work,
+    "config",
+    "includeIf.hasconfig:remote.*.url:https://hooked.invalid/**.path",
+    join(dir, "remote.inc"),
+  );
+  await commit();
+  await git(work, "remote", "add", "hooked", "https://hooked.invalid/repo.git");
+  await commit();
+  // Each planted hook is live: git runs it when not blanked (config hooks need Git 2.54).
+  const version = (await git(work, "--version")).stdout.match(/(\d+)\.(\d+)/);
+  if (version && (Number(version[1]) > 2 || Number(version[2]) >= 54)) {
+    await git(work, "hook", "run", "pre-commit");
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+      "added",
+      "branch",
+      "later",
+      "remote",
+    ]);
+  }
+});
+
+test("an unchanged worktree lists its config once and never hashes the empty tree", async () => {
+  const shim = gitShim();
+  const run = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work, env: shim.env });
+  for (let i = 0; i < 3; i++) {
+    await run("status", "--porcelain");
+    await run("diff", base);
+    await run("log", "-1");
+  }
+  const calls = shim.calls();
+  expect(calls.filter((call) => call.includes(" config --list "))).toHaveLength(1);
+  expect(calls.filter((call) => call.includes(" --get-regexp ^hook"))).toEqual([]);
+  expect(calls.filter((call) => call.includes(" hash-object "))).toEqual([]);
+  // Any edit to a config source lists again.
+  await git(work, "config", "user.name", "Edited");
+  await run("status", "--porcelain");
+  expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(2);
+});
+
+test("a repository found above the working directory is listed again for every command", async () => {
+  // An invalid `.git` directory doesn't stop discovery, and becoming valid later would switch repositories.
+  const sub = join(work, "sub");
+  mkdirSync(join(sub, ".git"), { recursive: true });
+  const shim = gitShim();
+  for (let i = 0; i < 3; i++)
+    await worktreeGit(["git", "status", "--porcelain"], { cwd: sub, env: shim.env });
+  expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(3);
+});
+
+/** Every hook key git sees in `cwd`, with the value a factory command sees there: "" once blanked. */
+async function hookValues(cwd: string, env = process.env as Record<string, string>) {
+  const listed = await sh(["git", "config", "--null", "--name-only", "--get-regexp", "^hook\\."], {
+    cwd,
+    env,
+    allowFail: true,
+  });
+  const keys = [...new Set(listed.stdout.split("\0").filter(Boolean))];
+  const seen = async (key: string) => [
+    key,
+    (await worktreeGit(["git", "config", "--get", key], { cwd, env })).stdout,
+  ];
+  return Object.fromEntries(await Promise.all(keys.map(seen)));
+}
+const hookConfig = (name: string) => `[hook "${name}"]\n\tcommand = true\n\tevent = pre-commit\n`;
+const blanked = (name: string) => ({ [`hook.${name}.command`]: "\n", [`hook.${name}.event`]: "\n" });
+
+test("a git directory or commondir through a retargeted symlink is resolved again before reuse", async () => {
+  // Recorded worktrees pin GIT_DIR and GIT_COMMON_DIR to real paths; these probes name them by hand.
+  const other = join(dir, "other");
+  await git(dir, "init", "-q", "-b", "main", other);
+  writeFileSync(
+    join(other, ".git", "config"),
+    `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
+  );
+  const probe = join(dir, "probe");
+  mkdirSync(probe);
+  const viaLink = { ...(process.env as Record<string, string>), GIT_DIR: join(dir, "link") };
+  symlinkSync(join(seed, ".git"), join(dir, "link"));
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env: viaLink });
+  rmSync(join(dir, "link"));
+  symlinkSync(join(other, ".git"), join(dir, "link"));
+  expect(await hookValues(probe, viaLink)).toEqual(blanked("other"));
+  // A worktree's administrative directory whose commondir runs through a symlink.
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  const viaAdmin = { ...(process.env as Record<string, string>), GIT_DIR: admin };
+  symlinkSync(join(seed, ".git"), join(dir, "common"));
+  writeFileSync(join(admin, "commondir"), `${join(dir, "common")}\n`);
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env: viaAdmin });
+  rmSync(join(dir, "common"));
+  symlinkSync(join(other, ".git"), join(dir, "common"));
+  expect(await hookValues(probe, viaAdmin)).toEqual(blanked("other"));
+});
+
+test("a commondir path with a trailing space is resolved as git reads it", async () => {
+  const other = join(dir, "other");
+  await git(dir, "init", "-q", "-b", "main", other);
+  writeFileSync(
+    join(other, ".git", "config"),
+    `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
+  );
+  // Git keeps the trailing space: `common ` is the pointer, `common` only a decoy with the same target.
+  for (const name of ["common", "common "]) symlinkSync(join(seed, ".git"), join(dir, name));
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  writeFileSync(join(admin, "commondir"), `${join(dir, "common ")}\n`);
+  const probe = join(dir, "probe");
+  mkdirSync(probe);
+  const env = { ...(process.env as Record<string, string>), GIT_DIR: admin };
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env });
+  rmSync(join(dir, "common "));
+  symlinkSync(join(other, ".git"), join(dir, "common "));
+  expect(await hookValues(probe, env)).toEqual(blanked("other"));
+});
+
+test("a nested .git that stops being a repository hands over to the one above, and is listed again", async () => {
+  const outer = join(dir, "outer");
+  const inner = join(outer, "inner");
+  await git(dir, "init", "-q", "-b", "main", outer);
+  await git(dir, "init", "-q", "-b", "main", inner);
+  writeFileSync(
+    join(outer, ".git", "config"),
+    `${readFileSync(join(outer, ".git", "config"))}${hookConfig("outer")}`,
+  );
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: inner });
+  // Without refs/ (or objects/, or a valid HEAD) git skips inner/.git and finds outer's.
+  renameSync(join(inner, ".git", "refs"), join(inner, ".git", "refs.moved"));
+  expect(await hookValues(inner)).toEqual(blanked("outer"));
+});
+
+test("a nested .git whose objects/ can't be searched hands over to the one above", async () => {
+  const outer = join(dir, "outer-objects");
+  const inner = join(outer, "inner");
+  await git(dir, "init", "-q", "-b", "main", outer);
+  await git(dir, "init", "-q", "-b", "main", inner);
+  writeFileSync(
+    join(outer, ".git", "config"),
+    `${readFileSync(join(outer, ".git", "config"))}${hookConfig("outer2")}`,
+  );
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: inner });
+  // is_git_directory also needs objects/ to be searchable, not only a directory.
+  const objects = join(inner, ".git", "objects");
+  chmodSync(objects, 0o644);
+  try {
+    expect(await hookValues(inner)).toEqual(blanked("outer2"));
+  } finally {
+    chmodSync(objects, 0o755);
+  }
+});
+
+test("a branch switch in a reftable repository is listed again, since its HEAD is not a file", async () => {
+  const version = (await git(dir, "--version")).stdout.match(/(\d+)\.(\d+)/);
+  if (!version || (Number(version[1]) === 2 && Number(version[2]) < 45)) return; // reftable needs Git 2.45
+  const repo = join(dir, "reftable");
+  await git(dir, "init", "-q", "-b", "main", "--ref-format=reftable", repo);
+  writeFileSync(join(dir, "branch.inc"), hookConfig("branch"));
+  await git(repo, "config", "includeIf.onbranch:hooked/**.path", join(dir, "branch.inc"));
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: repo });
+  await git(repo, "symbolic-ref", "HEAD", "refs/heads/hooked/x");
+  expect(await hookValues(repo)).toEqual(blanked("branch"));
+});
+
+test("config edited while it is being listed is listed again before the command runs", async () => {
+  const bin = join(dir, "racy");
+  const edited = join(dir, "edited");
+  const real = Bun.which("git");
+  mkdirSync(bin);
+  // The first listing finishes, then the repository config gains a hook before git exits.
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\ncase "$* " in *" config --list "*) if [ ! -e '${edited}' ]; then out=$('${real}' "$@" | base64); touch '${edited}'; '${real}' -C '${seed}' config hook.racy.command true; '${real}' -C '${seed}' config hook.racy.event pre-commit; printf '%s' "$out" | base64 -d; exit 0; fi;; esac\nexec '${real}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  const env = { ...(process.env as Record<string, string>), PATH: `${bin}:${process.env.PATH}` };
+  expect(
+    (await worktreeGit(["git", "config", "--get", "hook.racy.command"], { cwd: work, env })).stdout,
+  ).toBe("\n");
+  expect(existsSync(edited)).toBe(true);
+});
+
+test("hooks added through GIT_CONFIG_* variables are blanked in an already cached worktree", async () => {
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: work });
+  const env = {
+    ...(process.env as Record<string, string>),
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "hook.envy.command",
+    GIT_CONFIG_VALUE_0: "true",
+    GIT_CONFIG_KEY_1: "hook.envy.event",
+    GIT_CONFIG_VALUE_1: "pre-commit",
+  };
+  expect(await hookValues(work, env)).toEqual(blanked("envy"));
+});
+
+test("a global or XDG config file created after caching is listed again", async () => {
+  const { GIT_CONFIG_GLOBAL: _global, ...base } = process.env as Record<string, string>;
+  const home = join(dir, "home");
+  const variants: [Record<string, string>, string][] = [
+    [{ ...base, GIT_CONFIG_GLOBAL: join(dir, "global.config") }, join(dir, "global.config")],
+    [{ ...base, HOME: home, XDG_CONFIG_HOME: join(home, "xdg") }, join(home, "xdg", "git", "config")],
+  ];
+  for (const [env, file] of variants) {
+    await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: work, env });
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, hookConfig("global"));
+    expect(await hookValues(work, env)).toEqual(blanked("global"));
+  }
+});
+
 test("local pipeline scope retains original git settings and index behavior", async () => {
   await git(work, "config", "hook.agent.command", "original-command");
   await git(work, "update-index", "--skip-worktree", "sample.test.ts");
@@ -1089,10 +1374,10 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     ["*.md diff=markdown", { "README.md": "# changed\n" }, false],
     ["*.png binary", { "icon.png": Buffer.from([0x89, 0, 1]) }, false],
     ["*.ico -diff", { "icon.ico": Buffer.from([0x89, 0, 1]) }, false],
-    ["*.pdf binary", {}, false],
-    ["*.pdf -diff", {}, false],
+    ["*.pdf binary", {}, true],
+    ["*.pdf -diff", {}, true],
     ["*.dat binary", { "edge.dat": nulAt(7_999) }, false],
-    ["*.dat binary", { "edge.dat": nulAt(8_000) }, true],
+    ["*.dat binary", { "edge.dat": nulAt(8_000) }, false],
     ["*.bmp binary", { "icon.bmp": Buffer.from([0x89, 0, 1]) }, true],
     ["*.gif binary", { "logo.gif": Buffer.from([0, 1]) }, true],
     ["*.jpg -diff", { "photo.jpg": "now text\n" }, true],
@@ -1151,8 +1436,10 @@ test("pointer candidates are read in one batch per tree, and multi-byte text can
   const findings = await worktreeGitScope.run(false, async () =>
     auditDiff(await diffSince(work, revision, shim.env), { taskClass: null, protectedPaths: [] }),
   );
-  // Still recognized as a strict pointer, the edited base pointer keeps its exemption.
-  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  // A base pointer cannot exempt the opaque bytes that replace it.
+  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+    expect.objectContaining({ file: "zz-asset.png", severity: "block" }),
+  ]);
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
   expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
 });
@@ -1289,7 +1576,7 @@ test.each([
     await commitAll(work, "base blob");
   }
   const revision = await headSha(work);
-  writeFileSync(join(work, path), Buffer.from([0, 2]));
+  writeFileSync(join(work, path), path.endsWith(".png") ? mediaFixture("png") : Buffer.from([0, 2]));
   await commitAll(work, "binary blob");
   const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
   expect(findings.some((f) => f.rule === "binary-content" && f.severity === "block")).toBe(blocks);
@@ -1325,9 +1612,14 @@ test("a rename from text to a binary image keeps its text origin", async () => {
 test.each([
   ["src/**/*.impl.ts -diff", "block"],
   ["*.png -diff", "warn"],
-  ["*.zip binary", "warn"],
-  ["*.woff2 -diff", "warn"],
-  ["*.mp4 -diff", "warn"],
+  ["*.zip binary", "block"],
+  ["*.woff2 -diff", "block"],
+  ["*.mp4 -diff", "block"],
+  ["*.pdf binary", "block"],
+  ["*.bmp -diff", "block"],
+  ["*.psd -diff", "block"],
+  ["*.eot -diff", "block"],
+  ["*.glb -diff", "block"],
   ["*.unknown -diff", "block"],
   ["* -diff", "block"],
 ])("unmatched hiding rule %s produces a %s", async (line, severity) => {
@@ -1354,6 +1646,10 @@ test.each([
   ["onnx", "valid", false],
   ["\npointer.png", "valid", false],
   ["ts", "valid", true],
+  ["ts", "crlf", true],
+  ["ts", "legacy", true],
+  ["png", "crlf", false],
+  ["png", "legacy", false],
   ["png", "missing oid", true],
   ["psd", "missing oid", true],
   ["png", "missing size", true],
@@ -1361,6 +1657,8 @@ test.each([
   ["png", "invalid size", true],
 ])("LFS pointer %s (%s) receives only the non-source-path exemption", async (extension, kind, blocks) => {
   let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`;
+  if (kind === "crlf") pointer = pointer.replaceAll("\n", "\r\n");
+  if (kind === "legacy") pointer = pointer.replace("git-lfs", "hawser");
   if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
   if (kind === "missing size") pointer = pointer.replace(/size.*\n/, "");
   if (kind === "invalid hash") pointer = pointer.replace("a".repeat(64), "bad");
@@ -1390,7 +1688,17 @@ test.each([
   await factory("commit", "-qm", "LFS pointer fixture");
   const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
   expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
-  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  if (["valid", "crlf", "legacy"].includes(kind))
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+      expect.objectContaining({ severity: "block", file: `pointer.${extension}` }),
+    ]);
+  else
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+      expect.objectContaining({
+        severity: "block",
+        detail: expect.stringContaining("Malformed LFS pointer"),
+      }),
+    ]);
 });
 
 test.each(["diff", "-diff"])(
@@ -1494,35 +1802,100 @@ test.each(["nul.test.mts", "nul.cts", "nul.jsx", "lib/helper.dat", "script", "st
   },
 );
 
+test("new and edited opaque binaries require the binary allowance", async () => {
+  const paths = [
+    "wasm",
+    "WASM",
+    "so",
+    "dll",
+    "dylib",
+    "exe",
+    "class",
+    "pyc",
+    "zip",
+    "jar",
+    "war",
+    "apk",
+    "whl",
+    "tar",
+    "gz",
+    "bz2",
+    "xz",
+    "7z",
+    "rar",
+    "zst",
+    "docx",
+    "xlsx",
+    "pptx",
+    "odt",
+    "docm",
+    "sqlite",
+    "db",
+    "ai",
+    "unknown",
+    "pdf",
+    "bmp",
+    "psd",
+    "eot",
+    "glb",
+    "mp4",
+    "avif",
+    "tif",
+    "tiff",
+    "heic",
+    "m4a",
+    "mkv",
+    "mov",
+    "avi",
+    "webm",
+    "aac",
+    "fbx",
+    "blend",
+  ].map((ext, i) => `opaque-${i}.${ext}`);
+  paths.push("bun.lockb");
+  for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 1]));
+  await commitAll(work, "opaque binary additions");
+  const binaryBase = await headSha(work);
+  for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 2]));
+  await commitAll(work, "opaque binary edits");
+  for (const revision of [base, binaryBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] }).filter(
+      (f) => f.rule === "binary-content",
+    );
+    expect(findings).toHaveLength(paths.length);
+    for (const path of paths)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file: path,
+          severity: "block",
+          detail: expect.stringContaining(`${path}:`),
+        }),
+      );
+    expect(findings.every((f) => f.detail.includes("Allow: binary"))).toBe(true);
+    expect(
+      auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] }).filter(
+        (f) => f.rule === "binary-content",
+      ),
+    ).toEqual([]);
+  }
+});
+
 const assetExtensions = [
   "png",
-  "pdf",
-  "woff2",
-  "jar",
-  "war",
-  "apk",
-  "whl",
-  "docx",
-  "xlsx",
-  "pptx",
-  "odt",
-  "psd",
-  "ai",
-  "heic",
-  "wasm",
-  "so",
-  "dll",
-  "dylib",
-  "exe",
-  "class",
-  "pyc",
-  "sqlite",
-  "db",
-  "glb",
-  "fbx",
-  "blend",
+  "PNG",
+  "jpg",
+  "jpeg",
+  "gif",
+  "ico",
+  "webp",
+  "literal.webp",
+  "distance-wide.webp",
+  "distance-narrow.webp",
+  "lossy.webp",
+  "extended.webp",
 ];
-test("known binary extensions exempt assets and unmatched attribute rules", async () => {
+test("validated media exempt new and edited assets and eligible unmatched attribute rules", async () => {
   writeFileSync(join(work, ".gitattributes"), assetExtensions.map((ext) => `*.${ext} binary\n`).join(""));
   await commitAll(work, "unmatched asset rules");
   let diff = await diffSince(work, base);
@@ -1530,13 +1903,368 @@ test("known binary extensions exempt assets and unmatched attribute rules", asyn
   expect(findings.filter((f) => f.severity === "block")).toEqual([]);
   expect(findings).toHaveLength(assetExtensions.length);
   const revision = await headSha(work);
-  for (const ext of assetExtensions) writeFileSync(join(work, `asset.${ext}`), Buffer.from([0, 1, 2]));
+  for (const [i, ext] of assetExtensions.entries())
+    writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext));
+  const incidental = JSON.parse(
+    readFileSync(new URL("./fixtures/media/incidental-mz.json", import.meta.url), "utf8"),
+  ) as Record<string, string>;
+  writeFileSync(join(work, "noise.webp"), Buffer.from(incidental.webp ?? "", "base64"));
   await commitAll(work, "ordinary assets");
-  diff = await diffSince(work, revision);
-  findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
-  expect(diff.attributeErrors).toBeUndefined();
-  expect(findings).toEqual([]);
+  const binaryBase = await headSha(work);
+  for (const [i, ext] of assetExtensions.entries())
+    writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext, 1));
+  await commitAll(work, "edited assets");
+  for (const start of [revision, binaryBase]) {
+    diff = await diffSince(work, start);
+    findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(diff.attributeErrors).toBeUndefined();
+    expect(findings).toEqual([]);
+  }
 }, 30_000);
+
+test("complete PDFs, ZIPs, JARs, UTF-8 TARs and WASM still require an allowance on additions and edits", async () => {
+  const paths = ["pdf", "zip", "jar", "tar", "wasm"].map((ext) => `opaque.${ext}`);
+  for (const path of paths) writeFileSync(join(work, path), mediaFixture(path.split(".")[1] ?? ""));
+  await commitAll(work, "complete opaque additions");
+  const binaryBase = await headSha(work);
+  for (const path of paths) writeFileSync(join(work, path), mediaFixture(path.split(".")[1] ?? "", 1));
+  await commitAll(work, "complete opaque edits");
+  for (const revision of [base, binaryBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(paths.length);
+    for (const file of paths)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((f) => f.detail.includes("Allow: binary"))).toBe(true);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("eligible media must have complete structures, matching signatures and no appended or concatenated payload", async () => {
+  const files: { path: string; original: Buffer; changed: Buffer }[] = [];
+  for (const [index, extension] of assetExtensions.entries()) {
+    const original = mediaFixture(extension);
+    const variants = [
+      Buffer.concat([original, Buffer.from("hidden trailing bytes")]),
+      Buffer.concat([original, mediaFixture("zip")]),
+      original.subarray(0, Math.floor(original.length / 2)),
+      mediaFixture(extension.toLowerCase() === "png" ? "wav" : "png"),
+      Buffer.from([0, 1, 2]),
+    ];
+    for (const [i, changed] of variants.entries())
+      files.push({ path: `tampered-${index}-${i}.${extension}`, original, changed });
+  }
+  for (const { path, original } of files) writeFileSync(join(work, path), original);
+  await commitAll(work, "media base");
+  const mediaBase = await headSha(work);
+  for (const { path, changed } of files) writeFileSync(join(work, path), changed);
+  // The binary allowance must not suppress an independent attribute finding.
+  writeFileSync(join(work, ".gitattributes"), "*.mp4 binary\n");
+  await commitAll(work, "malformed media");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    const binary = findings.filter((f) => f.rule === "binary-content");
+    expect(binary).toHaveLength(files.length);
+    for (const { path } of files)
+      expect(binary).toContainEqual(expect.objectContaining({ file: path, severity: "block" }));
+    const allowed = auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] });
+    expect(allowed).toEqual(findings.filter((f) => f.rule !== "binary-content"));
+    expect(allowed).toContainEqual(expect.objectContaining({ rule: "gitattributes", severity: "block" }));
+  }
+});
+
+test("embedded image, font and audio payloads remain opaque even inside declared metadata", async () => {
+  const png = mediaFixture("png"),
+    gif = mediaFixture("gif"),
+    jpeg = mediaFixture("jpg"),
+    wav = mediaFixture("wav"),
+    woff = mediaFixture("woff"),
+    webp = mediaFixture("webp");
+  const payload = Buffer.from("hidden opaque bytes");
+  const pngChunk = Buffer.alloc(payload.length + 12);
+  pngChunk.writeUInt32BE(payload.length, 0);
+  pngChunk.write("tEXt", 4);
+  payload.copy(pngChunk, 8);
+  pngChunk.writeUInt32BE(Bun.hash.crc32(pngChunk.subarray(4, -4)), pngChunk.length - 4);
+  const jpegComment = Buffer.alloc(payload.length + 4);
+  jpegComment.writeUInt16BE(0xfffe, 0);
+  jpegComment.writeUInt16BE(payload.length + 2, 2);
+  payload.copy(jpegComment, 4);
+  const riffChunk = Buffer.alloc(8 + payload.length + (payload.length & 1));
+  riffChunk.write("JUNK");
+  riffChunk.writeUInt32LE(payload.length, 4);
+  payload.copy(riffChunk, 8);
+  const riffPayload = (b: Buffer) => {
+    const result = Buffer.concat([b, riffChunk]);
+    result.writeUInt32LE(result.length - 8, 4);
+    return result;
+  };
+  const privateWoff = Buffer.concat([woff, payload]);
+  privateWoff.writeUInt32BE(privateWoff.length, 8);
+  privateWoff.writeUInt32BE(woff.length, 36);
+  privateWoff.writeUInt32BE(payload.length, 40);
+  let codecWebp = Buffer.concat([webp.subarray(0, 20 + webp.readUInt32LE(16)), payload]);
+  codecWebp.writeUInt32LE(codecWebp.length - 20, 16);
+  if (codecWebp.readUInt32LE(16) & 1) {
+    // RIFF padding is outside the codec's declared byte range.
+    codecWebp = Buffer.concat([codecWebp, Buffer.from([0])]);
+  }
+  codecWebp.writeUInt32LE(codecWebp.length - 8, 4);
+  // Keep the font's directory, checksums and declared cmap length consistent while
+  // inserting bytes the character mapping never references.
+  const ttf = mediaFixture("ttf"),
+    count = ttf.readUInt16BE(4);
+  const directory = Buffer.from(ttf.subarray(0, 12 + count * 16)),
+    tables: Buffer[] = [];
+  let offset = directory.length,
+    headOffset = 0;
+  const checksum = (bytes: Buffer) => {
+    let sum = 0;
+    for (let i = 0; i < bytes.length; i += 4) sum = (sum + bytes.readUInt32BE(i)) >>> 0;
+    return sum;
+  };
+  for (let i = 0; i < count; i++) {
+    const at = 12 + i * 16,
+      tag = ttf.toString("ascii", at, at + 4);
+    let data = Buffer.from(
+      ttf.subarray(ttf.readUInt32BE(at + 8), ttf.readUInt32BE(at + 8) + ttf.readUInt32BE(at + 12)),
+    );
+    if (tag === "cmap") {
+      data = Buffer.concat([data, Buffer.from("hidden opaque bytes!")]);
+      const subtable = data.readUInt32BE(8);
+      data.writeUInt16BE(data.readUInt16BE(subtable + 2) + 20, subtable + 2);
+    }
+    if (tag === "head") {
+      headOffset = offset;
+      data.writeUInt32BE(0, 8);
+    }
+    const padded = Buffer.alloc((data.length + 3) & ~3);
+    data.copy(padded);
+    directory.writeUInt32BE(checksum(padded), at + 4);
+    directory.writeUInt32BE(offset, at + 8);
+    directory.writeUInt32BE(data.length, at + 12);
+    tables.push(padded);
+    offset += padded.length;
+  }
+  const tablePayload = Buffer.concat([directory, ...tables]);
+  tablePayload.writeUInt32BE((0xb1b0afba - checksum(tablePayload)) >>> 0, headOffset + 8);
+  const ancillaryMp3 = mediaFixture("mp3");
+  payload.copy(ancillaryMp3, ancillaryMp3.length - payload.length - 8);
+  const files: Record<string, Buffer> = {
+    "embedded.png": Buffer.concat([png.subarray(0, -12), pngChunk, png.subarray(-12)]),
+    "embedded.gif": Buffer.concat([
+      gif.subarray(0, -1),
+      Buffer.from([0x21, 0xfe, payload.length]),
+      payload,
+      Buffer.from([0, 0x3b]),
+    ]),
+    "embedded.jpg": Buffer.concat([jpeg.subarray(0, 2), jpegComment, jpeg.subarray(2)]),
+    "embedded.webp": riffPayload(webp),
+    "embedded-codec.webp": codecWebp,
+    "embedded-entropy.jpg": Buffer.concat([jpeg.subarray(0, -2), payload, jpeg.subarray(-2)]),
+    "embedded.wav": riffPayload(wav),
+    "embedded.woff": privateWoff,
+    "embedded-table.ttf": tablePayload,
+    "embedded.mp3": Buffer.concat([Buffer.from("ID3\x04\0\0\0\0\0\x13"), payload, mediaFixture("mp3")]),
+    "embedded-ancillary.mp3": ancillaryMp3,
+  };
+  for (const [path, bytes] of Object.entries(files)) writeFileSync(join(work, path), bytes);
+  await commitAll(work, "embedded payloads");
+  const diff = await diffSince(work, base);
+  const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+  expect(findings).toHaveLength(Object.keys(files).length);
+  for (const file of Object.keys(files))
+    expect(findings).toContainEqual(
+      expect.objectContaining({ file, rule: "binary-content", severity: "block" }),
+    );
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("GIF LZW pixel bytes are outside foreign-format recognition on additions and edits", async () => {
+  const payload = mediaFixture("zip");
+  const encode = (pixels: Buffer, frameWidth: number) => {
+    const screen = Buffer.alloc(7);
+    screen.writeUInt16LE(frameWidth, 0);
+    screen.writeUInt16LE(1, 2);
+    screen[4] = 0xf7; // A 256-color global palette permits every byte as a pixel index.
+    const frames: Buffer[] = [];
+    for (let offset = 0; offset < pixels.length; offset += frameWidth) {
+      const frame = pixels.subarray(offset, offset + frameWidth),
+        image = Buffer.alloc(10);
+      image[0] = 0x2c;
+      image.writeUInt16LE(frame.length, 5);
+      image.writeUInt16LE(1, 7);
+      // Clearing before each literal keeps every code nine bits wide and re-encodes
+      // the archive so its signatures do not appear in the raw GIF stream.
+      const codes = [...[...frame].flatMap((byte) => [256, byte]), 257];
+      const packed = Buffer.alloc(Math.ceil((codes.length * 9) / 8));
+      let bit = 0;
+      for (const code of codes)
+        for (let i = 0; i < 9; i++, bit++)
+          packed[bit >> 3] = (packed[bit >> 3] ?? 0) | (((code >> i) & 1) << (bit & 7));
+      const blocks: Buffer[] = [];
+      for (let at = 0; at < packed.length; at += 255) {
+        const block = packed.subarray(at, at + 255);
+        blocks.push(Buffer.from([block.length]), block);
+      }
+      frames.push(Buffer.concat([image, Buffer.from([8]), ...blocks, Buffer.from([0])]));
+    }
+    return Buffer.concat([Buffer.from("GIF89a"), screen, Buffer.alloc(768), ...frames, Buffer.from([0x3b])]);
+  };
+  const files = [payload.length, 1, 3].map((frameWidth) => ({
+    file: `encoded-payload-${frameWidth}.gif`,
+    frameWidth,
+  }));
+  for (const { file, frameWidth } of files)
+    writeFileSync(join(work, file), encode(Buffer.alloc(payload.length, 65), frameWidth));
+  await commitAll(work, "ordinary encoded pixels");
+  const mediaBase = await headSha(work);
+  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  for (const { file, frameWidth } of files) writeFileSync(join(work, file), encode(payload, frameWidth));
+  await commitAll(work, "ZIP encoded as pixels");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  }
+});
+
+test("supported WebP pixels pass while opaque transforms, FLAC and WOFF require an allowance", async () => {
+  const files = [
+    { file: "predictor.webp", original: "literal.webp", changed: "predictor.webp" },
+    { file: "literal-payload.webp", original: "literal.webp", changed: "literal-payload.webp" },
+    { file: "indexed.webp", original: "webp", changed: "indexed.webp" },
+    { file: "distance-one-payload.webp", original: "literal.webp", changed: "distance-one-payload.webp" },
+    { file: "distance-two-payload.webp", original: "literal.webp", changed: "distance-two-payload.webp" },
+    { file: "fixed.flac", original: "flac", changed: "predicted-0.flac" },
+    { file: "lpc.flac", original: "flac", changed: "predicted-8.flac" },
+    { file: "frames.flac", original: "flac", changed: "frames.flac" },
+    { file: "big-endian.flac", original: "flac", changed: "big-endian.flac" },
+    { file: "stereo-left.flac", original: "stereo.flac", changed: "stereo-left.flac" },
+    { file: "stereo-right-be.flac", original: "stereo.flac", changed: "stereo-right-be.flac" },
+    { file: "stereo-mid-side.flac", original: "stereo.flac", changed: "stereo-mid-side.flac" },
+    { file: "split.woff", original: "clean.woff", changed: "split.woff" },
+  ];
+  for (const { file, original } of files) writeFileSync(join(work, file), mediaFixture(original));
+  await commitAll(work, "clean decoded media");
+  const mediaBase = await headSha(work);
+  expect((await diffSince(work, base)).binaryPaths?.sort()).toEqual(
+    files
+      .filter(({ file }) => !file.endsWith(".webp"))
+      .map(({ file }) => file)
+      .sort(),
+  );
+  for (const { file, changed } of files) writeFileSync(join(work, file), mediaFixture(changed));
+  await commitAll(work, "payloads concealed in media encoding");
+  // Predictor transforms still fail structural validation independently of pixel content.
+  const opaque = files.filter(({ file }) => !file.endsWith(".webp") || file === "predictor.webp");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(opaque.length);
+    for (const { file } of opaque)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((finding) => finding.detail.includes("Allow: binary"))).toBe(true);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("JPEG thumbnails and ICO pixels may contain signatures while WAV requires an allowance", async () => {
+  const files: { path: string; original: Buffer; changed: Buffer }[] = [];
+  const magics = [
+    "feedface", // Mach-O, both byte orders and word sizes, including fat binaries.
+    "cefaedfe",
+    "feedfacf",
+    "cffaedfe",
+    "cafebabe", // Also the Java class signature.
+    "bebafeca",
+    "cafebabf",
+    "bfbafeca",
+    "6465780a30333500", // DEX and compact DEX.
+    "6364657830303100",
+    "4d5a", // DOS/NE/LX executables need not have a PE signature.
+  ];
+  for (const magic of magics) {
+    const original = mediaFixture("wav"),
+      changed = Buffer.from(original);
+    Buffer.from(magic, "hex").copy(changed, changed.indexOf("data") + 8);
+    files.push({ path: `executable-${magic}.wav`, original, changed });
+  }
+  const jpeg = mediaFixture("jpg"),
+    thumbnail = Buffer.alloc(24);
+  thumbnail.writeUInt16BE(0xffe0, 0);
+  thumbnail.writeUInt16BE(22, 2);
+  thumbnail.write("JFIF\0", 4);
+  thumbnail[9] = 1;
+  thumbnail[10] = 1;
+  thumbnail.writeUInt16BE(1, 12);
+  thumbnail.writeUInt16BE(1, 14);
+  thumbnail[16] = 2;
+  thumbnail[17] = 1;
+  const originalJpeg = Buffer.concat([jpeg.subarray(0, 2), thumbnail, jpeg.subarray(2)]);
+  Buffer.from("cffaedfe", "hex").copy(thumbnail, 18);
+  files.push({
+    path: "executable-thumbnail.jpg",
+    original: originalJpeg,
+    changed: Buffer.concat([jpeg.subarray(0, 2), thumbnail, jpeg.subarray(2)]),
+  });
+  const ico = Buffer.alloc(86);
+  ico.writeUInt16LE(1, 2);
+  ico.writeUInt16LE(1, 4);
+  ico[6] = ico[7] = 2;
+  ico.writeUInt16LE(1, 10);
+  ico.writeUInt16LE(24, 12);
+  ico.writeUInt32LE(64, 14);
+  ico.writeUInt32LE(22, 18);
+  ico.writeUInt32LE(40, 22);
+  ico.writeInt32LE(2, 26);
+  ico.writeInt32LE(4, 30);
+  ico.writeUInt16LE(1, 34);
+  ico.writeUInt16LE(24, 36);
+  const changedIco = Buffer.from(ico);
+  Buffer.from("cafebabe", "hex").copy(changedIco, 62);
+  files.push({ path: "executable-pixels.ico", original: ico, changed: changedIco });
+  for (const { path, original } of files) writeFileSync(join(work, path), original);
+  await commitAll(work, "ordinary raw media regions");
+  const mediaBase = await headSha(work);
+  expect((await diffSince(work, base)).binaryPaths?.sort()).toEqual(
+    files
+      .filter(({ path }) => path.endsWith(".wav"))
+      .map(({ path }) => path)
+      .sort(),
+  );
+  for (const { path, changed } of files) writeFileSync(join(work, path), changed);
+  await commitAll(work, "embedded executable signatures");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(files.filter(({ path }) => path.endsWith(".wav")).length);
+    for (const { path } of files.filter(({ path }) => path.endsWith(".wav")))
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file: path,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining("Allow: binary"),
+        }),
+      );
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
 
 test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
   const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
@@ -1550,7 +2278,7 @@ test("16,000 added files use stdin pathspecs without uncertainty findings", asyn
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
 }, 120_000);
 
-test("LFS inspection skips short blobs and checks repeated candidate blobs once", async () => {
+test("LFS inspection batches short and repeated candidate blobs per tree", async () => {
   const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
   for (let i = 0; i < 128; i++) {
     writeFileSync(join(work, `short-${i}.dat`), `small text ${i}\n`);
@@ -1568,10 +2296,11 @@ test("LFS inspection skips short blobs and checks repeated candidate blobs once"
   const shim = gitShim();
   const diff = await diffSince(work, revision, shim.env);
   expect(diff.binaryErrors).toBeUndefined();
-  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
-  // The two distinct candidate blobs at base are read in one batch; head has no candidates.
+  expect(diff.binaryPaths).toHaveLength(128);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  // Short blobs also need classification: each tree still uses only one batch.
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
-  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(1);
+  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
 }, 30_000);
 
 test("failed binary classification blocks even with attribute and binary allowances", async () => {
@@ -1601,7 +2330,7 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
   for (const directory of ["gen", "other"]) mkdirSync(join(work, directory));
   for (let i = 0; i < 312; i++) writeFileSync(join(work, "gen", `${i}.dat`), "generated text\n");
   for (let i = 0; i < 2; i++) writeFileSync(join(work, "other", `${i}.dat`), "other generated text\n");
-  writeFileSync(join(work, "photo.png"), Buffer.from([0, 1]));
+  writeFileSync(join(work, "photo.png"), mediaFixture("png"));
   await commitAll(work, "generated text and binary asset");
   const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
   expect(findings).toHaveLength(2);
@@ -1620,8 +2349,35 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
   expect(findings.some((f) => f.file === "photo.png")).toBe(false);
 }, 30_000);
 
+test("a new strict LFS pointer under an existing rule is not warned about as text", async () => {
+  writeFileSync(join(work, ".gitattributes"), "*.dat filter=lfs diff=lfs merge=lfs -text\n");
+  await commitAll(work, "base LFS rule");
+  const revision = await headSha(work);
+  writeFileSync(
+    join(work, "asset.dat"),
+    `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`,
+  );
+  // Commit the pointer bytes without invoking an installed LFS clean filter.
+  await factory(
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "filter.lfs.clean=cat",
+    "-c",
+    "filter.lfs.required=false",
+    "add",
+    "-A",
+  );
+  await factory("commit", "-qm", "new LFS pointer");
+  const diff = await diffSince(work, revision);
+  expect(diff.headTextPaths).toEqual([]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([
+    expect.objectContaining({ rule: "binary-content", severity: "block" }),
+  ]);
+});
+
 test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size", "extra line"])(
-  "binary edits of %s base LFS pointers require a strict pointer exemption",
+  "binary edits of %s base LFS pointers are judged on the new content",
   async (kind) => {
     let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
     if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
@@ -1670,7 +2426,18 @@ test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size
     );
     await factory("commit", "-qm", "binary LFS edit");
     const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
-    expect(findings.filter((f) => f.rule === "binary-content").length).toBe(kind === "valid" ? 0 : 3);
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual(
+      kind === "valid"
+        ? ["tracked.dat", "tracked.png", "tracked.ts"].map((file) =>
+            expect.objectContaining({ severity: "block", file }),
+          )
+        : [
+            expect.objectContaining({
+              severity: "block",
+              detail: expect.stringContaining("Malformed LFS pointer"),
+            }),
+          ],
+    );
   },
 );
 
@@ -1858,4 +2625,435 @@ test("recorded directories override inherited Git authority; missing records fai
   rmSync(`${work}.git-paths`);
   await expect(commitAll(work, "unrecorded")).rejects.toThrow("Missing trusted Git paths");
   await expect(checkoutCommitted(work)).rejects.toThrow("Missing trusted Git paths");
+});
+
+test.each([
+  ["GIT_AUTHOR_NAME", "author name"],
+  ["GIT_AUTHOR_EMAIL", "author email"],
+  ["GIT_COMMITTER_NAME", "committer name"],
+  ["GIT_COMMITTER_EMAIL", "committer email"],
+])("publication checks %s even after its changes are removed", async (variable, field) => {
+  const config = join(dir, "config");
+  mkdirSync(config);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  writeFileSync(join(work, "transient.txt"), "safe");
+  await git(work, "add", ".");
+  await sh(["git", "commit", "-qm", "safe"], {
+    cwd: work,
+    env: { ...(process.env as Record<string, string>), [variable]: "secret-host.example" },
+  });
+  rmSync(join(work, "transient.txt"));
+  await commitAll(work, "remove transient");
+  const error = await checkPrivateRange(work, `${base}..HEAD`, loadPrivateStrings(config)).catch(
+    (error: unknown) => error,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(String(error)).toContain(field);
+  expect(String(error)).not.toContain("secret-host.example");
+});
+
+test.each(["author-email", "message", "clean"])(
+  "publication ignores UTF-16 log config: %s",
+  async (scenario) => {
+    await git(work, "config", "i18n.logOutputEncoding", "UTF-16");
+    writeFileSync(join(work, "safe.txt"), "safe");
+    await git(work, "add", ".");
+    await git(
+      work,
+      "commit",
+      "--author=Safe <" +
+        (scenario === "author-email" ? "fake@secret-host.example" : "safe@example.com") +
+        ">",
+      "-qm",
+      scenario === "message" ? "Safe subject\n\nsecret-host.example" : "safe",
+    );
+    const scan = checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]);
+    if (scenario === "clean") await scan;
+    else {
+      const error = await scan.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain("entry 1");
+      expect(String(error)).not.toContain("secret-host.example");
+      if (scenario === "author-email") expect(String(error)).toContain("author email");
+    }
+  },
+);
+
+test("a planted graft cannot hide a published ancestor from the range check", async () => {
+  writeFileSync(join(work, "transient.txt"), "safe");
+  await commitAll(work, "hidden subject\n\nsecret-host.example");
+  const hidden = await headSha(work);
+  writeFileSync(join(work, "safe.txt"), "safe");
+  await commitAll(work, "safe");
+  const tip = await headSha(work);
+  // The graft makes the tip look parentless, hiding the denylisted commit from rev-list.
+  const common = (
+    await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: work })
+  ).stdout.trim();
+  mkdirSync(join(common, "info"), { recursive: true });
+  writeFileSync(join(common, "info", "grafts"), `${tip}\n`);
+  expect(hidden).not.toBe(tip);
+  await expect(
+    checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+  ).rejects.toThrow("entry 1");
+});
+
+/** Points one parent slot of `target` in a commit-graph file's CDAT chunk at `parent`, as a forged graph would. */
+function forgeGraphParent(path: string, target: string, slot: number, parent: string) {
+  const data = readFileSync(path);
+  const hashLength = data[5] === 1 ? 20 : 32;
+  const chunks = new Map<string, number>();
+  for (let i = 0; i <= (data[6] ?? 0); i++) {
+    const at = 8 + i * 12;
+    chunks.set(data.subarray(at, at + 4).toString("latin1"), Number(data.readBigUInt64BE(at + 4)));
+  }
+  const [fanout, lookup, cdat] = ["OIDF", "OIDL", "CDAT"].map((id) => chunks.get(id));
+  if (fanout === undefined || lookup === undefined || cdat === undefined)
+    throw new Error("unexpected commit-graph");
+  const oids = Array.from({ length: data.readUInt32BE(fanout + 255 * 4) }, (_, i) =>
+    data.subarray(lookup + i * hashLength, lookup + (i + 1) * hashLength).toString("hex"),
+  );
+  data.writeUInt32BE(
+    oids.indexOf(parent),
+    cdat + oids.indexOf(target) * (hashLength + 16) + hashLength + 4 * slot,
+  );
+  writeFileSync(path, data);
+}
+
+test.each(["shallow", "commit-graph"])(
+  "a planted %s cannot hide a published ancestor from the range check",
+  async (kind) => {
+    writeFileSync(join(work, "transient.txt"), "safe");
+    await commitAll(work, "hidden subject\n\nsecret-host.example");
+    const hidden = await headSha(work);
+    writeFileSync(join(work, "mid.txt"), "safe");
+    await commitAll(work, "mid");
+    const mid = await headSha(work);
+    writeFileSync(join(work, "safe.txt"), "safe");
+    await commitAll(work, "safe");
+    const tip = await headSha(work);
+    const common = (
+      await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: work })
+    ).stdout.trim();
+    // Either one makes `mid` look parentless or based directly on `base`, skipping the denylisted commit.
+    if (kind === "shallow") writeFileSync(join(common, "shallow"), `${mid}\n`);
+    else {
+      await sh(["git", "commit-graph", "write", "--reachable"], { cwd: work });
+      const graph = join(common, "objects", "info", "commit-graph");
+      chmodSync(graph, 0o644);
+      forgeGraphParent(graph, mid, 0, base);
+    }
+    expect((await sh(["git", "rev-list", `${base}..${tip}`], { cwd: work })).stdout).not.toContain(hidden);
+    await expect(
+      checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+    ).rejects.toThrow("entry 1");
+  },
+);
+
+test("factory git ignores commit-graphs and pack bitmaps, which could change what a push sends", async () => {
+  const bin = join(dir, "logging-bin");
+  const calls = join(dir, "git-calls");
+  mkdirSync(bin);
+  const real = Bun.which("git");
+  if (!real) throw new Error("missing git");
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexec '${real}' "$@"\n`, {
+    mode: 0o755,
+  });
+  await worktreeGit(["git", "rev-parse", "HEAD"], {
+    cwd: work,
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } as Record<string, string>,
+  });
+  const call = readFileSync(calls, "utf8")
+    .split("\n")
+    .find((line) => line.endsWith("rev-parse HEAD"));
+  expect(call).toContain("-c core.commitGraph=false -c pack.useBitmaps=false");
+});
+
+test.each(["mergetag", "gpgsig", "encoding", "utf8", "invalid-utf8", "message-header", "replacement"])(
+  "publication inspects raw commit headers: %s",
+  async (scenario) => {
+    const tree = (await git(work, "rev-parse", `${base}^{tree}`)).stdout.trim();
+    const tag = `mergetag object ${base}\n type commit\n tag safe\n tagger Safe <fake@secret-host.example> 1 +0000\n \n safe tag\n`;
+    const extra =
+      scenario === "gpgsig"
+        ? "gpgsig safe\n secret-host.example\n"
+        : ["mergetag", "replacement"].includes(scenario)
+          ? tag
+          : scenario === "encoding"
+            ? "encoding ISO-8859-1\n"
+            : scenario === "utf8"
+              ? "encoding UTF-8\n"
+              : "";
+    const raw = `tree ${tree}\nparent ${base}\nauthor Safe <safe@example.com> 1 +0000\ncommitter Safe <safe@example.com> 1 +0000\n${extra}\nsafe${scenario === "message-header" ? "\nencoding ISO-8859-1" : ""}\n`;
+    const object = join(dir, "commit-object");
+    writeFileSync(
+      object,
+      scenario === "invalid-utf8" ? Buffer.concat([Buffer.from(raw), Buffer.from([0xff])]) : raw,
+    );
+    const sha = (await git(work, "hash-object", "-t", "commit", "-w", object)).stdout.trim();
+    await git(work, "reset", "--hard", sha);
+    if (scenario === "replacement") await git(work, "replace", sha, base);
+    expect((await git(work, "tag", "--list")).stdout).toBe("");
+    const scan = checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]);
+    if (["utf8", "message-header"].includes(scenario)) await scan;
+    else {
+      const error = await scan.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain(["encoding", "invalid-utf8"].includes(scenario) ? "UTF-8" : "entry 1");
+      expect(String(error)).not.toContain("secret-host.example");
+      expect(String(error)).not.toContain("safe@example.com");
+      expect(String(error)).not.toContain("ISO-8859-1");
+    }
+  },
+);
+
+test.each(["patch", "message", "merge", "excluded"])("publication range checks %s", async (scenario) => {
+  const entries = [{ value: "secret-host.example", entry: 1 }];
+  writeFileSync(
+    join(work, "transient.txt"),
+    ["message", "merge"].includes(scenario) ? "safe" : "secret-host.example",
+  );
+  await commitAll(work, scenario === "message" ? "safe subject\n\nsecret-host.example" : "safe");
+  if (scenario === "merge") {
+    const side = await headSha(work);
+    await git(work, "reset", "--hard", base);
+    writeFileSync(join(work, "other.txt"), "safe");
+    await commitAll(work, "other");
+    await git(work, "merge", "--no-ff", "--no-commit", side);
+    writeFileSync(join(work, "transient.txt"), "secret-host.example");
+    await commitAll(work, "safe merge");
+  }
+  rmSync(join(work, "transient.txt"));
+  await commitAll(work, "remove transient");
+  const start = scenario === "excluded" ? await headSha(work) : base;
+  writeFileSync(join(work, "safe.txt"), "safe");
+  await commitAll(work, "safe");
+  const scan = checkPrivateRange(work, `${start}..HEAD`, entries);
+  if (scenario === "excluded") await scan;
+  else await expect(scan).rejects.toThrow("entry 1");
+});
+
+test("publication range checks gitlink paths even when config ignores submodules", async () => {
+  await git(work, "config", "diff.ignoreSubmodules", "all");
+  await git(work, "update-index", "--add", "--cacheinfo", `160000,${base},secret-host.example`);
+  await git(work, "commit", "--no-verify", "-qm", "safe");
+  await git(work, "rm", "-q", "--cached", "secret-host.example");
+  await git(work, "commit", "--no-verify", "-qm", "remove gitlink");
+  await expect(
+    checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+  ).rejects.toThrow("entry 1");
+});
+
+test.each([
+  "matching",
+  "clean",
+  "missing",
+  "unreadable",
+  "removed",
+  "staged",
+  "extended",
+  "extended-clean",
+  "corrupt",
+  "crlf",
+  "legacy",
+  "legacy-crlf",
+  "crlf-clean",
+  "legacy-clean",
+  "malformed",
+  "bad-extension",
+])("LFS payload inspection: %s", async (scenario) => {
+  const payload = Buffer.from(scenario.includes("clean") ? "safe\0" : "%73ecret-host.example\0");
+  const oid = createHash("sha256").update(payload).digest("hex");
+  const object = join(seed, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  mkdirSync(join(object, ".."), { recursive: true });
+  if (scenario === "unreadable") mkdirSync(object);
+  else if (scenario !== "missing")
+    writeFileSync(object, scenario === "corrupt" ? Buffer.alloc(payload.length, 97) : payload);
+  let pointer = `version https://${scenario.startsWith("legacy") ? "hawser" : "git-lfs"}.github.com/spec/v1\n${scenario.startsWith("extended") ? `ext-0-test sha256:${"a".repeat(64)}\n` : ""}oid sha256:${oid}\nsize ${payload.length}\n`;
+  if (scenario.includes("crlf")) pointer = pointer.replaceAll("\n", "\r\n");
+  if (scenario === "malformed") pointer = pointer.replace("size ", "unknown ");
+  if (scenario === "bad-extension") pointer = pointer.replace("oid ", "ext-0-test broken\noid ");
+  writeFileSync(join(work, "asset.dat"), pointer);
+  if (scenario === "staged") await git(work, "add", ".");
+  else await commitAll(work, "asset");
+  if (scenario === "removed") {
+    rmSync(join(work, "asset.dat"));
+    await commitAll(work, "remove asset");
+  }
+  const entries = [{ value: "secret-host.example", entry: 1 }];
+  const scan = checkPrivateRange(work, `${base}..HEAD`, entries, scenario === "staged");
+  if (scenario.includes("clean")) {
+    await scan;
+    expect((await diffSince(work, base, undefined, false, entries)).privateHits).toEqual([]);
+  } else
+    await expect(scan).rejects.toThrow(
+      ["malformed", "bad-extension"].includes(scenario)
+        ? "Malformed LFS pointer"
+        : ["missing", "unreadable", "corrupt"].includes(scenario)
+          ? "Cannot inspect local LFS payload"
+          : "entry 1",
+    );
+  if (!["removed", "staged"].includes(scenario)) {
+    const classified = await diffSince(work, base);
+    const findings = auditDiff(classified, { taskClass: "feature", protectedPaths: [] });
+    if (["malformed", "bad-extension"].includes(scenario))
+      expect(findings.some((f) => f.severity === "block" && f.detail.includes("Malformed LFS pointer"))).toBe(
+        true,
+      );
+    else expect(classified.attributeMatches).toBeDefined();
+    if (!["missing", "unreadable", "corrupt", "malformed", "bad-extension"].includes(scenario)) {
+      const inspected = await diffSince(work, base, undefined, false, entries);
+      expect(inspected.privateHits?.length).toBe(scenario.includes("clean") ? 0 : 1);
+    }
+  }
+});
+
+test.each(["complete", "truncated", "failed", "timeout", "timeout-exit-0", "cancelled"])(
+  "one byte-framed batch, %s",
+  async (scenario) => {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const ids = ["a".repeat(40), "b".repeat(40), "c".repeat(40)];
+    const bytes = Buffer.concat([
+      Buffer.from("\0é"),
+      Buffer.alloc(65_530, 97),
+      Buffer.from("%73ecret-host.example"),
+    ]);
+    const response = Buffer.concat(
+      ids.map((id) => Buffer.concat([Buffer.from(`${id} blob ${bytes.length}\n`), bytes, Buffer.from("\n")])),
+    );
+    const output = join(dir, "batch");
+    writeFileSync(output, scenario === "truncated" ? response.subarray(0, -1) : response);
+    const calls = join(dir, "calls");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\necho "$*" >> '${calls}'\ncat >/dev/null\n${["timeout", "cancelled"].includes(scenario) ? "sleep 10" : `cat '${output}'`}\n${scenario === "timeout-exit-0" ? "trap 'exit 0' TERM\nsleep 10 &\nwait\n" : ""}exit ${scenario === "failed" ? 1 : 0}\n`,
+      { mode: 0o755 },
+    );
+    const limit = attributeLimits.timeoutMs;
+    const controller = new AbortController();
+    const scope = {
+      signal: controller.signal,
+      killGraceMs: 10,
+      children: new Map(),
+      scratchDirs: new Set<string>(),
+    };
+    try {
+      if (scenario.startsWith("timeout")) attributeLimits.timeoutMs = 250;
+      const scan = processScope.run(scope, () =>
+        worktreeGitScope.run(false, () =>
+          blobPrivateEntries(work, { ...process.env, PATH: `${bin}:${process.env.PATH}` }, ids, [
+            { value: "secret-host.example", entry: 1 },
+          ]),
+        ),
+      );
+      if (scenario === "cancelled") {
+        while (!existsSync(calls)) await Bun.sleep(1);
+        controller.abort();
+      }
+      if (scenario === "complete") expect(await scan).toEqual(ids.map((id) => [id, 1]));
+      else await expect(scan).rejects.toThrow();
+      expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+        "--no-replace-objects cat-file --batch",
+      ]);
+    } finally {
+      attributeLimits.timeoutMs = limit;
+    }
+  },
+);
+
+test("fonts and audio require a binary allowance even with complete media structures", async () => {
+  const extensions = ["woff", "woff2", "ttf", "otf", "mp3", "ogg", "wav", "flac"];
+  for (const ext of extensions) writeFileSync(join(work, `asset.${ext}`), mediaFixture(ext));
+  await commitAll(work, "font and audio fixtures");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(extensions.map((ext) => `asset.${ext}`).sort());
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(extensions.length);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("LFS binary allowance follows the available new payload", async () => {
+  const pointer = (bytes: Buffer, local: boolean) => {
+    const oid = createHash("sha256").update(bytes).digest("hex");
+    if (local) {
+      const folder = join(seed, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4));
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, oid), bytes);
+    }
+    return `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${bytes.length}\n`;
+  };
+  writeFileSync(join(work, "replacement.png"), pointer(mediaFixture("png"), false));
+  await commitAll(work, "base pointer");
+  const revision = await headSha(work);
+  let previous = revision;
+  for (const variant of [0, 1]) {
+    writeFileSync(join(work, "missing.png"), pointer(Buffer.from(`unavailable ${variant}`), false));
+    writeFileSync(join(work, "archive.png"), pointer(mediaFixture("zip", variant), true));
+    writeFileSync(join(work, "image.png"), pointer(mediaFixture("png", variant), true));
+    writeFileSync(join(work, "replacement.png"), mediaFixture("zip", variant));
+    await commitAll(work, "new LFS content");
+    const diff = await diffSince(work, variant === 0 ? revision : previous);
+    expect(diff.binaryErrors).toBeUndefined();
+    expect(diff.binaryPaths?.sort()).toEqual(["archive.png", "missing.png", "replacement.png"]);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+    previous = await headSha(work);
+  }
+});
+
+test("executable image additions and mode-only changes need a binary allowance", async () => {
+  await factory("config", "core.filemode", "true");
+  for (const file of ["upgrade.png", "downgrade.png", "unchanged.png"])
+    writeFileSync(join(work, file), mediaFixture("png"));
+  chmodSync(join(work, "downgrade.png"), 0o755);
+  await commitAll(work, "image modes base");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "added.png"), mediaFixture("png"), { mode: 0o755 });
+  chmodSync(join(work, "upgrade.png"), 0o755);
+  chmodSync(join(work, "downgrade.png"), 0o644);
+  writeFileSync(join(work, "unchanged.png"), mediaFixture("png", 1));
+  await commitAll(work, "image mode changes");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths?.sort()).toEqual(["added.png", "downgrade.png", "upgrade.png"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("PDF and container formats cannot use the text-content exclusion", async () => {
+  const files = {
+    "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "disguised.txt": " \n%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "plain.pdf": "ordinary text\n",
+    "archive.txt": "Rar!\x1a\x07\x01opaque ASCII container",
+    "ordinary.txt": "ordinary text\n",
+  };
+  for (const [file, bytes] of Object.entries(files)) writeFileSync(join(work, file), bytes);
+  await commitAll(work, "text-like forbidden formats");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(["archive.txt", "ascii.pdf", "disguised.txt", "plain.pdf"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(4);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("whole-blob classification catches a valid V7 TAR with its first NUL at 9728", async () => {
+  // V7 headers allow space-terminated octal fields and full-width names without NULs.
+  const header = Buffer.alloc(512, 0x20);
+  header.fill(0x61, 0, 100);
+  header.write("0000644 ", 100);
+  header.write("0000000 ", 108);
+  header.write("0000000 ", 116);
+  header.write("00000000000 ", 124);
+  header.write("00000000000 ", 136);
+  header[156] = 0x30;
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(`${checksum.toString(8).padStart(6, "0")}  `, 148);
+  const tar = Buffer.concat([...Array.from({ length: 19 }, () => header), Buffer.alloc(1024)]);
+  writeFileSync(join(work, "late.tar"), tar);
+  writeFileSync(join(work, "late.txt"), Buffer.concat([Buffer.alloc(9728, 0x61), Buffer.from([0])]));
+  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}%PDF-1.4\n%%EOF\n`);
+  await commitAll(work, "late binary bytes");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(["late-signature.txt", "late.tar", "late.txt"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });

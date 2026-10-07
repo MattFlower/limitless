@@ -30,6 +30,12 @@ which stage runs next. The implementer never grades its own work: the factory ru
 model from a different vendor (when one is available) reviews the change, and a separate session
 verifies it against acceptance criteria and against scenarios the implementer never saw.
 
+### Private strings
+
+List private hostnames, endpoints, addresses, or other strings in the optional local file `~/.config/limitless/private-strings.txt` (or `$LIMITLESS_CONFIG_DIR/private-strings.txt`), outside repositories.
+Use one literal string per line; surrounding whitespace is trimmed, blank lines and lines starting with `#` are ignored, and matching is case-insensitive.
+Audit, delivery and `land-pr.sh` block publication with redacted diagnostics naming the entry's line number. Missing files have no effect; unreadable files block.
+
 ### The pipeline
 
 ```mermaid
@@ -107,15 +113,39 @@ warning. Optional extras: an OpenRouter API key, a local model server (see
 ### Get the code
 
 ```bash
-git clone git@github.com:MattFlower/limitless.git ~/code/limitless   # or your fork
+git clone git@github.com:<owner>/<repo>.git ~/code/limitless
 cd ~/code/limitless
 bun install --frozen-lockfile
 alias limitless="bun $PWD/src/cli/main.ts"   # or link the package bin onto your PATH
 limitless --help
 ```
 
-Most commands talk to the daemon over HTTP, so start it first. Only `serve`, `service` and
-`integrations install` work without it.
+### Getting started
+
+```bash
+limitless init
+# Accept defaults without prompts; --repo can be repeated:
+limitless init --yes --repo <owner>/<repo> --json
+```
+
+`init` checks prerequisites before writing config, detects logged-in Claude/Codex CLIs and local
+model servers, fills missing providers and repository settings, starts the service, and saves live
+smoke results. It asks before registering MCP with Claude Code or Codex; `--yes` grants consent.
+Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
+Re-running keeps existing settings and fills gaps. Existing TOML comments and unrelated settings
+are preserved, and changes create a timestamped backup. Converting to `[[providers]]` requires
+consent because the previous release cannot read it. If service startup, smoke checks, or MCP
+registration fails, init restores the original config. Discreet mode defaults to off; init records
+your choice in its summary, with behavior deferred to #37.
+
+For diagnosis, run `limitless doctor` (or `limitless doctor --json`). It reports exact fixes and
+never writes files or changes services. For a missing configured API key, add
+`<API_KEY_NAME>=<API_KEY>` to `~/.config/limitless/secrets.env`; setup never asks for secrets.
+The last smoke rows live in `~/.limitless/smoke-last.json` (`LIMITLESS_HOME` overrides the directory).
+For organization SSO failures, sign in to your identity provider, then `gh auth refresh`.
+
+Most other commands talk to the daemon over HTTP. `init`, `doctor`, `serve`, `service` and
+`integrations install` can run before it is started.
 
 ### Configure
 
@@ -160,6 +190,8 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
 | `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
+| `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
+| `[github] merge` | `"auto"` when absent; init chooses `"pr"` | Default for newly registered GitHub repos: `"auto"`, `"pr"`, or `"none"`. Existing repo rows stay unchanged; repository `.limitless.toml` policy still wins. |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
@@ -277,6 +309,8 @@ Coming soon (#49): run dependencies, meaning a run that starts only after anothe
 | `limitless logs <run> [-f]` | Event log (non-debug), optionally followed |
 | `limitless answer <run> "<text>"` | Answer **all** open questions on a run |
 | `limitless cancel <run>` | Cancel a queued or active run |
+| `limitless land <run\|pr> [--sha <sha>]` | Queue an open PR for landing (its recorded approval, or an explicit head; one land per repository at a time) |
+| `limitless land list` / `limitless land cancel <id>` | Show the land queue, or drop a queued or in-flight land |
 | `limitless providers [enable\|disable <id>]` | Provider health and quota, or toggle a provider |
 
 `LIMITLESS_URL` points the CLI at another daemon. The default is
@@ -284,8 +318,8 @@ Coming soon (#49): run dependencies, meaning a run that starts only after anothe
 
 ### UI and chat
 
-The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, provider cards, cost
-chart), **New run**, **Chat**, **Models** (providers, catalog, policy), **Evals** and run detail.
+The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, cost
+chart), **New run**, **Chat**, **Providers** (provider cards), **Models** (catalog, policy), **Evals** and run detail.
 The chat concierge runs on the `chat` routing role. It can propose a run (repo, title, profile,
 prompt), report status, and answer a run's questions. Nothing starts until you press **Confirm** on
 a proposal.
@@ -428,8 +462,9 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 - **Code review:** the model, verdict and findings. **Review follow-ups** lists non-blocking
   findings from later rounds.
 - **Audit flags:** any audit findings. On a run that passed, these are warnings only.
-- **Work log:** each invocation's role, model, effort, status, tokens, cost and duration, then the
-  totals: dollars spent and the API-equivalent value on subscriptions.
+- **Work log:** each invocation's role, model, effort, status, tokens (in = uncached + cached +
+  cache-write, with the cached and cache-write columns and the run's cache hit rate), cost and
+  duration, then the totals: dollars spent and the API-equivalent value on subscriptions.
 - `Closes #n` for issue-triggered runs, and a link to the run in the UI (`ui_url`).
 
 ## 5. Models and routing
@@ -446,16 +481,46 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 | `twilight` | free | same, `http://twilight:8080` | a LAN llama.cpp server and `TWILIGHT_API_KEY` |
 | `typesafe` | metered | `decisions`: typed questions over HTTP (`https://api.typesafe.ai/v1/systemone`); triage only | `TYPESAFE_API_KEY` |
 
-The provider and model catalog, including these endpoints, is currently built into
-`src/router/catalog.ts`. Defining providers in config is planned (M6 in [PLAN](PLAN.md)). Local
+The effective catalog combines built-in definitions, `[[providers]]` and
+`[[providers.models]]` in config.toml, and runtime model additions stored in SQLite. Local
 servers are probed every minute and show `down` until they answer. That is harmless: the router
 skips them.
 
 **Enable or disable** a provider with `limitless providers enable|disable <id>` or the button on
-its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
+its provider card on the **Providers** page. The setting persists across restarts. A provider
 whose API key is missing stays disabled.
 
-For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+Use `limitless catalog list` to see model sources and the latest served IDs from eligible
+authenticated `/v1/models` probes. `limitless providers` and provider cards show served models
+missing from the catalog and catalog models missing from the served list. A healthy provider's
+current served list prevents stale catalog entries from consuming an invocation attempt.
+Failed or malformed probes leave historical first/last-seen observations intact but make
+discovery inconclusive. Claude CLI, Codex CLI, and OpenRouter are excluded from discovery.
+
+To try a newly served local build, copy its exact backend ID from discovery and add explicit
+checkpoint origins (use `unknown` when unknown), vendor, tier, supported efforts, and prices
+in dollars per million tokens. For example:
+
+```sh
+limitless catalog add omlx/new-local --model New-Qwen-Build --origin CN --base-origin CN \
+  --vendor qwen --tier 2 --price-input 0 --price-output 0 --efforts none,high --effort none \
+  --notes 'Local experiment'
+limitless run 'Classify this task' --repo owner/repo --model triage=omlx/new-local@high
+limitless routing set triage.default omlx/new-local@high,codex/luna
+```
+
+Runtime models are immediately available and survive restarts. They participate only when
+explicitly named in a policy cell or run chain; automatic escalation and free-model widening
+exclude them. For agent roles on local Claude-backed servers, omit a default effort and use
+the bare model ID. `POST /api/catalog/models` accepts config-style metadata plus `provider`;
+`PATCH /api/catalog/models/:id` updates runtime entries. Code and config entries are read-only.
+Encode the full ID in the API path (for example `omlx%2Fnew-local`). Before
+`limitless catalog remove omlx/new-local`, clear every operator cell referencing it with
+`limitless routing reset <role>.<cell>`. Deletion names blocking cells; saved run chains retain
+deleted IDs and skip them as missing catalog entries. Provider definitions still require
+config.toml and a daemon restart.
+
+For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
 `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
 routing among free models the policy does not name, take catalog order, so they use Flash. Put `OMLX_API_KEY`
 in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
@@ -467,7 +532,8 @@ use the bare ID, preserving server-default thinking. Compare them with:
 limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow
 ```
 
-The committed `routing/policy.json` overlay remains authoritative over built-in defaults.
+The committed `routing/policy.json` eval overlay replaces built-in defaults cell by cell.
+SQLite operator overrides take precedence over both layers.
 For rollback, install with `--mtplx`, enable the provider if disabled, and select `mtplx/qwen-27b`.
 
 ### How a model is chosen
@@ -487,6 +553,42 @@ candidates that are:
 Quota or availability failures fall through to the next candidate without counting against the
 task. Review, verify and holdout avoid the relevant vendor where possible. Escalation adds any
 remaining catalog model at the required tier.
+
+### Editing routing live
+
+Routing has three layers: code `DEFAULT_POLICY`, the reviewed eval overlay in
+`routing/policy.json`, then operator cells stored in SQLite. Each override replaces one
+`role.cell` chain; resetting it reveals the eval cell, or the code cell when no eval cell exists.
+Cells are `default`, `trivial`, `small`, `medium`, and `large`. A complexity cell takes precedence
+over its role's `default`. Changes take effect on the next model call, including ongoing runs.
+An implementer removed from its cell loses its sticky preference; escalation constraints still apply.
+
+For example, reroute around a depleted Claude subscription:
+
+```sh
+limitless routing show --role implement
+limitless routing set implement.small 'codex/sol@high,codex/luna' --note 'Claude depleted'
+limitless routing preview implement small
+limitless routing reset implement.small
+limitless routing reset --all
+```
+
+Commas separate fallback groups; `|` joins interchangeable targets and `@effort` selects an
+explicit supported effort. Preview lists eligible and skipped targets without reserving capacity.
+Operator edits and resets persist across restarts, retain old/new audit history, and publish SSE updates.
+A run's `models` chains override all three layers for their roles and never fall back outside the chain.
+Use `limitless routing show --run <id>` or `limitless routing preview implement small --run <id>`
+to inspect a run's chains; without `--run`, these commands show global policy.
+
+`GET /api/routing` shows all layers, effective cells with their source and shadowed eval cells,
+provider preference, and history. Both it and `GET /api/routing/preview?role=implement&complexity=small`
+accept a `run=<id>` query parameter to apply the run's chains. Snapshot cells then report source `run`.
+Preview applies current eligibility to the chain without changing global policy.
+Cell PUT/DELETE requests use `/api/routing/cells/:role/:cell`
+(PUT body: `{ "groups": ["codex/sol@high"], "note": "Claude depleted" }`).
+PUT `/api/routing/prefer` with `{ "prefer": ["codex"] }` replaces config `[routing] prefer`
+until DELETE clears it; use provider IDs. An empty list also overrides config. These mutations
+use the same authentication, Origin, and JSON checks as provider enablement.
 
 A slot wait budget is spent once per provider in an invocation, across all its models. An expired
 provider stays eligible if its slot opens later. If every provider is busy after the budgets expire,
@@ -696,8 +798,9 @@ limitless eval policy --write          # write routing/policy.json and routing/E
 - The **Evals** page lists eval runs, per-trial details and a roles-by-models eligibility matrix
   with reasons.
 
-Today `routing/policy.json` overrides only `triage.default`. Metric definitions and statistics are
-in [EVALS](EVALS.md).
+The eval overlay can replace any role cell. `eval policy --write` continues to write the reviewed
+files; it does not hot-reload the daemon or remove operator overrides. Live operator changes sit
+above those recommendations until reset. Metric definitions and statistics are in [EVALS](EVALS.md).
 
 ## 6. Costs and quotas
 
@@ -801,7 +904,7 @@ debug events according to `[retention]`. Run it by hand with `limitless gc --dry
 
 `limitless local up|down|status` reports oMLX reachability even on `down`, without managing its
 lifecycle or enablement, and manages the llama.cpp unit on twilight. See [OPERATIONS](OPERATIONS.md#local-models). These endpoints are specific to the reference
-setup until providers become configurable.
+setup; additional providers can be defined in config.toml.
 
 <a id="remote-ui"></a>
 
@@ -925,3 +1028,105 @@ The daemon serves the UI shell only for `/`, `/runs/*`, `/new`, `/models` and `/
 - [EVALS](EVALS.md): datasets, graders, statistics and policy generation.
 - [REASONING_EFFORT](REASONING_EFFORT.md): effort as a routing dimension.
 - [PLAN](PLAN.md): milestones, including what is still to come.
+
+## Providers
+
+Define providers in `~/.config/limitless/config.toml` (or `$LIMITLESS_CONFIG_DIR/config.toml`).
+The first two entries alone are a valid subscription setup. This complete example also adds
+an unauthenticated local server and a metered API:
+
+```toml
+[[providers]]
+preset = "claude"
+
+[[providers]]
+preset = "codex"
+
+[[providers]]
+id = "local-models"
+kind = "openai-compatible"
+label = "Local models"
+base_url = "http://127.0.0.1:8989/v1"
+billing = "free"
+max_concurrent = 4
+
+[[providers.models]]
+id = "flash"
+model = "example/flash"
+vendor = "qwen"
+origin = "CN"
+base_origin = "CN"
+tier = 2
+price = { input = 0, output = 0 }
+efforts = ["none", "high"]
+effort = "none"
+
+[[providers]]
+id = "metered-api"
+kind = "anthropic-compatible"
+label = "Example API"
+base_url = "https://example.com/anthropic"
+openai_base_url = "https://example.com/v1"
+api_key_env = "EXAMPLE_API_KEY"
+billing = "metered"
+max_concurrent = 2
+
+[[providers.models]]
+id = "coder"
+model = "example/coder"
+vendor = "other"
+origin = "US"
+base_origin = "unknown"
+tier = 4
+price = { input = 1, output = 3, cache_read = 0.1 }
+efforts = []
+checkpoint = "example-coder"
+notes = "Optional model metadata"
+```
+
+Kinds are `claude-cli`, `codex-cli`, `anthropic-compatible`, `openai-compatible`, and
+`decisions`. OpenAI-compatible providers support tool-free triage, chat and summaries;
+agentic policy targets and production roster pins require an agent-capable transport.
+Decisions providers support triage only and accept `decisions_base_url` or `base_url`.
+Endpoint paths are used exactly as configured. `openai_base_url` takes precedence over
+`base_url` for OpenAI-compatible providers. Optional `health_url` enables health probes;
+`ssh_forward = { host = "example.com", local_port = 18080, remote_port = 8080 }` configures a tunnel.
+
+Public presets are `claude`, `codex`, `openrouter`, and `typesafe`. Without an explicit `id`,
+the preset name is the provider ID. With a new `id`, inherited models use that prefix.
+Explicit fields override preset or same-ID built-in defaults. Prices and SSH settings merge
+by field; models merge by local `id`, retaining omitted models and appending new ones.
+Model IDs remain `<provider>/<local id>`; backend `model` names may contain `/`. IDs must
+not contain whitespace, `/`, `@`, or `|`. Model metadata includes `notes`, `checkpoint`,
+`price.cache_read`, and `base_origin`; a default `effort` must appear in `efforts`.
+
+`api_key_env` is a variable name, never a key value. Put its value in `secrets.env` or the
+process environment. Provider credentials resolve from a nonempty secrets-file value first,
+then the environment; unrelated integration secrets retain their existing precedence.
+A missing key disables the provider and reports `missing key EXAMPLE_API_KEY` in startup
+notes, `limitless providers`, and the UI. Enabling cannot bypass this requirement.
+Omit `api_key_env` for CLI login authentication or an unauthenticated server. Literal-token
+fields such as `apiKey` are rejected. During this migration only, the deprecated built-in
+mtplx provider retains its internal static-token fallback under its original ID; export omits
+that token. An explicit `api_key_env` replaces the fallback.
+
+Part 1 keeps built-ins alongside configured providers: a matching ID takes precedence;
+omission does not remove a provider. Startup notes identify implicit deprecated machine
+providers until they have explicit definitions. Legacy `[providers.omlx]` tables with
+`max_concurrent = 4` still work, but do not count as migrated definitions. TOML provider
+arrays and legacy tables are alternative formats in one file.
+
+Run `limitless providers export` offline to print the effective catalog as `[[providers]]`
+TOML. Diagnostics go to stderr and credentials are never exported. Use
+`limitless providers export --write` to replace the provider configuration, preserving
+unrelated settings semantically and creating a uniquely named `config.toml.<id>.bak` with
+the original bytes. Comments/formatting are regenerated; previous backups and `secrets.env`
+remain untouched. Replacing an existing config requires affirmative interactive confirmation;
+use `--write --yes` for automation. Empty, negative, EOF, or non-interactive input refuses
+replacement without `--yes`. The warning and prompt show the planned backup path before writing.
+This is a one-way migration for the previous release: it cannot load `[[providers]]`.
+Before rolling back, restore the named original backup over `config.toml`, then start the older
+release. Creating a new config has no previous backup; remove it before rollback.
+Startup never migrates configuration automatically. Validation or backup failures leave the original config intact. Restart
+the daemon after editing configuration. Export includes disabled providers, without transient
+health, quota, or enablement state.

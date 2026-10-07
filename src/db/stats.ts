@@ -59,7 +59,7 @@ export function computeProviderWorkload(store: Store, now = Date.now()): Provide
   const rows = store.db
     .query(`
     SELECT provider, started_at, tokens_in, tokens_out, wall_ms, cost_equiv_usd FROM (
-      SELECT provider, started_at, input_tokens + cache_read_tokens AS tokens_in,
+      SELECT provider, started_at, input_tokens + cache_read_tokens + cache_write_tokens AS tokens_in,
              output_tokens AS tokens_out,
              CASE WHEN finished_at IS NULL THEN 0 ELSE MAX(0, finished_at - started_at) END AS wall_ms,
              cost_equiv_usd
@@ -67,7 +67,8 @@ export function computeProviderWorkload(store: Store, now = Date.now()): Provide
       UNION ALL
       SELECT provider, started_at,
              COALESCE(json_extract(result_json, '$.usage.input'), 0) +
-               COALESCE(json_extract(result_json, '$.usage.cacheRead'), 0),
+               COALESCE(json_extract(result_json, '$.usage.cacheRead'), 0) +
+               COALESCE(json_extract(result_json, '$.usage.cacheWrite'), 0),
              COALESCE(json_extract(result_json, '$.usage.output'), 0),
              COALESCE(duration_ms, 0),
              COALESCE(json_extract(result_json, '$.costEquivUsd'), 0)
@@ -133,7 +134,7 @@ export function computeStats(store: Store, days = 14): Stats {
               SUM(status NOT IN ('ok','running','cancelled','declined')) AS failed,
               SUM(cost_usd) AS cost_usd, SUM(cost_equiv_usd) AS cost_equiv_usd,
               AVG(COALESCE(finished_at, started_at) - started_at) AS avg_ms,
-              SUM(input_tokens + cache_read_tokens) AS tin, SUM(output_tokens) AS tout
+              SUM(input_tokens + cache_read_tokens + cache_write_tokens) AS tin, SUM(output_tokens) AS tout
          FROM invocations WHERE started_at >= ? AND role != 'review_shadow'
         GROUP BY model_id, role ORDER BY n DESC`,
     )
@@ -143,7 +144,7 @@ export function computeStats(store: Store, days = 14): Stats {
       `SELECT COUNT(*) AS runs, SUM(status = 'succeeded') AS succeeded, SUM(cost_usd) AS cost_usd,
               SUM(cost_equiv_usd) AS cost_equiv_usd,
               SUM(status IN ('running','waiting_input')) AS active, SUM(status = 'queued') AS queued,
-              SUM(status = 'needs_human') AS open_needs_human
+              SUM(status IN ('failed','needs_human')) AS open_needs_human
          FROM runs WHERE created_at >= ?`,
     )
     .get(since) as Record<string, number>;

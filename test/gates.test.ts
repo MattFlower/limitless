@@ -6,10 +6,11 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
@@ -21,6 +22,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
+import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -33,10 +35,11 @@ import { recordWorktree } from "../src/git/command.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
-import { formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { truncationEncodings } from "./privacy-support.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -365,6 +368,123 @@ describe("audit allowances and attribute rules", () => {
       "linguist-generated",
     ]);
     expect(newlyHidden({ diff: "unset" }, { diff: "unset" })).toEqual([]);
+  });
+});
+
+describe("private strings", () => {
+  test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {
+    const entries = [{ value: "private-prospect.example", entry: 3 }];
+    const text = encode(entries[0]?.value ?? "");
+    // Include every cutoff after the first complete encoded character, including partial escapes.
+    for (let cut = encode("p").length; cut < text.length; cut++)
+      expect(privateMatches(`Public: ${text.slice(0, cut)}`, entries, true)).toEqual(entries);
+    expect(privateMatches("Public: ＰＲＩＶＡＴＥ-pro", entries, true)).toEqual(entries);
+    expect(privateMatches("Public: private-pro", entries)).toEqual([]);
+    expect(privateMatches("Public: private-pro unrelated", entries, true)).toEqual([]);
+  });
+
+  test.each([
+    ["double URL", "%2573ecret-host.example"],
+    ["Unicode-escaped percent", "\\u002573ecret-host.example"],
+    ["URL of Unicode", "%5Cu0073ecret-host.example"],
+    ["alternating layers", "%5Cu002573ecret-host.example"],
+  ])("blocks %s encoding in publication and diagnostics", (_kind, text) => {
+    const entries = [{ value: "secret-host.example", entry: 3 }];
+    expect(privateMatches(text, entries)).toEqual(entries);
+    expect(() => checkPrivateText(text, "body", entries)).toThrow("entry 3");
+    expect(redactPrivate(text, entries)).toBe("[redacted diagnostic]");
+  });
+
+  test("private decoding fails closed at the round bound even without denylist entries", () => {
+    const entries = [{ value: "secret-host.example", entry: 3 }];
+    let nested = "%61 harmless";
+    for (let i = 0; i < 3; i++) nested = encodeURIComponent(nested);
+    expect(privateMatches(nested, entries)).toEqual([]);
+    expect(redactPrivate(nested, entries)).toBe(nested);
+    nested = encodeURIComponent(nested);
+    for (const policy of [entries, []]) {
+      expect(privateMatches(nested, policy)).toHaveLength(1);
+      expect(() => checkPrivateText(nested, "body", policy)).toThrow("decoding limit");
+      expect(redactPrivate(nested, policy)).toBe("[redacted diagnostic]");
+    }
+    for (let i = 0; i < 3; i++) nested = encodeURIComponent(nested);
+    expect(() => checkPrivateText(nested, "body", [])).toThrow("decoding limit");
+  });
+
+  test.each(["A", "R100"])("quoted %s filename and unrelated diagnostics cannot reveal entries", (status) => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\ni\u0307-host.example");
+      const patch =
+        'diff --git "a/secret-host.example\\t.txt" "b/secret-host.example\\t.txt"\n+++ "b/secret-host.example\\t.txt"\n@@ -0,0 +1 @@\n+SECRET-HOST.EXAMPLE\n';
+      const findings = auditDiff(diff(patch, [{ status, path: "secret-host.example\t.txt" }]), {
+        configDir,
+        taskClass: null,
+        protectedPaths: [],
+        toolCommands: ["git commit --no-verify İ-host.example"],
+      });
+      expect(findings.filter((f) => f.rule === "private-string")).toHaveLength(2);
+      expect(
+        findings.filter((f) => f.rule === "private-string").every((f) => f.file === "[redacted filename]"),
+      ).toBe(true);
+      const output = JSON.stringify(findings);
+      expect(output).not.toContain("secret-host.example");
+      expect(output).not.toContain("İ-host.example");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("local loader, absent file, physical entry numbers, and unreadable file", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      const changes = diff("diff --git a/a.txt b/a.txt\n@@ -0,0 +1 @@\n+SECRET-HOST.EXAMPLE", [
+        { status: "A", path: "a.txt" },
+      ]);
+      expect(loadPrivateStrings(configDir)).toEqual([]);
+      expect(auditDiff(changes, { configDir, taskClass: null, protectedPaths: [] })).toEqual([]);
+      writeFileSync(join(configDir, "private-strings.txt"), "  # ignored\n\n  secret-host.example  \n");
+      const findings = auditDiff(changes, { configDir, taskClass: null, protectedPaths: [] });
+      expect(findings).toEqual([
+        {
+          rule: "private-string",
+          severity: "block",
+          file: "a.txt",
+          detail: "a.txt:1 contains a private string (entry 3 in private-strings.txt)",
+        },
+      ]);
+      rmSync(join(configDir, "private-strings.txt"));
+      mkdirSync(join(configDir, "private-strings.txt"));
+      expect(() => loadPrivateStrings(configDir)).toThrow(
+        "Cannot read private-strings.txt; publication blocked",
+      );
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("multiple hunks, header-like content, added and renamed filenames redact every finding and feedback", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\nsecond-entry");
+      const patch =
+        "diff --git a/safe.txt b/safe.txt\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1,2 +1,3 @@\n context\n+SECRET-HOST.EXAMPLE second-entry\n kept\n@@ -20 +21,2 @@\n keep\n+++ b/secret-host.example\n";
+      const changes = diff(patch, [
+        { status: "M", path: "safe.txt" },
+        { status: "A", path: "SECRET-HOST.EXAMPLE.txt" },
+        { status: "R100", path: "secret-host.example.test.ts" },
+      ]);
+      const findings = auditDiff(changes, { configDir, taskClass: null, protectedPaths: ["*.ts"] });
+      expect(findings.filter((f) => f.rule === "private-string")).toHaveLength(5);
+      expect(findings.some((f) => f.detail.startsWith("safe.txt:22 "))).toBe(true);
+      expect(findings.filter((f) => f.file === "[redacted filename]")).toHaveLength(3);
+      expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+      expect(JSON.stringify(findings)).not.toContain("second-entry");
+      expect(formatAuditFeedback(findings).toLowerCase()).not.toContain("secret-host.example");
+      expect(formatAuditFeedback(findings)).toContain("entry 2 in private-strings.txt");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1111,3 +1231,177 @@ test("passing offline refusal smoke output does not turn its enclosing gate into
   expect(result.checks[0]?.ok).toBe(true);
   expect(compareGates(null, result)[0]).toMatchObject({ verdict: "new_pass", blocking: false });
 }, 35_000);
+
+test("private policy rejects broken lists and repository aliases; normalizes both sides", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-policy-"));
+  const config = join(root, "config");
+  const file = join(config, "private-strings.txt");
+  mkdirSync(config);
+  try {
+    expect(loadPrivateStrings(config)).toEqual([]);
+    symlinkSync(join(root, "missing"), file);
+    expect(() => loadPrivateStrings(config)).toThrow("Cannot read");
+    rmSync(file);
+    writeFileSync(file, Buffer.from([0xff]));
+    expect(() => loadPrivateStrings(config)).toThrow("Cannot read");
+    writeFileSync(file, "# ignored\n\nＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ\n");
+    const entries = loadPrivateStrings(config);
+    expect(entries[0]?.entry).toBe(3);
+    for (const text of [
+      "secret-host.example",
+      "ＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ",
+      "%73ecret-host%2Eexample",
+      "\\u0073ecret-host.example",
+      "%5Cu0073ecret-host.example",
+      JSON.stringify("\\u0073\\u0065\\u0063\\u0072\\u0065\\u0074-host.example"),
+      "%bad% secret-host.example",
+    ]) {
+      expect(privateMatches(text, entries)).toHaveLength(1);
+      expect(privateMatches(redactPrivate(text, entries), entries)).toEqual([]);
+    }
+    expect(privateMatches("secret-\nhost.example", entries)).toEqual([]);
+    // Compatibility letters must be normalized before context-sensitive lowercasing.
+    writeFileSync(file, "AΣᴬ");
+    expect(privateMatches("aσa", loadPrivateStrings(config))).toHaveLength(1);
+    writeFileSync(file, "＃secret-host.example");
+    expect(privateMatches("#secret-host.example", loadPrivateStrings(config))).toHaveLength(1);
+    const alias = join(root, "alias");
+    symlinkSync(config, alias);
+    expect(() => loadPrivateStrings(alias, [config])).toThrow("inside repository");
+    expect(() => loadPrivateStrings(join(config, "absent"), [config])).toThrow("inside repository");
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    symlinkSync(config, join(repo, "outward"));
+    expect(() => loadPrivateStrings(join(repo, "outward"), [repo])).toThrow("inside repository");
+    rmSync(file);
+    writeFileSync(join(repo, "list"), "secret-host.example");
+    symlinkSync(join(repo, "list"), file);
+    expect(() => loadPrivateStrings(config, [repo])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("daemon invocation directory is not an implicit repository root", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-daemon-cwd-"));
+  const config = join(root, "config");
+  const repo = join(root, "repo");
+  mkdirSync(config);
+  mkdirSync(repo);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  const program = `
+    import { loadPrivateStrings } from ${JSON.stringify(resolve("src/gates/private.ts"))};
+    if (loadPrivateStrings()[0]?.value !== "secret-host.example") throw new Error("missing list");
+    loadPrivateStrings(undefined, [${JSON.stringify(repo)}]);
+    for (const roots of [[${JSON.stringify(config)}], [${JSON.stringify(root)}]]) {
+      let blocked = false;
+      try { loadPrivateStrings(undefined, roots); }
+      catch (error) { blocked = error.message.includes("inside repository"); }
+      if (!blocked) throw new Error("repository config accepted");
+    }
+  `;
+  try {
+    const child = Bun.spawn([process.execPath, "-e", program], {
+      cwd: root,
+      env: { ...process.env, LIMITLESS_CONFIG_DIR: "config" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+    expect(stderr).toBe("");
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private config excludes common git directories and all linked worktrees canonically", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-boundaries-"));
+  try {
+    const repo = join(root, "repo");
+    const work = join(root, "work");
+    const other = join(root, "other");
+    await sh(["git", "init", "-q", repo], { cwd: root });
+    await sh(["git", "commit", "--allow-empty", "-qm", "base"], { cwd: repo });
+    await sh(["git", "worktree", "add", "-qb", "work", work], { cwd: repo });
+    await sh(["git", "worktree", "add", "-qb", "other", other], { cwd: repo });
+    for (const boundary of [repo, work, other, join(repo, ".git")]) {
+      const config = join(boundary, "config-private");
+      mkdirSync(config);
+      writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+      const alias = join(root, "alias");
+      symlinkSync(config, alias);
+      expect(() => loadPrivateStrings(config, [work])).toThrow("inside repository");
+      expect(() => loadPrivateStrings(alias, [work])).toThrow("inside repository");
+      rmSync(alias);
+    }
+    const aliasWork = join(root, "alias-work");
+    mkdirSync(aliasWork);
+    symlinkSync(join(repo, ".git"), join(aliasWork, ".git"));
+    expect(() => loadPrivateStrings(join(repo, "config-private"), [aliasWork])).toThrow("inside repository");
+    const external = join(root, "repo-sibling");
+    mkdirSync(external);
+    writeFileSync(join(external, "private-strings.txt"), "secret-host.example");
+    expect(loadPrivateStrings(external, [work])).toEqual([{ value: "secret-host.example", entry: 1 }]);
+    rmSync(join(external, "private-strings.txt"));
+    symlinkSync(join(other, "config-private", "private-strings.txt"), join(external, "private-strings.txt"));
+    expect(() => loadPrivateStrings(external, [work])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("waiting behind a lease does not spend the internal gate's execution timeout", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const id = await gateSlots.lease("deploy");
+  const queued = Promise.withResolvers<void>();
+  try {
+    const run = runGates(
+      process.cwd(),
+      {
+        setup: [],
+        checks: [{ name: "short", run: "true", timeoutSec: 0.1 }],
+        source: "detected",
+        protectedPaths: [],
+      },
+      new AbortController().signal,
+      { holder: "run-timeout", onWait: () => queued.resolve() },
+    );
+    await queued.promise;
+    await Bun.sleep(200);
+    expect(gateSlots.snapshot().holders).toEqual(["deploy"]);
+    gateSlots.heartbeat(id, true);
+    expect((await run).checks[0]?.ok).toBe(true);
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    gateSlots.heartbeat(id, true);
+    gateSlots.setLimit(previous);
+  }
+});
+
+test("gate subprocess excludes an arbitrary unselected provider credential", async () => {
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const fixture = providerFixture([{ ...customProvider, api_key_env: "MAC_MLX_KEY" }]);
+  const saved = process.env.MAC_MLX_KEY;
+  try {
+    process.env.MAC_MLX_KEY = "FAKE_GATE_CREDENTIAL_733";
+    fixture.load();
+    const gate = await runGates(
+      fixture.root,
+      {
+        setup: [],
+        checks: [{ name: "env", run: 'test -z "$MAC_MLX_KEY" && printf "credential=absent CI=%s" "$CI"' }],
+        source: "detected",
+        protectedPaths: [],
+        merge: "pr",
+      },
+      new AbortController().signal,
+    );
+    expect(gate.checks[0]).toMatchObject({ ok: true, output: "credential=absent CI=1" });
+  } finally {
+    if (saved === undefined) delete process.env.MAC_MLX_KEY;
+    else process.env.MAC_MLX_KEY = saved;
+    fixture.close();
+  }
+});

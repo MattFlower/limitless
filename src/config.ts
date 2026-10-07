@@ -7,8 +7,10 @@ import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
 import { parseReviewRosters } from "./pipeline/review-system.ts";
-import { PROVIDERS } from "./router/catalog.ts";
+import { type EffectiveCatalog, resolveCatalog } from "./router/config-catalog.ts";
+import { validatePrefer } from "./router/prefer.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
+import { registerCredential } from "./util/proc.ts";
 
 export interface Paths {
   home: string; // ~/.limitless
@@ -47,6 +49,7 @@ export interface Config {
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
   providerMaxConcurrent: Record<string, number>;
+  catalog?: EffectiveCatalog;
   /** Gate suites (setup + checks) allowed to run at once across the whole process. */
   maxConcurrentGates: number;
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
@@ -75,8 +78,10 @@ export interface Config {
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
+  githubMerge?: "auto" | "pr" | "none";
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
   githubPollSeconds: number; // [github] poll_seconds: the normal polling interval, at least 15
+  githubCiReruns: boolean; // [github] ci_reruns: retry transient CI failures once
   discordOwnerId: string | null;
   discordChannelId: string | null;
   discordNotifyAll: boolean;
@@ -86,8 +91,8 @@ export interface Config {
 }
 
 function parseEnvFile(path: string): Record<string, string> {
-  if (!existsSync(path)) return {};
-  const out: Record<string, string> = {};
+  if (!existsSync(path)) return Object.create(null);
+  const out: Record<string, string> = Object.create(null);
   for (const line of readFileSync(path, "utf8").split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -132,9 +137,8 @@ function str(v: unknown, fallback: string | null): string | null {
   return typeof v === "string" && v.length > 0 ? v : fallback;
 }
 
-export function loadConfig(
-  overrides: Partial<{ home: string; configDir: string; port: number }> = {},
-): Config {
+type LoadOptions = Partial<Paths> & { port?: number; readOnly?: boolean; raw?: Record<string, unknown> };
+export function loadConfig(overrides: LoadOptions = {}): Config {
   const home = overrides.home ?? process.env.LIMITLESS_HOME ?? join(homedir(), ".limitless");
   const configDir =
     overrides.configDir ?? process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless");
@@ -146,45 +150,36 @@ export function loadConfig(
     runs: join(home, "runs"),
     configDir,
   };
-  for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
+  if (!overrides.readOnly)
+    for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
 
   const tomlPath = join(configDir, "config.toml");
-  const raw: Record<string, unknown> = existsSync(tomlPath)
-    ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
-    : {};
-  evalSettings(raw);
-  const providerMaxConcurrent: Record<string, number> = {};
-  const configuredProviders = raw.providers === undefined ? {} : raw.providers;
-  if (
-    typeof configuredProviders !== "object" ||
-    configuredProviders === null ||
-    Array.isArray(configuredProviders)
-  )
-    throw new Error("providers must be a table");
-  for (const [id, value] of Object.entries(configuredProviders)) {
-    if (!PROVIDERS.some((provider) => provider.id === id))
-      throw new Error(`providers.${id}: unknown provider`);
-    if (typeof value !== "object" || value === null || Array.isArray(value))
-      throw new Error(`providers.${id} must be a table`);
-    const limit = (value as Record<string, unknown>).max_concurrent;
-    if (limit !== undefined) {
-      if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0)
-        throw new Error(`providers.${id}.max_concurrent must be a positive safe integer`);
-      providerMaxConcurrent[id] = limit;
-    }
+  let raw: Record<string, unknown>;
+  try {
+    raw =
+      overrides.raw ??
+      (existsSync(tomlPath)
+        ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
+        : {});
+  } catch {
+    // Parser diagnostics can include the source line, including credentials.
+    throw new Error("Invalid config.toml; fix TOML syntax in the configuration file");
   }
-  const secrets = { ...parseEnvFile(join(configDir, "secrets.env")) };
+  evalSettings(raw);
+  const catalog = resolveCatalog(raw.providers);
+  const { providerMaxConcurrent } = catalog;
+  const fileSecrets = parseEnvFile(join(configDir, "secrets.env"));
+  const secrets: Record<string, string> = Object.assign(Object.create(null), fileSecrets);
   // Environment variables win over the secrets file (useful for tests and CI).
-  for (const key of [
-    "OPENROUTER_API_KEY",
-    "OMLX_API_KEY",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_APP_ID",
-    "DISCORD_GUILD_ID",
-    "GITHUB_WEBHOOK_SECRET",
-  ]) {
+  for (const key of ["DISCORD_BOT_TOKEN", "DISCORD_APP_ID", "DISCORD_GUILD_ID", "GITHUB_WEBHOOK_SECRET"]) {
     const v = process.env[key];
     if (v) secrets[key] = v;
+  }
+
+  for (const p of catalog.providers) {
+    const key = p.apiKeySecret;
+    if (key) secrets[key] = fileSecrets[key] || (Object.hasOwn(process.env, key) && process.env[key]) || "";
+    if (key) registerCredential(key, secrets[key]);
   }
 
   const server = (raw.server ?? {}) as Record<string, unknown>;
@@ -227,6 +222,11 @@ export function loadConfig(
       throw new Error(`routing.wait_budget_s.${role} must be nonnegative integer seconds`);
     waitBudgetS[role as Role] = seconds;
   }
+  const prefer = validatePrefer(
+    routing.prefer === undefined ? [] : routing.prefer,
+    catalog.models,
+    catalog.providers,
+  );
   const rawReview = raw.review ?? {};
   if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
     throw new Error("review must be a table");
@@ -264,8 +264,15 @@ export function loadConfig(
     throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const github = (raw.github ?? {}) as Record<string, unknown>;
+  const repos = github.repos;
+  const valid = Array.isArray(repos) && repos.every((r) => typeof r === "string" && repoName.test(r));
+  if (repos !== undefined && !valid) throw new Error("github.repos must be an array of owner/name strings");
+  if (github.merge !== undefined && !["auto", "pr", "none"].includes(github.merge as string))
+    throw new Error("github.merge must be auto, pr or none");
   if (github.poll !== undefined && typeof github.poll !== "boolean")
     throw new Error("github.poll must be true or false");
+  if (github.ci_reruns !== undefined && typeof github.ci_reruns !== "boolean")
+    throw new Error("github.ci_reruns must be true or false");
   if (github.poll_seconds !== undefined && !Number.isFinite(github.poll_seconds))
     throw new Error("github.poll_seconds must be a number of seconds");
   const gates = (raw.gates ?? {}) as Record<string, unknown>;
@@ -324,6 +331,7 @@ export function loadConfig(
     uiUrl: str(server.ui_url, `http://localhost:${port}`) as string,
     maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
     providerMaxConcurrent,
+    catalog,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
     baselineEnv,
@@ -346,9 +354,7 @@ export function loadConfig(
         ]),
       ),
     },
-    preferProviders: Array.isArray(routing.prefer)
-      ? routing.prefer.filter((p): p is string => typeof p === "string")
-      : [],
+    preferProviders: prefer,
     waitBudgetS,
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
@@ -359,8 +365,10 @@ export function loadConfig(
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),
+    githubMerge: github.merge as Config["githubMerge"],
     githubPoll: github.poll !== false,
     githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),
+    githubCiReruns: github.ci_reruns !== false,
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),
     discordNotifyAll: discord.notify_all === true,
@@ -368,3 +376,4 @@ export function loadConfig(
     raw,
   };
 }
+export const repoName = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_][A-Za-z0-9_.-]*$/;

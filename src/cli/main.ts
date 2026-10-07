@@ -4,7 +4,8 @@ import { parseArgs } from "node:util";
 import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
-import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { parseRunModels } from "../core/run-models.ts";
+import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
 
@@ -16,6 +17,8 @@ Usage:
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
         [--allow submodules|gitattributes|binary]  Allow that blocked audit change (repeatable)
+        [--model role=model[@effort][,fallback]]  Pin a role's chain (repeatable; | joins alternatives)
+  limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
@@ -25,6 +28,9 @@ Usage:
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
   limitless review shadow-report [--since <ISO-8601>]  Single vs shadow panel reviews, with later outcomes
+  limitless review <run> --changes <findings.json> | --approve [--sha <sha>]
+        Apply findings as a new round on the run's PR, or approve it; --sha: the reviewed PR head
+        (default: the head the factory last delivered)
   limitless ls [--status s1,s2] [-n 20]   List runs
   limitless show <run>                    Run details
   limitless logs <run> [-f]               Print (and follow) the run's event log
@@ -32,13 +38,27 @@ Usage:
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless resolve <run> --as done_elsewhere|superseded|wont_do|pr_closed [--ref <run|url>] [--note "..."]
         Record that a needs_human or failed run was dealt with outside the factory
+  limitless land <run|pr|https://.../pull/7> [--sha <sha>]
+        Queue an open PR for landing; --sha approves a head explicitly (default: the recorded approval)
+  limitless land list                    Show the land queue
+  limitless land cancel <id>             Drop a queued or in-flight land
   limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
+  limitless digest [--consumer <name>]  Read-only session summary of what needs attention
   limitless providers                     Provider health and quota
+  limitless catalog list                  Effective models and discovery
+  limitless catalog add <provider>/<id> --model <backend> --origin <country> --base-origin <country> --vendor <vendor> --tier N --price-input N --price-output N [--efforts none,high] [--effort high] [--notes …]
+  limitless catalog remove <id>            Remove a runtime model
+  limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
-  limitless doctor                        Report GitHub access problems the PR poller recorded
+  limitless routing show [--role r] [--run id]
+  limitless routing set <role>.<cell> <chain> [--note …]
+  limitless routing reset <role>.<cell> | --all
+  limitless routing preview <role> [<complexity>] [--run id]
+  limitless init [--yes] [--repo owner/name]... [--json]  Idempotent machine setup
+  limitless doctor [--json]                Read-only machine and access diagnosis
   limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
   limitless auth passkeys [remove <id>]   List or remove UI passkeys
   limitless auth set-password             Set the UI sign-in password (prompted, never echoed)
@@ -50,6 +70,7 @@ Usage:
   limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
   limitless service uninstall|status
   limitless local up|down|status          Report oMLX health; manage twilight
+  limitless gate-slot [--name <holder>] [--max-wait <seconds>] -- <command...>
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
@@ -92,7 +113,7 @@ const color = {
 
 function statusColor(s: string): string {
   const status = s.trim();
-  if (status === "succeeded") return color.green(s);
+  if (status === "succeeded" || status === "landed") return color.green(s);
   if (status === "resolved") return color.cyan(s);
   if (status === "failed" || status === "needs_human") return color.red(s);
   if (status === "running") return color.cyan(s);
@@ -192,12 +213,27 @@ function parseSince(value: string): number {
 }
 
 async function main(): Promise<void> {
+  if (Bun.argv[2] === "gate-slot") {
+    process.exitCode = await (await import("./gate-slot.ts")).gateSlotCommand(Bun.argv.slice(3));
+    return;
+  }
   const { values, positionals } = parseArgs({
     args: Bun.argv.slice(2),
     allowPositionals: true,
     options: {
       evals: { type: "string" },
       models: { type: "string" },
+      origin: { type: "string" },
+      "base-origin": { type: "string" },
+      vendor: { type: "string" },
+      tier: { type: "string" },
+      efforts: { type: "string" },
+      effort: { type: "string" },
+      "price-input": { type: "string" },
+      "price-output": { type: "string" },
+      "price-cache-read": { type: "string" },
+      notes: { type: "string" },
+      model: { type: "string", multiple: true },
       systems: { type: "string" },
       "replay-finders": { type: "string" },
       k: { type: "string" },
@@ -213,7 +249,9 @@ async function main(): Promise<void> {
       after: { type: "string" },
       consumer: { type: "string" },
       wait: { type: "string" },
-      repo: { type: "string", short: "r" },
+      repo: { type: "string", short: "r", multiple: true },
+      role: { type: "string" },
+      run: { type: "string" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
       follow: { type: "boolean", short: "f" },
@@ -222,6 +260,7 @@ async function main(): Promise<void> {
       help: { type: "boolean", short: "h" },
       tunnel: { type: "boolean" },
       write: { type: "boolean" },
+      yes: { type: "boolean" },
       "dry-run": { type: "boolean" },
       mtplx: { type: "boolean" },
       smoke: { type: "boolean" },
@@ -231,10 +270,14 @@ async function main(): Promise<void> {
       as: { type: "string" },
       ref: { type: "string" },
       note: { type: "string" },
+      sha: { type: "string" },
       all: { type: "boolean" },
+      changes: { type: "string" },
+      approve: { type: "boolean" },
     },
   });
   const [cmd, ...rest] = positionals;
+  const repo = values.repo?.at(-1);
   if (!cmd || values.help) {
     console.log(USAGE);
     return;
@@ -243,6 +286,12 @@ async function main(): Promise<void> {
     case "eval": {
       const { evalCommand } = await import("./eval.ts");
       return evalCommand(rest, values, { api, print: console.log, wait: (ms) => Bun.sleep(ms) });
+    }
+    case "digest": {
+      const { digestCommand } = await import("./digest.ts");
+      const { loadConfig } = await import("../config.ts");
+      loadConfig({ readOnly: true });
+      return digestCommand(rest, values, { api, print: console.log });
     }
     case "feed": {
       const { feedCommand } = await import("./feed.ts");
@@ -295,13 +344,14 @@ async function main(): Promise<void> {
     }
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
-      if (!prompt || !values.repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
+      if (!prompt || !repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
       const allow = validateAllow(values.allow);
       const run = await api<Run>("/api/runs", {
         method: "POST",
         body: JSON.stringify({
-          repo: values.repo,
+          repo,
           prompt,
+          models: parseRunModels(values.model),
           ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
@@ -312,6 +362,16 @@ async function main(): Promise<void> {
         }),
       });
       console.log(`Created run ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
+      if (values.follow) await follow(run.id);
+      return;
+    }
+    case "retry": {
+      if (rest.length !== 1) throw new Error("usage: limitless retry <run> [--model role=chain]");
+      const run = await api<Run>(`/api/runs/${encodeURIComponent(rest[0] ?? "")}/retry`, {
+        method: "POST",
+        body: JSON.stringify({ models: parseRunModels(values.model) }),
+      });
+      console.log(`Created retry ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
       if (values.follow) await follow(run.id);
       return;
     }
@@ -336,6 +396,8 @@ async function main(): Promise<void> {
         `repo ${r.repoSlug}  status ${statusColor(r.status)}  profile ${r.resolvedProfile ?? r.profile}`,
       );
       if (r.prUrl) console.log(`PR ${r.prUrl}`);
+      for (const [role, chain] of Object.entries(r.models ?? {}))
+        console.log(`Model experiment: ${role} = ${chain.join(", ")}`);
       if (r.error) console.log(color.red(r.error));
       const cost = formatCost(r.costUsd, r.costEquivUsd);
       console.log(`cost ${cost.primary}${cost.paid ? ` ${cost.paid} paid` : ""} (${cost.title})`);
@@ -386,6 +448,32 @@ async function main(): Promise<void> {
       console.log(`Resolved ${run.id} as ${run.resolution?.kind ?? values.as}`);
       return;
     }
+    case "land": {
+      const [sub, ...args] = rest;
+      if (sub === "list") {
+        const entries = await api<import("../core/types.ts").LandEntry[]>("/api/land");
+        for (const entry of entries)
+          console.log(
+            `${entry.id}  ${statusColor(entry.state.padEnd(11))} ${entry.repo.padEnd(28)} ${entry.approvedSha.slice(0, 12)}  ${entry.prUrl}${entry.reason ? color.dim(`  ${entry.reason}`) : ""}`,
+          );
+        return;
+      }
+      if (sub === "cancel" && args.length === 1) {
+        await api(`/api/land/${encodeURIComponent(args[0] as string)}/cancel`, { method: "POST" });
+        console.log("Cancelled");
+        return;
+      }
+      if (!sub)
+        throw new Error("usage: limitless land <run|pr> [--sha <sha>] | land list | land cancel <id>");
+      const entry = await api<import("../core/types.ts").LandEntry>("/api/land", {
+        method: "POST",
+        body: JSON.stringify({ target: sub, ...(values.sha ? { sha: values.sha } : {}) }),
+      });
+      console.log(
+        `Land ${color.bold(String(entry.id))} queued for ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`,
+      );
+      return;
+    }
     case "service": {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
@@ -408,7 +496,15 @@ async function main(): Promise<void> {
         now: values.now === true,
       });
     }
+    case "catalog":
+      return (await import("./catalog.ts")).catalogCommand(rest, values, api);
+    case "routing":
+      return (await import("./routing.ts")).routingCommand(rest, values, api);
     case "providers": {
+      if (rest[0] === "export") {
+        if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");
+        return (await import("./providers-export.ts")).providersExport(!!values.write, !!values.yes);
+      }
       if (rest[0] === "fast") {
         const [, value, id] = rest;
         if (rest.length !== 3 || (value !== "on" && value !== "off") || !id)
@@ -438,7 +534,9 @@ async function main(): Promise<void> {
             state: string;
             reason: string | null;
             maxConcurrent: number;
+            quota?: import("../core/types.ts").QuotaMode;
             windows: Record<string, { utilization: number; observedAt?: number | null }>;
+            discovery?: import("../core/types.ts").ModelDiscovery;
           }[]
         >("/api/providers");
       for (const p of ps) {
@@ -446,16 +544,29 @@ async function main(): Promise<void> {
           .map(([k, v]) => `${k} ${utilizationPercent(v.utilization)} (${observationAge(v.observedAt)})`)
           .join(", ");
         console.log(
-          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${w} ${p.reason ? color.dim(p.reason) : ""}`,
+          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${p.quota === "unlimited" ? "No limit (configured) " : ""}${w} ${p.reason ? color.dim(p.reason) : ""}`,
         );
+        if (p.discovery) {
+          console.log(`  served-not-in-catalog: ${p.discovery.servedNotInCatalog.join(", ") || "none"}`);
+          console.log(`  catalog-not-served: ${p.discovery.catalogNotServed.join(", ") || "none"}`);
+        }
       }
       return;
     }
+    case "init":
     case "doctor": {
-      const problems = await api<import("../core/types.ts").GitHubAccessProblem[]>("/api/github/access");
-      const lines = (await import("../integrations/github-poller.ts")).githubDoctor(problems);
-      console.log(lines.join("\n"));
-      if (lines.length > 1) process.exitCode = 1;
+      const { setupCommand, setupDeps } = await import("./setup.ts");
+      let deps: ReturnType<typeof setupDeps>;
+      try {
+        deps = setupDeps();
+      } catch {
+        const error = "Invalid configuration; fix config.toml before running setup";
+        if (values.json) console.log(JSON.stringify({ ok: false, failedStep: "config", error }));
+        else console.error(error);
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = await setupCommand(cmd, values, deps);
       return;
     }
     case "gc": {
@@ -475,8 +586,35 @@ async function main(): Promise<void> {
       return;
     }
     case "review": {
+      const verdictUsage = "limitless review <run> --changes <findings.json> | --approve [--sha <sha>]";
+      if (values.changes !== undefined || values.approve) {
+        if (rest.length !== 1 || (values.changes !== undefined && values.approve))
+          throw new Error(`usage: ${verdictUsage}`);
+        const id = encodeURIComponent(rest[0] as string);
+        const detail = values.sha ? null : await api<RunDetail>(`/api/runs/${id}`);
+        const delivered = detail?.review?.rounds.findLast((r) => r.deliveredSha)?.deliveredSha;
+        const reviewedSha = values.sha ?? delivered ?? detail?.run.headSha;
+        const file = values.changes === undefined ? null : JSON.parse(await Bun.file(values.changes).text());
+        const result = await api<{ round?: Run; approval?: ReviewApproval }>(`/api/runs/${id}/review`, {
+          method: "POST",
+          body: JSON.stringify({
+            verdict: file ? "changes" : "approve",
+            reviewedSha,
+            ...(file ? { findings: Array.isArray(file) ? file : file.findings } : {}),
+            reviewer: process.env.USER ?? "cli",
+          }),
+        });
+        console.log(
+          result.round
+            ? `Review round queued: ${result.round.id} (${result.round.title})`
+            : `Approved ${result.approval?.sha}`,
+        );
+        return;
+      }
       if (rest.join(" ") !== "shadow-report")
-        throw new Error("usage: limitless review shadow-report [--since <ISO-8601 timestamp>]");
+        throw new Error(
+          `usage: limitless review shadow-report [--since <ISO-8601 timestamp>]\n       ${verdictUsage}`,
+        );
       const since = values.since === undefined ? undefined : parseSince(values.since);
       const { formatShadowReport } = await import("../pipeline/shadow-report.ts");
       console.log(
@@ -491,7 +629,7 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless gates clear-cache [--repo owner/name]");
       const { cleared } = await api<{ cleared: number }>("/api/gates/clear-cache", {
         method: "POST",
-        body: JSON.stringify(values.repo === undefined ? {} : { repo: values.repo }),
+        body: JSON.stringify(repo === undefined ? {} : { repo }),
       });
       console.log(`Cleared ${cleared} cached baselines`);
       return;

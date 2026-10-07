@@ -31,11 +31,16 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     console.warn,
     // While polling, merge reconciliation reads the poller's observations for the PRs it tracks.
     factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
+    factory.cfg.paths.configDir,
+    [factory.cfg.paths.repos, factory.cfg.paths.work],
   );
   const seconds = factory.cfg.githubPollSeconds;
   const stopPoller = factory.cfg.githubPoll
-    ? startGitHubPoller(factory.store, { client: deps.github, seconds })
+    ? startGitHubPoller(factory.store, { client: deps.github, seconds, ciReruns: factory.cfg.githubCiReruns })
     : () => {};
+  // The land queue resumes whatever the last daemon left in flight, and waits for new requests.
+  factory.land.start();
+  const queued = factory.land.list().filter((entry) => entry.state !== "landed");
   return {
     routes: {
       "/mcp": (req, server) => {
@@ -52,11 +57,12 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
         ? "GitHub webhooks enabled"
         : "GitHub webhooks disabled (GITHUB_WEBHOOK_SECRET is not configured)",
       factory.cfg.githubPoll ? `GitHub PR polling every ${seconds}s` : "GitHub PR polling disabled",
+      `Land queue: ${queued.length ? `${queued.length} pending` : "idle"}`,
     ],
     stop: async () => {
       stopNotifier();
       stopPoller();
-      await Promise.all([mcp.stop(), discord.stop()]);
+      await Promise.all([factory.land.stop(), mcp.stop(), discord.stop()]);
     },
   };
 }

@@ -118,6 +118,7 @@ function setup() {
       lockPath: join(dir, "deploy.lock"),
       command,
       client,
+      leaseClient: async () => ({ id: "lease", acquired: true }),
       clock,
       restart,
       log: (s: string) => logs.push(s),
@@ -1018,3 +1019,65 @@ for (const spelling of ["canonical", "symlink", "reverse"]) {
     expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf(launches[0] ?? ""));
   });
 }
+
+test("deploy leases the entire suite, including already-deployed smoke, and releases before later steps", async () => {
+  for (const already of [false, true]) {
+    for (const fail of [false, true]) {
+      const f = setup();
+      let held = false;
+      const order: string[] = [];
+      if (already) {
+        f.opts.client.health = async () => ({
+          ok: true,
+          uptimeMs: 1,
+          sha: "next",
+          draining: false,
+          active: [],
+        });
+        f.setSelected("next");
+      }
+      const work = deploy(7400, "feature", true, {
+        ...f.opts,
+        leaseClient: async (body) => {
+          if (body.name) {
+            expect(body.name).toBe("deploy");
+            held = true;
+            order.push("acquire");
+          }
+          if (body.release) {
+            held = false;
+            order.push("release");
+          }
+          return { id: "test-lease", acquired: true };
+        },
+        command: async (args, opts) => {
+          const line = args.join(" ");
+          if (["bun run lint", "bun run typecheck", "bun test", "bun scripts/smoke.ts"].includes(line)) {
+            order.push(line);
+            expect(held).toBe(line !== "bun scripts/smoke.ts");
+          }
+          if (fail && line === "bun run typecheck")
+            return { exitCode: 7, stdout: "", stderr: "failed typecheck" };
+          return f.opts.command(args, opts);
+        },
+      });
+      if (fail) {
+        await expect(work).rejects.toThrow("failed typecheck");
+        expect(order).toEqual(["acquire", "bun run lint", "bun run typecheck", "release"]);
+        expect(f.calls).not.toContain("drain");
+        expect(f.calls).not.toContain("restart");
+      } else {
+        await work;
+        expect(order).toEqual([
+          "acquire",
+          "bun run lint",
+          "bun run typecheck",
+          "bun test",
+          "release",
+          "bun scripts/smoke.ts",
+        ]);
+      }
+      expect(held).toBe(false);
+    }
+  }
+});

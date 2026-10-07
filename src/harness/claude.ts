@@ -1,6 +1,7 @@
-import { appendFileSync, realpathSync } from "node:fs";
+import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
-import { agentEnv, runProcess } from "../util/proc.ts";
+import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
   readConfinement,
@@ -19,6 +20,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  protectCredentials,
   redactJsonLine,
   type Usage,
 } from "./types.ts";
@@ -141,11 +143,15 @@ export class ClaudeStreamParser {
         this.numTurns = Number(e.num_turns ?? 0);
         this.reportedCostUsd = Number(e.total_cost_usd ?? 0);
         const u = (e.usage ?? {}) as Json;
+        const creation = (u.cache_creation ?? {}) as Json;
         this.usage = {
           input: Number(u.input_tokens ?? 0),
           output: Number(u.output_tokens ?? 0),
           cacheRead: Number(u.cache_read_input_tokens ?? 0),
           cacheWrite: Number(u.cache_creation_input_tokens ?? 0),
+          ...(creation.ephemeral_1h_input_tokens === undefined
+            ? {}
+            : { cacheWrite1h: Number(creation.ephemeral_1h_input_tokens) }),
         };
         this.structured = e.structured_output ?? null;
         this.finalText = typeof e.result === "string" ? e.result : this.lastAssistantText;
@@ -158,7 +164,7 @@ export class ClaudeStreamParser {
   }
 }
 
-export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
+export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: string): string[] {
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
     throw new Error("Reading invocations cannot grant additional directories");
@@ -177,7 +183,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     "--permission-mode",
     "dontAsk",
   ];
-  const fastSettings = spec.fast && t.provider === "claude" ? { fastMode: true } : {};
+  // The CLI reads backend credentials itself, so they never enter the agent's or its tools' environment.
+  const fastSettings = {
+    ...(spec.fast && t.provider === "claude" ? { fastMode: true } : {}),
+    ...(keyFile ? { apiKeyHelper: `cat ${JSON.stringify(keyFile)}` } : {}),
+  };
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
   denied.push("Bash(pkill:*)", "Bash(killall:*)", "Bash(kill -9 -1:*)");
   let readTools = ["Read", "Grep", "Glob"];
@@ -233,8 +243,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       }),
     );
   }
-  if (spec.fast && t.provider === "claude" && spec.noTools)
-    args.push("--settings", JSON.stringify(fastSettings));
+  if (Object.keys(fastSettings).length && spec.noTools) args.push("--settings", JSON.stringify(fastSettings));
   // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined (tool-enabled) invocation
   // cannot store a transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
   const ephemeral = !spec.noTools;
@@ -279,9 +288,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
 }
 
 export async function runClaude(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
+  spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
   const t = spec.target;
-  const args = buildClaudeArgs(spec, sessionId);
+  const keyFile = t.backend && `${tmpdir()}/limitless-${sessionId}.key`;
+  const args = buildClaudeArgs(spec, sessionId, keyFile);
   const editing = spec.mode === "edit" && !spec.noTools;
   const roots = spec.noTools
     ? null
@@ -292,11 +303,12 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
   const runner: typeof runProcess = (opts) =>
     roots ? runSandboxed(opts, roots, processRunner, undefined, undefined, !editing) : processRunner(opts);
-  appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
+  appendFileSync(spec.logPath, redactCredentials(`# claude ${t.model} ${new Date().toISOString()}\n`));
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+  // Agent tool read isolation for this key file is tracked in #335.
+  if (keyFile) writeFileSync(keyFile, t.backend?.authToken ?? "", { flag: "wx", mode: 0o600 });
   if (t.backend) {
     envExtra.ANTHROPIC_BASE_URL = t.backend.baseUrl;
-    envExtra.ANTHROPIC_AUTH_TOKEN = t.backend.authToken;
     envExtra.ANTHROPIC_API_KEY = "";
     // Background/fast tasks inside Claude Code must hit the same backend model.
     envExtra.ANTHROPIC_SMALL_FAST_MODEL = t.model;
@@ -357,13 +369,16 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
       appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
-      parser.feed(line);
+      parser.feed(redactJsonLine(line, redactCredentials));
     },
     onStderrLine: (line) => {
       appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       spec.onEvent({ type: "stderr", text: line });
     },
-  }).finally(() => clearInterval(progressWatch));
+  }).finally(() => {
+    clearInterval(progressWatch);
+    if (keyFile) rmSync(keyFile, { force: true });
+  });
 
   const cost = priceOf(parser.usage, t.price);
   const metered = t.billing === "metered";
@@ -401,7 +416,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     };
   }
   if (!parser.gotResult) {
-    const stderr = proc.stderr.trim().slice(-2000);
+    const stderr = redactCredentials(proc.stderr).trim().slice(-2000);
     const unavailable = /ECONNREFUSED|ENOTFOUND|fetch failed|overloaded|529|502|503|Could not connect/i.test(
       stderr,
     );

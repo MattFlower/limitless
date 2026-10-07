@@ -7,7 +7,9 @@ import type {
   QuotaWindow,
 } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import type { ProviderDef } from "./catalog.ts";
+import { MODELS, type ModelDef, type ProviderDef } from "./catalog.ts";
+import { providerKind } from "./config-catalog.ts";
+import { discoversModels, servedIds } from "./discovery.ts";
 
 /** How far apart sources report one window's reset (seen: 5 s; allows minute rounding). Windows are hours apart. */
 const RESET_JITTER_MS = 60_000;
@@ -73,6 +75,32 @@ const PREFLIGHT_MS = 2 * 60_000;
  * usable; the pipeline reports every invocation outcome back to it.
  */
 export class ProviderTracker {
+  private models: ModelDef[] = MODELS;
+  private served = new Map<string, string[] | null>();
+  private discoveryChanged: (() => void) | undefined;
+
+  onDiscoveryChanged(callback: () => void): void {
+    this.discoveryChanged = callback;
+  }
+
+  private recordDiscovery(id: string, served: string[] | null): void {
+    this.store.writeDiscovery(id, served, this.clock());
+    const changed = JSON.stringify(this.served.get(id) ?? null) !== JSON.stringify(served);
+    this.served.set(id, served);
+    if (changed) this.discoveryChanged?.();
+  }
+
+  setModels(models: ModelDef[]): void {
+    this.models = models;
+    for (const id of this.providers.keys()) this.publish(id);
+  }
+
+  notServed(model: ModelDef): boolean {
+    const served = this.served.get(model.provider);
+    return (
+      this.providers.get(model.provider)?.healthy === true && served != null && !served.includes(model.model)
+    );
+  }
   private providers = new Map<string, ProviderRuntime>();
   /** Individual models a provider rejected (e.g. not available on this plan). */
   private modelBlocks = new Map<string, { until: number; reason: string }>();
@@ -96,14 +124,15 @@ export class ProviderTracker {
     },
     private readonly fetchHealth: typeof fetch = fetch,
   ) {
+    this.budgets = Object.assign(Object.create(null), budgets);
     for (const def of defs) {
       const override = store.getProviderEnabledOverride(def.id);
       let enabled = override ?? true;
       let disabledReason: string | null = null;
       if (!enabled) disabledReason = "disabled";
-      if (def.apiKeySecret && !secrets[def.apiKeySecret]) {
+      if (enabled && def.apiKeySecret && !secrets[def.apiKeySecret]) {
         enabled = false;
-        disabledReason = `missing ${def.apiKeySecret}`;
+        disabledReason = `missing key ${def.apiKeySecret}`;
       }
       const row = store.getProviderRow(def.id);
       const lastFast = def.id === "claude" ? store.latestFastInvocation(def.id) : null;
@@ -147,6 +176,13 @@ export class ProviderTracker {
         waking: 0,
         shadows: new Set(),
       });
+    }
+    for (const alert of store.listAlerts(clock())) {
+      if (
+        this.def(alert.provider)?.quota === "unlimited" &&
+        (alert.source === "window" || (alert.source == null && alert.severity === "warning"))
+      )
+        store.clearAlert(alert.provider, alert.window);
     }
   }
 
@@ -313,8 +349,9 @@ export class ProviderTracker {
     const wasEnabled = p.enabled;
     this.store.setProviderEnabledOverride(id, enabled);
     p.enabled = enabled && (!p.def.apiKeySecret || !!this.secrets[p.def.apiKeySecret]);
+    if (!p.enabled && discoversModels(p.def)) this.recordDiscovery(id, null);
     if (p.enabled && !wasEnabled && p.def.healthUrl) p.healthy = false;
-    p.disabledReason = !enabled ? "disabled" : p.enabled ? null : `missing ${p.def.apiKeySecret}`;
+    p.disabledReason = !enabled ? "disabled" : p.enabled ? null : `missing key ${p.def.apiKeySecret}`;
     if (id === "openrouter") {
       if (!p.enabled && this.pollTimer) {
         this.timer.clear(this.pollTimer);
@@ -343,7 +380,7 @@ export class ProviderTracker {
     const p = this.providers.get(id);
     if (!p) return 0;
     let min = 1;
-    for (const [name, w] of Object.entries(p.windows)) {
+    for (const [name, w] of Object.entries(p.def.quota === "unlimited" ? {} : p.windows)) {
       const cap = this.reserveFor(id, name);
       const util = w.resetsAt !== null && w.resetsAt <= now ? 0 : w.utilization;
       min = Math.min(min, (cap - util) / cap);
@@ -370,6 +407,9 @@ export class ProviderTracker {
   private reserveFor(id: string, window: string): number {
     const configured = this.reserves.windows?.[id]?.[window];
     if (configured !== undefined) return configured;
+    // Native defaults follow the preset's kind (claude-cli, codex-cli), not the literal provider id.
+    const def = this.providers.get(id)?.def;
+    if (def) id = providerKind(def).replace(/-cli$/, "");
     if (id === "claude" && window === "five_hour") return this.reserves.claudeFiveHour;
     if (id === "claude" && window === "seven_day") return this.reserves.claudeSevenDay;
     if (id === "codex" && window === "five_hour") return this.reserves.codexFiveHour;
@@ -377,12 +417,16 @@ export class ProviderTracker {
     return 1;
   }
 
-  unavailableReason(id: string, now = this.clock()): string | null {
+  unavailableReason(id: string, now = this.clock(), detailed = false): string | null {
     const p = this.providers.get(id);
     if (!p) return "unknown provider";
     if (!p.enabled) return p.disabledReason ?? "disabled";
     if (!p.healthy) return "server not reachable";
-    if (p.exhaustedUntil && p.exhaustedUntil > now) return p.exhaustedReason ?? "quota exhausted";
+    if (p.exhaustedUntil && p.exhaustedUntil > now)
+      return (
+        (p.exhaustedReason ?? "quota exhausted") +
+        (detailed ? `; exhausted until ${new Date(p.exhaustedUntil).toISOString()}` : "")
+      );
     if (p.circuitOpenUntil && p.circuitOpenUntil > now)
       return `circuit open after ${p.consecutiveFailures} failures`;
     if (this.headroom(id, now) <= 0) return "at reserve limit";
@@ -564,7 +608,7 @@ export class ProviderTracker {
     p.windows = { ...p.windows, ...current };
     for (const name of Object.keys(current)) p.windowObservedAt[name] = now;
     this.persist(id);
-    if (p.def.billing !== "subscription") return;
+    if (p.def.billing !== "subscription" || p.def.quota === "unlimited") return;
     for (const [name, window] of Object.entries(current)) {
       const cap = this.reserveFor(id, name);
       if (window.resetsAt !== null && window.resetsAt <= now) {
@@ -584,6 +628,7 @@ export class ProviderTracker {
           window.utilization,
           window.resetsAt,
           window.utilization >= cap ? "exhausted" : "warning",
+          "window",
         );
       }
     }
@@ -595,6 +640,7 @@ export class ProviderTracker {
     utilization: number | null,
     resetsAt: number | null,
     severity: QuotaAlert["severity"],
+    source: QuotaAlert["source"],
   ): void {
     const routing =
       this.routingFor?.(id, this.status(id)?.state === "exhausted") ??
@@ -607,6 +653,7 @@ export class ProviderTracker {
       utilization,
       resetsAt,
       severity,
+      source,
       routing,
       createdAt: this.clock(),
     });
@@ -635,7 +682,9 @@ export class ProviderTracker {
         const known = Object.entries(p.windows)
           .filter(
             ([name, w]) =>
-              (w.resetsAt === null || w.resetsAt > now) && w.utilization >= this.reserveFor(id, name),
+              p.def.quota !== "unlimited" &&
+              (w.resetsAt === null || w.resetsAt > now) &&
+              w.utilization >= this.reserveFor(id, name),
           )
           .sort((a, b) => (a[1].resetsAt ?? Infinity) - (b[1].resetsAt ?? Infinity))[0];
         let resetsAt = known ? known[1].resetsAt : (detail?.exhaustedUntil ?? null);
@@ -647,7 +696,14 @@ export class ProviderTracker {
             .find((alert) => alert.provider === id && alert.window === "hard_limit");
           if (existing) resetsAt = existing.resetsAt;
         }
-        this.alert(id, known?.[0] ?? "hard_limit", known?.[1].utilization ?? null, resetsAt, "exhausted");
+        this.alert(
+          id,
+          known?.[0] ?? "hard_limit",
+          known?.[1].utilization ?? null,
+          resetsAt,
+          "exhausted",
+          "rejection",
+        );
       }
     } else if (status === "unavailable" || status === "timeout") {
       p.consecutiveFailures++;
@@ -698,9 +754,28 @@ export class ProviderTracker {
         signal: AbortSignal.timeout(3000),
         headers,
       });
-      if (p.enabled) this.setHealthy(p.def.id, res.ok);
+      if (!p.enabled) return;
+      if (discoversModels(p.def)) {
+        let served: string[] | null = null;
+        if (res.ok) {
+          try {
+            served = servedIds(await res.json());
+          } catch {
+            /* Reachable, but discovery is inconclusive. */
+          }
+        }
+        this.recordDiscovery(p.def.id, served);
+      }
+      this.setHealthy(p.def.id, res.ok);
+      this.publish(p.def.id);
     } catch {
-      if (p.enabled) this.setHealthy(p.def.id, false);
+      if (p.enabled) {
+        if (discoversModels(p.def)) {
+          this.recordDiscovery(p.def.id, null);
+        }
+        this.setHealthy(p.def.id, false);
+        this.publish(p.def.id);
+      }
     }
   }
 
@@ -720,7 +795,9 @@ export class ProviderTracker {
     return {
       id,
       label: p.def.label,
+      kind: providerKind(p.def),
       billing: p.def.billing,
+      quota: p.def.quota ?? "windows",
       enabled: p.enabled,
       fast: p.fast,
       supportsFast: id === "codex" || id === "claude",
@@ -748,12 +825,27 @@ export class ProviderTracker {
       inFlight: p.inFlight,
       maxConcurrent: p.def.maxConcurrent,
       updatedAt: now,
+      ...(discoversModels(p.def) ? { discovery: this.discovery(id) } : {}),
       ...(p.confinement ? { confinement: p.confinement } : {}),
     };
   }
 
   all(): ProviderStatus[] {
     return [...this.providers.keys()].map((id) => this.status(id) as ProviderStatus);
+  }
+
+  private discovery(id: string) {
+    const history = this.store.discovery(id);
+    const provider = this.providers.get(id);
+    const served = provider?.enabled && provider.healthy ? (this.served.get(id) ?? null) : null;
+    const models = this.models.filter((m) => m.provider === id);
+    return {
+      ...history,
+      served,
+      servedNotInCatalog: served?.filter((name) => !models.some((m) => m.model === name)) ?? [],
+      catalogNotServed:
+        served === null ? [] : models.filter((m) => !served.includes(m.model)).map((m) => m.id),
+    };
   }
 
   private persist(id: string): void {
