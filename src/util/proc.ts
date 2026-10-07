@@ -1,8 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
@@ -142,18 +142,17 @@ async function markedProcesses(
  * cannot select an unmarked process. An environment we may not read (a non-dumpable process)
  * is skipped, as ps showed none for it.
  */
-async function linuxMarkedProcesses(
-  uid: number,
-  carriesMarker: (entries: string[]) => boolean,
-): Promise<number[]> {
+function linuxMarkedProcesses(uid: number, carriesMarker: (entries: string[]) => boolean): number[] {
   const marked: number[] = [];
-  for (const name of await readdir("/proc")) {
+  // procfs is in memory: synchronous reads take microseconds, while hundreds of awaited ones
+  // per scan (twice per command) dominated short commands.
+  for (const name of readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      if ((await stat(`/proc/${name}`)).uid !== uid) continue;
-      const status = await readFile(`/proc/${name}/stat`, "utf8");
+      if (statSync(`/proc/${name}`).uid !== uid) continue;
+      const status = readFileSync(`/proc/${name}/stat`, "utf8");
       if (status.slice(status.lastIndexOf(")") + 2).startsWith("Z")) continue;
-      const environment = await readFile(`/proc/${name}/environ`, "utf8");
+      const environment = readFileSync(`/proc/${name}/environ`, "utf8");
       if (carriesMarker(environment.split("\0"))) marked.push(Number(name));
     } catch (error) {
       if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? ""))
