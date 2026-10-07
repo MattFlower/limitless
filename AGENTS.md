@@ -13,7 +13,7 @@ Read `docs/ARCHITECTURE.md` before changing anything structural.
 - `src/gates/` — gate detection/running and the deterministic diff audit.
 - `src/git/` — bare repo cache, per-run worktrees, push/PR/merge via `gh`. `command.ts` is the hardened git wrapper.
 - `src/land/` — the land queue. `src/evals/` — eval runner, graders and routing-policy generation.
-- `src/util/proc.ts` — every subprocess: `sh`/`runProcess`, `agentEnv`, credential redaction.
+- `src/util/proc.ts` — shared subprocess execution, cancellation and cleanup (`sh`/`runProcess`), plus `agentEnv` and credential redaction.
 - `src/server/http.ts` — REST + SSE API. `src/cli/main.ts` — CLI and `serve`.
 - `ui/` — SolidJS SPA, bundled by Bun via `scripts/solid-plugin.ts`.
 - `scripts/` — `land-pr.sh` (manual landing), `check-private-strings.ts`, `smoke.ts` (live CLI checks).
@@ -30,11 +30,14 @@ Read `docs/ARCHITECTURE.md` before changing anything structural.
 - Never commit secrets. Configuration lives in `~/.config/limitless/{config.toml,secrets.env}`.
 
 ## How a change ships
-A change to this repository is normally a factory pull request. The orchestrator reviews it, the
-land step merges `main` into it, runs `bun run check` and waits for GitHub CI on that exact commit,
-then squash-merges. `limitless deploy` then runs lint, typecheck, `bun test` and (with `--smoke`)
-`bun scripts/smoke.ts` in the release checkout and restarts the daemon, rolling back if the new
-release doesn't come up ([OPERATIONS](docs/OPERATIONS.md#shipping-a-change)). So a change must:
+A change to this repository is normally a factory pull request that the orchestrator reviews. The
+land queue merges the current base in when it has moved, runs the checks configured in the base
+commit's `.limitless.toml` (lint, typecheck and `bun test` here), waits for GitHub CI on the
+resulting head, then squash-merges exactly that head; the manual `scripts/land-pr.sh` runs
+`bun run check` instead. `limitless deploy` then runs lint, typecheck, `bun test` and (with
+`--smoke`) `bun scripts/smoke.ts` in the release checkout and restarts the daemon, rolling back if
+the new release doesn't come up ([OPERATIONS](docs/OPERATIONS.md#shipping-a-change)). So a change
+must:
 - **Pass on Linux CI as well as macOS.** CI runs `ubuntu-latest` with the Bun version pinned in
   `.github/workflows/ci.yml`, a newer git than macOS, and git-lfs filters configured on the runner. A
   git test that fails only in CI is usually a real version or configuration difference, not a flake.
@@ -61,17 +64,18 @@ release doesn't come up ([OPERATIONS](docs/OPERATIONS.md#shipping-a-change)). So
   release that ships first.
 - **HTTP JSON** changes are additive: new fields optional, old fields kept. Readers tolerate
   missing and unknown fields.
-- **Run state:** a run interrupted at any step (a deploy restarts the daemon mid-run) resumes at
-  that step without repeating paid model calls or side effects such as commits, pushes and PR
-  comments. A new stage or step needs a resume path and a test that restarts through it.
+- **Run state:** a deploy restarts the daemon mid-run, and runs resume from persisted phases and
+  checkpoints. Completed work and recorded side effects (commits, pushes, PR comments) must not
+  repeat after a restart; only work interrupted before its checkpoint may. A new stage or step
+  needs a durable checkpoint, a resume path and a test that restarts through it.
 - **Config:** new keys are optional with defaults. If an older release would refuse to start with a
   new key set, say so in the docs next to the key.
 - **Runs created before the change still resume.** A new precondition on run state (a sidecar file,
   a column) needs a path for runs that predate it. #323's trusted git paths broke every older
   worktree with "Missing trusted Git paths" until #357.
-- **Events work by polling alone.** Some installations run with webhooks off, so anything that
-  reacts to GitHub (CI results, reviews, PR state) must work from the poller; webhooks only make it
-  faster.
+- **Factory PRs work by polling alone.** Some installations run with webhooks off, so CI, review
+  and state observation for tracked factory PRs must work from the poller; webhooks only make it
+  faster. (Issue-label, `/limitless` comment and Dependabot triggers still need webhooks.)
 
 ## The machine is shared
 Other runs, their gates, land checks, the daemon and the owner's own work run on the same machine
@@ -91,24 +95,27 @@ as the same user.
 
 ## Isolation, processes and git
 Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing anything here.
-- **Seatbelt.** Agents and gate commands run inside a macOS Seatbelt profile that only allows
-  writes to the run's checkout and scratch. macOS can't nest Seatbelt: a process that is already
-  sandboxed (inside Codex's own sandbox, or in a confined gate) fails to apply another profile
-  (`sandbox_apply: Operation not permitted`, exit 71). Codex and tool-using Claude readers apply
-  their own sandbox, so they can't run inside an outer `sandbox-exec` profile (#369 tracks confining
-  them with their own sandbox off). Tests that need real Seatbelt use `test.skipIf(seatbeltSkip)` from
-  `test/confinement.ts`, so they skip inside confined gates and on Linux and run at landing and in
-  development. Check a profile change with a real probe (a command that must be denied and one
-  that must be allowed); reading the profile isn't enough.
+- **Seatbelt.** Gate commands and tool-enabled Claude editors run inside the factory's outer
+  Seatbelt profile, which allows writes only to the run's checkout and scratch. Codex uses its own
+  probed filesystem profile, and tool-enabled Claude readers use Claude's internal sandbox. macOS
+  can't nest Seatbelt: a process that is already sandboxed fails to apply another profile
+  (`sandbox_apply: Operation not permitted`, exit 71), so Codex and Claude readers can't simply be
+  wrapped in an outer `sandbox-exec` (#369 tracks confining them with their own sandbox off). Tests
+  that need real Seatbelt use `test.skipIf(seatbeltSkip !== null)` with `seatbeltSkip` from
+  `test/confinement.ts` in the title: they run on unconfined macOS (development and the manual
+  `land-pr.sh` check) and skip on other platforms and inside confined gates, including land-queue
+  checks. Check a profile change with a real probe (a command that must be denied and one that must
+  be allowed); reading the profile isn't enough.
 - **Subprocesses** go through `sh`/`runProcess` (`src/util/proc.ts`): abort signals, timeouts, the
   per-run process scope and descendant cleanup depend on it. The few direct spawns (preview servers,
   the SSH tunnel, `gate-slot`) manage their own lifecycle; don't add more without a reason. Agent
   environments come from `agentEnv()`, which strips factory secrets.
 - **Git in a checkout an agent can write** goes through `worktreeGit` (`src/git/command.ts`). The
   agent controls that repository's config and files, so the wrapper pins the recorded `GIT_DIR`,
-  `GIT_COMMON_DIR` and `GIT_WORK_TREE` and disables hooks, fsmonitor, external diff and textconv,
-  attributes, replace refs, commit-graph and pack bitmaps. A plain `sh(["git", …])` is only for
-  repositories that only the factory writes.
+  `GIT_COMMON_DIR` and `GIT_WORK_TREE` and disables hooks, configured filters, fsmonitor, replace
+  refs, commit graphs and pack bitmaps; for `diff` and `log` it also suppresses external diff,
+  textconv and repository attributes. A plain `sh(["git", …])` is only for repositories that only
+  the factory writes.
 - **macOS hides the environment of platform binaries.** SIP strips it from `KERN_PROCARGS2` for
   `/bin/sh`, `/bin/sleep` and every launchd-spawned system agent, so an environment marker can't
   identify such a process. Dozens of hidden-environment system agents start in any hour, so a rule
@@ -132,11 +139,12 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   service labels or webhook URLs from the owner's setup; use placeholders (`<host>`, `example.com`).
   The private-strings check ([GUIDE](docs/GUIDE.md#private-strings)) blocks audit, delivery and
   landing when a listed string appears, and it redacts its own diagnostics.
-- Text that may contain a secret goes through `redactCredentials` before it's logged, persisted, put
-  in an error message or sent to a model. That covers every channel: events, errors, PR comments,
-  digests, MCP results, commit metadata, branch names and tags. Error and retry paths need it as
-  much as the normal path (#318, #367, #394). Decode before you filter and filter before you
-  truncate, or an encoded or cut-off secret slips through.
+- Call `redactCredentials` at every boundary where secret-bearing text leaves the process or is
+  stored: logs, events, errors, PR comments, digests, MCP results, commit metadata, branch names
+  and tags, and text sent to a model. Nothing applies it automatically, and error and retry paths
+  need it as much as the normal path (#318, #367, #394). It replaces registered credentials
+  literally, so decode before you redact and redact before you truncate, or an encoded or cut-off
+  secret slips through.
 
 ## The diff audit
 The deterministic audit (`src/gates/audit.ts`) runs on every factory change.
@@ -144,9 +152,11 @@ The deterministic audit (`src/gates/audit.ts`) runs on every factory change.
   `test/fixtures/**` here) blocks the change; adding a new file there only warns. Build small
   fixtures inline in the test, or add a new file instead of editing a captured one.
 - Binary content (other than validated, inert images), nested repositories and attribute changes
-  that could hide diffs block unless the request says `Allow: binary`, `Allow: submodules` or
-  `Allow: gitattributes` (or the run was started with `--allow`). If your change really needs one,
-  say so in your report instead of working around the rule.
+  that could hide diffs block unless the requester grants the category: an `Allow: binary`,
+  `Allow: submodules` or `Allow: gitattributes` line of its own in the request, or
+  `--allow <category>` on the run. Allowances never bypass protected paths or a failed binary
+  inspection. If your change really needs one, say so in your report instead of working around the
+  rule.
 - Deleting a test file warns, and reviewers will ask why.
 
 ## Defects reviews keep finding
@@ -172,8 +182,9 @@ finish.
   where git trims only CR/LF; #382: media judged by extension; #385: any "timed out after" text
   counted as transient).
 - **Retries and fallbacks are bounded and honest.** Retry only transient failures, keep one retry
-  layer with one deadline, and make sure a retry never turns a failure into a pass and every
-  pending state ends (#179, #385). A failed candidate hands over to a different one or asks a
+  layer with one deadline, and make sure every pending state ends. A successful retry keeps the
+  original failure and its classification (a gate that passes on retry is `flaky`, not a clean
+  pass), and a retry never turns a security check's failure into a pass (#179, #385). A failed candidate hands over to a different one or asks a
   question; it doesn't end the run or loop back to the model that just failed (#53, #254).
 - **Derive current state; don't replay history.** Compute what's actionable from current records,
   dedupe by status episode, and treat UNKNOWN as "no observation" (#348: FAILURE→SUCCESS→FAILURE
@@ -184,9 +195,9 @@ finish.
 - **Git is configurable.** Hooks, templates, `push.followTags`, `diff.renames`, attributes, log
   encodings, file modes, LFS and symlinked gitdirs all change git's behavior. Set the options you
   depend on explicitly and test with real git (#298, #338, #341, #362).
-- **Experimental paths stay out of production.** Shadow, variant and panel calls get their own
-  slots, health state and caches; with them off, production behavior is unchanged (#263: shadow
-  timeouts opened provider circuits).
+- **Experimental paths stay out of production.** Shadow calls use spare, preemptible provider
+  slots and must not update production health, quota telemetry or model blocks; with them off,
+  production behavior is unchanged (#263: shadow timeouts opened provider circuits).
 - **Every fix has a test that fails without it.** Several tests asserted the defect they were
   meant to catch, or compared the code with itself (#318, #348, #391). See `test/AGENTS.md`.
 

@@ -59,11 +59,14 @@ and extend the closest case when it already exercises that behavior.
   path gets faster or slower. Arrange the order with deferred promises or readiness signals.
 - **CI is Linux.** It pins the Bun version in `.github/workflows/ci.yml`, runs a newer git than
   macOS, and has git-lfs filters (`filter.lfs.*`) configured outside the global file `setup.ts`
-  replaces. Don't compare exact git argv or full config listings. Reproduce a CI-only git failure
-  with `GIT_CONFIG_SYSTEM` pointing at a file that defines a fake lfs filter.
+  replaces. Avoid assertions on incidental, environment-dependent argv or config entries; keep
+  exact assertions where the command's structure is the behavior under test, and inject the
+  relevant configuration explicitly. Reproduce a CI-only git failure with `GIT_CONFIG_SYSTEM`
+  pointing at a file that defines a fake lfs filter.
 - **Platform-specific tests skip with a reason.** Real Seatbelt tests use
-  `test.skipIf(seatbeltSkip)` (`confinement.ts`): they skip on Linux and inside confined factory
-  gates, and run in development and at landing. Darwin-only process inspection checks
+  `test.skipIf(seatbeltSkip !== null)` and put `seatbeltSkip` (`confinement.ts`) in the title: they
+  skip on other platforms and inside confined gates (factory and land-queue checks), and run on
+  unconfined macOS (development and the manual `land-pr.sh` check). Darwin-only process inspection checks
   `process.platform`. A behavior whose only test is skipped everywhere it runs is untested.
 - **Real subprocesses:** keep every pid or handle the test starts and stop it in `finally`. Never
   find processes by name, never `pkill`, and give each test its own directory.
