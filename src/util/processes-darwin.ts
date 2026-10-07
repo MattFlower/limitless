@@ -18,6 +18,21 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
   },
 });
 
+function darwinDescendant(
+  pid: number,
+  parents: ReadonlyMap<number, number>,
+  members: ReadonlySet<number>,
+): boolean {
+  const seen = new Set([pid]);
+  let parent = parents.get(pid);
+  while (parent !== undefined && parent > 1 && !seen.has(parent)) {
+    if (members.has(parent)) return true;
+    seen.add(parent);
+    parent = parents.get(parent);
+  }
+  return false;
+}
+
 /** Roots are canonicalized at invocation start; only orphans need birth time and cwd inspection. */
 export function hiddenDarwinProcessMember(
   pid: number,
@@ -28,17 +43,13 @@ export function hiddenDarwinProcessMember(
   readBorn: () => number | { errno: number },
   readCwd: () => { path: string } | { errno: number },
 ): boolean {
-  const seen = new Set([pid]);
-  let parent = parents.get(pid);
-  while (parent !== undefined && parent > 1 && !seen.has(parent)) {
-    if (members.has(parent)) return true;
-    seen.add(parent);
-    parent = parents.get(parent);
-  }
+  if (darwinDescendant(pid, parents, members)) return true;
   // Hidden descendants of proven members are ours. Otherwise cwd can identify only
   // orphans (ppid 1) born during this invocation, never a live non-member's children.
   // Residuals: a detached platform tool that leaves the worktree and writes by absolute
   // path, or a hidden process whose parent is still alive but not a member, is unrecognized.
+  // On Linux, a descendant that replaces its environment is not recognised unless
+  // already claimed; discovery there relies only on environment markers.
   if (parents.get(pid) !== 1) return false;
   const born = readBorn();
   if (typeof born !== "number") {
@@ -56,6 +67,18 @@ export function hiddenDarwinProcessMember(
     (directory) =>
       path === directory || path.startsWith(directory.endsWith(sep) ? directory : `${directory}${sep}`),
   );
+}
+
+export function darwinProcessBirth(pid: number): string | null {
+  const bsd = new Uint8Array(136);
+  if (symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength) {
+    const address = symbols.__error();
+    const errno = address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);
+    if (errno === 3 /* ESRCH */) return null;
+    throw new Error(`Process birth time inspection failed for ${pid} (errno ${errno})`);
+  }
+  const view = new DataView(bsd.buffer);
+  return `${view.getBigUint64(120, true)}:${view.getBigUint64(128, true)}`;
 }
 
 export function markedDarwinProcesses(
@@ -79,7 +102,8 @@ export function markedDarwinProcesses(
   const inheritedToken = Buffer.from(`\0LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1\0`);
   const marked = new Set<number>();
   const parents = new Map<number, number>();
-  const hidden: number[] = [];
+  const unmarked: number[] = [];
+  const hidden = new Set<number>();
   const bsd = new Uint8Array(136); // proc_bsdinfo includes the process birth time
   const vnode = new Uint8Array(2352); // proc_vnodepathinfo: two vnode_info_path structs
   const errno = () => {
@@ -127,15 +151,19 @@ export function markedDarwinProcesses(
     }
     // Read only NUL-delimited environment entries: argv and other variables cannot match.
     const environment = Buffer.from(args.buffer, 0, length);
-    // SIP omits environment data for platform tools. Our session/group still proves
-    // membership; detached tools need ancestry or orphan birth time and cwd evidence.
+    // Our session/group proves membership even when a descendant replaces its
+    // environment. Detached descendants also belong through a proven parent chain.
     if (
       environment.includes(token, offset - 1) ||
       environment.includes(inheritedToken, offset - 1) ||
-      (offset === length && (session === group || info[2] === group))
+      session === group ||
+      info[2] === group
     )
       marked.add(pid);
-    else if (offset === length) hidden.push(pid);
+    else {
+      unmarked.push(pid);
+      if (offset === length) hidden.add(pid);
+    }
   }
   const isMember = (pid: number) =>
     hiddenDarwinProcessMember(
@@ -167,6 +195,7 @@ export function markedDarwinProcesses(
     );
   // Seed orphan members before resolving ancestry, independent of enumeration order.
   for (const pid of hidden) if (parents.get(pid) === 1 && isMember(pid)) marked.add(pid);
-  for (const pid of hidden) if (parents.get(pid) !== 1 && isMember(pid)) marked.add(pid);
+  for (const pid of unmarked)
+    if (darwinDescendant(pid, parents, marked) || (hidden.has(pid) && isMember(pid))) marked.add(pid);
   return [...marked];
 }

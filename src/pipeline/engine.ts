@@ -56,7 +56,7 @@ import { commandScope, confinementScope, seatbeltBackend } from "../harness/sand
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
-import { CommandError, ProcessTerminationError, processScope } from "../util/proc.ts";
+import { assertProcessesStopped, CommandError, ProcessTerminationError, processScope } from "../util/proc.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -827,7 +827,7 @@ async function buildLoop(ctx: RunContext): Promise<void> {
 const HOLDOUT_TOOL_CALLS = 40;
 
 /**
- * Run `fn` in a private export of the recorded base commit, removed afterwards whatever the outcome.
+ * Run `fn` in a private export of the recorded base commit, removed after confirmed shutdown.
  * Holdout runs alongside implement, so it must never see the worktree the implementer is editing.
  */
 async function withBaseSnapshot<T>(
@@ -844,6 +844,7 @@ async function withBaseSnapshot<T>(
     await exportCommit(worktree, baseSha, base, ctx.signal);
     return await fn(base);
   } finally {
+    assertProcessesStopped();
     rmSync(snapshot, { recursive: true, force: true });
   }
 }
@@ -995,6 +996,8 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       ctx.checkCancelled();
       const terminationError = processScope.getStore()?.terminationError;
       if (terminationError) {
+        // An unkillable writer or failed inspection needs a human: retrying another
+        // round alongside processes whose shutdown is unconfirmed is unsafe.
         ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
         ctx.state.needsHumanReason = terminationError.message;
         await ctx.save();

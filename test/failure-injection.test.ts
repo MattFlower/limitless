@@ -40,7 +40,14 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import {
+  CommandError,
+  type ProcOptions,
+  type ProcResult,
+  processInspection,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
@@ -189,6 +196,73 @@ async function run(f: Factory) {
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
   return r.id;
 }
+
+test("unconfirmed holdout shutdown preserves its snapshot and surfaces the termination reason", async () => {
+  const pidFile = join(root, "holdout-writer-pid");
+  const script = join(root, "holdout-parent.js");
+  let snapshot = "";
+  let release = () => {};
+  const done = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const f = factory(undefined, async (s) => {
+    if (s.prompt.startsWith("Write holdout checks") && !snapshot) {
+      snapshot = s.cwd;
+      const output = join(snapshot, "writer-output");
+      writeFileSync(
+        script,
+        `const fs = require("node:fs");
+        require("node:child_process").spawn("/bin/sh",
+          ["-c", 'trap "" TERM; echo $$ > "$1"; while :; do printf x >> "$2"; done', "sh",
+            ${JSON.stringify(pidFile)}, ${JSON.stringify(output)}], {detached:true, stdio:"ignore"}).unref();
+        setInterval(() => { if(fs.existsSync(${JSON.stringify(output)})) process.exit(0); }, 5);`,
+      );
+      try {
+        await processInspection.run(
+          async () => {
+            throw new Error("holdout process inspection unavailable");
+          },
+          () =>
+            runProcess({
+              cmd: [process.execPath, script],
+              cwd: s.cwd,
+              env: process.env as Record<string, string>,
+            }),
+        );
+      } finally {
+        release();
+      }
+    }
+    if (s.mode === "edit") await done;
+    return answer(s);
+  });
+  try {
+    const id = await run(f);
+    await settled(f, id);
+    expect(f.store.getRun(id)?.status).toBe("needs_human");
+    expect(f.store.getRun(id)?.error).toContain("holdout process inspection unavailable");
+    expect(f.store.getRunState<RunState>(id)?.needsHumanReason).toContain(
+      "Invocation termination could not be confirmed",
+    );
+    expect(existsSync(snapshot)).toBe(true);
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    expect(pid).toBeGreaterThan(0);
+    expect(process.kill(pid, 0)).toBe(true);
+    expect(existsSync(f.store.getRunState<RunState>(id)?.worktreePath ?? "")).toBe(true);
+  } finally {
+    release();
+    await f.stop();
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+    if (snapshot) rmSync(join(snapshot, ".."), { recursive: true, force: true });
+  }
+});
 
 test.each(["disabled", "quota", "rejected"])(
   "an unavailable pinned implementer stops with its chain and reason: %s",

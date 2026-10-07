@@ -21,6 +21,7 @@ import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
 import { compareGates } from "../src/gates/run.ts";
 import { parseNameStatus, resolveRepo } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
+import { withScratch } from "../src/harness/scratch.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
@@ -83,11 +84,13 @@ describe("process handling", () => {
 
   test("a descendant ignoring SIGTERM cannot recreate removed scratch after return", async () => {
     const scratch = join(dir, "scratch");
+    const pidFile = join(dir, "descendant-pid");
     const child = join(dir, "child.js");
     const parent = join(dir, "parent.js");
     writeFileSync(
       child,
       `const fs = require("node:fs"); process.on("SIGTERM", () => {});
+      fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
       setInterval(() => { fs.mkdirSync(${JSON.stringify(scratch)}, {recursive:true}); }, 5);
       setTimeout(() => process.exit(), 15000);`,
     );
@@ -98,16 +101,28 @@ describe("process handling", () => {
       spawn(process.execPath, [${JSON.stringify(child)}], {stdio:"ignore"}).unref();
       const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(scratch)})) { clearInterval(timer); process.exit(0); } }, 5);`,
     );
-    await runProcess({
-      cmd: [process.execPath, parent],
-      cwd: dir,
-      env: process.env as Record<string, string>,
-      timeoutMs: 3000,
-    });
-    expect(existsSync(scratch)).toBe(true);
-    rmSync(scratch, { recursive: true, force: true });
-    await Bun.sleep(100);
-    expect(existsSync(scratch)).toBe(false);
+    try {
+      await runProcess({
+        cmd: [process.execPath, parent],
+        cwd: dir,
+        env: process.env as Record<string, string>,
+        timeoutMs: 3000,
+      });
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(pid).toBeGreaterThan(0);
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(existsSync(scratch)).toBe(true);
+      rmSync(scratch, { recursive: true, force: true });
+    } finally {
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (pid > 0) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+      }
+    }
   });
 
   test.each(["normal", "error", "cancelled", "timeout", "stuck"])(
@@ -617,27 +632,120 @@ describe("process handling", () => {
   test.skipIf(process.platform !== "darwin").each(["cwd", "scratch"])(
     "a detached hidden shell ignoring TERM stops writing in %s before cleanup",
     async (location) => {
-      const scratch = mkdtempSync(join(tmpdir(), "limitless-scratch-"));
-      const writerCwd = location === "scratch" ? scratch : dir;
-      const pidFile = join(dir, "transient-pid");
-      const output = join(dir, "transient-output");
-      const launcher = join(dir, "transient-launcher.js");
-      const parent = join(dir, "transient-parent.js");
-      writeFileSync(
-        launcher,
-        `require("node:child_process").spawn("/bin/sh",
+      const scope = {
+        signal: new AbortController().signal,
+        killGraceMs: 20,
+        children: new Map<ChildProcess, Promise<void>>(),
+        scratchDirs: new Set<string>(),
+      };
+      let scratchPath = "";
+      await processScope.run(scope, () =>
+        withScratch(dir, async (scratch) => {
+          scratchPath = scratch;
+          expect(scope.scratchDirs.has(scratch)).toBe(true);
+          const writerCwd = location === "scratch" ? scratch : dir;
+          const pidFile = join(dir, "transient-pid");
+          const output = join(dir, "transient-output");
+          const launcher = join(dir, "transient-launcher.js");
+          const parent = join(dir, "transient-parent.js");
+          writeFileSync(
+            launcher,
+            `require("node:child_process").spawn("/bin/sh",
       ["-c", 'trap "" TERM; printf "%s" "$$" > "$1"; while [ -d "$2" ]; do printf x >> "$3"; done', "sh",
         ${JSON.stringify(pidFile)}, ${JSON.stringify(writerCwd)}, ${JSON.stringify(output)}],
         {cwd:${JSON.stringify(writerCwd)}, detached:true, stdio:"ignore"}).unref();`,
-      );
-      writeFileSync(
-        parent,
-        `const fs = require("node:fs");
+          );
+          writeFileSync(
+            parent,
+            `const fs = require("node:fs");
       require("node:child_process").spawn(process.execPath, [${JSON.stringify(launcher)}], {stdio:"ignore"})
         .on("exit", () => { setInterval(() => {
           if (fs.existsSync(${JSON.stringify(output)})) { console.log("ready"); process.exit(0); }
         }, 5); });`,
+          );
+          const kill = process.kill.bind(process);
+          const signals: { pid: number; signal: string | number | undefined }[] = [];
+          const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+            signals.push({ pid, signal });
+            return kill(pid, signal);
+          });
+          try {
+            const result = await runProcess({
+              cmd: [process.execPath, parent],
+              cwd: dir,
+              env: process.env as Record<string, string>,
+            });
+            expect(result.exitCode).toBe(0);
+            const writerPid = Number(readFileSync(pidFile, "utf8"));
+            const writerSignals = signals.filter(({ pid }) => pid === writerPid).map(({ signal }) => signal);
+            expect(writerSignals[0]).toBe("SIGTERM");
+            expect(writerSignals.slice(1)).toContain("SIGKILL");
+            expect(writerSignals.slice(1).every((signal) => signal === "SIGKILL")).toBe(true);
+            expect(() => kill(writerPid, 0)).toThrow();
+            expect(readFileSync(output).length).toBeGreaterThan(0);
+            // Simulate worktree cleanup immediately after invocation shutdown is confirmed.
+            rmSync(output);
+            await Bun.sleep(30);
+            expect(existsSync(output)).toBe(false);
+          } finally {
+            killSpy.mockRestore();
+            if (existsSync(pidFile)) {
+              const pid = Number(readFileSync(pidFile, "utf8"));
+              if (pid > 0) {
+                try {
+                  kill(pid, "SIGKILL");
+                } catch {}
+              }
+            }
+          }
+        }),
       );
+      expect(scope.scratchDirs.size).toBe(0);
+      expect(existsSync(scratchPath)).toBe(false);
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin").each(["hidden", "scrubbed-group", "scrubbed-ancestry"])(
+    "claimed descendants remain owned after their marked parent exits (%s)",
+    async (kind) => {
+      const outside = mkdtempSync(join(tmpdir(), "limitless-outside-"));
+      const pidFile = join(dir, "claimed-pid");
+      const middlePid = join(dir, "middle-pid");
+      const output = join(dir, "claimed-output");
+      const middle = join(dir, "middle.js");
+      const parent = join(dir, "parent.js");
+      const writer = join(dir, "scrubbed.js");
+      writeFileSync(
+        writer,
+        `const fs = require("node:fs"); process.on("SIGTERM", () => {});
+        fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+        setInterval(() => fs.appendFileSync(${JSON.stringify(output)}, "x"), 5);`,
+      );
+      const command =
+        kind === "hidden"
+          ? `["/bin/sh", ["-c", 'trap "" TERM; echo $$ > "$1"; while :; do printf x >> "$2"; done', "sh", ${JSON.stringify(pidFile)}, ${JSON.stringify(output)}]]`
+          : `[process.execPath, [${JSON.stringify(writer)}]]`;
+      writeFileSync(
+        middle,
+        `const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(middlePid)}, String(process.pid));
+        const [bin, args] = ${command};
+        require("node:child_process").spawn(bin, args, {
+          cwd:${JSON.stringify(outside)}, detached:${kind !== "scrubbed-group"}, stdio:"ignore"
+          ${kind === "hidden" ? "" : ", env:{PATH:process.env.PATH}"}
+        }).unref(); setInterval(() => {}, 1000);`,
+      );
+      writeFileSync(
+        parent,
+        `const fs = require("node:fs");
+        require("node:child_process").spawn(process.execPath, [${JSON.stringify(middle)}],
+          {detached:${kind !== "scrubbed-group"}, stdio:"ignore"}).unref();
+        setInterval(() => { if (fs.existsSync(${JSON.stringify(output)})) process.exit(0); }, 5);`,
+      );
+      const control = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        cwd: dir,
+        env: { PATH: process.env.PATH },
+        stdio: "ignore",
+      });
       const kill = process.kill.bind(process);
       const signals: { pid: number; signal: string | number | undefined }[] = [];
       const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
@@ -648,9 +756,9 @@ describe("process handling", () => {
         const result = await processScope.run(
           {
             signal: new AbortController().signal,
-            killGraceMs: 20,
+            killGraceMs: 100,
             children: new Map(),
-            scratchDirs: new Set([scratch]),
+            scratchDirs: new Set(),
           },
           () =>
             runProcess({
@@ -659,29 +767,29 @@ describe("process handling", () => {
               env: process.env as Record<string, string>,
             }),
         );
+        const pid = Number(readFileSync(pidFile, "utf8"));
         expect(result.exitCode).toBe(0);
-        const writerPid = Number(readFileSync(pidFile, "utf8"));
-        const writerSignals = signals.filter(({ pid }) => pid === writerPid).map(({ signal }) => signal);
-        expect(writerSignals[0]).toBe("SIGTERM");
-        expect(writerSignals.slice(1)).toContain("SIGKILL");
-        expect(writerSignals.slice(1).every((signal) => signal === "SIGKILL")).toBe(true);
-        expect(() => kill(writerPid, 0)).toThrow();
-        expect(readFileSync(output).length).toBeGreaterThan(0);
-        // Simulate worktree cleanup immediately after invocation shutdown is confirmed.
-        rmSync(output);
-        await Bun.sleep(30);
-        expect(existsSync(output)).toBe(false);
+        expect(pid).toBeGreaterThan(0);
+        expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGTERM");
+        expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGKILL");
+        expect(() => kill(pid, 0)).toThrow();
+        expect(kill(control.pid ?? 0, 0)).toBe(true);
+        expect(signals.some((s) => s.pid === control.pid)).toBe(false);
       } finally {
         killSpy.mockRestore();
-        if (existsSync(pidFile)) {
-          const pid = Number(readFileSync(pidFile, "utf8"));
+        control.kill("SIGKILL");
+        if (control.exitCode === null && control.signalCode === null)
+          await new Promise<void>((resolve) => control.once("close", () => resolve()));
+        for (const file of [pidFile, middlePid]) {
+          if (!existsSync(file)) continue;
+          const pid = Number(readFileSync(file, "utf8"));
           if (pid > 0) {
             try {
               kill(pid, "SIGKILL");
             } catch {}
           }
         }
-        rmSync(scratch, { recursive: true, force: true });
+        rmSync(outside, { recursive: true, force: true });
       }
     },
   );

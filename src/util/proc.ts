@@ -145,6 +145,29 @@ async function markedProcesses(
   throw new Error("Process arguments changed during inspection");
 }
 
+/** Confirm identity and disappearance without relying on marker membership. */
+async function processBirth(pid: number): Promise<string | null> {
+  if (inspectionPlatform === "darwin") {
+    const { darwinProcessBirth } = await import("./processes-darwin.ts");
+    return darwinProcessBirth(pid);
+  }
+  if (inspectionPlatform === "linux") {
+    try {
+      const row = await readFile(`/proc/${pid}/stat`, "utf8");
+      const fields = row
+        .slice(row.lastIndexOf(")") + 2)
+        .trim()
+        .split(/\s+/);
+      if (!fields[19]) throw new Error(`Invalid process birth time for ${pid}`);
+      return fields[19];
+    } catch (error) {
+      if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+      throw error;
+    }
+  }
+  throw new Error("Process birth time inspection is unsupported on this platform");
+}
+
 async function stopMarkedProcesses(
   marker: string,
   child: ChildProcess,
@@ -155,31 +178,40 @@ async function stopMarkedProcesses(
   const group = child.pid;
   if (group === undefined) return;
   const started = performance.now();
-  const termed = new Set<number>();
+  const claimed = new Map<number, { birth: string; termed: boolean }>();
   let empty = false;
   for (;;) {
     const pids = await markedProcesses(marker, group, invokedAt, directories);
+    for (const pid of pids) {
+      if (claimed.has(pid)) continue;
+      const birth = await processBirth(pid);
+      if (birth !== null) claimed.set(pid, { birth, termed: false });
+    }
+    // An already-claimed descendant stays ours after reparenting or an environment
+    // change. A reused PID is no longer that process and must never be signalled.
+    for (const [pid, identity] of claimed)
+      if ((await processBirth(pid)) !== identity.birth) claimed.delete(pid);
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
     const exited = child.exitCode !== null || child.signalCode !== null;
-    if (!pids.length && empty && exited) return;
-    empty = !pids.length && exited;
+    if (!claimed.size && empty && exited) return;
+    empty = !claimed.size && exited;
     if (performance.now() - started >= graceMs + 10_000)
       throw new Error(
-        `Marked processes still alive: ${[...new Set([...pids, ...(!exited ? [group] : [])])].join(", ")}`,
+        `Marked processes still alive: ${[...new Set([...claimed.keys(), ...(!exited ? [group] : [])])].join(", ")}`,
       );
-    for (const pid of pids) {
-      const signal = termed.has(pid) && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
-      if (signal === "SIGTERM" && termed.has(pid)) continue;
+    for (const [pid, identity] of claimed) {
+      const signal = identity.termed && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
+      if (signal === "SIGTERM" && identity.termed) continue;
       try {
         process.kill(pid, signal);
-        termed.add(pid);
+        identity.termed = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
     // Yield even for empty snapshots: spawn/exit notifications and a racing fork
     // must have an opportunity to arrive before we confirm shutdown.
-    if (pids.length || !exited) await Bun.sleep(10);
+    if (claimed.size || !exited) await Bun.sleep(10);
     else await new Promise<void>((resolve) => setImmediate(resolve));
   }
 }
