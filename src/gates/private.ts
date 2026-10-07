@@ -45,11 +45,42 @@ export function loadPrivateStrings(
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 const decoded = (text: string) =>
-  text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
-export const privateMatches = (text: string, entries: PrivateStrings) =>
-  entries.filter(({ value }) => normalize(`${text}\n${decoded(text)}`).includes(normalize(value)));
+  text
+    .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
+    // Diagnostics may JSON-quote a field's literal Unicode escapes.
+    .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+/** A clipped value also protects any trailing fragment of a private string. */
+export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
+  const layers = [text];
+  for (let round = 0; round < 5; round++) {
+    const next = decoded(text);
+    if (next === text) {
+      const normalized = layers.map(normalize);
+      return entries.filter(({ value }) => {
+        const protectedText = normalize(value);
+        return normalized.some((layer) => {
+          if (layer.includes(protectedText)) return true;
+          if (!truncated) return false;
+          // A cutoff can split an escape or a UTF-8 percent sequence, hiding the decoded tail.
+          const tails = [layer, layer.replace(/(?:%[0-9a-f]?|\\+u[0-9a-f]{0,3}|\\+|\ufffd)+$/i, "")];
+          return tails.some((tail) => {
+            for (let length = 1; length < protectedText.length && length <= tail.length; length++)
+              if (tail.endsWith(protectedText.slice(0, length))) return true;
+            return false;
+          });
+        });
+      });
+    }
+    layers.push(next);
+    text = next;
+  }
+  // Entry zero marks unsafe decoding, including when the denylist is empty.
+  return [{ value: "", entry: 0 }];
+}
 export const privateReason = (location: string, entry: number) =>
-  `${location} contains a private string (entry ${entry} in private-strings.txt)`;
+  entry === 0
+    ? `${location} exceeds the private text decoding limit; publication blocked`
+    : `${location} contains a private string (entry ${entry} in private-strings.txt)`;
 export function redactPrivate(text: string, entries: PrivateStrings): string {
   for (const { value } of entries)
     text = text.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]");

@@ -51,7 +51,7 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     ).status,
   ).toBe(202);
   const list = await route(rpc("tools/list"), localServer);
-  expect((await list.json()).result.tools).toHaveLength(9);
+  expect((await list.json()).result.tools).toHaveLength(12);
   const create = await route(
     rpc("tools/call", { name: "limitless_create_run", arguments: { repo: f.repo, prompt: "hello" } }),
     localServer,
@@ -63,6 +63,14 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     localServer,
   );
   expect(JSON.parse((await get.json()).result.content[0].text).id).toBe(run.id);
+  const status = await route(
+    rpc("tools/call", { name: "limitless_status", arguments: { run: run.id } }),
+    localServer,
+  );
+  expect(JSON.parse((await status.json()).result.content[0].text)).toMatchObject({
+    run: run.id,
+    state: "Work pending",
+  });
   const dependent = await route(
     rpc("tools/call", {
       name: "limitless_create_run",

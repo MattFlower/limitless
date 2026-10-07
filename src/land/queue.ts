@@ -133,7 +133,13 @@ export class LandQueue {
     this.store.releaseLandClaims(this.owner);
   }
 
-  list(): LandEntry[] {
+  list(runId?: string): LandEntry[] {
+    if (runId !== undefined) {
+      const run = this.store.getRun(runId);
+      if (!run) throw new Error("run not found");
+      const entry = this.store.latestLandEntry(run.id, run.prUrl);
+      return entry ? [entry] : [];
+    }
     return this.store.listLandEntries({ limit: 100 });
   }
 

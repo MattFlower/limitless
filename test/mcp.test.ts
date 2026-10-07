@@ -42,7 +42,7 @@ test("model-written MCP prompts cannot opt in through Allow lines", async () => 
   expect((await call("create_run", { repo: f.repo, prompt, allow: ["anything"] })).isError).toBe(true);
 });
 
-test("nine discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
+test("twelve discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
   const { tools } = await connection.client.listTools();
   expect(tools.map((t) => t.name).sort()).toEqual(
     [
@@ -52,9 +52,12 @@ test("nine discoverable tools, create defaults and overrides, get and queued can
       "feed",
       "feed_ack",
       "get_run",
+      "land",
       "list_runs",
       "providers",
       "resolve_run",
+      "review",
+      "status",
     ].map((s) => `limitless_${s}`),
   );
   for (const tool of tools) {
@@ -65,6 +68,20 @@ test("nine discoverable tools, create defaults and overrides, get and queued can
     "repo",
     "prompt",
   ]);
+  expect(tools.find((t) => t.name === "limitless_review")?.inputSchema).toMatchObject({
+    required: ["run", "verdict", "reviewedSha"],
+    additionalProperties: false,
+    properties: {
+      verdict: { enum: ["changes", "approve"] },
+      reviewedSha: { type: "string", pattern: "^[a-fA-F0-9]{40}$" },
+      findings: { type: "array", default: [], items: { required: ["severity", "title", "detail"] } },
+    },
+  });
+  expect(tools.find((t) => t.name === "limitless_land")?.inputSchema).toMatchObject({
+    required: ["run"],
+    properties: { run: { type: "string" }, sha: { type: "string" } },
+  });
+  expect(tools.find((t) => t.name === "limitless_status")?.inputSchema.required).toEqual(["run"]);
   const run = await create();
   expect(run).toMatchObject({ profile: "auto", source: "mcp", status: "queued" });
   expect(f.factory.store.getRun(run.id)?.source).toBe("mcp");
