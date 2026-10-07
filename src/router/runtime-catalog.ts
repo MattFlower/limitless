@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { Store } from "../db/store.ts";
 import type { ModelDef, ProviderDef } from "./catalog.ts";
 import { runtimeModel } from "./config-catalog.ts";
+import { originExclusion } from "./origins.ts";
 import { validatePolicy, validateRunModels } from "./policy.ts";
 import type { ProviderTracker } from "./providers.ts";
 import type { Router } from "./router.ts";
@@ -21,7 +22,14 @@ export class RuntimeCatalog {
   snapshot() {
     return {
       history: this.store.catalogHistory(),
-      models: this.models.map((m) => ({ ...m, source: m.source ?? "code" })),
+      ...(this.router.excludeOrigins === undefined ? {} : { excludeOrigins: this.router.excludeOrigins }),
+      models: this.models.map((m) => ({
+        ...m,
+        source: m.source ?? "code",
+        ...(this.router.excludeOrigins === undefined
+          ? {}
+          : { excluded: originExclusion(m, this.router.excludeOrigins) }),
+      })),
       providers: this.tracker
         .all()
         .filter((p) => p.discovery)

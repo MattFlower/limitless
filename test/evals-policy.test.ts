@@ -6,6 +6,7 @@ import { EVAL_ROLES, generatePolicy, selectEvidence } from "../src/evals/policy.
 import { evalSettings } from "../src/evals/settings.ts";
 import { pairedBootstrap, wilson } from "../src/evals/stats.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
+import { originExclusion, parseExcludeOrigins } from "../src/router/origins.ts";
 import { overlayPolicy, validatePolicy } from "../src/router/policy.ts";
 import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
@@ -976,4 +977,28 @@ test("only review systems matching [review] implementer_report are routing evide
   ]);
   // Legacy review runs have no systems and still count.
   expect(selectEvidence([base], undefined, "omit").map((e) => e.modelId)).toEqual([local, metered]);
+});
+
+test("shared origin parser and predicate retain exact eval semantics", () => {
+  expect(parseExcludeOrigins({})).toBeUndefined();
+  expect(parseExcludeOrigins({ routing: { exclude_origins: [] } })).toEqual([]);
+  expect(parseExcludeOrigins({ routing: { exclude_origins: ["CN", " "] } })).toEqual(["CN", " "]);
+  for (const value of [null, "CN", {}, [""], [1]]) {
+    expect(() => parseExcludeOrigins({ routing: { exclude_origins: value } })).toThrow();
+    expect(() => evalSettings({ routing: { exclude_origins: value } })).toThrow();
+  }
+  for (const model of [
+    { origin: "CN", baseOrigin: "US" },
+    { origin: "US", baseOrigin: "CN" },
+    { origin: "US", baseOrigin: "unknown" },
+  ]) {
+    expect(originExclusion(model, undefined)).toBeNull();
+    expect(originExclusion(model, ["CN"])).toBe(
+      `origin excluded (${model.origin}; baseOrigin=${model.baseOrigin})`,
+    );
+  }
+  expect(originExclusion({ origin: "US", baseOrigin: "unknown" }, [])).toBe(
+    "origin excluded (US; baseOrigin=unknown)",
+  );
+  expect(originExclusion({ origin: "cn", baseOrigin: "US" }, ["CN"])).toBeNull();
 });

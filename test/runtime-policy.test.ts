@@ -269,3 +269,21 @@ test("an eval update beneath an unchanged override preserves the saved implement
   expect(factory.policy.implement.small).toEqual(["codex/luna"]);
   expect(selected()).toBe("codex/luna");
 });
+
+test("only new cell writes reject exclusions; stored and eval layers load unchanged", () => {
+  const cn = MODELS.find((m) => m.origin === "CN");
+  if (!cn) throw new Error("missing CN model");
+  store.writeRouting("review.default", [cn.id], null, "operator");
+  const tracker = new ProviderTracker(PROVIDERS, store, loadConfig().reserves, {});
+  const router = new Router(tracker, DEFAULT_POLICY, MODELS, [], ["CN"]);
+  const runtime = new RuntimePolicy(store, router, MODELS, PROVIDERS, [], DEFAULT_POLICY, {
+    verify: { default: [cn.id] },
+  });
+  const before = runtime.snapshot();
+  expect(() => runtime.setCell("verify", "default", [`claude/opus|${cn.id}`])).toThrow(
+    `origin excluded (${cn.origin}; baseOrigin=${cn.baseOrigin})`,
+  );
+  expect(runtime.snapshot()).toEqual(before);
+  expect(router.route("review", "small").candidates).toEqual([]);
+  expect(router.route("verify", "small").candidates).toEqual([]);
+});

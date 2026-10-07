@@ -1489,3 +1489,68 @@ describe("bounded provider waits", () => {
     expect(tracker.status("claude")?.inFlight).toBe(0);
   });
 });
+
+test("origin exclusions survive exhausted providers, billing, independence, escalation and explicit routes", () => {
+  const catalog = models.map((m) => ({
+    ...m,
+    origin: m.provider === "openrouter" ? "CN" : "US",
+    baseOrigin: m.provider === "openrouter" ? "CN" : "US",
+  }));
+  const defs = providers.map((p) => (p.id === "openrouter" ? { ...p, billing: "free" as const } : p));
+  const tracker = new ProviderTracker(defs, store, reserves, { OPENROUTER_API_KEY: "fake" });
+  tracker.record("claude", "quota", { exhaustedUntil: Date.now() + 60_000 });
+  tracker.record("codex", "quota", { exhaustedUntil: Date.now() + 60_000 });
+  const routing = new Router(
+    tracker,
+    {
+      ...policy,
+      review: { default: ["codex/sol", "claude/sonnet", "openrouter/ds"] },
+      verify: { default: ["codex/sol", "openrouter/ds"] },
+    },
+    catalog,
+    [],
+    ["CN"],
+  );
+  const reason = "origin excluded (CN; baseOrigin=CN)";
+  for (const role of ["review", "verify"] as const) {
+    for (const constraints of [
+      {},
+      { billing: "free_first" as const },
+      { billing: "free_only" as const },
+      { avoidVendor: ["openai", "anthropic"], independenceFirst: true },
+      { minTier: 4 },
+      { prefer: "openrouter/ds" },
+      { only: "openrouter/ds" },
+      { chain: ["openrouter/ds|codex/sol"] },
+    ]) {
+      const result = routing.route(role, "small", constraints);
+      expect(result.candidates).toEqual([]);
+      expect(result.skipped).toContainEqual({ modelId: "openrouter/ds", reason });
+    }
+  }
+  expect(routing.preview("review", "small")).toContainEqual({
+    modelId: "openrouter/ds",
+    eligible: false,
+    reason,
+  });
+  // An out-of-cell scan must apply the same constraint.
+  routing.setPolicy({ ...policy, review: { default: ["codex/sol"] } });
+  for (const constraints of [{ billing: "free_first" as const }, { minTier: 4 }]) {
+    expect(routing.route("review", "small", constraints).skipped).toContainEqual({
+      modelId: "openrouter/ds",
+      reason,
+    });
+  }
+});
+
+test("unknown ancestry is eligible only when the origin constraint is unset", () => {
+  const { tracker } = setup();
+  const ancestry = models.map((m) => ({ ...m, origin: "US" }));
+  const constrained = new Router(tracker, policy, ancestry, [], []);
+  expect(constrained.route("review", "small").candidates).toEqual([]);
+  expect(constrained.route("review", "small").skipped).toContainEqual({
+    modelId: "codex/sol",
+    reason: "origin excluded (US; baseOrigin=unknown)",
+  });
+  expect(new Router(tracker, policy, ancestry).route("review", "small").candidates).toHaveLength(2);
+});

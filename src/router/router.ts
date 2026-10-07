@@ -1,6 +1,7 @@
 import type { Complexity, Effort, ModelSelection, Role } from "../core/types.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy } from "./catalog.ts";
+import { OriginExcludedError, originExclusion } from "./origins.ts";
 import type { ProviderTracker } from "./providers.ts";
 import { formatTarget, parseTarget, resolveTarget, transportError } from "./targets.ts";
 
@@ -61,6 +62,7 @@ export class Router {
     private policy: Policy = DEFAULT_POLICY,
     models: ModelDef[] = MODELS,
     private preferProviders: string[] = [],
+    readonly excludeOrigins?: string[],
   ) {
     this.models = new Map(models.map((m) => [m.id, m]));
     for (const model of models) this.resolve(model.id);
@@ -136,6 +138,14 @@ export class Router {
     return this.models.get(id);
   }
 
+  /** Targets can outlive catalog edits while waiting for a provider slot. */
+  assertOriginEligible(modelId: string): void {
+    if (this.excludeOrigins === undefined) return;
+    const { model } = this.resolve(modelId);
+    const reason = originExclusion(model, this.excludeOrigins);
+    if (reason) throw new OriginExcludedError(reason);
+  }
+
   checkpointIdentity = (reference: string): string => {
     const { modelId } = parseTarget(reference);
     return this.models.get(modelId)?.checkpoint ?? modelId;
@@ -154,6 +164,8 @@ export class Router {
   }
 
   toTarget(m: ModelDef, effort: Effort | null | undefined = m.effort): ModelTarget {
+    const origin = originExclusion(m, this.excludeOrigins);
+    if (origin) throw new Error(`${m.id}: ${origin}`);
     if (effort != null && !m.supportedEfforts.includes(effort))
       throw new Error(`Unsupported effort "${effort}" for ${m.id}`);
     const def = this.tracker.def(m.provider);
@@ -197,6 +209,7 @@ export class Router {
         const catalogModel = this.model(parseTarget(id).modelId);
         if (!catalogModel || !this.tracker.def(catalogModel.provider)) return [];
         const { model, effort } = this.resolveFor(role, id);
+        if (originExclusion(model, this.excludeOrigins)) return [];
         return [{ modelId: model.id, effort: effort ?? null, tier: model.tier }];
       }),
     );
@@ -318,6 +331,11 @@ export class Router {
         if (seen.has(id)) continue;
         seen.add(id);
         visited.push(id);
+        const origin = originExclusion(m, this.excludeOrigins);
+        if (origin) {
+          skipped.push({ modelId: id, reason: origin });
+          continue;
+        }
         if (excluded.has(id) || excludedCheckpoints.has(this.checkpointIdentity(m.id))) {
           skipped.push({
             modelId: id,

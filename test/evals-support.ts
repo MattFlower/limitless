@@ -74,10 +74,12 @@ export async function evalFixture(
   extraModels: ModelDef[] = [],
   extraProviders: ProviderDef[] = [],
   policy?: Policy,
+  excludeOrigins?: string[],
 ) {
   const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
   cfg.secrets = {};
+  if (excludeOrigins !== undefined) cfg.raw.routing = { exclude_origins: excludeOrigins };
   cfg.openrouterBudgetUsd = 100;
   const source = join(home, "source");
   const cache = join(cfg.paths.repos, "fixture__repo.git");

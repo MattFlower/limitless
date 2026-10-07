@@ -203,7 +203,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
 | `[review] shadow_grace_seconds` | `300` | How long a shadow panel may run after its single review finishes before it is aborted and recorded as `timeout`. `0` stops it as soon as the single review finishes. |
 | `[review] trusted_reviewers` | `[]` | GitHub logins, besides the repository owner, whose inline PR review comments count as evidence in `limitless review shadow-report`. |
-| `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
+| `[routing] exclude_origins` | unset | For example `["CN"]`. Runtime routing, eval policy generation and the Evals matrix exclude models whose origin or baseOrigin is listed (exact, case-sensitive matching). Any configured list, even `[]`, also excludes unknown baseOrigin. There is no excluded-model fallback; explicit run/retry pins, routing saves and eval targets are refused. Omit for no origin filter. Edit config.toml and restart to change this read-only safety constraint. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
 

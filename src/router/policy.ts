@@ -2,10 +2,16 @@ import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { type Role, RUN_ROLES, type RunModels } from "../core/types.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "./catalog.ts";
+import { originExclusion } from "./origins.ts";
 import { resolveTarget, transportError } from "./targets.ts";
 
 export type PolicyOverlay = Partial<Policy>;
-export function validateRunModels(value: unknown, models: ModelDef[], providers: ProviderDef[]): RunModels {
+export function validateRunModels(
+  value: unknown,
+  models: ModelDef[],
+  providers: ProviderDef[],
+  excludeOrigins?: string[],
+): RunModels {
   if (value === null || typeof value !== "object" || Array.isArray(value))
     throw new Error("models: expected a role-to-chain map");
   for (const [role, chain] of Object.entries(value)) {
@@ -16,7 +22,7 @@ export function validateRunModels(value: unknown, models: ModelDef[], providers:
     Object.entries(value).map(([role, chain]) => [role, { default: chain }]),
   );
   try {
-    validatePolicy(overlay, models, providers);
+    validatePolicy(overlay, models, providers, excludeOrigins);
   } catch (error) {
     const reason =
       error instanceof z.ZodError
@@ -38,12 +44,15 @@ export function validatePolicy(
   value: unknown,
   models: ModelDef[],
   providers: ProviderDef[] = PROVIDERS,
+  excludeOrigins?: string[],
 ): PolicyOverlay {
   const cells = (role: Role) => {
     const group = z.string().superRefine((s, ctx) => {
       for (const id of s.split("|")) {
         try {
           const target = resolveTarget(id, (id) => models.find((m) => m.id === id));
+          const origin = originExclusion(target.model, excludeOrigins);
+          if (origin) throw new Error(`${id}: ${origin}`);
           const problem = transportError(
             role,
             target,

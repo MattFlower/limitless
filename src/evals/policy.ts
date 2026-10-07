@@ -1,5 +1,6 @@
 import type { Effort, EvalRun, EvalTrial, ReviewSystem } from "../core/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../router/catalog.ts";
+import { originExclusion } from "../router/origins.ts";
 import type { PolicyOverlay } from "../router/policy.ts";
 import { effortTransportError, evidenceTarget, parseTarget, recordedTarget } from "../router/targets.ts";
 import type { EvalSettings } from "./settings.ts";
@@ -140,12 +141,7 @@ export function generatePolicy(input: PolicyInput) {
         const baseId = rows[0]?.modelId ?? parseTarget(entry.modelId).modelId;
         const model = models.find((m) => m.id === baseId);
         const provider = providers.find((p) => p.id === model?.provider);
-        const excluded =
-          model &&
-          settings.excludeOrigins !== undefined &&
-          (settings.excludeOrigins.includes(model.origin) ||
-            settings.excludeOrigins.includes(model.baseOrigin) ||
-            model.baseOrigin === "unknown");
+        const excluded = model ? originExclusion(model, settings.excludeOrigins) : null;
         const reasons: string[] = [];
         // Evidence for a model since removed from the catalog stays in the report but never routes.
         if (!model) reasons.push(`${baseId} is not in the model catalog`);
@@ -160,7 +156,7 @@ export function generatePolicy(input: PolicyInput) {
         for (const id of mismatchedProviders)
           reasons.push(`recorded provider ${id} differs from catalog provider ${model?.provider}`);
         const providerMismatch = mismatchedProviders.length > 0;
-        if (excluded) reasons.push(`origin excluded (${model?.origin}; baseOrigin=${model?.baseOrigin})`);
+        if (excluded) reasons.push(excluded);
         // Without trials only the saved reference exists, and metrics already mark it insufficient.
         const recordedEffort = rows.length
           ? (rows[0]?.effort ?? null)

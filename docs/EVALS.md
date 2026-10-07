@@ -396,8 +396,11 @@ preparation failures; unavailable latency sorts after known latency at equal cos
 
 When exclude_origins is configured (even an empty array), a candidate is excluded if its origin or
 baseOrigin is listed, or baseOrigin is `unknown`. The evidence still lists it with its rejection
-reason. Hosting location does not determine origin. This filter affects generation and the matrix;
-it does not change existing runtime escalation or unrelated routing cells.
+reason. Hosting location does not determine origin. This filter also enforces runtime routing,
+including fallback and escalation. Explicit eval models and system finder/verifier targets are
+refused before trials start. Excluded models are never
+called; if no eligible model remains, routing fails with the exclusion reason. Matching is exact
+and case-sensitive. Change config.toml and restart to update the read-only constraint.
 
 Eligible models clear every required floor, establish non-inferiority, and have catalog/provider
 metadata and applicable cost estimates. They sort by routing cost/case, then p50 latency, then model

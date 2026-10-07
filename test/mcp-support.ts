@@ -10,7 +10,10 @@ import { createMcpServer, type McpBackend } from "../src/integrations/mcp.ts";
 import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
-export async function fixture(bootSha?: string | ((repo: string) => Promise<string | undefined>)) {
+export async function fixture(
+  bootSha?: string | ((repo: string) => Promise<string | undefined>),
+  excludeOrigins?: string[],
+) {
   const home = mkdtempSync(join(tmpdir(), "limitless-mcp-"));
   const repo = join(home, "local repo");
   mkdirSync(repo);
@@ -28,6 +31,7 @@ export async function fixture(bootSha?: string | ((repo: string) => Promise<stri
   const previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
   process.env.LIMITLESS_CONFIG_DIR = cfg.paths.configDir;
   cfg.secrets = {};
+  if (excludeOrigins !== undefined) cfg.raw.routing = { exclude_origins: excludeOrigins };
   const factory = new Factory(cfg, {
     ...(resolvedBootSha ? { bootSha: resolvedBootSha } : {}),
     harnesses: { fake: fakeHarness(() => ({ delayMs: 30_000 })) },

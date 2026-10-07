@@ -13,6 +13,7 @@ import type {
 import { selectHarness } from "./harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "./harness/types.ts";
 import { toStrictJsonSchema } from "./pipeline/schemas.ts";
+import { OriginExcludedError } from "./router/origins.ts";
 
 const text = z.string().trim().min(1).max(12_000);
 const id = z.string().min(1).max(200);
@@ -246,11 +247,15 @@ export class Concierge {
     const signal = AbortSignal.timeout(120_000);
     let failure = "No model available for chat";
     for (let attempt = 0; attempt < 3; attempt++) {
-      const candidates = router
-        .route("chat", "small", { exclude: tried })
-        .candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
+      const decision = router.route("chat", "small", { exclude: tried });
+      const candidates = decision.candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
       const target = candidates[0];
-      if (!target) break;
+      if (!target) {
+        const exclusions = decision.skipped.filter((s) => s.reason.startsWith("origin excluded ("));
+        if (exclusions.length)
+          failure += `: ${exclusions.map((s) => `${s.modelId} (${s.reason})`).join(", ")}`;
+        break;
+      }
       // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
       const { harnessName, noTools } = selectHarness("chat", target);
       const harness = harnesses[harnessName];
@@ -273,6 +278,7 @@ export class Concierge {
       let directory: string | null = null;
       const startedAt = Date.now();
       let result: AgentResult;
+      let originFailure: OriginExcludedError | undefined;
       try {
         if (signal.aborted) throw new Error("Chat request timed out");
         if (!(await tracker.preflight(target.provider))) {
@@ -283,6 +289,7 @@ export class Concierge {
         tried.push({ modelId: target.modelId, effort: target.effort ?? null });
         mkdirSync(cfg.paths.runs, { recursive: true });
         directory = mkdtempSync(join(cfg.paths.runs, "chat-"));
+        router.assertOriginEligible(target.modelId);
         result = await harness({
           cwd: directory,
           prompt: this.prompt(conversationId, origin),
@@ -304,6 +311,7 @@ export class Concierge {
           },
         });
       } catch (error) {
+        if (error instanceof OriginExcludedError) originFailure = error;
         result = {
           status: signal.aborted ? "timeout" : "error",
           finalText: "",
@@ -321,6 +329,7 @@ export class Concierge {
         if (directory) rmSync(directory, { recursive: true, force: true });
       }
       store.recordChatCall(conversationId, target.provider, target.modelId, startedAt, result);
+      if (originFailure) throw originFailure;
       if (result.quota) tracker.observeWindows(target.provider, result.quota.windows);
       tracker.record(target.provider, result.status, {
         exhaustedUntil: result.quota?.exhaustedUntil ?? null,

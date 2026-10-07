@@ -122,7 +122,13 @@ export class Factory {
       opts.providerTimer,
       opts.healthFetch,
     );
-    this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
+    this.router = new Router(
+      this.tracker,
+      code,
+      this.models,
+      cfg.preferProviders,
+      this.evalSettings.excludeOrigins,
+    );
     this.tracker.setModels(this.models);
     this.routing = new RuntimePolicy(
       this.store,
@@ -275,11 +281,20 @@ export class Factory {
     req: CreateRunRequest,
     verifiedGitHubWebhook = false,
     chat?: { conversationId: string; proposalId: string },
+    validateOrigins = true,
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
     if (req.models !== undefined)
-      req = { ...req, models: validateRunModels(req.models, this.models, this.providerDefs) };
+      req = {
+        ...req,
+        models: validateRunModels(
+          req.models,
+          this.models,
+          this.providerDefs,
+          validateOrigins ? this.router.excludeOrigins : undefined,
+        ),
+      };
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
@@ -316,6 +331,9 @@ export class Factory {
         ...(run.allow?.length ? { allow: run.allow } : {}),
       },
       run.githubWebhookVerified,
+      undefined,
+      // Inherited chains predate this constraint; only replacement pins are refused up front.
+      models !== undefined,
     );
   }
 
