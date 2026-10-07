@@ -24,10 +24,11 @@ import { observerRoots, seatbeltBackend } from "../src/harness/sandbox.ts";
 import * as scratch from "../src/harness/scratch.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../src/pipeline/prompts.ts";
 import { SpecSchema } from "../src/pipeline/schemas.ts";
+import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
-import { enableEfforts, evalFixture } from "./evals-support.ts";
+import { deferred, enableEfforts, evalFixture } from "./evals-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 const TEST_TIMEOUT = 30_000;
@@ -37,8 +38,9 @@ async function fixture(
   gate = "test ! -f broken",
   baseFiles: (home: string, observe: string) => Record<string, string> = () => ({}),
   extraModels: Parameters<typeof evalFixture>[0] = [],
+  evalOptions?: { policy?: Policy; excludeOrigins?: string[] },
 ) {
-  const f = await evalFixture(extraModels);
+  const f = await evalFixture(extraModels, [], evalOptions?.policy, evalOptions?.excludeOrigins);
   // Confined gate and hidden commands may write here, and only here, outside their checkout.
   const observe = join(f.home, "observe");
   mkdirSync(observe);
@@ -106,6 +108,42 @@ async function pinBase(f: Awaited<ReturnType<typeof fixture>>) {
   await sh(["git", "push", f.cache, "HEAD:refs/heads/eval-base"], { cwd: f.source });
   f.save();
 }
+
+test("later retry rounds reject a retained target excluded during the slot wait", async () => {
+  const f = await fixture("true", undefined, [], { policy: {} as Policy, excludeOrigins: ["CN"] });
+  const model = f.factory.router.model("candidate-b");
+  if (!model) throw new Error("missing candidate");
+  f.factory.catalog.add({ ...model, id: "dynamic", origin: "US", baseOrigin: "US" });
+  const waiting = deferred<void>();
+  const proceed = deferred<void>();
+  const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
+  const spy = spyOn(f.factory.tracker, "acquire").mockImplementation(async (id, signal) => {
+    if (f.calls.length === 1) {
+      waiting.resolve();
+      await proceed.promise;
+    }
+    return acquire(id, signal);
+  });
+  try {
+    f.respond(() => ({ files: { answer: "wrong" }, sessionId: "retained", costUsd: 0.25 }));
+    const pending = f.run({ models: ["provider-b/dynamic"], rounds: 3 });
+    await waiting.promise;
+    f.factory.catalog.patch("provider-b/dynamic", { origin: "CN", baseOrigin: "CN" });
+    proceed.resolve();
+    const trial = (await pending).trials[0];
+    expect(f.calls).toHaveLength(1);
+    expect(trial).toMatchObject({
+      status: "error",
+      costUsd: 0.25,
+      details: { reason: "origin excluded (CN; baseOrigin=CN)" },
+    });
+    expect(f.factory.tracker.status("provider-b")?.inFlight).toBe(0);
+  } finally {
+    proceed.resolve();
+    spy.mockRestore();
+    await f.close();
+  }
+});
 
 for (const failure of ["setup", "timeout"] as const)
   test(`baseline ${failure} fails preparation without invoking or caching a candidate`, async () => {

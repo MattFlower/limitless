@@ -54,6 +54,7 @@ import {
 } from "../git/repos.ts";
 import { commandScope, confinementScope, seatbeltBackend } from "../harness/sandbox.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
+import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
 import { assertProcessesStopped, CommandError, ProcessTerminationError, processScope } from "../util/proc.ts";
@@ -1371,10 +1372,17 @@ async function oneRound(
             if (!system.verifier?.targets || (ctx.run.models?.review && !shadow))
               return call(request, constraints, system.verifier?.target).catch(skip);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
-            const listed = system.verifier.targets.map((target) => {
+            const exclusions: string[] = [];
+            const listed = system.verifier.targets.flatMap((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
-              return { vendor: model.vendor, modelId: model.id, targetId };
+              const reason = originExclusion(model, ctx.deps.router.excludeOrigins);
+              if (reason) {
+                exclusions.push(`${targetId}: ${reason}`);
+                return [];
+              }
+              return [{ vendor: model.vendor, modelId: model.id, targetId }];
             });
+            if (!listed.length && exclusions.length) throw new NoCapacityError(exclusions.join("; "));
             const identity = ctx.deps.router.checkpointIdentity;
             const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
             return call(request, { ...constraints, only }, undefined).catch(skip);

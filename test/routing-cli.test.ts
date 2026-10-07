@@ -1,7 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { routingCommand } from "../src/cli/routing.ts";
 
 test("routing CLI uses guarded API requests and preserves groups, alternatives and efforts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "limitless-routing-cli-"));
@@ -104,5 +105,33 @@ test("routing CLI uses guarded API requests and preserves groups, alternatives a
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("routing show prints configured and unset origin constraints", async () => {
+  const printed: string[] = [];
+  const log = spyOn(console, "log").mockImplementation((text: string) => {
+    printed.push(text);
+  });
+  try {
+    for (const excludeOrigins of [undefined, [], ["CN"]]) {
+      printed.length = 0;
+      await routingCommand(
+        ["show"],
+        {},
+        async <T>() =>
+          ({
+            runId: null,
+            effective: {},
+            prefer: [],
+            excludeOrigins,
+          }) as T,
+      );
+      expect(printed).toContain(
+        `exclude_origins: ${excludeOrigins === undefined ? "none" : JSON.stringify(excludeOrigins)}`,
+      );
+    }
+  } finally {
+    log.mockRestore();
   }
 });

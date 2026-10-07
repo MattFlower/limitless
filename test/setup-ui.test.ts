@@ -684,3 +684,17 @@ test("a delayed older preview cannot replace a newer refresh", async () => {
     expect(ui.render()).not.toContain("<span>old/model</span>");
   });
 });
+
+test("Setup displays configured origin exclusions without an edit control", async () => {
+  await fixture(async (_sent, state) => {
+    state.routing.excludeOrigins = ["CN"];
+    ui.emit({ kind: "reconnected" });
+    await settle();
+    const html = ui.render();
+    const paragraph = html.match(/<p[^>]*>Origin exclusions:[\s\S]*?<\/p>/)?.[0];
+    expect(paragraph).toContain("CN");
+    expect(paragraph).toContain("config.toml");
+    expect(paragraph).toContain("restart");
+    expect(paragraph).not.toMatch(/<(input|select|button|textarea)\b/);
+  });
+});

@@ -26,6 +26,7 @@ import {
   type VerifierRequest,
 } from "../pipeline/review.ts";
 import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
+import { OriginExcludedError } from "../router/origins.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { cacheKey, reviewSystemHash } from "./cache.ts";
@@ -873,6 +874,7 @@ export class EvalRunner {
             tracker.blockModel(to.modelId, outcome.error ?? "model rejected");
         };
         let resumeFailed = false;
+        let originFailure: OriginExcludedError | undefined;
         const before = { ...trial };
         for (let attempt = 0; ; attempt++) {
           own = undefined;
@@ -893,6 +895,7 @@ export class EvalRunner {
             ) => {
               const fast = tracker.isFast(to.target.provider);
               if (to.target.modelId === target.modelId) trial.details.fast = fast;
+              router.assertOriginEligible(to.target.modelId);
               return to.harness({
                 fast,
                 scratchDir,
@@ -985,7 +988,12 @@ export class EvalRunner {
                         // As in production, a local finder that cannot run is skipped, not a failed panel.
                         if (to)
                           return sendTo(request, to, `finder-${finder}`).catch((error: Error) => {
-                            if (signal.aborted || !system?.finders[finder]?.local) throw error;
+                            if (
+                              error instanceof OriginExcludedError ||
+                              signal.aborted ||
+                              !system?.finders[finder]?.local
+                            )
+                              throw error;
                             throw new FinderSkipped(error.message);
                           });
                         try {
@@ -1015,6 +1023,7 @@ export class EvalRunner {
                 ).result
               : await send();
           } catch (error) {
+            if (error instanceof OriginExcludedError) originFailure = error;
             const failure: AgentResult = {
               status: signal.aborted ? "cancelled" : "error",
               finalText: "",
@@ -1035,6 +1044,7 @@ export class EvalRunner {
           trial.tokensOut += result.usage.output;
           trial.details.cacheReadTokens = (trial.details.cacheReadTokens ?? 0) + result.usage.cacheRead;
           trial.details.cacheWriteTokens = (trial.details.cacheWriteTokens ?? 0) + result.usage.cacheWrite;
+          if (originFailure) throw originFailure;
           if (sessionId && attempt === 0 && result.status === "error" && !signal.aborted) {
             resumeFailed = true;
             sessionId = undefined;

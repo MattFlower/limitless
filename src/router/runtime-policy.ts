@@ -53,9 +53,14 @@ export class RuntimePolicy {
     return { role: role as Role, cell: cell as RoutingCell };
   }
 
-  private groups(role: Role, cell: RoutingCell, groups: unknown): string[] {
+  private groups(role: Role, cell: RoutingCell, groups: unknown, excludeOrigins?: string[]): string[] {
     try {
-      const checked = validatePolicy({ [role]: { [cell]: groups } }, this.models, this.providers);
+      const checked = validatePolicy(
+        { [role]: { [cell]: groups } },
+        this.models,
+        this.providers,
+        excludeOrigins,
+      );
       return checked[role]?.[cell] ?? [];
     } catch (error) {
       throw new Error(`${role}.${cell}: ${String(error)}`);
@@ -108,6 +113,7 @@ export class RuntimePolicy {
     );
     return {
       runId: runId ?? null,
+      ...(this.router.excludeOrigins === undefined ? {} : { excludeOrigins: this.router.excludeOrigins }),
       layers: { code: this.code, evals: this.evals, operator: this.operator },
       effective,
       prefer: this.prefer,
@@ -118,7 +124,7 @@ export class RuntimePolicy {
 
   setCell(roleName: string, cellName: string, value: unknown, note?: unknown, by = "operator") {
     const { role, cell } = this.entry(roleName, cellName);
-    const groups = value === null ? null : this.groups(role, cell, value);
+    const groups = value === null ? null : this.groups(role, cell, value, this.router.excludeOrigins);
     const next = structuredClone(this.operator);
     next[role] = { ...next[role] };
     if (groups === null) delete next[role]?.[cell];

@@ -1,7 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { catalogCommand } from "../src/cli/catalog.ts";
 
 test("catalog CLI forwards complete add metadata and lists and removes through the API", async () => {
   const dir = mkdtempSync(join(tmpdir(), "limitless-catalog-cli-"));
@@ -87,5 +88,38 @@ test("catalog CLI forwards complete add metadata and lists and removes through t
     expect(invalid.stderr).toContain("--origin is required");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("catalog list marks excluded models and prints the configured safety constraint", async () => {
+  const printed: string[] = [];
+  const log = spyOn(console, "log").mockImplementation((text: string) => {
+    printed.push(text);
+  });
+  try {
+    await catalogCommand(
+      ["list"],
+      {},
+      async <T>() =>
+        ({
+          excludeOrigins: ["CN"],
+          providers: [],
+          models: [
+            {
+              id: "fake/cn",
+              model: "backend",
+              source: "runtime",
+              tier: 4,
+              excluded: "origin excluded (CN; baseOrigin=CN)",
+            },
+          ],
+        }) as T,
+    );
+    expect(printed).toContain('exclude_origins: ["CN"]');
+    expect(printed.join("\n")).toContain(
+      "fake/cn [runtime] backend tier 4; origin excluded (CN; baseOrigin=CN)",
+    );
+  } finally {
+    log.mockRestore();
   }
 });

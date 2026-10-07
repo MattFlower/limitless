@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseExcludeOrigins } from "../router/origins.ts";
 
 const fraction = z.number().finite().min(0).max(1);
 const floors = z.strictObject({
@@ -15,12 +16,9 @@ const settings = z.strictObject({
   subscription_weight: z.number().finite().nonnegative().default(0.25),
 });
 export function evalSettings(raw: Record<string, unknown>) {
-  const routing = z
-    .object({ exclude_origins: z.array(z.string().min(1)).optional() })
-    .parse(raw.routing ?? {});
   return {
     ...settings.parse(raw.evals === undefined ? {} : raw.evals),
-    excludeOrigins: routing.exclude_origins,
+    excludeOrigins: parseExcludeOrigins(raw),
   };
 }
 export type EvalSettings = ReturnType<typeof evalSettings>;
