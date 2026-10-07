@@ -17,14 +17,44 @@ export function gateTestCommand(command: string, scripts: Record<string, string>
   return expanded && /^[\w./-]+(?: [\w./:=@-]+)*$/.test(expanded) ? expanded : null;
 }
 
-const gateClaim =
-  /\bgate\s+(?:run|stage|check|results?|evidence)\b|\bverified\s+by\s+gate\b|\bfactory\s+gates?\b/i;
-const stripCitations = (text: string): string =>
-  text
+const gateClaim = (text: string): boolean =>
+  /(?<![\w./-])gates?[\s:-]+(?:runs?|stages?|checks?|results?|evidence)(?![\w./-])|\bverified\s+by\s+(?:the\s+)?gates?\b|\bfactory[\s-]+gates?\b/i.test(
+    text.replace(/[`*_~]/g, ""),
+  );
+const stripCitations = (text: string): string => {
+  const retained = text
     .split(/\r?\n/)
-    .filter((line) => !gateClaim.test(line))
+    .filter((line) => !gateClaim(line))
     .join("\n")
     .trim();
+  // A citation split over multiple lines must not survive line-by-line stripping.
+  return gateClaim(retained) ? "" : retained;
+};
+
+function sanitizeGateClaims(verify: Verify): Verify {
+  return {
+    ...verify,
+    notes: stripCitations(verify.notes),
+    criteria: verify.criteria.map((criterion) => {
+      // Re-evaluate a previously substituted row on resume, including after a changed HEAD.
+      const { gateEvidence, ...row } = criterion;
+      const claimed =
+        gateEvidence ||
+        [criterion.evidence, criterion.publicSummary, criterion.requirementCitation ?? "", verify.notes].some(
+          gateClaim,
+        );
+      return {
+        ...row,
+        status: claimed && row.status === "met" ? ("blocked" as const) : row.status,
+        evidence:
+          stripCitations(gateEvidence?.blockedEvidence ?? row.evidence) ||
+          "The verifier did not provide independently observed evidence.",
+        publicSummary: stripCitations(row.publicSummary),
+        requirementCitation: stripCitations(row.requirementCitation ?? ""),
+      };
+    }),
+  };
+}
 
 /** Sanitize before schema parsing discards unknown, model-supplied provenance. */
 export const ModelVerifySchema = z.preprocess((value) => {
@@ -34,7 +64,7 @@ export const ModelVerifySchema = z.preprocess((value) => {
     value && typeof value === "object" && "criteria" in value && Array.isArray(value.criteria)
       ? value.criteria
       : [];
-  return {
+  return sanitizeGateClaims({
     ...parsed.data,
     criteria: parsed.data.criteria.map((criterion, index) => {
       const raw: unknown = rows[index];
@@ -42,8 +72,12 @@ export const ModelVerifySchema = z.preprocess((value) => {
         ? { ...criterion, status: criterion.status === "met" ? "blocked" : criterion.status }
         : criterion;
     }),
-  };
+  });
 }, VerifySchema);
+
+// Runner status rows and summaries, not words inside passing test names or diagnostic prose.
+const incompleteTestOutput =
+  /^\s*(?:\((?:skip|todo|fail)\)(?:\s|$)|(?:[1-9]\d* (?:skip(?:ped)?|todo|fail(?:ed)?|not run)|0 pass)\s*$|not run:\s)/im;
 
 /** Each nonempty line must be a complete simple command; prose/inspections fail closed. */
 function verificationCommands(instructions: string): string[] {
@@ -87,10 +121,7 @@ function covers(check: GateEvidence["checks"][number], requestedCommand: string)
     selected.length === requested.length &&
     requested.every((file, index) => file === selected[index] && /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file))
   )
-    return (
-      !check.result.testCoverage?.skippedFiles.length &&
-      !/\((?:skip|todo|fail)\)|(?:^|\n)\s*(?:[1-9]\d* (?:skip|todo)|0 pass)\b/.test(check.result.output)
-    );
+    return !check.result.testCoverage?.skippedFiles.length && !incompleteTestOutput.test(check.result.output);
   const recorded = new BunTestCoverage();
   for (const line of check.result.output.split(/\r?\n/)) recorded.observe(line);
   const coverage = check.result.testCoverage ?? recorded.result();
@@ -108,9 +139,7 @@ function passed(check: GateEvidence["checks"][number]): boolean {
     !result.confinementError &&
     !result.output.includes("sandbox_apply: Operation not permitted") &&
     !result.testCoverage?.skippedFiles.length &&
-    !/\((?:skip|todo|fail)\)|\b(?:skip(?:ped)?|todo|not run)\b|(?:^|\n)\s*(?:[1-9]\d* fail|0 pass)\b/i.test(
-      result.output,
-    ) &&
+    !incompleteTestOutput.test(result.output) &&
     (!result.firstAttempt || clean(result.firstAttempt));
   return (
     ["pass", "fixed", "new_pass"].includes(check.verdict) &&
@@ -128,26 +157,10 @@ export function applyGateEvidence(
   sha: string,
   gates?: GateEvidence,
 ): Verify {
+  const sanitized = sanitizeGateClaims(verify);
   return {
-    ...verify,
-    notes: stripCitations(verify.notes),
-    criteria: verify.criteria.map((criterion) => {
-      // Re-evaluate a previously substituted row on resume, including after a changed HEAD.
-      const { gateEvidence, ...row } = criterion;
-      const claimed =
-        gateEvidence ||
-        [criterion.evidence, criterion.publicSummary, criterion.requirementCitation ?? "", verify.notes].some(
-          (text) => gateClaim.test(text),
-        );
-      const blocked = {
-        ...row,
-        status: claimed && row.status === "met" ? ("blocked" as const) : row.status,
-        evidence:
-          stripCitations(gateEvidence?.blockedEvidence ?? row.evidence) ||
-          "The verifier did not provide independently observed evidence.",
-        publicSummary: stripCitations(row.publicSummary),
-        requirementCitation: stripCitations(row.requirementCitation ?? ""),
-      };
+    ...sanitized,
+    criteria: sanitized.criteria.map((blocked) => {
       if (
         blocked.status !== "blocked" ||
         !gates ||

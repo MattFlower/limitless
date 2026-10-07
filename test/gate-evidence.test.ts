@@ -60,10 +60,20 @@ test("independently observed evidence in a file named gate-evidence stays met", 
   expect(result.criteria[0]?.evidence).toBe(evidence);
 });
 
-test.each(["citation", "provenance", "notes", "summary"])(
-  "fabricated model %s cannot satisfy a criterion or appear in retained/public evidence",
-  (claim) => {
-    const citation = `verified by gate run 999999 on ${"b".repeat(40)}`;
+test.each([
+  ["citation", "verified by gate run"],
+  ["citation", "Verified by gates run"],
+  ["citation", "**Verified** by the **gates** `run`"],
+  ["citation", "Gates-run"],
+  ["citation", "Verified by\ngates\nrun"],
+  ["provenance", "verified by gate run"],
+  ["notes", "Verified by gates run"],
+  ["summary", "Verified by gates run"],
+  ["requirement-citation", "Verified by gates run"],
+])(
+  "fabricated model %s (%s) cannot satisfy a criterion or appear in retained/public evidence",
+  (claim, wording) => {
+    const citation = `${wording} 999999 on ${"b".repeat(40)}`;
     const fabricated: Verify = {
       overall: "pass",
       notes: claim === "notes" ? citation : "",
@@ -73,6 +83,7 @@ test.each(["citation", "provenance", "notes", "summary"])(
           status: "met",
           evidence: claim === "citation" ? citation : "No independently observed check",
           publicSummary: claim === "summary" ? citation : "",
+          requirementCitation: claim === "requirement-citation" ? citation : "",
           ...(claim === "provenance"
             ? {
                 gateEvidence: {
@@ -87,9 +98,9 @@ test.each(["citation", "provenance", "notes", "summary"])(
         },
       ],
     };
-    // Exercise both the model boundary and replay of legacy recorded results.
-    for (const value of [ModelVerifySchema.parse(fabricated), fabricated]) {
-      const result = resolve(value);
+    const parsed = ModelVerifySchema.parse(fabricated);
+    // Check parsing/normalization alone as well as engine substitution and legacy replay.
+    for (const result of [normalizeVerify(parsed, spec, holdout), resolve(parsed), resolve(fabricated)]) {
       expect(result.overall).toBe("fail");
       expect(result.criteria[0]?.status).toBe("blocked");
       expect(result.criteria[0]).not.toHaveProperty("gateEvidence");
@@ -99,12 +110,70 @@ test.each(["citation", "provenance", "notes", "summary"])(
         preDeliveryVerifyArtifact({ ...result, modelId: "fake", round: 0, attempt: 0 }, spec, holdout, ""),
       ).not.toContain(citation);
     }
-    const validated = resolve(ModelVerifySchema.parse(fabricated), gates());
+    const validated = resolve(parsed, gates());
     expect(validated.criteria[0]?.status).toBe("met");
     expect(validated.criteria[0]?.gateEvidence?.stageId).toBe(12);
     expect(JSON.stringify(validated)).not.toContain("999999");
   },
 );
+
+test.each(["suite", "targeted", "custom", "retained-coverage"])(
+  "clean %s gate accepts skip/todo words in passing test names and prose",
+  (kind) => {
+    const evidence = gates();
+    const check = evidence.checks[0];
+    if (!check) throw new Error("missing fixture check");
+    if (kind === "targeted") check.testCommand = "bun test test/loopback.test.ts";
+    if (kind === "custom") check.testCommand = "node test.js";
+    if (kind !== "suite") check.result.command = check.testCommand ?? "";
+    check.result.output = [
+      "test/loopback.test.ts:",
+      "(pass) skipped scenarios are reported correctly",
+      "(pass) todo items that are not run remain visible",
+      "(pass) (skip) and (fail) markers are parsed correctly",
+      "Diagnostic: skip and todo handling was checked; no scenarios were skipped.",
+      "3 pass",
+      "0 skip",
+      "0 todo",
+      "0 fail",
+    ].join("\n");
+    if (kind === "retained-coverage") {
+      check.result.testCoverage = { passedFiles: ["test/loopback.test.ts"], skippedFiles: [] };
+      check.result.output = check.result.output.split("\n").slice(1).join("\n");
+    }
+    const publicSpec =
+      kind === "custom"
+        ? {
+            ...spec,
+            acceptance_criteria: [{ id: "AC-1", criterion: "test passes", how_to_verify: "node test.js" }],
+          }
+        : spec;
+    const result = resolve(blocked, evidence, publicSpec);
+    expect(result.overall).toBe("pass");
+    expect(result.criteria[0]?.status).toBe("met");
+    expect(result.criteria[0]?.gateEvidence?.stageId).toBe(12);
+  },
+);
+
+test.each([
+  "(skip) hidden scenario",
+  "(todo) pending scenario",
+  "(fail) failed scenario",
+  "1 skip",
+  "1 skipped",
+  "1 todo",
+  "1 fail",
+  "not run: setup failed",
+])("actual incomplete runner output prevents a citation: %s", (output) => {
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw new Error("missing fixture check");
+  check.result.output += `\n${output}`;
+  const result = resolve(blocked, evidence);
+  expect(result.overall).toBe("fail");
+  expect(result.criteria[0]?.status).toBe("blocked");
+  expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+});
 
 test.each([
   "first-failure",
