@@ -69,7 +69,7 @@ import {
   type RunState,
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
-import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
+import { applyGateEvidence, gateTestCommand, ModelVerifySchema } from "./gate-evidence.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -1530,7 +1530,7 @@ async function oneRound(
               checks: usableGates?.checks,
             }),
             jsonSchema: toStrictJsonSchema(VerifySchema),
-            schema: VerifySchema,
+            schema: ModelVerifySchema,
             requireStructured: true,
             privateSession: true,
             redactHoldout: true,

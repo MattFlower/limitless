@@ -1,6 +1,7 @@
+import { z } from "zod";
 import type { GateComparison } from "../gates/run.ts";
 import { BunTestCoverage } from "../gates/test-coverage.ts";
-import type { Holdout, Spec, Verify } from "./schemas.ts";
+import { type Holdout, type Spec, type Verify, VerifySchema } from "./schemas.ts";
 
 /** Factory provenance, saved with the completed candidate gate stage (never baseline checks). */
 export interface GateEvidence {
@@ -16,27 +17,62 @@ export function gateTestCommand(command: string, scripts: Record<string, string>
   return expanded && /^[\w./-]+(?: [\w./:=@-]+)*$/.test(expanded) ? expanded : null;
 }
 
-function covers(check: GateEvidence["checks"][number], instructions: string): boolean {
+const gateClaim =
+  /\bgate\s+(?:run|stage|check|results?|evidence)\b|\bverified\s+by\s+gate\b|\bfactory\s+gates?\b/i;
+const stripCitations = (text: string): string =>
+  text
+    .split(/\r?\n/)
+    .filter((line) => !gateClaim.test(line))
+    .join("\n")
+    .trim();
+
+/** Sanitize before schema parsing discards unknown, model-supplied provenance. */
+export const ModelVerifySchema = z.preprocess((value) => {
+  const parsed = VerifySchema.safeParse(value);
+  if (!parsed.success) return value;
+  const rows =
+    value && typeof value === "object" && "criteria" in value && Array.isArray(value.criteria)
+      ? value.criteria
+      : [];
+  return {
+    ...parsed.data,
+    criteria: parsed.data.criteria.map((criterion, index) => {
+      const raw: unknown = rows[index];
+      return raw && typeof raw === "object" && "gateEvidence" in raw
+        ? { ...criterion, status: criterion.status === "met" ? "blocked" : criterion.status }
+        : criterion;
+    }),
+  };
+}, VerifySchema);
+
+/** Each nonempty line must be a complete simple command; prose/inspections fail closed. */
+function verificationCommands(instructions: string): string[] {
+  return instructions
+    .split(/\r?\n/)
+    .map((line) =>
+      line
+        .trim()
+        .replace(/^(?:[-*] |\d+[.)] )/, "")
+        .replace(/^Run\s+/i, "")
+        .replace(/^`([^`]+)`\.?$/, "$1"),
+    )
+    .filter(Boolean);
+}
+
+function covers(check: GateEvidence["checks"][number], requestedCommand: string): boolean {
   const command = check.testCommand;
   if (!command) return false;
-  if (/[;&|<>]/.test(instructions)) return false;
-  const exact = instructions
-    .trim()
-    .replace(/^Run\s+/i, "")
-    .replace(/^`|`\.?$/g, "");
   if (!command.startsWith("bun test")) {
-    return exact === command && !/\b(?:skip(?:ped)?|todo)\b/i.test(check.result.output);
+    return requestedCommand === command || requestedCommand === check.result.command;
   }
   // File headers and passing rows prove that the broad suite actually discovered and ran the file.
   // A tail without its header, a skipped file, flags/filters and unsupported runners fail closed.
-  const requestedCommand = exact === check.result.command ? command : instructions;
-  const commands = requestedCommand.match(/\bbun test(?: [\w./-]+)*/g) ?? [];
-  if (commands.length !== 1) return false;
-  const requested =
-    commands[0]
-      ?.split(" ")
-      .slice(2)
-      .map((path) => path.replace(/^\.\//, "")) ?? [];
+  const expanded = requestedCommand === check.result.command ? command : requestedCommand;
+  if (!/^bun test(?: [\w./-]+)*$/.test(expanded)) return false;
+  const requested = expanded
+    .split(" ")
+    .slice(2)
+    .map((path) => path.replace(/^\.\//, ""));
   const selected = command
     .split(" ")
     .slice(2)
@@ -66,15 +102,19 @@ function covers(check: GateEvidence["checks"][number], instructions: string): bo
 
 function passed(check: GateEvidence["checks"][number]): boolean {
   const clean = (result: GateComparison["result"]): boolean =>
+    result.ok &&
+    result.exitCode === 0 &&
+    !result.timedOut &&
     !result.confinementError &&
     !result.output.includes("sandbox_apply: Operation not permitted") &&
+    !result.testCoverage?.skippedFiles.length &&
+    !/\((?:skip|todo|fail)\)|\b(?:skip(?:ped)?|todo|not run)\b|(?:^|\n)\s*(?:[1-9]\d* fail|0 pass)\b/i.test(
+      result.output,
+    ) &&
     (!result.firstAttempt || clean(result.firstAttempt));
   return (
-    ["pass", "fixed", "new_pass", "flaky"].includes(check.verdict) &&
+    ["pass", "fixed", "new_pass"].includes(check.verdict) &&
     !check.blocking &&
-    check.result.ok &&
-    check.result.exitCode === 0 &&
-    !check.result.timedOut &&
     clean(check.result) &&
     (!check.firstAttempt || clean(check.firstAttempt))
   );
@@ -90,18 +130,32 @@ export function applyGateEvidence(
 ): Verify {
   return {
     ...verify,
+    notes: stripCitations(verify.notes),
     criteria: verify.criteria.map((criterion) => {
-      if (criterion.status === "unmet" || criterion.status === "unclear") return criterion;
       // Re-evaluate a previously substituted row on resume, including after a changed HEAD.
-      const blocked = criterion.gateEvidence
-        ? {
-            ...criterion,
-            status: "blocked" as const,
-            evidence: criterion.gateEvidence.blockedEvidence,
-            gateEvidence: undefined,
-          }
-        : criterion;
-      if (blocked.status !== "blocked" || !gates || gates.sha !== sha || !/^[a-f\d]{40}$/i.test(sha))
+      const { gateEvidence, ...row } = criterion;
+      const claimed =
+        gateEvidence ||
+        [criterion.evidence, criterion.publicSummary, criterion.requirementCitation ?? "", verify.notes].some(
+          (text) => gateClaim.test(text),
+        );
+      const blocked = {
+        ...row,
+        status: claimed && row.status === "met" ? ("blocked" as const) : row.status,
+        evidence:
+          stripCitations(gateEvidence?.blockedEvidence ?? row.evidence) ||
+          "The verifier did not provide independently observed evidence.",
+        publicSummary: stripCitations(row.publicSummary),
+        requirementCitation: stripCitations(row.requirementCitation ?? ""),
+      };
+      if (
+        blocked.status !== "blocked" ||
+        !gates ||
+        gates.sha !== sha ||
+        !/^[a-f\d]{40}$/i.test(sha) ||
+        !gates.checks.length ||
+        !gates.checks.every(passed)
+      )
         return blocked;
       const definitions = [
         ...spec.acceptance_criteria.filter((ac) => ac.id === blocked.id).map((ac) => ac.how_to_verify),
@@ -110,9 +164,13 @@ export function applyGateEvidence(
           .map((scenario) => scenario.steps),
       ];
       if (definitions.length !== 1) return blocked;
-      const check = gates.checks.find((check) => passed(check) && covers(check, definitions[0] ?? ""));
-      if (!check) return blocked;
-      const citation = `verified by gate run ${gates.stageId} on ${sha}; check ${check.name} (${check.result.command})`;
+      const commands = verificationCommands(definitions[0] ?? "");
+      const covering = commands.map((command) => gates.checks.find((check) => covers(check, command)));
+      if (!commands.length || covering.some((check) => !check)) return blocked;
+      const checks = [...new Set(covering)].filter((check) => check !== undefined);
+      const checkNames = checks.map((check) => check.name).join(", ");
+      const checkCommands = checks.map((check) => check.result.command).join("; ");
+      const citation = `verified by gate run ${gates.stageId} on ${sha}; check ${checkNames} (${checkCommands})`;
       return {
         ...blocked,
         status: "met" as const,
@@ -120,8 +178,8 @@ export function applyGateEvidence(
         gateEvidence: {
           stageId: gates.stageId,
           sha,
-          check: check.name,
-          command: check.result.command,
+          check: checkNames,
+          command: checkCommands,
           blockedEvidence: blocked.evidence,
         },
       };

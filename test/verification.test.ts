@@ -344,7 +344,7 @@ test("private literals do not match inside longer words or dollar-prefixed ident
   );
 });
 
-test("verifier cites the factory's gate results instead of rerunning whole suites", () => {
+test("verifier leaves gate citations to the engine instead of rerunning whole suites", () => {
   const result = (name: string, ok: boolean) => ({
     name,
     command: `bun run ${name}`,
@@ -366,6 +366,8 @@ test("verifier cites the factory's gate results instead of rerunning whole suite
   expect(prompt).toContain("- lint `bun run lint`: pass");
   expect(prompt).toContain("- test `bun run test`: FAIL (still failing)");
   expect(prompt).toContain("Do not rerun these full commands as evidence");
+  expect(prompt).toContain("Leave all gate citation and coverage decisions to the engine");
+  expect(prompt).toContain("do not mark a criterion met based on these results");
   // Without gate results (evals), the prompt is unchanged so cached eval results stay valid.
   expect(verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" })).not.toContain(
     "Repository checks",

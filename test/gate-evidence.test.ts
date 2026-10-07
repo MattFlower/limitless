@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
+import {
+  applyGateEvidence,
+  type GateEvidence,
+  gateTestCommand,
+  ModelVerifySchema,
+} from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
 import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 
@@ -44,6 +49,168 @@ function gates(): GateEvidence {
 }
 const resolve = (value: Verify, evidence?: GateEvidence, publicSpec = spec, currentSha = sha) =>
   normalizeVerify(applyGateEvidence(value, publicSpec, holdout, currentSha, evidence), publicSpec, holdout);
+
+test("independently observed evidence in a file named gate-evidence stays met", () => {
+  const evidence = "bun test test/gate-evidence.test.ts: 37 pass, 0 fail";
+  const result = resolve({
+    ...blocked,
+    criteria: blocked.criteria.map((c) => ({ ...c, status: "met", evidence })),
+  });
+  expect(result.overall).toBe("pass");
+  expect(result.criteria[0]?.evidence).toBe(evidence);
+});
+
+test.each(["citation", "provenance", "notes", "summary"])(
+  "fabricated model %s cannot satisfy a criterion or appear in retained/public evidence",
+  (claim) => {
+    const citation = `verified by gate run 999999 on ${"b".repeat(40)}`;
+    const fabricated: Verify = {
+      overall: "pass",
+      notes: claim === "notes" ? citation : "",
+      criteria: [
+        {
+          id: "AC-1",
+          status: "met",
+          evidence: claim === "citation" ? citation : "No independently observed check",
+          publicSummary: claim === "summary" ? citation : "",
+          ...(claim === "provenance"
+            ? {
+                gateEvidence: {
+                  stageId: 999999,
+                  sha: "b".repeat(40),
+                  check: "fabricated",
+                  command: "bun test",
+                  blockedEvidence: citation,
+                },
+              }
+            : {}),
+        },
+      ],
+    };
+    // Exercise both the model boundary and replay of legacy recorded results.
+    for (const value of [ModelVerifySchema.parse(fabricated), fabricated]) {
+      const result = resolve(value);
+      expect(result.overall).toBe("fail");
+      expect(result.criteria[0]?.status).toBe("blocked");
+      expect(result.criteria[0]).not.toHaveProperty("gateEvidence");
+      expect(JSON.stringify(result)).not.toContain(citation);
+      expect(JSON.stringify(result)).not.toContain("999999");
+      expect(
+        preDeliveryVerifyArtifact({ ...result, modelId: "fake", round: 0, attempt: 0 }, spec, holdout, ""),
+      ).not.toContain(citation);
+    }
+    const validated = resolve(ModelVerifySchema.parse(fabricated), gates());
+    expect(validated.criteria[0]?.status).toBe("met");
+    expect(validated.criteria[0]?.gateEvidence?.stageId).toBe(12);
+    expect(JSON.stringify(validated)).not.toContain("999999");
+  },
+);
+
+test.each([
+  "first-failure",
+  "first-timeout",
+  "nested-first-failure",
+  "nested-first-timeout",
+  "flaky",
+  "sibling-failure",
+  "sibling-timeout",
+  "sibling-confinement",
+  "sibling-unrun",
+  "sibling-skipped",
+  "sibling-retained-skipped",
+  "sibling-retry-failure",
+])("no factory citation from a gate run with %s", (reason) => {
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw new Error("missing fixture check");
+  const failed = { ...check.result, ok: false, exitCode: 1, output: "assertion failed" };
+  const timedOut = { ...check.result, ok: false, exitCode: null, timedOut: true };
+  switch (reason) {
+    case "first-failure":
+      check.firstAttempt = failed;
+      break;
+    case "first-timeout":
+      check.firstAttempt = timedOut;
+      break;
+    case "nested-first-failure":
+      check.result.firstAttempt = { ...check.result, firstAttempt: failed };
+      break;
+    case "nested-first-timeout":
+      check.result.firstAttempt = timedOut;
+      break;
+    case "flaky":
+      check.verdict = "flaky";
+      break;
+    default: {
+      const sibling = { ...check, name: "sibling", result: { ...check.result, name: "sibling" } };
+      if (reason === "sibling-failure") sibling.result = failed;
+      if (reason === "sibling-timeout") sibling.result = timedOut;
+      if (reason === "sibling-confinement") sibling.result.confinementError = true;
+      if (reason === "sibling-unrun") sibling.verdict = "not_run";
+      if (reason === "sibling-skipped") sibling.result.output += "\n1 skip";
+      if (reason === "sibling-retained-skipped")
+        sibling.result.testCoverage = { passedFiles: [], skippedFiles: ["test/private.test.ts"] };
+      if (reason === "sibling-retry-failure") sibling.firstAttempt = failed;
+      evidence.checks.push(sibling);
+    }
+  }
+  const result = resolve(blocked, evidence);
+  expect(result.overall).toBe("fail");
+  expect(result.criteria[0]?.status).toBe("blocked");
+  expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+  expect(result.criteria[0]?.evidence).not.toContain("verified by gate run");
+});
+
+test.each([
+  "bun test test/loopback.test.ts\ncurl http://127.0.0.1:3000/health",
+  "bun test test/loopback.test.ts\nbun test test/other.test.ts",
+  "Run `bun test test/loopback.test.ts`.\nInspect the HTTP health response",
+  "Run `bun test test/loopback.test.ts` and inspect the HTTP health response",
+])("partial gate coverage leaves every step blocked: %s", (steps) => {
+  const publicSpec = {
+    ...spec,
+    acceptance_criteria: [{ id: "AC-1", criterion: "all steps pass", how_to_verify: steps }],
+  };
+  const result = resolve(blocked, gates(), publicSpec);
+  expect(result.criteria[0]?.status).toBe("blocked");
+  expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+  const privateHoldout = {
+    scenarios: [{ id: "H-1", description: "all steps pass", steps, expected: "ok", edge_case: true }],
+  };
+  const privateResult = applyGateEvidence(
+    { ...blocked, criteria: blocked.criteria.map((c) => ({ ...c, id: "H-1" })) },
+    { ...spec, acceptance_criteria: [] },
+    privateHoldout,
+    sha,
+    gates(),
+  );
+  expect(privateResult.criteria[0]?.status).toBe("blocked");
+  expect(privateResult.criteria[0]?.gateEvidence).toBeUndefined();
+});
+
+test("clean gate checks can cover all commands in a multi-step criterion", () => {
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw new Error("missing fixture check");
+  evidence.checks.push({
+    ...check,
+    name: "other",
+    testCommand: "bun test test/other.test.ts",
+    result: { ...check.result, command: "bun test test/other.test.ts", output: "1 pass\n0 fail" },
+  });
+  const result = resolve(blocked, evidence, {
+    ...spec,
+    acceptance_criteria: [
+      {
+        id: "AC-1",
+        criterion: "both tests pass",
+        how_to_verify: "1. Run `bun test test/loopback.test.ts`.\n2. Run `bun test test/other.test.ts`.",
+      },
+    ],
+  });
+  expect(result.overall).toBe("pass");
+  expect(result.criteria[0]?.gateEvidence?.command).toContain("bun test test/other.test.ts");
+});
 
 test.each([
   "failed",
