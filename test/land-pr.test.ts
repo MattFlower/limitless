@@ -17,6 +17,7 @@ import { seeded } from "./seeded.ts";
 
 const script = resolve("scripts/land-pr.sh");
 const entry = "secret-host.example";
+const origin = "https://github.com/MattFlower/limitless.git";
 // Fake git scripts dispatch on the subcommand, after the global options land prepends.
 const gitSubcommand =
   'sub=""; skip=""; for a in "$@"; do if [ -n "$skip" ]; then skip=""; continue; fi; case "$a" in -c|-C) skip=1 ;; -*) ;; *) sub="$a"; break ;; esac; done';
@@ -94,6 +95,7 @@ describe("land-pr private strings", () => {
       for (const dir of [source, config, bin]) mkdirSync(dir);
       const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
       await git("init", "-q", "-b", "main");
+      await git("remote", "add", "origin", origin);
       writeFileSync(join(source, "file.txt"), "base\n");
       await git("add", ".");
       await git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base");
@@ -128,7 +130,11 @@ describe("land-pr private strings", () => {
         await git("-C", work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message);
         expectedHead = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
       };
-      if (scenario.startsWith("utf16-")) await git("config", "i18n.logOutputEncoding", "UTF-16");
+      const globalConfig = join(root, "global.config");
+      writeFileSync(
+        globalConfig,
+        `${readFileSync(process.env.GIT_CONFIG_GLOBAL ?? "/dev/null", "utf8")}${scenario.startsWith("utf16-") ? "\n[i18n]\nlogOutputEncoding = UTF-16\n" : ""}`,
+      );
       if (scenario.endsWith("author-email")) {
         await git("-C", work, "add", ".");
         await git(
@@ -217,6 +223,7 @@ describe("land-pr private strings", () => {
           ...process.env,
           PATH: `${bin}:${process.env.PATH}`,
           LIMITLESS_CONFIG_DIR: configDir,
+          GIT_CONFIG_GLOBAL: globalConfig,
           TMPDIR: root,
         },
         allowFail: true,
@@ -258,6 +265,11 @@ test.each([
   "working-tree",
   "config-failed-before",
   "config-failed-after",
+  "planted-before",
+  "include-before",
+  "origin-elsewhere",
+  "fresh-clone",
+  "install-config",
 ])(
   "land publishes only its trusted SHA, preserves working-tree edits and refuses repository config tampering: %s",
   async (scenario) => {
@@ -274,10 +286,21 @@ test.each([
       const gitBin = Bun.which("git");
       if (!gitBin) throw new Error("missing git");
       const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
-      await git("worktree", "add", "-qb", "pr", work);
-      await git("remote", "add", "origin", remote);
+      if (scenario === "fresh-clone") {
+        await git("clone", "-q", "--reference", source, source, work);
+        await git("-C", work, "checkout", "-qb", "pr");
+        // Git preserves subsection case; the allowlist must accept it as well.
+        await git("-C", work, "config", "branch.PR.remote", "origin");
+        await git("-C", work, "config", "branch.PR.merge", "refs/heads/main");
+        await git("-C", work, "remote", "set-url", "origin", "git@github.com:MattFlower/limitless.git");
+      } else await git("worktree", "add", "-qb", "pr", work);
+      await git("remote", "add", "origin", origin);
       await git("-C", alternate, "remote", "set-url", "origin", remote);
-      await git("config", "push.followTags", "true");
+      const globalConfig = join(root, "global.config");
+      writeFileSync(
+        globalConfig,
+        `${readFileSync(process.env.GIT_CONFIG_GLOBAL ?? "/dev/null", "utf8")}\n[push]\nfollowTags = true\n`,
+      );
       await git("tag", "-am", "safe tag", "local-tag");
       // Make the alternate commit available to HEAD-movement attacks without publishing it.
       await git("fetch", "-q", alternate, "main");
@@ -285,20 +308,42 @@ test.each([
       writeFileSync(join(config, "private-strings.txt"), entry);
       const paths = [
         realpathSync(work),
-        realpathSync(join(source, ".git/worktrees/work")),
-        realpathSync(join(source, ".git")),
+        realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git/worktrees/work")),
+        realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git")),
       ];
       const recorded = await sh([process.execPath, resolve("scripts/check-private-strings.ts"), "--record"], {
         cwd: work,
       });
       expect(recorded.stdout.trim().split("\n")).toEqual(paths);
-      expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
+      if (scenario !== "fresh-clone")
+        expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
       const calls = join(root, "calls");
       const pinned = join(root, "pinned");
       const checked = join(root, "checked");
       const marker = join(root, "config-command-ran");
       const injected = join(root, "injected.config");
       const command = `touch '${marker}'`;
+      const plantedKey =
+        scenario === "planted-before"
+          ? "remote.origin.receivepack"
+          : scenario === "include-before"
+            ? "include.path"
+            : scenario === "origin-elsewhere"
+              ? "remote.origin.url"
+              : undefined;
+      if (plantedKey) {
+        if (scenario === "include-before") writeFileSync(injected, "[core]\nfilemode = true\n");
+        // Model a lifecycle script that ran in this clone before land-pr.sh started.
+        await git(
+          "config",
+          plantedKey,
+          scenario === "include-before"
+            ? injected
+            : scenario === "origin-elsewhere"
+              ? "https://github.com/elsewhere/secret-config-value.git"
+              : command,
+        );
+      }
       const tampered = [
         "remote.origin.receivepack",
         "core.sshCommand",
@@ -336,6 +381,10 @@ if (args[0] === "install" || args[0] === "run") {
     if (result.status !== 0) process.exit(result.status ?? 1);
   }
   writeFileSync(cwd + "-state", JSON.stringify([before, snapshot()]));
+  if (args[0] === "install" && ${JSON.stringify(scenario)} === "install-config") {
+    const changed = spawnSync(${JSON.stringify(gitBin)}, ["config", "branch.install.remote", "origin\\n\\n"], { stdio: "inherit" });
+    if (changed.status !== 0) process.exit(1);
+  }
 }
 if (args[0] === "run") {
   writeFileSync(${JSON.stringify(checked)}, "ran");
@@ -373,7 +422,8 @@ if (args.includes("--show-scope") && !args.includes("-z") && (${JSON.stringify(s
   console.error("secret-config-value");
   process.exit(1);
 }
-const result = spawnSync(${JSON.stringify(gitBin)}, args, { stdio: "inherit" });
+const deliveryArgs = args.includes("push") ? args.map(arg => arg === "origin" ? ${JSON.stringify(remote)} : arg) : args;
+const result = spawnSync(${JSON.stringify(gitBin)}, deliveryArgs, { stdio: "inherit" });
 process.exit(result.status ?? 1);
 `,
         { mode: 0o755 },
@@ -399,6 +449,7 @@ else if (args[1] === "view") {
           ...process.env,
           PATH: `${bin}:${process.env.PATH}`,
           LIMITLESS_CONFIG_DIR: config,
+          GIT_CONFIG_GLOBAL: globalConfig,
           TMPDIR: root,
         },
         allowFail: true,
@@ -411,7 +462,7 @@ else if (args[1] === "view") {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
-      if (tampered || scenario.startsWith("config-failed-")) {
+      if (tampered || plantedKey || scenario === "install-config" || scenario.startsWith("config-failed-")) {
         expect(result.exitCode).not.toBe(0);
         expect(result.stderr).toContain("git config");
         expect(result.stderr).toContain("refusing to");
@@ -420,7 +471,11 @@ else if (args[1] === "view") {
         expect(logged.some((call) => call.tool === "git" && call.args.includes("push"))).toBe(false);
         expect(logged.some((call) => call.tool === "gh" && call.args[1] === "merge")).toBe(false);
         expect(existsSync(marker)).toBe(false);
-        expect(existsSync(checked)).toBe(scenario !== "config-failed-before");
+        expect(existsSync(checked)).toBe(!plantedKey && scenario !== "config-failed-before");
+        if (plantedKey) {
+          expect(result.stderr).toContain(plantedKey);
+          expect(logged.some((call) => call.tool === "bun" && call.args[0] === "install")).toBe(false);
+        }
         return;
       }
       if (scenario === "working-tree") {
@@ -452,6 +507,15 @@ else if (args[1] === "view") {
       const recordedAt = logged.findIndex((call) => call.tool === "recorded");
       expect(recordedAt).toBeGreaterThan(0);
       expect(installed).toBeGreaterThan(recordedAt);
+      const validations = logged
+        .map((call, index) => ({ call, index }))
+        .filter(
+          ({ call }) =>
+            call.tool === "git" && call.args.includes("--show-scope") && call.args.includes("--name-only"),
+        );
+      expect(validations).toHaveLength(2);
+      expect(validations[0]?.index).toBeLessThan(installed);
+      expect(validations[1]?.index).toBeGreaterThan(installed);
       for (const call of logged.slice(recordedAt + 1).filter((call) => call.tool !== "gh")) {
         const check = call.tool === "bun" && ["install", "run"].includes(call.args[0] ?? "");
         expect(call.paths).toEqual(check ? [null, null, null] : paths);
@@ -513,6 +577,7 @@ test.each([
     const work = join(root, "work");
     const source = join(root, "source");
     await sh(["git", "worktree", "add", "-qb", "pr", work], { cwd: source });
+    await sh(["git", "remote", "add", "origin", origin], { cwd: source });
     const paths = [
       realpathSync(work),
       realpathSync(join(source, ".git/worktrees/work")),
@@ -587,7 +652,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     );
     writeFileSync(
       join(bin, "git"),
-      '#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; esac\n',
+      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *config*-z*--get-all*) printf '${origin}\\000' ;; esac\n`,
       { mode: 0o755 },
     );
     mkdirSync(join(root, "admin"));
@@ -623,7 +688,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     );
     writeFileSync(
       join(bin, "git"),
-      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *config*--name-only*--get-regexp*) exit 1 ;; *config*--list*--show-scope*) exit 0 ;; *) touch '${marker}'; exit 1 ;; esac\n`,
+      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *config*--name-only*--get-regexp*) exit 1 ;; *config*--list*--show-scope*) exit 0 ;; *config*-z*--get-all*) printf '${origin}\\000' ;; *) touch '${marker}'; exit 1 ;; esac\n`,
       { mode: 0o755 },
     );
     writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
@@ -667,6 +732,7 @@ test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "m
       for (const path of [work, config, bin]) mkdirSync(path);
       const git = (...args: string[]) => sh([gitBin, ...args], { cwd: work });
       await git("init", "-qb", "main");
+      await git("remote", "add", "origin", origin);
       writeFileSync(join(work, "file"), "base");
       await git("add", ".");
       await git("commit", "-qm", "base");
