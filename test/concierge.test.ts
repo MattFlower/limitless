@@ -15,6 +15,26 @@ afterEach(() => {
   f.close();
 });
 const send = (text = "Help me") => f.factory.concierge.submit("one", { type: "text", text });
+test("chat reports and persists origin exclusions without invoking a harness", async () => {
+  const model = f.factory.router.model("fake/chat");
+  if (!model) throw new Error("missing chat model");
+  const models = [{ ...model, origin: "CN", baseOrigin: "CN" }];
+  const policy = { ...DEFAULT_POLICY, chat: { default: [model.id] } };
+  f.factory.deps.router = new Router(f.factory.tracker, policy, models, [], ["CN"]);
+  const history = await send();
+  expect(history.messages.at(-1)).toMatchObject({
+    role: "assistant",
+    content: expect.stringContaining("origin excluded (CN; baseOrigin=CN)"),
+    outcome: { error: true },
+  });
+  expect(f.harnessCalls).toEqual([]);
+  expect(f.specs).toEqual([]);
+  f.reopen();
+  expect(f.factory.concierge.history("one").messages.at(-1)).toEqual(history.messages.at(-1));
+  f.factory.deps.router = new Router(f.factory.tracker, policy, models);
+  expect((await send()).messages.at(-1)?.content).toBe("Hello");
+  expect(f.harnessCalls).toEqual(["fake"]);
+});
 test("proposal allowances remain optional input and required in strict model output", () => {
   expect(ChatProposalSchema.parse(proposalFields).allow).toEqual([]);
   expect(toStrictJsonSchema(ChatProposalSchema).required).toContain("allow");

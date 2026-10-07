@@ -14,6 +14,7 @@ import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harne
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveCatalog } from "../src/router/config-catalog.ts";
 import { discoversModels, servedIds } from "../src/router/discovery.ts";
+import { originExclusion, parseExcludeOrigins } from "../src/router/origins.ts";
 import { resolveTarget } from "../src/router/targets.ts";
 import { processScope, sh } from "../src/util/proc.ts";
 
@@ -347,19 +348,27 @@ const schema = {
   additionalProperties: false,
 };
 
+function eligibleModels(models: ModelDef[], excludeOrigins?: readonly string[]): ModelDef[] {
+  const eligible = models.filter((model) => !originExclusion(model, excludeOrigins));
+  if (models.length && !eligible.length)
+    throw new Error([...new Set(models.map((model) => originExclusion(model, excludeOrigins)))].join("; "));
+  return eligible;
+}
+
 /** Cheapest first; equal prices keep catalog order (stable sort), as free-first routing does. */
-function modelsByPrice(provider: string, catalog = MODELS): ModelDef[] {
-  const models = catalog
-    .filter((m) => m.provider === provider && m.source !== "runtime")
-    .sort((a, b) => a.price.input + a.price.output - b.price.input - b.price.output);
+function modelsByPrice(provider: string, catalog = MODELS, excludeOrigins?: readonly string[]): ModelDef[] {
+  const models = eligibleModels(
+    catalog.filter((m) => m.provider === provider && m.source !== "runtime"),
+    excludeOrigins,
+  ).sort((a, b) => a.price.input + a.price.output - b.price.input - b.price.output);
   if (models.length === 0) throw new Error(`no catalog model for ${provider}`);
   return models;
 }
 
-function cheapestModel(provider: string, catalog = MODELS): ModelDef {
+function cheapestModel(provider: string, catalog = MODELS, excludeOrigins?: readonly string[]): ModelDef {
   // On metered providers, ":free" variants are rate-limited and queue unpredictably; checking the
   // contract with the cheapest paid model costs a fraction of a cent and gives stable timing.
-  const models = modelsByPrice(provider, catalog);
+  const models = modelsByPrice(provider, catalog, excludeOrigins);
   const paid = models.filter((m) => !m.model.endsWith(":free"));
   const model = paid[0] ?? models[0];
   if (!model) throw new Error(`no catalog model for ${provider}`);
@@ -370,9 +379,10 @@ function cheapestModel(provider: string, catalog = MODELS): ModelDef {
 export async function checkCodexModels(
   models: ModelDef[],
   check: (model: ModelDef) => Promise<CheckResult>,
+  excludeOrigins?: readonly string[],
 ): Promise<{ result: CheckResult; model: ModelDef }> {
   const rejected: string[] = [];
-  const sorted = models.toSorted(
+  const sorted = eligibleModels(models, excludeOrigins).toSorted(
     (a, b) => a.price.input + a.price.output - b.price.input - b.price.output || a.id.localeCompare(b.id),
   );
   for (const model of sorted) {
@@ -910,6 +920,7 @@ export function backendChecks(
   check = liveCheck,
   decide = decisionsCheck,
   catalog = { providers: PROVIDERS, models: MODELS },
+  excludeOrigins?: readonly string[],
 ): SmokeCheck[] {
   const checks: SmokeCheck[] = [];
   for (const id of ["omlx", "twilight", "openrouter"]) {
@@ -920,13 +931,14 @@ export function backendChecks(
         name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
         timeoutMs: provider.billing === "free" ? 330_000 : 90_000,
         run: async (signal) => {
+          const model = cheapestModel(id, catalog.models, excludeOrigins);
           const unavailable = await providerAvailability(provider, secrets, fetchHealth);
           if (unavailable) return unavailable;
           return check(
             runClaude,
             targetFor(
               provider,
-              cheapestModel(id, catalog.models),
+              model,
               provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey,
             ),
             kind,
@@ -942,50 +954,49 @@ export function backendChecks(
     name: "typesafe decisions",
     timeoutMs: 90_000,
     run: async (signal) => {
+      const model = cheapestModel("typesafe", catalog.models, excludeOrigins);
       const unavailable = await providerAvailability(typesafe, secrets, fetchHealth);
       if (unavailable) return unavailable;
-      return decide(
-        targetFor(typesafe, cheapestModel("typesafe", catalog.models), secrets[key]),
-        runDecisions,
-        signal,
-      );
+      return decide(targetFor(typesafe, model, secrets[key]), runDecisions, signal);
     },
   });
   return checks;
 }
 
-export async function main(print = console.log, options: RunOptions = {}): Promise<number> {
-  const index = process.argv.indexOf("--models");
-  if (index >= 0) {
-    const references = process.argv[index + 1];
-    if (!references) throw new Error("--models requires model@effort references");
-    const checks: SmokeCheck[] = references.split(",").map((reference) => {
-      const resolved = resolveTarget(reference, (id) => MODELS.find((m) => m.id === id));
-      const provider = PROVIDERS.find((p) => p.id === resolved.model.provider);
-      if (!provider || !["claude", "codex"].includes(provider.id))
-        throw new Error("Explicit effort smoke checks require native Claude or Codex");
-      const target = { ...targetFor(provider, resolved.model), effort: resolved.effort };
-      return {
-        name: `${resolved.targetId} structured`,
-        timeoutMs: 90_000,
-        run: (signal) =>
-          liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
-      };
-    });
-    return reportChecks(checks, print, options);
-  }
-  const cfg = loadConfig();
-  const { secrets } = cfg;
-  const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
-  const store = new Store(cfg.paths.db);
-  const runtime = store.runtimeModels();
-  const enabled = catalog.providers.filter((p) => store.getProviderEnabledOverride(p.id) !== false);
-  store.close();
+export function explicitModelChecks(
+  references: string,
+  catalog = { providers: PROVIDERS, models: MODELS },
+  excludeOrigins?: readonly string[],
+  check = liveCheck,
+): SmokeCheck[] {
+  return references.split(",").map((reference) => {
+    const resolved = resolveTarget(reference, (id) => catalog.models.find((m) => m.id === id));
+    const reason = originExclusion(resolved.model, excludeOrigins);
+    if (reason) throw new Error(`${resolved.targetId}: ${reason}`);
+    const provider = catalog.providers.find((p) => p.id === resolved.model.provider);
+    if (!provider || !["claude", "codex"].includes(provider.id))
+      throw new Error("Explicit effort smoke checks require native Claude or Codex");
+    const target = { ...targetFor(provider, resolved.model), effort: resolved.effort };
+    return {
+      name: `${resolved.targetId} structured`,
+      timeoutMs: 90_000,
+      run: (signal) => check(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
+    };
+  });
+}
+
+export function nativeChecks(
+  catalog = { providers: PROVIDERS, models: MODELS },
+  excludeOrigins?: readonly string[],
+  check = liveCheck,
+): SmokeCheck[] {
   const checks: SmokeCheck[] = [];
   for (const id of ["claude", "codex"]) {
-    const provider = enabled.find((p) => p.id === id);
+    const provider = catalog.providers.find((p) => p.id === id);
     if (!provider) continue;
-    let target = targetFor(provider, cheapestModel(id, catalog.models));
+    let target: ModelTarget | undefined;
+    const selectedTarget = () =>
+      (target ??= targetFor(provider, cheapestModel(id, catalog.models, excludeOrigins)));
     const harness = id === "claude" ? runClaude : runCodex;
     for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify", "confine"] as const) {
       checks.push({
@@ -993,28 +1004,57 @@ export async function main(print = console.log, options: RunOptions = {}): Promi
         // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
         timeoutMs:
           id === "codex" && kind === "structured"
-            ? 60_000 * modelsByPrice(id, catalog.models).length + 30_000
+            ? 60_000 * catalog.models.filter((m) => m.provider === id && m.source !== "runtime").length +
+              30_000
             : kind === "verify" || kind === "confine"
               ? 120_000
               : 90_000,
         run: async (signal) => {
           if (id === "codex" && kind === "structured") {
-            const selected = await checkCodexModels(modelsByPrice(id, catalog.models), (model) =>
-              liveCheck(harness, targetFor(provider, model), kind, signal),
+            const selected = await checkCodexModels(
+              modelsByPrice(id, catalog.models, excludeOrigins),
+              (model) => check(harness, targetFor(provider, model), kind, signal),
+              excludeOrigins,
             );
             target = targetFor(provider, selected.model);
             return selected.result;
           }
-          return liveCheck(harness, target, kind, signal);
+          return check(harness, selectedTarget(), kind, signal);
         },
       });
     }
   }
+  return checks;
+}
+
+export async function main(print = console.log, options: RunOptions = {}): Promise<number> {
+  const cfg = loadConfig();
+  const { secrets } = cfg;
+  const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
+  const excludeOrigins = parseExcludeOrigins(cfg.raw);
+  const index = process.argv.indexOf("--models");
+  if (index >= 0) {
+    const references = process.argv[index + 1];
+    if (!references) throw new Error("--models requires model@effort references");
+    return reportChecks(explicitModelChecks(references, catalog, excludeOrigins), print, options);
+  }
+  const store = new Store(cfg.paths.db);
+  const runtime = store.runtimeModels();
+  const enabled = catalog.providers.filter((p) => store.getProviderEnabledOverride(p.id) !== false);
+  store.close();
+  const checks = nativeChecks({ providers: enabled, models: catalog.models }, excludeOrigins);
   checks.push(
-    ...backendChecks(secrets, fetch, liveCheck, decisionsCheck, {
-      providers: enabled,
-      models: catalog.models,
-    }),
+    ...backendChecks(
+      secrets,
+      fetch,
+      liveCheck,
+      decisionsCheck,
+      {
+        providers: enabled,
+        models: catalog.models,
+      },
+      excludeOrigins,
+    ),
   );
   checks.push(...catalogChecks(enabled, [...catalog.models, ...runtime], secrets));
   return reportChecks(checks, print, options);

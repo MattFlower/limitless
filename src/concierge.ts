@@ -246,11 +246,15 @@ export class Concierge {
     const signal = AbortSignal.timeout(120_000);
     let failure = "No model available for chat";
     for (let attempt = 0; attempt < 3; attempt++) {
-      const candidates = router
-        .route("chat", "small", { exclude: tried })
-        .candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
+      const decision = router.route("chat", "small", { exclude: tried });
+      const candidates = decision.candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
       const target = candidates[0];
-      if (!target) break;
+      if (!target) {
+        const exclusions = decision.skipped.filter((s) => s.reason.startsWith("origin excluded ("));
+        if (exclusions.length)
+          failure += `: ${exclusions.map((s) => `${s.modelId} (${s.reason})`).join(", ")}`;
+        break;
+      }
       // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
       const { harnessName, noTools } = selectHarness("chat", target);
       const harness = harnesses[harnessName];
