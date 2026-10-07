@@ -28,9 +28,10 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function makeFactory(store: Store, policy?: Policy) {
+function makeFactory(store: Store, policy?: Policy, excludeOrigins?: string[]) {
   const cfg = loadConfig({ home: dir, configDir: dir, port: 7400 });
   cfg.preferProviders = ["claude"];
+  if (excludeOrigins !== undefined) cfg.raw.routing = { exclude_origins: excludeOrigins };
   cfg.secrets.OMLX_API_KEY = "fake-key";
   const harness = fakeHarness((spec) => {
     calls.push(spec.target.modelId);
@@ -681,4 +682,86 @@ test("routing API requires a session through an authenticated proxy", async () =
     (await call("/api/routing/prefer", "PUT", { prefer: ["codex"] }, { ...headers, cookie }, server)).status,
   ).toBe(200);
   expect(factory.routing.prefer).toEqual(["codex"]);
+});
+
+test("origin safety is read-only, refuses setup writes, and marks accepted runtime catalog additions", async () => {
+  factory.store.close();
+  factory = makeFactory(new Store(":memory:"), undefined, ["CN"]);
+  const call = client();
+  const reason = "origin excluded (CN; baseOrigin=CN)";
+  expect((await (await call("/api/routing")).json()).excludeOrigins).toEqual(["CN"]);
+  const response = await call("/api/routing/cells/review/default", "PUT", {
+    groups: ["claude/opus|openrouter/deepseek-v4-pro"],
+  });
+  expect(response.status).toBe(400);
+  expect(await response.text()).toContain(reason);
+  expect(factory.store.routingCells()).toEqual([]);
+  const cn = factory.models.find((m) => m.origin === "CN");
+  if (!cn) throw new Error("missing CN model");
+  factory.router.setPolicy({ ...factory.policy, review: { default: [cn.id] } });
+  expect(await (await call("/api/routing/preview?role=review")).json()).toContainEqual({
+    modelId: factory.router.resolve(cn.id).targetId,
+    eligible: false,
+    reason: `origin excluded (${cn.origin}; baseOrigin=${cn.baseOrigin})`,
+  });
+  expect(
+    (
+      await call("/api/catalog/models", "POST", {
+        ...customModel,
+        provider: "codex",
+        id: "excluded",
+      })
+    ).status,
+  ).toBe(201);
+  const catalog = await (await call("/api/catalog")).json();
+  expect(catalog.excludeOrigins).toEqual(["CN"]);
+  expect(catalog.models).toContainEqual(
+    expect.objectContaining({
+      id: "codex/excluded",
+      excluded: reason,
+    }),
+  );
+  factory.router.setPolicy({ ...factory.policy, review: { default: ["codex/excluded"] } });
+  for (const constraints of [{ only: "codex/excluded" }, { prefer: "codex/excluded" }]) {
+    const result = factory.router.route("review", "small", constraints);
+    expect(result.candidates).toEqual([]);
+    expect(result.skipped).toContainEqual({ modelId: "codex/excluded@none", reason });
+  }
+});
+
+test("exhausted review and verify invocations never dispatch to excluded fallback models", async () => {
+  factory.store.close();
+  factory = makeFactory(new Store(":memory:"), undefined, ["CN"]);
+  const chain = ["claude/opus", "codex/sol", "openrouter/deepseek-v4-pro"];
+  factory.router.setPolicy({
+    ...factory.policy,
+    review: { default: chain },
+    verify: { default: chain },
+  });
+  factory.tracker.record("claude", "quota", { exhaustedUntil: 100_000 });
+  factory.tracker.record("codex", "quota", { exhaustedUntil: 100_000 });
+  const repo = factory.store.upsertRepo({
+    slug: "origin/repo",
+    kind: "local",
+    localPath: dir,
+    url: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "Review safely" });
+  const context = new RunContext(factory.deps, run, repo, new AbortController().signal);
+  for (const role of ["review", "verify"] as const) {
+    await expect(
+      context.invoke({
+        role,
+        stage: factory.store.startStage(run.id, role, 0),
+        prompt: "Review",
+        mode: "readonly",
+        complexity: "small",
+      }),
+    ).rejects.toThrow("origin excluded (CN; baseOrigin=CN)");
+  }
+  expect(calls).toEqual([]);
+  expect(factory.store.listInvocations(run.id)).toEqual([]);
+  expect(JSON.stringify(factory.store.listEvents(run.id))).toContain("origin excluded (CN; baseOrigin=CN)");
 });

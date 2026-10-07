@@ -511,9 +511,17 @@ export class RunContext {
       if (!target && lastResort && !chain)
         return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
+        const origins = decision.skipped
+          .filter((s) => s.reason.startsWith("origin excluded ("))
+          .map((s) => s.reason);
+        if (origins.length) this.log(`${opts.role}: ${[...new Set(origins)].join(", ")}`, "warn");
         if (chain) exhaustPinned(decision);
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
-        if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
+        if (opts.privateOutput) {
+          throw new NoCapacityError(
+            `No model available for ${opts.role}${origins.length ? `. ${origins.join(", ")}` : ""}`,
+          );
+        }
         throw new NoCapacityError(
           `No model available for ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}. Skipped: ${why || "none configured"}`,
         );

@@ -55,3 +55,70 @@ test("creation and retry validate before inserting; retries inherit, replace or 
     await f.close();
   }
 });
+
+test("excluded run and replacement retry pins fail before persistence; inherited chains still retry", async () => {
+  const f = await fixture(undefined, ["CN"]);
+  try {
+    const model = f.factory.router.model("fake/m");
+    if (!model) throw new Error("missing fake model");
+    model.origin = "CN";
+    model.baseOrigin = "CN";
+    const routes = createHttpRoutes(f.factory);
+    const repo = f.factory.store.upsertRepo({
+      slug: "origin/repo",
+      kind: "local",
+      localPath: f.repo,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const old = f.factory.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "Saved chain",
+      models: { review: ["fake/m"] },
+    });
+    for (const retry of [false, true]) {
+      const route = (routes[retry ? "/api/runs/:id/retry" : "/api/runs"] as { POST: Route }).POST;
+      const response = await route(
+        requestWithParams(
+          `http://localhost/api/runs${retry ? `/${old.id}/retry` : ""}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ repo: f.repo, prompt: "Blocked", models: { review: ["fake/m|fake/m"] } }),
+          },
+          retry ? { id: old.id } : {},
+        ),
+        localServer,
+      );
+      expect(response.status).toBe(400);
+      const error = await response.text();
+      expect(error).toContain("review");
+      expect(error).toContain("fake/m");
+      expect(error).toContain("origin excluded (CN; baseOrigin=CN)");
+      expect(f.factory.store.listRuns()).toHaveLength(1);
+    }
+    expect((await f.factory.retryRun(old.id)).models).toEqual(old.models);
+    expect(f.factory.store.listRuns()).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("CN pins remain accepted when exclude_origins is unset", async () => {
+  const f = await fixture();
+  try {
+    const model = f.factory.router.model("fake/m");
+    if (!model) throw new Error("missing fake model");
+    model.origin = "CN";
+    model.baseOrigin = "CN";
+    const run = await f.factory.createRun({
+      repo: f.repo,
+      prompt: "Home routing",
+      models: { review: ["fake/m"] },
+    });
+    expect((await f.factory.retryRun(run.id, { review: ["fake/m"] })).models).toEqual(run.models);
+  } finally {
+    await f.close();
+  }
+});

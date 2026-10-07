@@ -280,3 +280,82 @@ test("resume and cancel routes return the new run ID or final status and refuse 
     await f.close();
   }
 });
+
+test("excluded eval models and system targets are refused before eval persistence", async () => {
+  const f = await evalFixture(
+    [
+      {
+        id: "allowed",
+        provider: "provider-b",
+        model: "allowed",
+        tier: 1,
+        vendor: "other",
+        origin: "US",
+        baseOrigin: "US",
+        supportedEfforts: [],
+        price: { input: 1, output: 1 },
+      },
+    ],
+    [],
+    undefined,
+    ["CN"],
+  );
+  try {
+    const post = (createHttpRoutes(f.factory)["/api/evals"] as { POST: Route }).POST;
+    const response = await post(
+      requestWithParams("http://localhost/api/evals", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "triage", models: ["allowed", "candidate-a"] }),
+      }),
+      server,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("origin excluded (unknown; baseOrigin=unknown)");
+    expect(f.factory.store.listEvalRuns()).toEqual([]);
+    expect(f.calls).toEqual([]);
+    // Review systems resolve every finder and every listed verifier before persistence.
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({
+        role: "review",
+        version: 1,
+        cases: [{ ...reviewCase, base: f.sha, head: f.sha }],
+      }),
+    );
+    for (const system of [
+      {
+        name: "finder",
+        mode: "single",
+        finders: [{ target: "candidate-a", prompt: "standard" }],
+        implementerReport: "include",
+      },
+      {
+        name: "verifier",
+        mode: "panel",
+        finders: [{ target: "allowed", prompt: "standard" }],
+        implementerReport: "include",
+        verifier: { targets: ["candidate-b"] },
+      },
+    ]) {
+      const rejected = await post(
+        requestWithParams("http://localhost/api/evals", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ role: "review", systems: [system] }),
+        }),
+        server,
+      );
+      expect(rejected.status).toBe(400);
+      expect(await rejected.text()).toContain("origin excluded (unknown; baseOrigin=unknown)");
+      expect(f.factory.store.listEvalRuns()).toEqual([]);
+      expect(f.calls).toEqual([]);
+    }
+    f.save();
+    const accepted = await f.run({ models: ["allowed"], caseIds: ["a"], k: 1 });
+    expect(accepted.run.status).toBe("completed");
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});

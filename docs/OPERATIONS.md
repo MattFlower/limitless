@@ -254,9 +254,12 @@ Line 0 matches only file-level completeness defects. Verify missing/unclear/dupl
 neither binary label and count as false rejects for gold-met criteria. Overall is not used to grade.
 
 Models API/UI origin and base-origin metadata identify checkpoint organizations, not hosting
-providers. US/FR/CN values and `unknown` ancestry do not affect runtime routing or escalation; when
-`[routing].exclude_origins` is configured, the policy generator and the Evals matrix exclude models
-whose origin or baseOrigin is listed or whose baseOrigin is `unknown` (see below).
+providers. When `[routing].exclude_origins` is configured (even `[]`), runtime routing, fallback,
+escalation, the policy generator and the Evals matrix exclude models whose origin or baseOrigin is listed or
+whose baseOrigin is `unknown`. Matching is exact and case-sensitive; omitting the key applies no
+filter. Excluded models are never a fallback: routing fails if no eligible candidate remains.
+New run/retry pins, routing cell saves and explicit eval targets naming them are refused.
+The exclusions are read-only in Setup; edit config.toml and restart to change them (see below).
 
 
 ### Generate a routing policy from evals

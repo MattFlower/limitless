@@ -11,6 +11,7 @@ import {
 import { mapVerifier } from "../pipeline/review.ts";
 import { DEFAULT_ROSTERS, EvalReviewSystemsSchema, expandRoster } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
+import { originExclusion } from "../router/origins.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS, parseTarget } from "../router/targets.ts";
 import { reviewSystemHash } from "./cache.ts";
@@ -328,7 +329,7 @@ export type EvalRequest = z.infer<typeof EvalRequestSchema>;
 export function validateRequest(
   input: unknown,
   file: AnyCaseFile,
-  router: Pick<Router, "resolveFor" | "toTarget" | "checkpointIdentity">,
+  router: Pick<Router, "resolve" | "resolveFor" | "toTarget" | "checkpointIdentity" | "excludeOrigins">,
   rosters: Record<ResolvedProfile, ReviewFinder[]> = DEFAULT_ROSTERS,
 ) {
   const request = EvalRequestSchema.parse(input);
@@ -342,10 +343,11 @@ export function validateRequest(
     try {
       // `model@default` (a resume's stored form) pins an unset effort regardless of today's model default.
       const parsed = parseTarget(id);
-      let target = router.resolveFor(
-        request.role,
-        parsed.effort === "default" ? { modelId: parsed.modelId, effort: null } : id,
-      );
+      const reference = parsed.effort === "default" ? { modelId: parsed.modelId, effort: null } : id;
+      let target = router.resolve(reference);
+      const origin = originExclusion(target.model, router.excludeOrigins);
+      if (origin) throw new Error(origin);
+      target = router.resolveFor(request.role, reference);
       if (request.strategy === "effort") {
         const levels = EFFORT_LEVELS.filter((level) => target.model.supportedEfforts.includes(level));
         const effort = target.effort ?? levels[0];
