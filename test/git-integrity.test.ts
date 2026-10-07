@@ -3062,6 +3062,27 @@ test("an image that loses its executable bit while its content changes needs a b
   expect(diff.binaryPaths).toEqual(["icon.png"]);
 });
 
+test("a rename that drops the executable bit is a mode transition of the original file", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "icon.png"), mediaFixture("png"), { mode: 0o755 });
+  writeFileSync(join(work, "exit.com"), Buffer.from([0xcd, 0x20]), { mode: 0o755 });
+  writeFileSync(join(work, "tool.sh"), "#!/usr/bin/env bash\necho ok\n", { mode: 0o755 });
+  await commitAll(work, "executables before rename");
+  const revision = await headSha(work);
+  for (const [from, to] of [
+    ["icon.png", "renamed.png"],
+    ["exit.com", "renamed.com"],
+    ["tool.sh", "renamed.sh"],
+  ] as const) {
+    renameSync(join(work, from), join(work, to));
+    chmodSync(join(work, to), 0o644);
+  }
+  await commitAll(work, "renamed, no longer executable");
+  const diff = await diffSince(work, revision);
+  // The script is reviewable text; the image and the program are not.
+  expect(diff.binaryPaths?.sort()).toEqual(["renamed.com", "renamed.png"]);
+});
+
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
     "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",

@@ -559,14 +559,20 @@ export async function diffSince(
   const origins = new Map(files.map((file) => [file.path, file.from]));
   const changes: { path: string; from?: string; modeRequiresAllowance: boolean }[] = [];
   const entries = raw.stdout.split("\0");
+  // The raw diff has no renames: a rename's source is a deletion carrying the original mode.
+  const deletedModes = new Map<string, string>();
+  for (let i = 0; i + 1 < entries.length; i += 2)
+    if (entries[i]?.split(" ").at(-1)?.startsWith("D"))
+      deletedModes.set(entries[i + 1] ?? "", entries[i]?.split(" ")[0] ?? "");
   for (let i = 0; i + 1 < entries.length; i += 2) {
-    const [oldMode, newMode] = entries[i]?.split(" ") ?? [];
+    const [rawOldMode, newMode] = entries[i]?.split(" ") ?? [];
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
     blobs.set(path, entries[i]?.split(" ")[3] ?? "");
     const from = origins.get(path);
+    const oldMode = (from && from !== path ? deletedModes.get(from) : undefined) ?? rawOldMode;
     changes.push({
       path,
       ...(from ? { from } : status.startsWith("A") ? {} : { from: path }),
