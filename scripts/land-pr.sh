@@ -14,6 +14,8 @@ private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strin
 cli="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/cli/main.ts"
 cd "$dir"
 checker=""
+push_repo=""
+trap '[ -z "$push_repo" ] || rm -rf -- "$push_repo"' EXIT
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
 # The worktree's bunfig.toml (preload) and .env must not reach the checker.
 check_private() { bun --config=/dev/null --no-env-file "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
@@ -22,7 +24,7 @@ export LIMITLESS_GIT_EMPTY_HOOK=""
 safe_git() {
   # Key names never contain newlines (git forbids them in subsections); no temp files, which confined runs can't create.
   local keys key flags=()
-  keys="$(git config --name-only --get-regexp '^(hook|filter)\.')" || [ $? = 1 ] || return 1
+  keys="$(git config --name-only --get-regexp '^(hook|filter)\.' 2>/dev/null)" || [ $? = 1 ] || { echo "Cannot read git config; refusing to land" >&2; return 1; }
   set -f
   local IFS=$'\n'
   for key in $keys; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done
@@ -30,9 +32,11 @@ safe_git() {
   git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
     ${flags[@]+"${flags[@]}"} "$@"
 }
-
-admin="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
-common="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -P)"
+if ! admin="$(git rev-parse --absolute-git-dir 2>/dev/null)" || ! admin="$(cd "$admin" && pwd -P)" ||
+   ! common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || ! common="$(cd "$common" && pwd -P)"; then
+  echo "Cannot read repository git paths; refusing to land" >&2
+  exit 1
+fi
 paths="$(check_private --record)"
 { IFS= read -r GIT_WORK_TREE; IFS= read -r GIT_DIR; IFS= read -r GIT_COMMON_DIR; ! IFS= read -r extra; } <<< "$paths" || exit 1
 [[ "$GIT_WORK_TREE" = "$(pwd -P)" && "$GIT_DIR" = "$admin" && "$GIT_COMMON_DIR" = "$common" ]] || exit 1
@@ -61,7 +65,38 @@ fi
 sha="$(safe_git rev-parse HEAD)"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
-safe_git push --no-verify -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
+# Read all values once so ambiguous origins fail closed; preserve trailing newlines.
+if ! url="$(safe_git config --get-all remote.origin.url 2>/dev/null && printf '.')"; then
+  echo "Cannot read origin URL; refusing to push" >&2
+  exit 1
+fi
+url="${url%.}"
+url="${url%$'\n'}"
+if [[ -z "$url" || "$url" = *$'\n'* ]]; then
+  echo "Origin URL is missing or multi-valued; refusing to push" >&2
+  exit 1
+fi
+push_repo="$(mktemp -d "${TMPDIR:-/tmp}/land-pr-push.XXXXXXXX")"
+chmod 0700 "$push_repo"
+(
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG
+  cd "$push_repo"
+  if ! git -C "$push_repo" init --bare -q 2>/dev/null; then
+    echo "Cannot initialize push repository; refusing to push" >&2
+    exit 1
+  fi
+  printf '%s\n' "$common/objects" > "$push_repo/objects/info/alternates"
+  # Keep global hasconfig:remote.*.url includes working without copying clone config.
+  if ! safe_git -C "$push_repo" config remote.origin.url "$url" 2>/dev/null ||
+     ! safe_git -C "$push_repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
+    echo "Cannot prepare pinned commit in push repository; refusing to push" >&2
+    exit 1
+  fi
+  # A PR process still running as the user can act as the user directly; this script
+  # cannot defend against it. The land queue runs checks confined instead.
+  safe_git -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
+    push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"
+)
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""
