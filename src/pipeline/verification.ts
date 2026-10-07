@@ -2,31 +2,53 @@ import { redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
 export function preDeliveryVerifyArtifact(
-  verify: Verify & { modelId: string; round: number; attempt: number },
+  verify: Verify & { modelId: string; round: number; attempt: number; sha?: string; modelOutput?: Verify },
   spec: Spec,
   holdout: Holdout,
   publicSources: string,
 ): string {
+  const { modelOutput: _privateOutput, ...published } = verify;
   const redact = (value: string, id: string) =>
     rowKind(id, spec, holdout) === "unknown" ? "" : redactHoldoutText(value, holdout, publicSources);
+  const gateCitation = (criterion: Verify["criteria"][number]) =>
+    criterion.gateEvidence
+      ? {
+          gateEvidence: {
+            stageId: criterion.gateEvidence.stageId,
+            sha: criterion.gateEvidence.sha,
+            check: redact(criterion.gateEvidence.check, criterion.id),
+            command: redact(criterion.gateEvidence.command, criterion.id),
+          },
+        }
+      : {};
+  const evidence = (criterion: Verify["criteria"][number], publicRow = false) => {
+    if (rowKind(criterion.id, spec, holdout) === "unknown") return "";
+    const gate = criterion.gateEvidence;
+    // Rebuild factory evidence so redacting private commands cannot remove the SHA or stage ID.
+    return gate
+      ? `Factory gate ${redact(gate.check, criterion.id)} passed at ${gate.sha} (stage ${gate.stageId}); commands: ${redact(gate.command, criterion.id)}`
+      : redactHoldoutText(criterion.evidence, holdout, publicSources, !publicRow);
+  };
   return JSON.stringify(
     {
-      ...verify,
+      ...published,
       notes: redactHoldoutText(verify.notes, holdout, publicSources),
       criteria: verify.criteria.map((criterion, index) =>
         rowKind(criterion.id, spec, holdout) === "public"
           ? {
               ...criterion,
-              evidence: redactHoldoutText(criterion.evidence, holdout, publicSources, false),
+              evidence: evidence(criterion, true),
               publicSummary: redactHoldoutText(criterion.publicSummary, holdout, publicSources, false),
+              ...gateCitation(criterion),
             }
           : {
               id: rowKind(criterion.id, spec, holdout) === "unknown" ? `unknown-${index + 1}` : criterion.id,
               status: criterion.status,
-              evidence: redact(criterion.evidence, criterion.id),
+              evidence: evidence(criterion),
               publicSummary: redact(criterion.publicSummary.trim(), criterion.id),
               requirement: criterion.requirement ?? null,
               requirementCitation: redact(criterion.requirementCitation ?? "", criterion.id),
+              ...gateCitation(criterion),
             },
       ),
     },

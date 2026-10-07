@@ -70,6 +70,7 @@ import {
   type RunState,
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
+import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -1084,80 +1085,96 @@ async function oneRound(
   // --- gates
   const checks = ctx.stage(
     "gates",
-    commandScope(cwd, async () => {
-      const events = gateEvents(ctx);
-      let cmp: GateComparison[];
-      let baseTimeout = false;
-      try {
-        await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
-        let after = await runGates(cwd, gates, ctx.signal, events);
-        ctx.checkCancelled();
-        baseTimeout = after.checks.some(
-          (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
-        );
-        const failed = after.checks.filter((r) => !r.ok);
-        const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
-        if (timeoutOnly && !baseTimeout) {
-          const first = after;
-          ctx.store.putArtifact(ctx.run.id, `gates-timeout-${round}.json`, "gates", JSON.stringify(first));
-          ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
-          await ctx.save();
-          ctx.log(
-            `Gate checks timed out; re-running gates (timeout re-runs: ${ctx.state.gateTimeoutReruns})`,
-            "warn",
-          );
-          // The re-run starts from the committed tree too, not from what the first attempt left behind.
-          await checkoutCommitted(cwd);
-          after = await runGates(cwd, gates, ctx.signal, events);
+    (stage) =>
+      commandScope(cwd, async () => {
+        const events = gateEvents(ctx);
+        const checkedSha = await headSha(cwd);
+        let cmp: GateComparison[];
+        let testScripts: Record<string, string> = {};
+        let baseTimeout = false;
+        try {
+          await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+          testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
+          let after = await runGates(cwd, gates, ctx.signal, events);
           ctx.checkCancelled();
-          after.checks = after.checks.map((r) => ({
-            ...r,
-            firstAttempt: first.checks.find((c) => c.name === r.name),
+          baseTimeout = after.checks.some(
+            (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
+          );
+          const failed = after.checks.filter((r) => !r.ok);
+          const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
+          if (timeoutOnly && !baseTimeout) {
+            const first = after;
+            ctx.store.putArtifact(ctx.run.id, `gates-timeout-${round}.json`, "gates", JSON.stringify(first));
+            ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
+            await ctx.save();
+            ctx.log(
+              `Gate checks timed out; re-running gates (timeout re-runs: ${ctx.state.gateTimeoutReruns})`,
+              "warn",
+            );
+            // The re-run starts from the committed tree too, not from what the first attempt left behind.
+            await checkoutCommitted(cwd);
+            after = await runGates(cwd, gates, ctx.signal, events);
+            ctx.checkCancelled();
+            after.checks = after.checks.map((r) => ({
+              ...r,
+              firstAttempt: first.checks.find((c) => c.name === r.name),
+            }));
+          }
+          const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+          // Retry before discarding, so a check sees the same build output as its first attempt.
+          cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
+            ...c,
+            firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
           }));
+          if (!baseTimeout) cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait);
+          ctx.checkCancelled();
+          baseTimeout ||= after.checks.some(
+            (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
+          );
+        } finally {
+          // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
+          await discardChanges(cwd).catch((error: unknown) => {
+            if (ctx.state.implementerIssue && error instanceof CommandError)
+              throw new WorktreeCleanError(error.message, { cause: error });
+            throw error;
+          });
         }
-        const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
-        // Retry before discarding, so a check sees the same build output as its first attempt.
-        cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
-          ...c,
-          firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
-        }));
-        if (!baseTimeout) cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait);
-        ctx.checkCancelled();
-        baseTimeout ||= after.checks.some(
-          (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
-        );
-      } finally {
-        // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-        await discardChanges(cwd).catch((error: unknown) => {
-          if (ctx.state.implementerIssue && error instanceof CommandError)
-            throw new WorktreeCleanError(error.message, { cause: error });
-          throw error;
-        });
-      }
-      for (const c of cmp.filter((c) => c.firstAttempt)) {
-        ctx.store.addEvent({
-          runId: ctx.run.id,
-          type: "gate",
-          level: "warn",
-          message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}`,
-          data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
-        });
-      }
-      ctx.state.lastGates = cmp;
-      ctx.store.putArtifact(ctx.run.id, `gates-${round}.json`, "gates", JSON.stringify(cmp, null, 2));
-      if (baseTimeout) {
-        await ctx.save();
-        throw new NeedsHumanError("gate timed out on the base revision too");
-      }
-      const blocking = cmp.filter((c) => c.blocking).map((c) => c.name);
-      const flaky = cmp.filter((c) => c.verdict === "flaky").map((c) => c.name);
-      return {
-        summary: blocking.length
-          ? `blocking: ${blocking.join(", ")}`
-          : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
-        value: cmp,
-      };
-    }),
+        for (const c of cmp.filter((c) => c.firstAttempt)) {
+          ctx.store.addEvent({
+            runId: ctx.run.id,
+            type: "gate",
+            level: "warn",
+            message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}`,
+            data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
+          });
+        }
+        ctx.state.lastGates = cmp;
+        // A gate may have changed HEAD itself; those results cannot attest to the checked commit.
+        ctx.state.gateEvidence =
+          (await headSha(cwd)) === checkedSha
+            ? {
+                stageId: stage.id,
+                sha: checkedSha,
+                checks: cmp.map((check) => ({
+                  ...check,
+                  testCommand: gateTestCommand(check.result.command, testScripts),
+                })),
+              }
+            : undefined;
+        ctx.store.putArtifact(ctx.run.id, `gates-${round}.json`, "gates", JSON.stringify(cmp, null, 2));
+        if (baseTimeout) {
+          await ctx.save();
+          throw new NeedsHumanError("gate timed out on the base revision too");
+        }
+        const blocking = cmp.filter((c) => c.blocking).map((c) => c.name);
+        const flaky = cmp.filter((c) => c.verdict === "flaky").map((c) => c.name);
+        return {
+          summary: blocking.length
+            ? `blocking: ${blocking.join(", ")}`
+            : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
+          value: cmp,
+        };
+      })(),
     round,
   );
   const comparison = await checks.catch(async (error: unknown) => {
@@ -1498,6 +1515,27 @@ async function oneRound(
     await preview?.stop();
   };
   try {
+    const verifiedSha = await headSha(cwd);
+    const gateEvidence = ctx.state.gateEvidence;
+    const usableGates = () => {
+      const stage = gateEvidence ? ctx.store.getStage(gateEvidence.stageId) : null;
+      return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded"
+        ? gateEvidence
+        : undefined;
+    };
+    const resolveVerify = (value: Verify) =>
+      normalizeVerify(
+        applyGateEvidence(
+          value,
+          ctx.state.spec as Spec,
+          ctx.state.holdout as Holdout,
+          verifiedSha,
+          usableGates(),
+        ),
+        ctx.state.spec as Spec,
+        ctx.state.holdout as Holdout,
+        ctx.run.prompt,
+      );
     const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
       if (!preview && previewConfig && needsPreview(previewConfig, diff)) {
         preview = await ctx.stage(
@@ -1527,7 +1565,7 @@ async function oneRound(
               spec: ctx.state.spec as Spec,
               holdout: ctx.state.holdout as Holdout,
               baseSha,
-              checks: ctx.state.lastGates,
+              checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
             }),
             jsonSchema: toStrictJsonSchema(VerifySchema),
             schema: VerifySchema,
@@ -1536,16 +1574,16 @@ async function oneRound(
             redactHoldout: true,
           });
           await discardChanges(cwd);
-          const v = normalizeVerify(
-            VerifySchema.parse(result.structured),
-            ctx.state.spec as Spec,
-            ctx.state.holdout as Holdout,
-            ctx.run.prompt,
-          );
+          if ((await headSha(cwd)) !== verifiedSha)
+            throw new NeedsHumanError(
+              "Commit changed during verification; gate evidence cannot cover the new HEAD",
+            );
+          const modelOutput = VerifySchema.parse(result.structured);
+          const v = resolveVerify(modelOutput);
           ctx.state.lastVerify = { ...v, modelId: target.modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
-            { ...v, modelId: target.modelId, round, attempt },
+            { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha, modelOutput },
           ];
           await ctx.save();
           const publicSources = await ctx.publicHoldoutSources();
@@ -1554,7 +1592,7 @@ async function oneRound(
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
             preDeliveryVerifyArtifact(
-              { ...v, modelId: target.modelId, round, attempt },
+              { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha },
               ctx.state.spec as Spec,
               ctx.state.holdout as Holdout,
               publicSources,
@@ -1569,15 +1607,27 @@ async function oneRound(
         round,
       );
     };
-    const previous = (ctx.state.verifyResults ?? []).filter((v) => v.round === round);
+    const previous = (ctx.state.verifyResults ?? []).filter(
+      (v) => v.round === round && (!v.sha || v.sha === verifiedSha),
+    );
     const recorded = previous.at(-1);
-    let verify = recorded
-      ? normalizeVerify(recorded, ctx.state.spec as Spec, ctx.state.holdout, ctx.run.prompt)
-      : await verifyAttempt(0);
+    const original = recorded?.modelOutput ?? recorded;
+    let verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
     if (recorded) {
       Object.assign(recorded, verify);
       ctx.state.lastVerify = { ...verify, modelId: recorded.modelId };
       await ctx.save();
+      ctx.store.putArtifact(
+        ctx.run.id,
+        recorded.attempt === 1 ? `verify-${round}-retry.json` : `verify-${round}.json`,
+        "verify",
+        preDeliveryVerifyArtifact(
+          { ...recorded, attempt: recorded.attempt ?? 0 },
+          ctx.state.spec as Spec,
+          ctx.state.holdout,
+          await ctx.publicHoldoutSources(),
+        ),
+      );
     }
     const publicSources = await ctx.publicHoldoutSources();
     if (blockedOnly(verify)) {
@@ -2024,7 +2074,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             ctx.run.id,
             result.attempt === 1 ? `verify-${result.round}-retry.json` : `verify-${result.round}.json`,
             "verify",
-            JSON.stringify(result, null, 2),
+            JSON.stringify({ ...result, modelOutput: undefined }, null, 2),
           );
       }
     };

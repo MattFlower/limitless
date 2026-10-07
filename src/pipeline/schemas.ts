@@ -323,6 +323,13 @@ export const VerifySchema = z.object({
     z.object({
       id: z.string(),
       status: z.enum(["met", "unmet", "unclear", "blocked"]),
+      blockedReason: z
+        .enum(["sandbox", "environment"])
+        .nullable()
+        .optional()
+        .describe(
+          "For blocked checks: sandbox restrictions or another environmental failure; null otherwise",
+        ),
       evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
       publicSummary: z
         .string()
@@ -347,7 +354,12 @@ export const VerifySchema = z.object({
   overall: z.enum(["pass", "fail"]),
   notes: z.string(),
 });
-export type Verify = z.input<typeof VerifySchema>;
+export type Verify = Omit<z.input<typeof VerifySchema>, "criteria"> & {
+  criteria: (z.input<typeof VerifySchema>["criteria"][number] & {
+    /** Factory-only substitution; VerifySchema strips any model-supplied provenance. */
+    gateEvidence?: { stageId: number; sha: string; check: string; command: string };
+  })[];
+};
 export type HoldoutRequirement = NonNullable<Verify["criteria"][number]["requirement"]>;
 
 const flatText = (s: string) => s.replace(/[*`]/g, "").replace(/\s+/g, " ").toLowerCase();
