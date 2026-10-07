@@ -545,7 +545,7 @@ export async function diffSince(
   const gitlinks: string[] = [];
   const blobs = new Map<string, string>();
   const origins = new Map(files.map((file) => [file.path, file.from]));
-  const changes: { path: string; from?: string; modeRequiresAllowance: boolean; modeChanged: boolean }[] = [];
+  const changes: { path: string; from?: string; modeRequiresAllowance: boolean }[] = [];
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2) {
     const [oldMode, newMode, oldOid, newOid] = entries[i]?.split(" ") ?? [];
@@ -559,7 +559,6 @@ export async function diffSince(
       path,
       ...(from ? { from } : status.startsWith("A") ? {} : { from: path }),
       modeRequiresAllowance: newMode === "100755" || (oldMode !== `:${newMode}` && oldOid === newOid),
-      modeChanged: oldMode !== `:${newMode}`,
     });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
@@ -715,7 +714,7 @@ async function attributeInfo(
   env: Record<string, string> | undefined,
   range: string,
   base: string,
-  changes: { path: string; from?: string; modeRequiresAllowance: boolean; modeChanged: boolean }[],
+  changes: { path: string; from?: string; modeRequiresAllowance: boolean }[],
 ): Promise<Partial<DiffInfo>> {
   // Attribute files must be inspected even if binary or renamed into place.
   const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
@@ -955,9 +954,8 @@ async function attributeInfo(
       .map((change) => change.path);
     const binaryPaths = changes
       .filter(
-        ({ path, from, modeRequiresAllowance, modeChanged }) =>
-          // Editing existing executable text doesn't introduce binary content or change permissions.
-          (modeRequiresAllowance && (modeChanged || !afterText.raw.has(path))) ||
+        ({ path, from, modeRequiresAllowance }) =>
+          modeRequiresAllowance ||
           (matches.has(path) &&
             (!afterText.raw.has(path) || headPointers.has(path)) &&
             (beforeText.text.has(from ?? "") || !inert.has(path))),
