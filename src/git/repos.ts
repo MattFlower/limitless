@@ -955,7 +955,9 @@ async function attributeInfo(
     const binaryPaths = changes
       .filter(
         ({ path, from, modeRequiresAllowance }) =>
-          modeRequiresAllowance ||
+          // The executable bit only matters where content would otherwise pass as inert media.
+          // A text script, executable or not, is diffed and reviewed like any other text.
+          (modeRequiresAllowance && INERT_MEDIA_PATH.test(path)) ||
           (matches.has(path) &&
             (!afterText.raw.has(path) || headPointers.has(path)) &&
             (beforeText.text.has(from ?? "") || !inert.has(path))),

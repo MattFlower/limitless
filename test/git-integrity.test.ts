@@ -3019,6 +3019,21 @@ test("executable image additions and mode-only changes need a binary allowance",
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
 
+test("text scripts may be executable, edited, added or chmodded without a binary allowance", async () => {
+  await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "edited.sh"), "#!/usr/bin/env bash\necho one\n", { mode: 0o755 });
+  writeFileSync(join(work, "flipped.sh"), "#!/usr/bin/env bash\necho two\n");
+  await commitAll(work, "scripts base");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "edited.sh"), "#!/usr/bin/env bash\necho one changed\n");
+  writeFileSync(join(work, "added.sh"), "#!/usr/bin/env bash\necho three\n", { mode: 0o755 });
+  chmodSync(join(work, "flipped.sh"), 0o755);
+  await commitAll(work, "script edits and modes");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths ?? []).toEqual([]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+});
+
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
     "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
