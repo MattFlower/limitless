@@ -509,7 +509,7 @@ for (const [name, Parser] of [
     const parser = new Parser((event) => events.push(event));
     for (const line of fixture(`${name}-signals.jsonl`)) parser.feed(line);
     const warnings = events.filter((event) => event.type === "warning");
-    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 16 }, (_, i) => `signal-${i}`));
+    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 17 }, (_, i) => `signal-${i}`));
     expect(JSON.stringify(warnings)).not.toContain("marker");
     expect(events.filter((event) => event.type === "tool_result").length).toBeGreaterThan(10);
   });
@@ -518,25 +518,22 @@ for (const [name, Parser] of [
 test("sanitized captured CLI records each warn once across their real stream shapes", () => {
   const captures = [
     {
+      name: "claude",
       Parser: ClaudeStreamParser,
-      lines: [
-        '{"type":"assistant","message":{"id":"message-captured","type":"message","role":"assistant","model":"placeholder-model","content":[{"type":"tool_use","id":"signal-captured","name":"Bash","input":{"command":"pkill -f \\"bun test\\"; ls test | head -80"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"placeholder-session","uuid":"placeholder-message"}',
-      ],
+      command: 'pkill -f "bun test"; ls test | head -80',
+      count: 2,
     },
-    {
-      Parser: CodexStreamParser,
-      lines: [
-        '{"type":"item.started","item":{"id":"signal-captured","type":"command_execution","command":"/bin/zsh -lc \'kill -TERM 12345\'","aggregated_output":"","exit_code":null,"status":"in_progress"}}',
-        '{"type":"item.completed","item":{"id":"signal-captured","type":"command_execution","command":"/bin/zsh -lc \'kill -TERM 12345\'","aggregated_output":"","exit_code":0,"status":"completed"}}',
-      ],
-    },
-  ];
-  for (const { Parser, lines } of captures) {
+    { name: "codex", Parser: CodexStreamParser, command: "/bin/zsh -lc 'kill -TERM 12345'", count: 2 },
+  ] as const;
+  for (const { name, Parser, command, count } of captures) {
+    const lines = fixture(`${name}-signals.jsonl`).filter((line) => line.includes('"signal-16"'));
+    expect(lines).toHaveLength(count);
+    expect(lines[0]).toContain(JSON.stringify(command).slice(1, -1));
     const events: AgentEvent[] = [];
     const parser = new Parser((event) => events.push(event));
     for (const line of lines) parser.feed(line);
     expect(events.filter((event) => event.type === "warning")).toEqual([
-      { type: "warning", id: "signal-captured", text: "Process signal attempt detected." },
+      { type: "warning", id: "signal-16", text: "Process signal attempt detected." },
     ]);
   }
 });
