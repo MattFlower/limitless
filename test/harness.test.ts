@@ -509,71 +509,14 @@ for (const [name, Parser] of [
     const parser = new Parser((event) => events.push(event));
     for (const line of fixture(`${name}-signals.jsonl`)) parser.feed(line);
     const warnings = events.filter((event) => event.type === "warning");
-    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 16 }, (_, i) => `signal-${i}`));
+    expect(warnings.map((event) => event.id)).toEqual([
+      ...Array.from({ length: 16 }, (_, i) => `signal-${i}`),
+      "captured-1",
+    ]);
     expect(JSON.stringify(warnings)).not.toContain("marker");
     expect(events.filter((event) => event.type === "tool_result").length).toBeGreaterThan(10);
   });
 }
-
-// Sanitized captures in the real CLI stream shapes, with placeholder ids only.
-// The shared signal fixtures are protected, so these records live inline.
-const claudeCommand = 'pkill -f "bun test"; ls test | head -80';
-const codexCommand = "/bin/zsh -lc 'kill -TERM 12345'";
-const capturedSignalLines = {
-  claude: [
-    JSON.stringify({
-      type: "assistant",
-      message: {
-        id: "message-captured",
-        type: "message",
-        role: "assistant",
-        model: "placeholder-model",
-        content: [{ type: "tool_use", id: "captured-1", name: "Bash", input: { command: claudeCommand } }],
-        stop_reason: "tool_use",
-        usage: { input_tokens: 1, output_tokens: 1 },
-      },
-      parent_tool_use_id: null,
-      session_id: "placeholder-session",
-      uuid: "placeholder-message",
-    }),
-    JSON.stringify({
-      type: "user",
-      message: {
-        role: "user",
-        content: [
-          { type: "tool_result", tool_use_id: "captured-1", content: "placeholder-output", is_error: false },
-        ],
-      },
-      parent_tool_use_id: null,
-      session_id: "placeholder-session",
-      uuid: "placeholder-result",
-    }),
-  ],
-  codex: [
-    JSON.stringify({
-      type: "item.started",
-      item: {
-        id: "captured-1",
-        type: "command_execution",
-        command: codexCommand,
-        aggregated_output: "",
-        exit_code: null,
-        status: "in_progress",
-      },
-    }),
-    JSON.stringify({
-      type: "item.completed",
-      item: {
-        id: "captured-1",
-        type: "command_execution",
-        command: codexCommand,
-        aggregated_output: "",
-        exit_code: 0,
-        status: "completed",
-      },
-    }),
-  ],
-};
 
 test("sanitized captured CLI records each warn once across their real stream shapes", () => {
   for (const [name, Parser] of [
@@ -582,7 +525,8 @@ test("sanitized captured CLI records each warn once across their real stream sha
   ] as const) {
     const events: AgentEvent[] = [];
     const parser = new Parser((event) => events.push(event));
-    for (const line of capturedSignalLines[name]) parser.feed(line);
+    for (const line of fixture(`${name}-signals.jsonl`).filter((line) => line.includes('"captured-1"')))
+      parser.feed(line);
     expect(events.filter((event) => event.type === "warning")).toEqual([
       { type: "warning", id: "captured-1", text: "Process signal attempt detected." },
     ]);
