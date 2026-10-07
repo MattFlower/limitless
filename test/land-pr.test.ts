@@ -21,6 +21,13 @@ const origin = "https://github.com/MattFlower/limitless.git";
 // Fake git scripts dispatch on the subcommand, after the global options land prepends.
 const gitSubcommand =
   'sub=""; skip=""; for a in "$@"; do if [ -n "$skip" ]; then skip=""; continue; fi; case "$a" in -c|-C) skip=1 ;; -*) ;; *) sub="$a"; break ;; esac; done';
+const subcommand = (args: string[]) => {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? "";
+    if (["-c", "-C"].includes(arg)) i++;
+    else if (!arg.startsWith("-")) return arg;
+  }
+};
 // The global options land's factory git calls carry once PR code has run.
 const hardened = [
   "core.hooksPath=/dev/null",
@@ -75,7 +82,7 @@ describe("land-pr private strings", () => {
     "destination",
     "source-inside",
     "bunfig-preload",
-  ])("checks %s before committing or pushing", async (scenario) => {
+  ])("checks %s before pushing", async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "land-private-"));
     const source = join(root, "source");
     const work = join(root, "work");
@@ -194,15 +201,18 @@ describe("land-pr private strings", () => {
           'const exit = process.exit.bind(process);\nprocess.exit = ((_code?: number) => exit(0)) as typeof process.exit;\nprocess.on("exit", () => {\n  process.exitCode = 0;\n});\n',
         );
       }
-      // Stop permitted deliveries at commit so the script never reaches external delivery commands.
+      // Supply the index the orchestrator used; allowed landings must already be committed.
+      await git("-C", work, "add", ".");
+      if (["absent", "clean", "excluded", "destination"].includes(scenario)) await commit("safe");
+      // Stop permitted deliveries at push so the script never reaches the network.
       writeFileSync(
         join(bin, "git"),
-        `#!/bin/sh\n${gitSubcommand}\ncase "$sub" in\ncommit) echo commit >> '${join(root, "mutations")}'; ${["post-commit", "destination"].includes(scenario) ? `exec '${gitBin}' -c user.name=t -c user.email=t@t commit -qm '${scenario === "post-commit" ? entry : "safe"}'` : "exit 17"} ;;\npush) echo push >> '${join(root, "mutations")}'; exit 17 ;;\nesac\nexec '${gitBin}' "$@"\n`,
+        `#!/bin/sh\n${gitSubcommand}\ncase "$sub" in\ncommit) echo commit >> '${join(root, "mutations")}'; exit 17 ;;\npush) echo push >> '${join(root, "mutations")}'; exit 17 ;;\nesac\nexec '${gitBin}' "$@"\n`,
         { mode: 0o755 },
       );
       writeFileSync(
         join(bin, "bun"),
-        `#!/bin/sh\ncase "$*" in\n*check-private-strings.ts*) exec '${bunBin}' "$@" ;;\nesac\nexit 0\n`,
+        `#!/bin/sh\ncase "$*" in\n*check-private-strings.ts*) exec '${bunBin}' "$@" ;;\n${scenario === "post-commit" ? `*gate-slot*) exec '${gitBin}' -c user.name=t -c user.email=t@t commit -qm '${entry}' ;;` : ""}\nesac\nexit 0\n`,
         { mode: 0o755 },
       );
       writeFileSync(
@@ -224,14 +234,12 @@ describe("land-pr private strings", () => {
       expect(result.exitCode).not.toBe(0);
       expect(`${result.stdout}${result.stderr}`.toLowerCase()).not.toContain(entry);
       if (scenario.endsWith("author-email")) expect(result.stderr).toContain("author email");
-      if (!["post-commit", "destination"].includes(scenario))
+      if (scenario !== "post-commit")
         expect((await git("-C", work, "rev-parse", "HEAD")).stdout.trim()).toBe(expectedHead);
       if (["absent", "clean", "excluded"].includes(scenario)) {
-        expect(readFileSync(join(root, "mutations"), "utf8")).toBe("commit\n");
+        expect(readFileSync(join(root, "mutations"), "utf8")).toBe("push\n");
       } else {
-        if (["post-commit", "destination"].includes(scenario))
-          expect(readFileSync(join(root, "mutations"), "utf8")).toBe("commit\n");
-        else expect(existsSync(join(root, "mutations"))).toBe(false);
+        expect(existsSync(join(root, "mutations"))).toBe(false);
         expect(result.stderr).toContain(
           ["unreadable", "malformed", "dangling"].includes(scenario)
             ? "Cannot read private-strings.txt"
@@ -269,6 +277,18 @@ test.each([
   "redirect",
   "redirect-and-move-head",
   "working-tree",
+  "untracked",
+  "state:MERGE_HEAD",
+  "state:CHERRY_PICK_HEAD",
+  "state:REVERT_HEAD",
+  "checks:clean-filter",
+  "pre-push:clean-filter",
+  "checks:external-diff",
+  "checks:signing",
+  "checks:pager",
+  "status:malformed-include",
+  "read-tree-failed",
+  "status-failed",
   "fresh-clone",
   "config-failed-before",
   "config-failed-url",
@@ -319,6 +339,11 @@ test.each([
     // Make the alternate commit available to HEAD-movement attacks without publishing it.
     await git("fetch", "-q", alternate, "main");
     writeFileSync(join(work, "file"), "safe change\n");
+    if (scenario.endsWith(":clean-filter"))
+      writeFileSync(join(work, ".gitattributes"), "file filter=attack\n");
+    await git("-C", work, "add", ".");
+    await git("-C", work, "commit", "-qm", "safe change");
+    const landingSha = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
     writeFileSync(join(config, "private-strings.txt"), entry);
     const paths = [
       realpathSync(work),
@@ -334,10 +359,29 @@ test.each([
     const calls = join(root, "calls");
     const pinned = join(root, "pinned");
     const marker = join(root, "config-command-ran");
-    const injected = join(root, "injected.config");
+    const injected = join(
+      root,
+      scenario.endsWith(":malformed-include") ? `${entry}-secret-config-value.config` : "injected.config",
+    );
     const command = `touch '${marker}'`;
     const [plantAt, plantKey] = scenario.split(":");
-    const planted = plantedKeys.includes(plantKey ?? "");
+    const postCheckConfig: Record<string, string[][]> = {
+      "clean-filter": [["filter.attack.clean", `${command}; cat`]],
+      "external-diff": [
+        ["diff.external", command],
+        ["diff.trustExitCode", "true"],
+      ],
+      signing: [
+        ["commit.gpgSign", "true"],
+        ["gpg.program", command],
+      ],
+      pager: [
+        ["core.pager", command],
+        ["pager.status", "true"],
+      ],
+      "malformed-include": [["include.path", injected]],
+    };
+    const planted = plantedKeys.includes(plantKey ?? "") || (plantKey ?? "") in postCheckConfig;
     writeFileSync(injected, `[remote "origin"]\nreceivepack = ${JSON.stringify(command)}\n`);
     const plantValue =
       plantKey === "include.path"
@@ -350,6 +394,14 @@ test.each([
               ? origin
               : command;
     const plantArgs = ["--git-dir", paths[2] ?? "", "config", plantKey ?? "", plantValue];
+    const plantCommands = (postCheckConfig[plantKey ?? ""] ?? []).map((settings) => [
+      "--git-dir",
+      paths[2] ?? "",
+      "config",
+      ...settings,
+    ]);
+    if (plantCommands.length === 0) plantCommands.push(plantArgs);
+    if (plantKey === "malformed-include") writeFileSync(injected, `[${entry}-secret-config-value\n`);
     if (planted && plantAt === "before") await git(...plantArgs);
     const extHelper = join(root, "ext-helper");
     writeFileSync(extHelper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
@@ -421,13 +473,18 @@ if (args[0] === "install" || args[0] === "run") {
     if (changed.status !== 0) process.exit(1);
   }
   if (${planted} && args[0] === ${JSON.stringify(plantAt === "install" ? "install" : plantAt === "checks" ? "run" : "never")}) {
-    const changed = spawnSync(${JSON.stringify(gitBin)}, ${JSON.stringify(plantArgs)}, { stdio: "inherit" });
-    if (changed.status !== 0) process.exit(1);
+    for (const command of ${JSON.stringify(plantCommands)}) {
+      const changed = spawnSync(${JSON.stringify(gitBin)}, command, { stdio: "inherit" });
+      if (changed.status !== 0) process.exit(1);
+    }
   }
 }
 if (args[0] === "run") {
   if (${JSON.stringify(scenario)}.startsWith("redirect")) writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
   if (${JSON.stringify(scenario)} === "working-tree") writeFileSync(${JSON.stringify(join(work, "file"))}, "check-generated change\\n");
+  if (${JSON.stringify(scenario)} === "untracked") writeFileSync(${JSON.stringify(join(work, "untracked"))}, "generated\\n");
+  if (${JSON.stringify(scenario)}.startsWith("state:")) writeFileSync(${JSON.stringify(paths[1])} + "/" + ${JSON.stringify(plantKey)}, ${JSON.stringify(landingSha)} + "\\n");
+  if (${JSON.stringify(plantKey)} === "clean-filter") writeFileSync(${JSON.stringify(join(work, "file"))}, "safe change\\n");
 }
 if (args[0].endsWith(".ts")) {
   if (args.length === 6) {
@@ -447,16 +504,20 @@ if (args[0].endsWith(".ts")) {
     writeFileSync(
       join(bin, "git"),
       `#!${process.execPath}
-import { appendFileSync, existsSync, readFileSync, statSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
-appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths, config: process.env.GIT_CONFIG ?? null }) + "\\n");
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths, config: process.env.GIT_CONFIG ?? null, index: process.env.GIT_INDEX_FILE ?? null }) + "\\n");
 if ((${JSON.stringify(scenario)} === "config-failed-before" && args.includes("--absolute-git-dir")) ||
     (${JSON.stringify(scenario)} === "config-failed-url" && args.includes("--get-all"))) {
   console.error("secret-config-value"); process.exit(1);
 }
 if (${JSON.stringify(scenario)} === "commit-unavailable" && args.includes("-C") && args.includes("cat-file") && args.includes("-e")) process.exit(1);
+if ((${JSON.stringify(scenario)} === "read-tree-failed" && args.includes("read-tree")) ||
+    (${JSON.stringify(scenario)} === "status-failed" && args.includes("status"))) {
+  console.error("secret-config-value"); process.exit(1);
+}
 let deliveryArgs = args;
 if (args.includes("push")) {
   const repoAt = args.indexOf("-C");
@@ -474,7 +535,13 @@ if (args.includes("push")) {
     if (included.stdout.trim() !== "yes") process.exit(1);
   }
 }
+// Introduce a malformed clone include only during the dirty lookup, after the scans.
+const configFile = ${JSON.stringify(join(paths[2] ?? "", "config"))};
+const malformed = ${JSON.stringify(scenario)} === "status:malformed-include" && args.includes("status");
+const saved = malformed ? readFileSync(configFile) : null;
+if (malformed) appendFileSync(configFile, ${JSON.stringify(`\n[include]\npath = ${JSON.stringify(injected)}\n`)});
 const result = spawnSync(${JSON.stringify(gitBin)}, deliveryArgs, { stdio: "inherit" });
+if (saved) writeFileSync(configFile, saved);
 process.exit(result.status ?? 1);
 `,
       { mode: 0o755 },
@@ -489,8 +556,10 @@ appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "gh", args }) + 
 if (args[0] === "run" && args[1] === "list") console.log("123");
 else if (args[1] === "view") {
   if (args.includes("baseRefOid,body,headRefName") && existsSync(${JSON.stringify(pinned)}) && ${planted && plantAt === "pre-push"}) {
-    const changed = spawnSync(${JSON.stringify(gitBin)}, ${JSON.stringify(plantArgs)}, { stdio: "inherit" });
-    if (changed.status !== 0) process.exit(1);
+    for (const command of ${JSON.stringify(plantCommands)}) {
+      const changed = spawnSync(${JSON.stringify(gitBin)}, command, { stdio: "inherit" });
+      if (changed.status !== 0) process.exit(1);
+    }
   }
   if (args.includes("--jq")) console.log("pr");
   else if (args.includes("title,body,headRefOid")) console.log(JSON.stringify({ title: "safe", body: "safe", headRefOid: readFileSync(${JSON.stringify(pinned)}, "utf8") }));
@@ -513,17 +582,25 @@ else if (args[1] === "view") {
       allowFail: true,
     });
     expect(result.stderr).not.toContain(entry);
+    expect(result.stdout).not.toContain(entry);
+    expect(`${result.stdout}${result.stderr}`).not.toContain("secret-config-value");
     const logged: {
       tool: string;
       args: string[];
       paths?: (string | null)[];
       config?: string | null;
+      index?: string | null;
       mode?: number;
       alternates?: string;
     }[] = readFileSync(calls, "utf8")
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
+    expect(
+      logged.some((call) => call.tool === "git" && ["add", "commit"].includes(subcommand(call.args) ?? "")),
+    ).toBe(false);
+    if (scenario !== "redirect-and-move-head")
+      expect(readFileSync(join(paths[2] ?? "", "refs/heads/pr"), "utf8").trim()).toBe(landingSha);
     for (const call of logged.filter(
       (call) => call.tool === "git" && call.args.includes("init") && call.args.includes("-C"),
     )) {
@@ -538,7 +615,12 @@ else if (args[1] === "view") {
     expect(existsSync(marker)).toBe(false);
     const failure =
       scenario.startsWith("config-failed-") ||
+      scenario.startsWith("state:") ||
       [
+        "working-tree",
+        "untracked",
+        "read-tree-failed",
+        "status-failed",
         "missing-origin",
         "multiple-origins",
         "multiple-origins-blank",
@@ -558,6 +640,11 @@ else if (args[1] === "view") {
         expect(result.stderr).toContain("Cannot read origin URL");
       if (scenario === "commit-unavailable")
         expect(result.stderr).toContain("Cannot prepare pinned commit in push repository");
+      if (["working-tree", "untracked"].includes(scenario))
+        expect(result.stderr).toContain("Worktree differs from landing commit");
+      if (scenario.startsWith("state:")) expect(result.stderr).toContain("in progress");
+      if (["read-tree-failed", "status-failed"].includes(scenario))
+        expect(result.stderr).toContain("Cannot inspect worktree");
       if (scenario.startsWith("multiple-origins")) expect(result.stderr).toContain("multi-valued");
       expect(logged.some((call) => call.tool === "gh" && call.args[1] === "merge")).toBe(false);
       expect((await git("--git-dir", remote, "for-each-ref")).stdout).toBe("");
@@ -565,10 +652,13 @@ else if (args[1] === "view") {
         expect(pushRepos).toHaveLength(1);
       if (["file-path", "file-url", "ext-url"].includes(scenario))
         expect(result.stderr).toContain("not allowed");
+      if (
+        ["working-tree", "untracked", "read-tree-failed", "status-failed"].includes(scenario) ||
+        scenario.startsWith("state:")
+      )
+        expect(pushRepos).toHaveLength(0);
       return;
     }
-    if (scenario === "working-tree")
-      expect((await git("show", "pr:file")).stdout).toBe("check-generated change\n");
     expect(pushRepos).toHaveLength(1);
     expect((await git("--git-dir", remote, "rev-list", "--all")).stdout.trim().split("\n")).not.toContain(
       value.denied,
@@ -579,10 +669,11 @@ else if (args[1] === "view") {
     expect(sha).toMatch(/^[a-f0-9]{40}$/);
     expect(sha).not.toBe(value.base);
     expect(sha).not.toBe(value.denied);
+    expect(sha).toBe(landingSha);
     for (const command of ["install", "run"]) {
       expect(JSON.parse(readFileSync(join(root, `fixture-${command}-state`), "utf8"))).toEqual([
-        [value.base, ""],
-        [value.base, ""],
+        [landingSha, ""],
+        [landingSha, ""],
       ]);
       expect(
         (await git("-C", join(root, `fixture-${command}`), "log", "-1", "--format=%s")).stdout.trim(),
@@ -609,6 +700,16 @@ else if (args[1] === "view") {
       [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
     ]);
     const push = commands("git", "push")[0] ?? [];
+    const status = commands("git", "status")[0] ?? [];
+    for (const flag of ["--no-pager", "--porcelain", "--untracked-files=normal", "--ignored=no"])
+      expect(status).toContain(flag);
+    expect(status).toContain(`--git-dir=${pushRepos[0]?.args[0]}`);
+    expect(status).toContain(`--work-tree=${paths[0]}`);
+    expect(commands("git", "read-tree")[0]?.at(-1)).toBe(sha);
+    for (const call of logged.filter(
+      (call) => call.tool === "git" && ["read-tree", "status"].some((cmd) => call.args.includes(cmd)),
+    ))
+      expect(call.index).toBe(`${pushRepos[0]?.args[0]}/index`);
     for (const flag of [
       "--no-verify",
       "--no-follow-tags",
@@ -742,7 +843,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     );
     writeFileSync(
       join(bin, "git"),
-      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *config*-z*--get-all*) printf '${origin}\\000' ;; esac\n`,
+      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *rev-parse*HEAD) echo '${"a".repeat(40)}' ;; *config*--get-all*) echo '${origin}' ;; esac\n`,
       { mode: 0o755 },
     );
     mkdirSync(join(root, "admin"));
@@ -778,7 +879,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     );
     writeFileSync(
       join(bin, "git"),
-      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *config*--name-only*--get-regexp*) exit 1 ;; *config*--list*--show-scope*) exit 0 ;; *config*-z*--get-all*) printf '${origin}\\000' ;; *) touch '${marker}'; exit 1 ;; esac\n`,
+      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *rev-parse*HEAD) echo '${"a".repeat(40)}' ;; *config*--name-only*--get-regexp*) exit 1 ;; *config*--list*--show-scope*) exit 0 ;; *config*--get-all*) echo '${origin}' ;; *) touch '${marker}'; exit 1 ;; esac\n`,
       { mode: 0o755 },
     );
     writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
