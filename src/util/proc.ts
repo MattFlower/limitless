@@ -50,8 +50,8 @@ async function markedProcesses(
     try {
       return darwin.markedDarwinProcesses(uid, marker, group, started, directories, leader);
     } catch (error) {
-      // KERN_PROCARGS2 can return EIO/EINVAL while a process is exec'ing. Require
-      // a complete snapshot, but give these transient states time to settle.
+      // Unreadable argv uses hidden membership rules. Retry only inspection failures
+      // that still prevent proving ownership or confirming a claimed process's identity.
       if (attempt >= 10) throw error;
       await Bun.sleep(10);
       return markedProcesses(marker, group, started, directories, leader, attempt + 1);

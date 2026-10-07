@@ -47,6 +47,41 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
 
+async function loadNativeInspection(directory: string) {
+  const fixturePath = join(import.meta.dir, "darwin-inspection-fixture.ts");
+  const sourcePath = join(import.meta.dir, "../src/util/processes-darwin.ts");
+  const entry = join(directory, "native.ts");
+  writeFileSync(
+    entry,
+    `export * from ${JSON.stringify(sourcePath)}; export * from ${JSON.stringify(fixturePath)};`,
+  );
+  const build = await Bun.build({
+    entrypoints: [entry],
+    outdir: join(directory, "build"),
+    target: "bun",
+    plugins: [
+      {
+        name: "synthetic-libproc",
+        setup(builder) {
+          // Bun keeps built-in modules external; redirect the native import before bundling.
+          builder.onLoad({ filter: /processes-darwin\.ts$/ }, async (args) => ({
+            contents: (await Bun.file(args.path).text()).replace(
+              'from "bun:ffi";',
+              `from ${JSON.stringify(fixturePath)};`,
+            ),
+            loader: "ts",
+          }));
+        },
+      },
+    ],
+  });
+  expect(build.success).toBe(true);
+  const output = build.outputs[0];
+  if (!output) throw new Error("No synthetic native inspection build output");
+  return (await import(output.path)) as typeof import("../src/util/processes-darwin.ts") &
+    typeof import("./darwin-inspection-fixture.ts");
+}
+
 describe("process handling", () => {
   test("nested scratch restores the invocation root and unregisters cleaned paths", async () => {
     const scope = {
@@ -71,38 +106,7 @@ describe("process handling", () => {
   });
 
   test("native discovery rejects a recycled leader's session/group identity", async () => {
-    const fixturePath = join(import.meta.dir, "darwin-inspection-fixture.ts");
-    const sourcePath = join(import.meta.dir, "../src/util/processes-darwin.ts");
-    const entry = join(dir, "native.ts");
-    writeFileSync(
-      entry,
-      `export * from ${JSON.stringify(sourcePath)}; export * from ${JSON.stringify(fixturePath)};`,
-    );
-    const build = await Bun.build({
-      entrypoints: [entry],
-      outdir: join(dir, "build"),
-      target: "bun",
-      plugins: [
-        {
-          name: "synthetic-libproc",
-          setup(builder) {
-            // Bun keeps built-in modules external; redirect the native import before bundling.
-            builder.onLoad({ filter: /processes-darwin\.ts$/ }, async (args) => ({
-              contents: (await Bun.file(args.path).text()).replace(
-                'from "bun:ffi";',
-                `from ${JSON.stringify(fixturePath)};`,
-              ),
-              loader: "ts",
-            }));
-          },
-        },
-      ],
-    });
-    expect(build.success).toBe(true);
-    const output = build.outputs[0];
-    if (!output) throw new Error("No synthetic native inspection build output");
-    const native = (await import(output.path)) as typeof import("../src/util/processes-darwin.ts") &
-      typeof import("./darwin-inspection-fixture.ts");
+    const native = await loadNativeInspection(dir);
     const selected = (leader: ReturnType<typeof native.captureDarwinInvocationLeader>) =>
       native.markedDarwinProcesses(
         process.getuid?.() ?? 0,
@@ -125,6 +129,39 @@ describe("process handling", () => {
       native.setLeaderBirth(2n);
       expect(selected(original)).toEqual([]);
     }
+  });
+
+  test("native unreadable argv uses hidden membership rules and candidate lookups fail closed", async () => {
+    const native = await loadNativeInspection(dir);
+    const leader = native.captureDarwinInvocationLeader(native.leaderPid);
+    const selected = () =>
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "original-invocation",
+        native.leaderPid,
+        2000,
+        [realpathSync(dir)],
+        leader,
+      );
+    const unread = { errno: 1 };
+    // An unreadable child of the live test runner is unrelated even inside our roots.
+    native.setUnreadableProcess({ parent: process.pid, born: unread, cwd: unread });
+    expect(selected()).toEqual([native.memberPid, native.leaderPid]);
+    // Enumerated before its parent, but still claimed through proven membership.
+    native.setUnreadableProcess({ parent: native.memberPid, born: unread, cwd: unread });
+    expect(selected()).toContain(native.unreadablePid);
+    native.setUnreadableProcess({ parent: process.pid, born: unread, cwd: unread, inGroup: true });
+    expect(selected()).toContain(native.unreadablePid);
+    // The same unreadable argv cannot establish numeric ownership after PID reuse.
+    native.setLeaderBirth(2n);
+    expect(selected()).not.toContain(native.unreadablePid);
+    native.setLeaderBirth(1n);
+    native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: dir } });
+    expect(selected()).toContain(native.unreadablePid);
+    native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { errno: 22 } });
+    expect(selected).toThrow(`Process cwd inspection failed for ${native.unreadablePid}`);
+    native.setUnreadableProcess({ parent: 1, born: unread, cwd: unread });
+    expect(selected).toThrow(`Process birth time inspection failed for ${native.unreadablePid}`);
   });
 
   test.skipIf(process.platform !== "darwin")(
@@ -572,6 +609,15 @@ describe("process handling", () => {
         { stdio: "ignore" },
       );
       let pid: number | undefined;
+      let spawning = true;
+      const churn = (async () => {
+        while (spawning) {
+          const children = Array.from({ length: 8 }, () => spawn("/usr/bin/true", [], { stdio: "ignore" }));
+          await Promise.all(
+            children.map((child) => new Promise<void>((resolve) => child.once("close", () => resolve()))),
+          );
+        }
+      })();
       try {
         await new Promise<void>((resolve) => launcher.once("close", () => resolve()));
         const deadline = Date.now() + 3000;
@@ -592,6 +638,8 @@ describe("process handling", () => {
         expect(result.exitCode).toBe(0);
         expect(process.kill(pid, 0)).toBe(true);
       } finally {
+        spawning = false;
+        await churn;
         launcher.kill("SIGKILL");
         if (pid !== undefined) {
           try {

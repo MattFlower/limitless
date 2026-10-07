@@ -149,6 +149,7 @@ export function markedDarwinProcesses(
     }
     if (info[9] !== uid || info[3] === 5 /* SZOMB */) continue;
     parents.set(pid, info[1] ?? 0);
+    const processGroup = info[2];
     const session = symbols.getsid(pid);
     if (session < 0) {
       if (gone()) continue;
@@ -161,34 +162,39 @@ export function markedDarwinProcesses(
       if (gone()) continue;
       const inspected = symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength);
       if ((inspected === 0 && gone()) || (inspected === info.byteLength && info[3] === 5)) continue;
-      throw new Error(`Process environment inspection failed for ${pid}`);
-    }
-    const length = Number(size[0]);
-    const argc = new DataView(args.buffer).getInt32(0, true);
-    let offset = args.indexOf(0, 4); // executable path, followed by padding
-    if (length < 4 || argc <= 0 || offset < 0 || offset >= length || length > args.byteLength)
-      throw new Error(`Invalid process arguments for ${pid}`);
-    while (offset < length && args[offset] === 0) offset++;
-    for (let i = 0; i < argc; i++) {
-      const end = args.indexOf(0, offset);
-      if (end < offset || end >= length) throw new Error(`Incomplete process arguments for ${pid}`);
-      offset = end + 1;
-    }
-    // Read only NUL-delimited environment entries: argv and other variables cannot match.
-    const environment = Buffer.from(args.buffer, 0, length);
-    // Our session/group proves membership even when a descendant replaces its
-    // environment. Detached descendants also belong through a proven parent chain.
-    if (environment.includes(token, offset - 1) || environment.includes(inheritedToken, offset - 1))
-      marked.add(pid);
-    else {
-      if (
-        leader?.pid === group &&
-        ((leader.session === group && session === group) || (leader.group === group && info[2] === group))
-      )
-        membership.add(pid);
-      unmarked.push(pid);
+      // Fork/exec can leave argv unreadable, just like a SIP-hidden environment.
+      // Only proven session/group, ancestry or a new orphan's cwd can claim these;
+      // unrelated live parents must not block cleanup. Candidate lookup failures
+      // still fail closed below, as do identity checks for already-claimed members.
+      hidden.add(pid);
+    } else {
+      const length = Number(size[0]);
+      const argc = new DataView(args.buffer).getInt32(0, true);
+      let offset = args.indexOf(0, 4); // executable path, followed by padding
+      if (length < 4 || argc <= 0 || offset < 0 || offset >= length || length > args.byteLength)
+        throw new Error(`Invalid process arguments for ${pid}`);
+      while (offset < length && args[offset] === 0) offset++;
+      for (let i = 0; i < argc; i++) {
+        const end = args.indexOf(0, offset);
+        if (end < offset || end >= length) throw new Error(`Incomplete process arguments for ${pid}`);
+        offset = end + 1;
+      }
+      // Read only NUL-delimited environment entries: argv and other variables cannot match.
+      const environment = Buffer.from(args.buffer, 0, length);
+      if (environment.includes(token, offset - 1) || environment.includes(inheritedToken, offset - 1)) {
+        marked.add(pid);
+        continue;
+      }
       if (offset === length) hidden.add(pid);
     }
+    // Our session/group proves membership even when a descendant replaces its
+    // environment. Detached descendants also belong through a proven parent chain.
+    if (
+      leader?.pid === group &&
+      ((leader.session === group && session === group) || (leader.group === group && processGroup === group))
+    )
+      membership.add(pid);
+    unmarked.push(pid);
   }
   // Validate immediately before accepting numeric membership. An exited leader's
   // observed session/group remains ours; a recycled leader does not. Without the
