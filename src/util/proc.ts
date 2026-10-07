@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
@@ -58,6 +58,10 @@ async function markedProcesses(
     }
   };
   if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
+  const tokens = [`LIMITLESS_INVOCATION=${marker}`, `LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1`];
+  const carriesMarker = (entries: string[]) => tokens.some((token) => entries.includes(token));
+  if (inspectionPlatform === "linux" && !processInspection.getStore())
+    return linuxMarkedProcesses(uid, carriesMarker);
   const env = { ...process.env };
   delete env.LIMITLESS_INVOCATION;
   env.LIMITLESS_PROCESS_SCAN = marker;
@@ -102,8 +106,6 @@ async function markedProcesses(
     )
   )
     throw new Error("Process environment inspection could not be confirmed");
-  const tokens = [`LIMITLESS_INVOCATION=${marker}`, `LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1`];
-  const carriesMarker = (entries: string[]) => tokens.some((token) => entries.includes(token));
   const candidates = environments.filter(
     (row) =>
       row && Number(row[2]) === uid && !row[3]?.startsWith("Z") && carriesMarker((row[4] ?? "").split(/\s+/)),
@@ -128,27 +130,37 @@ async function markedProcesses(
     }
     return carriesMarker(full.slice(args.length).split(/\s+/)) ? [Number(row?.[1])] : [];
   });
-  if (!changed) {
-    // ps flattens environment entries with spaces. Verify their NUL-delimited
-    // boundaries so a marker-looking value cannot select an unmarked process.
-    if (inspectionPlatform === "linux" && !processInspection.getStore()) {
-      const marked: number[] = [];
-      for (const pid of pids) {
-        try {
-          if ((await stat(`/proc/${pid}`)).uid !== uid) continue;
-          const environment = await readFile(`/proc/${pid}/environ`, "utf8");
-          if (carriesMarker(environment.split("\0"))) marked.push(pid);
-        } catch (error) {
-          if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
-        }
-      }
-      return marked;
-    }
-    return pids;
-  }
+  if (!changed) return pids;
   // A shell may exec between snapshots; never signal it based on mismatched argv.
   if (attempt < 3) return markedProcesses(marker, group, started, directories, leader, attempt + 1);
   throw new Error("Process arguments changed during inspection");
+}
+
+/**
+ * Linux reads /proc directly: spawning ps twice for every command made each invocation's
+ * shutdown cost tens of milliseconds. Entries are NUL-delimited, so a marker-looking value
+ * cannot select an unmarked process. An environment we may not read (a non-dumpable process)
+ * is skipped, as ps showed none for it.
+ */
+async function linuxMarkedProcesses(
+  uid: number,
+  carriesMarker: (entries: string[]) => boolean,
+): Promise<number[]> {
+  const marked: number[] = [];
+  for (const name of await readdir("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      if ((await stat(`/proc/${name}`)).uid !== uid) continue;
+      const status = await readFile(`/proc/${name}/stat`, "utf8");
+      if (status.slice(status.lastIndexOf(")") + 2).startsWith("Z")) continue;
+      const environment = await readFile(`/proc/${name}/environ`, "utf8");
+      if (carriesMarker(environment.split("\0"))) marked.push(Number(name));
+    } catch (error) {
+      if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? ""))
+        throw error;
+    }
+  }
+  return marked;
 }
 
 /** Confirm identity and disappearance without relying on marker membership. */
