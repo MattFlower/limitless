@@ -174,7 +174,12 @@ for (const action of ["timeout", "cancel"] as const) {
     try {
       const result = await runConfined({
         cwd,
-        command: `"${process.execPath}" "${payload}"`,
+        command: `sleep 30 & child=$!
+kill -TERM "$child"
+wait "$child"; status=$?
+[ "$status" -gt 128 ] || exit 1
+printf 'owned-terminated\\n'
+exec "${process.execPath}" "${payload}"`,
         env: agentEnv({
           SIGNAL_WAIT: "1",
           SIGNAL_MARKER: `inside-${crypto.randomUUID()}`,

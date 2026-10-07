@@ -98,8 +98,8 @@ initialization is not evidence that the enclosing boundary failed. Gates retain
 the existing exact startup diagnostic `sandbox_apply: Operation not permitted`
 as a blocking operational error even when it appears before output truncation.
 
-Fixtures cover executable shell/JavaScript inputs, sanitized captured CLI
-shapes, denied and completion-only calls, duplicate records, comments, heredocs,
+Fixtures and inline parser records cover executable shell/JavaScript inputs,
+sanitized captured CLI shapes, denied and completion-only calls, duplicate records, comments, heredocs,
 assistant prose, file edits, tool output and printed/searched literals. Direct
 unit cases cover adjacent shell quoting, common wrappers and non-signaling
 `kill -0` polls. Private invocations keep a fixed warning message with invocation
