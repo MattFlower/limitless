@@ -7400,6 +7400,10 @@ for (const evidence of [
   "different-sha",
   "prior-round",
   "resume",
+  "resume-other-sha",
+  "resume-retried",
+  "resume-failed-stage",
+  "resume-legacy",
 ] as const) {
   test(`loopback verification uses confined gate evidence: ${evidence}`, async () => {
     mkdirSync(join(repoDir, "test"));
@@ -7477,6 +7481,7 @@ test("loopback server", () => {
                 ? {
                     ...c,
                     status: "blocked",
+                    blockedReason: "sandbox",
                     evidence: "bun test test/loopback.test.ts: EPERM listen 127.0.0.1:0",
                   }
                 : c,
@@ -7490,7 +7495,8 @@ test("loopback server", () => {
         },
       };
     });
-    if (evidence === "resume") f.deps.faults = { "stage:verify:after": { action: "kill", occurrence: 1 } };
+    const resume = evidence.startsWith("resume");
+    if (resume) f.deps.faults = { "stage:verify:after": { action: "kill", occurrence: 1 } };
     // Exercise stale evidence retained from an earlier round while the next round has a new SHA.
     if (evidence === "prior-round")
       f.deps.faults = { "stage:verify:before": { action: "kill", occurrence: 2 } };
@@ -7504,11 +7510,36 @@ test("loopback server", () => {
       profile: "standard",
     });
     let terminal: RunStatus;
-    if (evidence === "resume" || evidence === "prior-round") {
+    if (resume || evidence === "prior-round") {
       await interrupted.promise;
       await f.stop();
       const state = f.store.getRunState<RunState>(run.id);
       expect(state).not.toBeNull();
+      if (state && resume) {
+        const recorded = state.verifyResults?.at(-1);
+        const original = recorded?.modelOutput?.criteria.find((c) => c.id === "AC-1");
+        expect(original).toMatchObject({
+          status: "blocked",
+          blockedReason: "sandbox",
+          evidence: "bun test test/loopback.test.ts: EPERM listen 127.0.0.1:0",
+        });
+        expect(original?.gateEvidence).toBeUndefined();
+        expect(recorded?.criteria.find((c) => c.id === "AC-1")).toMatchObject({
+          status: "met",
+          gateEvidence: { stageId: state.gateEvidence?.stageId },
+        });
+        expect(f.store.getArtifact(run.id, "verify-0.json")).not.toContain("modelOutput");
+        if (evidence === "resume-other-sha" && state.gateEvidence) state.gateEvidence.sha = "b".repeat(40);
+        if (evidence === "resume-retried") {
+          const check = state.gateEvidence?.checks[0];
+          if (!check) throw new Error("missing gate check");
+          check.firstAttempt = { ...check.result };
+        }
+        if (evidence === "resume-failed-stage")
+          f.store.finishStage(state.gateEvidence?.stageId ?? -1, "failed", "gate record invalidated");
+        if (evidence === "resume-legacy" && recorded) delete recorded.modelOutput;
+        f.store.setRunState(run.id, state);
+      }
       if (state && evidence === "prior-round") {
         expect(priorGates).toBeDefined();
         state.gateEvidence = priorGates;
@@ -7518,7 +7549,7 @@ test("loopback server", () => {
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     unsubscribe();
-    const succeeds = ["matching", "suite", "resume"].includes(evidence);
+    const succeeds = ["matching", "suite", "resume", "resume-legacy"].includes(evidence);
     expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
@@ -7526,16 +7557,25 @@ test("loopback server", () => {
       const gate = state?.gateEvidence;
       expect(result?.status).toBe("met");
       expect(gate?.sha).toMatch(/^[a-f0-9]{40}$/);
-      expect(result?.evidence).toContain(`verified by gate run ${gate?.stageId} on ${gate?.sha}`);
-      expect(result?.evidence).toContain("check test");
+      expect(result?.evidence).toContain(`Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`);
+      expect(result?.gateEvidence?.stageId).toBe(gate?.stageId);
       expect(f.store.getStage(gate?.stageId ?? -1)?.status).toBe("succeeded");
-      expect(f.store.getArtifact(run.id, "verify-0.json")).toContain(
-        `verified by gate run ${gate?.stageId} on ${gate?.sha}`,
-      );
-      expect(attempts).toBe(1);
+      expect(
+        f.store.getArtifact(run.id, evidence === "resume-legacy" ? "verify-0-retry.json" : "verify-0.json"),
+      ).toContain(`Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`);
+      expect(attempts).toBe(evidence === "resume-legacy" ? 2 : 1);
+      if (evidence === "resume-legacy")
+        expect(state?.verifyResults?.[0]?.criteria.find((c) => c.id === "AC-1")).toMatchObject({
+          status: "blocked",
+          evidence: "Original sandbox block was not recorded.",
+        });
     } else {
       expect(result?.status).toBe("blocked");
       expect(result?.gateEvidence).toBeUndefined();
+      if (resume) {
+        expect(state?.verifyResults?.[0]?.criteria.find((c) => c.id === "AC-1")?.status).toBe("blocked");
+        expect(result?.evidence).toContain("Factory gate substitution unavailable");
+      }
       expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
       if (initialGateSha) expect(state?.verifyResults?.at(-1)?.sha).not.toBe(initialGateSha);
     }

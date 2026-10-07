@@ -144,7 +144,14 @@ export interface RunState {
   }[];
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;
-  verifyResults?: (Verify & { modelId: string; round: number; attempt?: number; sha?: string })[];
+  verifyResults?: (Verify & {
+    modelId: string;
+    round: number;
+    attempt?: number;
+    sha?: string;
+    /** Parsed verifier output, before engine substitution; retained privately for restart. */
+    modelOutput?: Verify;
+  })[];
   /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
   terminalReason?: string;

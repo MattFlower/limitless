@@ -69,7 +69,7 @@ import {
   type RunState,
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
-import { applyGateEvidence, gateTestCommand, ModelVerifySchema } from "./gate-evidence.ts";
+import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -1477,14 +1477,12 @@ async function oneRound(
   try {
     const verifiedSha = await headSha(cwd);
     const gateEvidence = ctx.state.gateEvidence;
-    const completedGate = gateEvidence ? ctx.store.getStage(gateEvidence.stageId) : null;
-    const usableGates =
-      completedGate?.runId === ctx.run.id &&
-      completedGate.name === "gates" &&
-      completedGate.status === "succeeded" &&
-      gateEvidence?.sha === verifiedSha
+    const usableGates = () => {
+      const stage = gateEvidence ? ctx.store.getStage(gateEvidence.stageId) : null;
+      return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded"
         ? gateEvidence
         : undefined;
+    };
     const resolveVerify = (value: Verify) =>
       normalizeVerify(
         applyGateEvidence(
@@ -1492,7 +1490,7 @@ async function oneRound(
           ctx.state.spec as Spec,
           ctx.state.holdout as Holdout,
           verifiedSha,
-          usableGates,
+          usableGates(),
         ),
         ctx.state.spec as Spec,
         ctx.state.holdout as Holdout,
@@ -1527,10 +1525,10 @@ async function oneRound(
               spec: ctx.state.spec as Spec,
               holdout: ctx.state.holdout as Holdout,
               baseSha,
-              checks: usableGates?.checks,
+              checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
             }),
             jsonSchema: toStrictJsonSchema(VerifySchema),
-            schema: ModelVerifySchema,
+            schema: VerifySchema,
             requireStructured: true,
             privateSession: true,
             redactHoldout: true,
@@ -1540,11 +1538,12 @@ async function oneRound(
             throw new NeedsHumanError(
               "Commit changed during verification; gate evidence cannot cover the new HEAD",
             );
-          const v = resolveVerify(VerifySchema.parse(result.structured));
+          const modelOutput = VerifySchema.parse(result.structured);
+          const v = resolveVerify(modelOutput);
           ctx.state.lastVerify = { ...v, modelId: target.modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
-            { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha },
+            { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha, modelOutput },
           ];
           await ctx.save();
           const publicSources = await ctx.publicHoldoutSources();
@@ -1572,7 +1571,24 @@ async function oneRound(
       (v) => v.round === round && (!v.sha || v.sha === verifiedSha),
     );
     const recorded = previous.at(-1);
-    let verify = recorded ? resolveVerify(recorded) : await verifyAttempt(0);
+    // Legacy substitutions did not preserve structured sandbox blocks. Read them conservatively;
+    // ordinary historical model judgments retain their existing semantics.
+    const original =
+      recorded?.modelOutput ??
+      (recorded && {
+        ...recorded,
+        criteria: recorded.criteria.map((row) =>
+          row.gateEvidence
+            ? {
+                ...row,
+                status: "blocked" as const,
+                blockedReason: null,
+                evidence: "Original sandbox block was not recorded.",
+              }
+            : row,
+        ),
+      });
+    let verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
     if (recorded) {
       Object.assign(recorded, verify);
       ctx.state.lastVerify = { ...verify, modelId: recorded.modelId };
@@ -2034,7 +2050,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             ctx.run.id,
             result.attempt === 1 ? `verify-${result.round}-retry.json` : `verify-${result.round}.json`,
             "verify",
-            JSON.stringify(result, null, 2),
+            JSON.stringify({ ...result, modelOutput: undefined }, null, 2),
           );
       }
     };

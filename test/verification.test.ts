@@ -368,10 +368,12 @@ test("verifier leaves gate citations to the engine instead of rerunning whole su
   expect(prompt).toContain("Do not rerun these full commands as evidence");
   expect(prompt).toContain("Leave all gate citation and coverage decisions to the engine");
   expect(prompt).toContain("do not mark a criterion met based on these results");
-  // Without gate results (evals), the prompt is unchanged so cached eval results stay valid.
-  expect(verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" })).not.toContain(
-    "Repository checks",
-  );
+  expect(prompt).toContain('blockedReason "sandbox"');
+  expect(prompt).toContain("Do not cite factory gate runs");
+  expect(prompt).toContain("The factory will evaluate its own gate results");
+  const withoutGates = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" });
+  expect(withoutGates).not.toContain("Repository checks");
+  expect(withoutGates).toContain('blockedReason "sandbox"');
 });
 
 const unmetHoldout = (extra: Partial<Verify["criteria"][number]>): Verify => ({

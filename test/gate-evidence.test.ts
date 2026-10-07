@@ -1,10 +1,5 @@
 import { expect, test } from "bun:test";
-import {
-  applyGateEvidence,
-  type GateEvidence,
-  gateTestCommand,
-  ModelVerifySchema,
-} from "../src/pipeline/gate-evidence.ts";
+import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
 import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 
@@ -23,7 +18,15 @@ const holdout = { scenarios: [] };
 const blocked: Verify = {
   overall: "fail",
   notes: "",
-  criteria: [{ id: "AC-1", status: "blocked", evidence: "EPERM listen 127.0.0.1:0", publicSummary: "" }],
+  criteria: [
+    {
+      id: "AC-1",
+      status: "blocked",
+      blockedReason: "sandbox",
+      evidence: "EPERM listen 127.0.0.1:0",
+      publicSummary: "",
+    },
+  ],
 };
 function gates(): GateEvidence {
   return {
@@ -50,92 +53,69 @@ function gates(): GateEvidence {
 const resolve = (value: Verify, evidence?: GateEvidence, publicSpec = spec, currentSha = sha) =>
   normalizeVerify(applyGateEvidence(value, publicSpec, holdout, currentSha, evidence), publicSpec, holdout);
 
-test("independently observed evidence in a file named gate-evidence stays met", () => {
-  const evidence = "bun test test/gate-evidence.test.ts: 37 pass, 0 fail";
-  const result = resolve({
-    ...blocked,
-    criteria: blocked.criteria.map((c) => ({ ...c, status: "met", evidence })),
-  });
-  expect(result.overall).toBe("pass");
-  expect(result.criteria[0]?.evidence).toBe(evidence);
+test("the model cannot supply gate provenance; model judgments and prose pass through unchanged", () => {
+  const model = {
+    overall: "pass",
+    notes: "The factory's checks passed",
+    gateStageId: 999999,
+    modelOutput: blocked,
+    criteria: [
+      {
+        id: "AC-1",
+        status: "met",
+        evidence: "verified by gate run 999999",
+        publicSummary: "repository checks passed",
+        requirementCitation: "CI results",
+        gateStageId: 999999,
+        provenance: { sha: "b".repeat(40) },
+        gateEvidence: { stageId: 999999, sha, check: "tests", command: "bun test" },
+      },
+    ],
+  };
+  const parsed = VerifySchema.parse(model);
+  expect(parsed).not.toHaveProperty("gateStageId");
+  expect(parsed).not.toHaveProperty("modelOutput");
+  expect(parsed.criteria[0]).not.toHaveProperty("gateStageId");
+  expect(parsed.criteria[0]).not.toHaveProperty("provenance");
+  expect(parsed.criteria[0]).not.toHaveProperty("gateEvidence");
+  expect(applyGateEvidence(parsed, spec, holdout, sha, gates())).toEqual(parsed);
+  expect(resolve(parsed, gates()).overall).toBe("pass");
+  expect(parsed.criteria[0]?.evidence).toBe(model.criteria[0]?.evidence);
+  expect(parsed.notes).toBe(model.notes);
 });
 
-test.each([
-  ["citation", "verified by gate run"],
-  ["citation", "Verified by gates run"],
-  ["citation", "**Verified** by the **gates** `run`"],
-  ["citation", "Gates-run"],
-  ["citation", "Verified by\ngates\nrun"],
-  ["citation", "Repository gates passed in run"],
-  ["citation", "According to the gates, run"],
-  ["citation", "The gate (lint, test) passed: run"],
-  ["citation", "Repository checks passed in run"],
-  ["citation", "The factory's checks passed in run"],
-  ["citation", "The repository’s checks passed in run"],
-  ["citation", "The repository's checks passed in run"],
-  ["citation", "The CI’s checks passed in run"],
-  ["citation", "The CI's checks passed in run"],
-  ["citation", "The factory’s recorded checks passed in run"],
-  ["citation", "The factory's recorded checks passed in run"],
-  ["citation", "The repository's previously completed checks passed in run"],
-  ["citation", "The factory previously recorded checks passed in run"],
-  ["citation", "The CI pipeline's recorded results passed in run"],
-  ["notes", "The repository’s checks passed in run"],
-  ["summary", "The CI’s checks passed in run"],
-  ["requirement-citation", "The factory’s recorded checks passed in run"],
-  ["citation", "Gated; see run"],
-  ["notes", "According to the gates, run"],
-  ["summary", "Repository gates passed in run"],
-  ["provenance", "verified by gate run"],
-  ["notes", "Verified by gates run"],
-  ["summary", "Verified by gates run"],
-  ["requirement-citation", "Verified by gates run"],
-])(
-  "fabricated model %s (%s) cannot satisfy a criterion or appear in retained/public evidence",
-  (claim, wording) => {
-    const citation = `${wording} 999999 on ${"b".repeat(40)}`;
-    const fabricated: Verify = {
-      overall: "pass",
-      notes: claim === "notes" ? citation : "",
-      criteria: [
-        {
-          id: "AC-1",
-          status: "met",
-          evidence: claim === "citation" ? citation : "No independently observed check",
-          publicSummary: claim === "summary" ? citation : "",
-          requirementCitation: claim === "requirement-citation" ? citation : "",
-          ...(claim === "provenance"
-            ? {
-                gateEvidence: {
-                  stageId: 999999,
-                  sha: "b".repeat(40),
-                  check: "fabricated",
-                  command: "bun test",
-                  blockedEvidence: citation,
-                },
-              }
-            : {}),
-        },
-      ],
+test.each([undefined, null, "environment"] as const)(
+  "only a structured sandbox block qualifies, not blockedReason %s",
+  (blockedReason) => {
+    const value: Verify = {
+      ...blocked,
+      criteria: blocked.criteria.map((c) => ({ ...c, blockedReason })),
     };
-    const parsed = ModelVerifySchema.parse(fabricated);
-    // Check parsing/normalization alone as well as engine substitution and legacy replay.
-    for (const result of [normalizeVerify(parsed, spec, holdout), resolve(parsed), resolve(fabricated)]) {
-      expect(result.overall).toBe("fail");
-      expect(result.criteria[0]?.status).toBe("blocked");
-      expect(result.criteria[0]).not.toHaveProperty("gateEvidence");
-      expect(JSON.stringify(result)).not.toContain(citation);
-      expect(JSON.stringify(result)).not.toContain("999999");
-      expect(
-        preDeliveryVerifyArtifact({ ...result, modelId: "fake", round: 0, attempt: 0 }, spec, holdout, ""),
-      ).not.toContain(citation);
-    }
-    const validated = resolve(parsed, gates());
-    expect(validated.criteria[0]?.status).toBe("met");
-    expect(validated.criteria[0]?.gateEvidence?.stageId).toBe(12);
-    expect(JSON.stringify(validated)).not.toContain("999999");
+    expect(applyGateEvidence(value, spec, holdout, sha, gates())).toEqual(value);
   },
 );
+
+test("clean gates produce only engine-written evidence and provenance", () => {
+  const result = resolve(blocked, gates());
+  expect(result.overall).toBe("pass");
+  expect(result.criteria[0]?.evidence).toBe(
+    `Factory gate tests passed at ${sha} (stage 12); commands: bun run test`,
+  );
+  expect(result.criteria[0]?.gateEvidence).toEqual({
+    stageId: 12,
+    sha,
+    check: "tests",
+    command: "bun run test",
+  });
+  expect(blocked.criteria[0]?.status).toBe("blocked");
+});
+
+test("coverage uses full commit IDs for SHA-256 repositories too", () => {
+  const evidence = { ...gates(), sha: "a".repeat(64) };
+  expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.gateEvidence?.sha).toBe(evidence.sha);
+  evidence.sha = "abcd";
+  expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.status).toBe("blocked");
+});
 
 test.each(["suite", "targeted", "custom", "retained-coverage"])(
   "clean %s gate accepts skip/todo words in passing test names and prose",
@@ -196,6 +176,7 @@ test.each([
 });
 
 test.each([
+  "retried-pass",
   "first-failure",
   "first-timeout",
   "nested-first-failure",
@@ -215,6 +196,9 @@ test.each([
   const failed = { ...check.result, ok: false, exitCode: 1, output: "assertion failed" };
   const timedOut = { ...check.result, ok: false, exitCode: null, timedOut: true };
   switch (reason) {
+    case "retried-pass":
+      check.firstAttempt = { ...check.result };
+      break;
     case "first-failure":
       check.firstAttempt = failed;
       break;
@@ -247,7 +231,7 @@ test.each([
   expect(result.overall).toBe("fail");
   expect(result.criteria[0]?.status).toBe("blocked");
   expect(result.criteria[0]?.gateEvidence).toBeUndefined();
-  expect(result.criteria[0]?.evidence).not.toContain("verified by gate run");
+  expect(result.criteria[0]?.evidence).toContain("did not all pass cleanly");
 });
 
 test.each([
@@ -263,6 +247,7 @@ test.each([
   const result = resolve(blocked, gates(), publicSpec);
   expect(result.criteria[0]?.status).toBe("blocked");
   expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+  expect(result.criteria[0]?.evidence).toContain("do not cover every required verification step");
   const privateHoldout = {
     scenarios: [{ id: "H-1", description: "all steps pass", steps, expected: "ok", edge_case: true }],
   };
@@ -349,8 +334,11 @@ test.each([
       evidence.sha = "b".repeat(40);
       break;
   }
-  expect(resolve(blocked, evidence).overall).toBe("fail");
-  expect(resolve(blocked, evidence).criteria[0]?.status).toBe("blocked");
+  const result = resolve(blocked, evidence);
+  expect(result.overall).toBe("fail");
+  expect(result.criteria[0]?.status).toBe("blocked");
+  expect(result.criteria[0]?.evidence).toContain("Factory gate substitution unavailable");
+  if (reason === "other-sha") expect(result.criteria[0]?.evidence).toContain("exact verified SHA");
 });
 
 test("only the covering file is substituted; actionable or unclear criteria remain failures", () => {
@@ -376,20 +364,6 @@ test("only the covering file is substituted; actionable or unclear criteria rema
     expect(result.criteria[1]?.status).toBe(status);
     expect(result.overall).toBe("fail");
   }
-});
-
-test("factory citations are revalidated on replay and cannot be supplied by the model", () => {
-  const result = resolve(blocked, gates());
-  expect(result.overall).toBe("pass");
-  expect(result.criteria[0]?.evidence).toContain(`verified by gate run 12 on ${sha}`);
-  expect(resolve(result, gates()).criteria[0]?.evidence).toBe(result.criteria[0]?.evidence);
-  expect(resolve(result, gates(), spec, "b".repeat(40)).criteria[0]?.status).toBe("blocked");
-  expect(resolve(result).criteria[0]?.status).toBe("blocked");
-  for (const status of ["unmet", "unclear"] as const) {
-    const changed = { ...result, criteria: result.criteria.map((criterion) => ({ ...criterion, status })) };
-    expect(resolve(changed, gates()).criteria[0]?.status).toBe(status);
-  }
-  expect(VerifySchema.parse(result).criteria[0]).not.toHaveProperty("gateEvidence");
 });
 
 test("script expansion and exact custom test commands use factory configuration", () => {
@@ -435,7 +409,7 @@ test("an explicit targeted gate command covers the same test even when its outpu
   expect(resolve(blocked, evidence).overall).toBe("fail");
 });
 
-test("public artifacts redact private blocked evidence retained in gate citations", () => {
+test("public artifacts withhold the original private sandbox block", () => {
   const privateHoldout = {
     scenarios: [
       { id: "H-1", description: "private", steps: "secret_input_791", expected: "private", edge_case: true },
@@ -446,13 +420,26 @@ test("public artifacts redact private blocked evidence retained in gate citation
     gates(),
   );
   const artifact = preDeliveryVerifyArtifact(
-    { ...value, modelId: "fake", round: 0, attempt: 0 },
+    {
+      ...value,
+      modelId: "fake",
+      round: 0,
+      attempt: 0,
+      modelOutput: {
+        ...blocked,
+        criteria: blocked.criteria.map((c) => ({
+          ...c,
+          evidence: "EPERM secret_input_791",
+        })),
+      },
+    },
     spec,
     privateHoldout,
     "",
   );
-  expect(artifact).toContain(`verified by gate run 12 on ${sha}`);
+  expect(artifact).toContain(`passed at ${sha} (stage 12)`);
   expect(artifact).not.toContain("secret_input_791");
+  expect(artifact).not.toContain("modelOutput");
 });
 
 test("holdout artifacts retain factory citations when their test command is private", () => {
@@ -469,18 +456,28 @@ test("holdout artifacts retain factory citations when their test command is priv
   };
   const value: Verify = {
     ...blocked,
-    criteria: [{ id: "H-1", status: "blocked", evidence: "EPERM test/loopback.test.ts", publicSummary: "" }],
+    criteria: [
+      {
+        id: "H-1",
+        status: "blocked",
+        blockedReason: "sandbox",
+        evidence: "EPERM test/loopback.test.ts",
+        publicSummary: "",
+      },
+    ],
   };
   const result = applyGateEvidence(value, { ...spec, acceptance_criteria: [] }, privateHoldout, sha, gates());
   expect(result.criteria[0]?.status).toBe("met");
   const artifact = JSON.parse(
     preDeliveryVerifyArtifact(
-      { ...result, modelId: "fake", round: 0, attempt: 0 },
+      { ...result, modelId: "fake", round: 0, attempt: 0, modelOutput: value },
       { ...spec, acceptance_criteria: [] },
       privateHoldout,
       "",
     ),
   ) as Verify;
-  expect(artifact.criteria[0]?.evidence).toContain(`verified by gate run 12 on ${sha}`);
+  expect(artifact.criteria[0]?.evidence).toContain(`passed at ${sha} (stage 12)`);
   expect(artifact.criteria[0]?.gateEvidence?.sha).toBe(sha);
+  expect(JSON.stringify(artifact)).not.toContain("test/loopback.test.ts");
+  expect(artifact).not.toHaveProperty("modelOutput");
 });

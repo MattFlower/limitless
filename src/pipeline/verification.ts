@@ -2,37 +2,36 @@ import { redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
 export function preDeliveryVerifyArtifact(
-  verify: Verify & { modelId: string; round: number; attempt: number; sha?: string },
+  verify: Verify & { modelId: string; round: number; attempt: number; sha?: string; modelOutput?: Verify },
   spec: Spec,
   holdout: Holdout,
   publicSources: string,
 ): string {
+  const { modelOutput: _privateOutput, ...published } = verify;
   const redact = (value: string, id: string) =>
     rowKind(id, spec, holdout) === "unknown" ? "" : redactHoldoutText(value, holdout, publicSources);
   const gateCitation = (criterion: Verify["criteria"][number]) =>
     criterion.gateEvidence
       ? {
           gateEvidence: {
-            ...criterion.gateEvidence,
+            stageId: criterion.gateEvidence.stageId,
+            sha: criterion.gateEvidence.sha,
             check: redact(criterion.gateEvidence.check, criterion.id),
             command: redact(criterion.gateEvidence.command, criterion.id),
-            blockedEvidence: redact(criterion.gateEvidence.blockedEvidence, criterion.id),
           },
         }
       : {};
   const evidence = (criterion: Verify["criteria"][number], publicRow = false) => {
     if (rowKind(criterion.id, spec, holdout) === "unknown") return "";
     const gate = criterion.gateEvidence;
-    const original = gate?.blockedEvidence ?? criterion.evidence;
-    const redacted = redactHoldoutText(original, holdout, publicSources, !publicRow);
-    // Rebuild the factory citation after redaction, so private scenario text cannot remove its SHA.
+    // Rebuild factory evidence so redacting private commands cannot remove the SHA or stage ID.
     return gate
-      ? `${redacted}\nverified by gate run ${gate.stageId} on ${gate.sha}; check ${redact(gate.check, criterion.id)} (${redact(gate.command, criterion.id)})`
-      : redacted;
+      ? `Factory gate ${redact(gate.check, criterion.id)} passed at ${gate.sha} (stage ${gate.stageId}); commands: ${redact(gate.command, criterion.id)}`
+      : redactHoldoutText(criterion.evidence, holdout, publicSources, !publicRow);
   };
   return JSON.stringify(
     {
-      ...verify,
+      ...published,
       notes: redactHoldoutText(verify.notes, holdout, publicSources),
       criteria: verify.criteria.map((criterion, index) =>
         rowKind(criterion.id, spec, holdout) === "public"

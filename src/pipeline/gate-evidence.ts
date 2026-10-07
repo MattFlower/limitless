@@ -1,7 +1,6 @@
-import { z } from "zod";
 import type { GateComparison } from "../gates/run.ts";
 import { BunTestCoverage } from "../gates/test-coverage.ts";
-import { type Holdout, type Spec, type Verify, VerifySchema } from "./schemas.ts";
+import type { Holdout, Spec, Verify } from "./schemas.ts";
 
 /** Factory provenance, saved with the completed candidate gate stage (never baseline checks). */
 export interface GateEvidence {
@@ -16,66 +15,6 @@ export function gateTestCommand(command: string, scripts: Record<string, string>
   const expanded = script ? scripts[script[1] ?? ""] : command.trim();
   return expanded && /^[\w./-]+(?: [\w./:=@-]+)*$/.test(expanded) ? expanded : null;
 }
-
-// Conservative: any standalone mention of gates (not a path segment), or of the factory's
-// repository/CI checks, is treated as gate-dependent. A false positive only blocks a criterion.
-const gateClaim = (text: string): boolean => {
-  const plain = text.replace(/[`*_~]/g, "");
-  return (
-    /(?<![\w./-])gat(?:e|es|ed|ing)(?![\w/]|\.\w)/i.test(plain) ||
-    // Possessives and intervening words do not make factory-dependent claims independent evidence.
-    /\b(?:repository|factory|ci)(?:['’]s)?\b[\s\S]*?\b(?:checks?|runs?|results?|records?|pipelines?)\b/i.test(
-      plain,
-    ) ||
-    /\bverified\s+by\s+(?:the\s+)?(?:factory|repository|ci)\b/i.test(plain)
-  );
-};
-// Drop the whole field: a citation split over lines would leave fragments behind line-by-line stripping.
-const stripCitations = (text: string): string => (gateClaim(text) ? "" : text.trim());
-
-function sanitizeGateClaims(verify: Verify): Verify {
-  return {
-    ...verify,
-    notes: stripCitations(verify.notes),
-    criteria: verify.criteria.map((criterion) => {
-      // Re-evaluate a previously substituted row on resume, including after a changed HEAD.
-      const { gateEvidence, ...row } = criterion;
-      const claimed =
-        gateEvidence ||
-        [criterion.evidence, criterion.publicSummary, criterion.requirementCitation ?? "", verify.notes].some(
-          gateClaim,
-        );
-      return {
-        ...row,
-        status: claimed && row.status === "met" ? ("blocked" as const) : row.status,
-        evidence:
-          stripCitations(gateEvidence?.blockedEvidence ?? row.evidence) ||
-          "The verifier did not provide independently observed evidence.",
-        publicSummary: stripCitations(row.publicSummary),
-        requirementCitation: stripCitations(row.requirementCitation ?? ""),
-      };
-    }),
-  };
-}
-
-/** Sanitize before schema parsing discards unknown, model-supplied provenance. */
-export const ModelVerifySchema = z.preprocess((value) => {
-  const parsed = VerifySchema.safeParse(value);
-  if (!parsed.success) return value;
-  const rows =
-    value && typeof value === "object" && "criteria" in value && Array.isArray(value.criteria)
-      ? value.criteria
-      : [];
-  return sanitizeGateClaims({
-    ...parsed.data,
-    criteria: parsed.data.criteria.map((criterion, index) => {
-      const raw: unknown = rows[index];
-      return raw && typeof raw === "object" && "gateEvidence" in raw
-        ? { ...criterion, status: criterion.status === "met" ? "blocked" : criterion.status }
-        : criterion;
-    }),
-  });
-}, VerifySchema);
 
 // Runner status rows and summaries, not words inside passing test names or diagnostic prose.
 const incompleteTestOutput =
@@ -142,16 +81,16 @@ function passed(check: GateEvidence["checks"][number]): boolean {
     !result.output.includes("sandbox_apply: Operation not permitted") &&
     !result.testCoverage?.skippedFiles.length &&
     !incompleteTestOutput.test(result.output) &&
-    (!result.firstAttempt || clean(result.firstAttempt));
+    !result.firstAttempt;
   return (
     ["pass", "fixed", "new_pass"].includes(check.verdict) &&
     !check.blocking &&
     clean(check.result) &&
-    (!check.firstAttempt || clean(check.firstAttempt))
+    !check.firstAttempt
   );
 }
 
-/** Model output supplies only `blocked`; provenance and coverage come from factory gate records. */
+/** Only structured sandbox blocks qualify; provenance and coverage come from factory records. */
 export function applyGateEvidence(
   verify: Verify,
   spec: Spec,
@@ -159,43 +98,43 @@ export function applyGateEvidence(
   sha: string,
   gates?: GateEvidence,
 ): Verify {
-  const sanitized = sanitizeGateClaims(verify);
   return {
-    ...sanitized,
-    criteria: sanitized.criteria.map((blocked) => {
-      if (
-        blocked.status !== "blocked" ||
-        !gates ||
-        gates.sha !== sha ||
-        !/^[a-f\d]{40}$/i.test(sha) ||
-        !gates.checks.length ||
-        !gates.checks.every(passed)
-      )
-        return blocked;
+    ...verify,
+    criteria: verify.criteria.map((blocked) => {
+      if (blocked.status !== "blocked" || blocked.blockedReason !== "sandbox") return blocked;
+      const refuse = (reason: string) => ({
+        ...blocked,
+        evidence: `Factory gate substitution unavailable: ${reason}.`,
+      });
+      if (!gates) return refuse("no completed candidate gate stage for this run");
+      if (gates.sha !== sha || !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha))
+        return refuse("candidate gates did not check the exact verified SHA");
+      if (!gates.checks.length || !gates.checks.every(passed))
+        return refuse("candidate gate checks did not all pass cleanly without retries or skipped tests");
       const definitions = [
         ...spec.acceptance_criteria.filter((ac) => ac.id === blocked.id).map((ac) => ac.how_to_verify),
         ...holdout.scenarios
           .filter((scenario) => scenario.id === blocked.id)
           .map((scenario) => scenario.steps),
       ];
-      if (definitions.length !== 1) return blocked;
+      if (definitions.length !== 1) return refuse("criterion has no unique verification definition");
       const commands = verificationCommands(definitions[0] ?? "");
       const covering = commands.map((command) => gates.checks.find((check) => covers(check, command)));
-      if (!commands.length || covering.some((check) => !check)) return blocked;
+      if (!commands.length || covering.some((check) => !check))
+        return refuse("candidate gate checks do not cover every required verification step");
       const checks = [...new Set(covering)].filter((check) => check !== undefined);
       const checkNames = checks.map((check) => check.name).join(", ");
       const checkCommands = checks.map((check) => check.result.command).join("; ");
-      const citation = `verified by gate run ${gates.stageId} on ${sha}; check ${checkNames} (${checkCommands})`;
+      const citation = `Factory gate ${checkNames} passed at ${sha} (stage ${gates.stageId}); commands: ${checkCommands}`;
       return {
         ...blocked,
         status: "met" as const,
-        evidence: `${blocked.evidence}\n${citation}`,
+        evidence: citation,
         gateEvidence: {
           stageId: gates.stageId,
           sha,
           check: checkNames,
           command: checkCommands,
-          blockedEvidence: blocked.evidence,
         },
       };
     }),
