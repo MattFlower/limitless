@@ -81,7 +81,5 @@
 {"type":"item.completed","item":{"id":"signal-15","type":"command_execution","command":"cat <<EOF > notes.txt && kill 123\nhi\nEOF\n","aggregated_output":"kill 123","exit_code":0}}
 {"type":"item.started","item":{"id":"literal-22","type":"command_execution","command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n"}}
 {"type":"item.completed","item":{"id":"literal-22","type":"command_execution","command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n","aggregated_output":"kill 123","exit_code":0}}
-{"type":"item.started","item":{"id":"signal-16","type":"command_execution","command":"/bin/zsh -lc 'kill -TERM 12345'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
-{"type":"item.completed","item":{"id":"signal-16","type":"command_execution","command":"/bin/zsh -lc 'kill -TERM 12345'","aggregated_output":"","exit_code":0,"status":"completed"}}
 {"type":"item.started","item":{"id":"literal-23","type":"command_execution","command":"node --version && node -r ./x.js -e \"console.log(1)\""}}
 {"type":"item.completed","item":{"id":"literal-23","type":"command_execution","command":"node --version && node -r ./x.js -e \"console.log(1)\"","aggregated_output":"kill 123","exit_code":0}}

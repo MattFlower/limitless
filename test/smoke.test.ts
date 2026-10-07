@@ -1086,7 +1086,7 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
         ...(timed || ownTimeout || mode === "completed" || mode === "probe"
           ? [entry]
           : [
-              join(process.cwd(), "scripts/smoke.ts"),
+              "scripts/smoke.ts",
               "--models",
               mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet-5.5@low",
             ]),

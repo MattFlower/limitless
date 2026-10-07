@@ -244,8 +244,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     );
   }
   if (Object.keys(fastSettings).length && spec.noTools) args.push("--settings", JSON.stringify(fastSettings));
-  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined editor
-  // cannot store a transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
+  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined editor cannot store a
+  // transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
   const ephemeral = spec.mode === "edit" && !spec.noTools;
   if (ephemeral && spec.resumeSessionId)
     throw new Error("Confined Claude editors do not persist sessions and cannot resume one");
