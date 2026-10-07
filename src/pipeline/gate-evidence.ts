@@ -13,7 +13,7 @@ export interface GateEvidence {
 export function gateTestCommand(command: string, scripts: Record<string, string>): string | null {
   const script = /^(?:bun|npm|pnpm) run ([\w:-]+)$/.exec(command.trim());
   const expanded = script ? scripts[script[1] ?? ""] : command.trim();
-  return expanded && /^[\w./-]+(?: [\w./:=@-]+)*$/.test(expanded) ? expanded : null;
+  return expanded && /^bun test(?: [\w./-]+)*$/.test(expanded) ? expanded : null;
 }
 
 // Runner status rows and summaries, not words inside passing test names or diagnostic prose.
@@ -36,10 +36,7 @@ function verificationCommands(instructions: string): string[] {
 
 function covers(check: GateEvidence["checks"][number], requestedCommand: string): boolean {
   const command = check.testCommand;
-  if (!command) return false;
-  if (!command.startsWith("bun test")) {
-    return requestedCommand === command || requestedCommand === check.result.command;
-  }
+  if (!command || !/^bun test(?: [\w./-]+)*$/.test(command)) return false;
   // File headers and passing rows prove that the broad suite actually discovered and ran the file.
   // A tail without its header, a skipped file, flags/filters and unsupported runners fail closed.
   const expanded = requestedCommand === check.result.command ? command : requestedCommand;
@@ -57,15 +54,10 @@ function covers(check: GateEvidence["checks"][number], requestedCommand: string)
     return false;
   if (requested.some((file) => selected.length > 0 && !selected.some((filter) => file.includes(filter))))
     return false;
-  if (
-    requested.length > 0 &&
-    selected.length === requested.length &&
-    requested.every((file, index) => file === selected[index] && /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file))
-  )
-    return !check.result.testCoverage?.skippedFiles.length && !incompleteTestOutput.test(check.result.output);
   const recorded = new BunTestCoverage();
   for (const line of check.result.output.split(/\r?\n/)) recorded.observe(line);
   const coverage = check.result.testCoverage ?? recorded.result();
+  if (!coverage.summary || coverage.summary.passed < 1 || coverage.summary.failed !== 0) return false;
   const ran = coverage.passedFiles;
   if (!requested.length)
     return command === "bun test" && ran.length > 0 && coverage.skippedFiles.length === 0;
@@ -112,13 +104,24 @@ export function applyGateEvidence(
       if (!gates.checks.length || !gates.checks.every(passed))
         return refuse("candidate gate checks did not all pass cleanly without retries or skipped tests");
       const definitions = [
-        ...spec.acceptance_criteria.filter((ac) => ac.id === blocked.id).map((ac) => ac.how_to_verify),
+        ...spec.acceptance_criteria
+          .filter((ac) => ac.id === blocked.id)
+          .map((ac) => ({ steps: ac.how_to_verify, expected: ac.criterion })),
         ...holdout.scenarios
           .filter((scenario) => scenario.id === blocked.id)
-          .map((scenario) => scenario.steps),
+          .map((scenario) => ({ steps: scenario.steps, expected: scenario.expected })),
       ];
       if (definitions.length !== 1) return refuse("criterion has no unique verification definition");
-      const commands = verificationCommands(definitions[0] ?? "");
+      const definition = definitions[0];
+      // Exit success attests only to tests passing, never to an additional observable outcome.
+      if (
+        !definition ||
+        !/^(?:(?:the|all|both|targeted|covered|project|gate)\s+)*(?:[\w./-]+\s+)?tests?(?:\s+suite)?\s+pass(?:es)?[.!]?$/i.test(
+          definition.expected.trim(),
+        )
+      )
+        return refuse("required outcome is not solely that tests pass");
+      const commands = verificationCommands(definition.steps);
       const covering = commands.map((command) => gates.checks.find((check) => covers(check, command)));
       if (!commands.length || covering.some((check) => !check))
         return refuse("candidate gate checks do not cover every required verification step");

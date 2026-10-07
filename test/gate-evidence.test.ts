@@ -1,7 +1,14 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { compareGates, runGates } from "../src/gates/run.ts";
+import { BunTestCoverage } from "../src/gates/test-coverage.ts";
+import { confinementScope } from "../src/harness/sandbox.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
 import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import { fakeConfinement } from "./confinement.ts";
 
 const sha = "a".repeat(40);
 const spec: Spec = {
@@ -117,14 +124,13 @@ test("coverage uses full commit IDs for SHA-256 repositories too", () => {
   expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.status).toBe("blocked");
 });
 
-test.each(["suite", "targeted", "custom", "retained-coverage"])(
+test.each(["suite", "targeted", "retained-coverage"])(
   "clean %s gate accepts skip/todo words in passing test names and prose",
   (kind) => {
     const evidence = gates();
     const check = evidence.checks[0];
     if (!check) throw new Error("missing fixture check");
     if (kind === "targeted") check.testCommand = "bun test test/loopback.test.ts";
-    if (kind === "custom") check.testCommand = "node test.js";
     if (kind !== "suite") check.result.command = check.testCommand ?? "";
     check.result.output = [
       "test/loopback.test.ts:",
@@ -138,17 +144,14 @@ test.each(["suite", "targeted", "custom", "retained-coverage"])(
       "0 fail",
     ].join("\n");
     if (kind === "retained-coverage") {
-      check.result.testCoverage = { passedFiles: ["test/loopback.test.ts"], skippedFiles: [] };
+      check.result.testCoverage = {
+        passedFiles: ["test/loopback.test.ts"],
+        skippedFiles: [],
+        summary: { passed: 3, failed: 0 },
+      };
       check.result.output = check.result.output.split("\n").slice(1).join("\n");
     }
-    const publicSpec =
-      kind === "custom"
-        ? {
-            ...spec,
-            acceptance_criteria: [{ id: "AC-1", criterion: "test passes", how_to_verify: "node test.js" }],
-          }
-        : spec;
-    const result = resolve(blocked, evidence, publicSpec);
+    const result = resolve(blocked, evidence);
     expect(result.overall).toBe("pass");
     expect(result.criteria[0]?.status).toBe("met");
     expect(result.criteria[0]?.gateEvidence?.stageId).toBe(12);
@@ -242,7 +245,7 @@ test.each([
 ])("partial gate coverage leaves every step blocked: %s", (steps) => {
   const publicSpec = {
     ...spec,
-    acceptance_criteria: [{ id: "AC-1", criterion: "all steps pass", how_to_verify: steps }],
+    acceptance_criteria: [{ id: "AC-1", criterion: "all tests pass", how_to_verify: steps }],
   };
   const result = resolve(blocked, gates(), publicSpec);
   expect(result.criteria[0]?.status).toBe("blocked");
@@ -270,7 +273,11 @@ test("clean gate checks can cover all commands in a multi-step criterion", () =>
     ...check,
     name: "other",
     testCommand: "bun test test/other.test.ts",
-    result: { ...check.result, command: "bun test test/other.test.ts", output: "1 pass\n0 fail" },
+    result: {
+      ...check.result,
+      command: "bun test test/other.test.ts",
+      output: "test/other.test.ts:\n(pass) other test\n1 pass\n0 fail",
+    },
   });
   const result = resolve(blocked, evidence, {
     ...spec,
@@ -366,10 +373,12 @@ test("only the covering file is substituted; actionable or unclear criteria rema
   }
 });
 
-test("script expansion and exact custom test commands use factory configuration", () => {
+test("script expansion only accepts supported test runners from factory configuration", () => {
   expect(gateTestCommand("bun run test", { test: "bun test" })).toBe("bun test");
   expect(gateTestCommand("bun run test", {})).toBeNull();
   expect(gateTestCommand("bun run test", { test: "true || bun test" })).toBeNull();
+  expect(gateTestCommand("cat farewell.txt", {})).toBeNull();
+  expect(gateTestCommand("node test/loopback.js", {})).toBeNull();
   expect(
     resolve(blocked, gates(), {
       ...spec,
@@ -394,20 +403,203 @@ test("script expansion and exact custom test commands use factory configuration"
         },
       ],
     }).overall,
-  ).toBe("pass");
+  ).toBe("fail");
 });
 
-test("an explicit targeted gate command covers the same test even when its output tail lost the header", () => {
-  const evidence = gates();
-  const check = evidence.checks[0];
-  if (!check) throw new Error("missing fixture check");
-  check.testCommand = "bun test ./test/loopback.test.ts";
-  check.result.command = check.testCommand;
-  check.result.output = "1 pass\n0 fail";
-  expect(resolve(blocked, evidence).overall).toBe("pass");
-  check.result.output = "1 pass\n1 skip\n0 fail";
-  expect(resolve(blocked, evidence).overall).toBe("fail");
+test.each([
+  "returns goodbye",
+  "tests pass and the HTTP response is goodbye",
+  "HTTP returns goodbye if tests pass",
+])("a passing test runner does not prove a specific required observation: %s", (expected) => {
+  const publicSpec = {
+    ...spec,
+    acceptance_criteria: [
+      {
+        ...spec.acceptance_criteria[0],
+        id: "AC-1",
+        criterion: expected,
+        how_to_verify: "bun test test/loopback.test.ts",
+      },
+    ],
+  };
+  expect(resolve(blocked, gates(), publicSpec).criteria[0]).toMatchObject({
+    status: "blocked",
+    evidence: "Factory gate substitution unavailable: required outcome is not solely that tests pass.",
+  });
+  const privateResult = applyGateEvidence(
+    { ...blocked, criteria: blocked.criteria.map((row) => ({ ...row, id: "H-1" })) },
+    { ...spec, acceptance_criteria: [] },
+    {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "observation",
+          steps: "bun test test/loopback.test.ts",
+          expected,
+          edge_case: false,
+        },
+      ],
+    },
+    sha,
+    gates(),
+  );
+  expect(privateResult.criteria[0]?.status).toBe("blocked");
+  expect(privateResult.criteria[0]?.gateEvidence).toBeUndefined();
 });
+
+test.each(["wrong-content", "zero-tests-truncated", "noisy-pass"])(
+  "real gate execution preserves the proof boundary: %s",
+  async (kind) => {
+    const cwd = mkdtempSync(join(tmpdir(), "limitless-gate-evidence-"));
+    try {
+      writeFileSync(join(cwd, "farewell.txt"), "hello\n");
+      const reporter =
+        'Bun.spawn(["bun", "-e", \'await Bun.stdin.text(); console.error("x".repeat(8000))\'], { stdin: "pipe", stdout: "ignore", stderr: "inherit" }).unref();\n';
+      writeFileSync(join(cwd, "empty.test.ts"), reporter);
+      writeFileSync(
+        join(cwd, "passing.test.ts"),
+        `import { test, expect } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n${reporter}`,
+      );
+      const command =
+        kind === "wrong-content"
+          ? "cat farewell.txt"
+          : `bun test ./${kind === "noisy-pass" ? "passing" : "empty"}.test.ts`;
+      const run = await confinementScope.run(fakeConfinement, () =>
+        runGates(
+          cwd,
+          {
+            source: ".limitless.toml",
+            setup: [],
+            protectedPaths: [],
+            checks: [{ name: "tests", run: command }],
+          },
+          new AbortController().signal,
+        ),
+      );
+      const evidence = {
+        stageId: 12,
+        sha,
+        checks: compareGates(null, run).map((check) => ({
+          ...check,
+          testCommand: gateTestCommand(check.result.command, {}),
+        })),
+      };
+      expect(run.checks[0]?.ok).toBe(true);
+      if (kind !== "wrong-content") {
+        expect(run.checks[0]?.output).not.toMatch(/\d+ pass/);
+        expect(run.checks[0]?.output.length).toBe(6000);
+      }
+      const privateHoldout = {
+        scenarios: [
+          {
+            id: "H-1",
+            description: "gate check",
+            steps: command,
+            expected: kind === "wrong-content" ? "goodbye" : "tests pass",
+            edge_case: false,
+          },
+        ],
+      };
+      const publicSpec = { ...spec, acceptance_criteria: [] };
+      const result = normalizeVerify(
+        applyGateEvidence(
+          { ...blocked, criteria: blocked.criteria.map((row) => ({ ...row, id: "H-1" })) },
+          publicSpec,
+          privateHoldout,
+          sha,
+          evidence,
+        ),
+        publicSpec,
+        privateHoldout,
+      );
+      expect(result.criteria[0]?.status).toBe(kind === "noisy-pass" ? "met" : "blocked");
+      expect(result.overall).toBe(kind === "noisy-pass" ? "pass" : "fail");
+      if (kind !== "noisy-pass") {
+        expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+        expect(result.criteria[0]?.evidence).toContain("Factory gate substitution unavailable");
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["relative", "linux-absolute", "macos-absolute", "colored-crlf", "github-actions", "skipped"])(
+  "Bun file and summary parsing is independent of output format: %s",
+  (format) => {
+    const cwd = format === "linux-absolute" ? "/home/runner/work/project/project" : "/private/var/project";
+    const file = format.endsWith("absolute") ? `${cwd}/test/loopback.test.ts` : "./test/loopback.test.ts";
+    const coverage = new BunTestCoverage(cwd);
+    const lines = [`${file}:`, "(pass) loopback", "1 pass", "0 fail"];
+    if (format === "github-actions") {
+      lines[0] = `::group::${file}:`;
+      lines.splice(2, 0, "::endgroup::");
+    }
+    if (format === "skipped") lines.splice(2, 0, "(skip) unavailable", "1 skip");
+    if (format === "colored-crlf") {
+      lines[2] = "1 passed";
+      lines[3] = "0 failed";
+    }
+    for (const line of lines) coverage.observe(format === "colored-crlf" ? `\x1b[32m${line}\x1b[0m\r` : line);
+    expect(coverage.result()).toEqual({
+      passedFiles: format === "skipped" ? [] : ["test/loopback.test.ts"],
+      skippedFiles: format === "skipped" ? ["test/loopback.test.ts"] : [],
+      summary: { passed: 1, failed: 0 },
+    });
+  },
+);
+
+test("Bun absolute file headers and checkout roots use the same realpath", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "limitless-coverage-path-"));
+  try {
+    const alias = join(cwd, "alias");
+    writeFileSync(join(cwd, "loopback.test.ts"), "");
+    symlinkSync(cwd, alias, "dir");
+    for (const [root, header] of [
+      [alias, realpathSync(cwd)],
+      [realpathSync(cwd), alias],
+    ]) {
+      const coverage = new BunTestCoverage(root);
+      for (const line of [`${header}/loopback.test.ts:`, "(pass) loopback", "1 pass", "0 fail"])
+        coverage.observe(line);
+      expect(coverage.result()).toEqual({
+        passedFiles: ["loopback.test.ts"],
+        skippedFiles: [],
+        summary: { passed: 1, failed: 0 },
+      });
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each(["no-header", "no-summary", "partial-summary", "zero-tests", "truncated", "retained-pass"])(
+  "exact targeted commands require positive file coverage and a summary: %s",
+  (kind) => {
+    const evidence = gates();
+    const check = evidence.checks[0];
+    if (!check) throw new Error("missing fixture check");
+    check.testCommand = "bun test ./test/loopback.test.ts";
+    check.result.command = check.testCommand;
+    if (kind === "no-header") check.result.output = "1 pass\n0 fail";
+    if (kind === "no-summary") check.result.output = "test/loopback.test.ts:\n(pass) loopback";
+    if (kind === "partial-summary") check.result.output = "test/loopback.test.ts:\n(pass) loopback\n1 pass";
+    if (kind === "zero-tests") check.result.output = "test/loopback.test.ts:\n0 pass\n0 fail";
+    if (kind === "truncated" || kind === "retained-pass") check.result.output = "x".repeat(6000);
+    if (kind === "retained-pass")
+      check.result.testCoverage = {
+        passedFiles: ["test/loopback.test.ts"],
+        skippedFiles: [],
+        summary: { passed: 1, failed: 0 },
+      };
+    const result = resolve(blocked, evidence);
+    expect(result.criteria[0]?.status).toBe(kind === "retained-pass" ? "met" : "blocked");
+    if (kind !== "retained-pass") {
+      expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+      expect(result.criteria[0]?.evidence).toContain("Factory gate substitution unavailable");
+    }
+  },
+);
 
 test("public artifacts withhold the original private sandbox block", () => {
   const privateHoldout = {
@@ -449,7 +641,7 @@ test("holdout artifacts retain factory citations when their test command is priv
         id: "H-1",
         description: "private loopback",
         steps: "bun test test/loopback.test.ts",
-        expected: "private",
+        expected: "tests pass",
         edge_case: true,
       },
     ],

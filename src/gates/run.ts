@@ -64,7 +64,7 @@ export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLO
 /** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
   let confinementError = false;
-  const coverage = new BunTestCoverage();
+  const coverage = new BunTestCoverage(cwd);
   const observe = (line: string) => {
     confinementError ||= launchFailure(line);
     coverage.observe(line);
@@ -90,7 +90,9 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     ...(res.timedOut ? { timedOut: true } : {}),
     // Present only when set, like timedOut, so results stay readable by strict schemas and older releases.
     ...(confinementError ? { confinementError: true } : {}),
-    ...(testCoverage.passedFiles.length || testCoverage.skippedFiles.length ? { testCoverage } : {}),
+    ...(testCoverage.summary || testCoverage.passedFiles.length || testCoverage.skippedFiles.length
+      ? { testCoverage }
+      : {}),
   };
 }
 

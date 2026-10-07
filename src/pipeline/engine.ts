@@ -1135,12 +1135,6 @@ async function oneRound(
               }
             : undefined;
         ctx.store.putArtifact(ctx.run.id, `gates-${round}.json`, "gates", JSON.stringify(cmp, null, 2));
-        ctx.store.putArtifact(
-          ctx.run.id,
-          `gate-evidence-${round}.json`,
-          "gates",
-          JSON.stringify(ctx.state.gateEvidence ?? null, null, 2),
-        );
         if (baseTimeout) {
           await ctx.save();
           throw new NeedsHumanError("gate timed out on the base revision too");
@@ -1571,23 +1565,7 @@ async function oneRound(
       (v) => v.round === round && (!v.sha || v.sha === verifiedSha),
     );
     const recorded = previous.at(-1);
-    // Legacy substitutions did not preserve structured sandbox blocks. Read them conservatively;
-    // ordinary historical model judgments retain their existing semantics.
-    const original =
-      recorded?.modelOutput ??
-      (recorded && {
-        ...recorded,
-        criteria: recorded.criteria.map((row) =>
-          row.gateEvidence
-            ? {
-                ...row,
-                status: "blocked" as const,
-                blockedReason: null,
-                evidence: "Original sandbox block was not recorded.",
-              }
-            : row,
-        ),
-      });
+    const original = recorded?.modelOutput ?? recorded;
     let verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
     if (recorded) {
       Object.assign(recorded, verify);

@@ -7403,7 +7403,6 @@ for (const evidence of [
   "resume-other-sha",
   "resume-retried",
   "resume-failed-stage",
-  "resume-legacy",
 ] as const) {
   test(`loopback verification uses confined gate evidence: ${evidence}`, async () => {
     mkdirSync(join(repoDir, "test"));
@@ -7537,7 +7536,6 @@ test("loopback server", () => {
         }
         if (evidence === "resume-failed-stage")
           f.store.finishStage(state.gateEvidence?.stageId ?? -1, "failed", "gate record invalidated");
-        if (evidence === "resume-legacy" && recorded) delete recorded.modelOutput;
         f.store.setRunState(run.id, state);
       }
       if (state && evidence === "prior-round") {
@@ -7549,7 +7547,7 @@ test("loopback server", () => {
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     unsubscribe();
-    const succeeds = ["matching", "suite", "resume", "resume-legacy"].includes(evidence);
+    const succeeds = ["matching", "suite", "resume"].includes(evidence);
     expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
@@ -7560,15 +7558,10 @@ test("loopback server", () => {
       expect(result?.evidence).toContain(`Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`);
       expect(result?.gateEvidence?.stageId).toBe(gate?.stageId);
       expect(f.store.getStage(gate?.stageId ?? -1)?.status).toBe("succeeded");
-      expect(
-        f.store.getArtifact(run.id, evidence === "resume-legacy" ? "verify-0-retry.json" : "verify-0.json"),
-      ).toContain(`Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`);
-      expect(attempts).toBe(evidence === "resume-legacy" ? 2 : 1);
-      if (evidence === "resume-legacy")
-        expect(state?.verifyResults?.[0]?.criteria.find((c) => c.id === "AC-1")).toMatchObject({
-          status: "blocked",
-          evidence: "Original sandbox block was not recorded.",
-        });
+      expect(f.store.getArtifact(run.id, "verify-0.json")).toContain(
+        `Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`,
+      );
+      expect(attempts).toBe(1);
     } else {
       expect(result?.status).toBe("blocked");
       expect(result?.gateEvidence).toBeUndefined();
