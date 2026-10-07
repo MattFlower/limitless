@@ -201,9 +201,10 @@ describe("land-pr private strings", () => {
           'const exit = process.exit.bind(process);\nprocess.exit = ((_code?: number) => exit(0)) as typeof process.exit;\nprocess.on("exit", () => {\n  process.exitCode = 0;\n});\n',
         );
       }
-      // Supply the index the orchestrator used; allowed landings must already be committed.
+      // Scan committed PR content; only the post-check mutation starts uncommitted.
       await git("-C", work, "add", ".");
-      if (["absent", "clean", "excluded", "destination"].includes(scenario)) await commit("safe");
+      if (scenario !== "post-commit" && (await git("-C", work, "diff", "--cached", "--name-only")).stdout)
+        await commit("safe");
       // Stop permitted deliveries at push so the script never reaches the network.
       writeFileSync(
         join(bin, "git"),
@@ -245,9 +246,11 @@ describe("land-pr private strings", () => {
             ? "Cannot read private-strings.txt"
             : ["inside", "alias", "source-inside"].includes(scenario)
               ? "inside repository"
-              : scenario === "lfs-missing"
-                ? "Cannot inspect local LFS payload"
-                : "entry 3 in private-strings.txt",
+              : scenario === "post-commit"
+                ? "Worktree differs from landing commit"
+                : scenario === "lfs-missing"
+                  ? "Cannot inspect local LFS payload"
+                  : "entry 3 in private-strings.txt",
         );
       }
     } finally {
@@ -278,6 +281,10 @@ test.each([
   "redirect-and-move-head",
   "working-tree",
   "untracked",
+  "ignored",
+  "local-exclude",
+  "changed-local-exclude",
+  "no-private-strings",
   "state:MERGE_HEAD",
   "state:CHERRY_PICK_HEAD",
   "state:REVERT_HEAD",
@@ -339,12 +346,15 @@ test.each([
     // Make the alternate commit available to HEAD-movement attacks without publishing it.
     await git("fetch", "-q", alternate, "main");
     writeFileSync(join(work, "file"), "safe change\n");
+    if (scenario === "ignored") writeFileSync(join(work, ".gitignore"), "local-build/\n");
+    if (["local-exclude", "changed-local-exclude"].includes(scenario))
+      writeFileSync(join(source, ".git/info/exclude"), "local-build/\n");
     if (scenario.endsWith(":clean-filter"))
       writeFileSync(join(work, ".gitattributes"), "file filter=attack\n");
     await git("-C", work, "add", ".");
     await git("-C", work, "commit", "-qm", "safe change");
     const landingSha = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
-    writeFileSync(join(config, "private-strings.txt"), entry);
+    if (scenario !== "no-private-strings") writeFileSync(join(config, "private-strings.txt"), entry);
     const paths = [
       realpathSync(work),
       realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git/worktrees/work")),
@@ -358,6 +368,7 @@ test.each([
       expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
     const calls = join(root, "calls");
     const pinned = join(root, "pinned");
+    const checked = join(root, "checked");
     const marker = join(root, "config-command-ran");
     const injected = join(
       root,
@@ -483,14 +494,20 @@ if (args[0] === "run") {
   if (${JSON.stringify(scenario)}.startsWith("redirect")) writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
   if (${JSON.stringify(scenario)} === "working-tree") writeFileSync(${JSON.stringify(join(work, "file"))}, "check-generated change\\n");
   if (${JSON.stringify(scenario)} === "untracked") writeFileSync(${JSON.stringify(join(work, "untracked"))}, "generated\\n");
+  if (${JSON.stringify(["ignored", "local-exclude", "changed-local-exclude"].includes(scenario))}) {
+    mkdirSync(${JSON.stringify(join(work, "local-build"))});
+    writeFileSync(${JSON.stringify(join(work, "local-build/output"))}, "generated\\n");
+    if (${JSON.stringify(scenario)} === "changed-local-exclude") writeFileSync(${JSON.stringify(join(source, ".git/info/exclude"))}, "");
+  }
   if (${JSON.stringify(scenario)}.startsWith("state:")) writeFileSync(${JSON.stringify(paths[1])} + "/" + ${JSON.stringify(plantKey)}, ${JSON.stringify(landingSha)} + "\\n");
   if (${JSON.stringify(plantKey)} === "clean-filter") writeFileSync(${JSON.stringify(join(work, "file"))}, "safe change\\n");
+  writeFileSync(${JSON.stringify(checked)}, "ready");
 }
 if (args[0].endsWith(".ts")) {
   if (args.length === 6) {
     writeFileSync(${JSON.stringify(pinned)}, args[5]);
     if (${JSON.stringify(scenario)} === "redirect-and-move-head") {
-      const moved = spawnSync(${JSON.stringify(gitBin)}, ["update-ref", "refs/heads/pr", ${JSON.stringify(value.denied)}], { stdio: "inherit" });
+      const moved = spawnSync(${JSON.stringify(gitBin)}, ["update-ref", "refs/heads/pr", ${JSON.stringify(value.denied)}], { env: { ...process.env, GIT_DIR: ${JSON.stringify(paths[1])}, GIT_COMMON_DIR: ${JSON.stringify(paths[2])} }, stdio: "inherit" });
       if (moved.status !== 0) process.exit(1);
     }
   }
@@ -508,7 +525,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, rmSync, writeFileSy
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
-appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths, config: process.env.GIT_CONFIG ?? null, index: process.env.GIT_INDEX_FILE ?? null }) + "\\n");
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths, checked: existsSync(${JSON.stringify(checked)}), config: process.env.GIT_CONFIG ?? null, index: process.env.GIT_INDEX_FILE ?? null }) + "\\n");
 if ((${JSON.stringify(scenario)} === "config-failed-before" && args.includes("--absolute-git-dir")) ||
     (${JSON.stringify(scenario)} === "config-failed-url" && args.includes("--get-all"))) {
   console.error("secret-config-value"); process.exit(1);
@@ -535,13 +552,11 @@ if (args.includes("push")) {
     if (included.stdout.trim() !== "yes") process.exit(1);
   }
 }
-// Introduce a malformed clone include only during the dirty lookup, after the scans.
+// Leave the malformed clone include in place through push and the final merge check.
 const configFile = ${JSON.stringify(join(paths[2] ?? "", "config"))};
 const malformed = ${JSON.stringify(scenario)} === "status:malformed-include" && args.includes("status");
-const saved = malformed ? readFileSync(configFile) : null;
 if (malformed) appendFileSync(configFile, ${JSON.stringify(`\n[include]\npath = ${JSON.stringify(injected)}\n`)});
 const result = spawnSync(${JSON.stringify(gitBin)}, deliveryArgs, { stdio: "inherit" });
-if (saved) writeFileSync(configFile, saved);
 process.exit(result.status ?? 1);
 `,
       { mode: 0o755 },
@@ -590,6 +605,7 @@ else if (args[1] === "view") {
       paths?: (string | null)[];
       config?: string | null;
       index?: string | null;
+      checked?: boolean;
       mode?: number;
       alternates?: string;
     }[] = readFileSync(calls, "utf8")
@@ -607,6 +623,14 @@ else if (args[1] === "view") {
       expect(existsSync(call.args[call.args.indexOf("-C") + 1] ?? "")).toBe(false);
     }
     const pushRepos = logged.filter((call) => call.tool === "push-repo");
+    for (const call of logged.filter((call) => call.tool === "git" && call.checked)) {
+      const privateDir = call.paths?.[1];
+      expect(privateDir).toStartWith(`${root}/land-pr-push.`);
+      expect(call.paths?.[2]).toBe(privateDir);
+      expect(call.index).toBe(`${privateDir}/index`);
+      expect(call.paths).not.toContain(paths[1]);
+      expect(call.paths).not.toContain(paths[2]);
+    }
     for (const call of pushRepos) {
       expect(call.mode).toBe(0o700);
       expect(call.alternates).toBe(`${paths[2]}/objects\n`);
@@ -683,8 +707,9 @@ else if (args[1] === "view") {
     const recordedAt = logged.findIndex((call) => call.tool === "recorded");
     expect(recordedAt).toBeGreaterThan(0);
     expect(installed).toBeGreaterThan(recordedAt);
+    const checkedAt = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "run");
     for (const call of logged
-      .slice(recordedAt + 1)
+      .slice(recordedAt + 1, checkedAt + 1)
       .filter((call) => call.tool === "git" || call.tool === "bun")) {
       const isolated =
         (call.tool === "bun" && ["install", "run"].includes(call.args[0] ?? "")) ||
@@ -722,7 +747,9 @@ else if (args[1] === "view") {
     expect(push.at(-2)).toBe(expectedUrl);
     expect(push.at(-1)).toBe(`${sha}:refs/heads/pr`);
     expect(commands("git", "remote.origin.url").filter((args) => args.includes("--get-all"))).toHaveLength(1);
-    expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
+    expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(
+      scenario !== "no-private-strings",
+    );
     expect(commands("gh", "list")).toEqual([
       [
         "run",

@@ -18,7 +18,7 @@ push_repo=""
 trap '[ -z "$push_repo" ] || rm -rf -- "$push_repo"' EXIT
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
 # The worktree's bunfig.toml (preload) and .env must not reach the checker.
-check_private() { bun --config=/dev/null --no-env-file "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
+check_private() { (cd "${check_dir:-$PWD}"; exec bun --config=/dev/null --no-env-file "$private_check" "$@") & checker=$!; wait "$checker"; checker=""; }
 # Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
 export LIMITLESS_GIT_EMPTY_HOOK=""
 safe_git() {
@@ -58,6 +58,17 @@ if [[ -z "$url" || "$url" = *$'\n'* ]]; then
   echo "Origin URL is missing or multi-valued; refusing to push" >&2
   exit 1
 fi
+push_repo="$(mktemp -d "${TMPDIR:-/tmp}/land-pr-push.XXXXXXXX")"
+chmod 0700 "$push_repo"
+# Snapshot local ignore data before PR code runs; never reopen clone config afterward.
+if [ -e "$common/info/exclude" ] || [ -L "$common/info/exclude" ]; then
+  if ! cat "$common/info/exclude" > "$push_repo/exclude" 2>/dev/null; then
+    echo "Cannot snapshot repository exclusions; refusing to land" >&2
+    exit 1
+  fi
+else
+  : > "$push_repo/exclude"
+fi
 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
 if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
@@ -71,43 +82,48 @@ for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
     exit 1
   fi
 done
+clone="$GIT_WORK_TREE"
+unset GIT_WORK_TREE GIT_CONFIG
+export GIT_DIR="$push_repo" GIT_COMMON_DIR="$push_repo" GIT_INDEX_FILE="$push_repo/index"
+if ! git -C "$push_repo" init --bare -q 2>/dev/null; then
+  echo "Cannot initialize push repository; refusing to push" >&2
+  exit 1
+fi
+export GIT_WORK_TREE="$clone"
+printf '%s\n' "$common/objects" > "$push_repo/objects/info/alternates"
+mv "$push_repo/exclude" "$push_repo/info/exclude"
+# Local LFS payloads remain source data, not Git configuration.
+ln -s "$common/lfs" "$push_repo/lfs"
+# Keep global hasconfig:remote.*.url includes working without copying clone config.
+if ! safe_git -C "$push_repo" config remote.origin.url "$url" 2>/dev/null ||
+   ! safe_git -C "$push_repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  echo "Cannot prepare pinned commit in push repository; refusing to push" >&2
+  exit 1
+fi
+# Status must compare the private index with the pinned commit, not an unborn HEAD.
+printf '%s\n' "$sha" > "$push_repo/HEAD"
+if ! safe_git --git-dir="$push_repo" --work-tree="$clone" read-tree "$sha" 2>/dev/null; then
+  echo "Cannot inspect worktree; refusing to land" >&2
+  exit 1
+fi
+# Running outside the clone prevents worktreeGit from restoring its recorded admin paths.
+check_dir="$push_repo"
+export LIMITLESS_LAND_SOURCE_DIR="$clone" LIMITLESS_LAND_SOURCE_COMMON_DIR="$common"
 check_private "$pr" "$repo" "$subject"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
-clone="$GIT_WORK_TREE"
-push_repo="$(mktemp -d "${TMPDIR:-/tmp}/land-pr-push.XXXXXXXX")"
-chmod 0700 "$push_repo"
-(
-  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG
-  cd "$push_repo"
-  if ! git -C "$push_repo" init --bare -q 2>/dev/null; then
-    echo "Cannot initialize push repository; refusing to push" >&2
-    exit 1
-  fi
-  printf '%s\n' "$common/objects" > "$push_repo/objects/info/alternates"
-  # Keep global hasconfig:remote.*.url includes working without copying clone config.
-  if ! safe_git -C "$push_repo" config remote.origin.url "$url" 2>/dev/null ||
-     ! safe_git -C "$push_repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
-    echo "Cannot prepare pinned commit in push repository; refusing to push" >&2
-    exit 1
-  fi
-  # Status must compare the private index with the pinned commit, not an unborn HEAD.
-  printf '%s\n' "$sha" > "$push_repo/HEAD"
-  export GIT_INDEX_FILE="$push_repo/index"
-  if ! safe_git --git-dir="$push_repo" --work-tree="$clone" read-tree "$sha" 2>/dev/null ||
-     ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
-    echo "Cannot inspect worktree; refusing to land" >&2
-    exit 1
-  fi
-  if [ -n "$dirty" ]; then
-    echo "Worktree differs from landing commit; refusing to land" >&2
-    exit 1
-  fi
-  # A PR process still running as the user can act as the user directly; this script
-  # cannot defend against it. The land queue runs checks confined instead.
-  safe_git -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
-    push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"
-)
+if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
+  echo "Cannot inspect worktree; refusing to land" >&2
+  exit 1
+fi
+if [ -n "$dirty" ]; then
+  echo "Worktree differs from landing commit; refusing to land" >&2
+  exit 1
+fi
+# A PR process still running as the user can act as the user directly; this script
+# cannot defend against it. The land queue runs checks confined instead.
+safe_git -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
+  push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""
