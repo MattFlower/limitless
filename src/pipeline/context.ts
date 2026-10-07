@@ -520,9 +520,17 @@ export class RunContext {
       if (!target && lastResort && !chain)
         return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
+        const origins = decision.skipped
+          .filter((s) => s.reason.startsWith("origin excluded ("))
+          .map((s) => s.reason);
+        if (origins.length) this.log(`${opts.role}: ${[...new Set(origins)].join(", ")}`, "warn");
         if (chain) exhaustPinned(decision);
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
-        if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
+        if (opts.privateOutput) {
+          throw new NoCapacityError(
+            `No model available for ${opts.role}${origins.length ? `. ${origins.join(", ")}` : ""}`,
+          );
+        }
         throw new NoCapacityError(
           `No model available for ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}. Skipped: ${why || "none configured"}`,
         );
@@ -721,7 +729,10 @@ export class RunContext {
           signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
-            ? () => {}
+            ? (ev) => {
+                if (ev.type === "warning")
+                  this.onAgentEvent(invocation.id, { ...ev, id: String(Bun.hash(ev.id)) }, opts.role);
+              }
             : (ev) => {
                 this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
@@ -970,7 +981,9 @@ export class RunContext {
           redact && data !== undefined
             ? JSON.parse(
                 JSON.stringify(data, (_key, value: unknown) =>
-                  typeof value === "string" ? redact(value) : value,
+                  typeof value === "string" && !(_key === "code" && value === "signal_attempt")
+                    ? redact(value)
+                    : value,
                 ),
               )
             : data,
@@ -1008,6 +1021,9 @@ export class RunContext {
         break;
       case "stderr":
         add("stderr", ev.text, undefined, "debug");
+        break;
+      case "warning":
+        add("status", ev.text, { code: "signal_attempt", id: ev.id }, "warn");
         break;
       case "status":
         add("status", ev.text);

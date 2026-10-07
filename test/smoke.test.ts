@@ -20,8 +20,10 @@ import {
   confineLiveCheck,
   decisionsCheck,
   exitCode,
+  explicitModelChecks,
   formatReport,
   liveCheck,
+  nativeChecks,
   quotaCheck,
   reportChecks,
   runChecks,
@@ -34,6 +36,7 @@ import { deploy } from "../src/cli/service.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
+import { parseExcludeOrigins } from "../src/router/origins.ts";
 import { sh } from "../src/util/proc.ts";
 
 const result: AgentResult = {
@@ -49,6 +52,166 @@ const result: AgentResult = {
   quota: null,
 };
 const now = () => performance.now();
+
+test("excluded backend smoke preserves missing-key and failed-health skips without invoking a checker", async () => {
+  const providers = PROVIDERS.filter((p) => ["omlx", "twilight", "openrouter", "typesafe"].includes(p.id));
+  const models = MODELS.filter((m) => providers.some((p) => p.id === m.provider)).map((m) => ({
+    ...m,
+    origin: "CN",
+    baseOrigin: "CN",
+  }));
+  const catalog = { providers, models };
+  const calls: string[] = [];
+  const check: typeof liveCheck = async (_harness, target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  const decide: typeof decisionsCheck = async (target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  let probes = 0;
+  const probe = (async (_url: Parameters<typeof fetch>[0]) => {
+    probes++;
+    return new Response("", { status: 503 });
+  }) as typeof fetch;
+  const missing = await runChecks(backendChecks({}, probe, check, decide, catalog, ["CN"]));
+  expect(missing.map((r) => [r.name, r.status, r.reason])).toEqual([
+    ["omlx structured", "skip", "missing OMLX_API_KEY"],
+    ["omlx claude-harness edit", "skip", "missing OMLX_API_KEY"],
+    ["twilight structured", "skip", "missing TWILIGHT_API_KEY"],
+    ["openrouter structured", "skip", "missing OPENROUTER_API_KEY"],
+    ["typesafe decisions", "skip", "missing TYPESAFE_API_KEY"],
+  ]);
+  expect(exitCode(missing)).toBe(0);
+  expect(probes).toBe(0);
+  const local = { providers: providers.filter((p) => p.healthUrl), models };
+  const down = await runChecks(
+    backendChecks({ OMLX_API_KEY: "key", TWILIGHT_API_KEY: "key" }, probe, check, decide, local, ["CN"]),
+    now,
+    noDelay,
+  );
+  expect(down).toHaveLength(3);
+  expect(down.every((r) => r.status === "skip" && r.reason === "health probe returned HTTP 503")).toBe(true);
+  expect(exitCode(down)).toBe(0);
+  expect(probes).toBe(6);
+  expect(calls).toEqual([]);
+});
+
+test("backend smoke excludes origins before structured, edit and decisions calls and selects allowed alternatives", async () => {
+  const providers = ["omlx", "twilight", "openrouter", "typesafe"].map((id) => {
+    const provider = PROVIDERS.find((p) => p.id === id);
+    if (!provider) throw new Error(`missing ${id} provider`);
+    return provider;
+  });
+  const excluded = providers.map((p) => {
+    const model = MODELS.find((m) => m.provider === p.id);
+    if (!model) throw new Error(`missing ${p.id} model`);
+    return { ...model, origin: "CN", baseOrigin: "CN" };
+  });
+  const secrets = Object.fromEntries(providers.map((p) => [p.apiKeySecret ?? "", "key"]));
+  const calls: string[] = [];
+  const check: typeof liveCheck = async (_harness, target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  const decide: typeof decisionsCheck = async (target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  const probe = (async (_url: Parameters<typeof fetch>[0]) =>
+    new Response("", { status: 200 })) as typeof fetch;
+  const run = (models: typeof MODELS, exclusions?: string[]) =>
+    runChecks(backendChecks(secrets, probe, check, decide, { providers, models }, exclusions));
+  const blocked = await run(excluded, ["CN"]);
+  expect(blocked.map((r) => r.name)).toContain("omlx claude-harness edit");
+  expect(
+    blocked.every((r) => r.status === "skip" && r.reason === "origin excluded (CN; baseOrigin=CN)"),
+  ).toBe(true);
+  expect(exitCode(blocked)).toBe(0);
+  expect(calls).toEqual([]);
+  const allowed = excluded.map((m) => ({
+    ...m,
+    id: `${m.id}-allowed`,
+    origin: "US",
+    baseOrigin: "US",
+    price: { input: 100, output: 100 },
+  }));
+  expect((await run([...excluded, ...allowed], ["CN"])).every((r) => r.status === "pass")).toBe(true);
+  expect(calls).toEqual(allowed.flatMap((m) => (m.provider === "omlx" ? [m.id, m.id] : [m.id])));
+  calls.length = 0;
+  await run(excluded);
+  expect(calls).toEqual(excluded.flatMap((m) => (m.provider === "omlx" ? [m.id, m.id] : [m.id])));
+});
+
+test("native smoke and Codex iteration never call excluded candidates and retain an eligible target for later checks", async () => {
+  const providers = PROVIDERS.filter((p) => ["claude", "codex"].includes(p.id));
+  const models = providers.flatMap((p) => {
+    const model = MODELS.find((m) => m.provider === p.id);
+    if (!model) throw new Error(`missing ${p.id} model`);
+    return [
+      { ...model, origin: "CN", baseOrigin: "CN", price: { input: 0, output: 0 } },
+      { ...model, id: `${model.id}-allowed`, origin: "US", baseOrigin: "US" },
+    ];
+  });
+  const calls: string[] = [];
+  const check: typeof liveCheck = async (_harness, target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  const blocked = models.filter((m) => m.origin === "CN");
+  const rows = await runChecks(nativeChecks({ providers, models: blocked }, ["CN"], check));
+  expect(rows).toHaveLength(14);
+  expect(rows.every((r) => r.reason?.includes("origin excluded (CN; baseOrigin=CN)"))).toBe(true);
+  expect(calls).toEqual([]);
+  await runChecks(nativeChecks({ providers, models }, ["CN"], check));
+  expect(calls).toEqual(
+    models.filter((m) => m.origin === "US").flatMap((m) => Array.from({ length: 7 }, () => m.id)),
+  );
+  calls.length = 0;
+  await checkCodexModels(
+    models.filter((m) => m.provider === "codex"),
+    async (model) => {
+      calls.push(model.id);
+      return { status: "pass" };
+    },
+    ["CN"],
+  );
+  expect(calls).toEqual(models.filter((m) => m.provider === "codex" && m.origin === "US").map((m) => m.id));
+  calls.length = 0;
+  await runChecks(nativeChecks({ providers, models }, undefined, check));
+  expect(calls).toEqual(blocked.flatMap((m) => Array.from({ length: 7 }, () => m.id)));
+});
+
+test("explicit smoke refuses exclusions before any trial and absent configuration permits unknown ancestry", async () => {
+  const native = MODELS.find((m) => m.provider === "claude");
+  if (!native) throw new Error("missing native model");
+  const excluded = { ...native, origin: "CN", baseOrigin: "CN" };
+  const unknown = { ...native, id: "claude/unknown", origin: "US", baseOrigin: "unknown" };
+  const allowed = { ...unknown, id: "claude/allowed", baseOrigin: "US" };
+  const catalog = { providers: PROVIDERS, models: [excluded, unknown, allowed] };
+  const calls: string[] = [];
+  const check: typeof liveCheck = async (_harness, target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  expect(() =>
+    explicitModelChecks(
+      `${allowed.id},${excluded.id}`,
+      catalog,
+      parseExcludeOrigins({ routing: { exclude_origins: ["CN"] } }),
+      check,
+    ),
+  ).toThrow("origin excluded (CN; baseOrigin=CN)");
+  expect(() => explicitModelChecks(unknown.id, catalog, [], check)).toThrow(
+    "origin excluded (US; baseOrigin=unknown)",
+  );
+  expect(calls).toEqual([]);
+  await runChecks(
+    explicitModelChecks(`${excluded.id},${unknown.id}`, catalog, parseExcludeOrigins({}), check),
+  );
+  expect(calls).toEqual([excluded.id, unknown.id]);
+});
 
 test("catalog smoke authenticates, names stale entries and served IDs, and handles malformed and unreachable lists", async () => {
   const provider = PROVIDERS.find((p) => p.id === "omlx");

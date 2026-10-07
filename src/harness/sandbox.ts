@@ -31,6 +31,8 @@ export function seatbeltProfile(roots: WriteRoots): string {
   return [
     "(version 1)",
     "(allow default)",
+    "(deny signal)",
+    "(allow signal (target self) (target same-sandbox))",
     "(deny file-write*)",
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
@@ -58,8 +60,28 @@ export async function verifySeatbelt(
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted();
-  await probeSeatbelt(run, executable, platform, roots, signal);
+  try {
+    await probeSeatbelt(run, executable, platform, roots, signal);
+  } catch (error) {
+    if (error instanceof ConfinementError) throw error;
+    throw new ConfinementError(`Signal confinement preflight failed: ${String(error)}`);
+  }
 }
+
+// All targets are created by this trusted supervisor; no PID/name from the host is accepted.
+const SIGNAL_PROBE = `
+sleep 30 & outside=$!
+sibling=""
+trap 'kill "$outside" $sibling 2>/dev/null; wait 2>/dev/null' EXIT
+"$1" -p "$2" /bin/sh -c 'echo ready > "$1"; exec sleep 30' sh "$3" & sibling=$!
+i=0; while [ ! -f "$3" ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .01; done
+"$1" -p "$2" /bin/sh -c '
+  kill -TERM "$1" 2>/dev/null && exit 1
+  kill -TERM "$2" 2>/dev/null && exit 1
+  /bin/sh -c "$3" || exit 1
+' sh "$outside" "$sibling" 'sleep 30 & child=$!; kill -TERM "$child"; wait "$child"; [ "$?" -gt 128 ]' || exit 1
+kill -0 "$outside" && kill -0 "$sibling" && printf signals-verified
+`;
 
 const WRITE_BOTH = 'printf ok > "$1" && ! printf no > "$2" && printf verified';
 
@@ -104,6 +126,19 @@ async function probeSeatbelt(
       throw new ConfinementError(
         `Write confinement not verified: Seatbelt did not enforce its profile; ${proc.stderr.trim()}`,
       );
+    const profile = seatbeltProfile(roots ?? { write: [allowed], protect: [] });
+    const cmd = ["/bin/sh", "-c", SIGNAL_PROBE, "sh", executable, profile, join(allowed, "ready")];
+    const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 30_000, signal });
+    // An interrupted probe is inconclusive even when its marker was printed.
+    if (
+      p.exitCode !== 0 ||
+      p.stdout !== "signals-verified" ||
+      p.cancelled ||
+      p.timedOut ||
+      p.idleTimedOut ||
+      p.signal
+    )
+      throw new ConfinementError(`Signal confinement not verified: ${p.stderr}`);
   } finally {
     rmSync(allowed, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
@@ -113,7 +148,7 @@ async function probeSeatbelt(
 /** Extra roots confined commands may write: only test fixtures that observe gate runs add any. */
 export const observerRoots = new Set<string>();
 
-/** One owned scratch for dependent setup/check commands; nested scopes reuse it. */
+/** One owned scratch for dependent setup/check commands; inner scopes reuse it. */
 const commandScratch = new AsyncLocalStorage<{ dir: string; initialized: boolean }>();
 export const withCommandScratch = <T>(cwd: string, fn: () => Promise<T>): Promise<T> =>
   commandScratch.getStore()

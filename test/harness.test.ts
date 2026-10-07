@@ -11,6 +11,7 @@ import {
 } from "../src/harness/codex.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
+import { signalCommand } from "../src/harness/signals.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -497,6 +498,157 @@ test("native fast flags cover edit, structured and isolated readers without leak
     expect(parser.fastModeState).toBe("on");
     expect(parser.fastModeDisabledReason).toBeNull();
   });
+});
+
+for (const [name, Parser] of [
+  ["claude", ClaudeStreamParser],
+  ["codex", CodexStreamParser],
+] as const) {
+  test(`${name} warns once for executable signals including denied attempts, not prose or literal data`, () => {
+    const events: AgentEvent[] = [];
+    const parser = new Parser((event) => events.push(event));
+    for (const line of fixture(`${name}-signals.jsonl`)) parser.feed(line);
+    const warnings = events.filter((event) => event.type === "warning");
+    expect(warnings.map((event) => event.id)).toEqual([
+      ...Array.from({ length: 16 }, (_, i) => `signal-${i}`),
+      "captured-1",
+    ]);
+    expect(JSON.stringify(warnings)).not.toContain("marker");
+    expect(events.filter((event) => event.type === "tool_result").length).toBeGreaterThan(10);
+  });
+}
+
+test("sanitized captured CLI records each warn once across their real stream shapes", () => {
+  for (const [name, Parser] of [
+    ["claude", ClaudeStreamParser],
+    ["codex", CodexStreamParser],
+  ] as const) {
+    const events: AgentEvent[] = [];
+    const parser = new Parser((event) => events.push(event));
+    for (const line of fixture(`${name}-signals.jsonl`).filter((line) => line.includes('"captured-1"')))
+      parser.feed(line);
+    expect(events.filter((event) => event.type === "warning")).toEqual([
+      { type: "warning", id: "captured-1", text: "Process signal attempt detected." },
+    ]);
+  }
+});
+
+test("signal detection recognizes wrappers and ignores process polls and command lookup", () => {
+  for (const command of [
+    "timeout 5 pkill -f x",
+    "timeout --signal TERM -k 2 5 pkill -f x",
+    "nice pkill x",
+    "nice -n 5 pkill x",
+    "time pkill x",
+    "time -o timing.log pkill x",
+    "watch pkill x",
+    "watch -n 2 pkill x",
+    "watch -d pkill x",
+    "stdbuf -o L pkill x",
+    "stdbuf --input 0 --error L pkill x",
+    "{ pkill x; }",
+    "node --eval='process.kill(1)'",
+    'bun --print="process.kill(1)"',
+    "xargs -a pids kill",
+    "xargs -d , -E stop -s 100 kill",
+  ])
+    expect(signalCommand(command)).toBe(true);
+  for (const command of [
+    "command -v pkill",
+    "command -V pkill",
+    "kill -0 123",
+    "kill -s 0 123",
+    "kill -0 $pid && echo running",
+    "xargs -a pids kill -0",
+    "node --eval='console.log(\"process.kill(1)\")'",
+    `/bin/zsh -lc "cat > f.ts <<'EOF'
+const re = /"'^(?:pkill|killall)$'"/;
+EOF
+bun run typecheck"`,
+  ])
+    expect(signalCommand(command)).toBe(false);
+});
+
+test("Claude edit denies named process signals and broadcast kill as backstops", async () => {
+  await withScratch(process.cwd(), async (scratchDir) => {
+    const args = buildClaudeArgs(
+      {
+        cwd: process.cwd(),
+        scratchDir,
+        prompt: "edit",
+        mode: "edit",
+        target: {
+          modelId: "claude/test",
+          model: "test",
+          provider: "claude",
+          harness: "claude",
+          vendor: "anthropic",
+          tier: 4,
+          billing: "subscription",
+        },
+        signal: new AbortController().signal,
+        timeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        maxToolCalls: 5,
+        logPath: join(scratchDir, "log"),
+        onEvent: () => {},
+      },
+      "session",
+    );
+    for (const pattern of ["Bash(pkill:*)", "Bash(killall:*)", "Bash(kill -9 -1:*)"])
+      expect(args.slice(args.indexOf("--disallowedTools") + 1)).toContain(pattern);
+  });
+});
+
+test("Codex completion-only denied command warns once without treating tool output as commands", () => {
+  const events: AgentEvent[] = [];
+  const parser = new CodexStreamParser((event) => events.push(event));
+  const call = JSON.stringify({
+    type: "item.completed",
+    item: {
+      id: "denied",
+      type: "command_execution",
+      command: "kill -TERM 123",
+      status: "failed",
+      exit_code: 1,
+      aggregated_output: "Denied: killall marker",
+    },
+  });
+  parser.feed(call);
+  parser.feed(call);
+  expect(events.filter((event) => event.type === "warning")).toHaveLength(1);
+  expect(events.filter((event) => event.type === "tool_call")).toHaveLength(1);
+});
+
+test("executed JavaScript tools warn for process.kill while comments and printed strings stay literal", () => {
+  for (const kind of ["claude", "codex"]) {
+    const events: AgentEvent[] = [];
+    const parser =
+      kind === "claude"
+        ? new ClaudeStreamParser((e) => events.push(e))
+        : new CodexStreamParser((e) => events.push(e));
+    for (const [id, code] of [
+      ["signal-js", "process.kill(123, 'SIGTERM')"],
+      ["text-js", "console.log('process.kill(123)'); // process.kill(456)"],
+    ]) {
+      parser.feed(
+        JSON.stringify(
+          kind === "claude"
+            ? {
+                type: "assistant",
+                message: { content: [{ type: "tool_use", id, name: "node_repl", input: { code } }] },
+              }
+            : {
+                type: "item.started",
+                item: { type: "mcp_tool_call", id, server: "node_repl", tool: "js", arguments: { code } },
+              },
+        ),
+      );
+    }
+    expect(events.filter((event) => event.type === "warning").map((event) => event.id)).toEqual([
+      "signal-js",
+    ]);
+  }
 });
 
 test("configured backend auth reaches the CLI only through a key helper, never the agent environment", async () => {

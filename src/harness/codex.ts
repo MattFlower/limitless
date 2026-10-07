@@ -26,6 +26,7 @@ import {
   validateScratch,
   writeRoots,
 } from "./scratch.ts";
+import { signalWarnings } from "./signals.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -51,8 +52,12 @@ export class CodexStreamParser {
   turns = 0;
   failed: string | null = null;
   completed = false;
+  private readonly commands = new Set<string>();
 
-  constructor(private readonly emit: (e: AgentEvent) => void) {}
+  private readonly emit: (e: AgentEvent) => void;
+  constructor(emit: (e: AgentEvent) => void) {
+    this.emit = signalWarnings(emit);
+  }
 
   feed(line: string): void {
     let e: Json;
@@ -112,9 +117,11 @@ export class CodexStreamParser {
         if (phase === "item.completed" && item.text) this.emit({ type: "thinking", text: String(item.text) });
         break;
       case "command_execution":
-        if (phase === "item.started") {
+        if (!this.commands.has(id)) {
+          this.commands.add(id);
           this.emit({ type: "tool_call", id, name: "shell", input: { command: item.command } });
-        } else {
+        }
+        if (phase !== "item.started") {
           const output = String(item.aggregated_output ?? "");
           this.emit({
             type: "tool_result",

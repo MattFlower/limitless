@@ -8194,6 +8194,64 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   expect(f.store.getRun(noVerifier.id)?.error).toContain("raised a candidate it would check");
 });
 
+test("panel review: listed verifiers filter origins before independence selection and fail when all are excluded", async () => {
+  const verifiers: string[] = [];
+  const f = start(
+    (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        verifiers.push(s.target.modelId);
+        return {
+          structured: {
+            results: [
+              {
+                id: "C1",
+                verdict: "REFUTED",
+                severity: "low",
+                category: "correctness",
+                evidence: "Checked the farewell text",
+                trigger: "none",
+              },
+            ],
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: reviewOutput(1, "minor", "farewell.txt") };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    true,
+  );
+  const catalog = ["alpha/m", "beta/m", "gamma/m", "delta/m"].map((id) => {
+    const model = f.router.model(id);
+    if (!model) throw new Error(`missing ${id} model`);
+    const origin = id === "delta/m" ? "CN" : "US";
+    return { ...model, origin, baseOrigin: origin };
+  });
+  f.deps.router = new Router(f.tracker, policy, catalog, [], ["CN"]);
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    implementerReport: "include",
+    finders: [{ target: "alpha/m", prompt: "standard" }],
+    verifier: { targets: ["delta/m", "gamma/m", "beta/m"] },
+  };
+  const allowed = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, allowed.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual(["beta/m"]);
+  // With independent vendors removed from the roster, the allowed same-vendor model still verifies.
+  f.deps.reviewSystem.verifier = { targets: ["delta/m", "gamma/m"] };
+  const sameVendor = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, sameVendor.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual(["beta/m", "gamma/m"]);
+  f.deps.reviewSystem.verifier = { targets: ["delta/m"] };
+  const blocked = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, blocked.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(f.store.getRun(blocked.id)?.error).toContain("origin excluded (CN; baseOrigin=CN)");
+  expect(verifiers).toEqual(["beta/m", "gamma/m"]);
+});
+
 test("panel review: batches from different vendors go to different listed verifiers", async () => {
   const verifiers: [string, string[]][] = [];
   const f = start(

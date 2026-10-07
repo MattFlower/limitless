@@ -21,7 +21,11 @@ export async function catalogCommand(
   const [action, id] = args;
   if (action === "list" && args.length === 1) {
     const catalog = await api<ReturnType<RuntimeCatalog["snapshot"]>>("/api/catalog");
-    for (const m of catalog.models) console.log(`${m.id} [${m.source}] ${m.model} tier ${m.tier}`);
+    console.log(
+      `exclude_origins: ${catalog.excludeOrigins === undefined ? "none" : JSON.stringify(catalog.excludeOrigins)}`,
+    );
+    for (const m of catalog.models)
+      console.log(`${m.id} [${m.source}] ${m.model} tier ${m.tier}${m.excluded ? `; ${m.excluded}` : ""}`);
     for (const p of catalog.providers)
       console.log(`${p.provider} served: ${p.served?.join(", ") ?? "inconclusive"}`);
   } else if (action === "remove" && id && args.length === 2) {

@@ -230,6 +230,11 @@ export const Setup = () => {
       <section class="stack" aria-label="Routing grid">
         <h2>Routing</h2>
         <Show when={routing()} fallback={<p>Loading routing…</p>}>
+          <p>
+            Origin exclusions:{" "}
+            {routing()?.excludeOrigins === undefined ? "none" : JSON.stringify(routing()?.excludeOrigins)}.
+            Change exclude_origins in config.toml and restart.
+          </p>
           <For each={Object.keys(routing()?.effective ?? {})}>
             {(role) => (
               <section class="stack">
@@ -560,6 +565,9 @@ export const Setup = () => {
                 <article class="card card-pad stack">
                   <strong>{id}</strong>
                   <span class="chip-tag">{model()?.source}</span>
+                  <Show when={model()?.excluded}>
+                    <p>{model()?.excluded}</p>
+                  </Show>
                   <p>
                     {model()?.model} · {model()?.vendor} · {model()?.origin} · tier {model()?.tier}
                   </p>

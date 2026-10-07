@@ -96,8 +96,9 @@ as the same user.
 ## Isolation, processes and git
 Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing anything here.
 - **Seatbelt.** Gate commands and tool-enabled Claude editors run inside the factory's outer
-  Seatbelt profile, which allows writes only to the run's checkout and scratch. Codex uses its own
-  probed filesystem profile, and tool-enabled Claude readers use Claude's internal sandbox. macOS
+  Seatbelt profile, which allows writes only to the run's checkout and scratch and signals only to
+  the process itself and its own sandbox. Codex uses its own probed filesystem profile, and
+  tool-enabled Claude readers use Claude's internal sandbox. macOS
   can't nest Seatbelt: a process that is already sandboxed fails to apply another profile
   (`sandbox_apply: Operation not permitted`, exit 71), so Codex and Claude readers can't simply be
   wrapped in an outer `sandbox-exec` (#369 tracks confining them with their own sandbox off). Tests

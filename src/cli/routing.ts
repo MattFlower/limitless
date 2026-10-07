@@ -34,6 +34,9 @@ export async function routingCommand(
       for (const [cell, value] of Object.entries(cells))
         console.log(`${role}.${cell} [${value.layer}] ${value.groups.join(",")}`);
     }
+    console.log(
+      `exclude_origins: ${routing.excludeOrigins === undefined ? "none" : JSON.stringify(routing.excludeOrigins)}`,
+    );
     console.log(`prefer: ${routing.prefer.join(",")}`);
   } else if (action === "set" && args.length === 3 && entry && chain) {
     const groups = chain.split(",").map((g) =>

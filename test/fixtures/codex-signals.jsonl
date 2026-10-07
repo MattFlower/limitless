@@ -1,0 +1,87 @@
+{"type": "item.started", "item": {"id": "signal-0", "type": "command_execution", "command": "pkill -f marker", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-0", "type": "command_execution", "command": "pkill -f marker", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-0", "type": "command_execution", "command": "pkill -f marker", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-1", "type": "command_execution", "command": "/usr/bin/killall marker", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-1", "type": "command_execution", "command": "/usr/bin/killall marker", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-1", "type": "command_execution", "command": "/usr/bin/killall marker", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-2", "type": "command_execution", "command": "kill -TERM 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-2", "type": "command_execution", "command": "kill -TERM 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-2", "type": "command_execution", "command": "kill -TERM 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-3", "type": "command_execution", "command": "printf 123 | xargs kill", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-3", "type": "command_execution", "command": "printf 123 | xargs kill", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-3", "type": "command_execution", "command": "printf 123 | xargs kill", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-4", "type": "command_execution", "command": "xargs -n 1 /bin/kill -9", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-4", "type": "command_execution", "command": "xargs -n 1 /bin/kill -9", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-4", "type": "command_execution", "command": "xargs -n 1 /bin/kill -9", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-5", "type": "command_execution", "command": "bash -lc \"/usr/bin/pkill -f marker\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-5", "type": "command_execution", "command": "bash -lc \"/usr/bin/pkill -f marker\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-5", "type": "command_execution", "command": "bash -lc \"/usr/bin/pkill -f marker\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-6", "type": "command_execution", "command": "echo ready && /bin/kill -9 -123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-6", "type": "command_execution", "command": "echo ready && /bin/kill -9 -123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-6", "type": "command_execution", "command": "echo ready && /bin/kill -9 -123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-7", "type": "command_execution", "command": "env MARKER=x sh -c 'kill \"$child\"'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-7", "type": "command_execution", "command": "env MARKER=x sh -c 'kill \"$child\"'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-7", "type": "command_execution", "command": "env MARKER=x sh -c 'kill \"$child\"'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-8", "type": "command_execution", "command": "node -e 'process.kill(123, \"SIGTERM\")'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-8", "type": "command_execution", "command": "node -e 'process.kill(123, \"SIGTERM\")'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-8", "type": "command_execution", "command": "node -e 'process.kill(123, \"SIGTERM\")'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-9", "type": "command_execution", "command": "bun --eval 'const x = 1; process.kill(x)'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "signal-9", "type": "command_execution", "command": "bun --eval 'const x = 1; process.kill(x)'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "signal-9", "type": "command_execution", "command": "bun --eval 'const x = 1; process.kill(x)'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-10", "type": "command_execution", "command": "echo \"pkill -f marker\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-10", "type": "command_execution", "command": "echo \"pkill -f marker\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-10", "type": "command_execution", "command": "echo \"pkill -f marker\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-11", "type": "command_execution", "command": "printf \"%s\" \"kill 123\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-11", "type": "command_execution", "command": "printf \"%s\" \"kill 123\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-11", "type": "command_execution", "command": "printf \"%s\" \"kill 123\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-12", "type": "command_execution", "command": "rg \"process.kill(123)\" src", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-12", "type": "command_execution", "command": "rg \"process.kill(123)\" src", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-12", "type": "command_execution", "command": "rg \"process.kill(123)\" src", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-13", "type": "command_execution", "command": "grep -e killall file", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-13", "type": "command_execution", "command": "grep -e killall file", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-13", "type": "command_execution", "command": "grep -e killall file", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-14", "type": "command_execution", "command": "node -e 'console.log(\"process.kill(123)\")'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-14", "type": "command_execution", "command": "node -e 'console.log(\"process.kill(123)\")'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-14", "type": "command_execution", "command": "node -e 'console.log(\"process.kill(123)\")'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-15", "type": "command_execution", "command": "node -e 'otherprocess.kill(123); obj.process.kill(123)'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-15", "type": "command_execution", "command": "node -e 'otherprocess.kill(123); obj.process.kill(123)'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-15", "type": "command_execution", "command": "node -e 'otherprocess.kill(123); obj.process.kill(123)'", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-16", "type": "command_execution", "command": "echo kill 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-16", "type": "command_execution", "command": "echo kill 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-16", "type": "command_execution", "command": "echo kill 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-17", "type": "command_execution", "command": "cat <<EOF\nkill 123\nEOF\n", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-17", "type": "command_execution", "command": "cat <<EOF\nkill 123\nEOF\n", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-17", "type": "command_execution", "command": "cat <<EOF\nkill 123\nEOF\n", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-18", "type": "command_execution", "command": "kill -l; echo 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-18", "type": "command_execution", "command": "kill -l; echo 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-18", "type": "command_execution", "command": "kill -l; echo 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-19", "type": "command_execution", "command": "echo \"killall marker; kill 123\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-19", "type": "command_execution", "command": "echo \"killall marker; kill 123\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-19", "type": "command_execution", "command": "echo \"killall marker; kill 123\"", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-20", "type": "command_execution", "command": "/bin/echo /usr/bin/pkill", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-20", "type": "command_execution", "command": "/bin/echo /usr/bin/pkill", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-20", "type": "command_execution", "command": "/bin/echo /usr/bin/pkill", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-21", "type": "command_execution", "command": "true # kill 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.started", "item": {"id": "literal-21", "type": "command_execution", "command": "true # kill 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "literal-21", "type": "command_execution", "command": "true # kill 123", "aggregated_output": "killall marker", "exit_code": 1}}
+{"type": "item.completed", "item": {"id": "prose", "type": "agent_message", "text": "kill 123"}}
+{"type": "item.completed", "item": {"id": "edit", "type": "file_change", "changes": [{"diff": "kill 123"}]}}
+{"type": "item.started", "item": {"id": "comment", "type": "command_execution", "command": "echo safe # pkill -f marker; kill 123"}}
+{"type": "item.started", "item": {"id": "signal-10", "type": "command_execution", "command": "bash -lc \"kill \\\"$PID\\\"\""}}
+{"type": "item.started", "item": {"id": "escaped-literal", "type": "command_execution", "command": "node -e \"console.log(\\\"process.kill(123)\\\")\""}}
+{"type":"item.started","item":{"id":"signal-11","type":"command_execution","command":"node --input-type=module -e 'process.kill(123)'"}}
+{"type":"item.completed","item":{"id":"signal-11","type":"command_execution","command":"node --input-type=module -e 'process.kill(123)'","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-12","type":"command_execution","command":"node <<'JS'\nprocess.kill(123)\nJS\n"}}
+{"type":"item.completed","item":{"id":"signal-12","type":"command_execution","command":"node <<'JS'\nprocess.kill(123)\nJS\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-13","type":"command_execution","command":"bash -e -o pipefail -c \"pkill -f marker\""}}
+{"type":"item.completed","item":{"id":"signal-13","type":"command_execution","command":"bash -e -o pipefail -c \"pkill -f marker\"","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-14","type":"command_execution","command":"FOO=1 /bin/bash -s <<EOF\nkillall marker\nEOF\n"}}
+{"type":"item.completed","item":{"id":"signal-14","type":"command_execution","command":"FOO=1 /bin/bash -s <<EOF\nkillall marker\nEOF\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-15","type":"command_execution","command":"cat <<EOF > notes.txt && kill 123\nhi\nEOF\n"}}
+{"type":"item.completed","item":{"id":"signal-15","type":"command_execution","command":"cat <<EOF > notes.txt && kill 123\nhi\nEOF\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"literal-22","type":"command_execution","command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n"}}
+{"type":"item.completed","item":{"id":"literal-22","type":"command_execution","command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"literal-23","type":"command_execution","command":"node --version && node -r ./x.js -e \"console.log(1)\""}}
+{"type":"item.completed","item":{"id":"literal-23","type":"command_execution","command":"node --version && node -r ./x.js -e \"console.log(1)\"","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"captured-1","type":"command_execution","command":"/bin/zsh -lc 'kill -TERM 12345'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"captured-1","type":"command_execution","command":"/bin/zsh -lc 'kill -TERM 12345'","aggregated_output":"","exit_code":0,"status":"completed"}}

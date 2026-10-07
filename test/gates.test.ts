@@ -38,7 +38,7 @@ import { ConfinementError } from "../src/harness/sandbox.ts";
 import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
-import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
 
 function tempDir(files: Record<string, string>): string {
@@ -937,14 +937,15 @@ test.skipIf(process.platform !== "darwin")(
     let probes = 0;
     let launches = 0;
     const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
-      const probing = opts.cmd.at(-1)?.endsWith("/denied");
+      const signalProbe = opts.cmd[0] === "/bin/sh";
+      const probing = signalProbe || opts.cmd.at(-1)?.endsWith("/denied");
       if (probing) {
         probes++;
-        writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+        if (!signalProbe) writeFileSync(opts.cmd.at(-2) ?? "", "ok");
       } else launches++;
       return {
         exitCode: probing ? 0 : 71,
-        stdout: probing ? "verified" : "",
+        stdout: signalProbe ? "signals-verified" : probing ? "verified" : "",
         stderr: "sandbox initialization failed",
         signal: null,
         cancelled: false,
@@ -970,7 +971,7 @@ test.skipIf(process.platform !== "darwin")(
         (async () =>
           compareGates(baseline, await productionGates(cwd, config, new AbortController().signal)))(),
       ).rejects.toThrow(ConfinementError);
-      expect(probes).toBe(1);
+      expect(probes).toBe(2);
       expect(launches).toBe(1);
     } finally {
       runner.mockRestore();
@@ -987,7 +988,7 @@ test.skipIf(process.platform !== "darwin")(
     const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
       if (opts.cmd.at(-1)?.endsWith("/denied")) {
         writeFileSync(opts.cmd.at(-2) ?? "", "ok");
-      } else {
+      } else if (opts.cmd[0] !== "/bin/sh") {
         const current = opts.env.TMPDIR ?? "";
         if (opts.cmd.at(-1) === "setup") {
           scratch = current;
@@ -1000,7 +1001,12 @@ test.skipIf(process.platform !== "darwin")(
       }
       return {
         exitCode: 0,
-        stdout: opts.cmd.at(-1)?.endsWith("/denied") ? "verified" : "",
+        stdout:
+          opts.cmd[0] === "/bin/sh"
+            ? "signals-verified"
+            : opts.cmd.at(-1)?.endsWith("/denied")
+              ? "verified"
+              : "",
         stderr: "",
         signal: null,
         cancelled: false,
@@ -1146,6 +1152,86 @@ test.skipIf(seatbeltSkip !== null)(
     }
   },
 );
+
+test("signal confinement covers setup, checks and baseline/regression retries; failure never becomes a pass", async () => {
+  const cwd = tempDir({});
+  const { backend, calls } = recordingConfinement();
+  const signal = new AbortController().signal;
+  const cfg: GateConfig = {
+    setup: ["echo setup"],
+    checks: [{ name: "test", run: "test -f passed" }],
+    source: "none",
+    protectedPaths: [],
+  };
+  try {
+    await sandbox.confinementScope.run(backend, async () => {
+      const baseline = await productionGates(cwd, cfg, signal);
+      expect(baseline.checks[0]?.ok).toBe(false);
+      writeFileSync(join(cwd, "passed"), "ok");
+      const retry = await productionBaselineRetry(baseline, cwd, cfg, signal);
+      expect(retry.checks[0]?.ok).toBe(true);
+      expect(calls.map((call) => call.opts.cmd.at(-1))).toEqual([
+        "echo setup",
+        "test -f passed",
+        "test -f passed",
+      ]);
+      const compare = compareGates(retry, baseline);
+      backend.verify = async () => {
+        throw new ConfinementError("Signal confinement not verified");
+      };
+      await expect(productionRetry(compare, cwd, cfg, [], signal)).rejects.toThrow("Signal confinement");
+      await expect(productionBaselineRetry(baseline, cwd, cfg, signal)).rejects.toThrow("Signal confinement");
+      await expect(productionGates(cwd, cfg, signal)).rejects.toThrow("Signal confinement");
+      expect(calls).toHaveLength(3);
+    });
+    for (const diagnostic of ["sandbox_apply: Operation not permitted"]) {
+      const failed: GateRun = {
+        setupOk: true,
+        setup: [],
+        checks: [
+          {
+            name: "test",
+            command: "test -f passed",
+            ok: false,
+            exitCode: 1,
+            durationMs: 1,
+            output: diagnostic,
+          },
+        ],
+      };
+      expect(compareGates(failed, failed)[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
+      expect(await productionBaselineRetry(failed, cwd, cfg, signal)).toBe(failed);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("passing checks can print sandbox research and caught signal-probe errors", async () => {
+  const cwd = tempDir({});
+  try {
+    const result = await runGates(
+      cwd,
+      {
+        source: "none",
+        setup: [],
+        protectedPaths: [],
+        checks: [
+          {
+            name: "diagnostics",
+            run: 'echo "warn: sandbox initialization failed, retrying"; echo "Signal confinement not verified"; exit 0',
+          },
+        ],
+      },
+      new AbortController().signal,
+    );
+    expect(result.checks[0]?.ok).toBe(true);
+    expect(result.checks[0]?.confinementError).toBeFalsy();
+    expect(compareGates(null, result)[0]).toMatchObject({ verdict: "new_pass", blocking: false });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("private policy rejects broken lists and repository aliases; normalizes both sides", () => {
   const root = mkdtempSync(join(tmpdir(), "private-policy-"));

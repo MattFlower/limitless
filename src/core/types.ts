@@ -445,6 +445,7 @@ export interface RoutingChange {
 }
 
 export type FeedKind =
+  | "run.warning"
   | "run.gate_timeout_retry"
   | LandFeedKind
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`

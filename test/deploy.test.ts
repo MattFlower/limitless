@@ -146,11 +146,11 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
     "bun scripts/smoke.ts",
   ]);
   expect(f.calls[10]).toBe("drain");
-  // The full suite outgrew 10 minutes on a busy machine; lint and typecheck keep the shorter bound.
+  // The full suite outgrew 20 minutes on a busy machine; lint and typecheck keep the shorter bound.
   expect([...f.commandTimeouts].filter(([line]) => /^bun (run|test)/.test(line))).toEqual([
     ["bun run lint", 600_000],
     ["bun run typecheck", 600_000],
-    ["bun test", 1_200_000],
+    ["bun test", 1_800_000],
   ]);
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.sleeps).toEqual([5000, 5000]);

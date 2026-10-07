@@ -22,6 +22,7 @@ function table(header: string[], rows: string[][]): string {
 }
 
 export interface ReportInput {
+  signalWarnings?: number;
   models?: RunModels;
   success: boolean;
   runId: string;
@@ -158,6 +159,10 @@ export function renderReport(input: ReportInput): string {
       );
   }
 
+  if (input.signalWarnings)
+    blocks.push(
+      `> [!WARNING]\n> ${input.signalWarnings} process signal attempt(s) detected. See the invocation event log; this does not establish that a signal succeeded.`,
+    );
   blocks.push("## Checks");
   if (state.gateTimeoutReruns) blocks.push(`Timeout-caused gate re-runs: ${state.gateTimeoutReruns}.`);
   if (state.lastGates?.length) {
@@ -288,6 +293,7 @@ export function buildReport(
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
   return renderReport({
     success,
+    signalWarnings: ctx.store.countEvents(ctx.run.id, "signal_attempt"),
     runId: ctx.run.id,
     prompt: ctx.run.prompt,
     state: verifiedFailure ? verifiedFailureState(ctx.state) : ctx.state,

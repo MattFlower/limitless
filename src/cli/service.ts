@@ -476,11 +476,12 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
       [`Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`, ...tail].join("\n"),
     );
   };
-  // The full suite takes 8–11 minutes alone and longer while runs use the machine.
+  // The full suite takes 8–11 minutes alone and over 20 while runs use the machine; the
+  // repository's own test gate allows 30 minutes (.limitless.toml), and so does this one.
   await withGateLease(
     "deploy",
     async () => {
-      for (const args of GATES) await gate(args, args.includes("test") ? 1_200_000 : 600_000);
+      for (const args of GATES) await gate(args, args.includes("test") ? 1_800_000 : 600_000);
     },
     lease,
   );

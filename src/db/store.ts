@@ -1666,6 +1666,16 @@ export class Store {
     return event;
   }
 
+  countEvents(runId: string, code: string): number {
+    return (
+      this.db
+        .query<{ n: number }, [string, string]>(
+          "SELECT count(*) AS n FROM events WHERE run_id = ? AND json_extract(data, '$.code') = ?",
+        )
+        .get(runId, code)?.n ?? 0
+    );
+  }
+
   listEvents(
     runId: string,
     opts: {

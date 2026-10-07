@@ -11,6 +11,7 @@ import {
   validateScratch,
   writeRoots,
 } from "./scratch.ts";
+import { signalWarnings } from "./signals.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -64,7 +65,10 @@ export class ClaudeStreamParser {
   quotaRejectedUntil: number | null = null;
   quotaText = false;
 
-  constructor(private readonly emit: (e: AgentEvent) => void) {}
+  private readonly emit: (e: AgentEvent) => void;
+  constructor(emit: (e: AgentEvent) => void) {
+    this.emit = signalWarnings(emit);
+  }
 
   feed(line: string): void {
     let e: Json;
@@ -185,6 +189,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     ...(keyFile ? { apiKeyHelper: `cat ${JSON.stringify(keyFile)}` } : {}),
   };
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
+  denied.push("Bash(pkill:*)", "Bash(killall:*)", "Bash(kill -9 -1:*)");
   let readTools = ["Read", "Grep", "Glob"];
   let editTools: string[] = [];
   if (!spec.noTools) {
