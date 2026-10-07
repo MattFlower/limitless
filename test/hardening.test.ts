@@ -374,12 +374,16 @@ describe("process handling", () => {
     },
   );
 
-  test.skipIf(process.platform !== "darwin").each(["outside", "sibling"])(
+  test.skipIf(process.platform !== "darwin").each(["outside", "sibling", "inside"])(
     "a new hidden platform process in a %s cwd is never signalled",
     async (location) => {
-      const outside =
-        location === "sibling" ? `${dir}-sibling` : mkdtempSync(join(tmpdir(), "limitless-control-"));
-      mkdirSync(outside, { recursive: true });
+      const controlCwd =
+        location === "inside"
+          ? dir
+          : location === "sibling"
+            ? `${dir}-sibling`
+            : mkdtempSync(join(tmpdir(), "limitless-control-"));
+      mkdirSync(controlCwd, { recursive: true });
       const release = join(dir, "release");
       let control: ChildProcess | undefined;
       const kill = process.kill.bind(process);
@@ -400,8 +404,13 @@ describe("process handling", () => {
           cwd: dir,
           env: process.env as Record<string, string>,
           onStdoutLine: () => {
-            // Spawn only after the invocation is running, in a separate session without its marker.
-            control = spawn("/bin/sleep", ["15"], { cwd: outside, detached: true, stdio: "ignore", env: {} });
+            // Born after invocation start, but a child of the test process without its marker.
+            control = spawn("/bin/sleep", ["15"], {
+              cwd: controlCwd,
+              detached: location !== "inside",
+              stdio: "ignore",
+              env: {},
+            });
             control.once("spawn", () => writeFileSync(release, ""));
           },
           timeoutMs: 3000,
@@ -413,11 +422,12 @@ describe("process handling", () => {
         expect(kill(control?.pid ?? 0, 0)).toBe(true);
       } finally {
         killSpy.mockRestore();
-        if (control) {
+        if (control && control.exitCode === null && control.signalCode === null) {
+          const closed = new Promise<void>((resolve) => control?.once("close", () => resolve()));
           control.kill("SIGKILL");
-          await new Promise<void>((resolve) => control?.once("close", () => resolve()));
+          await closed;
         }
-        rmSync(outside, { recursive: true, force: true });
+        if (controlCwd !== dir) rmSync(controlCwd, { recursive: true, force: true });
       }
     },
   );
@@ -431,18 +441,110 @@ describe("process handling", () => {
       const alias = join(dir, "alias");
       symlinkSync(nested, alias);
       const roots = [realpathSync(dir)];
-      expect(hiddenDarwinProcessMember(42, 100, 100, roots, () => ({ path: dir }))).toBe(true);
-      expect(hiddenDarwinProcessMember(42, 101, 100, roots, () => ({ path: alias }))).toBe(true);
+      const parents = new Map([[42, 1]]);
+      const members = new Set<number>();
+      const decide = (
+        readBorn: () => number | { errno: number },
+        readCwd: () => { path: string } | { errno: number },
+      ) => hiddenDarwinProcessMember(42, parents, members, 100, roots, readBorn, readCwd);
       expect(
-        hiddenDarwinProcessMember(42, 99, 100, roots, () => {
-          throw new Error("must not inspect older cwd");
-        }),
+        decide(
+          () => 100,
+          () => ({ path: dir }),
+        ),
+      ).toBe(true);
+      expect(
+        decide(
+          () => 101,
+          () => ({ path: alias }),
+        ),
+      ).toBe(true);
+      expect(
+        decide(
+          () => 99,
+          () => {
+            throw new Error("must not inspect older cwd");
+          },
+        ),
       ).toBe(false);
-      expect(hiddenDarwinProcessMember(42, 101, 100, roots, () => ({ errno: 3 }))).toBe(false);
-      for (const errno of [1, 5, 22])
-        expect(() => hiddenDarwinProcessMember(42, 101, 100, roots, () => ({ errno }))).toThrow(
-          "Process cwd inspection failed for 42",
+      const sibling = `${dir}-sibling`;
+      mkdirSync(sibling);
+      try {
+        expect(
+          decide(
+            () => 101,
+            () => ({ path: sibling }),
+          ),
+        ).toBe(false);
+      } finally {
+        rmSync(sibling, { recursive: true, force: true });
+      }
+      expect(
+        decide(
+          () => 101,
+          () => ({ errno: 3 }),
+        ),
+      ).toBe(false);
+      const unread = () => {
+        throw new Error("must not inspect cwd after a failed birth time lookup");
+      };
+      expect(decide(() => ({ errno: 3 }), unread)).toBe(false);
+      for (const errno of [1, 5, 22]) {
+        expect(() =>
+          decide(
+            () => 101,
+            () => ({ errno }),
+          ),
+        ).toThrow("Process cwd inspection failed for 42");
+        expect(() => decide(() => ({ errno }), unread)).toThrow(
+          "Process birth time inspection failed for 42",
         );
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "hidden membership follows proven ancestry and ignores live non-members without lookups",
+    async () => {
+      const { hiddenDarwinProcessMember } = await import("../src/util/processes-darwin.ts");
+      const parents = new Map([
+        [42, 43],
+        [43, 44],
+        [44, 1],
+      ]);
+      const members = new Set<number>();
+      const unread = () => {
+        throw new Error("live-parent candidates must not inspect birth time or cwd");
+      };
+      const decide = () =>
+        hiddenDarwinProcessMember(42, parents, members, 100, [realpathSync(dir)], unread, unread);
+      expect(decide()).toBe(false);
+      members.add(43); // Direct child of a marker/session/group member, even outside the cwd roots.
+      expect(decide()).toBe(true);
+      members.clear();
+      members.add(44); // Grandchild, even before its intermediate parent has been identified.
+      expect(decide()).toBe(true);
+      members.clear();
+      expect(
+        hiddenDarwinProcessMember(
+          44,
+          parents,
+          members,
+          100,
+          [realpathSync(dir)],
+          () => 101,
+          () => ({ path: dir }),
+        ),
+      ).toBe(true);
+      members.add(44); // The orphan rule also seeds ancestry membership.
+      expect(decide()).toBe(true);
+      members.clear();
+      parents.delete(44); // An absent parent is not evidence of orphaning.
+      expect(decide()).toBe(false);
+      parents.set(43, 42); // Defensive cycle handling must not hang inspection.
+      expect(decide()).toBe(false);
+      parents.set(42, 0);
+      expect(decide()).toBe(false);
     },
   );
 

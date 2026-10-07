@@ -18,14 +18,33 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
   },
 });
 
-/** Roots are canonicalized at invocation start; cwd inspection is lazy for older processes. */
+/** Roots are canonicalized at invocation start; only orphans need birth time and cwd inspection. */
 export function hiddenDarwinProcessMember(
   pid: number,
-  born: number,
+  parents: ReadonlyMap<number, number>,
+  members: ReadonlySet<number>,
   started: number,
   directories: readonly string[],
+  readBorn: () => number | { errno: number },
   readCwd: () => { path: string } | { errno: number },
 ): boolean {
+  const seen = new Set([pid]);
+  let parent = parents.get(pid);
+  while (parent !== undefined && parent > 1 && !seen.has(parent)) {
+    if (members.has(parent)) return true;
+    seen.add(parent);
+    parent = parents.get(parent);
+  }
+  // Hidden descendants of proven members are ours. Otherwise cwd can identify only
+  // orphans (ppid 1) born during this invocation, never a live non-member's children.
+  // Residuals: a detached platform tool that leaves the worktree and writes by absolute
+  // path, or a hidden process whose parent is still alive but not a member, is unrecognized.
+  if (parents.get(pid) !== 1) return false;
+  const born = readBorn();
+  if (typeof born !== "number") {
+    if (born.errno === 3 /* ESRCH */) return false;
+    throw new Error(`Process birth time inspection failed for ${pid} (errno ${born.errno})`);
+  }
   if (born < started) return false;
   const cwd = readCwd();
   if ("errno" in cwd) {
@@ -33,8 +52,6 @@ export function hiddenDarwinProcessMember(
     throw new Error(`Process cwd inspection failed for ${pid} (errno ${cwd.errno})`);
   }
   const path = realpathSync(cwd.path);
-  // A detached platform tool that chdirs outside these roots and writes by absolute
-  // path cannot be recognized. WorktreeCleanError then becomes a round failure.
   return directories.some(
     (directory) =>
       path === directory || path.startsWith(directory.endsWith(sep) ? directory : `${directory}${sep}`),
@@ -60,7 +77,9 @@ export function markedDarwinProcesses(
   const size = new BigUint64Array(1);
   const token = Buffer.from(`\0LIMITLESS_INVOCATION=${marker}\0`);
   const inheritedToken = Buffer.from(`\0LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1\0`);
-  const marked: number[] = [];
+  const marked = new Set<number>();
+  const parents = new Map<number, number>();
+  const hidden: number[] = [];
   const bsd = new Uint8Array(136); // proc_bsdinfo includes the process birth time
   const vnode = new Uint8Array(2352); // proc_vnodepathinfo: two vnode_info_path structs
   const errno = () => {
@@ -80,6 +99,7 @@ export function markedDarwinProcesses(
       throw new Error(`Process ownership inspection failed for ${pid}`);
     }
     if (info[9] !== uid || info[3] === 5 /* SZOMB */) continue;
+    parents.set(pid, info[1] ?? 0);
     const session = symbols.getsid(pid);
     if (session < 0) {
       if (gone()) continue;
@@ -108,38 +128,45 @@ export function markedDarwinProcesses(
     // Read only NUL-delimited environment entries: argv and other variables cannot match.
     const environment = Buffer.from(args.buffer, 0, length);
     // SIP omits environment data for platform tools. Our session/group still proves
-    // membership; detached tools need birth time and cwd evidence instead.
+    // membership; detached tools need ancestry or orphan birth time and cwd evidence.
     if (
       environment.includes(token, offset - 1) ||
       environment.includes(inheritedToken, offset - 1) ||
       (offset === length && (session === group || info[2] === group))
     )
-      marked.push(pid);
-    else if (offset === length) {
-      if (
-        symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength
-      ) {
-        if (gone()) continue;
-        throw new Error(`Process birth time inspection failed for ${pid}`);
-      }
-      const view = new DataView(bsd.buffer);
-      const born = Number(view.getBigUint64(120, true)) * 1000 + Number(view.getBigUint64(128, true)) / 1000;
-      if (
-        hiddenDarwinProcessMember(pid, born, started, directories, () => {
-          if (
-            symbols.proc_pidinfo(pid, 9 /* PROC_PIDVNODEPATHINFO */, 0, ptr(vnode), vnode.byteLength) !==
-            vnode.byteLength
-          )
-            return { errno: errno() };
-          // pvi_cdir.vip_path follows the 152-byte vnode_info, with MAXPATHLEN = 1024.
-          const path = Buffer.from(vnode.buffer, 152, 1024);
-          const end = path.indexOf(0);
-          if (end <= 0) throw new Error(`Invalid process cwd for ${pid}`);
-          return { path: path.toString("utf8", 0, end) };
-        })
-      )
-        marked.push(pid);
-    }
+      marked.add(pid);
+    else if (offset === length) hidden.push(pid);
   }
-  return marked;
+  const isMember = (pid: number) =>
+    hiddenDarwinProcessMember(
+      pid,
+      parents,
+      marked,
+      started,
+      directories,
+      () => {
+        if (
+          symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength
+        )
+          return { errno: errno() };
+        const view = new DataView(bsd.buffer);
+        return Number(view.getBigUint64(120, true)) * 1000 + Number(view.getBigUint64(128, true)) / 1000;
+      },
+      () => {
+        if (
+          symbols.proc_pidinfo(pid, 9 /* PROC_PIDVNODEPATHINFO */, 0, ptr(vnode), vnode.byteLength) !==
+          vnode.byteLength
+        )
+          return { errno: errno() };
+        // pvi_cdir.vip_path follows the 152-byte vnode_info, with MAXPATHLEN = 1024.
+        const path = Buffer.from(vnode.buffer, 152, 1024);
+        const end = path.indexOf(0);
+        if (end <= 0) throw new Error(`Invalid process cwd for ${pid}`);
+        return { path: path.toString("utf8", 0, end) };
+      },
+    );
+  // Seed orphan members before resolving ancestry, independent of enumeration order.
+  for (const pid of hidden) if (parents.get(pid) === 1 && isMember(pid)) marked.add(pid);
+  for (const pid of hidden) if (parents.get(pid) !== 1 && isMember(pid)) marked.add(pid);
+  return [...marked];
 }
