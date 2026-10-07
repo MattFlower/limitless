@@ -30,6 +30,17 @@ safe_git() {
   git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
     ${flags[@]+"${flags[@]}"} "$@"
 }
+repository_config() {
+  local config line
+  config="$(safe_git config --list --show-scope --show-origin --includes 2>/dev/null && printf '.')" || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      local$'\t'*|worktree$'\t'*) printf '%s\n' "$line" ;;
+    esac
+  done <<< "${config%.}"
+  # Preserve trailing newlines through command substitution without storing secrets on disk.
+  printf '.'
+}
 
 admin="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
 common="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -P)"
@@ -41,6 +52,10 @@ export GIT_GRAFT_FILE=/dev/null/none GIT_SHALLOW_FILE=""
 export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
+if ! config_before="$(repository_config)"; then
+  echo "Cannot read repository git config; refusing to land" >&2
+  exit 1
+fi
 if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
   echo "bun run check failed; see $log" >&2
   exit 1
@@ -61,6 +76,10 @@ fi
 sha="$(safe_git rev-parse HEAD)"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
+if ! config_after="$(repository_config)" || [ "$config_before" != "$config_after" ]; then
+  echo "Repository git config changed during the checks or could not be read; refusing to push" >&2
+  exit 1
+fi
 safe_git push --no-verify -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.

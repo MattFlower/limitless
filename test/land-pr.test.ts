@@ -248,8 +248,18 @@ describe("land-pr private strings", () => {
   });
 });
 
-test.each(["redirect", "redirect-and-move-head"])(
-  "land publishes only its trusted SHA: %s",
+test.each([
+  "redirect",
+  "redirect-and-move-head",
+  "remote.origin.receivepack",
+  "core.sshCommand",
+  "credential.helper",
+  "include.path",
+  "working-tree",
+  "config-failed-before",
+  "config-failed-after",
+])(
+  "land publishes only its trusted SHA, preserves working-tree edits and refuses repository config tampering: %s",
   async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "land-trusted-"));
     try {
@@ -285,6 +295,16 @@ test.each(["redirect", "redirect-and-move-head"])(
       expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
       const calls = join(root, "calls");
       const pinned = join(root, "pinned");
+      const checked = join(root, "checked");
+      const marker = join(root, "config-command-ran");
+      const injected = join(root, "injected.config");
+      const command = `touch '${marker}'`;
+      const tampered = [
+        "remote.origin.receivepack",
+        "core.sshCommand",
+        "credential.helper",
+        "include.path",
+      ].includes(scenario);
       writeFileSync(
         join(bin, "bun"),
         `#!${process.execPath}
@@ -317,7 +337,16 @@ if (args[0] === "install" || args[0] === "run") {
   }
   writeFileSync(cwd + "-state", JSON.stringify([before, snapshot()]));
 }
-if (args[0] === "run") writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
+if (args[0] === "run") {
+  writeFileSync(${JSON.stringify(checked)}, "ran");
+  if (${JSON.stringify(scenario)}.startsWith("redirect")) writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
+  if (${tampered}) {
+    if (${JSON.stringify(scenario)} === "include.path") writeFileSync(${JSON.stringify(injected)}, ${JSON.stringify(`[core]\nsshCommand = ${JSON.stringify(command)}\n`)});
+    const changed = spawnSync(${JSON.stringify(gitBin)}, ["config", ${JSON.stringify(scenario)}, ${JSON.stringify(scenario === "include.path" ? injected : scenario === "credential.helper" ? `!${command}` : command)}], { stdio: "inherit" });
+    if (changed.status !== 0) process.exit(1);
+  }
+  if (${JSON.stringify(scenario)} === "working-tree") writeFileSync(${JSON.stringify(join(work, "file"))}, "check-generated change\\n");
+}
 if (args[0].endsWith(".ts")) {
   if (args.length === 6) {
     writeFileSync(${JSON.stringify(pinned)}, args[5]);
@@ -336,10 +365,14 @@ if (args[0].endsWith(".ts")) {
       writeFileSync(
         join(bin, "git"),
         `#!${process.execPath}
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths: [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR] }) + "\\n");
+if (args.includes("--show-scope") && !args.includes("-z") && (${JSON.stringify(scenario)} === "config-failed-before" || (${JSON.stringify(scenario)} === "config-failed-after" && existsSync(${JSON.stringify(checked)})))) {
+  console.error("secret-config-value");
+  process.exit(1);
+}
 const result = spawnSync(${JSON.stringify(gitBin)}, args, { stdio: "inherit" });
 process.exit(result.status ?? 1);
 `,
@@ -371,6 +404,32 @@ else if (args[1] === "view") {
         allowFail: true,
       });
       expect(result.stderr).not.toContain(entry);
+      const logged: { tool: string; args: string[]; paths?: (string | null)[] }[] = readFileSync(
+        calls,
+        "utf8",
+      )
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      if (tampered || scenario.startsWith("config-failed-")) {
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain("git config");
+        expect(result.stderr).toContain("refusing to");
+        expect(result.stderr).not.toContain("secret-config-value");
+        expect(result.stderr).not.toContain(command);
+        expect(logged.some((call) => call.tool === "git" && call.args.includes("push"))).toBe(false);
+        expect(logged.some((call) => call.tool === "gh" && call.args[1] === "merge")).toBe(false);
+        expect(existsSync(marker)).toBe(false);
+        expect(existsSync(checked)).toBe(scenario !== "config-failed-before");
+        return;
+      }
+      if (scenario === "working-tree") {
+        const snapshots = logged.filter(
+          (call) => call.tool === "git" && call.args.includes("--show-scope") && !call.args.includes("-z"),
+        );
+        expect(snapshots).toHaveLength(2);
+        expect((await git("show", "pr:file")).stdout).toBe("check-generated change\n");
+      }
       expect((await git("--git-dir", remote, "rev-list", "--all")).stdout.trim().split("\n")).not.toContain(
         value.denied,
       );
@@ -389,13 +448,6 @@ else if (args[1] === "view") {
           (await git("-C", join(root, `fixture-${command}`), "log", "-1", "--format=%s")).stdout.trim(),
         ).toBe(`test fixture ${command}`);
       }
-      const logged: { tool: string; args: string[]; paths?: (string | null)[] }[] = readFileSync(
-        calls,
-        "utf8",
-      )
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
       const installed = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "install");
       const recordedAt = logged.findIndex((call) => call.tool === "recorded");
       expect(recordedAt).toBeGreaterThan(0);
@@ -435,7 +487,8 @@ else if (args[1] === "view") {
       expect(commands("gh", "merge")[0]?.at(-1)).toBe(sha);
       expect((await git("--git-dir", remote, "rev-parse", "refs/heads/pr")).stdout.trim()).toBe(sha);
       expect((await git("--git-dir", remote, "tag", "--list")).stdout).toBe("");
-      expect(readFileSync(join(work, ".git"), "utf8")).toContain(join(alternate, ".git"));
+      if (scenario.startsWith("redirect"))
+        expect(readFileSync(join(work, ".git"), "utf8")).toContain(join(alternate, ".git"));
       if (scenario === "redirect-and-move-head")
         expect((await git("rev-parse", "pr")).stdout.trim()).toBe(value.denied);
     } finally {
@@ -570,7 +623,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     );
     writeFileSync(
       join(bin, "git"),
-      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *) touch '${marker}'; exit 1 ;; esac\n`,
+      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *config*--name-only*--get-regexp*) exit 1 ;; *config*--list*--show-scope*) exit 0 ;; *) touch '${marker}'; exit 1 ;; esac\n`,
       { mode: 0o755 },
     );
     writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
