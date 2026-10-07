@@ -380,15 +380,6 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     };
     child.once("exit", terminate);
 
-    const onAbort = () => {
-      cancelled = true;
-      void terminate();
-    };
-    if (opts.signal) {
-      if (opts.signal.aborted) onAbort();
-      else opts.signal.addEventListener("abort", onAbort, { once: true });
-    }
-
     const timers: ReturnType<typeof setTimeout>[] = [];
     if (opts.timeoutMs) {
       timers.push(
@@ -417,6 +408,16 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       if (idleTimer) clearInterval(idleTimer);
       opts.signal?.removeEventListener("abort", onAbort);
     };
+
+    const onAbort = () => {
+      cancelled = true;
+      void terminate();
+    };
+    // After finishTimers exists: a pre-aborted signal can fail termination synchronously.
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");

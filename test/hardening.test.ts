@@ -405,6 +405,38 @@ describe("process handling", () => {
     },
   );
 
+  test.skipIf(process.platform !== "darwin")(
+    "a pre-aborted invocation whose leader cannot be inspected rejects instead of hanging",
+    async () => {
+      const darwin = await import("../src/util/processes-darwin.ts");
+      const capture = spyOn(darwin, "captureDarwinInvocationLeader").mockImplementation(() => {
+        throw new Error("leader inspection failed");
+      });
+      const controller = new AbortController();
+      controller.abort();
+      const dir = mkdtempSync(join(tmpdir(), "limitless-preabort-"));
+      try {
+        const outcome = await Promise.race([
+          runProcess({
+            cmd: ["/bin/sh", "-c", "sleep 5"],
+            cwd: dir,
+            env: process.env as Record<string, string>,
+            signal: controller.signal,
+          }).then(
+            () => "resolved",
+            (error: unknown) => error,
+          ),
+          // A bound on a hang, not an ordering: the rejection arrives within milliseconds.
+          Bun.sleep(3_000).then(() => "pending"),
+        ]);
+        expect(outcome).toBeInstanceOf(ProcessTerminationError);
+      } finally {
+        capture.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("empty startup snapshots cannot confirm shutdown before the direct child exits", async () => {
     const controller = new AbortController();
     const uid = process.getuid?.() ?? 0;
