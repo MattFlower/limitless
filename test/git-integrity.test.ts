@@ -3003,6 +3003,7 @@ test("LFS binary allowance follows the available new payload", async () => {
 
 test("executable image additions and mode-only changes need a binary allowance", async () => {
   await factory("config", "core.filemode", "true");
+  writeFileSync(join(work, "existing.sh"), "#!/bin/sh\necho before\n", { mode: 0o755 });
   for (const file of ["upgrade.png", "downgrade.png", "unchanged.png"])
     writeFileSync(join(work, file), mediaFixture("png"));
   chmodSync(join(work, "downgrade.png"), 0o755);
@@ -3012,6 +3013,7 @@ test("executable image additions and mode-only changes need a binary allowance",
   chmodSync(join(work, "upgrade.png"), 0o755);
   chmodSync(join(work, "downgrade.png"), 0o644);
   writeFileSync(join(work, "unchanged.png"), mediaFixture("png", 1));
+  writeFileSync(join(work, "existing.sh"), "#!/bin/sh\necho after\n");
   await commitAll(work, "image mode changes");
   const diff = await diffSince(work, revision);
   expect(diff.binaryPaths?.sort()).toEqual(["added.png", "downgrade.png", "upgrade.png"]);
