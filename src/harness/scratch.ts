@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -59,6 +60,7 @@ export function scratchParent(scratchDir: string): string {
 }
 
 export function removeScratch(scratchDir: string): void {
+  assertProcessesStopped();
   const root = basename(scratchDir) === SCRATCH_NAME ? dirname(scratchDir) : scratchDir;
   const remove = () => rmSync(root, { recursive: true, force: true });
   try {
@@ -179,9 +181,12 @@ export function readConfinement(spec: AgentSpec, scratch: string): ReadConfineme
 /** The callback must await process termination; cleanup also covers thrown errors and cancellation. */
 export async function withScratch<T>(cwd: string, run: (scratchDir: string) => Promise<T>): Promise<T> {
   const scratchDir = createScratch(cwd);
+  const scope = processScope.getStore();
+  scope?.scratchDirs.add(scratchDir);
   try {
-    return await run(scratchDir);
+    return await invocationScratch.run(scratchDir, () => run(scratchDir));
   } finally {
     removeScratch(scratchDir);
+    scope?.scratchDirs.delete(scratchDir);
   }
 }

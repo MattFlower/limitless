@@ -64,9 +64,30 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work, ...NO_PARENT_REWRITES };
 }
 
+export class WorktreeCleanError extends Error {}
+
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
-export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1]) {
-  if (worktreeGitScope.getStore() === false) return sh(cmd, opts);
+export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1], retryClean = false) {
+  const run = async (cmd: string[], opts: Parameters<typeof sh>[1]) => {
+    try {
+      return await sh(cmd, opts);
+    } catch (error) {
+      if (
+        !retryClean ||
+        cmd.at(-2) !== "clean" ||
+        cmd.at(-1) !== "-ffdxq" ||
+        !(error instanceof CommandError)
+      )
+        throw error;
+      try {
+        return await sh(cmd, opts);
+      } catch (retryError) {
+        if (!(retryError instanceof CommandError)) throw retryError;
+        throw new WorktreeCleanError(retryError.message, { cause: retryError });
+      }
+    }
+  };
+  if (worktreeGitScope.getStore() === false) return run(cmd, opts);
   opts.signal?.throwIfAborted();
   opts = { ...opts, env: trustedEnv(opts.cwd, opts.env ?? (process.env as Record<string, string>)) };
   // Not bound to the first caller's signal: an aborted first call must not fail every later one.
@@ -105,7 +126,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   const indicators = ["new=+", "old=-", "context= "].map((value) => `--output-indicator-${value}`);
   const format = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", ...indicators];
   const flags = inspection ? ["--no-ext-diff", "--no-textconv", ...format] : [];
-  return sh([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
+  return run([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
     ...opts,
     env,
   });
