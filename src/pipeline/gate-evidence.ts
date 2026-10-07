@@ -23,7 +23,8 @@ const gateClaim = (text: string): boolean => {
   const plain = text.replace(/[`*_~]/g, "");
   return (
     /(?<![\w./-])gat(?:e|es|ed|ing)(?![\w/]|\.\w)/i.test(plain) ||
-    /\b(?:repository|factory(?:['’]s)?|ci)[\s:-]+(?:checks?|runs?|results?|records?|pipelines?)\b/i.test(
+    // Possessives and intervening words do not make factory-dependent claims independent evidence.
+    /\b(?:repository|factory|ci)(?:['’]s)?\b[\s\S]*?\b(?:checks?|runs?|results?|records?|pipelines?)\b/i.test(
       plain,
     ) ||
     /\bverified\s+by\s+(?:the\s+)?(?:factory|repository|ci)\b/i.test(plain)
