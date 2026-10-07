@@ -159,10 +159,11 @@ The deterministic audit (`src/gates/audit.ts`) runs on every factory change.
   `--allow <category>` on the run. Allowances never bypass protected paths or a failed binary
   inspection. If your change really needs one, say so in your report instead of working around the
   rule.
-- The executable bit and mode changes count too: an executable or mode-changed file passes only if its
-  content is plain reviewable text (strict UTF-8 with no control bytes besides tab, newline, form feed
-  and carriage return). Shell scripts pass; keep them free of raw escape bytes (write `\033`, not the
-  byte). The finding reads `[binary-content]` even when the cause is the mode.
+- The executable bit and mode changes count too: an executable or mode-changed file needs
+  `Allow: binary` unless its content is reviewable text (strict UTF-8, no DEL and no control bytes
+  besides tab, newline, form feed and carriage return), and an executable or mode-changed image always
+  needs it. Shell scripts pass; keep them free of raw escape bytes (write `\033`, not the byte). The
+  finding reads `[binary-content]` even when the cause is the mode.
 - Deleting a test file warns, and reviewers will ask why.
 
 ## Defects reviews keep finding
@@ -214,8 +215,9 @@ finish.
   `PATH`.
 - Write shell scripts for `#!/usr/bin/env bash`, not zsh: non-interactive zsh sources `~/.zshenv`,
   which can reorder `PATH`.
-- In zsh (the shell agents' commands run in), `$var:` followed by a letter applies a modifier:
-  `$sha:refs/heads/x` becomes something else entirely and `git show $rev:path` silently prints
-  nothing. Write `"${var}:..."`.
+- In zsh (agents' shell commands on this Mac run in it), an unbraced variable followed by a colon can
+  apply a modifier: with `sha=abc`, `$sha:refs/heads/x` expands to `abcefs/heads/x`, and
+  `$rev:src/a` fails with `bad substitution` (redirected output is then just empty). Write
+  `"${var}:..."`.
 - Biome also formats JSON. Run `bunx biome check --write <files>` on anything generated or edited by
   a script.
