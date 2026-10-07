@@ -257,10 +257,10 @@ describe("LoopDetector", () => {
     for (const changing of [true, false]) {
       const d = new LoopDetector(100);
       for (let i = 0; i < 6; i++) {
-        expect(d.observe("shell", { command: "tail test.log" }, String(i))).toBe(
+        expect(d.observe("shell", { command: "tail test.log" }, String(i))).toBeNull();
+        expect(d.observeResult(String(i), changing ? `${i} tests passed` : "waiting")).toBe(
           !changing && i === 5 ? "repeated the same shell call 6 times" : null,
         );
-        d.observeResult(String(i), changing ? `${i} tests passed` : "waiting");
       }
     }
   });
@@ -269,21 +269,20 @@ describe("LoopDetector", () => {
     const d = new LoopDetector(100);
     for (let i = 0; i < 10; i++) {
       d.observeResult("unmatched", String(i));
-      expect(d.observe("shell", "poll", String(i))).toBe(
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      expect(d.observeResult(String(i), i < 3 ? "waiting" : "progress")).toBe(
         i === 9 ? "repeated the same shell call 6 times" : null,
       );
-      d.observeResult(String(i), i < 3 ? "waiting" : "progress");
-      d.observeResult(String(i), "duplicate result must be ignored");
+      expect(d.observeResult(String(i), "duplicate result must be ignored")).toBeNull();
     }
   });
 
   test("missing results still count and changing results still consume the budget", () => {
     const missing = new LoopDetector(100);
     for (let i = 0; i < 6; i++) {
-      expect(missing.observe("shell", "poll", String(i))).toBe(
-        i === 5 ? "repeated the same shell call 6 times" : null,
-      );
+      expect(missing.observe("shell", "poll", String(i))).toBeNull();
     }
+    expect(missing.finish()).toBe("repeated the same shell call 6 times");
     const bounded = new LoopDetector(6);
     for (let i = 0; i < 6; i++) {
       expect(bounded.observe("shell", "poll", String(i))).toBeNull();
@@ -292,7 +291,7 @@ describe("LoopDetector", () => {
     expect(bounded.observe("shell", "poll", "6")).toBe("exceeded tool-call budget (6)");
   });
 
-  test("results match IDs across interleaved calls and late completions", () => {
+  test("results match IDs across interleaved calls and late completions in call order", () => {
     const d = new LoopDetector(100);
     expect(d.observe("shell", "poll", "first")).toBeNull();
     expect(d.observe("Read", "file", "read")).toBeNull();
@@ -300,10 +299,83 @@ describe("LoopDetector", () => {
     d.observeResult("read", "contents");
     expect(d.observe("shell", "poll", "late")).toBeNull();
     expect(d.observe("shell", "poll", "newer")).toBeNull();
-    d.observeResult("newer", "waiting");
-    d.observeResult("late", "progress");
-    for (let i = 0; i < 4; i++) expect(d.observe("shell", "poll", String(i))).toBeNull();
-    expect(d.observe("shell", "poll", "stop")).toBe("repeated the same shell call 6 times");
+    expect(d.observeResult("newer", "progress")).toBeNull();
+    expect(d.observeResult("late", "waiting")).toBeNull();
+    for (let i = 3; i <= 8; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      expect(d.observeResult(String(i), "progress")).toBe(
+        i === 8 ? "repeated the same shell call 6 times" : null,
+      );
+    }
+  });
+
+  test("the threshold result can establish progress, even with parallel calls", () => {
+    for (const parallel of [false, true]) {
+      for (const outputs of [
+        ["waiting", "waiting", "waiting", "waiting", "waiting", "progress"],
+        Array.from({ length: 6 }, (_, i) => String(i)),
+        Array.from({ length: 6 }, () => "waiting"),
+      ]) {
+        const d = new LoopDetector(100);
+        if (parallel) for (let i = 0; i < 6; i++) expect(d.observe("shell", "poll", String(i))).toBeNull();
+        for (const [i, output] of outputs.entries()) {
+          if (!parallel) expect(d.observe("shell", "poll", String(i))).toBeNull();
+          expect(d.observeResult(String(i), output)).toBe(
+            i === 5 && output === "waiting" ? "repeated the same shell call 6 times" : null,
+          );
+        }
+      }
+    }
+  });
+
+  test("timestamp-only and counter-only changes are bounded by the unchanged budget", () => {
+    for (const command of ["sleep 5; date +%s", "poll counter"]) {
+      const d = new LoopDetector(20);
+      for (let i = 0; i < 20; i++) {
+        expect(d.observe("shell", command, String(i))).toBeNull();
+        expect(d.observeResult(String(i), String(1_000_000 + i))).toBeNull();
+      }
+      expect(d.observe("shell", command, "20")).toBe("exceeded tool-call budget (20)");
+    }
+  });
+
+  test("completed and unresolved state is bounded by the window and evicted IDs are ignored", () => {
+    for (const completed of [false, true]) {
+      const d = new LoopDetector(1000);
+      // Inspect retained state to catch unbounded keys, including large serialized inputs.
+      const state = d as unknown as {
+        recent: { key: string }[];
+        pending: Map<string, unknown>;
+        results: Map<string, string>;
+      };
+      for (let i = 0; i < 400; i++) {
+        expect(d.observe("apply_patch", `${i}:${"x".repeat(20_000)}`, String(i))).toBeNull();
+        if (completed) expect(d.observeResult(String(i), "done")).toBeNull();
+        expect(state.recent.length).toBeLessThanOrEqual(12);
+        expect(state.pending.size).toBeLessThanOrEqual(12);
+        expect(state.results.size).toBeLessThanOrEqual(12);
+        const keys = new Set(state.recent.map((entry) => entry.key));
+        expect([...state.results.keys()].every((key) => keys.has(key))).toBe(true);
+      }
+      expect(d.observeResult("0", "late evicted result")).toBeNull();
+      expect(state.results.size).toBe(completed ? 12 : 0);
+    }
+  });
+
+  test("eviction unblocks later completions and evicted results cannot reset a live key", () => {
+    const d = new LoopDetector(100);
+    expect(d.observe("shell", "poll", "old")).toBeNull();
+    expect(d.observe("shell", "poll", "new")).toBeNull();
+    expect(d.observeResult("new", "progress")).toBeNull();
+    for (let i = 0; i < 11; i++) expect(d.observe("Read", i, `read-${i}`)).toBeNull();
+    expect(d.observeResult("old", "stale")).toBeNull();
+    // The baseline survives while its key is live, even after its originating call is evicted.
+    for (let i = 0; i < 5; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      expect(d.observeResult(String(i), "progress")).toBeNull();
+    }
+    expect(d.observe("shell", "poll", "stop")).toBeNull();
+    expect(d.observeResult("stop", "progress")).toBe("repeated the same shell call 6 times");
   });
 
   test("progress clears only its key and retains the twelve-call window", () => {
@@ -320,58 +392,81 @@ describe("LoopDetector", () => {
 });
 
 for (const harness of ["codex", "claude"] as const) {
-  test(`${harness} delivers ID-matched parser results to loop detection`, async () => {
-    for (const mode of ["changing", "identical", "missing", "truncated"]) {
-      await withScratch(import.meta.dir, async (scratchDir) => {
-        const result = await (harness === "codex" ? verifiedCodex : runClaude)(
-          {
-            cwd: import.meta.dir,
-            scratchDir,
-            prompt: "poll tests",
-            mode: "readonly",
-            target: {
-              modelId: `${harness}/test`,
-              provider: harness,
-              harness,
-              model: "test",
-              vendor: "other",
-              tier: 4,
-              billing: "subscription",
+  const tools =
+    harness === "codex" ? ["shell", "apply_patch", "test.poll"] : ["Bash", "Edit", "mcp__test__poll"];
+  for (const tool of tools) {
+    test(`${harness} ${tool} delivers ID-matched parser results to loop detection`, async () => {
+      const modes =
+        tool === tools[0]
+          ? [
+              "changing",
+              "threshold",
+              "identical",
+              "missing",
+              "missing-timeout",
+              "missing-failure",
+              "truncated",
+              "parallel-changing",
+              "parallel-threshold",
+              "parallel-identical",
+              "late",
+              "budget",
+            ]
+          : ["threshold", "identical"];
+      for (const mode of modes) {
+        await withScratch(import.meta.dir, async (scratchDir) => {
+          const result = await (harness === "codex" ? verifiedCodex : runClaude)(
+            {
+              cwd: import.meta.dir,
+              scratchDir,
+              prompt: "poll tests",
+              mode: "readonly",
+              target: {
+                modelId: `${harness}/test`,
+                provider: harness,
+                harness,
+                model: "test",
+                vendor: "other",
+                tier: 4,
+                billing: "subscription",
+              },
+              timeoutMs: 1000,
+              idleTimeoutMs: 1000,
+              maxToolCalls: mode === "budget" ? 6 : 100,
+              signal: new AbortController().signal,
+              logPath: join(scratchDir, "log"),
+              onEvent: () => {},
             },
-            timeoutMs: 1000,
-            idleTimeoutMs: 1000,
-            maxToolCalls: 100,
-            signal: new AbortController().signal,
-            logPath: join(scratchDir, "log"),
-            onEvent: () => {},
-          },
-          async (opts) => {
-            const emit = (record: unknown) => opts.onStdoutLine?.(JSON.stringify(record));
-            for (let i = 0; i < 6 && !opts.signal?.aborted; i++) {
-              const id = `poll-${i}`;
-              const output =
-                mode === "changing"
-                  ? `${i} passed`
-                  : mode === "truncated"
-                    ? `${"x".repeat(20_000)}${i}`
-                    : "waiting";
-              if (harness === "codex") {
-                const item = { type: "command_execution", id, command: "tail test.log" };
-                emit({ type: "item.started", item });
-                if (mode !== "missing")
+            async (opts) => {
+              const emit = (record: unknown) => opts.onStdoutLine?.(JSON.stringify(record));
+              const call = (i: number) => {
+                const id = `poll-${i}`;
+                if (harness === "claude") {
                   emit({
-                    type: "item.completed",
-                    item: { ...item, aggregated_output: output, exit_code: i % 2 },
+                    type: "assistant",
+                    message: {
+                      content: [{ type: "tool_use", id, name: tool, input: { command: "tail test.log" } }],
+                    },
                   });
-                emit({ type: "item.completed", item: { type: "mcp_tool_call", id: "orphan", result: i } });
-              } else {
-                emit({
-                  type: "assistant",
-                  message: {
-                    content: [{ type: "tool_use", id, name: "Bash", input: { command: "tail test.log" } }],
-                  },
-                });
-                if (mode !== "missing")
+                } else if (tool !== "apply_patch") {
+                  emit({
+                    type: "item.started",
+                    item:
+                      tool === "shell"
+                        ? { type: "command_execution", id, command: "tail test.log" }
+                        : {
+                            type: "mcp_tool_call",
+                            id,
+                            server: "test",
+                            tool: "poll",
+                            arguments: { log: "test.log" },
+                          },
+                  });
+                }
+              };
+              const complete = (i: number, output: string) => {
+                const id = `poll-${i}`;
+                if (harness === "claude") {
                   emit({
                     type: "user",
                     message: {
@@ -385,39 +480,102 @@ for (const harness of ["codex", "claude"] as const) {
                       ],
                     },
                   });
-                emit({
-                  type: "user",
-                  message: { content: [{ type: "tool_result", tool_use_id: "orphan", content: String(i) }] },
-                });
+                } else {
+                  emit({
+                    type: "item.completed",
+                    item:
+                      tool === "shell"
+                        ? {
+                            type: "command_execution",
+                            id,
+                            command: "tail test.log",
+                            aggregated_output: output,
+                            exit_code: i % 2,
+                          }
+                        : tool === "apply_patch"
+                          ? {
+                              type: "file_change",
+                              id,
+                              changes: [{ path: "test.txt", kind: "update" }],
+                              status: output === "progress" ? "completed" : "failed",
+                            }
+                          : { type: "mcp_tool_call", id, result: output },
+                  });
+                }
+              };
+              const parallel = mode.startsWith("parallel");
+              const count = mode === "late" ? 9 : mode === "budget" ? 7 : 6;
+              if (parallel) {
+                for (let i = 0; i < count; i++) {
+                  call(i);
+                  expect(opts.signal?.aborted).toBe(false);
+                }
               }
-            }
-            emit(
-              harness === "codex"
-                ? { type: "turn.completed", usage: {} }
-                : { type: "result", result: "done" },
-            );
-            return {
-              exitCode: 0,
-              signal: null,
-              truncated: false,
-              durationMs: 1,
-              stdout: "",
-              stderr: "",
-              timedOut: false,
-              idleTimedOut: false,
-              cancelled: opts.signal?.aborted ?? false,
-            };
-          },
-        );
-        expect(result.status).toBe(mode === "changing" ? "ok" : "stuck");
-        expect(result.error).toBe(
-          mode === "changing"
-            ? null
-            : `repeated the same ${harness === "codex" ? "shell" : "Bash"} call 6 times`,
-        );
-      });
-    }
-  });
+              for (let i = 0; i < count; i++) {
+                if (!parallel) call(i);
+                if (mode === "budget" && i === 6) {
+                  expect(opts.signal?.aborted).toBe(true);
+                  break;
+                }
+                expect(opts.signal?.aborted).toBe(false);
+                if (mode === "late" && i === 1) continue;
+                const output =
+                  mode.includes("changing") || mode === "budget"
+                    ? String(1_000_000 + i)
+                    : (mode.includes("threshold") && i === 5) || (mode === "late" && i >= 2)
+                      ? "progress"
+                      : mode === "truncated"
+                        ? `${"x".repeat(20_000)}${i}`
+                        : "waiting";
+                if (!mode.startsWith("missing")) complete(i, output);
+                if (mode === "late" && i === 2) complete(1, "waiting");
+                // A result without a corresponding call must not affect another call's baseline.
+                emit(
+                  harness === "codex"
+                    ? { type: "item.completed", item: { type: "mcp_tool_call", id: "orphan", result: i } }
+                    : {
+                        type: "user",
+                        message: {
+                          content: [{ type: "tool_result", tool_use_id: "orphan", content: String(i) }],
+                        },
+                      },
+                );
+                const stopped =
+                  ((mode.endsWith("identical") || mode === "truncated") && i === 5) ||
+                  (mode === "late" && i === 8);
+                expect(opts.signal?.aborted).toBe(stopped);
+              }
+              emit(
+                harness === "codex"
+                  ? { type: "turn.completed", usage: {} }
+                  : { type: "result", result: "done" },
+              );
+              return {
+                exitCode: mode === "missing-failure" ? 1 : 0,
+                signal: null,
+                truncated: false,
+                durationMs: 1,
+                stdout: "",
+                stderr: "",
+                timedOut: mode === "missing-timeout",
+                idleTimedOut: false,
+                cancelled: opts.signal?.aborted ?? false,
+              };
+            },
+          );
+          const progress = mode.includes("changing") || mode.includes("threshold");
+          expect(result.status).toBe(progress ? "ok" : "stuck");
+          expect(result.error).toBe(
+            progress
+              ? null
+              : mode === "budget"
+                ? "exceeded tool-call budget (6)"
+                : `repeated the same ${tool} call 6 times`,
+          );
+        });
+      }
+    });
+  }
 }
 
 test("priceOf charges cache reads at a discount", () => {

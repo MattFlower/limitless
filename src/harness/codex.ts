@@ -798,15 +798,19 @@ export async function runCodex(
   let stuckReason: string | null = null;
   const signal = AbortSignal.any([spec.signal, stuckController.signal]);
   const parser = new CodexStreamParser((ev) => {
-    if (ev.type === "tool_call" && !stuckReason) {
-      const reason = loop.observe(ev.name, ev.input, ev.id);
+    if (!stuckReason) {
+      const reason =
+        ev.type === "tool_call"
+          ? loop.observe(ev.name, ev.input, ev.id)
+          : ev.type === "tool_result"
+            ? loop.observeResult(ev.id, ev.output)
+            : null;
       if (reason) {
         stuckReason = reason;
         spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
         stuckController.abort();
       }
     }
-    if (ev.type === "tool_result") loop.observeResult(ev.id, ev.output);
     spec.onEvent(ev);
   });
 
@@ -854,8 +858,10 @@ export async function runCodex(
     ...(confinement ? { confinement } : {}),
   };
 
-  if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };
+  if (stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
+  const repeatReason = loop.finish();
+  if (repeatReason) return { ...base, status: "stuck", error: repeatReason };
   if (proc.timedOut) return { ...base, status: "timeout", error: `timed out after ${spec.timeoutMs}ms` };
   if (proc.idleTimedOut)
     return { ...base, status: "stuck", error: `no output for ${Math.round(spec.idleTimeoutMs / 1000)}s` };

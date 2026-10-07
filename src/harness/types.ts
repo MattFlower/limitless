@@ -145,13 +145,22 @@ export function priceOf(usage: Usage, price: ModelTarget["price"]): number {
   );
 }
 
+interface LoopCall {
+  key: string;
+  name: string;
+  id?: string;
+  hash?: string;
+  processed: boolean;
+  counted: boolean;
+}
+
 /**
  * Detects an agent stuck repeating the same tool call, or blowing through its tool budget.
  * Returns a reason string when the run should be stopped.
  */
 export class LoopDetector {
-  private recent: { key: string | null; call: number }[] = [];
-  private pending = new Map<string, { key: string; call: number }>();
+  private recent: LoopCall[] = [];
+  private pending = new Map<string, LoopCall>();
   private results = new Map<string, string>();
   private total = 0;
   constructor(
@@ -164,27 +173,59 @@ export class LoopDetector {
     this.total++;
     if (this.total > this.maxToolCalls) return `exceeded tool-call budget (${this.maxToolCalls})`;
     const key = `${name}:${JSON.stringify(input)}`;
-    if (id !== undefined) this.pending.set(id, { key, call: this.total });
-    this.recent.push({ key, call: this.total });
-    if (this.recent.length > this.window) this.recent.shift();
-    const same = this.recent.filter((entry) => entry.key === key).length;
-    if (same >= this.maxIdenticalInWindow) return `repeated the same ${name} call ${same} times`;
-    return null;
+    const entry = { key, name, id, processed: false, counted: false };
+    if (id !== undefined) this.pending.set(id, entry);
+    this.recent.push(entry);
+    if (this.recent.length > this.window) {
+      const evicted = this.recent.shift();
+      if (evicted?.id !== undefined) this.pending.delete(evicted.id);
+      if (evicted && !this.recent.some((entry) => entry.key === evicted.key))
+        this.results.delete(evicted.key);
+    }
+    return this.reconcile();
   }
 
-  observeResult(id: string, output: string): void {
-    const pending = this.pending.get(id);
-    if (!pending) return;
+  observeResult(id: string, output: string): string | null {
+    const entry = this.pending.get(id);
+    if (!entry) return null;
     this.pending.delete(id);
-    const { key, call } = pending;
-    const previous = this.results.get(key);
-    const hash = createHash("sha256").update(output).digest("hex");
-    if (previous !== undefined && previous !== hash) {
-      for (const entry of this.recent) {
-        if (entry.key === key && entry.call <= call) entry.key = null;
+    entry.hash = createHash("sha256").update(output).digest("hex");
+    return this.reconcile();
+  }
+
+  /** Only invocation completion establishes that a pending result is missing. */
+  finish(): string | null {
+    return this.reconcile(true);
+  }
+
+  private reconcile(finished = false): string | null {
+    // A later completion waits for earlier calls of its key so baselines follow call order.
+    const blocked = new Set<string>();
+    for (const entry of this.recent) {
+      if (entry.processed || blocked.has(entry.key)) continue;
+      if (entry.id !== undefined && entry.hash === undefined && !finished) {
+        blocked.add(entry.key);
+        continue;
       }
+      entry.processed = true;
+      entry.counted = true;
+      if (entry.hash !== undefined) {
+        const previous = this.results.get(entry.key);
+        if (previous !== undefined && previous !== entry.hash) {
+          // Any changed output is progress, even timestamps: varying-output loops stop only at
+          // the tool-call budget or invocation timeout. Repeated failing commands with identical
+          // output, the stuck behavior seen in practice, remain detectable.
+          for (const earlier of this.recent) {
+            if (earlier.key === entry.key && earlier.processed) earlier.counted = false;
+          }
+        }
+        this.results.set(entry.key, entry.hash);
+      }
+      if (entry.id !== undefined) this.pending.delete(entry.id);
+      const same = this.recent.filter((other) => other.key === entry.key && other.counted).length;
+      if (same >= this.maxIdenticalInWindow) return `repeated the same ${entry.name} call ${same} times`;
     }
-    this.results.set(key, hash);
+    return null;
   }
 }
 
