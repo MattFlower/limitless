@@ -24,6 +24,7 @@ import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { plantPushConfig } from "./push-config.ts";
 import { waitClock } from "./wait-clock.ts";
 
 // These tests drive real git and confined gate commands; under CPU load they outlast Bun's 5 s default.
@@ -378,14 +379,24 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   const behindHead = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, behindHead);
   approve(1, behindHead);
+  const cache = join(paths.repos, `${SLUG.replace("/", "__")}.git`);
+  const attackConfig = join(root, "attack.config");
+  const cleanConfig = join(root, "clean.config");
+  writeFileSync(
+    join(seed, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = "land", run = "cp '${cache}/config' '${cleanConfig}'; cat '${attackConfig}' >> '${cache}/config'" }]\n`,
+  );
   await advanceBase();
   const upToDate = delivered(2, "pr-2");
   const head2 = await pushBranch("pr-2", "two.txt", "two\n", 2);
   observe(2, head2);
   approve(2, head2);
+  const originalConfig = readFileSync(join(seed, ".git/config"), "utf8");
+  const markers = await plantPushConfig(seed, root, bare);
+  writeFileSync(attackConfig, readFileSync(join(seed, ".git/config"), "utf8"));
+  writeFileSync(join(seed, ".git/config"), originalConfig);
   const q = queue();
   q.request({ target: behind.run.id });
-  q.request({ target: upToDate.run.id });
   await settle();
   const merged = store.getLandEntry(1);
   expect(merged?.state).toBe("landed");
@@ -393,12 +404,16 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   expect(mergeSha).not.toBe(behindHead);
   // The pushed commit is a factory merge commit that carries the moved base.
   expect(await remoteHead("pr-1")).toBe(mergeSha);
+  expect(markers()).toEqual([]);
   expect(await remoteHead("main")).not.toBe(behindHead);
   const ancestor = await sh(["git", "merge-base", "--is-ancestor", "refs/remotes/origin/main", mergeSha], {
     cwd: join(paths.repos, `${SLUG.replace("/", "__")}.git`),
   });
   expect(ancestor.exitCode).toBe(0);
   // Nothing to merge, nothing to push: the approved head is what lands.
+  writeFileSync(join(cache, "config"), readFileSync(cleanConfig));
+  q.request({ target: upToDate.run.id });
+  await settle();
   const ahead = store.getLandEntry(2);
   expect(ahead).toMatchObject({ state: "landed", pushedSha: await remoteHead("pr-2") });
   expect(ghCalls("pr merge")).toEqual([

@@ -2136,11 +2136,11 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   >[0];
   const budget = { leftMs: 100 };
   try {
-    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    await pushBranch(repo, source, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(1);
     expect(budget.leftMs).toBeLessThan(0);
     // With the budget spent, the next call's first attempt still runs (as on main); only retries stop.
-    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    await pushBranch(repo, source, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(2);
   } finally {
     await restore();

@@ -9,6 +9,7 @@ subject="$2"
 dir="${3:-.}"
 repo="MattFlower/limitless"
 private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
+push_git="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/push-git.sh"
 [[ "${LIMITLESS_CONFIG_DIR-/}" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
 # The checkout's own CLI: `limitless` need not be on PATH.
 cli="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/cli/main.ts"
@@ -27,7 +28,9 @@ safe_git() {
   local IFS=$'\n'
   for key in $keys; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done
   set +f
-  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
+  local command=(git)
+  if [ "${1-}" = push ]; then command=(bash "$push_git" git); fi
+  "${command[@]}" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
     ${flags[@]+"${flags[@]}"} "$@"
 }
 
@@ -61,7 +64,7 @@ fi
 sha="$(safe_git rev-parse HEAD)"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
-safe_git push --no-verify -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
+safe_git push --no-verify -q --no-follow-tags "https://github.com/$repo.git" "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""

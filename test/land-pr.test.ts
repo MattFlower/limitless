@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sh } from "../src/util/proc.ts";
+import { plantPushConfig } from "./push-config.ts";
 import { seeded } from "./seeded.ts";
 
 const script = resolve("scripts/land-pr.sh");
@@ -283,6 +284,13 @@ test.each(["redirect", "redirect-and-move-head"])(
       });
       expect(recorded.stdout.trim().split("\n")).toEqual(paths);
       expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
+      const destination = "https://github.com/MattFlower/limitless.git";
+      const markers = await plantPushConfig(work, root, destination, gitBin);
+      const global = join(root, "global.config");
+      writeFileSync(
+        global,
+        `[include]\npath = ${JSON.stringify(process.env.GIT_CONFIG_GLOBAL)}\n[url "file://${remote}"]\ninsteadOf = ${destination}\n`,
+      );
       const calls = join(root, "calls");
       const pinned = join(root, "pinned");
       writeFileSync(
@@ -367,6 +375,7 @@ else if (args[1] === "view") {
           PATH: `${bin}:${process.env.PATH}`,
           LIMITLESS_CONFIG_DIR: config,
           TMPDIR: root,
+          GIT_CONFIG_GLOBAL: global,
         },
         allowFail: true,
       });
@@ -376,6 +385,7 @@ else if (args[1] === "view") {
       );
       expect((await git("--git-dir", remote, "log", "--all", "--format=%B")).stdout).not.toContain(entry);
       expect(result.exitCode).toBe(0);
+      expect(markers()).toEqual([]);
       const sha = readFileSync(pinned, "utf8");
       expect(sha).toMatch(/^[a-f0-9]{40}$/);
       expect(sha).not.toBe(value.base);
@@ -402,7 +412,9 @@ else if (args[1] === "view") {
       expect(installed).toBeGreaterThan(recordedAt);
       for (const call of logged.slice(recordedAt + 1).filter((call) => call.tool !== "gh")) {
         const check = call.tool === "bun" && ["install", "run"].includes(call.args[0] ?? "");
-        expect(call.paths).toEqual(check ? [null, null, null] : paths);
+        if (call.paths?.[2]?.includes("/limitless-push.")) {
+          expect(call.paths.slice(0, 2)).toEqual(paths.slice(0, 2));
+        } else expect(call.paths).toEqual(check ? [null, null, null] : paths);
       }
       const commands = (tool: string, command: string) =>
         logged.filter((call) => call.tool === tool && call.args.includes(command)).map((call) => call.args);
@@ -410,8 +422,18 @@ else if (args[1] === "view") {
         [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "safe", "pr", sha],
         [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
       ]);
-      expect(commands("git", "push").map(blanked)).toEqual([
-        [...hardened, "push", "--no-verify", "-q", "--no-follow-tags", "origin", `${sha}:refs/heads/pr`],
+      const pushes = commands("git", "push").map(blanked);
+      expect(pushes).toHaveLength(1);
+      expect(pushes[0]).toEqual(
+        expect.arrayContaining([...hardened, "protocol.ext.allow=never", "core.sshCommand=ssh"]),
+      );
+      expect(pushes[0]?.slice(-6)).toEqual([
+        "push",
+        "--no-verify",
+        "-q",
+        "--no-follow-tags",
+        destination,
+        `${sha}:refs/heads/pr`,
       ]);
       expect(commands("git", "HEAD").map(blanked)).toEqual([[...hardened, "rev-parse", "HEAD"]]);
       expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
@@ -727,13 +749,16 @@ exec '${gitBin}' "$@"
       }
       if (scenario !== "cancel") {
         expect(existsSync(watched)).toBe(true);
-        expect(blanked(readFileSync(pushed, "utf8").trim().split("\n"))).toEqual([
-          ...hardened,
+        const args = blanked(readFileSync(pushed, "utf8").trim().split("\n"));
+        expect(args).toEqual(
+          expect.arrayContaining([...hardened, "protocol.ext.allow=never", "core.sshCommand=ssh"]),
+        );
+        expect(args.slice(-6)).toEqual([
           "push",
           "--no-verify",
           "-q",
           "--no-follow-tags",
-          "origin",
+          "https://github.com/MattFlower/limitless.git",
           `${sha}:refs/heads/safe-branch`,
         ]);
       }

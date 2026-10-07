@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
 import { harden } from "./hardening.ts";
@@ -126,7 +127,10 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   const indicators = ["new=+", "old=-", "context= "].map((value) => `--output-indicator-${value}`);
   const format = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", ...indicators];
   const flags = inspection ? ["--no-ext-diff", "--no-textconv", ...format] : [];
-  return run([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
+  const hardened = [...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)];
+  const push = fileURLToPath(new URL("../../scripts/push-git.sh", import.meta.url));
+  // The lease lookup must observe the same trusted destination as the subsequent push.
+  return run(["push", "ls-remote"].includes(cmd[command] ?? "") ? ["bash", push, ...hardened] : hardened, {
     ...opts,
     env,
   });
