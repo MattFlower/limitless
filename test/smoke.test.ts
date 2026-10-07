@@ -53,6 +53,51 @@ const result: AgentResult = {
 };
 const now = () => performance.now();
 
+test("excluded backend smoke preserves missing-key and failed-health skips without invoking a checker", async () => {
+  const providers = PROVIDERS.filter((p) => ["omlx", "twilight", "openrouter", "typesafe"].includes(p.id));
+  const models = MODELS.filter((m) => providers.some((p) => p.id === m.provider)).map((m) => ({
+    ...m,
+    origin: "CN",
+    baseOrigin: "CN",
+  }));
+  const catalog = { providers, models };
+  const calls: string[] = [];
+  const check: typeof liveCheck = async (_harness, target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  const decide: typeof decisionsCheck = async (target) => {
+    calls.push(target.modelId);
+    return { status: "pass" };
+  };
+  let probes = 0;
+  const probe = (async (_url: Parameters<typeof fetch>[0]) => {
+    probes++;
+    return new Response("", { status: 503 });
+  }) as typeof fetch;
+  const missing = await runChecks(backendChecks({}, probe, check, decide, catalog, ["CN"]));
+  expect(missing.map((r) => [r.name, r.status, r.reason])).toEqual([
+    ["omlx structured", "skip", "missing OMLX_API_KEY"],
+    ["omlx claude-harness edit", "skip", "missing OMLX_API_KEY"],
+    ["twilight structured", "skip", "missing TWILIGHT_API_KEY"],
+    ["openrouter structured", "skip", "missing OPENROUTER_API_KEY"],
+    ["typesafe decisions", "skip", "missing TYPESAFE_API_KEY"],
+  ]);
+  expect(exitCode(missing)).toBe(0);
+  expect(probes).toBe(0);
+  const local = { providers: providers.filter((p) => p.healthUrl), models };
+  const down = await runChecks(
+    backendChecks({ OMLX_API_KEY: "key", TWILIGHT_API_KEY: "key" }, probe, check, decide, local, ["CN"]),
+    now,
+    noDelay,
+  );
+  expect(down).toHaveLength(3);
+  expect(down.every((r) => r.status === "skip" && r.reason === "health probe returned HTTP 503")).toBe(true);
+  expect(exitCode(down)).toBe(0);
+  expect(probes).toBe(6);
+  expect(calls).toEqual([]);
+});
+
 test("backend smoke excludes origins before structured, edit and decisions calls and selects allowed alternatives", async () => {
   const providers = ["omlx", "twilight", "openrouter", "typesafe"].map((id) => {
     const provider = PROVIDERS.find((p) => p.id === id);
@@ -81,8 +126,9 @@ test("backend smoke excludes origins before structured, edit and decisions calls
   const blocked = await run(excluded, ["CN"]);
   expect(blocked.map((r) => r.name)).toContain("omlx claude-harness edit");
   expect(
-    blocked.every((r) => r.status === "fail" && r.reason?.includes("origin excluded (CN; baseOrigin=CN)")),
+    blocked.every((r) => r.status === "skip" && r.reason === "origin excluded (CN; baseOrigin=CN)"),
   ).toBe(true);
+  expect(exitCode(blocked)).toBe(0);
   expect(calls).toEqual([]);
   const allowed = excluded.map((m) => ({
     ...m,

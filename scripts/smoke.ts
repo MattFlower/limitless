@@ -860,20 +860,29 @@ async function providerAvailability(
   provider: ProviderDef,
   secrets: Record<string, string>,
   fetchHealth = fetch,
+  catalog = MODELS,
+  excludeOrigins?: readonly string[],
 ): Promise<CheckResult | null> {
   if (provider.apiKeySecret && !secrets[provider.apiKeySecret])
     return { status: "skip", reason: `missing ${provider.apiKeySecret}` };
-  if (!provider.healthUrl) return null;
-  try {
-    const token = provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey;
-    const response = await fetchHealth(provider.healthUrl, {
-      signal: AbortSignal.timeout(3000),
-      ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
-    });
-    return response.ok ? null : fail(`health probe returned HTTP ${response.status}`, "health");
-  } catch {
-    return fail("health probe failed", "health");
+  if (provider.healthUrl) {
+    try {
+      const token = provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey;
+      const response = await fetchHealth(provider.healthUrl, {
+        signal: AbortSignal.timeout(3000),
+        ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
+      });
+      if (!response.ok) return fail(`health probe returned HTTP ${response.status}`, "health");
+    } catch {
+      return fail("health probe failed", "health");
+    }
   }
+  const reasons = catalog
+    .filter((m) => m.provider === provider.id && m.source !== "runtime")
+    .map((m) => originExclusion(m, excludeOrigins));
+  if (reasons.length && reasons.every((reason) => reason !== null))
+    return { status: "skip", reason: [...new Set(reasons)].join("; ") };
+  return null;
 }
 
 export function catalogChecks(
@@ -931,9 +940,15 @@ export function backendChecks(
         name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
         timeoutMs: provider.billing === "free" ? 330_000 : 90_000,
         run: async (signal) => {
-          const model = cheapestModel(id, catalog.models, excludeOrigins);
-          const unavailable = await providerAvailability(provider, secrets, fetchHealth);
+          const unavailable = await providerAvailability(
+            provider,
+            secrets,
+            fetchHealth,
+            catalog.models,
+            excludeOrigins,
+          );
           if (unavailable) return unavailable;
+          const model = cheapestModel(id, catalog.models, excludeOrigins);
           return check(
             runClaude,
             targetFor(
@@ -954,9 +969,15 @@ export function backendChecks(
     name: "typesafe decisions",
     timeoutMs: 90_000,
     run: async (signal) => {
-      const model = cheapestModel("typesafe", catalog.models, excludeOrigins);
-      const unavailable = await providerAvailability(typesafe, secrets, fetchHealth);
+      const unavailable = await providerAvailability(
+        typesafe,
+        secrets,
+        fetchHealth,
+        catalog.models,
+        excludeOrigins,
+      );
       if (unavailable) return unavailable;
+      const model = cheapestModel("typesafe", catalog.models, excludeOrigins);
       return decide(targetFor(typesafe, model, secrets[key]), runDecisions, signal);
     },
   });
