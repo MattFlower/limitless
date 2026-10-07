@@ -3,6 +3,10 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import type { DarwinInvocationLeader } from "./processes-darwin.ts";
+
+/** Only the innermost invocation's scratch is an ownership root. */
+export const invocationScratch = new AsyncLocalStorage<string>();
 
 export const processScope = new AsyncLocalStorage<{
   signal: AbortSignal;
@@ -27,12 +31,14 @@ export const processInspection = new AsyncLocalStorage<
   (withEnvironment: boolean, marker: string, pids?: number[]) => Promise<string>
 >();
 const inspectionPlatform = process.platform;
+const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwin.ts") : undefined;
 
 async function markedProcesses(
   marker: string,
   group: number,
   started: number,
   directories: readonly string[],
+  leader: DarwinInvocationLeader | null,
   attempt = 0,
 ): Promise<number[]> {
   const uid = process.getuid?.();
@@ -40,15 +46,15 @@ async function markedProcesses(
   // macOS ps is setuid and cannot launch inside a worker sandbox. Read the same kernel
   // process/environment data directly, without needing elevated privileges.
   const nativeProcesses = async () => {
-    const { markedDarwinProcesses } = await import("./processes-darwin.ts");
+    if (!darwin) throw new Error("Native process inspection is unavailable");
     try {
-      return markedDarwinProcesses(uid, marker, group, started, directories);
+      return darwin.markedDarwinProcesses(uid, marker, group, started, directories, leader);
     } catch (error) {
       // KERN_PROCARGS2 can return EIO/EINVAL while a process is exec'ing. Require
       // a complete snapshot, but give these transient states time to settle.
       if (attempt >= 10) throw error;
       await Bun.sleep(10);
-      return markedProcesses(marker, group, started, directories, attempt + 1);
+      return markedProcesses(marker, group, started, directories, leader, attempt + 1);
     }
   };
   if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
@@ -141,15 +147,15 @@ async function markedProcesses(
     return pids;
   }
   // A shell may exec between snapshots; never signal it based on mismatched argv.
-  if (attempt < 3) return markedProcesses(marker, group, started, directories, attempt + 1);
+  if (attempt < 3) return markedProcesses(marker, group, started, directories, leader, attempt + 1);
   throw new Error("Process arguments changed during inspection");
 }
 
 /** Confirm identity and disappearance without relying on marker membership. */
 async function processBirth(pid: number): Promise<string | null> {
   if (inspectionPlatform === "darwin") {
-    const { darwinProcessBirth } = await import("./processes-darwin.ts");
-    return darwinProcessBirth(pid);
+    if (!darwin) throw new Error("Native process inspection is unavailable");
+    return darwin.darwinProcessBirth(pid);
   }
   if (inspectionPlatform === "linux") {
     try {
@@ -174,6 +180,7 @@ async function stopMarkedProcesses(
   graceMs: number,
   invokedAt: number,
   directories: readonly string[],
+  leader: DarwinInvocationLeader | null,
 ): Promise<void> {
   const group = child.pid;
   if (group === undefined) return;
@@ -181,7 +188,7 @@ async function stopMarkedProcesses(
   const claimed = new Map<number, { birth: string; termed: boolean }>();
   let empty = false;
   for (;;) {
-    const pids = await markedProcesses(marker, group, invokedAt, directories);
+    const pids = await markedProcesses(marker, group, invokedAt, directories, leader);
     for (const pid of pids) {
       if (claimed.has(pid)) continue;
       const birth = await processBirth(pid);
@@ -283,10 +290,11 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
     const marker = randomUUID();
+    const scratch = invocationScratch.getStore();
     // Capture canonical roots before spawning: cleanup may later remove scratch paths.
     const directories =
       inspectionPlatform === "darwin"
-        ? [opts.cwd, ...(scope?.scratchDirs ?? [])].map((directory) => realpathSync(directory))
+        ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
         : [];
     const child = spawn(bin, args, {
       cwd: opts.cwd,
@@ -299,6 +307,13 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    let leader: DarwinInvocationLeader | null = null;
+    let leaderInspectionError: unknown;
+    try {
+      if (darwin && child.pid !== undefined) leader = darwin.captureDarwinInvocationLeader(child.pid);
+    } catch (error) {
+      leaderInspectionError = error;
+    }
     let resolveStopped: (() => void) | undefined;
     scope?.children.set(
       child,
@@ -330,6 +345,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const terminate = () => {
       shutdown ??= (async () => {
         try {
+          if (leaderInspectionError) throw leaderInspectionError;
           if (child.pid !== undefined)
             await stopMarkedProcesses(
               marker,
@@ -337,6 +353,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
               started,
               directories,
+              leader,
             );
         } catch (error) {
           terminationError = new ProcessTerminationError(

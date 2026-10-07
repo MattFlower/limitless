@@ -81,12 +81,36 @@ export function darwinProcessBirth(pid: number): string | null {
   return `${view.getBigUint64(120, true)}:${view.getBigUint64(128, true)}`;
 }
 
+export interface DarwinInvocationLeader {
+  pid: number;
+  birth: string;
+  session: number;
+  group: number;
+}
+
+/** Capture membership at spawn, bracketed by the original leader's birth identity. */
+export function captureDarwinInvocationLeader(pid: number): DarwinInvocationLeader | null {
+  const birth = darwinProcessBirth(pid);
+  if (birth === null) return null;
+  const info = new Uint32Array(16);
+  if (symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength) !== info.byteLength) {
+    if (darwinProcessBirth(pid) === null) return null;
+    throw new Error(`Process leader inspection failed for ${pid}`);
+  }
+  const session = symbols.getsid(pid);
+  if (darwinProcessBirth(pid) !== birth) return null;
+  if (info[3] === 5 /* SZOMB */) return null;
+  if (session < 0) throw new Error(`Process session inspection failed for ${pid}`);
+  return { pid, birth, session, group: info[2] ?? 0 };
+}
+
 export function markedDarwinProcesses(
   uid: number,
   marker: string,
   group: number,
   started: number,
   directories: readonly string[],
+  leader: DarwinInvocationLeader | null = null,
 ): number[] {
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
@@ -101,6 +125,7 @@ export function markedDarwinProcesses(
   const token = Buffer.from(`\0LIMITLESS_INVOCATION=${marker}\0`);
   const inheritedToken = Buffer.from(`\0LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1\0`);
   const marked = new Set<number>();
+  const membership = new Set<number>();
   const parents = new Map<number, number>();
   const unmarked: number[] = [];
   const hidden = new Set<number>();
@@ -153,17 +178,24 @@ export function markedDarwinProcesses(
     const environment = Buffer.from(args.buffer, 0, length);
     // Our session/group proves membership even when a descendant replaces its
     // environment. Detached descendants also belong through a proven parent chain.
-    if (
-      environment.includes(token, offset - 1) ||
-      environment.includes(inheritedToken, offset - 1) ||
-      session === group ||
-      info[2] === group
-    )
+    if (environment.includes(token, offset - 1) || environment.includes(inheritedToken, offset - 1))
       marked.add(pid);
     else {
+      if (
+        leader?.pid === group &&
+        ((leader.session === group && session === group) || (leader.group === group && info[2] === group))
+      )
+        membership.add(pid);
       unmarked.push(pid);
       if (offset === length) hidden.add(pid);
     }
+  }
+  // Validate immediately before accepting numeric membership. An exited leader's
+  // observed session/group remains ours; a recycled leader does not. Without the
+  // spawn identity, numeric IDs alone cannot establish ownership.
+  if (leader && membership.size) {
+    const birth = darwinProcessBirth(leader.pid);
+    if (birth === leader.birth || birth === null) for (const pid of membership) marked.add(pid);
   }
   const isMember = (pid: number) =>
     hiddenDarwinProcessMember(

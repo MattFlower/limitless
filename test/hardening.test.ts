@@ -26,6 +26,7 @@ import { executeRun } from "../src/pipeline/engine.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import {
+  invocationScratch,
   ProcessTerminationError,
   processInspection,
   processScope,
@@ -47,6 +48,186 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
 
 describe("process handling", () => {
+  test("nested scratch restores the invocation root and unregisters cleaned paths", async () => {
+    const scope = {
+      signal: new AbortController().signal,
+      killGraceMs: 0,
+      children: new Map<ChildProcess, Promise<void>>(),
+      scratchDirs: new Set<string>(),
+    };
+    await processScope.run(scope, () =>
+      withScratch(dir, async (outer) => {
+        expect(invocationScratch.getStore()).toBe(outer);
+        await withScratch(dir, async (inner) => {
+          expect(invocationScratch.getStore()).toBe(inner);
+          expect(scope.scratchDirs.size).toBe(2);
+        });
+        expect(invocationScratch.getStore()).toBe(outer);
+        expect(scope.scratchDirs.size).toBe(1);
+      }),
+    );
+    expect(invocationScratch.getStore()).toBeUndefined();
+    expect(scope.scratchDirs.size).toBe(0);
+  });
+
+  test("native discovery rejects a recycled leader's session/group identity", async () => {
+    const fixturePath = join(import.meta.dir, "darwin-inspection-fixture.ts");
+    const sourcePath = join(import.meta.dir, "../src/util/processes-darwin.ts");
+    const entry = join(dir, "native.ts");
+    writeFileSync(
+      entry,
+      `export * from ${JSON.stringify(sourcePath)}; export * from ${JSON.stringify(fixturePath)};`,
+    );
+    const build = await Bun.build({
+      entrypoints: [entry],
+      outdir: join(dir, "build"),
+      target: "bun",
+      plugins: [
+        {
+          name: "synthetic-libproc",
+          setup(builder) {
+            // Bun keeps built-in modules external; redirect the native import before bundling.
+            builder.onLoad({ filter: /processes-darwin\.ts$/ }, async (args) => ({
+              contents: (await Bun.file(args.path).text()).replace(
+                'from "bun:ffi";',
+                `from ${JSON.stringify(fixturePath)};`,
+              ),
+              loader: "ts",
+            }));
+          },
+        },
+      ],
+    });
+    expect(build.success).toBe(true);
+    const output = build.outputs[0];
+    if (!output) throw new Error("No synthetic native inspection build output");
+    const native = (await import(output.path)) as typeof import("../src/util/processes-darwin.ts") &
+      typeof import("./darwin-inspection-fixture.ts");
+    const selected = (leader: ReturnType<typeof native.captureDarwinInvocationLeader>) =>
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "original-invocation",
+        native.leaderPid,
+        Date.now(),
+        [],
+        leader,
+      );
+    for (const membership of ["session", "group"] as const) {
+      native.setMembership(membership);
+      native.setLeaderBirth(1n);
+      const original = native.captureDarwinInvocationLeader(native.leaderPid);
+      expect(original?.birth).toBe("1:0");
+      expect(selected(original)).toContain(native.memberPid);
+      native.setLeaderBirth(null);
+      // Membership observed with the original live leader remains usable after exit.
+      expect(selected(original)).toEqual([native.memberPid]);
+      expect(selected(null)).toEqual([]);
+      native.setLeaderBirth(2n);
+      expect(selected(original)).toEqual([]);
+    }
+  });
+
+  test.skipIf(process.platform !== "darwin")(
+    "finishing one invocation never signals another invocation's hidden scratch orphan",
+    async () => {
+      const scope = {
+        signal: new AbortController().signal,
+        killGraceMs: 20,
+        children: new Map<ChildProcess, Promise<void>>(),
+        scratchDirs: new Set<string>(),
+      };
+      const start = join(dir, "start-writer");
+      const release = join(dir, "release-owner");
+      const pidFile = join(dir, "other-writer-pid");
+      const output = join(dir, "other-writer-output");
+      const launcher = join(dir, "other-launcher.js");
+      const kill = process.kill.bind(process);
+      const signals: number[] = [];
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (signal === "SIGTERM" || signal === "SIGKILL") signals.push(pid);
+        return kill(pid, signal);
+      });
+      let owner: Promise<unknown> | undefined;
+      let ownerScratch = "";
+      try {
+        await processScope.run(scope, async () => {
+          const ready = Promise.withResolvers<void>();
+          owner = withScratch(dir, (scratch) => {
+            ownerScratch = scratch;
+            writeFileSync(
+              launcher,
+              `require("node:child_process").spawn("/bin/sh",
+              ["-c", 'trap "" TERM; echo $$ > "$1"; while [ -d "$2" ]; do printf x >> "$3"; done', "sh",
+                ${JSON.stringify(pidFile)}, ${JSON.stringify(scratch)}, ${JSON.stringify(output)}],
+              {cwd:${JSON.stringify(scratch)}, env:{}, detached:true, stdio:"ignore"}).unref();`,
+            );
+            return runProcess({
+              cmd: [
+                process.execPath,
+                "-e",
+                `const fs = require("node:fs"); console.log("ready");
+                let launched = false;
+                setInterval(() => {
+                  if (!launched && fs.existsSync(${JSON.stringify(start)})) {
+                    launched = true;
+                    require("node:child_process").spawn(process.execPath, [${JSON.stringify(launcher)}], {stdio:"ignore"}).unref();
+                  }
+                  if (fs.existsSync(${JSON.stringify(release)})) process.exit(0);
+                }, 5);`,
+              ],
+              cwd: dir,
+              env: process.env as Record<string, string>,
+              timeoutMs: 5000,
+              onStdoutLine: () => ready.resolve(),
+            });
+          });
+          await ready.promise;
+          const finished = await withScratch(dir, () =>
+            runProcess({
+              cmd: [
+                process.execPath,
+                "-e",
+                `console.log("ready"); setInterval(() => {
+              if (require("node:fs").existsSync(${JSON.stringify(output)})) process.exit(0);
+            }, 5);`,
+              ],
+              cwd: dir,
+              env: process.env as Record<string, string>,
+              timeoutMs: 3000,
+              onStdoutLine: () => writeFileSync(start, ""),
+            }),
+          );
+          const writerPid = Number(readFileSync(pidFile, "utf8"));
+          expect(finished.exitCode).toBe(0);
+          expect(finished.timedOut).toBe(false);
+          expect(writerPid).toBeGreaterThan(0);
+          expect(signals).not.toContain(writerPid);
+          expect(kill(writerPid, 0)).toBe(true);
+          expect(scope.children.size).toBe(1);
+          expect(scope.scratchDirs.size).toBe(1);
+          expect(existsSync(ownerScratch)).toBe(true);
+          writeFileSync(release, "");
+          await owner;
+          expect(() => kill(writerPid, 0)).toThrow();
+          expect(scope.scratchDirs.size).toBe(0);
+          expect(existsSync(ownerScratch)).toBe(false);
+        });
+      } finally {
+        killSpy.mockRestore();
+        writeFileSync(release, "");
+        await owner?.catch(() => {});
+        if (existsSync(pidFile)) {
+          const pid = Number(readFileSync(pidFile, "utf8"));
+          if (pid > 0) {
+            try {
+              kill(pid, "SIGKILL");
+            } catch {}
+          }
+        }
+      }
+    },
+  );
+
   test("a child that exits before reading stdin does not crash us (EPIPE)", async () => {
     const res = await runProcess({
       cmd: ["/bin/sh", "-c", "exit 3"],

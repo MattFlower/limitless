@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { assertProcessesStopped, processScope } from "../util/proc.ts";
+import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -184,7 +184,7 @@ export async function withScratch<T>(cwd: string, run: (scratchDir: string) => P
   const scope = processScope.getStore();
   scope?.scratchDirs.add(scratchDir);
   try {
-    return await run(scratchDir);
+    return await invocationScratch.run(scratchDir, () => run(scratchDir));
   } finally {
     removeScratch(scratchDir);
     scope?.scratchDirs.delete(scratchDir);
