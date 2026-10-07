@@ -1131,9 +1131,11 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       const output = await new Response(child.stdout).text();
       if (timed) {
         expect(output).toContain("FAIL");
-        expect(pids()).toHaveLength(mode === "timeout" ? 4 : 2);
+        expect(pids()).toHaveLength(mode === "timeout" || mode === "escaped-timeout" ? 4 : 2);
         if (escaped) {
-          expect(output).toContain("attempt did not stop, not retried");
+          expect(() => process.kill(Number(readFileSync(join(dir, "escaped"), "utf8")), 0)).toThrow();
+          expect(output).toContain("retried after:");
+          expect(output).not.toContain("attempt did not stop, not retried");
           expect(output).toMatch(/next\s+PASS/);
         }
       }
@@ -1148,12 +1150,13 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       }
       if (mode === "completed") {
         expect(output).toMatch(/completed\s+PASS/);
-        const completed = readFileSync(join(dir, "completed"), "utf8").trim();
+        const completed = Number(readFileSync(join(dir, "completed"), "utf8").trim());
+        expect(() => process.kill(completed, 0)).toThrow();
         expect(
           readFileSync(join(dir, "signals"), "utf8")
             .split("\n")
-            .filter((line) => line.startsWith(`-${completed} `)),
-        ).toHaveLength(1);
+            .filter((line) => line.startsWith(`${completed} `) || line.startsWith(`-${completed} `)),
+        ).toHaveLength(0);
       }
     } finally {
       child.kill("SIGKILL");

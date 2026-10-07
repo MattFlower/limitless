@@ -40,7 +40,14 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import {
+  CommandError,
+  type ProcOptions,
+  type ProcResult,
+  processInspection,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
@@ -189,6 +196,73 @@ async function run(f: Factory) {
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
   return r.id;
 }
+
+test("unconfirmed holdout shutdown preserves its snapshot and surfaces the termination reason", async () => {
+  const pidFile = join(root, "holdout-writer-pid");
+  const script = join(root, "holdout-parent.js");
+  let snapshot = "";
+  let release = () => {};
+  const done = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const f = factory(undefined, async (s) => {
+    if (s.prompt.startsWith("Write holdout checks") && !snapshot) {
+      snapshot = s.cwd;
+      const output = join(snapshot, "writer-output");
+      writeFileSync(
+        script,
+        `const fs = require("node:fs");
+        require("node:child_process").spawn("/bin/sh",
+          ["-c", 'trap "" TERM; echo $$ > "$1"; while :; do printf x >> "$2"; done', "sh",
+            ${JSON.stringify(pidFile)}, ${JSON.stringify(output)}], {detached:true, stdio:"ignore"}).unref();
+        setInterval(() => { if(fs.existsSync(${JSON.stringify(output)})) process.exit(0); }, 5);`,
+      );
+      try {
+        await processInspection.run(
+          async () => {
+            throw new Error("holdout process inspection unavailable");
+          },
+          () =>
+            runProcess({
+              cmd: [process.execPath, script],
+              cwd: s.cwd,
+              env: process.env as Record<string, string>,
+            }),
+        );
+      } finally {
+        release();
+      }
+    }
+    if (s.mode === "edit") await done;
+    return answer(s);
+  });
+  try {
+    const id = await run(f);
+    await settled(f, id);
+    expect(f.store.getRun(id)?.status).toBe("needs_human");
+    expect(f.store.getRun(id)?.error).toContain("holdout process inspection unavailable");
+    expect(f.store.getRunState<RunState>(id)?.needsHumanReason).toContain(
+      "Invocation termination could not be confirmed",
+    );
+    expect(existsSync(snapshot)).toBe(true);
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    expect(pid).toBeGreaterThan(0);
+    expect(process.kill(pid, 0)).toBe(true);
+    expect(existsSync(f.store.getRunState<RunState>(id)?.worktreePath ?? "")).toBe(true);
+  } finally {
+    release();
+    await f.stop();
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+    if (snapshot) rmSync(join(snapshot, ".."), { recursive: true, force: true });
+  }
+});
 
 test.each(["disabled", "quota", "rejected"])(
   "an unavailable pinned implementer stops with its chain and reason: %s",
@@ -427,6 +501,150 @@ for (const [name, failure] of Object.entries(failures))
       history(f, id);
     });
   }
+
+for (const failures of [0, 1, 2, 3])
+  test(`stalled implementer's writer stops before cleanup (${failures} clean failures)`, async () => {
+    const invocationSecret = "PRIVATE_REPEATED_COMMAND_377";
+    const cleanupSecret = "PRIVATE_WORKTREE_PATH_377";
+    mkdirSync(join(root, "cfg"), { recursive: true });
+    writeFileSync(join(root, "cfg/private-strings.txt"), `${invocationSecret}\n${cleanupSecret}\n`);
+    writeFileSync(
+      join(source, ".limitless.toml"),
+      '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
+    );
+    await sh(["git", "commit", "-qam", "check completed implementation"], { cwd: source });
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const active = join(root, "failed-round");
+    const pidFile = join(root, "writer-pid");
+    const calls = join(root, "cleanup-calls");
+    const alive = join(root, "writer-alive-at-clean");
+    const realGit = Bun.which("git");
+    if (!realGit) throw new Error("git not found");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh
+if [ -f '${active}' ]; then
+  case "$*" in
+    (*" reset --hard -q HEAD") echo reset >> '${calls}';;
+    (*" clean -ffdxq")
+      if kill -0 "$(cat '${pidFile}')" 2>/dev/null; then touch '${alive}'; fi
+      echo clean >> '${calls}'
+      attempts=$(grep -c '^clean$' '${calls}')
+      if [ "$attempts" -le ${Math.min(failures, 2)} ]; then
+        ${failures === 3 ? "touch clean-residue" : ":"}
+        echo 'warning: could not lstat node_modules/writer/${cleanupSecret}' >&2; exit 1
+      fi;;
+    (*" clean -fdq")
+      echo discard >> '${calls}'
+      if [ ${failures} -eq 3 ]; then echo 'warning: could not lstat node_modules/writer/${cleanupSecret}' >&2; exit 1; fi;;
+  esac
+fi
+exec '${realGit}' "$@"
+`,
+      { mode: 0o755 },
+    );
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath}`;
+    const writerScript = join(root, "writer.js");
+    const parentScript = join(root, "parent.js");
+    writeFileSync(
+      writerScript,
+      `const fs = require("node:fs");
+      process.on("SIGTERM", () => {}); fs.mkdirSync("node_modules", {recursive:true});
+      setInterval(() => fs.appendFileSync("node_modules/.ci-check-final.log", "writing\\n"), 5);
+      setTimeout(() => process.exit(), 15000);`,
+    );
+    writeFileSync(
+      parentScript,
+      `const fs = require("node:fs");
+      const child = require("node:child_process").spawn(process.execPath,
+        [${JSON.stringify(writerScript)}], {detached:true, stdio:"ignore"});
+      child.unref(); fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+      process.on("SIGTERM", () => process.exit(0));
+      const timer = setInterval(() => {
+        if (fs.existsSync("node_modules/.ci-check-final.log")) {
+          clearInterval(timer); console.log("ready"); setInterval(() => {}, 1000);
+        }
+      }, 5);`,
+    );
+    let writerPid: number | undefined;
+    const attempts: { state: RunState | null; prompt: string }[] = [];
+    const f = factory(undefined, async (s) => {
+      if (s.mode !== "edit") return answer(s);
+      attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
+      if (attempts.length > 1) {
+        rmSync(active);
+        return answer(s);
+      }
+      writeFileSync(active, "");
+      writeFileSync(join(s.cwd, ".gitignore"), "node_modules/\n");
+      const stalled = new AbortController();
+      const result = await runProcess({
+        cmd: [process.execPath, parentScript],
+        cwd: s.cwd,
+        env: process.env as Record<string, string>,
+        signal: AbortSignal.any([s.signal, stalled.signal]),
+        onStdoutLine: () => {
+          writerPid = Number(readFileSync(pidFile, "utf8"));
+          stalled.abort();
+        },
+      });
+      expect(result.cancelled).toBe(true);
+      expect(writerPid).toBeGreaterThan(0);
+      expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      return {
+        status: "stuck",
+        error: `repeated shell call ${invocationSecret}`,
+        files: { "ui/change.txt": "partial\n" },
+      };
+    });
+    const id = await run(f);
+    try {
+      await settled(f, id);
+      expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
+      expect(attempts.map((a) => a.state?.round)).toEqual([0, 1]);
+      expect(existsSync(alive)).toBe(false);
+      expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+        "reset",
+        "clean",
+        ...(failures ? ["clean"] : []),
+        ...(failures === 3 ? ["reset", "discard"] : []),
+      ]);
+      expect(attempts[1]?.prompt).toContain("stuck: repeated shell call");
+      if (failures >= 2) {
+        expect(attempts[1]?.state?.feedback).toContain("Worktree cleanup failed after retry");
+        expect(attempts[1]?.prompt).toContain("could not lstat node_modules/writer");
+        const warning = f.store
+          .listEvents(id)
+          .find((e) => e.message?.startsWith("### Your previous session ended early"));
+        expect(warning?.level).toBe("warn");
+        for (const text of [attempts[1]?.state?.feedback, attempts[1]?.prompt, warning?.message]) {
+          expect(text).toContain("stuck: repeated shell call [redacted]");
+          expect(text).toContain("could not lstat node_modules/writer/[redacted]");
+          expect(text).not.toContain(invocationSecret);
+          expect(text).not.toContain(cleanupSecret);
+        }
+        expect(f.store.listStages(id).find((s) => s.name === "gates")).toMatchObject({
+          status: "failed",
+          round: 0,
+          summary: expect.stringContaining("could not lstat"),
+        });
+      }
+      const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
+      expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
+      expect(existsSync(join(cwd, "node_modules/.ci-check-final.log"))).toBe(false);
+      history(f, id);
+    } finally {
+      await f.stop();
+      process.env.PATH = oldPath;
+      if (writerPid !== undefined) {
+        try {
+          process.kill(writerPid, "SIGKILL");
+        } catch {}
+      }
+    }
+  });
 
 for (const status of ["timeout", "stuck", "error"] as const)
   test(`implement ${status} preserves partial work and uses task feedback in the next round`, async () => {
