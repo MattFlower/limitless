@@ -293,6 +293,7 @@ test.each([
   "checks:external-diff",
   "checks:signing",
   "checks:pager",
+  "checks:private-repository",
   "status:malformed-include",
   "read-tree-failed",
   "status-failed",
@@ -448,10 +449,20 @@ test.each([
       globalConfig,
       `${readFileSync(globalConfig, "utf8")}\n[protocol]\nallow = always\n[includeIf "hasconfig:remote.*.url:https://github.com/**"]\npath = ${globalInclude}\n`,
     );
+    if (scenario === "checks:private-repository") {
+      const ssh = join(root, "trusted-ssh");
+      writeFileSync(
+        ssh,
+        `#!/bin/sh\nunset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE\nexec '${gitBin}' receive-pack '${remote}'\n`,
+        { mode: 0o755 },
+      );
+      await git("config", "--file", globalConfig, "core.sshCommand", ssh);
+      await git("config", "--file", globalConfig, "ssh.variant", "ssh");
+    }
     writeFileSync(
       join(bin, "bun"),
       `#!${process.execPath}
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 let args = process.argv.slice(2);
 const bunFlags = [];
@@ -464,6 +475,11 @@ if (args[1] === "gate-slot") {
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths }) + "\\n");
 if (args[0] === "install" || args[0] === "run") {
+  if (${JSON.stringify(scenario)} === "checks:private-repository") {
+    const repos = readdirSync(process.env.TMPDIR).filter(name => name.startsWith("land-pr-push."));
+    appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "check-visible-repos", args: repos }) + "\\n");
+    for (const name of repos) writeFileSync(process.env.TMPDIR + "/" + name + "/config", ${JSON.stringify(`[core]\nsshCommand = ${JSON.stringify(`${command}; exit 1`)}\n`)});
+  }
   const trustedEnv = { ...process.env, GIT_WORK_TREE: ${JSON.stringify(paths[0])}, GIT_DIR: ${JSON.stringify(paths[1])}, GIT_COMMON_DIR: ${JSON.stringify(paths[2])} };
   const snapshot = () => ["rev-parse HEAD", "diff --cached --raw"].map(command => {
     const result = spawnSync(${JSON.stringify(gitBin)}, command.split(" "), { env: trustedEnv, encoding: "utf8" });
@@ -544,6 +560,7 @@ if (args.includes("push")) {
   if (!${JSON.stringify(["file-path", "file-url", "ext-url"].includes(scenario))}) {
     // Only delivery is redirected to a real local bare remote. Policy remains intact for denied URLs.
     deliveryArgs = ["-c", "protocol.file.allow=always", ...args.map(arg => arg === ${JSON.stringify(expectedUrl)} || arg === "origin" ? ${JSON.stringify(remote)} : arg)];
+    if (${JSON.stringify(scenario)} === "checks:private-repository") deliveryArgs = args.map(arg => arg === ${JSON.stringify(expectedUrl)} ? "ssh://example.com/remote" : arg);
     // Permitted test delivery must not trigger the target hook used by the denied-transport cases.
     rmSync(${JSON.stringify(targetHook)});
   }
@@ -556,7 +573,10 @@ if (args.includes("push")) {
 const configFile = ${JSON.stringify(join(paths[2] ?? "", "config"))};
 const malformed = ${JSON.stringify(scenario)} === "status:malformed-include" && args.includes("status");
 if (malformed) appendFileSync(configFile, ${JSON.stringify(`\n[include]\npath = ${JSON.stringify(injected)}\n`)});
-const result = spawnSync(${JSON.stringify(gitBin)}, deliveryArgs, { stdio: "inherit" });
+const env = { ...process.env };
+if (${JSON.stringify(scenario)} === "checks:private-repository" && args.includes("push"))
+  for (const key of ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT"]) delete env[key];
+const result = spawnSync(${JSON.stringify(gitBin)}, deliveryArgs, { env, stdio: "inherit" });
 process.exit(result.status ?? 1);
 `,
       { mode: 0o755 },
@@ -637,6 +657,11 @@ else if (args[1] === "view") {
       expect(existsSync(call.args[0] ?? "")).toBe(false);
     }
     expect(existsSync(marker)).toBe(false);
+    if (scenario === "checks:private-repository")
+      expect(logged.filter((call) => call.tool === "check-visible-repos").map((call) => call.args)).toEqual([
+        [],
+        [],
+      ]);
     const failure =
       scenario.startsWith("config-failed-") ||
       scenario.startsWith("state:") ||

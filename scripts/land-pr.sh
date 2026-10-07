@@ -58,16 +58,15 @@ if [[ -z "$url" || "$url" = *$'\n'* ]]; then
   echo "Origin URL is missing or multi-valued; refusing to push" >&2
   exit 1
 fi
-push_repo="$(mktemp -d "${TMPDIR:-/tmp}/land-pr-push.XXXXXXXX")"
-chmod 0700 "$push_repo"
-# Snapshot local ignore data before PR code runs; never reopen clone config afterward.
+# Keep the snapshot in shell memory so PR code cannot replace it during checks.
 if [ -e "$common/info/exclude" ] || [ -L "$common/info/exclude" ]; then
-  if ! cat "$common/info/exclude" > "$push_repo/exclude" 2>/dev/null; then
+  if ! exclude="$(cat "$common/info/exclude" 2>/dev/null && printf '.')"; then
     echo "Cannot snapshot repository exclusions; refusing to land" >&2
     exit 1
   fi
+  exclude="${exclude%.}"
 else
-  : > "$push_repo/exclude"
+  exclude=""
 fi
 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
@@ -82,6 +81,8 @@ for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
     exit 1
   fi
 done
+push_repo="$(mktemp -d "${TMPDIR:-/tmp}/land-pr-push.XXXXXXXX")"
+chmod 0700 "$push_repo"
 clone="$GIT_WORK_TREE"
 unset GIT_WORK_TREE GIT_CONFIG
 export GIT_DIR="$push_repo" GIT_COMMON_DIR="$push_repo" GIT_INDEX_FILE="$push_repo/index"
@@ -91,7 +92,7 @@ if ! git -C "$push_repo" init --bare -q 2>/dev/null; then
 fi
 export GIT_WORK_TREE="$clone"
 printf '%s\n' "$common/objects" > "$push_repo/objects/info/alternates"
-mv "$push_repo/exclude" "$push_repo/info/exclude"
+printf '%s' "$exclude" > "$push_repo/info/exclude"
 # Local LFS payloads remain source data, not Git configuration.
 ln -s "$common/lfs" "$push_repo/lfs"
 # Keep global hasconfig:remote.*.url includes working without copying clone config.
