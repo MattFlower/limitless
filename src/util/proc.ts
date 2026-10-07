@@ -1,12 +1,238 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import type { DarwinInvocationLeader } from "./processes-darwin.ts";
+
+/** Only the innermost invocation's scratch is an ownership root. */
+export const invocationScratch = new AsyncLocalStorage<string>();
 
 export const processScope = new AsyncLocalStorage<{
   signal: AbortSignal;
   killGraceMs: number;
   children: Map<ChildProcess, Promise<void>>;
   scratchDirs: Set<string>;
+  terminationError?: ProcessTerminationError;
 }>();
+
+export class ProcessTerminationError extends Error {
+  static readonly prefix = "Invocation termination could not be confirmed";
+}
+
+/** A failed shutdown blocks subsequent commands, including worktree cleanup. */
+export function assertProcessesStopped(): void {
+  const error = processScope.getStore()?.terminationError;
+  if (error) throw error;
+}
+
+/** Scoped inspection backend for deterministic shutdown tests. */
+export const processInspection = new AsyncLocalStorage<
+  (withEnvironment: boolean, marker: string, pids?: number[]) => Promise<string>
+>();
+const inspectionPlatform = process.platform;
+const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwin.ts") : undefined;
+
+async function markedProcesses(
+  marker: string,
+  group: number,
+  started: number,
+  directories: readonly string[],
+  leader: DarwinInvocationLeader | null,
+  attempt = 0,
+): Promise<number[]> {
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("Process ownership cannot be determined");
+  // macOS ps is setuid and cannot launch inside a worker sandbox. Read the same kernel
+  // process/environment data directly, without needing elevated privileges.
+  const nativeProcesses = async () => {
+    if (!darwin) throw new Error("Native process inspection is unavailable");
+    try {
+      return darwin.markedDarwinProcesses(uid, marker, group, started, directories, leader);
+    } catch (error) {
+      // Unreadable argv uses hidden membership rules. Retry only inspection failures
+      // that still prevent proving ownership or confirming a claimed process's identity.
+      if (attempt >= 10) throw error;
+      await Bun.sleep(10);
+      return markedProcesses(marker, group, started, directories, leader, attempt + 1);
+    }
+  };
+  if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
+  const tokens = [`LIMITLESS_INVOCATION=${marker}`, `LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1`];
+  const carriesMarker = (entries: string[]) => tokens.some((token) => entries.includes(token));
+  if (inspectionPlatform === "linux" && !processInspection.getStore())
+    return linuxMarkedProcesses(uid, carriesMarker);
+  const env = { ...process.env };
+  delete env.LIMITLESS_INVOCATION;
+  env.LIMITLESS_PROCESS_SCAN = marker;
+  let inspectionPid: number | undefined;
+  const inspect = (withEnvironment: boolean, pids?: number[]) => {
+    const injected = processInspection.getStore();
+    if (injected) return injected(withEnvironment, marker, pids);
+    return new Promise<string>((resolve, reject) => {
+      const scanner = execFile(
+        "/bin/ps",
+        [
+          ...(withEnvironment ? [inspectionPlatform === "darwin" ? "-E" : "eww"] : []),
+          "-ww",
+          ...(pids ? ["-p", pids.join(",")] : ["-U", String(uid)]),
+          "-o",
+          "pid=,uid=,stat=,command=",
+        ],
+        { env, timeout: 2000, maxBuffer: 32 * 1024 * 1024 },
+        (error, stdout) =>
+          error && !(pids && error.code === 1 && !stdout.trim())
+            ? reject(new Error("Process environment inspection failed", { cause: error }))
+            : resolve(stdout),
+      );
+      inspectionPid = scanner.pid;
+    });
+  };
+  const rows = (output: string) =>
+    output
+      .trim()
+      .split("\n")
+      .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/));
+  const output = await inspect(true);
+  const environments = rows(output);
+  if (
+    !environments.some(
+      (row) =>
+        row &&
+        // macOS ps is setuid; its effective uid need not be ours. Verify the scanner
+        // we launched, while the candidate filtering below always requires our uid.
+        (inspectionPid === undefined ? Number(row[2]) === uid : Number(row[1]) === inspectionPid) &&
+        row[4]?.split(/\s+/).includes(`LIMITLESS_PROCESS_SCAN=${marker}`),
+    )
+  )
+    throw new Error("Process environment inspection could not be confirmed");
+  const candidates = environments.filter(
+    (row) =>
+      row && Number(row[2]) === uid && !row[3]?.startsWith("Z") && carriesMarker((row[4] ?? "").split(/\s+/)),
+  );
+  if (!candidates.length) return [];
+  const commands = rows(
+    await inspect(
+      false,
+      candidates.map((row) => Number(row?.[1])),
+    ),
+  );
+  let changed = false;
+  const pids = candidates.flatMap((row) => {
+    const command = commands.find((cmd) => cmd?.[1] === row?.[1] && Number(cmd?.[2]) === uid);
+    if (!command || command[3]?.startsWith("Z")) return [];
+    const args = command[4] ?? "";
+    const full = row?.[4] ?? "";
+    // ps appends the environment to argv. A marker appearing only in argv is unmarked.
+    if (!args || !full.startsWith(args)) {
+      changed = true;
+      return [];
+    }
+    return carriesMarker(full.slice(args.length).split(/\s+/)) ? [Number(row?.[1])] : [];
+  });
+  if (!changed) return pids;
+  // A shell may exec between snapshots; never signal it based on mismatched argv.
+  if (attempt < 3) return markedProcesses(marker, group, started, directories, leader, attempt + 1);
+  throw new Error("Process arguments changed during inspection");
+}
+
+/**
+ * Linux reads /proc directly: spawning ps twice for every command made each invocation's
+ * shutdown cost tens of milliseconds. Entries are NUL-delimited, so a marker-looking value
+ * cannot select an unmarked process. An environment we may not read (a non-dumpable process)
+ * is skipped, as ps showed none for it.
+ */
+function linuxMarkedProcesses(uid: number, carriesMarker: (entries: string[]) => boolean): number[] {
+  const marked: number[] = [];
+  // procfs is in memory: synchronous reads take microseconds, while hundreds of awaited ones
+  // per scan (twice per command) dominated short commands.
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      if (statSync(`/proc/${name}`).uid !== uid) continue;
+      const status = readFileSync(`/proc/${name}/stat`, "utf8");
+      if (status.slice(status.lastIndexOf(")") + 2).startsWith("Z")) continue;
+      const environment = readFileSync(`/proc/${name}/environ`, "utf8");
+      if (carriesMarker(environment.split("\0"))) marked.push(Number(name));
+    } catch (error) {
+      if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? ""))
+        throw error;
+    }
+  }
+  return marked;
+}
+
+/** Confirm identity and disappearance without relying on marker membership. */
+async function processBirth(pid: number): Promise<string | null> {
+  if (inspectionPlatform === "darwin") {
+    if (!darwin) throw new Error("Native process inspection is unavailable");
+    return darwin.darwinProcessBirth(pid);
+  }
+  if (inspectionPlatform === "linux") {
+    try {
+      const row = await readFile(`/proc/${pid}/stat`, "utf8");
+      const fields = row
+        .slice(row.lastIndexOf(")") + 2)
+        .trim()
+        .split(/\s+/);
+      if (!fields[19]) throw new Error(`Invalid process birth time for ${pid}`);
+      return fields[19];
+    } catch (error) {
+      if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+      throw error;
+    }
+  }
+  throw new Error("Process birth time inspection is unsupported on this platform");
+}
+
+async function stopMarkedProcesses(
+  marker: string,
+  child: ChildProcess,
+  graceMs: number,
+  invokedAt: number,
+  directories: readonly string[],
+  leader: DarwinInvocationLeader | null,
+): Promise<void> {
+  const group = child.pid;
+  if (group === undefined) return;
+  const started = performance.now();
+  const claimed = new Map<number, { birth: string; termed: boolean }>();
+  let empty = false;
+  for (;;) {
+    const pids = await markedProcesses(marker, group, invokedAt, directories, leader);
+    for (const pid of pids) {
+      if (claimed.has(pid)) continue;
+      const birth = await processBirth(pid);
+      if (birth !== null) claimed.set(pid, { birth, termed: false });
+    }
+    // An already-claimed descendant stays ours after reparenting or an environment
+    // change. A reused PID is no longer that process and must never be signalled.
+    for (const [pid, identity] of claimed)
+      if ((await processBirth(pid)) !== identity.birth) claimed.delete(pid);
+    // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
+    const exited = child.exitCode !== null || child.signalCode !== null;
+    if (!claimed.size && empty && exited) return;
+    empty = !claimed.size && exited;
+    if (performance.now() - started >= graceMs + 10_000)
+      throw new Error(
+        `Marked processes still alive: ${[...new Set([...claimed.keys(), ...(!exited ? [group] : [])])].join(", ")}`,
+      );
+    for (const [pid, identity] of claimed) {
+      const signal = identity.termed && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
+      if (signal === "SIGTERM" && identity.termed) continue;
+      try {
+        process.kill(pid, signal);
+        identity.termed = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+    // Yield even for empty snapshots: spawn/exit notifications and a racing fork
+    // must have an opportunity to arrive before we confirm shutdown.
+    if (claimed.size || !exited) await Bun.sleep(10);
+    else await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
 
 export interface ProcOptions {
   cmd: string[];
@@ -62,32 +288,49 @@ function lineSplitter(onLine?: (line: string) => void) {
 }
 
 /**
- * Run a child process in its own process group so cancellation kills the whole tree
- * (agent CLIs spawn shells, MCP servers and test runners).
+ * Mark a child and its descendants so shutdown also finds detached, reparented processes.
  */
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
+  assertProcessesStopped();
   const scope = processScope.getStore();
   if (scope)
     opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
   if (scope) opts.signal?.throwIfAborted();
   const started = Date.now();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
+    const marker = randomUUID();
+    const scratch = invocationScratch.getStore();
+    // Capture canonical roots before spawning: cleanup may later remove scratch paths.
+    const directories =
+      inspectionPlatform === "darwin"
+        ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
+        : [];
     const child = spawn(bin, args, {
       cwd: opts.cwd,
-      env: opts.env,
+      // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
+      env: {
+        ...opts.env,
+        LIMITLESS_INVOCATION: marker,
+        [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
+      },
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    let leader: DarwinInvocationLeader | null = null;
+    let leaderInspectionError: unknown;
+    try {
+      if (darwin && child.pid !== undefined) leader = darwin.captureDarwinInvocationLeader(child.pid);
+    } catch (error) {
+      leaderInspectionError = error;
+    }
+    let resolveStopped: (() => void) | undefined;
     scope?.children.set(
       child,
-      new Promise<void>((resolve) =>
-        child.once("close", () => {
-          scope.children.delete(child);
-          resolve();
-        }),
-      ),
+      new Promise<void>((resolve) => {
+        resolveStopped = resolve;
+      }),
     );
 
     const limit = opts.tailLimit ?? DEFAULT_TAIL;
@@ -108,38 +351,45 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const out = lineSplitter(opts.onStdoutLine);
     const err = lineSplitter(opts.onStderrLine);
 
-    const killTree = (sig: NodeJS.Signals) => {
-      if (child.pid === undefined) return;
-      try {
-        process.kill(-child.pid, sig);
-      } catch {
+    let shutdown: Promise<void> | undefined;
+    let terminationError: ProcessTerminationError | undefined;
+    const terminate = () => {
+      shutdown ??= (async () => {
         try {
-          child.kill(sig);
-        } catch {
-          // already gone
+          if (leaderInspectionError) throw leaderInspectionError;
+          if (child.pid !== undefined)
+            await stopMarkedProcesses(
+              marker,
+              child,
+              timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
+              started,
+              directories,
+              leader,
+            );
+        } catch (error) {
+          terminationError = new ProcessTerminationError(
+            `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
+            { cause: error },
+          );
+          if (scope) scope.terminationError = terminationError;
+          // The directly spawned child is ours even if process discovery is unavailable.
+          child.kill("SIGKILL");
+          settled = true;
+          finishTimers();
+          reject(terminationError);
+        } finally {
+          child.stdin.destroy();
+          // Confirmed shutdown closes inherited pipes naturally. Let their buffered output
+          // drain before close; only a failed shutdown must bypass still-open descendants.
+          if (terminationError) {
+            child.stdout.destroy();
+            child.stderr.destroy();
+          }
         }
-      }
+      })();
+      return shutdown;
     };
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const terminate = (graceMs = 5_000) => {
-      if (killTimer) return;
-      killTree("SIGTERM");
-      killTimer = setTimeout(() => killTree("SIGKILL"), graceMs);
-      killTimer.unref?.();
-    };
-
-    const onAbort = () => {
-      cancelled = true;
-      if (scope) {
-        clearTimeout(killTimer);
-        killTimer = undefined;
-      }
-      terminate(scope?.killGraceMs);
-    };
-    if (opts.signal) {
-      if (opts.signal.aborted) onAbort();
-      else opts.signal.addEventListener("abort", onAbort, { once: true });
-    }
+    child.once("exit", terminate);
 
     const timers: ReturnType<typeof setTimeout>[] = [];
     if (opts.timeoutMs) {
@@ -164,6 +414,22 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       );
     }
 
+    const finishTimers = () => {
+      for (const t of timers) clearTimeout(t);
+      if (idleTimer) clearInterval(idleTimer);
+      opts.signal?.removeEventListener("abort", onAbort);
+    };
+
+    const onAbort = () => {
+      cancelled = true;
+      void terminate();
+    };
+    // After finishTimers exists: a pre-aborted signal can fail termination synchronously.
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -181,17 +447,19 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       stderr = appendTail(stderr, `\n[spawn error] ${e.message}`);
     });
 
-    child.on("close", (code, sig) => {
+    child.on("close", async (code, sig) => {
       if (settled) return;
       settled = true;
-      clearTimeout(killTimer);
       out.flush();
       err.flush();
-      for (const t of timers) clearTimeout(t);
-      if (idleTimer) clearInterval(idleTimer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      // No descendants may keep writing after callers begin scratch/worktree cleanup.
-      killTree("SIGKILL");
+      finishTimers();
+      await terminate();
+      if (terminationError) {
+        reject(terminationError);
+        return;
+      }
+      scope?.children.delete(child);
+      resolveStopped?.();
       resolve({
         exitCode: code,
         signal: sig,
@@ -307,7 +575,11 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined || isCredential([k, v])) continue;
-    if (/^(OPENROUTER_|DISCORD_|GITHUB_WEBHOOK_|LIMITLESS_)/.test(k)) continue;
+    if (
+      /^(OPENROUTER_|DISCORD_|GITHUB_WEBHOOK_|LIMITLESS_)/.test(k) &&
+      !(/^LIMITLESS_INVOCATION_[0-9a-f_]{36}$/.test(k) && v === "1")
+    )
+      continue;
     // Don't let a parent Claude Code session's markers change the child's behavior.
     if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PLUGIN_DATA") continue;
     if (k.startsWith("ANTHROPIC_")) continue;
