@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -744,7 +745,7 @@ describe("process handling", () => {
         ),
       ).toBe(false);
       const sibling = `${dir}-sibling`;
-      mkdirSync(sibling);
+      mkdirSync(join(sibling, "inner"), { recursive: true });
       try {
         expect(
           decide(
@@ -752,7 +753,30 @@ describe("process handling", () => {
             () => ({ path: sibling }),
           ),
         ).toBe(false);
+        // Any new orphan is a candidate. Unrelated ones may sit where realpath fails (a
+        // sandbox container, a deleted directory); that must not block our shutdown.
+        chmodSync(sibling, 0o000);
+        expect(
+          decide(
+            () => 101,
+            () => ({ path: join(sibling, "inner") }),
+          ),
+        ).toBe(false);
+        expect(
+          decide(
+            () => 101,
+            () => ({ path: join(`${dir}-deleted`, "inner") }),
+          ),
+        ).toBe(false);
+        // Our own orphan whose cwd was deleted is still recognised by its reported path.
+        expect(
+          decide(
+            () => 101,
+            () => ({ path: join(roots[0] ?? dir, "deleted") }),
+          ),
+        ).toBe(true);
       } finally {
+        chmodSync(sibling, 0o700);
         rmSync(sibling, { recursive: true, force: true });
       }
       expect(

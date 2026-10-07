@@ -62,7 +62,13 @@ export function hiddenDarwinProcessMember(
     if (cwd.errno === 3 /* ESRCH */) return false;
     throw new Error(`Process cwd inspection failed for ${pid} (errno ${cwd.errno})`);
   }
-  const path = realpathSync(cwd.path);
+  // The kernel reports a symlink-free path; canonicalizing only resolves aliases. Any orphan
+  // can be a candidate, and unrelated ones often sit where we cannot look (a sandbox container,
+  // a deleted directory), so failing to canonicalize compares the reported path instead.
+  let path = cwd.path;
+  try {
+    path = realpathSync(cwd.path);
+  } catch {}
   return directories.some(
     (directory) =>
       path === directory || path.startsWith(directory.endsWith(sep) ? directory : `${directory}${sep}`),
