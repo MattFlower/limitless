@@ -292,6 +292,8 @@ test.each([
         // Git preserves subsection case; the allowlist must accept it as well.
         await git("-C", work, "config", "branch.PR.remote", "origin");
         await git("-C", work, "config", "branch.PR.merge", "refs/heads/main");
+        // A global branch.autoSetupRebase adds this at clone time on real machines.
+        await git("-C", work, "config", "branch.PR.rebase", "true");
         await git("-C", work, "remote", "set-url", "origin", "git@github.com:MattFlower/limitless.git");
       } else await git("worktree", "add", "-qb", "pr", work);
       await git("remote", "add", "origin", origin);

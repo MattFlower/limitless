@@ -50,7 +50,8 @@ validate_repository_config() {
       case "$key" in
         core.repositoryformatversion|core.filemode|core.bare|core.logallrefupdates|core.ignorecase|core.precomposeunicode|core.symlinks|core.untrackedcache|extensions.worktreeconfig|extensions.objectformat|remote.origin.url|remote.origin.fetch) continue ;;
       esac
-      [[ "$key" =~ ^branch\..+\.(remote|merge)$ ]] && continue
+      # branch.<name>.rebase comes from a global branch.autoSetupRebase at clone time.
+      [[ "$key" =~ ^branch\..+\.(remote|merge|rebase)$ ]] && continue
       printf 'Repository git config key %s is not allowed; refusing to land\n' "$key" >&2
       bad=1
     done
