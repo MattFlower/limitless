@@ -336,13 +336,14 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     // StructuredOutput is how Claude Code returns the final --json-schema answer, not agent work;
     // counting it would trip a zero tool budget exactly when a no-tools call succeeds.
     if (ev.type === "tool_call" && ev.name !== STRUCTURED_OUTPUT_TOOL && !stuckReason) {
-      const reason = loop.observe(ev.name, ev.input);
+      const reason = loop.observe(ev.name, ev.input, ev.id);
       if (reason) {
         stuckReason = reason;
         spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
         stuckController.abort();
       }
     }
+    if (ev.type === "tool_result") loop.observeResult(ev.id, ev.output);
     spec.onEvent(ev);
   });
 

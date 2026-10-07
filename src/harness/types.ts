@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ZodType } from "zod";
 import type { Billing, ConfinementProbe, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
@@ -149,7 +150,9 @@ export function priceOf(usage: Usage, price: ModelTarget["price"]): number {
  * Returns a reason string when the run should be stopped.
  */
 export class LoopDetector {
-  private recent: string[] = [];
+  private recent: { key: string | null; call: number }[] = [];
+  private pending = new Map<string, { key: string; call: number }>();
+  private results = new Map<string, string>();
   private total = 0;
   constructor(
     private readonly maxToolCalls: number,
@@ -157,15 +160,31 @@ export class LoopDetector {
     private readonly window = 12,
   ) {}
 
-  observe(name: string, input: unknown): string | null {
+  observe(name: string, input: unknown, id?: string): string | null {
     this.total++;
     if (this.total > this.maxToolCalls) return `exceeded tool-call budget (${this.maxToolCalls})`;
     const key = `${name}:${JSON.stringify(input)}`;
-    this.recent.push(key);
+    if (id !== undefined) this.pending.set(id, { key, call: this.total });
+    this.recent.push({ key, call: this.total });
     if (this.recent.length > this.window) this.recent.shift();
-    const same = this.recent.filter((k) => k === key).length;
+    const same = this.recent.filter((entry) => entry.key === key).length;
     if (same >= this.maxIdenticalInWindow) return `repeated the same ${name} call ${same} times`;
     return null;
+  }
+
+  observeResult(id: string, output: string): void {
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    const { key, call } = pending;
+    const previous = this.results.get(key);
+    const hash = createHash("sha256").update(output).digest("hex");
+    if (previous !== undefined && previous !== hash) {
+      for (const entry of this.recent) {
+        if (entry.key === key && entry.call <= call) entry.key = null;
+      }
+    }
+    this.results.set(key, hash);
   }
 }
 

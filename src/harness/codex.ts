@@ -799,13 +799,14 @@ export async function runCodex(
   const signal = AbortSignal.any([spec.signal, stuckController.signal]);
   const parser = new CodexStreamParser((ev) => {
     if (ev.type === "tool_call" && !stuckReason) {
-      const reason = loop.observe(ev.name, ev.input);
+      const reason = loop.observe(ev.name, ev.input, ev.id);
       if (reason) {
         stuckReason = reason;
         spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
         stuckController.abort();
       }
     }
+    if (ev.type === "tool_result") loop.observeResult(ev.id, ev.output);
     spec.onEvent(ev);
   });
 
