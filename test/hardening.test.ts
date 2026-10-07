@@ -345,11 +345,23 @@ describe("process handling", () => {
         if (marked) {
           const known = new Set([pid]);
           expect(() =>
-            markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, known),
+            markedDarwinProcesses(
+              process.getuid?.() ?? 0,
+              "hidden-writer",
+              launcher.pid ?? 0,
+              known,
+              Date.now(),
+            ),
           ).toThrow(`Cannot inspect environment of marked process ${pid}`);
         } else
           expect(
-            markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0),
+            markedDarwinProcesses(
+              process.getuid?.() ?? 0,
+              "hidden-writer",
+              launcher.pid ?? 0,
+              new Set(),
+              Date.now(),
+            ),
           ).not.toContain(pid);
         const result = await runProcess({
           cmd: [process.execPath, "-e", "process.exit(0)"],
@@ -364,6 +376,224 @@ describe("process handling", () => {
           try {
             process.kill(-pid, "SIGKILL");
           } catch {}
+        }
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin").each([false, true])(
+    "an unrelated session owns its new hidden shell after the leader exits (new group: %s)",
+    async (newGroup) => {
+      const pidFile = join(dir, "control-shell-pid");
+      const ready = join(dir, "control-shell-ready");
+      const launcher = join(dir, "control-shell-launcher.js");
+      const member = join(dir, "control-member.js");
+      const memberPidFile = join(dir, "control-member-pid");
+      const trigger = join(dir, "control-go");
+      writeFileSync(
+        launcher,
+        `${newGroup ? 'const {dlopen, FFIType} = require("bun:ffi"); if (dlopen("/usr/lib/libSystem.B.dylib", {setpgid:{args:[FFIType.i32, FFIType.i32], returns:FFIType.i32}}).symbols.setpgid(0,0) !== 0) throw Error("setpgid failed");' : ""}
+        require("node:child_process").spawn("/bin/sh",
+      ["-c", 'printf "%s" "$$" > "$1"; while [ -d "$2" ]; do :; done', "sh",
+        ${JSON.stringify(pidFile)}, ${JSON.stringify(dir)}], {stdio:"ignore"}).unref();`,
+      );
+      writeFileSync(
+        member,
+        `const fs = require("node:fs");
+        fs.writeFileSync(${JSON.stringify(memberPidFile)}, String(process.pid));
+        const timer = setInterval(() => {
+          if (!fs.existsSync(${JSON.stringify(dir)})) process.exit(0);
+          if (!fs.existsSync(${JSON.stringify(trigger)})) return;
+          clearInterval(timer);
+          require("node:child_process").spawn(process.execPath, [${JSON.stringify(launcher)}],
+            {stdio:"ignore"}).on("exit", () => {
+              setInterval(() => {
+                if (fs.existsSync(${JSON.stringify(pidFile)})) fs.writeFileSync(${JSON.stringify(ready)}, "");
+              }, 5);
+            });
+        }, 5);
+        setTimeout(() => process.exit(), 15000);`,
+      );
+      const leader = spawn(
+        process.execPath,
+        [
+          "-e",
+          `require("node:child_process").spawn(process.execPath, [${JSON.stringify(member)}], {stdio:"ignore"}).unref();`,
+        ],
+        { detached: true, stdio: "ignore" },
+      );
+      try {
+        await new Promise<void>((resolve) => leader.once("close", () => resolve()));
+        const deadline = Date.now() + 3000;
+        while (
+          (!existsSync(memberPidFile) || !readFileSync(memberPidFile, "utf8").trim()) &&
+          Date.now() < deadline
+        )
+          await Bun.sleep(10);
+        const memberPid = Number(readFileSync(memberPidFile, "utf8"));
+        expect(memberPid).toBeGreaterThan(0);
+        expect(() => process.kill(leader.pid ?? 0, 0)).toThrow();
+        const result = await runProcess({
+          cmd: [
+            process.execPath,
+            "-e",
+            `console.log("start"); setInterval(() => {
+            if (require("node:fs").existsSync(${JSON.stringify(ready)})) process.exit(0);
+          }, 5);`,
+          ],
+          cwd: dir,
+          env: process.env as Record<string, string>,
+          onStdoutLine: () => {
+            // The hidden orphan starts AFTER the invocation. Only an unrelated
+            // group member survives to prove that the shell belongs to another tree.
+            writeFileSync(trigger, "");
+          },
+          timeoutMs: 3000,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.timedOut).toBe(false);
+        expect(process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toBe(true);
+        expect(process.kill(memberPid, 0)).toBe(true);
+      } finally {
+        for (const file of [pidFile, memberPidFile]) {
+          if (existsSync(file)) {
+            const pid = Number(readFileSync(file, "utf8"));
+            if (pid > 0) {
+              try {
+                process.kill(pid, "SIGKILL");
+              } catch {}
+            }
+          }
+        }
+        leader.kill("SIGKILL");
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin").each(["normal", "error", "cancelled", "timeout", "stuck"])(
+    "a detached reparented shell with a hidden environment blocks cleanup on %s",
+    async (ending) => {
+      const pidFile = join(dir, "shell-pid");
+      const output = join(dir, "shell-output");
+      const launcher = join(dir, "shell-launcher.js");
+      const parent = join(dir, "shell-parent.js");
+      writeFileSync(
+        launcher,
+        `require("node:child_process").spawn("/bin/sh",
+        ["-c", 'printf "%s" "$$" > "$1"; while [ -d "$2" ]; do printf x >> "$3"; done', "sh",
+          ${JSON.stringify(pidFile)}, ${JSON.stringify(dir)}, ${JSON.stringify(output)}],
+        {detached:true, stdio:"ignore"}).unref();`,
+      );
+      writeFileSync(
+        parent,
+        `const {spawn} = require("node:child_process"); const fs = require("node:fs");
+        spawn(process.execPath, [${JSON.stringify(launcher)}], {stdio:"ignore"}).on("exit", () => {
+          const timer = setInterval(() => {
+            if (!fs.existsSync(${JSON.stringify(output)})) return;
+            clearInterval(timer); console.log("ready");
+            ${ending === "normal" || ending === "error" ? `process.exit(${ending === "error" ? 3 : 0});` : "setInterval(() => {}, 1000);"}
+          }, 5);
+        });`,
+      );
+      const control = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      const controller = new AbortController();
+      try {
+        await processScope.run(
+          { signal: controller.signal, killGraceMs: 0, children: new Map(), scratchDirs: new Set() },
+          async () => {
+            await expect(
+              runProcess({
+                cmd: [process.execPath, parent],
+                cwd: dir,
+                env: process.env as Record<string, string>,
+                timeoutMs: ending === "timeout" ? 1500 : undefined,
+                onStdoutLine: () => {
+                  if (ending === "cancelled" || ending === "stuck") controller.abort(new Error(ending));
+                },
+              }),
+            ).rejects.toBeInstanceOf(ProcessTerminationError);
+            expect(processScope.getStore()?.terminationError?.message).toContain(
+              "Cannot establish invocation membership",
+            );
+            // The writer's environment is withheld by SIP. Its PID alone cannot authorize
+            // a signal, and a still-writing process must never be followed by git clean.
+            const writerPid = Number(readFileSync(pidFile, "utf8"));
+            expect(writerPid).toBeGreaterThan(0);
+            expect(process.kill(writerPid, 0)).toBe(true);
+            expect(process.kill(control.pid ?? 0, 0)).toBe(true);
+            await expect(
+              sh(["/bin/sh", "-c", "touch shell-cleanup-started"], { cwd: dir }),
+            ).rejects.toBeInstanceOf(ProcessTerminationError);
+            expect(existsSync(join(dir, "shell-cleanup-started"))).toBe(false);
+          },
+        );
+      } finally {
+        controller.abort();
+        control.kill("SIGKILL");
+        await new Promise<void>((resolve) => control.once("close", () => resolve()));
+        if (existsSync(pidFile)) {
+          try {
+            process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+          } catch {}
+        }
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "a detached hidden shell writer must stop writing before cleanup",
+    async () => {
+      const pidFile = join(dir, "transient-pid");
+      const ready = join(dir, "transient-ready");
+      const stop = join(dir, "transient-stop");
+      const output = join(dir, "transient-output");
+      const launcher = join(dir, "transient-launcher.js");
+      const parent = join(dir, "transient-parent.js");
+      writeFileSync(
+        launcher,
+        `require("node:child_process").spawn("/bin/sh",
+      ["-c", 'printf "%s" "$$" > "$1"; while [ ! -e "$2" ]; do printf x >> "$3"; done', "sh",
+        ${JSON.stringify(pidFile)}, ${JSON.stringify(stop)}, ${JSON.stringify(output)}],
+        {detached:true, stdio:"ignore"}).unref();`,
+      );
+      writeFileSync(
+        parent,
+        `const fs = require("node:fs");
+      require("node:child_process").spawn(process.execPath, [${JSON.stringify(launcher)}], {stdio:"ignore"})
+        .on("exit", () => { setInterval(() => {
+          if (fs.existsSync(${JSON.stringify(output)})) { console.log("ready"); process.exit(0); }
+        }, 5); });`,
+      );
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await runProcess({
+          cmd: [process.execPath, parent],
+          cwd: dir,
+          env: process.env as Record<string, string>,
+          onStdoutLine: () => {
+            writeFileSync(ready, "");
+            timer = setTimeout(() => writeFileSync(stop, ""), 300);
+          },
+        });
+        expect(result.exitCode).toBe(0);
+        expect(existsSync(stop)).toBe(true);
+        expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow();
+        expect(readFileSync(output).length).toBeGreaterThan(0);
+        // This cleanup callback can run only once the previously ambiguous PID is gone.
+        rmSync(output);
+        rmSync(ready);
+        await Bun.sleep(30);
+        expect(existsSync(output)).toBe(false);
+        expect(existsSync(ready)).toBe(false);
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (existsSync(pidFile)) {
+          const pid = Number(readFileSync(pidFile, "utf8"));
+          if (pid > 0) {
+            try {
+              process.kill(pid, "SIGKILL");
+            } catch {}
+          }
         }
       }
     },

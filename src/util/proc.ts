@@ -31,6 +31,7 @@ async function markedProcesses(
   marker: string,
   group: number,
   known: Set<number>,
+  started: number,
   attempt = 0,
 ): Promise<number[]> {
   const uid = process.getuid?.();
@@ -40,13 +41,13 @@ async function markedProcesses(
   const nativeProcesses = async () => {
     const { markedDarwinProcesses } = await import("./processes-darwin.ts");
     try {
-      return markedDarwinProcesses(uid, marker, group, known);
+      return markedDarwinProcesses(uid, marker, group, known, started);
     } catch (error) {
-      // KERN_PROCARGS2 can return EIO/EINVAL while a process is exec'ing. Require
-      // a complete snapshot, but give these transient states time to settle.
-      if (attempt >= 10) throw error;
+      // Exec races and short-lived hidden orphans can make membership temporarily
+      // unprovable. Keep cleanup blocked while allowing a bounded window to settle.
+      if (attempt >= 200) throw error;
       await Bun.sleep(10);
-      return markedProcesses(marker, group, known, attempt + 1);
+      return markedProcesses(marker, group, known, started, attempt + 1);
     }
   };
   if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
@@ -139,11 +140,16 @@ async function markedProcesses(
     return pids;
   }
   // A shell may exec between snapshots; never signal it based on mismatched argv.
-  if (attempt < 3) return markedProcesses(marker, group, known, attempt + 1);
+  if (attempt < 3) return markedProcesses(marker, group, known, started, attempt + 1);
   throw new Error("Process arguments changed during inspection");
 }
 
-async function stopMarkedProcesses(marker: string, child: ChildProcess, graceMs: number): Promise<void> {
+async function stopMarkedProcesses(
+  marker: string,
+  child: ChildProcess,
+  graceMs: number,
+  invokedAt: number,
+): Promise<void> {
   const group = child.pid;
   if (group === undefined) return;
   const started = performance.now();
@@ -151,7 +157,7 @@ async function stopMarkedProcesses(marker: string, child: ChildProcess, graceMs:
   const known = new Set([group]);
   let empty = false;
   for (;;) {
-    const pids = await markedProcesses(marker, group, known);
+    const pids = await markedProcesses(marker, group, known, invokedAt);
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
     const exited = child.exitCode !== null || child.signalCode !== null;
     if (!pids.length && empty && exited) return;
@@ -292,6 +298,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               marker,
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
+              started,
             );
         } catch (error) {
           terminationError = new ProcessTerminationError(
