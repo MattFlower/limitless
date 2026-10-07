@@ -28,13 +28,6 @@ const hardened = [
   "core.commitGraph=false",
   "pack.useBitmaps=false",
 ].flatMap((flag) => ["-c", flag]);
-// Config-defined hooks and filters (e.g. a runner's global git-lfs filters) are blanked one flag each.
-const blanked = (args: string[]) => {
-  const blanks = args.filter((arg) => arg.startsWith("--config-env="));
-  for (const flag of blanks)
-    expect(flag).toMatch(/^--config-env=(hook|filter)\..+=LIMITLESS_GIT_EMPTY_HOOK$/);
-  return args.filter((arg) => !blanks.includes(arg));
-};
 const repositories = seeded(async (root) => {
   const source = join(root, "source");
   const alternate = join(root, "alternate");
@@ -255,106 +248,146 @@ describe("land-pr private strings", () => {
   });
 });
 
+const plantedKeys = [
+  "remote.origin.receivepack",
+  "remote.origin.pushurl",
+  "core.sshCommand",
+  "credential.helper",
+  "credential.https://github.com.helper",
+  "url.attack.insteadOf",
+  "include.path",
+];
+const originForms = [
+  origin,
+  "https://github.com/MattFlower/limitless",
+  "git@github.com:MattFlower/limitless.git",
+  "ssh://git@github.com/MattFlower/limitless.git",
+  "https://github.com/fork-owner/limitless.git",
+];
+
 test.each([
   "redirect",
   "redirect-and-move-head",
-  "remote.origin.receivepack",
-  "core.sshCommand",
-  "credential.helper",
-  "include.path",
   "working-tree",
-  "config-failed-before",
-  "config-failed-after",
-  "planted-before",
-  "include-before",
-  "origin-elsewhere",
   "fresh-clone",
-  "install-config",
-])(
-  "land publishes only its trusted SHA, preserves working-tree edits and refuses repository config tampering: %s",
-  async (scenario) => {
-    const root = mkdtempSync(join(tmpdir(), "land-trusted-"));
-    try {
-      const { value } = await repositories(root);
-      const source = join(root, "source");
-      const alternate = join(root, "alternate");
-      const remote = join(root, "remote");
-      const work = join(root, "work");
-      const bin = join(root, "bin");
-      const config = join(root, "config");
-      for (const path of [bin, config]) mkdirSync(path);
-      const gitBin = Bun.which("git");
-      if (!gitBin) throw new Error("missing git");
-      const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
-      if (scenario === "fresh-clone") {
-        await git("clone", "-q", "--reference", source, source, work);
-        await git("-C", work, "checkout", "-qb", "pr");
-        // Git preserves subsection case; the allowlist must accept it as well.
-        await git("-C", work, "config", "branch.PR.remote", "origin");
-        await git("-C", work, "config", "branch.PR.merge", "refs/heads/main");
-        // A global branch.autoSetupRebase adds this at clone time on real machines.
-        await git("-C", work, "config", "branch.PR.rebase", "true");
-        await git("-C", work, "remote", "set-url", "origin", "git@github.com:MattFlower/limitless.git");
-      } else await git("worktree", "add", "-qb", "pr", work);
-      await git("remote", "add", "origin", origin);
-      await git("-C", alternate, "remote", "set-url", "origin", remote);
-      const globalConfig = join(root, "global.config");
-      writeFileSync(
-        globalConfig,
-        `${readFileSync(process.env.GIT_CONFIG_GLOBAL ?? "/dev/null", "utf8")}\n[push]\nfollowTags = true\n`,
-      );
-      await git("tag", "-am", "safe tag", "local-tag");
-      // Make the alternate commit available to HEAD-movement attacks without publishing it.
-      await git("fetch", "-q", alternate, "main");
-      writeFileSync(join(work, "file"), "safe change\n");
-      writeFileSync(join(config, "private-strings.txt"), entry);
-      const paths = [
-        realpathSync(work),
-        realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git/worktrees/work")),
-        realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git")),
-      ];
-      const recorded = await sh([process.execPath, resolve("scripts/check-private-strings.ts"), "--record"], {
-        cwd: work,
-      });
-      expect(recorded.stdout.trim().split("\n")).toEqual(paths);
-      if (scenario !== "fresh-clone")
-        expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
-      const calls = join(root, "calls");
-      const pinned = join(root, "pinned");
-      const checked = join(root, "checked");
-      const marker = join(root, "config-command-ran");
-      const injected = join(root, "injected.config");
-      const command = `touch '${marker}'`;
-      const plantedKey =
-        scenario === "planted-before"
-          ? "remote.origin.receivepack"
-          : scenario === "include-before"
-            ? "include.path"
-            : scenario === "origin-elsewhere"
-              ? "remote.origin.url"
-              : undefined;
-      if (plantedKey) {
-        if (scenario === "include-before") writeFileSync(injected, "[core]\nfilemode = true\n");
-        // Model a lifecycle script that ran in this clone before land-pr.sh started.
-        await git(
-          "config",
-          plantedKey,
-          scenario === "include-before"
-            ? injected
-            : scenario === "origin-elsewhere"
-              ? "https://github.com/elsewhere/secret-config-value.git"
-              : command,
-        );
-      }
-      const tampered = [
-        "remote.origin.receivepack",
-        "core.sshCommand",
-        "credential.helper",
-        "include.path",
-      ].includes(scenario);
-      writeFileSync(
-        join(bin, "bun"),
-        `#!${process.execPath}
+  "config-failed-before",
+  "config-failed-url",
+  "missing-origin",
+  "multiple-origins",
+  "multiple-origins-blank",
+  "malformed-config",
+  "push-failed",
+  "commit-unavailable",
+  "file-path",
+  "file-url",
+  "ext-url",
+  "git-config-env",
+  ...originForms.map((url) => `origin:${url}`),
+  ...plantedKeys.flatMap((key) => ["before", "install", "checks", "pre-push"].map((at) => `${at}:${key}`)),
+])("land publishes its pinned SHA from an isolated push repository: %s", async (scenario) => {
+  const root = mkdtempSync(join(tmpdir(), "land-trusted-"));
+  try {
+    const { value } = await repositories(root);
+    const source = join(root, "source");
+    const alternate = join(root, "alternate");
+    const remote = join(root, "remote");
+    const work = join(root, "work");
+    const bin = join(root, "bin");
+    const config = join(root, "config");
+    for (const path of [bin, config]) mkdirSync(path);
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("missing git");
+    const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
+    if (scenario === "fresh-clone") {
+      await git("clone", "-q", "--reference", source, source, work);
+      await git("-C", work, "checkout", "-qb", "pr");
+      // Ordinary clone metadata may use mixed-case branch names.
+      await git("-C", work, "config", "branch.PR.remote", "origin");
+      await git("-C", work, "config", "branch.PR.merge", "refs/heads/main");
+      // A global branch.autoSetupRebase adds this at clone time on real machines.
+      await git("-C", work, "config", "branch.PR.rebase", "true");
+      await git("-C", work, "remote", "set-url", "origin", "git@github.com:MattFlower/limitless.git");
+    } else await git("worktree", "add", "-qb", "pr", work);
+    await git("remote", "add", "origin", origin);
+    await git("-C", alternate, "remote", "set-url", "origin", remote);
+    const globalConfig = join(root, "global.config");
+    writeFileSync(
+      globalConfig,
+      `${readFileSync(process.env.GIT_CONFIG_GLOBAL ?? "/dev/null", "utf8")}\n[push]\nfollowTags = true\n`,
+    );
+    await git("tag", "-am", "safe tag", "local-tag");
+    // Make the alternate commit available to HEAD-movement attacks without publishing it.
+    await git("fetch", "-q", alternate, "main");
+    writeFileSync(join(work, "file"), "safe change\n");
+    writeFileSync(join(config, "private-strings.txt"), entry);
+    const paths = [
+      realpathSync(work),
+      realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git/worktrees/work")),
+      realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git")),
+    ];
+    const recorded = await sh([process.execPath, resolve("scripts/check-private-strings.ts"), "--record"], {
+      cwd: work,
+    });
+    expect(recorded.stdout.trim().split("\n")).toEqual(paths);
+    if (scenario !== "fresh-clone")
+      expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
+    const calls = join(root, "calls");
+    const pinned = join(root, "pinned");
+    const marker = join(root, "config-command-ran");
+    const injected = join(root, "injected.config");
+    const command = `touch '${marker}'`;
+    const [plantAt, plantKey] = scenario.split(":");
+    const planted = plantedKeys.includes(plantKey ?? "");
+    writeFileSync(injected, `[remote "origin"]\nreceivepack = ${JSON.stringify(command)}\n`);
+    const plantValue =
+      plantKey === "include.path"
+        ? injected
+        : plantKey?.includes("helper")
+          ? `!${command}`
+          : plantKey === "remote.origin.pushurl"
+            ? `ext::${command}`
+            : plantKey === "url.attack.insteadOf"
+              ? origin
+              : command;
+    const plantArgs = ["--git-dir", paths[2] ?? "", "config", plantKey ?? "", plantValue];
+    if (planted && plantAt === "before") await git(...plantArgs);
+    const extHelper = join(root, "ext-helper");
+    writeFileSync(extHelper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    const expectedUrl = scenario.startsWith("origin:")
+      ? scenario.slice(7)
+      : scenario === "fresh-clone"
+        ? "git@github.com:MattFlower/limitless.git"
+        : scenario === "file-path"
+          ? remote
+          : scenario === "file-url"
+            ? `file://${remote}`
+            : scenario === "ext-url"
+              ? `ext::${extHelper}`
+              : origin;
+    if (scenario !== "fresh-clone") await git("config", "remote.origin.url", expectedUrl);
+    if (scenario === "missing-origin") await git("config", "--unset-all", "remote.origin.url");
+    if (scenario.startsWith("multiple-origins"))
+      await git("config", "--add", "remote.origin.url", scenario.endsWith("blank") ? "" : origin);
+    if (scenario === "malformed-config") {
+      const malformed = join(root, `${entry}.config`);
+      writeFileSync(malformed, "[malformed\n");
+      await git("config", "include.path", malformed);
+    }
+    const targetHook = join(remote, "hooks", "pre-receive");
+    writeFileSync(targetHook, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    const externalConfig = join(root, "external.config");
+    writeFileSync(externalConfig, `[remote "origin"]\nurl = ${origin}\n`);
+    // Override permissive global protocol defaults; keep hasconfig includes and runner LFS filters.
+    const globalInclude = join(root, "global-include.config");
+    writeFileSync(globalInclude, "[land]\ntrustedInclude = yes\n");
+    writeFileSync(join(root, "system.config"), '[filter "lfs"]\nprocess = false\nrequired = true\n');
+    writeFileSync(
+      globalConfig,
+      `${readFileSync(globalConfig, "utf8")}\n[protocol]\nallow = always\n[includeIf "hasconfig:remote.*.url:https://github.com/**"]\npath = ${globalInclude}\n`,
+    );
+    writeFileSync(
+      join(bin, "bun"),
+      `#!${process.execPath}
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 let args = process.argv.slice(2);
@@ -383,19 +416,17 @@ if (args[0] === "install" || args[0] === "run") {
     if (result.status !== 0) process.exit(result.status ?? 1);
   }
   writeFileSync(cwd + "-state", JSON.stringify([before, snapshot()]));
-  if (args[0] === "install" && ${JSON.stringify(scenario)} === "install-config") {
-    const changed = spawnSync(${JSON.stringify(gitBin)}, ["config", "branch.install.remote", "origin\\n\\n"], { stdio: "inherit" });
+  if (${JSON.stringify(scenario)} === "git-config-env" && args[0] === "run") {
+    const changed = spawnSync(${JSON.stringify(gitBin)}, ["--git-dir", ${JSON.stringify(paths[2])}, "config", "remote.origin.receivepack", ${JSON.stringify(command)}], { env: { ...process.env, GIT_CONFIG: undefined }, stdio: "inherit" });
+    if (changed.status !== 0) process.exit(1);
+  }
+  if (${planted} && args[0] === ${JSON.stringify(plantAt === "install" ? "install" : plantAt === "checks" ? "run" : "never")}) {
+    const changed = spawnSync(${JSON.stringify(gitBin)}, ${JSON.stringify(plantArgs)}, { stdio: "inherit" });
     if (changed.status !== 0) process.exit(1);
   }
 }
 if (args[0] === "run") {
-  writeFileSync(${JSON.stringify(checked)}, "ran");
   if (${JSON.stringify(scenario)}.startsWith("redirect")) writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
-  if (${tampered}) {
-    if (${JSON.stringify(scenario)} === "include.path") writeFileSync(${JSON.stringify(injected)}, ${JSON.stringify(`[core]\nsshCommand = ${JSON.stringify(command)}\n`)});
-    const changed = spawnSync(${JSON.stringify(gitBin)}, ["config", ${JSON.stringify(scenario)}, ${JSON.stringify(scenario === "include.path" ? injected : scenario === "credential.helper" ? `!${command}` : command)}], { stdio: "inherit" });
-    if (changed.status !== 0) process.exit(1);
-  }
   if (${JSON.stringify(scenario)} === "working-tree") writeFileSync(${JSON.stringify(join(work, "file"))}, "check-generated change\\n");
 }
 if (args[0].endsWith(".ts")) {
@@ -411,157 +442,214 @@ if (args[0].endsWith(".ts")) {
   process.exit(result.status ?? 1);
 }
 `,
-        { mode: 0o755 },
-      );
-      writeFileSync(
-        join(bin, "git"),
-        `#!${process.execPath}
-import { appendFileSync, existsSync } from "node:fs";
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(bin, "git"),
+      `#!${process.execPath}
+import { appendFileSync, existsSync, readFileSync, statSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths: [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR] }) + "\\n");
-if (args.includes("--show-scope") && !args.includes("-z") && (${JSON.stringify(scenario)} === "config-failed-before" || (${JSON.stringify(scenario)} === "config-failed-after" && existsSync(${JSON.stringify(checked)})))) {
-  console.error("secret-config-value");
-  process.exit(1);
+const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths, config: process.env.GIT_CONFIG ?? null }) + "\\n");
+if ((${JSON.stringify(scenario)} === "config-failed-before" && args.includes("--absolute-git-dir")) ||
+    (${JSON.stringify(scenario)} === "config-failed-url" && args.includes("--get-all"))) {
+  console.error("secret-config-value"); process.exit(1);
 }
-const deliveryArgs = args.includes("push") ? args.map(arg => arg === "origin" ? ${JSON.stringify(remote)} : arg) : args;
+if (${JSON.stringify(scenario)} === "commit-unavailable" && args.includes("-C") && args.includes("cat-file") && args.includes("-e")) process.exit(1);
+let deliveryArgs = args;
+if (args.includes("push")) {
+  const repoAt = args.indexOf("-C");
+  const pushRepo = repoAt < 0 ? process.env.GIT_COMMON_DIR : args[repoAt + 1];
+  appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "push-repo", args: [pushRepo], mode: statSync(pushRepo).mode & 0o777, alternates: readFileSync(pushRepo + "/objects/info/alternates", "utf8") }) + "\\n");
+  if (${JSON.stringify(scenario)} === "push-failed") process.exit(1);
+  if (!${JSON.stringify(["file-path", "file-url", "ext-url"].includes(scenario))}) {
+    // Only delivery is redirected to a real local bare remote. Policy remains intact for denied URLs.
+    deliveryArgs = ["-c", "protocol.file.allow=always", ...args.map(arg => arg === ${JSON.stringify(expectedUrl)} || arg === "origin" ? ${JSON.stringify(remote)} : arg)];
+    // Permitted test delivery must not trigger the target hook used by the denied-transport cases.
+    rmSync(${JSON.stringify(targetHook)});
+  }
+  if (${JSON.stringify(expectedUrl.startsWith("https://github.com/"))}) {
+    const included = spawnSync(${JSON.stringify(gitBin)}, ["-C", pushRepo, "config", "--get", "land.trustedInclude"], { encoding: "utf8" });
+    if (included.stdout.trim() !== "yes") process.exit(1);
+  }
+}
 const result = spawnSync(${JSON.stringify(gitBin)}, deliveryArgs, { stdio: "inherit" });
 process.exit(result.status ?? 1);
 `,
-        { mode: 0o755 },
-      );
-      writeFileSync(
-        join(bin, "gh"),
-        `#!${process.execPath}
-import { appendFileSync, readFileSync } from "node:fs";
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(bin, "gh"),
+      `#!${process.execPath}
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "gh", args }) + "\\n");
 if (args[0] === "run" && args[1] === "list") console.log("123");
 else if (args[1] === "view") {
+  if (args.includes("baseRefOid,body,headRefName") && existsSync(${JSON.stringify(pinned)}) && ${planted && plantAt === "pre-push"}) {
+    const changed = spawnSync(${JSON.stringify(gitBin)}, ${JSON.stringify(plantArgs)}, { stdio: "inherit" });
+    if (changed.status !== 0) process.exit(1);
+  }
   if (args.includes("--jq")) console.log("pr");
   else if (args.includes("title,body,headRefOid")) console.log(JSON.stringify({ title: "safe", body: "safe", headRefOid: readFileSync(${JSON.stringify(pinned)}, "utf8") }));
   else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: value.base, body: "safe", headRefName: "pr" }))});
 }
 `,
-        { mode: 0o755 },
-      );
-      const result = await sh(["bash", script, "123", "safe", work], {
-        cwd: root,
-        env: {
-          ...process.env,
-          PATH: `${bin}:${process.env.PATH}`,
-          LIMITLESS_CONFIG_DIR: config,
-          GIT_CONFIG_GLOBAL: globalConfig,
-          TMPDIR: root,
-        },
-        allowFail: true,
-      });
-      expect(result.stderr).not.toContain(entry);
-      const logged: { tool: string; args: string[]; paths?: (string | null)[] }[] = readFileSync(
-        calls,
-        "utf8",
-      )
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      if (tampered || plantedKey || scenario === "install-config" || scenario.startsWith("config-failed-")) {
-        expect(result.exitCode).not.toBe(0);
-        expect(result.stderr).toContain("git config");
-        expect(result.stderr).toContain("refusing to");
-        expect(result.stderr).not.toContain("secret-config-value");
-        expect(result.stderr).not.toContain(command);
-        expect(logged.some((call) => call.tool === "git" && call.args.includes("push"))).toBe(false);
-        expect(logged.some((call) => call.tool === "gh" && call.args[1] === "merge")).toBe(false);
-        expect(existsSync(marker)).toBe(false);
-        expect(existsSync(checked)).toBe(!plantedKey && scenario !== "config-failed-before");
-        if (plantedKey) {
-          expect(result.stderr).toContain(plantedKey);
-          expect(logged.some((call) => call.tool === "bun" && call.args[0] === "install")).toBe(false);
-        }
-        return;
-      }
-      if (scenario === "working-tree") {
-        const snapshots = logged.filter(
-          (call) => call.tool === "git" && call.args.includes("--show-scope") && !call.args.includes("-z"),
-        );
-        expect(snapshots).toHaveLength(2);
-        expect((await git("show", "pr:file")).stdout).toBe("check-generated change\n");
-      }
-      expect((await git("--git-dir", remote, "rev-list", "--all")).stdout.trim().split("\n")).not.toContain(
-        value.denied,
-      );
-      expect((await git("--git-dir", remote, "log", "--all", "--format=%B")).stdout).not.toContain(entry);
-      expect(result.exitCode).toBe(0);
-      const sha = readFileSync(pinned, "utf8");
-      expect(sha).toMatch(/^[a-f0-9]{40}$/);
-      expect(sha).not.toBe(value.base);
-      expect(sha).not.toBe(value.denied);
-      for (const command of ["install", "run"]) {
-        expect(JSON.parse(readFileSync(join(root, `fixture-${command}-state`), "utf8"))).toEqual([
-          [value.base, ""],
-          [value.base, ""],
-        ]);
-        expect(
-          (await git("-C", join(root, `fixture-${command}`), "log", "-1", "--format=%s")).stdout.trim(),
-        ).toBe(`test fixture ${command}`);
-      }
-      const installed = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "install");
-      const recordedAt = logged.findIndex((call) => call.tool === "recorded");
-      expect(recordedAt).toBeGreaterThan(0);
-      expect(installed).toBeGreaterThan(recordedAt);
-      const validations = logged
-        .map((call, index) => ({ call, index }))
-        .filter(
-          ({ call }) =>
-            call.tool === "git" && call.args.includes("--show-scope") && call.args.includes("--name-only"),
-        );
-      expect(validations).toHaveLength(2);
-      expect(validations[0]?.index).toBeLessThan(installed);
-      expect(validations[1]?.index).toBeGreaterThan(installed);
-      for (const call of logged.slice(recordedAt + 1).filter((call) => call.tool !== "gh")) {
-        const check = call.tool === "bun" && ["install", "run"].includes(call.args[0] ?? "");
-        expect(call.paths).toEqual(check ? [null, null, null] : paths);
-      }
-      const commands = (tool: string, command: string) =>
-        logged.filter((call) => call.tool === tool && call.args.includes(command)).map((call) => call.args);
-      expect(commands("bun", sha)).toEqual([
-        [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "safe", "pr", sha],
-        [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
-      ]);
-      expect(commands("git", "push").map(blanked)).toEqual([
-        [...hardened, "push", "--no-verify", "-q", "--no-follow-tags", "origin", `${sha}:refs/heads/pr`],
-      ]);
-      expect(commands("git", "HEAD").map(blanked)).toEqual([[...hardened, "rev-parse", "HEAD"]]);
-      expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
-      expect(commands("gh", "list")).toEqual([
-        [
-          "run",
-          "list",
-          "-R",
-          "MattFlower/limitless",
-          "--commit",
-          sha,
-          "--limit",
-          "1",
-          "--json",
-          "databaseId",
-          "--jq",
-          ".[0].databaseId // empty",
-        ],
-      ]);
-      expect(commands("gh", "merge")[0]).toContain("--match-head-commit");
-      expect(commands("gh", "merge")[0]?.at(-1)).toBe(sha);
-      expect((await git("--git-dir", remote, "rev-parse", "refs/heads/pr")).stdout.trim()).toBe(sha);
-      expect((await git("--git-dir", remote, "tag", "--list")).stdout).toBe("");
-      if (scenario.startsWith("redirect"))
-        expect(readFileSync(join(work, ".git"), "utf8")).toContain(join(alternate, ".git"));
-      if (scenario === "redirect-and-move-head")
-        expect((await git("rev-parse", "pr")).stdout.trim()).toBe(value.denied);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
+      { mode: 0o755 },
+    );
+    const result = await sh(["bash", script, "123", "safe", work], {
+      cwd: root,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        LIMITLESS_CONFIG_DIR: config,
+        GIT_CONFIG_GLOBAL: globalConfig,
+        GIT_CONFIG_SYSTEM: join(root, "system.config"),
+        ...(scenario === "git-config-env" ? { GIT_CONFIG: externalConfig } : {}),
+        TMPDIR: root,
+      },
+      allowFail: true,
+    });
+    expect(result.stderr).not.toContain(entry);
+    const logged: {
+      tool: string;
+      args: string[];
+      paths?: (string | null)[];
+      config?: string | null;
+      mode?: number;
+      alternates?: string;
+    }[] = readFileSync(calls, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    for (const call of logged.filter(
+      (call) => call.tool === "git" && call.args.includes("init") && call.args.includes("-C"),
+    )) {
+      expect(existsSync(call.args[call.args.indexOf("-C") + 1] ?? "")).toBe(false);
     }
-  },
-);
+    const pushRepos = logged.filter((call) => call.tool === "push-repo");
+    for (const call of pushRepos) {
+      expect(call.mode).toBe(0o700);
+      expect(call.alternates).toBe(`${paths[2]}/objects\n`);
+      expect(existsSync(call.args[0] ?? "")).toBe(false);
+    }
+    expect(existsSync(marker)).toBe(false);
+    const failure =
+      scenario.startsWith("config-failed-") ||
+      [
+        "missing-origin",
+        "multiple-origins",
+        "multiple-origins-blank",
+        "malformed-config",
+        "push-failed",
+        "commit-unavailable",
+        "file-path",
+        "file-url",
+        "ext-url",
+      ].includes(scenario);
+    if (failure) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).not.toContain("secret-config-value");
+      if (scenario === "malformed-config" || scenario === "config-failed-before")
+        expect(result.stderr).toContain("Cannot read repository git paths");
+      if (scenario === "config-failed-url" || scenario === "missing-origin")
+        expect(result.stderr).toContain("Cannot read origin URL");
+      if (scenario === "commit-unavailable")
+        expect(result.stderr).toContain("Cannot prepare pinned commit in push repository");
+      if (scenario.startsWith("multiple-origins")) expect(result.stderr).toContain("multi-valued");
+      expect(logged.some((call) => call.tool === "gh" && call.args[1] === "merge")).toBe(false);
+      expect((await git("--git-dir", remote, "for-each-ref")).stdout).toBe("");
+      if (["push-failed", "file-path", "file-url", "ext-url"].includes(scenario))
+        expect(pushRepos).toHaveLength(1);
+      if (["file-path", "file-url", "ext-url"].includes(scenario))
+        expect(result.stderr).toContain("not allowed");
+      return;
+    }
+    if (scenario === "working-tree")
+      expect((await git("show", "pr:file")).stdout).toBe("check-generated change\n");
+    expect(pushRepos).toHaveLength(1);
+    expect((await git("--git-dir", remote, "rev-list", "--all")).stdout.trim().split("\n")).not.toContain(
+      value.denied,
+    );
+    expect((await git("--git-dir", remote, "log", "--all", "--format=%B")).stdout).not.toContain(entry);
+    expect(result.exitCode).toBe(0);
+    const sha = readFileSync(pinned, "utf8");
+    expect(sha).toMatch(/^[a-f0-9]{40}$/);
+    expect(sha).not.toBe(value.base);
+    expect(sha).not.toBe(value.denied);
+    for (const command of ["install", "run"]) {
+      expect(JSON.parse(readFileSync(join(root, `fixture-${command}-state`), "utf8"))).toEqual([
+        [value.base, ""],
+        [value.base, ""],
+      ]);
+      expect(
+        (await git("-C", join(root, `fixture-${command}`), "log", "-1", "--format=%s")).stdout.trim(),
+      ).toBe(`test fixture ${command}`);
+    }
+    const installed = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "install");
+    const recordedAt = logged.findIndex((call) => call.tool === "recorded");
+    expect(recordedAt).toBeGreaterThan(0);
+    expect(installed).toBeGreaterThan(recordedAt);
+    for (const call of logged
+      .slice(recordedAt + 1)
+      .filter((call) => call.tool === "git" || call.tool === "bun")) {
+      const isolated =
+        (call.tool === "bun" && ["install", "run"].includes(call.args[0] ?? "")) ||
+        call.args.includes("-C") ||
+        (call.tool === "git" && call.paths?.every((path) => path === null));
+      expect(call.paths).toEqual(isolated ? [null, null, null] : paths);
+      if (call.args.includes("push")) expect(call.config).toBeNull();
+    }
+    const commands = (tool: string, command: string) =>
+      logged.filter((call) => call.tool === tool && call.args.includes(command)).map((call) => call.args);
+    expect(commands("bun", sha)).toEqual([
+      [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "safe", "pr", sha],
+      [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
+    ]);
+    const push = commands("git", "push")[0] ?? [];
+    for (const flag of [
+      "--no-verify",
+      "--no-follow-tags",
+      "protocol.allow=never",
+      "protocol.https.allow=always",
+      "protocol.ssh.allow=always",
+      ...hardened.filter((arg) => arg !== "-c"),
+    ])
+      expect(push).toContain(flag);
+    expect(push.at(-2)).toBe(expectedUrl);
+    expect(push.at(-1)).toBe(`${sha}:refs/heads/pr`);
+    expect(commands("git", "remote.origin.url").filter((args) => args.includes("--get-all"))).toHaveLength(1);
+    expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
+    expect(commands("gh", "list")).toEqual([
+      [
+        "run",
+        "list",
+        "-R",
+        "MattFlower/limitless",
+        "--commit",
+        sha,
+        "--limit",
+        "1",
+        "--json",
+        "databaseId",
+        "--jq",
+        ".[0].databaseId // empty",
+      ],
+    ]);
+    expect(commands("gh", "merge")[0]).toContain("--match-head-commit");
+    expect(commands("gh", "merge")[0]?.at(-1)).toBe(sha);
+    expect((await git("--git-dir", remote, "rev-parse", "refs/heads/pr")).stdout.trim()).toBe(sha);
+    expect((await git("--git-dir", remote, "tag", "--list")).stdout).toBe("");
+    if (scenario.startsWith("redirect"))
+      expect(readFileSync(join(work, ".git"), "utf8")).toContain(join(alternate, ".git"));
+    if (scenario === "redirect-and-move-head")
+      expect((await git("rev-parse", "pr")).stdout.trim()).toBe(value.denied);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test.each([
   "missing",
@@ -848,15 +936,11 @@ exec '${gitBin}' "$@"
       }
       if (scenario !== "cancel") {
         expect(existsSync(watched)).toBe(true);
-        expect(blanked(readFileSync(pushed, "utf8").trim().split("\n"))).toEqual([
-          ...hardened,
-          "push",
-          "--no-verify",
-          "-q",
-          "--no-follow-tags",
-          "origin",
-          `${sha}:refs/heads/safe-branch`,
-        ]);
+        const push = readFileSync(pushed, "utf8").trim().split("\n");
+        expect(push).toContain("--no-verify");
+        expect(push).toContain("--no-follow-tags");
+        expect(push.at(-2)).toBe(origin);
+        expect(push.at(-1)).toBe(`${sha}:refs/heads/safe-branch`);
       }
     } finally {
       if (scanGroup) {
