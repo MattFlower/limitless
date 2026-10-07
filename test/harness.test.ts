@@ -561,7 +561,7 @@ test("signal detection recognizes wrappers and ignores process polls and command
     "kill -0 $pid && echo running",
     "xargs -a pids kill -0",
     "node --eval='console.log(\"process.kill(1)\")'",
-    String.raw`/bin/zsh -lc "cat > f.ts <<'EOF'
+    `/bin/zsh -lc "cat > f.ts <<'EOF'
 const re = /"'^(?:pkill|killall)$'"/;
 EOF
 bun run typecheck"`,

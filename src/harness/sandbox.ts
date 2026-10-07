@@ -128,7 +128,7 @@ async function probeSeatbelt(
       );
     const profile = seatbeltProfile(roots ?? { write: [allowed], protect: [] });
     const cmd = ["/bin/sh", "-c", SIGNAL_PROBE, "sh", executable, profile, join(allowed, "ready")];
-    const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 5000, signal });
+    const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 30_000, signal });
     // An interrupted probe is inconclusive even when its marker was printed.
     if (
       p.exitCode !== 0 ||

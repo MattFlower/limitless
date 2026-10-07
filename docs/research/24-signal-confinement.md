@@ -24,7 +24,7 @@ sandbox; they did not establish host support or effective signal enforcement.
 | same-sandbox | Processes inheriting one sandbox instance | Use as the invocation boundary, with effective canaries. |
 
 The outer policy denies signals except self and same-sandbox. Every launch
-proves denial to an outside test-owned PID and an independently confined sibling
+proves denial to an outside supervisor-owned PID and an independently confined sibling
 with identical profile bytes, and termination of an owned descendant. Missing,
 ineffective, interrupted or inconclusive probes fail closed. On the reported
 host the non-nested signal canary passes for Claude editors and gates. The
@@ -32,8 +32,8 @@ offline substitute smoke also exercised their OS enforcement: a marker-name
 signal killed the owned marker while outside and sibling markers survived;
 a direct signal to the outside PID was denied with EPERM.
 
-`runProcess` starts a detached process group and cleans that group on timeout
-or cancellation. Keep that supervision. A process group/session alone cannot
+`runProcess` starts a detached process group, and since #392 also stops marked
+descendants that left it before cleanup. Keep that supervision. A process group/session alone cannot
 prevent signaling another same-user PID; a kernel policy provides that boundary.
 
 ## CLI composition
