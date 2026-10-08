@@ -13,7 +13,7 @@ import {
 import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import { redactGateStreams } from "../gates/output.ts";
 import { sh } from "../util/proc.ts";
 import {
   bounded,
@@ -447,8 +447,7 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
   const gate = async (args: string[], timeoutMs: number) => {
     const res = await run(args, { cwd: dir, timeoutMs, allowFail: true });
     if (res.exitCode === 0) return;
-    const stdout = redactGateOutput(res.stdout);
-    const stderr = redactGateOutput(res.stderr);
+    const { stdout, stderr } = redactGateStreams(res.stdout, res.stderr);
     const failures = extractFailures(`${stdout}\n${stderr}`);
     const tailBytes = failures ? 1_000 : GATE_TAIL_BYTES;
     // The failing check (a smoke row, a test name) is usually near the end of the output.

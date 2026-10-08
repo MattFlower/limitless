@@ -22,6 +22,7 @@ import type {
 import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
+import { redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
@@ -292,16 +293,19 @@ export class RunContext {
     this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
-    this.state = deps.store.getRunState<RunState>(run.id) ?? {
-      flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
-      phase: "prepare",
-      answers: [],
-      round: 0,
-      roundsOnImplementer: 0,
-      triedImplementers: [],
-      feedback: null,
-      toolCommands: [],
-    };
+    const restored = deps.store.getRunState<RunState>(run.id);
+    this.state = restored
+      ? redactGateData(restored)
+      : {
+          flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
+          phase: "prepare",
+          answers: [],
+          round: 0,
+          roundsOnImplementer: 0,
+          triedImplementers: [],
+          feedback: null,
+          toolCommands: [],
+        };
   }
 
   get store(): Store {
@@ -397,7 +401,7 @@ export class RunContext {
     const checkSha =
       cacheable && this.state.worktreePath ? await headSha(this.state.worktreePath) : undefined;
     if (cacheable && cache?.round === round && cache.sha === checkSha && Object.hasOwn(cache.values, name))
-      return cache.values[name] as T;
+      return redactGateData(cache.values[name]) as T;
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();

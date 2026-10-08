@@ -1,8 +1,160 @@
 import { expect, test } from "bun:test";
+import { join } from "node:path";
+import { Factory } from "../src/app.ts";
+import { Store } from "../src/db/store.ts";
 import { extractFailures } from "../src/gates/failures.ts";
 import { compareGates, type GateComparison } from "../src/gates/run.ts";
-import { formatGateFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { formatGateFeedback, implementPrompt, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
+import { renderReport } from "../src/pipeline/report.ts";
+import type { Spec } from "../src/pipeline/schemas.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { providerFixture } from "./provider-config-support.ts";
+
+test("legacy gate results are redacted on reopened state, checkpoints, HTTP and SSE reads", async () => {
+  const secret = "synthetic-legacy-gate-credential-421";
+  registerCredential("LEGACY_GATE_TEST_TOKEN", secret);
+  const colored = `${secret.slice(0, 12)}\u001b[31m${secret.slice(12)}`;
+  const fixture = providerFixture([]);
+  const db = join(fixture.root, "store.db");
+  let store = new Store(db);
+  let factory: Factory | undefined;
+  const controller = new AbortController();
+  try {
+    const repo = store.upsertRepo({
+      slug: "test/repo",
+      kind: "local",
+      localPath: fixture.root,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const gates = comparison(`credential: ${colored}`, `error: ${secret}\n(fail) assertion`, false);
+    const state: RunState = {
+      flow: "build",
+      phase: "loop",
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      toolCommands: [],
+      feedback: `gate feedback: ${colored}`,
+      baseline: { setupOk: true, setup: [], checks: gates.map((g) => g.result) },
+      lastGates: gates,
+      preRebaseGates: gates,
+      gateEvidence: { stageId: 1, sha: "head", checks: gates.map((g) => ({ ...g, testCommand: null })) },
+      completedChecks: { round: 0, values: { gates } },
+      terminalReason: `gate failure: ${colored}`,
+    };
+    store.setRunState(run.id, state);
+    store.putArtifact(run.id, "gates.json", "gates", JSON.stringify(gates));
+    store.addEvent({ runId: run.id, type: "gate", message: `gate: ${secret}`, data: gates });
+    store.close();
+    store = new Store(db);
+    factory = new Factory(fixture.load(), { store });
+    const context = new RunContext(factory.deps, run, repo, controller.signal);
+    const checkpoint = await context.stage("gates", async () => {
+      throw new Error("completed gate checkpoint must be reused");
+    });
+    const routes = createHttpRoutes(factory);
+    const read = (path: string, name = "") =>
+      (routes[path] as Route)(
+        requestWithParams(
+          `http://localhost:7400${path.replace(":id", run.id).replace(":name", name)}`,
+          { signal: controller.signal },
+          { id: run.id, name },
+        ),
+        localServer,
+      );
+    const artifact = await (await read("/api/runs/:id/artifacts/:name", "gates.json")).text();
+    const events = await (await read("/api/runs/:id/events")).json();
+    const response = await read("/api/runs/:id/stream");
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("missing SSE stream");
+    let backlog = "";
+    while (!backlog.includes("data: ")) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("SSE ended before its backlog");
+      backlog += new TextDecoder().decode(chunk.value);
+    }
+    controller.abort();
+    await reader.cancel();
+    const spec: Spec = {
+      summary: "test",
+      requirements: [],
+      assumptions: [],
+      out_of_scope: [],
+      blocking_questions: [],
+      acceptance_criteria: [],
+    };
+    const messages = [
+      JSON.stringify(context.state),
+      JSON.stringify(checkpoint),
+      artifact,
+      JSON.stringify(events),
+      backlog,
+      formatGateFeedback(context.state.lastGates ?? []),
+      formatGateFeedback(gates),
+      implementPrompt({
+        prompt: "test",
+        spec,
+        baseSha: "base",
+        round: 1,
+        hasHoldout: false,
+        feedback: state.feedback,
+        gates: {
+          setup: [],
+          checks: [],
+          source: "detected",
+          protectedPaths: [],
+        },
+        baseline: state.baseline ?? null,
+      }),
+      reviewPrompt({
+        prompt: "test",
+        spec,
+        baseSha: "base",
+        stat: "",
+        gates,
+        audit: [],
+        implementerReport: "",
+      }),
+      verifyPrompt({
+        prompt: "test",
+        spec,
+        holdout: { scenarios: [] },
+        baseSha: "base",
+        checks: gates.map((g) => ({ ...g, result: { ...g.result, command: secret } })),
+      }),
+      renderReport({
+        success: false,
+        runId: run.id,
+        prompt: "test",
+        state,
+        invocations: [],
+        totals: { costUsd: 0, costEquivUsd: 0 },
+        runUrl: "https://example.com/run",
+      }),
+    ];
+    for (const message of messages) {
+      expect(message).toContain("[redacted]");
+      expect(message).not.toContain(secret);
+      expect(message).not.toContain(secret.slice(12));
+    }
+    // Reads must leave the previous release's rows untouched.
+    expect(store.getRunState<RunState>(run.id)).toEqual(state);
+    expect(store.getArtifact(run.id, "gates.json")).toBe(JSON.stringify(gates));
+  } finally {
+    controller.abort();
+    await factory?.stop();
+    store.close();
+    fixture.close();
+  }
+});
 
 test("gate feedback and review receive redacted early diagnostics and tails", async () => {
   const gates = compareGates(null, await credentialGate());

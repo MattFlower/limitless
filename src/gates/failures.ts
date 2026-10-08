@@ -1,4 +1,4 @@
-import { stripVTControlCharacters } from "node:util";
+import { redactGateData, redactGateOutput } from "./output.ts";
 import type { GateResult } from "./run.ts";
 
 const FAILURE_RESULT = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/;
@@ -15,8 +15,12 @@ export class FailureExcerpts {
   private failure: string | undefined;
 
   observe(raw: string): void {
-    const line = stripVTControlCharacters(raw);
+    const line = redactGateOutput(raw);
     const text = line.trim();
+    if (text === OMITTED) {
+      this.omitted = true;
+      return;
+    }
     if (this.failure !== undefined) {
       // Bun emits the timeout explanation just after the result, unlike assertion diagnostics.
       const timeout = TIMEOUT.test(text);
@@ -100,6 +104,7 @@ function shortenFailureExcerpts(excerpt: string, limit: number): string {
 
 /** Excerpts come first; legacy results keep their original tail budget. */
 export function formatGateOutput(result: Pick<GateResult, "output" | "failures">, limit = 3_000): string {
+  result = redactGateData(result);
   if (!result.failures) return result.output.slice(-limit);
   const failures = shortenFailureExcerpts(result.failures, limit - 1_002);
   return `${failures}\n\n${result.output.slice(-1_000)}`;

@@ -7,6 +7,7 @@ import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
+import { redactGateArtifact, redactGateData } from "../gates/output.ts";
 import { gateSlots } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
@@ -46,7 +47,9 @@ function sse(
       const send = (msg: unknown) => {
         try {
           controller.enqueue(
-            encoder.encode(`${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${JSON.stringify(msg)}\n\n`),
+            encoder.encode(
+              `${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${JSON.stringify(redactGateData(msg))}\n\n`,
+            ),
           );
         } catch {
           cleanup?.();
@@ -468,20 +471,24 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const url = new URL(req.url);
       const inv = url.searchParams.get("invocation");
       return json(
-        store.listEvents(req.params.id as string, {
-          after: Number(url.searchParams.get("after") ?? 0),
-          tail: url.searchParams.get("tail") === "true",
-          excludeDebug: url.searchParams.get("excludeDebug") === "true",
-          limit: Math.min(5000, Number(url.searchParams.get("limit") ?? 1000)),
-          ...(inv ? { invocationId: Number(inv) } : {}),
-        }),
+        redactGateData(
+          store.listEvents(req.params.id as string, {
+            after: Number(url.searchParams.get("after") ?? 0),
+            tail: url.searchParams.get("tail") === "true",
+            excludeDebug: url.searchParams.get("excludeDebug") === "true",
+            limit: Math.min(5000, Number(url.searchParams.get("limit") ?? 1000)),
+            ...(inv ? { invocationId: Number(inv) } : {}),
+          }),
+        ),
       );
     }),
     "/api/runs/:id/artifacts/:name": handle((req) => {
       const content = store.getArtifact(req.params.id as string, req.params.name as string);
       return content === null
         ? error("not found", 404)
-        : new Response(content, { headers: { "content-type": "text/plain; charset=utf-8" } });
+        : new Response(redactGateArtifact(content), {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+          });
     }),
     "/api/runs/:id/stream": handle((req, server) => {
       const runId = req.params.id as string;

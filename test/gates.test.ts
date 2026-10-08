@@ -93,6 +93,108 @@ describe("detectGates", () => {
 });
 
 describe("runGates / compareGates", () => {
+  test.each([1, 19, 37])("redacts only the stream boundary pieces at credential split %i", async (split) => {
+    const secret = "synthetic-boundary-only-credential-42Z";
+    proc.registerCredential("BOUNDARY_ONLY_TEST_TOKEN", secret);
+    const stdout =
+      `${secret}.test.ts:\n(pass) full\nsZ.test.ts:\n(pass) intact\nerror: s Z\n` +
+      `(fail) s Z ${secret.slice(0, split)}`;
+    const stderr = `${secret.slice(split)}\nerror: s Z\n(fail) s Z\n`;
+    const dir = tempDir({ "stdout.txt": stdout, "stderr.txt": stderr });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [{ name: "test", run: "cat stdout.txt; cat stderr.txt >&2; exit 1" }],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.output).toBe(
+        "[redacted].test.ts:\n(pass) full\nsZ.test.ts:\n(pass) intact\nerror: s Z\n" +
+          "(fail) s Z [redacted]\n[redacted]\nerror: s Z\n(fail) s Z",
+      );
+      expect(run.checks[0]?.failures).toBe(
+        "error: s Z\n(fail) s Z [redacted]\n\n[redacted]\nerror: s Z\n(fail) s Z",
+      );
+      expect(run.checks[0]?.testCoverage).toEqual({
+        passedFiles: ["[redacted].test.ts"],
+        skippedFiles: ["sZ.test.ts"],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("credential fragments cannot survive the runner cap or normalized tail cuts", async () => {
+    const secret = "synthetic-runner-cap-credential-421";
+    proc.registerCredential("RUNNER_CAP_TEST_TOKEN", secret);
+    const dir = tempDir({
+      "cap.txt": `${secret}${"\u001b[0m".repeat(15_995)}`,
+      "tail.txt": `${secret}${"\u001b[0mz".repeat(5_980)}`,
+      "excerpt.txt": `error: ${secret}\n${"x".repeat(9_000)}${secret}\n(fail) assertion\n`,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: ["cap", "tail", "excerpt"].flatMap((name) => [
+            { name: `${name}-stdout`, run: `cat ${name}.txt; exit 1` },
+            { name: `${name}-stderr`, run: `cat ${name}.txt >&2; exit 1` },
+          ]),
+        },
+        new AbortController().signal,
+      );
+      for (const result of run.checks) {
+        const text = `${result.output}\n${result.failures ?? ""}`;
+        for (let i = 0; i <= secret.length - 8; i++) expect(text).not.toContain(secret.slice(i, i + 8));
+      }
+      expect(run.checks).toHaveLength(6);
+      expect(run.checks[2]?.output).toContain("[redacted]");
+      expect(run.checks[4]?.failures).toContain("[redacted]");
+      expect(run.checks[4]?.failures).toContain("left out");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("raw confinement classification survives redaction and cannot be created by ANSI normalization", async () => {
+    const marker = "sandbox_apply: Operation not permitted";
+    const secret = `${marker} synthetic-raw-confinement-421`;
+    proc.registerCredential("RAW_CONFINEMENT_TEST_TOKEN", secret);
+    const dir = tempDir({
+      "interrupted.txt": marker.replace("Operation", "Oper\u001b[0mation"),
+      "raw.txt": secret,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [
+            { name: "interrupted", run: "cat interrupted.txt; exit 1" },
+            { name: "raw", run: "cat raw.txt; exit 1" },
+          ],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]).toMatchObject({ output: marker, confinementError: false });
+      expect(run.checks[1]).toMatchObject({ output: "[redacted]", confinementError: true });
+      expect(compareGates(null, run).map((c) => c.verdict)).toEqual(["new_failure", "confinement_error"]);
+      const legacy = { ...run, checks: run.checks.slice(0, 1).map(({ confinementError: _flag, ...r }) => r) };
+      expect(compareGates(null, legacy)[0]?.verdict).toBe("confinement_error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("redacts setup, checks and retries before tail cuts, callbacks and persistence", async () => {
     const credential = "synthetic-gate-boundary-credential-409";
     proc.registerCredential("GATE_BOUNDARY_TEST_TOKEN", credential);
