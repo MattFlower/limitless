@@ -37,7 +37,12 @@ const jobSchema = z.object({
   steps: z.array(z.object({ name: z.string(), status: z.string(), conclusion: z.string().nullable() })),
 });
 type Check = z.infer<typeof checkSchema>;
-type Call = (repo: string, path: string, body?: unknown) => Promise<GitHubResponse | null>;
+type Call = (
+  repo: string,
+  path: string,
+  body?: unknown,
+  optionalLog?: boolean,
+) => Promise<GitHubResponse | null>;
 const bounded = (text: string) => text.trim().slice(0, 500);
 const logLines = (log: string) =>
   Bun.stripANSI(log)
@@ -82,8 +87,11 @@ async function inspectCi(
   consumer: "poller" | "land",
 ): Promise<boolean | "head_moved"> {
   const root = `repos/${pr.repo}`;
-  const read = async (path: string) => {
-    const res = await call(pr.repo, `${root}/${path}`);
+  const read = async (path: string, optionalLog = false, fallback = "") => {
+    const res = await call(pr.repo, `${root}/${path}`, undefined, optionalLog);
+    // A verified job may have no uploaded log after its workflow times out.
+    if (optionalLog && res?.status === 404)
+      return ["error: Job log unavailable (HTTP 404)", fallback].join("\n");
     if (res?.status !== 200)
       throw new Error(`Incomplete CI inspection: ${path} (${res?.status ?? "paused"})`);
     return res.body;
@@ -275,7 +283,7 @@ async function inspectCi(
       const log =
         job.started_at === null || job.conclusion === "startup_failure"
           ? ""
-          : z.string().parse(await read(`actions/jobs/${job.id}/logs`));
+          : z.string().parse(await read(`actions/jobs/${job.id}/logs`, true));
       if (!current()) return true;
       const failure = {
         ...f,
@@ -362,7 +370,7 @@ async function inspectCi(
           job.conclusion !== "startup_failure" &&
           c.conclusion !== "startup_failure"
         ) {
-          const body = await read(`actions/jobs/${job.id}/logs`);
+          const body = await read(`actions/jobs/${job.id}/logs`, true, log);
           if (typeof body !== "string") throw new Error("Incomplete CI log");
           log = body;
         }

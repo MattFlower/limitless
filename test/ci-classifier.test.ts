@@ -46,6 +46,7 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
     conclusion,
     head_sha: SHA,
     check_run_url: `https://api.github.com/repos/o/r/check-runs/${check.id}`,
+    started_at: new Date(0).toISOString(),
     labels: ["ubuntu-latest"],
     steps: [] as { name: string; status: string; conclusion: string | null }[],
   };
@@ -112,7 +113,11 @@ test("a timed-out job reruns once and a pass at its SHA is flake evidence", asyn
   h.start(15);
   await h.advance(0);
   expect(reruns()).toHaveLength(1);
-  expect(h.store.ciFailures(url("o/r", 1), SHA)[0]?.outcome).toBe("rerunning");
+  expect(h.store.ciFailures(url("o/r", 1), SHA)[0]).toMatchObject({
+    outcome: "rerunning",
+    line: "(fail) slow [5000.01ms]",
+    signature: '["test","(fail) slow [5000.01ms]","ubuntu-24.04"]',
+  });
   const count = h.gh.rest().length;
   await h.advance(15000);
   expect(h.gh.rest()).toHaveLength(count);
@@ -146,6 +151,50 @@ test("a failed rerun reports needs-fix and the cap survives reopening SQLite", a
   expect(reruns()).toHaveLength(1);
   expect(items("ci.needs_fix")).toHaveLength(1);
 });
+
+test.each(["cancelled", "timed_out"])(
+  "a started %s job with unavailable logs reruns once across restart",
+  async (conclusion) => {
+    h = pollerHarness();
+    const f = failure(1, "test", conclusion);
+    const missing = () => respond(404, "BlobNotFound");
+    const originalLog = `repos/o/r/actions/jobs/${f.job.id}/logs`;
+    h.gh.responses.set(originalLog, missing);
+    h.start(15);
+    await h.advance(0);
+    expect(reruns()).toHaveLength(1);
+    expect(items("github.access_problem")).toHaveLength(0);
+    expect(h.store.githubAccessProblems()).toHaveLength(0);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+      outcome: "rerunning",
+      line: "error: Job log unavailable (HTTP 404)",
+    });
+    h.reopen();
+    f.rerun(conclusion);
+    f.observe("FAILURE", "rerun");
+    const rerunLog = `repos/o/r/actions/jobs/${f.job.id}/logs`;
+    h.gh.responses.set(rerunLog, missing);
+    h.start(15);
+    await h.advance(0);
+    expect(h.gh.rest().map((c) => c.path)).toContain(originalLog);
+    expect(h.gh.rest().map((c) => c.path)).toContain(rerunLog);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_again");
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(items("ci.needs_fix")[0]?.data).toMatchObject({
+      signature: { line: "> error: Job log unavailable (HTTP 404)" },
+      excerpt: "> error: Job log unavailable (HTTP 404)",
+    });
+    h.reopen();
+    f.observe("FAILURE", "after-restart");
+    h.start(15);
+    await h.advance(0);
+    await h.advance(15000);
+    expect(reruns()).toHaveLength(1);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(items("github.access_problem")).toHaveLength(0);
+    expect(h.store.githubAccessProblems()).toHaveLength(0);
+  },
+);
 
 test.each([401, 403, 404, 422])(
   "a rejected rerun (%s) is terminal across polls and restart",
@@ -841,20 +890,120 @@ test("a last-window log response pauses before claiming the rerun, then retries"
   expect(reruns()).toHaveLength(1);
 });
 
-test("CI detail access failures persist a doctor episode and keep inspection pending", async () => {
+test.each(["job", "run", "PR"])("a %s 404 remains a CI access problem", async (part) => {
+  h = pollerHarness();
+  const f = failure();
+  if (part === "PR") {
+    const pr = h.store.githubTracked()[0];
+    if (!pr) throw new Error("missing fixture PR");
+    h.store.saveGithubPr({ ...pr, nodeId: f.node.id });
+  }
+  if (part === "run") {
+    h.start(15);
+    await h.advance(0);
+    f.rerun("timed_out");
+    f.observe("FAILURE", "rerun");
+  }
+  const path =
+    part === "job"
+      ? `repos/o/r/actions/jobs/${f.job.id}`
+      : part === "run"
+        ? "repos/o/r/actions/runs/1"
+        : "repos/o/r/pulls/1";
+  h.gh.responses.set(path, () => respond(404, { message: "Not Found" }));
+  if (part === "run") await h.advance(15000);
+  else {
+    h.start(15);
+    await h.advance(0);
+  }
+  expect(items("github.access_problem")).toHaveLength(1);
+  expect(items("github.access_problem")[0]?.data.reason).toBe("not_found");
+  expect(h.store.githubAccessProblems()[0]?.reason).toBe("not_found");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(reruns()).toHaveLength(part === "run" ? 1 : 0);
+  expect(h.store.ciFailures(f.node.url, SHA).some((f) => f.line.includes("log unavailable"))).toBe(false);
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+});
+
+test.each([403, 500])("CI log errors (%s) keep both inspections pending", async (status) => {
   h = pollerHarness();
   const f = failure();
   const path = `repos/o/r/actions/jobs/${f.job.id}/logs`;
-  h.gh.responses.set(path, () => respond(403, { message: "Resource forbidden" }));
+  const refused = () => respond(status, { message: "Log request failed" });
+  h.gh.responses.set(path, refused);
   h.start(15);
   await h.advance(0);
-  expect(h.store.githubAccessProblems()[0]?.reason).toBe("forbidden");
+  expect(h.store.githubAccessProblems()[0]?.reason).toBe(status === 403 ? "forbidden" : undefined);
   expect(reruns()).toHaveLength(0);
+  expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
   h.gh.responses.set(path, () => respond(200, f.state.log));
   await h.advance(60000);
   expect(reruns()).toHaveLength(1);
   expect(h.store.githubAccessProblems()).toHaveLength(0);
+  f.rerun("timed_out");
+  f.observe("FAILURE", "rerun");
+  const rerunLog = `repos/o/r/actions/jobs/${f.job.id}/logs`;
+  h.gh.responses.set(rerunLog, refused);
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.line).not.toContain("log unavailable");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+  h.gh.responses.set(rerunLog, () => respond(200, f.state.log));
+  await h.advance(60000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_again");
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(reruns()).toHaveLength(1);
 });
+
+test("a missing log retains recognized timeout diagnostics from check output", async () => {
+  h = pollerHarness();
+  const f = failure(1, "test", "failure");
+  h.gh.responses.set(checksPath(SHA), () =>
+    respond(200, {
+      total_count: 1,
+      check_runs: [{ ...f.check, output: { title: "tests", summary: "Test timeout of 30000ms exceeded." } }],
+    }),
+  );
+  h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/logs`, () => respond(404, "BlobNotFound"));
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(1);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.line).toContain("Job log unavailable (HTTP 404)");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(items("github.access_problem")).toHaveLength(0);
+});
+
+test.each(["output", "step", "annotation"])(
+  "a missing log preserves %s security evidence",
+  async (source) => {
+    h = pollerHarness();
+    const f = failure(1, "test", "cancelled");
+    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/logs`, () => respond(404, "BlobNotFound"));
+    if (source === "output")
+      h.gh.responses.set(checksPath(SHA), () =>
+        respond(200, {
+          total_count: 1,
+          check_runs: [{ ...f.check, output: { title: "tests", summary: "error: security tests failed" } }],
+        }),
+      );
+    if (source === "step")
+      f.job.steps.push({ name: "security tests", status: "completed", conclusion: "failure" });
+    if (source === "annotation")
+      h.gh.responses.set(`repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=1`, () =>
+        respond(200, [{ annotation_level: "failure", title: "tests", message: "security tests failed" }]),
+      );
+    h.start(15);
+    await h.advance(0);
+    expect(reruns()).toHaveLength(0);
+    expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(items("ci.needs_fix")[0]?.data.excerpt).toContain("Job log unavailable (HTTP 404)");
+    expect(items("github.access_problem")).toHaveLength(0);
+  },
+);
 
 test("commit-status failures are classified without a job rerun operation", async () => {
   h = pollerHarness();
