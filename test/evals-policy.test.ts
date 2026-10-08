@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import type { EvalRound } from "../src/core/types.ts";
 import { proposedOverlay, renderEvidence } from "../src/evals/evidence.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
@@ -435,7 +438,12 @@ test("evidence rendering is reproducible and documents selected runs, missing me
   );
   const markdown = renderEvidence(result);
   expect(markdown).toBe(renderEvidence(result));
-  expect(markdown).toMatchSnapshot();
+  // Read the golden output without asking the snapshot matcher to open it for writing.
+  const snapshots: Record<string, string> = {};
+  runInNewContext(readFileSync(join(import.meta.dir, "__snapshots__/evals-policy.test.ts.snap"), "utf8"), {
+    exports: snapshots,
+  });
+  expect(Object.values(snapshots)).toEqual([`\n"${markdown}"\n`]);
   for (const text of [
     "Wilson 95%",
     "subscription",
