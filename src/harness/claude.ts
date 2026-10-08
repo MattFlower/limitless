@@ -335,8 +335,13 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     }
     // StructuredOutput is how Claude Code returns the final --json-schema answer, not agent work;
     // counting it would trip a zero tool budget exactly when a no-tools call succeeds.
-    if (ev.type === "tool_call" && ev.name !== STRUCTURED_OUTPUT_TOOL && !stuckReason) {
-      const reason = loop.observe(ev.name, ev.input);
+    if (!stuckReason) {
+      const reason =
+        ev.type === "tool_call" && ev.name !== STRUCTURED_OUTPUT_TOOL
+          ? loop.observe(ev.name, ev.input, ev.id)
+          : ev.type === "tool_result"
+            ? loop.observeResult(ev.id, ev.output)
+            : null;
       if (reason) {
         stuckReason = reason;
         spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
@@ -394,8 +399,10 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
         : null,
   };
 
-  if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };
+  if (stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
+  const repeatReason = loop.finish();
+  if (repeatReason) return { ...base, status: "stuck", error: repeatReason };
   if (proc.timedOut) return { ...base, status: "timeout", error: `timed out after ${spec.timeoutMs}ms` };
   if (proc.idleTimedOut)
     return { ...base, status: "stuck", error: `no output for ${Math.round(spec.idleTimeoutMs / 1000)}s` };

@@ -252,7 +252,456 @@ describe("LoopDetector", () => {
     expect(d.observe("Read", { p: 3 })).toBeNull();
     expect(d.observe("Read", { p: 4 })).toContain("budget");
   });
+
+  test("changing results are progress while identical results still stop", () => {
+    for (const changing of [true, false]) {
+      const d = new LoopDetector(100);
+      for (let i = 0; i < 6; i++) {
+        expect(d.observe("shell", { command: "tail test.log" }, String(i))).toBeNull();
+        expect(d.observeResult(String(i), changing ? `${i} tests passed` : "waiting")).toBe(
+          !changing && i === 5 ? "repeated the same shell call 6 times" : null,
+        );
+      }
+    }
+  });
+
+  test("a changed result restarts the count and ignores unmatched or duplicate results", () => {
+    const d = new LoopDetector(100);
+    for (let i = 0; i < 10; i++) {
+      d.observeResult("unmatched", String(i));
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      expect(d.observeResult(String(i), i < 3 ? "waiting" : "progress")).toBe(
+        i === 9 ? "repeated the same shell call 6 times" : null,
+      );
+      expect(d.observeResult(String(i), "duplicate result must be ignored")).toBeNull();
+    }
+  });
+
+  test("missing results still count and changing results still consume the budget", () => {
+    const missing = new LoopDetector(100);
+    for (let i = 0; i < 6; i++) {
+      expect(missing.observe("shell", "poll", String(i))).toBeNull();
+    }
+    expect(missing.finish()).toBe("repeated the same shell call 6 times");
+    const bounded = new LoopDetector(6);
+    for (let i = 0; i < 6; i++) {
+      expect(bounded.observe("shell", "poll", String(i))).toBeNull();
+      bounded.observeResult(String(i), String(i));
+    }
+    expect(bounded.observe("shell", "poll", "6")).toBe("exceeded tool-call budget (6)");
+  });
+
+  test("a missing earlier result counts without denying the threshold result progress", () => {
+    for (const changed of [false, true]) {
+      const d = new LoopDetector(100);
+      expect(d.observe("shell", "poll", "missing")).toBeNull();
+      for (let i = 1; i < 6; i++) {
+        expect(d.observe("shell", "poll", String(i))).toBeNull();
+        expect(d.observeResult(String(i), changed && i === 5 ? "progress" : "waiting")).toBeNull();
+      }
+      if (!changed) expect(d.observe("shell", "poll", "next")).toBe("repeated the same shell call 6 times");
+      if (changed) {
+        // An older completion must not replace the sixth call's newer baseline.
+        expect(d.observeResult("missing", "waiting")).toBeNull();
+        for (let i = 6; i < 12; i++) {
+          expect(d.observe("shell", "poll", String(i))).toBeNull();
+          expect(d.observeResult(String(i), "progress")).toBe(
+            i === 11 ? "repeated the same shell call 6 times" : null,
+          );
+        }
+      }
+    }
+  });
+
+  test("a pending threshold result can show progress only until the next call", () => {
+    for (const nextTool of ["shell", "Read"]) {
+      const d = new LoopDetector(100);
+      for (let i = 0; i < 6; i++) {
+        expect(d.observe("shell", "poll", String(i))).toBeNull();
+        if (i < 5) expect(d.observeResult(String(i), "waiting")).toBeNull();
+      }
+      expect(d.observe(nextTool, "poll", "next")).toBe("repeated the same shell call 6 times");
+    }
+  });
+
+  test("late results that expose a loop preserve the threshold in its reason", () => {
+    const d = new LoopDetector(100);
+    for (let i = 0; i < 9; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      if (i !== 1 && i !== 2) {
+        expect(d.observeResult(String(i), i === 0 ? "waiting" : "progress")).toBeNull();
+      }
+    }
+    expect(d.observeResult("1", "progress")).toBeNull();
+    expect(d.observeResult("2", "progress")).toBe("repeated the same shell call 6 times");
+  });
+
+  test("results match IDs across interleaved calls and late completions in call order", () => {
+    const d = new LoopDetector(100);
+    expect(d.observe("shell", "poll", "first")).toBeNull();
+    expect(d.observe("Read", "file", "read")).toBeNull();
+    d.observeResult("first", "waiting");
+    d.observeResult("read", "contents");
+    expect(d.observe("shell", "poll", "late")).toBeNull();
+    expect(d.observe("shell", "poll", "newer")).toBeNull();
+    expect(d.observeResult("newer", "progress")).toBeNull();
+    expect(d.observeResult("late", "waiting")).toBeNull();
+    for (let i = 3; i <= 8; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      expect(d.observeResult(String(i), "progress")).toBe(
+        i === 8 ? "repeated the same shell call 6 times" : null,
+      );
+    }
+  });
+
+  test("the threshold result can establish progress, even with parallel calls", () => {
+    for (const parallel of [false, true]) {
+      for (const outputs of [
+        ["waiting", "waiting", "waiting", "waiting", "waiting", "progress"],
+        Array.from({ length: 6 }, (_, i) => String(i)),
+        Array.from({ length: 6 }, () => "waiting"),
+      ]) {
+        const d = new LoopDetector(100);
+        if (parallel) for (let i = 0; i < 6; i++) expect(d.observe("shell", "poll", String(i))).toBeNull();
+        for (const [i, output] of outputs.entries()) {
+          if (!parallel) expect(d.observe("shell", "poll", String(i))).toBeNull();
+          expect(d.observeResult(String(i), output)).toBe(
+            i === 5 && output === "waiting" ? "repeated the same shell call 6 times" : null,
+          );
+        }
+      }
+    }
+  });
+
+  test("timestamp-only and counter-only changes are bounded by the unchanged budget", () => {
+    for (const command of ["sleep 5; date +%s", "poll counter"]) {
+      const d = new LoopDetector(20);
+      for (let i = 0; i < 20; i++) {
+        expect(d.observe("shell", command, String(i))).toBeNull();
+        expect(d.observeResult(String(i), String(1_000_000 + i))).toBeNull();
+      }
+      expect(d.observe("shell", command, "20")).toBe("exceeded tool-call budget (20)");
+    }
+  });
+
+  test("completed and unresolved state is bounded by the window and evicted IDs are ignored", () => {
+    for (const completed of [false, true]) {
+      const d = new LoopDetector(1000);
+      // Inspect retained state to catch unbounded keys, including large serialized inputs.
+      const state = d as unknown as {
+        recent: { key: string }[];
+        pending: Map<string, unknown>;
+        results: Map<string, string>;
+      };
+      for (let i = 0; i < 400; i++) {
+        expect(d.observe("apply_patch", `${i}:${"x".repeat(20_000)}`, String(i))).toBeNull();
+        if (completed) expect(d.observeResult(String(i), "done")).toBeNull();
+        expect(state.recent.length).toBeLessThanOrEqual(12);
+        expect(state.pending.size).toBeLessThanOrEqual(12);
+        expect(state.results.size).toBeLessThanOrEqual(12);
+        const keys = new Set(state.recent.map((entry) => entry.key));
+        expect([...state.results.keys()].every((key) => keys.has(key))).toBe(true);
+      }
+      expect(d.observeResult("0", "late evicted result")).toBeNull();
+      expect(state.results.size).toBe(completed ? 12 : 0);
+    }
+  });
+
+  test("eviction unblocks later completions and evicted results cannot reset a live key", () => {
+    const d = new LoopDetector(100);
+    expect(d.observe("shell", "poll", "old")).toBeNull();
+    expect(d.observe("shell", "poll", "new")).toBeNull();
+    expect(d.observeResult("new", "progress")).toBeNull();
+    for (let i = 0; i < 11; i++) expect(d.observe("Read", i, `read-${i}`)).toBeNull();
+    expect(d.observeResult("old", "stale")).toBeNull();
+    // The baseline survives while its key is live, even after its originating call is evicted.
+    for (let i = 0; i < 5; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      expect(d.observeResult(String(i), "progress")).toBeNull();
+    }
+    expect(d.observe("shell", "poll", "stop")).toBeNull();
+    expect(d.observeResult("stop", "progress")).toBe("repeated the same shell call 6 times");
+  });
+
+  test("progress clears only its key and retains the twelve-call window", () => {
+    const d = new LoopDetector(100);
+    expect(d.observe("Read", "file")).toBeNull();
+    for (let i = 0; i < 8; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      d.observeResult(String(i), i < 3 ? "waiting" : "progress");
+    }
+    for (let i = 0; i < 3; i++) expect(d.observe("other", i)).toBeNull();
+    for (let i = 0; i < 5; i++) expect(d.observe("Read", "file")).toBeNull();
+    expect(d.observe("Read", "file")).toBe("repeated the same Read call 6 times");
+  });
 });
+
+for (const harness of ["codex", "claude"] as const) {
+  const tools =
+    harness === "codex"
+      ? ["shell", "apply_patch", "test.poll", "web_search"]
+      : ["Bash", "Edit", "mcp__test__poll"];
+  test(`${harness} parser waits for a late predecessor to establish progress`, () => {
+    const detector = new LoopDetector(100);
+    const onEvent = (event: AgentEvent) => {
+      if (event.type === "tool_call") expect(detector.observe(event.name, event.input, event.id)).toBeNull();
+      if (event.type === "tool_result") expect(detector.observeResult(event.id, event.output)).toBeNull();
+    };
+    const parser = harness === "codex" ? new CodexStreamParser(onEvent) : new ClaudeStreamParser(onEvent);
+    const call = (i: number) =>
+      parser.feed(
+        JSON.stringify(
+          harness === "codex"
+            ? { type: "item.started", item: { type: "command_execution", id: String(i), command: "poll" } }
+            : {
+                type: "assistant",
+                message: {
+                  content: [{ type: "tool_use", id: String(i), name: "Bash", input: { command: "poll" } }],
+                },
+              },
+        ),
+      );
+    const complete = (i: number, output: string) =>
+      parser.feed(
+        JSON.stringify(
+          harness === "codex"
+            ? {
+                type: "item.completed",
+                item: {
+                  type: "command_execution",
+                  id: String(i),
+                  command: "poll",
+                  aggregated_output: output,
+                  exit_code: 0,
+                },
+              }
+            : {
+                type: "user",
+                message: { content: [{ type: "tool_result", tool_use_id: String(i), content: output }] },
+              },
+        ),
+      );
+    call(1);
+    complete(1, "A");
+    for (let i = 2; i <= 6; i++) call(i);
+    for (let i = 6; i >= 3; i--) complete(i, "A");
+    complete(2, "B");
+    expect(detector.finish()).toBeNull();
+  });
+  for (const tool of tools) {
+    test(`${harness} ${tool} parser events detect loops during the invocation`, async () => {
+      const modes =
+        tool === tools[0]
+          ? [
+              "changing",
+              "threshold",
+              "identical",
+              "missing",
+              "missing-stream",
+              "missing-timeout",
+              "missing-failure",
+              "truncated",
+              "parallel-changing",
+              "parallel-threshold",
+              "parallel-identical",
+              "parallel-changing-reverse",
+              "parallel-identical-reverse",
+              "late",
+              "budget",
+            ]
+          : tool === "web_search"
+            ? ["identical"]
+            : ["threshold", "identical"];
+      for (const mode of modes) {
+        await withScratch(import.meta.dir, async (scratchDir) => {
+          const result = await (harness === "codex" ? verifiedCodex : runClaude)(
+            {
+              cwd: import.meta.dir,
+              scratchDir,
+              prompt: "poll tests",
+              mode: "readonly",
+              target: {
+                modelId: `${harness}/test`,
+                provider: harness,
+                harness,
+                model: "test",
+                vendor: "other",
+                tier: 4,
+                billing: "subscription",
+              },
+              timeoutMs: 1000,
+              idleTimeoutMs: 1000,
+              maxToolCalls: mode === "budget" ? 6 : 100,
+              signal: new AbortController().signal,
+              logPath: join(scratchDir, "log"),
+              onEvent: () => {},
+            },
+            async (opts) => {
+              const emit = (record: unknown) => opts.onStdoutLine?.(JSON.stringify(record));
+              const call = (i: number) => {
+                const id = `poll-${i}`;
+                if (harness === "claude") {
+                  emit({
+                    type: "assistant",
+                    message: {
+                      content: [{ type: "tool_use", id, name: tool, input: { command: "tail test.log" } }],
+                    },
+                  });
+                } else if (tool !== "apply_patch") {
+                  emit({
+                    type: "item.started",
+                    item:
+                      tool === "shell"
+                        ? { type: "command_execution", id, command: "tail test.log" }
+                        : tool === "web_search"
+                          ? { type: "web_search", id, query: "test progress" }
+                          : {
+                              type: "mcp_tool_call",
+                              id,
+                              server: "test",
+                              tool: "poll",
+                              arguments: { log: "test.log" },
+                            },
+                  });
+                }
+              };
+              const complete = (i: number, output: string) => {
+                const id = `poll-${i}`;
+                if (harness === "claude") {
+                  emit({
+                    type: "user",
+                    message: {
+                      content: [
+                        {
+                          type: "tool_result",
+                          tool_use_id: id,
+                          content: [{ type: "text", text: output }],
+                          is_error: Boolean(i % 2),
+                        },
+                      ],
+                    },
+                  });
+                } else {
+                  emit({
+                    type: "item.completed",
+                    item:
+                      tool === "shell"
+                        ? {
+                            type: "command_execution",
+                            id,
+                            command: "tail test.log",
+                            aggregated_output: output,
+                            exit_code: i % 2,
+                          }
+                        : tool === "apply_patch"
+                          ? {
+                              type: "file_change",
+                              id,
+                              changes: [{ path: "test.txt", kind: "update" }],
+                              status: output === "progress" ? "completed" : "failed",
+                            }
+                          : tool === "web_search"
+                            ? { type: "web_search", id, query: "test progress" }
+                            : { type: "mcp_tool_call", id, result: output },
+                  });
+                }
+              };
+              const parallel = mode.startsWith("parallel");
+              const count = mode === "missing-stream" ? 20 : mode === "late" ? 9 : mode === "budget" ? 7 : 6;
+              if (parallel) {
+                if (harness === "claude") {
+                  emit({
+                    type: "assistant",
+                    message: {
+                      content: Array.from({ length: count }, (_, i) => ({
+                        type: "tool_use",
+                        id: `poll-${i}`,
+                        name: tool,
+                        input: { command: "tail test.log" },
+                      })),
+                    },
+                  });
+                  expect(opts.signal?.aborted).toBe(false);
+                } else {
+                  for (let i = 0; i < count; i++) {
+                    call(i);
+                    expect(opts.signal?.aborted).toBe(false);
+                  }
+                }
+              }
+              for (let i = 0; i < count; i++) {
+                if (!parallel) call(i);
+                if (mode === "missing-stream" && i === 6) {
+                  // The runner intended to emit more than a window, but must stop in flight.
+                  expect(opts.signal?.aborted).toBe(true);
+                  break;
+                }
+                if (mode === "budget" && i === 6) {
+                  expect(opts.signal?.aborted).toBe(true);
+                  break;
+                }
+                // Searches have no result text; the sixth call must stop before completion.
+                expect(opts.signal?.aborted).toBe(tool === "web_search" && i === 5);
+                if (mode === "late" && i === 1) continue;
+                const resultIndex = mode.endsWith("reverse") ? count - 1 - i : i;
+                const output =
+                  mode.includes("changing") || mode === "budget"
+                    ? String(1_000_000 + resultIndex)
+                    : (mode.includes("threshold") && i === 5) || (mode === "late" && i >= 2)
+                      ? "progress"
+                      : mode === "truncated"
+                        ? `${"x".repeat(20_000)}${i}`
+                        : "waiting";
+                if (!mode.startsWith("missing")) complete(resultIndex, output);
+                if (mode === "late" && i === 2) complete(1, "waiting");
+                // A result without a corresponding call must not affect another call's baseline.
+                emit(
+                  harness === "codex"
+                    ? { type: "item.completed", item: { type: "mcp_tool_call", id: "orphan", result: i } }
+                    : {
+                        type: "user",
+                        message: {
+                          content: [{ type: "tool_result", tool_use_id: "orphan", content: String(i) }],
+                        },
+                      },
+                );
+                const stopped =
+                  ((mode.includes("identical") || mode === "truncated") && i === 5) ||
+                  (mode === "late" && i === 8);
+                expect(opts.signal?.aborted).toBe(stopped);
+              }
+              emit(
+                harness === "codex"
+                  ? { type: "turn.completed", usage: {} }
+                  : { type: "result", result: "done" },
+              );
+              return {
+                exitCode: mode === "missing-failure" ? 1 : 0,
+                signal: null,
+                truncated: false,
+                durationMs: 1,
+                stdout: "",
+                stderr: "",
+                timedOut: mode === "missing-timeout",
+                idleTimedOut: false,
+                cancelled: opts.signal?.aborted ?? false,
+              };
+            },
+          );
+          const progress = mode.includes("changing") || mode.includes("threshold");
+          expect(result.status).toBe(progress ? "ok" : "stuck");
+          expect(result.error).toBe(
+            progress
+              ? null
+              : mode === "budget"
+                ? "exceeded tool-call budget (6)"
+                : `repeated the same ${tool} call 6 times`,
+          );
+        });
+      }
+    });
+  }
+}
 
 test("priceOf charges cache reads at a discount", () => {
   const usage = { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 };
