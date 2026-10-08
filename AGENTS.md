@@ -92,6 +92,11 @@ as the same user.
   (`bun run check`, `bun run test`, or `bun test` without file arguments): the gates run it after every
   round. In a hand-run session, run `bun run check` once at the end. The suite takes 8 to 11 minutes
   alone and over 20 on a loaded machine, and concurrent full runs push each other's gates into timeouts.
+- **Keep generated load bounded.** To reproduce a race under contention, first run the affected
+  test files together under `bun test --parallel=4`, which is the real load. If you must add
+  synthetic CPU load, use at most 4 processes for at most 10 minutes, keep their pids, and stop
+  exactly those. (An implementer once ran about 20 busy loops for 30 minutes; the machine's load
+  reached 44 and every other run's gates starved until the run was cancelled.)
 - **Don't hardcode `/tmp` or `/var/tmp`.** Confined commands get `TMPDIR` pointing into private
   scratch and can't write the system temp directories. Use `os.tmpdir()`/`mkdtemp` in TypeScript and
   `${TMPDIR:-/tmp}` in shell.
@@ -110,7 +115,10 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   `test/confinement.ts` in the title: they run on unconfined macOS (development and the manual
   `land-pr.sh` check) and skip on other platforms and inside confined gates, including land-queue
   checks. Check a profile change with a real probe (a command that must be denied and one that must
-  be allowed); reading the profile isn't enough.
+  be allowed); reading the profile isn't enough. A gate whose output contains
+  `sandbox_apply: Operation not permitted` counts as a confinement failure, not a test result, so
+  keep that literal out of test titles and printed strings (a `test.each` title containing it once
+  blocked a round as a confinement error).
 - **Subprocesses** go through `sh`/`runProcess` (`src/util/proc.ts`): abort signals, timeouts, the
   per-run process scope and descendant cleanup depend on it. The few direct spawns (preview servers,
   the SSH tunnel, `gate-slot`) manage their own lifecycle; don't add more without a reason. Agent
