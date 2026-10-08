@@ -3,6 +3,7 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
@@ -245,7 +246,7 @@ export interface ProcOptions {
   timeoutMs?: number;
   /** Kill when neither stdout nor stderr produced output for this long. */
   idleTimeoutMs?: number;
-  /** Redact decoded streams before line framing and tail cuts. */
+  /** Strip terminal controls and redact decoded streams before line framing and tail cuts. */
   redactOutput?: boolean;
   /** Raw decoded chunks for internal checks only; never retain or forward them. */
   onRawChunk?: (chunk: string, stream: "stdout" | "stderr") => void;
@@ -271,6 +272,11 @@ export interface ProcResult {
 }
 
 const DEFAULT_TAIL = 64_000;
+const VT_ESCAPE = "\u001b";
+const MAX_PENDING_VT = 4_096;
+const INCOMPLETE_VT = new RegExp(
+  String.raw`(?:${VT_ESCAPE}(?:\][^${"\u0007\u001b\u009c"}]*(?:${VT_ESCAPE})?|\[[0-?]*[ -/]*|[ -/]*)|${"\u009b"}[0-?]*[ -/]*)$`,
+);
 
 function lineSplitter(onLine?: (line: string) => void) {
   let pending = "";
@@ -440,6 +446,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stderr.setEncoding("utf8");
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
       let pending = "";
+      let terminalPending = "";
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
@@ -450,16 +457,34 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
           lastActivity = Date.now();
           opts.onRawChunk?.(chunk, stream);
           if (!opts.redactOutput) return emit(chunk);
-          pending = redactCredentials(pending + chunk);
+          const decoded = terminalPending + chunk;
+          // Hold incomplete CSI, OSC and ESC sequences until stripping can see them whole.
+          const incomplete = decoded.match(INCOMPLETE_VT);
+          // An unterminated sequence (a stray ESC ] in binary output) must not hold the stream forever.
+          const held = incomplete?.index !== undefined && decoded.length - incomplete.index <= MAX_PENDING_VT;
+          const terminalCut = held ? (incomplete?.index ?? decoded.length) : decoded.length;
+          terminalPending = decoded.slice(terminalCut);
+          pending += stripVTControlCharacters(decoded.slice(0, terminalCut));
           // Retain possible credential prefixes, including JSON-escaped forms, across chunks.
           const overlap = Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
-          const cut = Math.max(0, pending.length - overlap);
-          emit(pending.slice(0, cut));
+          let cut = Math.max(0, pending.length - overlap);
+          // A complete match crossing the cut must also stay raw: replacing a shorter
+          // prefix in the carry would destroy a longer credential arriving next.
+          let previousCut: number;
+          do {
+            previousCut = cut;
+            for (const [secret] of sortedCredentialVariants) {
+              const start = pending.indexOf(secret, Math.max(0, cut - secret.length + 1));
+              if (start >= 0 && start < cut && start + secret.length > cut) cut = start;
+            }
+          } while (cut !== previousCut);
+          emit(redactCredentials(pending.slice(0, cut)));
           pending = pending.slice(cut);
         },
         flush() {
-          emit(redactCredentials(pending));
+          emit(redactCredentials(pending + stripVTControlCharacters(terminalPending)));
           pending = "";
+          terminalPending = "";
         },
       };
     };

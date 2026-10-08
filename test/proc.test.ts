@@ -42,6 +42,119 @@ async function withChunks<T>(chunks: Chunk[], run: () => Promise<T>): Promise<T>
 
 const options = (): ProcOptions => ({ cmd: ["fixture"], cwd: process.cwd(), env: {} });
 
+test("runner keeps overlapping credentials raw in one chunk and at every split offset", async () => {
+  const short = 'synthetic-overlap-"key"-\\prefix';
+  const long = `${short}-private-overlap-footer`;
+  registerCredential("OVERLAP_SHORT_TEST_TOKEN", short);
+  registerCredential("OVERLAP_LONG_TEST_TOKEN", long);
+  for (const value of [long, JSON.stringify(long).slice(1, -1)]) {
+    for (const stream of ["stdout", "stderr"] as const) {
+      // Also split after the full value, so a complete match can cross the carry cut.
+      for (let offset = 0; offset < value.length + 20; offset++) {
+        const text = `error: ${value}\n(fail) overlap\n${"z".repeat(200)}`;
+        const chunks = offset
+          ? [
+              { stream, text: text.slice(0, 7 + offset) },
+              { stream, text: text.slice(7 + offset) },
+            ]
+          : [{ stream, text }];
+        const lines: string[] = [];
+        const result = await withChunks(chunks, () =>
+          runProcess({
+            ...options(),
+            redactOutput: true,
+            onStdoutLine: (line) => lines.push(line),
+            onStderrLine: (line) => lines.push(line),
+          }),
+        );
+        expect(result[stream]).toBe(`error: [redacted]\n(fail) overlap\n${"z".repeat(200)}`);
+        expect(lines).toEqual(["error: [redacted]", "(fail) overlap", "z".repeat(200)]);
+      }
+    }
+  }
+});
+
+test("runner strips split terminal sequences before matching and leaves raw observation unchanged", async () => {
+  const secret = "synthetic-terminal-chunk-credential";
+  registerCredential("TERMINAL_CHUNK_TEST_TOKEN", secret);
+  for (const control of ["\u001b[31m", "\u009b38;5;1m", "\u001b]0;title\u0007", "\u001b]0;title\u001b\\"]) {
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 1; offset < control.length; offset++) {
+        const raw: string[] = [];
+        const lines: string[] = [];
+        const prefix = `error: ${secret.slice(0, 12)}`;
+        const suffix = `${secret.slice(12)}\u001b[0m\n(fail) terminal\n`;
+        const result = await withChunks(
+          [
+            { stream, text: prefix + control.slice(0, offset) },
+            { stream, text: control.slice(offset) + suffix },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              onRawChunk: (chunk) => raw.push(chunk),
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(result[stream]).toBe("error: [redacted]\n(fail) terminal\n");
+        expect(lines).toEqual(["error: [redacted]", "(fail) terminal"]);
+        expect(raw.join("")).toBe(prefix + control + suffix);
+      }
+    }
+  }
+});
+
+test("runner strips ANSI before the tail cap around a long credential", async () => {
+  const secret = `synthetic-ansi-cap-${"s".repeat(2_000)}-private-ansi-cap-footer`;
+  registerCredential("ANSI_CAP_TEST_TOKEN", secret);
+  const colored = `${secret.slice(0, 1_800)}\u001b[31m${secret.slice(1_800)}`;
+  const text = colored + "\u001b[0m".repeat(16_000);
+  for (const stream of ["stdout", "stderr"] as const) {
+    const result = await withChunks([{ stream, text }], () =>
+      runProcess({ ...options(), redactOutput: true }),
+    );
+    expect(result[stream]).toBe("[redacted]");
+    expect(result.truncated).toBe(false);
+  }
+});
+
+test("runner does not reprocess redaction markers in its carry", async () => {
+  // Isolate the registration of marker text from every other test's credentials.
+  const script = `
+    import { spyOn } from "bun:test";
+    import * as subprocess from "node:child_process";
+    import { EventEmitter } from "node:events";
+    import { PassThrough } from "node:stream";
+    import { registerCredential, runProcess } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).href)};
+    registerCredential("MARKER_TEXT_TEST_TOKEN", "redacted");
+    const secret = "synthetic-marker-[redacted]-" + "x".repeat(100);
+    registerCredential("MARKER_CREDENTIAL_TEST_TOKEN", secret);
+    const fixture = spyOn(subprocess, "spawn").mockImplementation(() => {
+      const child = Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough()
+      });
+      setImmediate(() => {
+        child.stdout.write(secret);
+        child.stdout.write(" redacted ");
+        for (let i = 0; i < 40; i++) child.stdout.write("q");
+        child.stdout.end(); child.stderr.end();
+        setImmediate(() => child.emit("close", 0, null));
+      });
+      return child;
+    });
+    try {
+      const result = await runProcess({ cmd: ["fixture"], cwd: process.cwd(), env: {}, redactOutput: true });
+      console.log(JSON.stringify(result.stdout));
+    } finally { fixture.mockRestore(); }
+  `;
+  const result = await runProcess({ ...options(), cmd: [process.execPath, "-e", script] });
+  expect(result.exitCode).toBe(0);
+  // One redactCredentials call also matches the marker text it inserts, once.
+  expect(JSON.parse(result.stdout)).toBe(`[[redacted]] [redacted] ${"q".repeat(40)}`);
+});
+
 test("runner redaction handles every two-chunk offset on both streams before framing and cuts", async () => {
   const secret = 'synthetic-offset-"key"-\\slash\n\n(fail) x\nsecret-footer';
   registerCredential("CHUNK_OFFSET_TEST_TOKEN", secret);
@@ -180,7 +293,8 @@ test("runner without redaction retains raw callbacks, empty-line framing, tails 
   const chunks: Chunk[] = [
     { stream: "stdout", text: Buffer.from(`\n${secret.slice(0, 9)}`) },
     { stream: "stderr", text: Buffer.from(`\n${secret}\nlast-error`) },
-    { stream: "stdout", text: Buffer.from(`${secret.slice(9)}\n\nfinal`) },
+    { stream: "stdout", text: Buffer.from(`${secret.slice(9)}\n\n\u001b[`) },
+    { stream: "stdout", text: Buffer.from("31mfinal\u001b[0m") },
   ];
   const result = await withChunks(chunks, () =>
     runProcess({
@@ -190,9 +304,9 @@ test("runner without redaction retains raw callbacks, empty-line framing, tails 
       onStderrLine: (line) => stderrLines.push(line),
     }),
   );
-  expect(stdoutLines).toEqual([secret, "final"]);
+  expect(stdoutLines).toEqual([secret, "\u001b[31mfinal\u001b[0m"]);
   expect(stderrLines).toEqual([secret, "last-error"]);
-  expect(result.stdout).toBe(`${secret}\n\nfinal`.slice(-12));
+  expect(result.stdout).toBe(`${secret}\n\n\u001b[31mfinal\u001b[0m`.slice(-12));
   expect(result.stderr).toBe(`${secret}\nlast-error`.slice(-12));
   expect(result).toMatchObject({
     exitCode: 0,
@@ -204,4 +318,26 @@ test("runner without redaction retains raw callbacks, empty-line framing, tails 
     runProcess({ ...options(), encoding: "latin1" }),
   );
   expect(encoded.stdout).toBe("ÿ");
+});
+
+test("runner releases an unterminated terminal sequence instead of holding the stream", async () => {
+  const lines: string[] = [];
+  const seenAtChunk: number[] = [];
+  const body = "x".repeat(5_000);
+  await withChunks(
+    [
+      { stream: "stdout", text: `before\n\u001b]${body}\n` },
+      { stream: "stdout", text: "after\n" },
+    ],
+    () =>
+      runProcess({
+        ...options(),
+        redactOutput: true,
+        onRawChunk: () => seenAtChunk.push(lines.length),
+        onStdoutLine: (line) => lines.push(line),
+      }),
+  );
+  // Past the hold limit, the stray sequence's text is released while the stream is still running.
+  expect(seenAtChunk[1]).toBe(2);
+  expect(lines.at(-1)).toBe("after");
 });

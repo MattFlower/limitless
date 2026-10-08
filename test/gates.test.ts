@@ -366,6 +366,50 @@ describe("runGates / compareGates", () => {
     }
   });
 
+  test("redacts ANSI on every line of a multiline credential before excerpts and artifacts", async () => {
+    const secret = "synthetic-colored-first-paragraph\n\nsynthetic-colored-last-paragraph";
+    proc.registerCredential("COLORED_MULTILINE_TEST_TOKEN", secret);
+    const colored = secret
+      .split("\n")
+      .map((line) => `\u001b[31m${line}\u001b[0m`)
+      .join("\n");
+    const output = `error: ${colored}\n(fail) colored assertion\n`;
+    const dir = tempDir({
+      "emit.ts": `process.stdout.write(${JSON.stringify(output)}); process.exitCode = 1;`,
+    });
+    const store = new Store(":memory:");
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [{ name: "test", run: `'${process.execPath}' emit.ts` }],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.output).toBe("error: [redacted]\n(fail) colored assertion");
+      expect(run.checks[0]?.failures).toBe("error: [redacted]\n(fail) colored assertion");
+      const repo = store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        localPath: null,
+        url: "https://example.com/repo",
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const saved = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+      store.putArtifact(saved.id, "gates.json", "gates", JSON.stringify(run));
+      const artifact = store.getArtifact(saved.id, "gates.json");
+      expect(artifact).toContain("[redacted]");
+      for (const fragment of secret.split("\n").filter(Boolean)) expect(artifact).not.toContain(fragment);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("retains early failure diagnostics in the result and its existing artifact", async () => {
     const output =
       "sample.test.ts:\n(pass) earlier\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +
