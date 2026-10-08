@@ -1,6 +1,8 @@
 import { stripVTControlCharacters } from "node:util";
 import type { GateResult } from "./run.ts";
 
+const FAILURE_RESULT = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/;
+const TIMEOUT = /^\^ this test timed out after \d+(?:\.\d+)?ms\.$/;
 const OMITTED = "[failure excerpts: diagnostic lines or failures left out]";
 
 /** Capture before the process runner truncates output, retaining only bounded diagnostics. */
@@ -17,11 +19,11 @@ export class FailureExcerpts {
     const text = line.trim();
     if (this.failure !== undefined) {
       // Bun emits the timeout explanation just after the result, unlike assertion diagnostics.
-      const timeout = /^\^ this test timed out after \d+(?:\.\d+)?ms\.$/.test(text);
+      const timeout = TIMEOUT.test(text);
       this.finish(timeout ? line : undefined);
       if (timeout) return;
     }
-    const failure = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/.test(text);
+    const failure = FAILURE_RESULT.test(text);
     if (failure) {
       this.failure = line;
     } else if (/^(?:(?:\((?:pass|skip|todo)\)|✓|»)(?:\s|$)|ok(?:\s|$)|.+\.test\.ts:$)/.test(text)) {
@@ -71,11 +73,33 @@ export function extractFailures(output: string): string | undefined {
   return excerpts.result();
 }
 
+/** Reserve complete result lines before spending the remaining budget on diagnostics. */
+function shortenFailureExcerpts(excerpt: string, limit: number): string {
+  if (excerpt.length <= limit) return excerpt;
+  const lines = excerpt.split("\n").filter((line) => line !== OMITTED);
+  const identities = new Set<number>();
+  let room = limit - OMITTED.length;
+  for (const [i, line] of lines.entries()) {
+    if ((FAILURE_RESULT.test(line.trim()) || TIMEOUT.test(line.trim())) && line.length + 1 <= room) {
+      identities.add(i);
+      room -= line.length + 1;
+    }
+  }
+  const kept: string[] = [];
+  for (const [i, line] of lines.entries()) {
+    if (identities.has(i)) kept.push(line);
+    else if (!FAILURE_RESULT.test(line.trim()) && !TIMEOUT.test(line.trim()) && room > 1) {
+      const diagnostic = line.slice(0, room - 1);
+      kept.push(diagnostic);
+      room -= diagnostic.length + 1;
+    }
+  }
+  return [...kept, OMITTED].join("\n");
+}
+
 /** Excerpts come first; legacy results keep their original tail budget. */
 export function formatGateOutput(result: Pick<GateResult, "output" | "failures">, limit = 3_000): string {
   if (!result.failures) return result.output.slice(-limit);
-  const room = limit - 1_000 - OMITTED.length - 3;
-  const failures =
-    result.failures.length > room ? `${result.failures.slice(0, room)}\n${OMITTED}` : result.failures;
+  const failures = shortenFailureExcerpts(result.failures, limit - 1_002);
   return `${failures}\n\n${result.output.slice(-1_000)}`;
 }

@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
-import { formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { extractFailures } from "../src/gates/failures.ts";
+import type { GateComparison } from "../src/gates/run.ts";
+import { formatGateFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
 
-function feedback(output: string, failures?: string, timedOut = true): string {
-  return formatGateFeedback([
+function comparison(output: string, failures?: string, timedOut = true): GateComparison[] {
+  return [
     {
       name: "test",
       verdict: "regressed",
@@ -18,7 +20,11 @@ function feedback(output: string, failures?: string, timedOut = true): string {
         ...(failures ? { failures } : {}),
       },
     },
-  ]);
+  ];
+}
+
+function feedback(output: string, failures?: string, timedOut = true): string {
+  return formatGateFeedback(comparison(output, failures, timedOut));
 }
 
 test.each([false, true])(
@@ -72,3 +78,32 @@ test("timeout feedback recognizes indented TAP completion with ANSI and CRLF", (
     feedback("\u001b[32m  # Subtest: completed test\u001b[0m\r\n  ok 1 - completed test\r\n"),
   ).not.toContain("the last test running was completed test");
 });
+
+for (const consumer of ["feedback", "review"]) {
+  test.each([
+    ["(fail) identifier", "(fail) identifier"],
+    ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
+    ["not ok 1 - tap identifier", "not ok 1 - tap identifier"],
+  ])(`${consumer} keeps the complete identity after a long diagnostic: %s`, (result, identity) => {
+    const failures = extractFailures(`error: reason\n${"x".repeat(9_000)}\n${result}`);
+    const gates = comparison("summary\n".repeat(800), failures, false);
+    const message =
+      consumer === "feedback"
+        ? formatGateFeedback(gates)
+        : reviewPrompt({
+            prompt: "fix tests",
+            spec: null,
+            baseSha: "base",
+            stat: "",
+            gates,
+            audit: [],
+            implementerReport: "",
+          });
+    expect(message).toContain(identity);
+    expect(message).toContain("error: reason");
+    expect(message).toContain("left out");
+    expect(message.indexOf(identity)).toBeLessThan(message.indexOf("summary"));
+    expect(message).not.toContain("\u001b");
+    if (consumer === "feedback") expect(message.length).toBeLessThan(3_300);
+  });
+}

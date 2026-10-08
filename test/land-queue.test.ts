@@ -519,10 +519,13 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
   expect(feed[1]?.data).toMatchObject({ url: url(1), sha: approved, reason: "CI failed: build, typecheck" });
 });
 
-test("a failing land check blocks the entry with the check names and no output", async () => {
+test.each([
+  ["(fail) identifier", "(fail) identifier"],
+  ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
+])("a failing land check keeps its identity after a long diagnostic: %s", async (result, identity) => {
   writeFileSync(
     join(seed, "output.txt"),
-    "sample.test.ts:\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +
+    `sample.test.ts:\nerror: values differ\nExpected: 1\nReceived: 2\n${"x".repeat(9_000)}\n${result}\n` +
       "skipped summary\n".repeat(700),
   );
   writeFileSync(
@@ -546,6 +549,9 @@ test("a failing land check blocks the entry with the check names and no output",
   expect(blocked?.reason).not.toContain("secret in output");
   const log = readFileSync(blocked?.logPath ?? "", "utf8");
   expect(log).toContain("error: values differ\nExpected: 1\nReceived: 2");
+  expect(log).toContain(identity);
+  expect(log).toContain("left out");
+  expect(log.indexOf(identity)).toBeLessThan(log.indexOf("skipped summary"));
   expect(log.indexOf("error:")).toBeLessThan(log.indexOf("skipped summary"));
   expect(ghCalls("pr merge")).toEqual([]);
 });

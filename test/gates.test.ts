@@ -23,7 +23,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { extractFailures } from "../src/gates/failures.ts";
+import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
@@ -318,6 +318,20 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
       expect(excerpt).toContain("left out");
     },
   );
+
+  test.each([3_000, 9_000])("shortening to %i keeps every identity and the timeout explanation", (limit) => {
+    const timeout = "  ^ this test timed out after 25ms.";
+    const failures = extractFailures(
+      `error: first\n(fail) first\nerror: reason\n${"x".repeat(9_000)}\n✗ second\n${timeout}`,
+    );
+    const output = formatGateOutput({ output: "summary\n".repeat(800), failures }, limit);
+    expect(output).toContain("(fail) first");
+    expect(output).toContain(`✗ second\n${timeout}`);
+    expect(output.indexOf("(fail) first")).toBeLessThan(output.indexOf("✗ second"));
+    expect(output.indexOf("✗ second")).toBeLessThan(output.indexOf("summary"));
+    expect(output).toContain("left out");
+    expect(output.length).toBeLessThanOrEqual(limit);
+  });
 });
 
 describe("gate slots and flaky retry", () => {
