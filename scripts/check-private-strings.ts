@@ -29,8 +29,12 @@ try {
   }
   const head = z.optional(z.string().regex(/^[a-f0-9]{40,64}$/i)).parse(process.argv[6]);
   if (head) await worktreeGit(["git", "cat-file", "-e", `${head}^{commit}`], { cwd: process.cwd() });
-  const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd: process.cwd() });
-  const entries = privacy.loadPrivateStrings(undefined, [process.cwd(), resolve(common.stdout.trim(), "..")]);
+  // Landing supplies inert source paths while all Git runs from its private repository.
+  const source = process.env.LIMITLESS_LAND_SOURCE_DIR ?? process.cwd();
+  const common =
+    process.env.LIMITLESS_LAND_SOURCE_COMMON_DIR ??
+    (await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd: process.cwd() })).stdout.trim();
+  const entries = privacy.loadPrivateStrings(undefined, [source, resolve(common, "..")]);
   if (process.argv[4] === "--merge") {
     const [pr = "", repo = "", , sha = ""] = process.argv.slice(2);
     const opts = { cwd: process.cwd() };
