@@ -150,8 +150,7 @@ interface LoopCall {
   name: string;
   id?: string;
   hash?: string;
-  processed: boolean;
-  counted: boolean;
+  previous?: string;
 }
 
 /**
@@ -172,8 +171,11 @@ export class LoopDetector {
   observe(name: string, input: unknown, id?: string): string | null {
     this.total++;
     if (this.total > this.maxToolCalls) return `exceeded tool-call budget (${this.maxToolCalls})`;
+    // A threshold call may show progress until the next call, but cannot defer a stop forever.
+    const reason = this.reconcile(true);
+    if (reason) return reason;
     const key = `${name}:${JSON.stringify(input)}`;
-    const entry = { key, name, id, processed: false, counted: false };
+    const entry = { key, name, id, previous: this.results.get(key) };
     if (id !== undefined) this.pending.set(id, entry);
     this.recent.push(entry);
     if (this.recent.length > this.window) {
@@ -193,37 +195,37 @@ export class LoopDetector {
     return this.reconcile();
   }
 
-  /** Only invocation completion establishes that a pending result is missing. */
+  /** Invocation completion ends the threshold call's opportunity to show progress. */
   finish(): string | null {
     return this.reconcile(true);
   }
 
   private reconcile(finished = false): string | null {
-    // A later completion waits for earlier calls of its key so baselines follow call order.
-    const blocked = new Set<string>();
+    // Replay the bounded window so late results compare in call order. Each entry remembers
+    // its preceding baseline, including when that baseline's call has left the window.
+    const baselines = new Map<string, string | undefined>();
+    const counts = new Map<string, { same: number; last: LoopCall }>();
     for (const entry of this.recent) {
-      if (entry.processed || blocked.has(entry.key)) continue;
-      if (entry.id !== undefined && entry.hash === undefined && !finished) {
-        blocked.add(entry.key);
-        continue;
-      }
-      entry.processed = true;
-      entry.counted = true;
+      const previous = baselines.has(entry.key) ? baselines.get(entry.key) : entry.previous;
+      entry.previous = previous;
+      let same = (counts.get(entry.key)?.same ?? 0) + 1;
       if (entry.hash !== undefined) {
-        const previous = this.results.get(entry.key);
         if (previous !== undefined && previous !== entry.hash) {
           // Any changed output is progress, even timestamps: varying-output loops stop only at
           // the tool-call budget or invocation timeout. Repeated failing commands with identical
           // output, the stuck behavior seen in practice, remain detectable.
-          for (const earlier of this.recent) {
-            if (earlier.key === entry.key && earlier.processed) earlier.counted = false;
-          }
+          same = 0;
         }
-        this.results.set(entry.key, entry.hash);
       }
-      if (entry.id !== undefined) this.pending.delete(entry.id);
-      const same = this.recent.filter((other) => other.key === entry.key && other.counted).length;
-      if (same >= this.maxIdenticalInWindow) return `repeated the same ${entry.name} call ${same} times`;
+      const baseline = entry.hash ?? previous;
+      baselines.set(entry.key, baseline);
+      if (baseline !== undefined) this.results.set(entry.key, baseline);
+      counts.set(entry.key, { same, last: entry });
+    }
+    for (const { same, last } of counts.values()) {
+      if (same < this.maxIdenticalInWindow) continue;
+      if (!finished && last.id !== undefined && last.hash === undefined) continue;
+      return `repeated the same ${last.name} call ${this.maxIdenticalInWindow} times`;
     }
     return null;
   }

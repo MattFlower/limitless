@@ -291,6 +291,51 @@ describe("LoopDetector", () => {
     expect(bounded.observe("shell", "poll", "6")).toBe("exceeded tool-call budget (6)");
   });
 
+  test("a missing earlier result counts without denying the threshold result progress", () => {
+    for (const changed of [false, true]) {
+      const d = new LoopDetector(100);
+      expect(d.observe("shell", "poll", "missing")).toBeNull();
+      for (let i = 1; i < 6; i++) {
+        expect(d.observe("shell", "poll", String(i))).toBeNull();
+        expect(d.observeResult(String(i), changed && i === 5 ? "progress" : "waiting")).toBe(
+          !changed && i === 5 ? "repeated the same shell call 6 times" : null,
+        );
+      }
+      if (changed) {
+        // An older completion must not replace the sixth call's newer baseline.
+        expect(d.observeResult("missing", "waiting")).toBeNull();
+        for (let i = 6; i < 12; i++) {
+          expect(d.observe("shell", "poll", String(i))).toBeNull();
+          expect(d.observeResult(String(i), "progress")).toBe(
+            i === 11 ? "repeated the same shell call 6 times" : null,
+          );
+        }
+      }
+    }
+  });
+
+  test("a pending threshold result can show progress only until the next call", () => {
+    for (const nextTool of ["shell", "Read"]) {
+      const d = new LoopDetector(100);
+      for (let i = 0; i < 6; i++) {
+        expect(d.observe("shell", "poll", String(i))).toBeNull();
+        if (i < 5) expect(d.observeResult(String(i), "waiting")).toBeNull();
+      }
+      expect(d.observe(nextTool, "poll", "next")).toBe("repeated the same shell call 6 times");
+    }
+  });
+
+  test("late results that expose a loop preserve the threshold in its reason", () => {
+    const d = new LoopDetector(100);
+    for (let i = 0; i < 9; i++) {
+      expect(d.observe("shell", "poll", String(i))).toBeNull();
+      if (i !== 1 && i !== 2) {
+        expect(d.observeResult(String(i), i === 0 ? "waiting" : "progress")).toBeNull();
+      }
+    }
+    expect(d.observeResult("1", "progress")).toBe("repeated the same shell call 6 times");
+  });
+
   test("results match IDs across interleaved calls and late completions in call order", () => {
     const d = new LoopDetector(100);
     expect(d.observe("shell", "poll", "first")).toBeNull();
@@ -405,6 +450,7 @@ for (const harness of ["codex", "claude"] as const) {
               "threshold",
               "identical",
               "missing",
+              "missing-stream",
               "missing-timeout",
               "missing-failure",
               "truncated",
@@ -512,7 +558,7 @@ for (const harness of ["codex", "claude"] as const) {
                 }
               };
               const parallel = mode.startsWith("parallel");
-              const count = mode === "late" ? 9 : mode === "budget" ? 7 : 6;
+              const count = mode === "missing-stream" ? 20 : mode === "late" ? 9 : mode === "budget" ? 7 : 6;
               if (parallel) {
                 for (let i = 0; i < count; i++) {
                   call(i);
@@ -521,6 +567,11 @@ for (const harness of ["codex", "claude"] as const) {
               }
               for (let i = 0; i < count; i++) {
                 if (!parallel) call(i);
+                if (mode === "missing-stream" && i === 6) {
+                  // The runner intended to emit more than a window, but must stop in flight.
+                  expect(opts.signal?.aborted).toBe(true);
+                  break;
+                }
                 if (mode === "budget" && i === 6) {
                   expect(opts.signal?.aborted).toBe(true);
                   break;
