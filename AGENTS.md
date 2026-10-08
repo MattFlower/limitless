@@ -19,7 +19,10 @@ Read `docs/ARCHITECTURE.md` before changing anything structural.
 - `scripts/` — `land-pr.sh` (manual landing), `check-private-strings.ts`, `smoke.ts` (live CLI checks).
 
 ## Rules
-- Run `bun run check` (biome lint, `tsc --noEmit`, `bun test`) before finishing. All three must pass.
+- Lint, typecheck and tests must pass before you finish. In a hand-run session, run `bun run check`
+  (biome lint, `tsc --noEmit`, `bun test`) once at the end. In a factory run, run the affected test
+  files, `bunx biome check` on the changed files and `bunx tsc --noEmit`; the factory's gates run the
+  full suite after you finish and send back any failures.
 - Before adding or changing tests, read `test/AGENTS.md` (what is worth testing, and keeping tests fast).
 - The pipeline is deterministic code; LLMs only work *inside* stages. Don't add LLM-decided control flow.
 - Anything that talks to a paid model must be testable with the fake harness (`src/harness/fake.ts`).
@@ -84,10 +87,11 @@ as the same user.
   `kill -9 -1`, no `kill` of a pid you found by searching. Stop your own processes through the handle
   or pid you got when you started them. (Implementers once ran `pkill -f "bun test"` and killed a
   deploy gate and other checkouts' checks.)
-- **Run the tests you need, not the whole suite repeatedly.** While working, run the affected files
-  (`bun test test/<name>.test.ts`) plus lint and typecheck; run `bun run check` once at the end. The
-  factory's gates run the full suite. On a loaded machine it takes close to 20 minutes, and several
-  concurrent full runs push each other's gates into timeouts.
+- **Run the tests you need, not the whole suite.** While working, run the affected files
+  (`bun test test/<name>.test.ts`) plus lint and typecheck. In a factory run, don't run the full suite
+  (`bun run check`, `bun run test`, or `bun test` without file arguments): the gates run it after every
+  round. In a hand-run session, run `bun run check` once at the end. The suite takes 8 to 11 minutes
+  alone and over 20 on a loaded machine, and concurrent full runs push each other's gates into timeouts.
 - **Don't hardcode `/tmp` or `/var/tmp`.** Confined commands get `TMPDIR` pointing into private
   scratch and can't write the system temp directories. Use `os.tmpdir()`/`mkdtemp` in TypeScript and
   `${TMPDIR:-/tmp}` in shell.
