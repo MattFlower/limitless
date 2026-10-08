@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -27,7 +27,13 @@ import type { HealthResponse } from "../src/core/types.ts";
 import type { sh } from "../src/util/proc.ts";
 
 const dirs: string[] = [];
+const originalWorkers = process.env.LIMITLESS_TEST_WORKERS;
+beforeEach(() => {
+  delete process.env.LIMITLESS_TEST_WORKERS;
+});
 afterEach(() => {
+  if (originalWorkers === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
+  else process.env.LIMITLESS_TEST_WORKERS = originalWorkers;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -142,7 +148,7 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
     "bun install --frozen-lockfile",
     "bun run lint",
     "bun run typecheck",
-    "bun test",
+    "bun test --parallel=4",
     "bun scripts/smoke.ts",
   ]);
   expect(f.calls[10]).toBe("drain");
@@ -150,7 +156,7 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   expect([...f.commandTimeouts].filter(([line]) => /^bun (run|test)/.test(line))).toEqual([
     ["bun run lint", 600_000],
     ["bun run typecheck", 600_000],
-    ["bun test", 1_800_000],
+    ["bun test --parallel=4", 1_800_000],
   ]);
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.sleeps).toEqual([5000, 5000]);
@@ -158,6 +164,33 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   expect(f.logs.join("\n")).toContain("run-a (review)");
   expect(f.logs.join("\n")).toContain("Drain complete");
   expect(f.calls.slice(-3)).toEqual(["health", "restart", "health"]);
+});
+
+test.each([
+  [undefined, 4],
+  ["3", 3],
+  ["", 4],
+  ["0", 4],
+  ["-2", 4],
+  ["1.5", 4],
+  ["invalid", 4],
+  ["9007199254740992", 4],
+] as const)("deploy resolves test workers at gate execution: %s", async (value, workers) => {
+  const previous = process.env.LIMITLESS_TEST_WORKERS;
+  try {
+    if (value === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
+    else process.env.LIMITLESS_TEST_WORKERS = value;
+    const f = setup();
+    await deploy(7400, "feature", false, f.opts);
+    expect([...f.commandTimeouts].filter(([line]) => /^bun (run|test)/.test(line))).toEqual([
+      ["bun run lint", 600_000],
+      ["bun run typecheck", 600_000],
+      [`bun test --parallel=${workers}`, 1_800_000],
+    ]);
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
+    else process.env.LIMITLESS_TEST_WORKERS = previous;
+  }
 });
 
 test("deploy waits for three current stages, not the queued work after them", async () => {
@@ -326,7 +359,7 @@ test("initially empty and unchanged ref do not wait", async () => {
   expect(f.calls.slice(-4)).toEqual([
     "bun run lint",
     "bun run typecheck",
-    "bun test",
+    "bun test --parallel=4",
     "bun scripts/smoke.ts",
   ]);
   expect(f.calls).not.toContain("drain");
@@ -373,7 +406,7 @@ test("failure after a possible drain restores release and resumes, retaining cle
     if (failure === "gate") {
       const command = f.opts.command;
       f.opts.command = async (args, opts) => {
-        if (args.join(" ") === "bun test") throw new Error("bad gate");
+        if (args.join(" ") === "bun test --parallel=4") throw new Error("bad gate");
         return command(args, opts);
       };
     }
@@ -629,7 +662,7 @@ test("checkout already at target reruns gates before drain", async () => {
   f.setSelected("next");
   await deploy(7400, "feature", false, f.opts);
   expect(f.calls.indexOf("bun install --frozen-lockfile")).toBeLessThan(f.calls.indexOf("bun run lint"));
-  expect(f.calls.indexOf("bun test")).toBeLessThan(f.calls.indexOf("drain"));
+  expect(f.calls.indexOf("bun test --parallel=4")).toBeLessThan(f.calls.indexOf("drain"));
   expect(f.calls).not.toContain("git checkout -q --detach next");
   expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("restart"));
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
@@ -642,7 +675,7 @@ test("a target checkout still aborts on failed gates before draining", async () 
   f.setSelected("next");
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") === "bun test") throw new Error("failed check");
+    if (args.join(" ") === "bun test --parallel=4") throw new Error("failed check");
     return command(args, options);
   };
   await expect(deploy(7400, "feature", true, f.opts)).rejects.toThrow("failed check");
@@ -688,7 +721,7 @@ test("a failed deploy gate keeps early test diagnostics before the summary tail"
   const f = setup();
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") !== "bun test") return command(args, options);
+    if (args.join(" ") !== "bun test --parallel=4") return command(args, options);
     return {
       stdout: "",
       stderr:
@@ -711,7 +744,7 @@ test("a failed gate tail keeps stderr first and stays within 4000 bytes", async 
   const f = setup();
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") !== "bun test") return command(args, options);
+    if (args.join(" ") !== "bun test --parallel=4") return command(args, options);
     return {
       stdout: `${Array.from({ length: 200 }, (_, i) => `stdout ${i} ${"x".repeat(200)}`).join("\n")}\n`,
       stderr: `${Array.from({ length: 40 }, (_, i) => `stderr ${i}`).join("\n")}\n 3 fail\n Ran 900 tests\n${"é".repeat(3000)}\n`,
@@ -719,7 +752,7 @@ test("a failed gate tail keeps stderr first and stays within 4000 bytes", async 
     };
   };
   const message = String(await deploy(7400, "feature", false, f.opts).catch((e: unknown) => e));
-  const tail = message.slice(message.indexOf("Command failed (1): bun test"));
+  const tail = message.slice(message.indexOf("Command failed (1): bun test --parallel=4"));
   expect(Buffer.byteLength(tail)).toBeLessThan(4_200);
   expect(tail).toContain(" 3 fail\n Ran 900 tests");
   expect(tail).toContain("stderr 39");
@@ -766,7 +799,7 @@ test("a pre-upgrade daemon without a boot SHA deploys using the checkout commit"
     };
     await deploy(7400, "feature", false, f.opts);
     expect(f.calls).toContain("git checkout -q --detach next");
-    expect(f.calls).toContain("bun test");
+    expect(f.calls).toContain("bun test --parallel=4");
     expect(f.calls.filter((call) => call === "restart")).toHaveLength(1);
     expect(f.logs).toContain("daemon before: unknown");
     expect(f.logs).toContain("daemon after: next");
@@ -891,7 +924,7 @@ test("a gate failure resumes a daemon that was draining on entry", async () => {
   f.setDraining(true);
   const command = f.opts.command;
   f.opts.command = async (args, opts) => {
-    if (args.join(" ") === "bun test") throw new Error("bad gate");
+    if (args.join(" ") === "bun test --parallel=4") throw new Error("bad gate");
     return command(args, opts);
   };
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("bad gate");
@@ -923,7 +956,7 @@ test("a second signal exits immediately during rollback", async () => {
   const exits: number[] = [];
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") === "bun test") process.emit("SIGINT");
+    if (args.join(" ") === "bun test --parallel=4") process.emit("SIGINT");
     if (args[1] === "checkout" && args[4] === "previous") {
       process.emit("SIGTERM");
       expect(exits).toEqual([143]);
@@ -945,7 +978,7 @@ test("a signal during gates cancels the command before restoring the checkout", 
   const f = setup();
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") !== "bun test") return command(args, options);
+    if (args.join(" ") !== "bun test --parallel=4") return command(args, options);
     f.calls.push("gate started");
     process.emit("SIGINT");
     expect(options.signal?.aborted).toBe(true);
@@ -1075,7 +1108,11 @@ test("deploy leases the entire suite, including already-deployed smoke, and rele
         },
         command: async (args, opts) => {
           const line = args.join(" ");
-          if (["bun run lint", "bun run typecheck", "bun test", "bun scripts/smoke.ts"].includes(line)) {
+          if (
+            ["bun run lint", "bun run typecheck", "bun test --parallel=4", "bun scripts/smoke.ts"].includes(
+              line,
+            )
+          ) {
             order.push(line);
             expect(held).toBe(line !== "bun scripts/smoke.ts");
           }
@@ -1095,7 +1132,7 @@ test("deploy leases the entire suite, including already-deployed smoke, and rele
           "acquire",
           "bun run lint",
           "bun run typecheck",
-          "bun test",
+          "bun test --parallel=4",
           "release",
           "bun scripts/smoke.ts",
         ]);
