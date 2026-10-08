@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
 import { Factory } from "../src/app.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
+import { emptyUsage, priceOf } from "../src/harness/types.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
+import { resolveCatalog } from "../src/router/config-catalog.ts";
+import { validatePolicy } from "../src/router/policy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -17,6 +20,41 @@ const candidates = [
   ["gpt-oss-120b", "openai/gpt-oss-120b", 0.15, 0.6, "US"],
   ["ministral-14b-2512", "mistralai/ministral-14b-2512", 0.2, 0.2, "FR"],
 ] as const;
+test("Haiku 5.5 validates and prices usage while Haiku 4.5 stays unchanged", () => {
+  const model = resolveCatalog([{ preset: "claude" }]).models.find((m) => m.id === "claude/haiku-5.5");
+  if (!model) throw new Error("missing Haiku 5.5");
+  expect(model).toMatchObject({
+    id: "claude/haiku-5.5",
+    provider: "claude",
+    model: "claude-haiku-5-5",
+    vendor: "anthropic",
+    origin: "US",
+    baseOrigin: "US",
+    tier: 3,
+    supportedEfforts: ["low", "medium", "high"],
+    effort: "medium",
+    price: { input: 0.1, output: 0.5, cacheRead: 0.01 },
+  });
+  expect(
+    priceOf({ ...emptyUsage(), input: 20_000, output: 4_000, cacheRead: 60_000 }, model.price),
+  ).toBeCloseTo(0.0046, 8);
+  for (const effort of ["low", "medium", "high"])
+    expect(
+      validatePolicy({ triage: { default: [`claude/haiku-5.5@${effort}`] } }, MODELS).triage?.default,
+    ).toEqual([`claude/haiku-5.5@${effort}`]);
+  expect(MODELS.find((m) => m.id === "claude/haiku")).toEqual({
+    id: "claude/haiku",
+    provider: "claude",
+    model: "claude-haiku-4-5",
+    vendor: "anthropic",
+    origin: "US",
+    baseOrigin: "US",
+    supportedEfforts: [],
+    tier: 3,
+    price: { input: 1, output: 5, cacheRead: 0.1 },
+  });
+});
+
 test("catalog records checkpoint origins, exact candidate backend prices and leaves policy independent", () => {
   expect(new Set(MODELS.map((m) => m.id)).size).toBe(MODELS.length);
   for (const m of MODELS) {

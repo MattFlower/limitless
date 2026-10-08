@@ -1,7 +1,7 @@
 {
   "triage.default": {
-    "reason": "Luna at medium effort first, through the Codex subscription (codex/luna, the same gpt-6-luna model as openrouter/gpt-6-luna), then low and none; OpenRouter Luna follows as the metered fallback. Held-out evidence for Luna@medium: eval-mump7s7re29l (78.9%, no risk under-calls); the owner judged the transport difference to be within standard error. The remaining entries are availability fallbacks that the held-out set has not ranked. Sonnet 5.5 replaced Sonnet 5 as the last fallback on 2026-10-04 (owner decision).",
-    "decided": "2026-10-01"
+    "reason": "Codex Luna at medium effort first, then Claude Haiku 5.5 at medium as the fallback; remaining availability fallbacks keep their existing order. On 30 held-out triage cases, k=3, Haiku 5.5 passed 73.3% (Wilson 95% CI 63–81), with 0/84 risk under-calls, 10% flips and 3.4 s p50 (eval-muyogy5fibhy). The stored Luna baseline passed 71.1% (Wilson 95% CI 61–80), with 2/84 risk under-calls and 23% flips (eval-mupjkaccha17). The difference is within noise; Haiku 5.5 is a fallback, not a replacement. See routing/EVIDENCE.md.",
+    "decided": "2026-10-07"
   },
   "implement.trivial": {
     "reason": "Codex first while banked Codex resets last (owner decision, 2026-10-03): Sol 6.1 at high effort, then Opus. Astra was removed from routing on 2026-10-04 (owner decision), so escalation now goes from Sol 6.1 straight to Opus. This continues the Sol 6.1 field trial of 2026-10-01 (the implement eval cannot rank models; every model scores 100%). See routing/EVIDENCE.md.",
