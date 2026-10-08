@@ -236,7 +236,7 @@ test("policy rejects efforts the role's harness cannot deliver", () => {
     ["implement", "mtplx/qwen-27b@none"],
     ["implement", "omlx/qwen-27b@none"],
     ["review", "omlx/qwen-27b@high"],
-    ["verify", "twilight/qwen-27b@high|claude/opus"],
+    ["verify", "mtplx/qwen-27b@high|claude/opus"],
   ] as const)
     expect(() => validatePolicy({ [role]: { default: [reference] } }, MODELS)).toThrow("cannot carry effort");
   // Tool-less roles use the HTTP harness, which maps effort; bare IDs work everywhere.
@@ -246,7 +246,7 @@ test("policy rejects efforts the role's harness cannot deliver", () => {
     ["chat", "omlx/qwen-27b@none"],
     ["triage", "omlx/qwen-27b@high"],
     ["implement", "omlx/qwen-27b"],
-    ["summarize", "twilight/qwen-27b@high"],
+    ["summarize", "mtplx/qwen-27b@high"],
     ["review", "openrouter/gpt-6-luna"],
   ] as const)
     expect(validatePolicy({ [role]: { default: [reference] } }, MODELS)[role]?.default).toEqual([reference]);
@@ -274,9 +274,25 @@ test("the default local model comes first among free oMLX models", () => {
 
 test("frozen pre-PR identity and export preserve all routing decisions", async () => {
   const baseline = await Bun.file(join(import.meta.dir, "fixtures/routing-identity.json")).json();
+  // Keep the captured fixture intact; build expectations for its retired entry inline.
+  const retired = baseline.snapshot.providers.filter(
+    (id: string) => !resolveCatalog().providers.some((p) => p.id === id),
+  );
+  expect(retired).toHaveLength(1);
+  const retiredModels = new Set<string>(
+    baseline.snapshot.models
+      .filter((m: { provider: string }) => retired.includes(m.provider))
+      .map((m: { id: string }) => m.id),
+  );
+  baseline.snapshot.providers = baseline.snapshot.providers.filter((id: string) => !retired.includes(id));
+  baseline.snapshot.models = baseline.snapshot.models.filter((m: { id: string }) => !retiredModels.has(m.id));
   for (const decision of baseline.decisionTable) {
-    decision.candidates = decision.candidates.map((i: number) => baseline.candidateTable[i]);
-    decision.skipped = decision.skipped.map((i: number) => baseline.skippedTable[i]);
+    decision.candidates = decision.candidates
+      .map((i: number) => baseline.candidateTable[i])
+      .filter((c: { modelId: string }) => !retiredModels.has(c.modelId));
+    decision.skipped = decision.skipped
+      .map((i: number) => baseline.skippedTable[i])
+      .filter((c: { modelId: string }) => !retiredModels.has(c.modelId.split("@")[0] ?? ""));
   }
   for (const row of baseline.snapshot.decisions) row.decision = baseline.decisionTable[row.decision];
   expect(identitySnapshot(resolveCatalog())).toEqual(baseline.snapshot);

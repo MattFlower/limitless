@@ -932,7 +932,7 @@ export function backendChecks(
   excludeOrigins?: readonly string[],
 ): SmokeCheck[] {
   const checks: SmokeCheck[] = [];
-  for (const id of ["omlx", "twilight", "openrouter"]) {
+  for (const id of ["omlx", "openrouter"]) {
     const provider = catalog.providers.find((p) => p.id === id);
     if (!provider) continue;
     for (const kind of id === "omlx" ? (["structured", "edit"] as const) : (["structured"] as const))

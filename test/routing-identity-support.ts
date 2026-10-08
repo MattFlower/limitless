@@ -26,7 +26,6 @@ export function identitySnapshot(catalog = { providers: PROVIDERS, models: MODEL
   const secrets = {
     OPENROUTER_API_KEY: "router-key",
     OMLX_API_KEY: "omlx-key",
-    TWILIGHT_API_KEY: "twilight-key",
     TYPESAFE_API_KEY: "typesafe-key",
   };
   const constraints: RouteConstraints[] = [

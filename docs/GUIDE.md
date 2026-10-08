@@ -154,12 +154,12 @@ another directory.
 
 **`secrets.env`** (run `chmod 600` on it). It uses `KEY=value` lines. Quotes, a leading `export`
 and `#` comments are allowed. Environment variables of the same name override the file, except for
-`TWILIGHT_API_KEY` and `TYPESAFE_API_KEY`, which are read only from the file.
+`TYPESAFE_API_KEY`, which is read only from the file. Config-defined provider keys
+use the file first, then the environment.
 
 | Key | Enables |
 |---|---|
 | `OPENROUTER_API_KEY` | The `openrouter` provider. Without it, the provider shows `missing OPENROUTER_API_KEY`. |
-| `TWILIGHT_API_KEY` | The `twilight` provider (LAN llama.cpp server) |
 | `TYPESAFE_API_KEY` | The `typesafe` provider (TypeSafe decisions API key, for the Jev decision model) |
 | `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID` | The Discord bot (also needs `[owners].discord` and `[discord].channel_id`) |
 | `GITHUB_WEBHOOK_SECRET` | `POST /webhooks/github`. Without it, the endpoint answers 503. |
@@ -205,7 +205,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[review] trusted_reviewers` | `[]` | GitHub logins, besides the repository owner, whose inline PR review comments count as evidence in `limitless review shadow-report`. |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Runtime routing, eval policy generation and the Evals matrix exclude models whose origin or baseOrigin is listed (exact, case-sensitive matching). Any configured list, even `[]`, also excludes unknown baseOrigin. There is no excluded-model fallback; explicit run/retry pins, routing saves and eval targets are refused. Omit for no origin filter. Edit config.toml and restart to change this read-only safety constraint. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
-| `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
+| `[local] remote_model_path`, `remote_host`, `remote_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default
 branch:
@@ -478,8 +478,34 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 | `openrouter` | metered | `claude` CLI via an Anthropic-compatible endpoint; direct HTTP for tool-free roles | `OPENROUTER_API_KEY` |
 | `omlx` | free | same, `http://127.0.0.1:8989` | oMLX.app / `omlx start` and `OMLX_API_KEY` |
 | `mtplx` (rollback) | free | same, `http://127.0.0.1:8000` | opt-in `service install --mtplx` |
-| `twilight` | free | same, `http://twilight:8080` | a LAN llama.cpp server and `TWILIGHT_API_KEY` |
 | `typesafe` | metered | `decisions`: typed questions over HTTP (`https://api.typesafe.ai/v1/systemone`); triage only | `TYPESAFE_API_KEY` |
+
+LAN llama.cpp inference requires an explicit provider; no remote host is built in. Replace
+`<host>` with your server (for example `example.com`), and put `REMOTE_API_KEY` in `secrets.env`:
+
+```toml
+[[providers]]
+id = "lan"
+kind = "openai-compatible"
+base_url = "http://<host>:8080/v1"
+health_url = "http://<host>:8080/v1/models"
+api_key_env = "REMOTE_API_KEY"
+billing = "free"
+max_concurrent = 1
+
+[[providers.models]]
+id = "local"
+model = "local" # alias used by the generated remote unit
+vendor = "qwen"
+origin = "CN"
+base_origin = "CN"
+tier = 2
+efforts = ["none", "high"]
+price = { input = 0, output = 0 }
+```
+
+Select `lan/local` for a tool-free role, for example with
+`limitless run 'Classify this task' --repo owner/repo --model triage=lan/local@none`.
 
 The effective catalog combines built-in definitions, `[[providers]]` and
 `[[providers.models]]` in config.toml, and runtime model additions stored in SQLite. Local
@@ -903,8 +929,8 @@ debug events according to `[retention]`. Run it by hand with `limitless gc --dry
 ### Local models
 
 `limitless local up|down|status` reports oMLX reachability even on `down`, without managing its
-lifecycle or enablement, and manages the llama.cpp unit on twilight. See [OPERATIONS](OPERATIONS.md#local-models). These endpoints are specific to the reference
-setup; additional providers can be defined in config.toml.
+lifecycle or enablement. With `[local].remote_host` configured it also manages a remote llama.cpp
+unit; without it, no remote SSH or health probe runs. See [OPERATIONS](OPERATIONS.md#local-models).
 
 <a id="remote-ui"></a>
 

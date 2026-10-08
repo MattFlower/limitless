@@ -391,7 +391,7 @@ seedProvider(
   "at reserve limit",
   NOW + 55 * MIN,
 );
-// openrouter starts disabled (no OPENROUTER_API_KEY in this dev environment) and mtplx/twilight
+// openrouter starts disabled (no OPENROUTER_API_KEY in this dev environment) and mtplx/oMLX
 // start down (no local model server running) — both realistic and require no seeding beyond the
 // invocations below, which give openrouter its spend-vs-budget gauge.
 

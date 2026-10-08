@@ -144,7 +144,7 @@ test("all checks pass without external effects, and outputs stay read-only", asy
   try {
     writeFileSync(
       join(f.configDir, "secrets.env"),
-      "UNUSED_API_KEY=sk-SENTINEL-read-only\nOPENROUTER_API_KEY=sk-SENTINEL-or\nOMLX_API_KEY=sk-SENTINEL-omlx\nTWILIGHT_API_KEY=sk-SENTINEL-twilight\nTYPESAFE_API_KEY=sk-SENTINEL-typesafe\n",
+      "UNUSED_API_KEY=sk-SENTINEL-read-only\nOPENROUTER_API_KEY=sk-SENTINEL-or\nOMLX_API_KEY=sk-SENTINEL-omlx\nREMOTE_API_KEY=sk-SENTINEL-remote\nTYPESAFE_API_KEY=sk-SENTINEL-typesafe\n",
     );
     f.reload();
     const fetch = f.d.fetch;
@@ -157,7 +157,7 @@ test("all checks pass without external effects, and outputs stay read-only", asy
     const before = f.snapshot();
     expect(await setupCommand("doctor", { json: true }, f.d)).toBe(0);
     const summary = JSON.parse(f.output[0] ?? "");
-    expect(summary.checks.map((c: { status: string }) => c.status)).toEqual(Array(16).fill("ok"));
+    expect(summary.checks.map((c: { status: string }) => c.status)).toEqual(Array(14).fill("ok"));
     expect(f.snapshot()).toEqual(before);
     expect(f.effects).toEqual([]);
     expect(f.requests.every((r) => r.method === "GET")).toBe(true);

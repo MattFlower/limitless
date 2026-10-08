@@ -8,7 +8,7 @@ How the factory runs day to day, where to look when something breaks, and how ch
 |---|---|---|---|
 | Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `dev.limitless.daemon` | `~/.limitless/logs/dev.limitless.daemon.log` |
 | Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
-| GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
+| GPU model (Qwen 3.8 27B, CUDA llama.cpp) | the remote llama.cpp host, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on the remote llama.cpp host |
 | Public webhook tunnel | Cloudflare → `<public_url host>/webhooks/*` | launchd `dev.limitless.tunnel` (opt-in) | `~/.limitless/logs/dev.limitless.tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
 | Config & secrets | `~/.config/limitless/config.toml`, `secrets.env` (chmod 600) | you | — |
@@ -88,7 +88,7 @@ attempt is cancelled and awaited, so a leak it reports while stopping still fail
 one that does not stop is not retried. Each result line is printed as the check finishes, so a
 killed run still shows which checks passed and which one was running.
 
-The oMLX structured / Claude-harness edit and twilight checks are skipped when their required key is absent or their health probe
+The oMLX structured / Claude-harness edit checks are skipped when their required key is absent or their health probe
 fails on both attempts. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
 environment. An attempted check that fails exits nonzero; skips alone do not. Use
 `limitless deploy [ref] --smoke` to require these checks during deployment.
@@ -97,24 +97,27 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 - `limitless local up|down|status` reports externally managed oMLX authenticated `/v1/models`
   reachability on every action, including `down`; it never changes Mac processes or enablement.
-  `up` starts `limitless-llama.service` on twilight over SSH. An installed unit is never overwritten
+  `up` starts `limitless-llama.service` on the remote llama.cpp host over SSH. An installed unit is never overwritten
   (it may carry host-specific tuning such as a patched chat template); only when none exists does
   `up` generate one, which needs the installed GGUF path in `~/.config/limitless/config.toml`:
 
   ```toml
   [local]
-  twilight_model_path = "/absolute/path/to/model.gguf"
-  # twilight_host = "twilight"
-  # twilight_llama_binary = "/home/mflower/.local/share/limitless/llama-bin/llama-server"
+  remote_model_path = "/absolute/path/to/model.gguf"
+  remote_host = "example.com" # required for remote management; no default
+  # remote_llama_binary = "/usr/local/bin/llama-server"
   ```
 
-  oMLX uses `http://127.0.0.1:8989/v1`; twilight uses `http://twilight:8080/v1`;
+  oMLX uses `http://127.0.0.1:8989/v1`; the remote llama.cpp host uses `http://<host>:8080/v1`;
   OpenRouter uses `https://openrouter.ai/api/v1` for direct structured completions. Agentic
   calls retain their Anthropic-compatible Claude CLI endpoints. `limitless service install`
   installs the daemon; `--mtplx` explicitly adds the rollback agent. `limitless local` controls
-  only twilight. SSH access to twilight and an installed model/binary are required.
-  The generated unit reads its API key from twilight's `~/.config/limitless/llama-api-key` (so it
-  never appears in the process list); put the same value in the Mac's `TWILIGHT_API_KEY`.
+  only the configured remote host; without remote_host all actions report only oMLX. Remote
+  management requires SSH access and an installed model/binary.
+  The generated unit reads its API key from the remote llama.cpp host's `~/.config/limitless/llama-api-key` (so it
+  never appears in the process list); configure a matching LAN provider as shown in
+  [GUIDE](GUIDE.md#providers-1), using that key for authenticated health checks. Up/down update
+  enablement only for a configured provider whose endpoint matches the remote host.
 
 - **Mac (oMLX):** start the server with oMLX.app / `omlx start`; Limitless does not manage it.
   Put `OMLX_API_KEY` in `~/.config/limitless/secrets.env` (used by both inference transports and
@@ -129,7 +132,7 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
   For rollback, `limitless service install --mtplx` installs the old agent on port 8000;
   enable `mtplx` explicitly if disabled and select `mtplx/qwen-27b`. Existing agents are not
   automatically removed; `LIMITLESS_MTPLX_MODEL` still overrides the rollback model at install.
-- **twilight:** `systemctl --user stop limitless-llama` frees the GPU (e.g. for Unsloth Studio);
+- **Remote llama.cpp host:** `systemctl --user stop limitless-llama` frees the GPU (e.g. for Unsloth Studio);
   `start` brings it back. The factory routes around it while it's down. The binary is a copy of
   Unsloth Studio's CUDA build in `~/.local/share/limitless/llama-bin/`; the chat template is patched
   (`~/.config/limitless/qwen38-limitless.jinja`) so agent harnesses may send system messages

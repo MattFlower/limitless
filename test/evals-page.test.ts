@@ -152,6 +152,13 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
             role: "synthesis_worker" as typeof firstInvocation.role,
             model: null as unknown as string,
           },
+          {
+            ...firstInvocation,
+            id: 99,
+            provider: "retired-lan",
+            modelId: "retired-lan/legacy",
+            model: "historical-backend",
+          },
         ],
         selectedId: null,
         onSelect: () => {},
@@ -159,6 +166,7 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     );
     expect(legacyHtml).toContain("does not recognize");
     expect(legacyHtml).toContain("codex/luna → unknown model (legacy) · low");
+    expect(legacyHtml).toContain("retired-lan/legacy → historical-backend · low");
     expect(legacyHtml).not.toContain("→ null");
     expect(invocationHtml).toContain('<th class="num">Cache hit</th>');
     expect(invocationHtml).toContain(

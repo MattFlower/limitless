@@ -43,7 +43,7 @@ export interface ModelDef {
   notes?: string;
 }
 
-/** omlx, mtplx and twilight are deprecated implicit defaults pending config migration. */
+/** omlx and mtplx are deprecated implicit defaults pending config migration. */
 export const PROVIDERS: ProviderDef[] = [
   {
     id: "claude",
@@ -90,20 +90,6 @@ export const PROVIDERS: ProviderDef[] = [
     openaiBaseUrl: "http://127.0.0.1:8000/v1",
     apiKey: "mtplx-local",
     healthUrl: "http://127.0.0.1:8000/v1/models",
-  },
-  {
-    id: "twilight",
-    label: "twilight RTX 5090 (llama.cpp)",
-    harness: "claude",
-    billing: "free",
-    maxConcurrent: 1,
-    // llama-server (CUDA build) on the LAN, API-key protected; ufw allows 10.1.0.0/16 on 8080.
-    // When away from the LAN, set sshForward instead: { host: "twilight", localPort: 18080, remotePort: 8080 }
-    // with baseUrl/healthUrl on http://127.0.0.1:18080.
-    baseUrl: "http://twilight:8080",
-    openaiBaseUrl: "http://twilight:8080/v1",
-    apiKeySecret: "TWILIGHT_API_KEY",
-    healthUrl: "http://twilight:8080/v1/models",
   },
   {
     // Decision models answer typed questions instead of writing text (docs/research/09-jev-decisions.md).
@@ -439,17 +425,6 @@ export const MODELS: ModelDef[] = [
     tier: 2,
     price: { input: 0, output: 0 },
     notes: "Qwen 3.8 27B (MTPLX optimized-quality) on this Mac, 262K context",
-  },
-  {
-    id: "twilight/qwen-27b",
-    provider: "twilight",
-    model: "qwen3.8-27b",
-    vendor: "qwen",
-    origin: "CN",
-    baseOrigin: "CN",
-    supportedEfforts: ["none", "high"],
-    tier: 2,
-    price: { input: 0, output: 0 },
   },
 ];
 

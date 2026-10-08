@@ -1,8 +1,37 @@
 import { expect, test } from "bun:test";
-import { manageLocal, twilightUnit } from "../src/cli/local.ts";
+import { join } from "node:path";
+import { manageLocal, remoteUnit } from "../src/cli/local.ts";
+import { PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import type { sh } from "../src/util/proc.ts";
 
-test("up generates the twilight unit once and never manages a Mac service", async () => {
+const remoteHost = "example.com";
+const providers: ProviderDef[] = [
+  ...PROVIDERS,
+  {
+    id: "lan",
+    harness: "claude",
+    billing: "free",
+    label: "LAN llama.cpp",
+    maxConcurrent: 1,
+    openaiBaseUrl: "http://example.com:8080/v1",
+    healthUrl: "http://example.com:8080/v1/models",
+    apiKeySecret: "REMOTE_API_KEY",
+  },
+];
+
+test("local CLI help describes the explicit remote settings", () => {
+  const child = Bun.spawnSync([
+    process.execPath,
+    join(import.meta.dir, "../src/cli/main.ts"),
+    "local",
+    "--help",
+  ]);
+  expect(child.exitCode).toBe(0);
+  const help = child.stdout.toString();
+  for (const key of ["remote_host", "remote_model_path", "remote_llama_binary"]) expect(help).toContain(key);
+});
+
+test("up generates the remote unit once and never manages a Mac service", async () => {
   const calls: string[][] = [];
   const input: string[] = [];
   let unitInstalled = false;
@@ -15,9 +44,15 @@ test("up generates the twilight unit once and never manages a Mac service", asyn
     if (args.includes("test")) return { stdout: "", stderr: "", exitCode: unitInstalled ? 0 : 1 };
     return { stdout: "", stderr: "", exitCode: 0 };
   };
-  const opts = { modelPath: "/models/Qwen 27B.gguf", command, probe: async () => true };
-  expect((await manageLocal("up", opts)).twilight.service).toBe("active");
-  expect(calls.every((c) => c[0] === "ssh")).toBe(true);
+  const opts = {
+    remoteHost,
+    providers,
+    remoteModelPath: "/models/Qwen 27B.gguf",
+    command,
+    probe: async () => true,
+  };
+  expect((await manageLocal("up", opts)).remote?.service).toBe("active");
+  expect(calls.every((c) => c[0] === "ssh" && c.includes(remoteHost))).toBe(true);
   expect(input[0]).toContain('-m "/models/Qwen 27B.gguf"');
   expect(calls.some((c) => c.includes("daemon-reload"))).toBe(true);
   calls.length = 0;
@@ -25,20 +60,13 @@ test("up generates the twilight unit once and never manages a Mac service", asyn
   expect(calls.some((c) => c.includes("bootstrap"))).toBe(false);
   expect(calls.some((c) => c.includes("enable"))).toBe(true);
   expect(input).toHaveLength(1);
-  const unit = twilightUnit("/models/a.gguf");
-  for (const flag of [
-    "--port 8080",
-    "--alias qwen3.8-27b",
-    "-ngl 99",
-    "-c 131072",
-    "--jinja",
-    "--api-key-file",
-  ])
+  const unit = remoteUnit("/models/a.gguf");
+  for (const flag of ["--port 8080", "--alias local", "-ngl 99", "-c 131072", "--jinja", "--api-key-file"])
     expect(unit).toContain(flag);
   expect(unit).not.toContain("--api-key ");
 });
 
-test("up never overwrites an installed twilight unit and needs no model path to start it", async () => {
+test("up never overwrites an installed remote unit and needs no model path to start it", async () => {
   const calls: string[][] = [];
   const input: string[] = [];
   const command: typeof sh = async (args, opts) => {
@@ -46,8 +74,8 @@ test("up never overwrites an installed twilight unit and needs no model path to 
     if (opts.stdin) input.push(opts.stdin);
     return { stdout: "", stderr: "", exitCode: 0 };
   };
-  const opts = { modelPath: "", command, probe: async () => true };
-  expect((await manageLocal("up", opts)).twilight.service).toBe("active");
+  const opts = { remoteHost, providers, remoteModelPath: "", command, probe: async () => true };
+  expect((await manageLocal("up", opts)).remote?.service).toBe("active");
   expect(input).toEqual([]);
   expect(calls.some((c) => c.includes("daemon-reload"))).toBe(false);
   expect(calls.some((c) => c.includes("enable"))).toBe(true);
@@ -61,14 +89,16 @@ test("health probes authenticate with the provider's key", async () => {
     return true;
   };
   await manageLocal("status", {
-    modelPath: "",
+    remoteHost,
+    providers,
+    remoteModelPath: "",
     command,
     probe,
-    secrets: { TWILIGHT_API_KEY: "tw-key", OMLX_API_KEY: "om-key" },
+    secrets: { REMOTE_API_KEY: "tw-key", OMLX_API_KEY: "om-key" },
   });
   expect(probed).toEqual([
     ["http://127.0.0.1:8989/v1/models", "om-key"],
-    ["http://twilight:8080/v1/models", "tw-key"],
+    ["http://example.com:8080/v1/models", "tw-key"],
   ]);
 });
 
@@ -78,31 +108,31 @@ test("up reports a missing unit when no model path is configured", async () => {
     stderr: "",
     exitCode: args.includes("test") || args.includes("is-active") ? 1 : 0,
   });
-  const opts = { modelPath: "", command, probe: async () => false };
-  expect((await manageLocal("up", opts)).twilight.service).toBe(
-    "unit missing: set [local].twilight_model_path",
-  );
+  const opts = { remoteHost, providers, remoteModelPath: "", command, probe: async () => false };
+  expect((await manageLocal("up", opts)).remote?.service).toBe("unit missing: set [local].remote_model_path");
 });
 
-test("down is idempotent and unreachable twilight is reported", async () => {
+test("down is idempotent and unreachable remote is reported", async () => {
   const calls: string[][] = [];
   const command: typeof sh = async (args) => {
     calls.push(args);
     return { stdout: "", stderr: "", exitCode: args[0] === "ssh" ? 255 : 1 };
   };
   const opts = {
-    modelPath: "/models/a.gguf",
+    remoteHost,
+    providers,
+    remoteModelPath: "/models/a.gguf",
     command,
     probe: async () => false,
   };
   const report = await manageLocal("down", opts);
   expect(report.omlx.endpoint).toBe("unavailable: missing OMLX_API_KEY");
-  expect(report.twilight.service).toBe("unreachable");
+  expect(report.remote?.service).toBe("unreachable");
   expect(calls.some((c) => c.includes("bootout"))).toBe(false);
-  expect((await manageLocal("status", opts)).twilight.service).toBe("unreachable");
+  expect((await manageLocal("status", opts)).remote?.service).toBe("unreachable");
 });
 
-test("twilight down updates only stopped providers; up requires service and authenticated health", async () => {
+test("remote down updates only stopped providers; up requires service and authenticated health", async () => {
   const updates: [string, boolean][] = [];
   const probed: string[] = [];
   let remoteReachable = true;
@@ -112,12 +142,14 @@ test("twilight down updates only stopped providers; up requires service and auth
     return { stdout: "", stderr: "", exitCode: 0 };
   };
   const opts = {
-    modelPath: "",
+    remoteHost,
+    providers,
+    remoteModelPath: "",
     command,
-    secrets: { TWILIGHT_API_KEY: "key" },
+    secrets: { REMOTE_API_KEY: "key" },
     probe: async (url: string, token?: string) => {
       probed.push(`${url}:${token}`);
-      return url.includes("twilight") ? remoteHealthy : true;
+      return url.includes("example.com") ? remoteHealthy : true;
     },
     setEnabled: async (id: string, enabled: boolean) => {
       updates.push([id, enabled]);
@@ -131,8 +163,8 @@ test("twilight down updates only stopped providers; up requires service and auth
   await manageLocal("down", opts);
   await manageLocal("down", opts);
   expect(updates).toEqual([
-    ["twilight", false],
-    ["twilight", false],
+    ["lan", false],
+    ["lan", false],
   ]);
   expect(probed).toEqual([]);
   updates.length = 0;
@@ -142,7 +174,7 @@ test("twilight down updates only stopped providers; up requires service and auth
   remoteHealthy = true;
   updates.length = 0;
   await manageLocal("up", opts);
-  expect(updates).toEqual([["twilight", true]]);
+  expect(updates).toEqual([["lan", true]]);
   updates.length = 0;
   await manageLocal("status", opts);
   expect(updates).toEqual([]);
@@ -155,7 +187,7 @@ test("all local actions only report authenticated oMLX reachability", async () =
         updates: string[] = [],
         probes: string[] = [];
       const report = await manageLocal(action, {
-        modelPath: "",
+        remoteModelPath: "",
         secrets: healthy === undefined ? {} : { OMLX_API_KEY: "key" },
         command: async (args) => {
           calls.push(args);
@@ -176,7 +208,35 @@ test("all local actions only report authenticated oMLX reachability", async () =
           healthy === undefined ? "unavailable: missing OMLX_API_KEY" : healthy ? "healthy" : "unreachable",
       });
       expect(probes.includes("http://127.0.0.1:8989/v1/models")).toBe(healthy !== undefined);
-      expect(calls.every((args) => args[0] === "ssh")).toBe(true);
+      expect(calls).toEqual([]);
+      expect(report.remote).toBeUndefined();
       expect(updates).toEqual([]);
     }
+});
+
+test("remote management enables an anonymous configured provider without changing other endpoints", async () => {
+  const updates: [string, boolean][] = [];
+  const anonymous: ProviderDef = {
+    id: "lan",
+    label: "LAN",
+    harness: "claude",
+    billing: "free",
+    maxConcurrent: 1,
+    openaiBaseUrl: "http://example.com:8080/v1",
+  };
+  const opts = {
+    remoteHost,
+    providers: [{ ...anonymous, id: "other", openaiBaseUrl: "http://example.com:8989/v1" }, anonymous],
+    command: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    probe: async () => true,
+    setEnabled: async (id: string, enabled: boolean) => {
+      updates.push([id, enabled]);
+    },
+  };
+  await manageLocal("up", opts);
+  await manageLocal("down", opts);
+  expect(updates).toEqual([
+    ["lan", true],
+    ["lan", false],
+  ]);
 });

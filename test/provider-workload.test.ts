@@ -22,7 +22,7 @@ test("provider workload uses local calendar boundaries and adds chat calls once"
     inv.run("mtplx", localDay(0, 1), localDay(0, 2), 10, 4, 3, 0.5);
     inv.run("mtplx", localDay(-6, 1), localDay(-6, 2), 20, 5, 6, 1);
     inv.run("mtplx", localDay(-6) - 1, localDay(-6), 999, 0, 999, 99);
-    inv.run("twilight", localDay(0) - 1, null, 7, 2, 8, 0.2);
+    inv.run("retired-lan", localDay(0) - 1, null, 7, 2, 8, 0.2);
     store.db
       .query(`INSERT INTO chat_calls
       (conversation_id, provider, model_id, result_json, cost_usd, started_at, duration_ms)
@@ -38,7 +38,7 @@ test("provider workload uses local calendar boundaries and adds chat calls once"
       (conversation_id, provider, model_id, result_json, cost_usd, started_at)
       VALUES ('c', ?, 'm', ?, 0, ?)`)
       .run(
-        "twilight",
+        "retired-lan",
         JSON.stringify({ usage: { input: 3, cacheRead: 0, output: 1 }, costEquivUsd: 0.1 }),
         localDay(-6, 2),
       );
@@ -58,8 +58,8 @@ test("provider workload uses local calendar boundaries and adds chat calls once"
       today: { invocations: 3, tokensIn: 17, tokensOut: 7, wallTimeMs: 3_602_500, costEquivUsd: 0.8 },
       sevenDays: { invocations: 4, tokensIn: 42, tokensOut: 13, wallTimeMs: 7_202_500, costEquivUsd: 1.8 },
     });
-    expect(workloadFor("twilight", rows)).toEqual({
-      provider: "twilight",
+    expect(workloadFor("retired-lan", rows)).toEqual({
+      provider: "retired-lan",
       today: { invocations: 0, tokensIn: 0, tokensOut: 0, wallTimeMs: 0, costEquivUsd: 0 },
       sevenDays: {
         invocations: 2,
