@@ -15,9 +15,9 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit -p .",
-    "test": "bun test",
+    "test": "bun test --parallel=$(bun -p 'const v=process.env.LIMITLESS_TEST_WORKERS ?? \"\"; const n=Number(v); /^\\d+$/.test(v) && Number.isSafeInteger(n) && n>0 ? n : 4')",
     "smoke": "bun scripts/smoke.ts",
-    "check": "bun run lint && bun run typecheck && bun test"
+    "check": "bun run lint && bun run typecheck && bun run test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",

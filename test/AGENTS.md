@@ -46,11 +46,16 @@ and extend the closest case when it already exercises that behavior.
 - Do not delete security, isolation, cancellation, crash-resume, or delivery tests just because
   they are slow. Identify the unique failure they catch and any replacement coverage first.
 - Measure proposed speed changes with the complete default suite. Do not obtain a faster result
-  by skipping tests, weakening assertions, or enabling blanket concurrency over shared globals
-  such as `process.env`, spies, timers, and gate slots. Finish with `bun run check`.
+  by skipping tests or weakening assertions. The suite runs process-isolated files with
+  `--parallel`; `LIMITLESS_TEST_WORKERS` overrides the fixed worker count. Blanket in-process
+  concurrency (`--concurrent`), including concurrency over shared globals such as `process.env`,
+  spies, timers, and gate slots, is still forbidden. Follow the root `AGENTS.md` for final checks.
 
 ## Tests that hold on every machine
 
+- **Files run in parallel.** Every new test file must run independently alongside other files:
+  use its own temporary directories under `os.tmpdir()`, port 0, no fixed shared paths, and no
+  dependence on file order. Process isolation keeps globals local to a file, not to a test.
 - **Show that the test fails without the change.** Undo the fix (copy the file aside, never
   `git stash`), run the test, and restore it. A test that still passes protects nothing, and
   reviewers run this check.

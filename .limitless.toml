@@ -7,7 +7,7 @@ checks = [
   # The full suite takes about 18 minutes while two gates and a land check share the machine (2026-10-04),
   # so the 900 s default timed out the test gate in nearly every run, and a check that also times out
   # on the base counts as still failing and doesn't block.
-  { name = "test", run = "bun test", timeoutSec = 1800 },
+  { name = "test", run = "bun test --parallel=$(bun -p 'const v=process.env.LIMITLESS_TEST_WORKERS ?? \"\"; const n=Number(v); /^\\d+$/.test(v) && Number.isSafeInteger(n) && n>0 ? n : 4')", timeoutSec = 1800 },
 ]
 
 [policy]

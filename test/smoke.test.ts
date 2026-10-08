@@ -777,6 +777,7 @@ test("Codex smoke retries only an unsupported ChatGPT model and reports the sele
 });
 
 test("deploy restores the previous checkout when injected smoke fails before restart", async () => {
+  const originalWorkers = process.env.LIMITLESS_TEST_WORKERS;
   const dir = mkdtempSync(join(tmpdir(), "limitless-deploy-test-"));
   mkdirSync(join(dir, ".git"));
   const calls: string[] = [];
@@ -791,6 +792,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
     return { stdout: "", stderr: "", exitCode: 0 };
   };
   try {
+    delete process.env.LIMITLESS_TEST_WORKERS;
     await expect(
       deploy(7400, "feature", true, {
         leaseClient: async () => ({ id: "lease", acquired: true }),
@@ -826,12 +828,14 @@ test("deploy restores the previous checkout when injected smoke fails before res
       "bun install --frozen-lockfile",
       "bun run lint",
       "bun run typecheck",
-      "bun test",
+      "bun test --parallel=4",
       "bun scripts/smoke.ts",
       "git checkout -q --detach previous-commit",
       "bun install --frozen-lockfile",
     ]);
   } finally {
+    if (originalWorkers === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
+    else process.env.LIMITLESS_TEST_WORKERS = originalWorkers;
     rmSync(dir, { recursive: true, force: true });
   }
 });
