@@ -682,8 +682,10 @@ test("policy CLI keeps the committed triage pin", async () => {
   files.set("routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8"));
   const committed = JSON.parse(files.get("routing/policy.json") ?? "{}");
   await evalCommand(["policy"], { write: true }, io);
-  const { decided } = JSON.parse(files.get("routing/overrides.json") ?? "{}")["triage.default"];
-  expect(printed.join("\n")).toContain(`triage.default: pinned by owner decision (${decided})`);
+  expect(printed.join("\n")).toContain("triage.default: pinned by owner decision (2026-10-07)");
+  expect(printed.join("\n")).toContain("eval-muyogy5fibhy");
+  expect(printed.join("\n")).toContain("eval-mupjkaccha17");
+  expect(committed.triage.default.slice(0, 2)).toEqual(["codex/luna@medium", "claude/haiku-5.5@medium"]);
   expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual(committed);
 });
 

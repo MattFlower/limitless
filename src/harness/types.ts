@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ZodType } from "zod";
 import type { Billing, ConfinementProbe, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
@@ -144,12 +145,22 @@ export function priceOf(usage: Usage, price: ModelTarget["price"]): number {
   );
 }
 
+interface LoopCall {
+  key: string;
+  name: string;
+  id?: string;
+  hash?: string;
+  previous?: string;
+}
+
 /**
  * Detects an agent stuck repeating the same tool call, or blowing through its tool budget.
  * Returns a reason string when the run should be stopped.
  */
 export class LoopDetector {
-  private recent: string[] = [];
+  private recent: LoopCall[] = [];
+  private pending = new Map<string, LoopCall>();
+  private results = new Map<string, string>();
   private total = 0;
   constructor(
     private readonly maxToolCalls: number,
@@ -157,14 +168,71 @@ export class LoopDetector {
     private readonly window = 12,
   ) {}
 
-  observe(name: string, input: unknown): string | null {
+  observe(name: string, input: unknown, id?: string): string | null {
     this.total++;
     if (this.total > this.maxToolCalls) return `exceeded tool-call budget (${this.maxToolCalls})`;
+    // A threshold call may show progress until the next call, but cannot defer a stop forever.
+    const reason = this.reconcile(true);
+    if (reason) return reason;
     const key = `${name}:${JSON.stringify(input)}`;
-    this.recent.push(key);
-    if (this.recent.length > this.window) this.recent.shift();
-    const same = this.recent.filter((k) => k === key).length;
-    if (same >= this.maxIdenticalInWindow) return `repeated the same ${name} call ${same} times`;
+    const entry = { key, name, id, previous: this.results.get(key) };
+    if (id !== undefined) this.pending.set(id, entry);
+    this.recent.push(entry);
+    if (this.recent.length > this.window) {
+      const evicted = this.recent.shift();
+      if (evicted?.id !== undefined) this.pending.delete(evicted.id);
+      if (evicted && !this.recent.some((entry) => entry.key === evicted.key))
+        this.results.delete(evicted.key);
+    }
+    return this.reconcile();
+  }
+
+  observeResult(id: string, output: string): string | null {
+    const entry = this.pending.get(id);
+    if (!entry) return null;
+    this.pending.delete(id);
+    entry.hash = createHash("sha256").update(output).digest("hex");
+    return this.reconcile();
+  }
+
+  /** Invocation completion ends the threshold call's opportunity to show progress. */
+  finish(): string | null {
+    return this.reconcile(true);
+  }
+
+  private reconcile(finished = false): string | null {
+    // Replay the bounded window so late results compare in call order. Each entry remembers
+    // its preceding baseline, including when that baseline's call has left the window.
+    const baselines = new Map<string, string | undefined>();
+    const counts = new Map<string, { same: number; last: LoopCall }>();
+    for (const entry of this.recent) {
+      const previous = baselines.has(entry.key) ? baselines.get(entry.key) : entry.previous;
+      entry.previous = previous;
+      let same = (counts.get(entry.key)?.same ?? 0) + 1;
+      if (entry.hash !== undefined) {
+        if (previous !== undefined && previous !== entry.hash) {
+          // Any changed output is progress, even timestamps: varying-output loops stop only at
+          // the tool-call budget or invocation timeout. Repeated failing commands with identical
+          // output, the stuck behavior seen in practice, remain detectable.
+          same = 0;
+        }
+      }
+      const baseline = entry.hash ?? previous;
+      baselines.set(entry.key, baseline);
+      if (baseline !== undefined) this.results.set(entry.key, baseline);
+      counts.set(entry.key, { same, last: entry });
+    }
+    for (const { same, last } of counts.values()) {
+      if (same < this.maxIdenticalInWindow) continue;
+      if (
+        !finished &&
+        this.recent.some(
+          (entry) => entry.key === last.key && entry.id !== undefined && entry.hash === undefined,
+        )
+      )
+        continue;
+      return `repeated the same ${last.name} call ${this.maxIdenticalInWindow} times`;
+    }
     return null;
   }
 }

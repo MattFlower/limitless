@@ -140,6 +140,20 @@ export const MODELS: ModelDef[] = [
     tier: 3,
     price: { input: 1, output: 5, cacheRead: 0.1 },
   },
+  {
+    id: "claude/haiku-5.5",
+    provider: "claude",
+    model: "claude-haiku-5-5",
+    vendor: "anthropic",
+    origin: "US",
+    baseOrigin: "US",
+    supportedEfforts: ["low", "medium", "high"],
+    effort: "medium",
+    tier: 3,
+    price: { input: 0.1, output: 0.5, cacheRead: 0.01 },
+    notes:
+      "Prompts over 100k tokens cost $0.50 input / $2.50 output per million tokens; tokenizer counts about 30% more tokens than Haiku 4.5",
+  },
   // OpenAI via the ChatGPT subscription (Codex CLI >= 0.157 serves the gpt-6 family on this plan).
   {
     id: "codex/sol",

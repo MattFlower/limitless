@@ -159,6 +159,18 @@ test("review and verify datasets validate pins, nested inputs, labels and unique
       schema.safeParse({ ...file, cases: [{ ...item, input: { ...item.input, gates: [timedOut] } }] })
         .success,
     ).toBe(true);
+    const withFailures = { ...timedOut.result, failures: "error: assertion\n(fail) named test" };
+    const comparison = { ...timedOut, result: withFailures, firstAttempt: withFailures };
+    const withGates = (gate: unknown) => ({
+      ...file,
+      cases: [{ ...item, input: { ...item.input, gates: [gate] } }],
+    });
+    expect(schema.safeParse(withGates(comparison)).success).toBe(true);
+    for (const field of ["result", "firstAttempt"]) {
+      expect(
+        schema.safeParse(withGates({ ...comparison, [field]: { ...withFailures, unknown: true } })).success,
+      ).toBe(false);
+    }
   }
   const r = review.cases[0];
   const v = verify.cases[0];

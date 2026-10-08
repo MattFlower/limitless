@@ -100,6 +100,42 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage fallback", () => {
+  const tracker = new ProviderTracker(
+    PROVIDERS,
+    store,
+    reserves,
+    { OPENROUTER_API_KEY: "fake-key", TWILIGHT_API_KEY: "fake-key" },
+    { openrouter: 50 },
+  );
+  for (const provider of ["twilight", "mtplx"]) tracker.setHealthy(provider, true);
+  const committed = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
+  const router = new Router(tracker, committed, MODELS);
+  const ids = () => router.route("triage", "small").candidates.map((c) => c.targetId);
+  expect(ids()).toEqual([
+    "codex/luna@medium",
+    "claude/haiku-5.5@medium",
+    "codex/luna@low",
+    "codex/luna@none",
+    "openrouter/gpt-6-luna@medium",
+    "openrouter/gpt-6-luna@low",
+    "openrouter/gpt-6-luna@none",
+    "twilight/qwen-27b@none",
+    "mtplx/qwen-27b@high",
+    "claude/sonnet-5.5@low",
+  ]);
+  tracker.setHealthy("codex", false);
+  expect(ids()).toEqual([
+    "claude/haiku-5.5@medium",
+    "openrouter/gpt-6-luna@medium",
+    "openrouter/gpt-6-luna@low",
+    "openrouter/gpt-6-luna@none",
+    "twilight/qwen-27b@none",
+    "mtplx/qwen-27b@high",
+    "claude/sonnet-5.5@low",
+  ]);
+});
+
 test("live policy removes sticky targets, preserves exclusions and tiers, and explicit only targets win", () => {
   const { router } = setup();
   const selected = router.cellRevision("implement", "small");

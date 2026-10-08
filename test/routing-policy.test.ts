@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,7 @@ import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
-import { exportProviders, resolveCatalog } from "../src/router/config-catalog.ts";
+import { exportProviders, resolveCatalog, runtimeModel } from "../src/router/config-catalog.ts";
 import { loadPolicy, validatePolicy } from "../src/router/policy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
@@ -15,6 +15,55 @@ import { evalFixture } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { customModel, providerFixture } from "./provider-config-support.ts";
 import { identitySnapshot } from "./routing-identity-support.ts";
+
+test("startup prefers built-in Haiku 5.5 over a retained runtime entry; other collisions fail", async () => {
+  const fixture = providerFixture([]);
+  const store = new Store(":memory:");
+  const cfg = fixture.load();
+  const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
+  const builtIn = catalog.models.find((m) => m.id === "claude/haiku-5.5");
+  if (!builtIn) throw new Error("missing Haiku 5.5");
+  const runtime = runtimeModel({ ...customModel, id: "haiku-5.5", provider: "claude" }, catalog.providers);
+  store.writeRuntimeModel(runtime.id, runtime);
+  const history = store.catalogHistory();
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  let factory: Factory | undefined;
+  try {
+    factory = new Factory(cfg, { store, policyPath: join(import.meta.dir, "../routing/policy.json") });
+    expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([builtIn]);
+    factory.tracker.setHealthy("codex", false);
+    expect(factory.router.route("triage", "small").candidates[0]).toMatchObject({
+      modelId: "claude/haiku-5.5",
+      model: "claude-haiku-5-5",
+      effort: "medium",
+      vendor: "anthropic",
+      price: { input: 0.1, output: 0.5, cacheRead: 0.01 },
+    });
+    expect(warn).toHaveBeenCalledWith(
+      "[catalog] claude/haiku-5.5: redundant runtime entry; using built-in definition",
+    );
+    expect(store.runtimeModels()).toEqual([runtime]);
+    expect(store.catalogHistory()).toEqual(history);
+    expect(() => factory?.catalog.add({ ...customModel, id: "haiku-5.5", provider: "claude" })).toThrow(
+      "catalog collision: claude/haiku-5.5",
+    );
+    expect(
+      () =>
+        new Factory(cfg, {
+          store,
+          models: MODELS.map((m) => (m.id === runtime.id ? { ...m, source: "config" } : m)),
+        }),
+    ).toThrow("catalog collision: claude/haiku-5.5");
+    const other = runtimeModel({ ...customModel, id: "luna", provider: "codex" }, catalog.providers);
+    store.writeRuntimeModel(other.id, other);
+    expect(() => new Factory(cfg, { store })).toThrow("catalog collision: codex/luna");
+  } finally {
+    warn.mockRestore();
+    await factory?.stop();
+    store.close();
+    fixture.close();
+  }
+});
 
 test("runtime models stay out of escalation and free widening unless explicitly named", () => {
   const fixture = providerFixture([], "OMLX_API_KEY=fake-key\n");
@@ -295,9 +344,19 @@ test("frozen pre-PR identity and export preserve all routing decisions", async (
       .filter((c: { modelId: string }) => !retiredModels.has(c.modelId.split("@")[0] ?? ""));
   }
   for (const row of baseline.snapshot.decisions) row.decision = baseline.decisionTable[row.decision];
-  expect(identitySnapshot(resolveCatalog())).toEqual(baseline.snapshot);
+  // Haiku 5.5 is an intentional addition, covered above; retain every frozen assertion for existing models.
+  const existingSnapshot = (catalog: ReturnType<typeof resolveCatalog>) => {
+    const snapshot = identitySnapshot(catalog);
+    snapshot.models = snapshot.models.filter((m) => m.id !== "claude/haiku-5.5");
+    for (const row of snapshot.decisions) {
+      row.decision.candidates = row.decision.candidates.filter((m) => m.modelId !== "claude/haiku-5.5");
+      row.decision.skipped = row.decision.skipped.filter((m) => m.modelId !== "claude/haiku-5.5@medium");
+    }
+    return snapshot;
+  };
+  expect(existingSnapshot(resolveCatalog())).toEqual(baseline.snapshot);
   const exported = resolveCatalog(
     (Bun.TOML.parse(exportProviders(resolveCatalog())) as Record<string, unknown>).providers,
   );
-  expect(identitySnapshot(exported)).toEqual(baseline.snapshot);
+  expect(existingSnapshot(exported)).toEqual(baseline.snapshot);
 });
