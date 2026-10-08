@@ -109,3 +109,37 @@ prompt decisions may use dev only; heldout is reported once per decision.
 | #419 | dev |
 | #421 | dev |
 | #424 | heldout |
+
+## M5.2 adjudication procedure — 2026-10-08
+
+Recorded on 2026-10-08 (checked with `date`) before any candidate was
+adjudicated. It applies the candidate rule above to every pending defect.
+
+- **Every pending defect is adjudicated, minor and nit included.** Only
+  blocker and major defects can be gold (`required: true`). A confirmed minor
+  or nit stays as an optional defect (`required: false`), so a review that
+  reports it is matched instead of counted as an unexpected finding. A
+  confirmed blocker or major whose real severity is lower is downgraded and
+  kept at the lower severity; downgraded to minor, it becomes optional. A
+  rejected candidate is removed and recorded in `labelHistory`.
+- **The defect must be in the change.** It must exist at the case head and be
+  introduced or newly exposed by `base..head`. Findings about delivery or
+  process rather than code at head (merge conflicts, branch state, the PR
+  description) are rejected. Two candidates in one case that describe the
+  same defect are merged into one.
+- **Evidence or rejection.** The adjudicator quotes the code at head with the
+  base contrast, or gives a reproduction. A candidate without evidence is
+  rejected. Behaviour that needs real Seatbelt can't be reproduced inside the
+  adjudicator's own sandbox (macOS can't nest Seatbelt profiles), so for those
+  quoted code is the evidence, or the orchestrator reproduces it unconfined.
+- **Location.** The adjudicator gives the file and line range at head where
+  the defect is expressed. The grader credits a finding in the same file
+  within five lines of that range, so the range covers the lines a reviewer
+  would cite, and it replaces the candidate's approximate range.
+- **Independence.** The adjudicator (codex/sol-6.1, high effort) is the same
+  model as production's in-run reviewer, and many candidates came from
+  orchestrator reviews run on that model. Its verdict alone is therefore not
+  evidence. The orchestrator re-quotes every cited range at head and base,
+  re-runs every reproduction, and checks rejections as well as
+  confirmations. Report results for Sol 6.1-based systems on these cases with
+  this caveat.
