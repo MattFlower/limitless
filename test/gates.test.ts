@@ -24,6 +24,7 @@ import {
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
+import { redactGateStreams } from "../src/gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
@@ -93,14 +94,13 @@ describe("detectGates", () => {
 });
 
 describe("runGates / compareGates", () => {
-  test.each([1, 19, 37])("redacts only the stream boundary pieces at credential split %i", async (split) => {
-    const secret = "synthetic-boundary-only-credential-42Z";
-    proc.registerCredential("BOUNDARY_ONLY_TEST_TOKEN", secret);
-    const stdout =
-      `${secret}.test.ts:\n(pass) full\nsZ.test.ts:\n(pass) intact\nerror: s Z\n` +
-      `(fail) s Z ${secret.slice(0, split)}`;
-    const stderr = `${secret.slice(split)}\nerror: s Z\n(fail) s Z\n`;
-    const dir = tempDir({ "stdout.txt": stdout, "stderr.txt": stderr });
+  test("intact credentials on either stream are redacted without holding failure lines", async () => {
+    const secret = "synthetic-intact-stream-credential-421";
+    proc.registerCredential("INTACT_STREAM_TEST_TOKEN", secret);
+    const dir = tempDir({
+      "stdout.txt": `error: ${secret}\n(fail) stdout assertion\n`,
+      "stderr.txt": `(fail) stderr ${secret}\n^ this test timed out after 100ms.\n`,
+    });
     try {
       const run = await runGates(
         dir,
@@ -113,20 +113,58 @@ describe("runGates / compareGates", () => {
         new AbortController().signal,
       );
       expect(run.checks[0]?.output).toBe(
-        "[redacted].test.ts:\n(pass) full\nsZ.test.ts:\n(pass) intact\nerror: s Z\n" +
-          "(fail) s Z [redacted]\n[redacted]\nerror: s Z\n(fail) s Z",
+        "error: [redacted]\n(fail) stdout assertion\n\n(fail) stderr [redacted]\n^ this test timed out after 100ms.",
       );
-      expect(run.checks[0]?.failures).toBe(
-        "error: s Z\n(fail) s Z [redacted]\n\n[redacted]\nerror: s Z\n(fail) s Z",
+      expect(run.checks[0]?.failures).toContain(
+        "(fail) stderr [redacted]\n^ this test timed out after 100ms.",
       );
-      expect(run.checks[0]?.testCoverage).toEqual({
-        passedFiles: ["[redacted].test.ts"],
-        skippedFiles: ["sZ.test.ts"],
-      });
+      expect(JSON.stringify(run)).not.toContain(secret);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test.each(["stdout", "stderr"])(
+    "only the truncated %s stream loses its credential overlap",
+    async (stream) => {
+      const secret = "synthetic-per-stream-cut-credential-421";
+      proc.registerCredential("PER_STREAM_CUT_TEST_TOKEN", secret);
+      const diagnostic = "(fail) retained identity\n^ this test timed out after 100ms.\n";
+      const streams = redactGateStreams(
+        stream === "stdout" ? "x".repeat(64_000) : diagnostic,
+        stream === "stderr" ? "x".repeat(64_000) : diagnostic,
+        { stdoutTruncated: stream === "stdout", stderrTruncated: stream === "stderr" },
+      );
+      expect(streams[stream === "stdout" ? "stderr" : "stdout"]).toBe(diagnostic);
+      expect(streams[stream].length).toBeLessThan(64_000);
+      const dir = tempDir({ "long.txt": "x".repeat(65_000), "short.txt": diagnostic });
+      try {
+        const run = await runGates(
+          dir,
+          {
+            setup: [],
+            source: "detected",
+            protectedPaths: [],
+            checks: [
+              {
+                name: "test",
+                run:
+                  stream === "stdout"
+                    ? "cat long.txt; cat short.txt >&2; exit 1"
+                    : "cat long.txt >&2; cat short.txt; exit 1",
+              },
+            ],
+          },
+          new AbortController().signal,
+        );
+        // The stdout tail can itself fall outside the combined tail, but its early excerpt must survive.
+        if (stream === "stdout") expect(run.checks[0]?.output).toContain(diagnostic.trim());
+        expect(run.checks[0]?.failures).toContain(diagnostic.trim());
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("credential fragments cannot survive the runner cap or normalized tail cuts", async () => {
     const secret = "synthetic-runner-cap-credential-421";

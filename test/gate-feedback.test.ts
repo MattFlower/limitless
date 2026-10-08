@@ -17,6 +17,8 @@ import { providerFixture } from "./provider-config-support.ts";
 test("legacy gate results are redacted on reopened state, checkpoints, HTTP and SSE reads", async () => {
   const secret = "synthetic-legacy-gate-credential-421";
   registerCredential("LEGACY_GATE_TEST_TOKEN", secret);
+  const terminalSecret = "synthetic-legacy-terminal-credential-421";
+  registerCredential("LEGACY_TERMINAL_TEST_TOKEN", terminalSecret);
   const colored = `${secret.slice(0, 12)}\u001b[31m${secret.slice(12)}`;
   const fixture = providerFixture([]);
   const db = join(fixture.root, "store.db");
@@ -34,6 +36,10 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
     });
     const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
     const gates = comparison(`credential: ${colored}`, `error: ${secret}\n(fail) assertion`, false);
+    const interrupted = comparison("sandbox_apply: Oper\u001b[0mation not permitted", undefined, false)[0];
+    if (!interrupted) throw new Error("missing legacy result");
+    interrupted.result.firstAttempt = { ...interrupted.result };
+    gates.push(interrupted);
     const state: RunState = {
       flow: "build",
       phase: "loop",
@@ -50,9 +56,18 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
       completedChecks: { round: 0, values: { gates } },
       terminalReason: `gate failure: ${colored}`,
     };
+    store.updateRun(run.id, {
+      status: "failed",
+      error: `terminal error: ${terminalSecret}; Last feedback: ${colored}`,
+    });
     store.setRunState(run.id, state);
     store.putArtifact(run.id, "gates.json", "gates", JSON.stringify(gates));
-    store.addEvent({ runId: run.id, type: "gate", message: `gate: ${secret}`, data: gates });
+    store.addEvent({
+      runId: run.id,
+      type: "gate",
+      message: `gate: ${secret}; terminal error: ${terminalSecret}`,
+      data: gates,
+    });
     store.close();
     store = new Store(db);
     factory = new Factory(fixture.load(), { store });
@@ -60,9 +75,17 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
     const checkpoint = await context.stage("gates", async () => {
       throw new Error("completed gate checkpoint must be reused");
     });
+    if (!state.baseline || !context.state.baseline) throw new Error("missing baseline");
+    expect(compareGates(null, state.baseline).at(-1)?.verdict).toBe("new_failure");
+    expect(compareGates(null, context.state.baseline).at(-1)?.verdict).toBe("new_failure");
+    expect((checkpoint as GateComparison[]).at(-1)?.result).toMatchObject({
+      confinementError: false,
+      firstAttempt: { confinementError: false },
+    });
     const routes = createHttpRoutes(factory);
-    const read = (path: string, name = "") =>
-      (routes[path] as Route)(
+    const read = (path: string, name = "") => {
+      const route = routes[path];
+      return (typeof route === "function" ? (route as Route) : (route as { GET: Route }).GET)(
         requestWithParams(
           `http://localhost:7400${path.replace(":id", run.id).replace(":name", name)}`,
           { signal: controller.signal },
@@ -70,6 +93,17 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
         ),
         localServer,
       );
+    };
+    const runResponses = await Promise.all(
+      ["/api/runs/:id", "/api/runs", "/api/feed"].map(async (path) => {
+        const response = await read(path);
+        expect(response.status).toBe(200);
+        const text = JSON.stringify(await response.json());
+        expect(text).toContain("terminal error: [redacted]");
+        expect(text).toContain("Last feedback: [redacted]");
+        return text;
+      }),
+    );
     const artifact = await (await read("/api/runs/:id/artifacts/:name", "gates.json")).text();
     const events = await (await read("/api/runs/:id/events")).json();
     const response = await read("/api/runs/:id/stream");
@@ -92,6 +126,7 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
       acceptance_criteria: [],
     };
     const messages = [
+      ...runResponses,
       JSON.stringify(context.state),
       JSON.stringify(checkpoint),
       artifact,
@@ -143,6 +178,7 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
     for (const message of messages) {
       expect(message).toContain("[redacted]");
       expect(message).not.toContain(secret);
+      expect(message).not.toContain(terminalSecret);
       expect(message).not.toContain(secret.slice(12));
     }
     // Reads must leave the previous release's rows untouched.

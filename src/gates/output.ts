@@ -1,45 +1,38 @@
 import { stripVTControlCharacters } from "node:util";
-import { redactCredentials, registeredCredentials } from "../util/proc.ts";
+import { type ProcResult, redactCredentials, registeredCredentials } from "../util/proc.ts";
+
+export const launchFailure = (output: string) => output.includes("sandbox_apply: Operation not permitted");
 
 /** Remove terminal formatting before redaction, and redact before any diagnostic or tail cuts. */
 export const redactGateOutput = (output: string): string =>
   redactCredentials(stripVTControlCharacters(output));
 
-/** Sanitize decoded values, including historical state and JSON artifacts, without changing rows. */
-export const redactGateData = <T>(value: T, redact = redactGateOutput): T =>
+/** Sanitize decoded historical data without changing rows; preserve the raw confinement verdict. */
+export const redactGateData = <T>(value: T): T =>
   value === undefined
     ? value
-    : JSON.parse(JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redact(v) : v)));
+    : JSON.parse(
+        JSON.stringify(value, (_key, v: unknown) => {
+          if (typeof v === "string") return redactGateOutput(v);
+          if (v && typeof v === "object" && "ok" in v && "output" in v && typeof v.output === "string") {
+            if ("confinementError" in v && v.confinementError != null) return v;
+            return { ...v, confinementError: launchFailure(v.output) };
+          }
+          return v;
+        }),
+      );
 
-export function redactGateArtifact(content: string): string {
-  try {
-    return JSON.stringify(redactGateData(JSON.parse(content)));
-  } catch {
-    return redactGateOutput(content);
-  }
-}
-
-/** A raw runner cut may have removed a credential's prefix. Drop its possible decoded overlap. */
-export function redactGateStreams(stdout: string, stderr: string, truncated = false) {
+/** A raw runner cut may have removed a credential's prefix. Drop only that stream's overlap. */
+export function redactGateStreams(
+  stdout: string,
+  stderr: string,
+  cuts: Pick<ProcResult, "stdoutTruncated" | "stderrTruncated"> = {},
+) {
+  // Literal redaction covers accidental disclosure: one write stays on one stream. Deliberate splits,
+  // interleaving or encoding require keeping credentials out of gate commands' reach (#335).
   const overlap = Math.max(0, ...registeredCredentials().map((secret) => secret.length - 1));
-  stdout = stripVTControlCharacters(stdout);
-  stderr = stripVTControlCharacters(stderr);
-  let stdoutCut = 0;
-  let stderrCut = 0;
-  for (const secret of registeredCredentials()) {
-    for (let split = 1; split < secret.length; split++) {
-      const left = secret.slice(0, split);
-      const right = secret.slice(split);
-      if (stdout.endsWith(left) && stderr.startsWith(right)) {
-        stdoutCut = Math.max(stdoutCut, left.length);
-        stderrCut = Math.max(stderrCut, right.length);
-      }
-    }
-  }
-  if (stdoutCut) stdout = `${stdout.slice(0, -stdoutCut)}[redacted]`;
-  if (stderrCut) stderr = `[redacted]${stderr.slice(stderrCut)}`;
   return {
-    stdout: redactCredentials(stdout).slice(truncated ? overlap : 0),
-    stderr: redactCredentials(stderr).slice(truncated ? overlap : 0),
+    stdout: redactGateOutput(stdout).slice(cuts.stdoutTruncated ? overlap : 0),
+    stderr: redactGateOutput(stderr).slice(cuts.stderrTruncated ? overlap : 0),
   };
 }

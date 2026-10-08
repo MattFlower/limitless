@@ -1146,6 +1146,23 @@ describe("process handling", () => {
     }
   }, 20_000);
 
+  test.each(["stdout", "stderr"])("runner reports only %s as truncated", async (stream) => {
+    const res = await runProcess({
+      cmd: [
+        process.execPath,
+        "-e",
+        `process.${stream}.write('x'.repeat(200)); process.${stream === "stdout" ? "stderr" : "stdout"}.write('short diagnostic')`,
+      ],
+      cwd: dir,
+      env: process.env as Record<string, string>,
+      tailLimit: 100,
+    });
+    expect(res.truncated).toBe(true);
+    expect(res.stdoutTruncated).toBe(stream === "stdout");
+    expect(res.stderrTruncated).toBe(stream === "stderr");
+    expect(stream === "stdout" ? res.stderr : res.stdout).toBe("short diagnostic");
+  });
+
   test("sh refuses to return truncated output", async () => {
     const res = await sh(["/bin/sh", "-c", "head -c 70000 /dev/zero | tr '\\0' a"], { cwd: dir });
     expect(res.stdout.length).toBe(70_000);

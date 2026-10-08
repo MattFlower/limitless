@@ -17,10 +17,6 @@ export class FailureExcerpts {
   observe(raw: string): void {
     const line = redactGateOutput(raw);
     const text = line.trim();
-    if (text === OMITTED) {
-      this.omitted = true;
-      return;
-    }
     if (this.failure !== undefined) {
       // Bun emits the timeout explanation just after the result, unlike assertion diagnostics.
       const timeout = TIMEOUT.test(text);

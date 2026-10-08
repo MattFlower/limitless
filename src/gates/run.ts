@@ -2,8 +2,8 @@ import { basename } from "node:path";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
-import { extractFailures, FailureExcerpts } from "./failures.ts";
-import { redactGateData, redactGateOutput, redactGateStreams } from "./output.ts";
+import { FailureExcerpts } from "./failures.ts";
+import { launchFailure, redactGateOutput, redactGateStreams } from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -57,7 +57,6 @@ export interface GateHooks {
 }
 
 const OUTPUT_TAIL = 6_000;
-const launchFailure = (output: string) => output.includes("sandbox_apply: Operation not permitted");
 export const confinementFailed = (r?: GateResult): boolean =>
   !!r && ((r.confinementError ?? launchFailure(r.output)) || confinementFailed(r.firstAttempt));
 
@@ -68,15 +67,13 @@ export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLO
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
   let confinementError = false;
   const coverage = new BunTestCoverage(cwd);
-  const outExcerpts = new FailureExcerpts();
-  const errExcerpts = new FailureExcerpts();
-  let lastStdout: string | undefined;
-  let firstStderr: string | undefined;
+  const excerpts = new FailureExcerpts();
   const observe = (line: string) => {
     // Redaction can hide the launch diagnostic; inspect it before retaining any text.
     confinementError ||= launchFailure(line);
     line = redactGateOutput(line);
     coverage.observe(line);
+    excerpts.observe(line);
   };
   const res = await runConfined({
     command: cmd.run,
@@ -84,29 +81,14 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     env: gateEnv(),
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
-    onStdoutLine: (line) => {
-      observe(line);
-      if (lastStdout !== undefined) outExcerpts.observe(lastStdout);
-      lastStdout = line;
-    },
-    onStderrLine: (line) => {
-      observe(line);
-      if (firstStderr === undefined) firstStderr = line;
-      else errExcerpts.observe(line);
-    },
+    onStdoutLine: observe,
+    onStderrLine: observe,
   });
-  // Hold the two boundary lines until both streams are known, before excerpt caps can split them.
-  const boundary = redactGateStreams(lastStdout ?? "", firstStderr ?? "");
-  if (lastStdout !== undefined) outExcerpts.observe(boundary.stdout);
-  const output = redactGateStreams(res.stdout, res.stderr, res.truncated);
+  const output = redactGateStreams(res.stdout, res.stderr, res);
   const combined = `${output.stdout}\n${output.stderr}`.trim();
-  const testCoverage = redactGateData(coverage.result());
+  const testCoverage = coverage.result();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
-  const failures = ok
-    ? undefined
-    : extractFailures(
-        [outExcerpts.result(), boundary.stderr, errExcerpts.result()].filter(Boolean).join("\n"),
-      );
+  const failures = ok ? undefined : excerpts.result();
   return {
     name: cmd.name,
     command: cmd.run,

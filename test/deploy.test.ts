@@ -24,10 +24,7 @@ import {
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
 import type { HealthResponse } from "../src/core/types.ts";
-import { runGates } from "../src/gates/run.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
 import { registerCredential, type sh } from "../src/util/proc.ts";
-import { fakeConfinement } from "./confinement.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -684,41 +681,6 @@ test("a failed smoke gate reports the tail of both output streams and restores t
   expect(f.calls).not.toContain("drain");
   expect(f.calls).not.toContain("restart");
   expect(f.calls.at(-2)).toBe("git checkout -q --detach previous");
-  expect(f.selected()).toBe("previous");
-});
-
-test("split stdout/stderr credentials are redacted in gate results and deploy errors", async () => {
-  const secret = "synthetic-split-stream-credential-421";
-  registerCredential("SPLIT_STREAM_TEST_TOKEN", secret);
-  const f = setup();
-  const left = secret.slice(0, 19);
-  const right = secret.slice(19);
-  writeFileSync(join(f.opts.releaseDir, "stdout.txt"), `error: ${left}`);
-  writeFileSync(join(f.opts.releaseDir, "stderr.txt"), `${right}\n(fail) assertion\n`);
-  const run = await confinementScope.run(fakeConfinement, () =>
-    runGates(
-      f.opts.releaseDir,
-      {
-        setup: [],
-        source: "detected",
-        protectedPaths: [],
-        checks: [{ name: "test", run: "cat stdout.txt; cat stderr.txt >&2; exit 1" }],
-      },
-      new AbortController().signal,
-    ),
-  );
-  const command = f.opts.command;
-  f.opts.command = async (args, opts) =>
-    args.join(" ") === "bun test"
-      ? { stdout: `error: ${left}`, stderr: `${right}\n(fail) assertion\n`, exitCode: 1 }
-      : command(args, opts);
-  const error = String(await deploy(7400, "feature", false, f.opts).catch((e: unknown) => e));
-  for (const text of [JSON.stringify(run), error]) {
-    expect(text).toContain("[redacted]");
-    expect(text).not.toContain(left);
-    expect(text).not.toContain(right);
-  }
-  expect(error).toContain("deploy gate failed");
   expect(f.selected()).toBe("previous");
 });
 

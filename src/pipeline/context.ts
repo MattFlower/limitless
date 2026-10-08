@@ -293,19 +293,17 @@ export class RunContext {
     this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
-    const restored = deps.store.getRunState<RunState>(run.id);
-    this.state = restored
-      ? redactGateData(restored)
-      : {
-          flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
-          phase: "prepare",
-          answers: [],
-          round: 0,
-          roundsOnImplementer: 0,
-          triedImplementers: [],
-          feedback: null,
-          toolCommands: [],
-        };
+    this.state = deps.store.getRunState<RunState>(run.id) ?? {
+      flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
+      phase: "prepare",
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      feedback: null,
+      toolCommands: [],
+    };
+    this.state = redactGateData(this.state);
   }
 
   get store(): Store {

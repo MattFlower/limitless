@@ -261,6 +261,8 @@ export interface ProcResult {
   stderr: string; // tail, bounded by tailLimit
   /** True when output exceeded tailLimit and the head was dropped. */
   truncated: boolean;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
   durationMs: number;
 }
 
@@ -334,11 +336,11 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     );
 
     const limit = opts.tailLimit ?? DEFAULT_TAIL;
-    let truncated = false;
-    const appendTail = (buf: string, chunk: string): string => {
+    const truncated = { stdout: false, stderr: false };
+    const appendTail = (buf: string, chunk: string, stream: "stdout" | "stderr"): string => {
       const next = buf + chunk;
       if (next.length <= limit) return next;
-      truncated = true;
+      truncated[stream] = true;
       return next.slice(next.length - limit);
     };
     let stdout = "";
@@ -434,17 +436,17 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       lastActivity = Date.now();
-      stdout = appendTail(stdout, chunk);
+      stdout = appendTail(stdout, chunk, "stdout");
       out.push(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
       lastActivity = Date.now();
-      stderr = appendTail(stderr, chunk);
+      stderr = appendTail(stderr, chunk, "stderr");
       err.push(chunk);
     });
 
     child.on("error", (e) => {
-      stderr = appendTail(stderr, `\n[spawn error] ${e.message}`);
+      stderr = appendTail(stderr, `\n[spawn error] ${e.message}`, "stderr");
     });
 
     child.on("close", async (code, sig) => {
@@ -468,14 +470,16 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         idleTimedOut,
         stdout,
         stderr,
-        truncated,
+        truncated: truncated.stdout || truncated.stderr,
+        stdoutTruncated: truncated.stdout,
+        stderrTruncated: truncated.stderr,
         durationMs: Date.now() - started,
       });
     });
 
     // A child that exits before reading its input raises EPIPE on stdin; that must not crash us.
     child.stdin.on("error", (e) => {
-      stderr = appendTail(stderr, `\n[stdin error] ${e.message}`);
+      stderr = appendTail(stderr, `\n[stdin error] ${e.message}`, "stderr");
     });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
