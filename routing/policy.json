@@ -2,6 +2,7 @@
   "triage": {
     "default": [
       "codex/luna@medium",
+      "claude/haiku-5.5@medium",
       "codex/luna@low",
       "codex/luna@none",
       "openrouter/gpt-6-luna@medium",

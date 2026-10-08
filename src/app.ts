@@ -98,7 +98,14 @@ export class Factory {
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
     for (const model of this.store.runtimeModels()) {
-      if (this.models.some((m) => m.id === model.id)) throw new Error(`catalog collision: ${model.id}`);
+      const existing = this.models.find((m) => m.id === model.id);
+      if (existing) {
+        if (existing.id === "claude/haiku-5.5" && (existing.source ?? "code") === "code") {
+          console.warn("[catalog] claude/haiku-5.5: redundant runtime entry; using built-in definition");
+          continue;
+        }
+        throw new Error(`catalog collision: ${model.id}`);
+      }
       if (!this.providerDefs.some((p) => p.id === model.provider))
         throw new Error(`unknown provider ${model.provider}`);
       this.models.push(model);
