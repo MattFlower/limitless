@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { type PresetTarget, types as t, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
-import { chromium } from "playwright";
+import { type Browser, chromium, type Page } from "playwright";
 import { renderToString } from "solid-js/web";
 import type { StreamMessage } from "../src/core/types.ts";
 
@@ -192,45 +192,60 @@ export async function settle(): Promise<void> {
   for (let i = 0; i < 15; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+// One browser page per test file: a Chromium launch costs seconds under parallel load. The page
+// stays open because a --single-process Chromium exits when its last page closes.
+let shared: Promise<{ browser: Browser; page: Page }> | undefined;
+async function sharedPage(): Promise<Page> {
+  shared ??= (async () => {
+    const cache = join(import.meta.dir, "../node_modules/playwright-core/.local-browsers");
+    const binaries = new Bun.Glob("chromium_headless_shell-*/**/chrome-headless-shell{,.exe}").scan({
+      cwd: cache,
+      absolute: true,
+    });
+    const executable = (await binaries.next()).value;
+    if (!executable) throw new Error("Headless browser missing; run bun install first.");
+    const browser = await chromium.launch({
+      executablePath: executable,
+      // Factory confinement disallows Chromium's macOS child-process rendezvous.
+      args: ["--single-process", "--no-zygote", "--disable-gpu"],
+    });
+    const page = await browser.newPage();
+    await page.route("**/*", (route) => route.abort());
+    return { browser, page };
+  })();
+  return (await shared).page;
+}
+
+/** Close the shared browser; call from the test file's afterAll. */
+export async function closeSetupBrowser(): Promise<void> {
+  const current = shared;
+  shared = undefined;
+  await (await current)?.browser.close();
+}
+
 /** Measure the rendered UI with real CSS, offline and over pipes (no local server or socket). */
 export async function setupLayout(html: string, viewport: { width: number; height: number }) {
-  const cache = join(import.meta.dir, "../node_modules/playwright-core/.local-browsers");
-  const binaries = new Bun.Glob("chromium_headless_shell-*/**/chrome-headless-shell{,.exe}").scan({
-    cwd: cache,
-    absolute: true,
+  const page = await sharedPage();
+  await page.setViewportSize(viewport);
+  const css = await Bun.file(join(import.meta.dir, "../ui/styles.css")).text();
+  await page.setContent(`<style>${css}</style><div id="root">${html}</div>`);
+  return await page.evaluate(() => {
+    const page = document.querySelector<HTMLElement>(".setup-page");
+    if (!page) throw new Error("Setup page missing");
+    const bounds = (element: Element) => {
+      const { left, right, width } = element.getBoundingClientRect();
+      return { label: element.getAttribute("aria-label") ?? element.textContent, left, right, width };
+    };
+    return {
+      viewport: window.innerWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      pageWidth: page.clientWidth,
+      pageScrollWidth: page.scrollWidth,
+      cells: [...page.querySelectorAll("article[aria-label]")].map(bounds),
+      controls: [...page.querySelectorAll("input, select, button")].map(bounds),
+      overflowingCards: [...page.querySelectorAll<HTMLElement>(".card")]
+        .filter((card) => card.scrollWidth > card.clientWidth + 1)
+        .map(bounds),
+    };
   });
-  const executable = (await binaries.next()).value;
-  if (!executable) throw new Error("Headless browser missing; run bun install first.");
-  const browser = await chromium.launch({
-    executablePath: executable,
-    // Factory confinement disallows Chromium's macOS child-process rendezvous.
-    args: ["--single-process", "--no-zygote", "--disable-gpu"],
-  });
-  try {
-    const page = await browser.newPage({ viewport });
-    await page.route("**/*", (route) => route.abort());
-    const css = await Bun.file(join(import.meta.dir, "../ui/styles.css")).text();
-    await page.setContent(`<style>${css}</style><div id="root">${html}</div>`);
-    return await page.evaluate(() => {
-      const page = document.querySelector<HTMLElement>(".setup-page");
-      if (!page) throw new Error("Setup page missing");
-      const bounds = (element: Element) => {
-        const { left, right, width } = element.getBoundingClientRect();
-        return { label: element.getAttribute("aria-label") ?? element.textContent, left, right, width };
-      };
-      return {
-        viewport: window.innerWidth,
-        scrollWidth: document.documentElement.scrollWidth,
-        pageWidth: page.clientWidth,
-        pageScrollWidth: page.scrollWidth,
-        cells: [...page.querySelectorAll("article[aria-label]")].map(bounds),
-        controls: [...page.querySelectorAll("input, select, button")].map(bounds),
-        overflowingCards: [...page.querySelectorAll<HTMLElement>(".card")]
-          .filter((card) => card.scrollWidth > card.clientWidth + 1)
-          .map(bounds),
-      };
-    });
-  } finally {
-    await browser.close();
-  }
 }

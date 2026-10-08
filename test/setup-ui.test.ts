@@ -11,7 +11,7 @@ import type { RoutePreview } from "../src/router/router.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import type { CatalogSnapshot, RoutingSnapshot } from "../ui/api.ts";
 import { deferred } from "./evals-support.ts";
-import { buildSetupUi, settle, setupLayout, type Ui } from "./setup-ui-support.ts";
+import { buildSetupUi, closeSetupBrowser, settle, setupLayout, type Ui } from "./setup-ui-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "limitless-setup-ui-"));
@@ -82,11 +82,12 @@ beforeAll(async () => {
   retry = await buildSetupUi(join(dir, "retry"), "RetryModels");
   form = await buildSetupUi(join(dir, "form"), "CatalogForm");
 });
-afterAll(() => {
+afterAll(async () => {
   ui?.dispose();
   form?.dispose();
   retry?.dispose();
   rmSync(dir, { recursive: true, force: true });
+  await closeSetupBrowser();
 });
 type Sent = { path: string; method: string; value: Record<string, unknown> | undefined };
 async function fixture(
@@ -209,7 +210,8 @@ test("responsive Setup wraps cells and open editors at a 375px viewport without 
       expect(layout.overflowingCards).toEqual([]);
     }
   });
-});
+  // It launches and drives a real headless Chromium, which takes seconds under parallel CI load.
+}, 20_000);
 
 test("grid renders layers, recommendations, concrete previews, history and distinct quota telemetry", async () => {
   await fixture(async (sent) => {
