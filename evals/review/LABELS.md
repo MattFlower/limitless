@@ -143,3 +143,13 @@ adjudicated. It applies the candidate rule above to every pending defect.
   re-runs every reproduction, and checks rejections as well as
   confirmations. Report results for Sol 6.1-based systems on these cases with
   this caveat.
+- **Amendment, 2026-10-08, after a three-case pilot.** A requirement stated
+  in the case's request that the change does not meet at head is a defect of
+  the change (category `completeness` or `spec-mismatch`), even when the code
+  involved is unchanged from base: the change was asked to fix it. The
+  evidence quotes the requirement from the request and the code at head. A
+  defect present at base that the request didn't ask the change to address
+  is still rejected. The pilot (review-087, review-101 and review-106) showed
+  the adjudicator rejecting three unmet requirements as pre-existing; those
+  cases are re-adjudicated under this text, and no other outcome was seen
+  before it was written.
