@@ -105,10 +105,10 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
     PROVIDERS,
     store,
     reserves,
-    { OPENROUTER_API_KEY: "fake-key", TWILIGHT_API_KEY: "fake-key" },
+    { OPENROUTER_API_KEY: "fake-key" },
     { openrouter: 50 },
   );
-  for (const provider of ["twilight", "mtplx"]) tracker.setHealthy(provider, true);
+  tracker.setHealthy("mtplx", true);
   const committed = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
   const router = new Router(tracker, committed, MODELS);
   const ids = () => router.route("triage", "small").candidates.map((c) => c.targetId);
@@ -120,7 +120,6 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
     "openrouter/gpt-6-luna@medium",
     "openrouter/gpt-6-luna@low",
     "openrouter/gpt-6-luna@none",
-    "twilight/qwen-27b@none",
     "mtplx/qwen-27b@high",
     "claude/sonnet-5.5@low",
   ]);
@@ -130,7 +129,6 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
     "openrouter/gpt-6-luna@medium",
     "openrouter/gpt-6-luna@low",
     "openrouter/gpt-6-luna@none",
-    "twilight/qwen-27b@none",
     "mtplx/qwen-27b@high",
     "claude/sonnet-5.5@low",
   ]);

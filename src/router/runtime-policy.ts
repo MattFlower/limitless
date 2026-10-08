@@ -1,8 +1,10 @@
 import type { Complexity, Role, RoutingCell, RoutingChange, RunModels, RunRole } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./catalog.ts";
 import { overlayPolicy, type PolicyOverlay, validatePolicy } from "./policy.ts";
 import { validatePrefer } from "./prefer.ts";
+import { filterRetiredTargets, retiredReason } from "./retired.ts";
 import type { Router } from "./router.ts";
 
 const CELLS: RoutingCell[] = ["default", "trivial", "small", "medium", "large"];
@@ -24,11 +26,23 @@ export class RuntimePolicy {
   ) {
     for (const row of store.routingCells()) {
       const { role, cell } = this.entry(row.role, row.cell);
-      this.operator[role] = { ...this.operator[role], [cell]: this.groups(role, cell, row.groups) };
+      const groups = filterRetiredTargets(row.groups, models, providers);
+      if (groups.length)
+        this.operator[role] = { ...this.operator[role], [cell]: this.groups(role, cell, groups) };
     }
     this.operatorPrefer = store.routingPrefer();
     if (this.operatorPrefer !== null)
-      this.operatorPrefer = validatePrefer(this.operatorPrefer, this.models, this.providers);
+      this.operatorPrefer = validatePrefer(
+        this.operatorPrefer.filter((id) => !retiredReason(id, providers)),
+        this.models,
+        this.providers,
+      );
+    for (const target of this.unavailable())
+      console.warn(
+        redactCredentials(
+          `[routing] ${target.id}: unavailable (${target.reason}); ${target.references.join("; ")}`,
+        ),
+      );
     // History IDs survive restart and distinguish edits even when a cell is reset to its old value.
     for (const change of store.routingHistory())
       if (this.changesCell(change) && !this.revisions.has(change.key))
@@ -77,6 +91,32 @@ export class RuntimePolicy {
     return [...(this.operatorPrefer ?? this.configPrefer)];
   }
 
+  private unavailable() {
+    const retired = new Map<string, { id: string; reason: string; references: string[] }>();
+    const add = (id: string, reason: string, reference: string) => {
+      const entry = retired.get(id) ?? { id, reason, references: [] };
+      if (!entry.references.includes(reference)) entry.references.push(reference);
+      retired.set(id, entry);
+    };
+    for (const row of this.store.routingCells()) {
+      const missing: { id: string; reason: string }[] = [];
+      const groups = filterRetiredTargets(row.groups, this.models, this.providers, (id, reason) =>
+        missing.push({ id, reason }),
+      );
+      for (const { id, reason } of missing)
+        add(
+          id,
+          reason,
+          `${row.role}.${row.cell}${groups.length ? "" : ": no override; falling back to code/evals policy"}`,
+        );
+    }
+    for (const id of this.store.routingPrefer() ?? []) {
+      const reason = retiredReason(id, this.providers);
+      if (reason) add(id, reason, "prefer");
+    }
+    return [...retired.values()];
+  }
+
   private runModels(runId?: string): RunModels | undefined {
     if (runId === undefined) return undefined;
     const run = this.store.getRun(runId);
@@ -111,6 +151,7 @@ export class RuntimePolicy {
         ];
       }),
     );
+    const unavailable = this.unavailable();
     return {
       runId: runId ?? null,
       ...(this.router.excludeOrigins === undefined ? {} : { excludeOrigins: this.router.excludeOrigins }),
@@ -118,6 +159,7 @@ export class RuntimePolicy {
       effective,
       prefer: this.prefer,
       operatorPrefer: this.operatorPrefer,
+      ...(unavailable.length ? { unavailable } : {}),
       history: this.store.routingHistory(),
     };
   }

@@ -8,6 +8,7 @@ import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import type { Policy } from "../src/router/catalog.ts";
+import { runtimeModel } from "../src/router/config-catalog.ts";
 import { Auth } from "../src/server/auth.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -352,7 +353,7 @@ test("catalog validates stored chains beyond the default run limit and regardles
   const run = factory.store.createRun(repo, {
     repo: repo.slug,
     prompt: "finished pinned run",
-    models: { review: ["claude/opus|codex/experiment@high"] },
+    models: { review: ["retired-lan/legacy|claude/opus|codex/experiment@high"] },
   });
   factory.store.updateRun(run.id, { status: "succeeded" });
   factory.store.db.query("UPDATE runs SET created_at = 0 WHERE id = ?").run(run.id);
@@ -368,52 +369,42 @@ test("catalog validates stored chains beyond the default run limit and regardles
     expect(error).toContain("review");
     expect(error).toContain(method === "PATCH" ? 'Unsupported effort "high"' : "unknown model ID");
     expect(catalogState()).toEqual(before);
-    expect(factory.routing.preview("review", "small", run.id)[1]?.eligible).toBe(true);
+    expect(
+      factory.routing.preview("review", "small", run.id).find((p) => p.modelId === "codex/experiment@high")
+        ?.eligible,
+    ).toBe(true);
     expect(events).toEqual([]);
   }
 });
 
 test.each(["code", "evals", "operator", "run"] as const)(
-  "catalog POST refuses a retained invalid %s reference before publishing or persisting",
+  "catalog POST tolerates an already retired %s reference",
   async (layer) => {
-    // Seed an invalid retained reference: additions must validate the whole proposed catalog too.
     factory = makeFactory(factory.store, structuredClone(factory.routing.code));
-    let provenance: string;
     if (layer === "run") {
       const repo = factory.store.upsertRepo({
-        slug: "catalog/invalid",
+        slug: "catalog/retired",
         kind: "local",
         localPath: dir,
         url: null,
         defaultBranch: "main",
         mergePolicy: "none",
       });
-      const run = factory.store.createRun(repo, {
+      factory.store.createRun(repo, {
         repo: repo.slug,
-        prompt: "invalid legacy chain",
-        models: { implement: ["codex/missing"] },
+        prompt: "legacy chain",
+        models: { implement: ["retired-lan/legacy"] },
       });
-      provenance = `run ${run.id}`;
     } else {
-      factory.routing.snapshot().layers[layer].triage = { small: ["codex/missing"] };
-      provenance = layer;
+      factory.routing.snapshot().layers[layer].triage = { small: ["retired-lan/legacy"] };
     }
-    const before = catalogState();
-    const events: unknown[] = [];
-    factory.store.subscribe((event) => events.push(event));
     const response = await client()("/api/catalog/models", "POST", {
       ...customModel,
       provider: "codex",
       id: "experiment",
     });
-    expect(response.status).toBe(400);
-    const error = (await response.json()).error;
-    expect(error).toContain(provenance);
-    expect(error).toContain(layer === "run" ? "implement" : "triage.small");
-    expect(error).toContain('unknown model ID "codex/missing"');
-    expect(catalogState()).toEqual(before);
-    expect(() => factory.router.resolveFor("triage", "codex/experiment")).toThrow("unknown model ID");
-    expect(events).toEqual([]);
+    expect(response.status).toBe(201);
+    expect(factory.models.some((m) => m.id === "codex/experiment")).toBe(true);
   },
 );
 
@@ -765,3 +756,117 @@ test("exhausted review and verify invocations never dispatch to excluded fallbac
   expect(factory.store.listInvocations(run.id)).toEqual([]);
   expect(JSON.stringify(factory.store.listEvents(run.id))).toContain("origin excluded (CN; baseOrigin=CN)");
 });
+
+test.each([
+  "mixed routing",
+  "retired preference",
+  "retired cell",
+  "retired provider",
+  "historical run",
+] as const)(
+  "reopened database with %s starts, reports unavailable references and permits unrelated catalog edits",
+  async (scenario) => {
+    factory.store.close();
+    const db = join(dir, "persisted.sqlite");
+    let store = new Store(db);
+    const retired = "retired-lan/legacy";
+    let runId: string | undefined;
+    if (scenario === "mixed routing") {
+      store.writeRouting(
+        "triage.default",
+        [`${retired}|codex/luna@medium`, retired],
+        null,
+        "previous release",
+      );
+      store.writeRouting("prefer", ["retired-lan", "codex"], null, "previous release");
+    } else if (scenario === "retired preference") {
+      store.writeRouting("prefer", ["retired-lan", "codex"], null, "previous release");
+    } else if (scenario === "retired cell") {
+      store.writeRouting("chat.default", [retired], null, "previous release");
+    } else if (scenario === "retired provider") {
+      const model = runtimeModel({ ...customModel, provider: "codex", id: "legacy" }, [
+        {
+          id: "codex",
+          label: "Codex",
+          harness: "codex",
+          billing: "subscription",
+          maxConcurrent: 1,
+        },
+      ]);
+      store.writeRuntimeModel(retired, { ...model, id: retired, provider: "retired-lan" });
+      store.writeRouting("triage.default", [retired, "codex/luna"], null, "previous release");
+    } else {
+      const repo = store.upsertRepo({
+        slug: "catalog/history",
+        kind: "local",
+        localPath: dir,
+        url: null,
+        defaultBranch: "main",
+        mergePolicy: "none",
+      });
+      const run = store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "finished legacy run",
+        models: { triage: [retired, "codex/luna"] },
+      });
+      store.updateRun(run.id, { status: "succeeded" });
+      runId = run.id;
+    }
+    const cells = store.routingCells();
+    const prefer = store.routingPrefer();
+    const models = store.runtimeModels();
+    store.close();
+    store = new Store(db);
+    factory = makeFactory(store);
+    const call = client();
+    const routing = await (await call("/api/routing")).json();
+    const catalog = await (await call("/api/catalog")).json();
+    if (scenario === "retired cell") {
+      expect(factory.policy.chat).toEqual(factory.routing.code.chat);
+      expect(factory.router.route("chat", "small").candidates.length).toBeGreaterThan(0);
+      expect(routing.effective.chat.default.layer).toBe("code");
+    } else if (scenario !== "retired preference") {
+      const route = factory.router.route("triage", "small", {
+        chain: runId ? store.getRun(runId)?.models?.triage : undefined,
+      });
+      expect(route.candidates[0]?.modelId).toBe("codex/luna");
+    }
+    if (runId) {
+      const preview = await (
+        await call(`/api/routing/preview?role=triage&complexity=small&run=${runId}`)
+      ).json();
+      expect(preview).toContainEqual({
+        modelId: retired,
+        eligible: false,
+        reason: expect.stringContaining("unknown model ID"),
+      });
+    } else if (scenario !== "retired preference") {
+      expect(routing.unavailable).toContainEqual(
+        expect.objectContaining({ id: retired, reason: expect.stringContaining("retired reference") }),
+      );
+    }
+    if (scenario === "mixed routing" || scenario === "retired preference") {
+      expect(routing.prefer).toEqual(["codex"]);
+      expect(routing.unavailable).toContainEqual(expect.objectContaining({ id: "retired-lan" }));
+    }
+    if (scenario === "retired provider") {
+      expect(catalog.models).toContainEqual(
+        expect.objectContaining({ id: retired, unavailable: expect.stringContaining("retired-lan") }),
+      );
+      expect(factory.router.preview("triage", "small", { chain: [retired] })[0]).toMatchObject({
+        eligible: false,
+        reason: expect.stringContaining("unknown provider"),
+      });
+    }
+    expect(
+      (await call("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "unrelated" }))
+        .status,
+    ).toBe(201);
+    expect((await call("/api/routing/cells/triage/default", "PUT", { groups: [retired] })).status).toBe(400);
+    expect((await call("/api/routing/prefer", "PUT", { prefer: ["retired-lan"] })).status).toBe(400);
+    expect(store.routingCells()).toEqual(cells);
+    expect(store.routingPrefer()).toEqual(prefer);
+    expect(store.runtimeModels().filter((m) => m.id === retired)).toEqual(models);
+    if (runId) expect(store.getRun(runId)?.models?.triage).toEqual([retired, "codex/luna"]);
+  },
+);

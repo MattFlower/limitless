@@ -698,3 +698,34 @@ test("Setup displays configured origin exclusions without an edit control", asyn
     expect(paragraph).not.toMatch(/<(input|select|button|textarea)\b/);
   });
 });
+
+test("Setup shows retired routing references and runtime models as unavailable", async () => {
+  await fixture(async (_sent, state) => {
+    state.routing.unavailable = [
+      {
+        id: "retired-lan/legacy",
+        reason: "retired reference: retired-lan/legacy is not in the catalog",
+        references: ["triage.default: no override; falling back to code/evals policy"],
+      },
+      {
+        id: "retired-lan",
+        reason: "retired reference: retired-lan is not in the catalog",
+        references: ["prefer"],
+      },
+    ];
+    state.catalog.models.push({
+      ...first,
+      id: "retired-lan/runtime",
+      provider: "retired-lan",
+      source: "runtime",
+      unavailable: "retired reference: retired-lan is not in the catalog",
+    });
+    ui.emit({ kind: "reconnected" });
+    await settle();
+    const html = ui.render();
+    expect(html).toContain("retired-lan/legacy: unavailable");
+    expect(html).toContain("retired-lan: unavailable");
+    expect(html).toContain("no override; falling back to code/evals policy");
+    expect(html).toContain("Unavailable: retired reference: retired-lan is not in the catalog");
+  });
+});

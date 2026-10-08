@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -169,16 +169,52 @@ test("history insertion failure rolls back the current cell and leaves routing u
   expect(router.getPolicy()).toEqual(before);
 });
 
-test("startup validates persisted operator cells and preferences against today's catalog", () => {
-  store.writeRouting("triage.default", ["claude/fable"], null, "previous release");
+test("startup still validates live persisted targets", () => {
+  store.writeRouting("triage.default", ["codex/sol@invalid"], null, "previous release");
   expect(setup).toThrow("triage.default");
-  expect(setup).toThrow("owner decision");
-  store.writeRouting("triage.default", null, null, "tester");
-  store.writeRouting("prefer", ["codex/sol"], null, "previous release");
-  expect(setup).toThrow(
-    'routing.prefer: "codex/sol" is a model ID, not a provider; prefer takes provider IDs (use "codex")',
-  );
-  expect(store.routingHistory()).toHaveLength(3);
+  expect(setup).toThrow("Unsupported effort");
+});
+
+test("retired routing targets preserve storage, warn once per id and retain live alternatives", () => {
+  const mixed = ["retired-lan/legacy|codex/luna@medium", "retired-lan/legacy"];
+  store.writeRouting("triage.default", mixed, null, "previous release");
+  store.writeRouting("chat.default", ["retired-lan/legacy"], null, "previous release");
+  store.writeRouting("prefer", ["retired-lan", "codex"], null, "previous release");
+  const history = store.routingHistory();
+  store.close();
+  store = new Store(join(dir, "db.sqlite"));
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const { runtime, router } = setup();
+    expect(router.route("triage", "small").candidates.map((c) => c.targetId)).toEqual(["codex/luna@medium"]);
+    expect(router.getPolicy().chat).toEqual(DEFAULT_POLICY.chat);
+    expect(runtime.snapshot().effective.chat?.default?.layer).toBe("code");
+    expect(runtime.prefer).toEqual(["codex"]);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls.flat().join("\n")).toContain("chat.default: no override; falling back");
+    expect(runtime.snapshot().unavailable).toEqual([
+      {
+        id: "retired-lan/legacy",
+        reason: expect.stringContaining("retired reference"),
+        references: expect.arrayContaining([
+          "triage.default",
+          "chat.default: no override; falling back to code/evals policy",
+        ]),
+      },
+      { id: "retired-lan", reason: expect.stringContaining("retired reference"), references: ["prefer"] },
+    ]);
+    expect(store.routingCells().find((c) => c.role === "triage")?.groups).toEqual(mixed);
+    expect(store.routingPrefer()).toEqual(["retired-lan", "codex"]);
+    expect(store.routingHistory()).toEqual(history);
+    expect(() => runtime.setCell("triage", "default", mixed)).toThrow("unknown model ID");
+    expect(() => runtime.setPrefer(["retired-lan"])).toThrow("not a known provider ID");
+    runtime.setCell("triage", "default", null);
+    runtime.setCell("chat", "default", null);
+    runtime.setPrefer(null);
+    expect(runtime.snapshot().unavailable ?? []).toEqual([]);
+  } finally {
+    warn.mockRestore();
+  }
 });
 
 test("Factory startup restores cells and preferences; clearing preference restores config after reopen", () => {
