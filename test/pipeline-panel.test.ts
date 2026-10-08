@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { discardChanges } from "../src/git/repos.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
@@ -49,6 +50,15 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("read-only cleanup leaves the index shared by panel finders unchanged", async () => {
+    const indexPath = join(repoDir, ".git", "index");
+    const index = readFileSync(indexPath);
+    // A changed stat forces ordinary git status to refresh the index even with identical bytes.
+    utimesSync(join(repoDir, "greeting.txt"), new Date(0), new Date(0));
+    expect(await discardChanges(repoDir)).toBe(false);
+    expect(readFileSync(indexPath)).toEqual(index);
+  });
+
   test("replayed review retains one omitted follow-up on the same round and SHA", async () => {
     let reviews = 0;
     const specs: AgentSpec[] = [];
@@ -207,9 +217,20 @@ describe("pipeline (fake agents, real git + gates)", () => {
           { prompt: "standard", lens: { name: "failure-paths", focus: "Failure paths." }, local: true },
         ];
       const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "deep" });
-      // Two implementation/panel rounds exceeded waitFor's 20 s deadline under git subprocess load.
-      // Budget both rounds, with a longer Bun timeout for fixture setup and cancellation/cleanup.
-      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"], 40_000)).toBe("succeeded");
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"], 20_000);
+      if (status !== "succeeded")
+        console.error(
+          JSON.stringify(
+            {
+              run: f.store.getRun(run.id),
+              stages: f.store.listStages(run.id),
+              events: f.store.listEvents(run.id),
+            },
+            null,
+            2,
+          ),
+        );
+      expect(status).toBe("succeeded");
       expect(f.store.getArtifact(run.id, "diff.patch")).toContain("HEAD_FOCUS");
       const prompts = reviews.map((s) => s.prompt);
       expect(prompts.filter((p) => p.includes("review R2"))).toHaveLength(3);
@@ -236,7 +257,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           { prompt: "standard", lens: "ops", vendor: "openai" },
         ]);
     },
-    60_000,
+    30_000,
   );
 
   test("panel mode: one deadline covers a local finder's fallbacks, and its skip says why", async () => {

@@ -15,7 +15,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit -p .",
-    "test": "bun test --parallel=$(bun -p 'const v=process.env.LIMITLESS_TEST_WORKERS ?? \"\"; const n=Number(v); /^\\d+$/.test(v) && Number.isSafeInteger(n) && n>0 ? n : 4')",
+    "test": "bun test --parallel=$(bun scripts/test-workers.ts)",
     "smoke": "bun scripts/smoke.ts",
     "check": "bun run lint && bun run typecheck && bun run test"
   },

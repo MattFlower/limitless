@@ -14,6 +14,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
 import { sh } from "../util/proc.ts";
+import { resolveTestWorkers } from "../util/test-workers.ts";
 import {
   bounded,
   DEFAULT_MAX_WAIT_MS,
@@ -415,13 +416,10 @@ export async function uninstall(): Promise<void> {
  */
 // Resolve the override when gates run, rather than capturing the environment at module load.
 const GATES = () => {
-  const value = process.env.LIMITLESS_TEST_WORKERS ?? "";
-  const n = Number(value);
-  const workers = /^\d+$/.test(value) && Number.isSafeInteger(n) && n > 0 ? n : 4;
   return [
     ["bun", "run", "lint"],
     ["bun", "run", "typecheck"],
-    ["bun", "test", `--parallel=${workers}`],
+    ["bun", "test", `--parallel=${resolveTestWorkers()}`],
   ];
 };
 const SMOKE = ["bun", "scripts/smoke.ts"];

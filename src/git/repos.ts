@@ -479,7 +479,9 @@ export async function checkoutCommitted(
 /** Throw away any uncommitted changes (used after read-only stages). */
 /** `env` matters when the checkout's git config is untrusted: filters and drivers run with it. */
 export async function discardChanges(cwd: string, env?: Record<string, string>): Promise<boolean> {
-  const status = await worktreeGit(["git", "status", "--porcelain"], { cwd, env });
+  // Parallel panel finders inspect the same Git admin directory. An optional status refresh
+  // races those checks with transient index locks/hard links; read the index without updating it.
+  const status = await worktreeGit(["git", "--no-optional-locks", "status", "--porcelain"], { cwd, env });
   if (!status.stdout.trim()) return false;
   await worktreeGit(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
   await worktreeGit(["git", "clean", "-fdq"], { cwd, env });
