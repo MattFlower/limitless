@@ -393,9 +393,11 @@ describe("LoopDetector", () => {
 
 for (const harness of ["codex", "claude"] as const) {
   const tools =
-    harness === "codex" ? ["shell", "apply_patch", "test.poll"] : ["Bash", "Edit", "mcp__test__poll"];
+    harness === "codex"
+      ? ["shell", "apply_patch", "test.poll", "web_search"]
+      : ["Bash", "Edit", "mcp__test__poll"];
   for (const tool of tools) {
-    test(`${harness} ${tool} delivers ID-matched parser results to loop detection`, async () => {
+    test(`${harness} ${tool} parser events detect loops during the invocation`, async () => {
       const modes =
         tool === tools[0]
           ? [
@@ -412,7 +414,9 @@ for (const harness of ["codex", "claude"] as const) {
               "late",
               "budget",
             ]
-          : ["threshold", "identical"];
+          : tool === "web_search"
+            ? ["identical"]
+            : ["threshold", "identical"];
       for (const mode of modes) {
         await withScratch(import.meta.dir, async (scratchDir) => {
           const result = await (harness === "codex" ? verifiedCodex : runClaude)(
@@ -454,13 +458,15 @@ for (const harness of ["codex", "claude"] as const) {
                     item:
                       tool === "shell"
                         ? { type: "command_execution", id, command: "tail test.log" }
-                        : {
-                            type: "mcp_tool_call",
-                            id,
-                            server: "test",
-                            tool: "poll",
-                            arguments: { log: "test.log" },
-                          },
+                        : tool === "web_search"
+                          ? { type: "web_search", id, query: "test progress" }
+                          : {
+                              type: "mcp_tool_call",
+                              id,
+                              server: "test",
+                              tool: "poll",
+                              arguments: { log: "test.log" },
+                            },
                   });
                 }
               };
@@ -499,7 +505,9 @@ for (const harness of ["codex", "claude"] as const) {
                               changes: [{ path: "test.txt", kind: "update" }],
                               status: output === "progress" ? "completed" : "failed",
                             }
-                          : { type: "mcp_tool_call", id, result: output },
+                          : tool === "web_search"
+                            ? { type: "web_search", id, query: "test progress" }
+                            : { type: "mcp_tool_call", id, result: output },
                   });
                 }
               };
@@ -517,7 +525,8 @@ for (const harness of ["codex", "claude"] as const) {
                   expect(opts.signal?.aborted).toBe(true);
                   break;
                 }
-                expect(opts.signal?.aborted).toBe(false);
+                // Searches have no result text; the sixth call must stop before completion.
+                expect(opts.signal?.aborted).toBe(tool === "web_search" && i === 5);
                 if (mode === "late" && i === 1) continue;
                 const output =
                   mode.includes("changing") || mode === "budget"

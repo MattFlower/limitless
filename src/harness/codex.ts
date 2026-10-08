@@ -799,9 +799,10 @@ export async function runCodex(
   const signal = AbortSignal.any([spec.signal, stuckController.signal]);
   const parser = new CodexStreamParser((ev) => {
     if (!stuckReason) {
+      // Web searches emit no result text, so count them immediately instead of awaiting a result.
       const reason =
         ev.type === "tool_call"
-          ? loop.observe(ev.name, ev.input, ev.id)
+          ? loop.observe(ev.name, ev.input, ev.name === "web_search" ? undefined : ev.id)
           : ev.type === "tool_result"
             ? loop.observeResult(ev.id, ev.output)
             : null;
