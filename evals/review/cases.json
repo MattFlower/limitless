@@ -127,7 +127,10 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [116, 118],
+          "lines": [
+            116,
+            118
+          ],
           "severity": "major",
           "category": "security",
           "summary": "Existing-branch delivery (skip PR, force-push to run.deliveryBranch) is authorized by the mere presence of deliveryBranch; nothing requires the run to come from the signature-verified GitHub/Dependabot webhook. deliveryBranch/baseBranch/sourceRef are accepted verbatim from POST /api/runs (store.ts createRun), so any API caller could get a run force-pushed onto main, bypassing mergePolicy and PR review.",
@@ -258,7 +261,10 @@
       "defects": [
         {
           "file": "src/harness/codex.ts",
-          "lines": [211, 232],
+          "lines": [
+            211,
+            232
+          ],
           "severity": "blocker",
           "category": "security",
           "summary": "AgentSpec.noTools is ignored by runCodex (only mode→sandbox is honored), so a Codex-routed holdout author keeps shell/file access and is not 'blind'; Codex is the first candidate in the default holdout policy.",
@@ -267,7 +273,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [604, 604],
+          "lines": [
+            604,
+            604
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "Verify invocation is run with privateOutput: true, which (context.ts 227-298) drops all agent events, replaces real errors with 'private invocation failed' and deletes the raw transcript for every verify call in every standard/deep run - far broader than the holdout-secrecy requirement; verify becomes undebuggable. Reviewer cited context.ts:604 (file has 370 lines); the flag is set at engine.ts:604.",
@@ -276,7 +285,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [655, 672],
+          "lines": [
+            655,
+            672
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "publish() writes holdout-scenarios.json and the buffered verify-N.json artifacts only when success; renderReport likewise hides the holdout table unless success. needs_human draft PRs therefore lose the holdout/verify evidence, and failed runs regress to having no verify artifacts at all (previously written every round).",
@@ -407,7 +419,10 @@
       "defects": [
         {
           "file": "src/harness/codex.ts",
-          "lines": [228, 243],
+          "lines": [
+            228,
+            243
+          ],
           "severity": "blocker",
           "category": "correctness",
           "summary": "The round-1 fix for noTools passes '--strict-config' together with config keys that do not exist in Codex (tools.disable_defaults, include_apply_patch_tool, features.* via -c), so every Codex-routed holdout call fails at startup. Orchestrator replaced them with '--disable shell_tool --disable multi_agent'.",
@@ -416,7 +431,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [351, 352],
+          "lines": [
+            351,
+            352
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "The holdout invocation sets maxToolCalls: 0 as a backstop, but the Claude loop detector counts the final structured-output call as a tool call, so every Claude-routed holdout is stopped as stuck and silently re-routed to the spec author's vendor.",
@@ -542,7 +560,10 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [270, 284],
+          "lines": [
+            270,
+            284
+          ],
           "severity": "blocker",
           "category": "correctness",
           "summary": "Hard-limit exhaustion alerts dedupe on boundary = detail.exhaustedUntil, which codex.ts computes as Date.now()+30min on every rejection when no window is known; concurrent/repeated rejections each create a new alert row and a new Discord post (violates the at-most-one-alert-per-window requirement).",
@@ -666,7 +687,10 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [146, 150],
+          "lines": [
+            146,
+            150
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "fetchBase runs 'git fetch origin refs/heads/B:refs/remotes/origin/B' in the worktree (shared object store/refs of the bare cache) without withRepoLock; concurrent runs on the same repo race on the ref lock and delivery fails intermittently ('cannot lock ref'). Called up to 3x per delivery without allowFail.",
@@ -675,7 +699,10 @@
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [146, 150],
+          "lines": [
+            146,
+            150
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "fetchBase's refspec has no leading '+', so a force-pushed/rewritten base branch makes git reject the non-fast-forward update and sh() throws a raw git error before the isAncestor guard can report 'base branch no longer descends from the recorded base'. Carried over: also present in this head, first flagged in review round 1; 7ee37e75 rewrote this function for the race but kept the non-'+' refspec; fixed in faf8e2ca.",
@@ -684,7 +711,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [695, 714],
+          "lines": [
+            695,
+            714
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "When the base advances and the rebase conflicts, deliver() updates run.baseSha and sends the implementer back to 'git merge origin/<base>', but ctx.state.baselineScripts (captured once in prepare from the original base) is never refreshed; the re-run audit compares old-base scripts against the merged package.json and raises a block-severity gate-script-changed finding for upstream script changes. Reviewer cited src/gates/audit.ts:202 (the rule); the fix landed in engine.ts. Carried over: present in this head, first flagged in review round 1; fixed in faf8e2ca.",
@@ -825,7 +855,10 @@
       "defects": [
         {
           "file": "src/concierge.ts",
-          "lines": [85, 102],
+          "lines": [
+            85,
+            102
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "process() commits confirmChat (proposal -> 'confirmed') and then calls createRun; if resolveRepo throws (bad repo string from the model, non-git path, gh failure) the proposal stays 'confirmed' with no run and the conversation is stuck: new proposals, edits and re-confirmation all fail. Reviewer cited line 160; the confirm/execute/catch block is lines 85-102.",
@@ -945,7 +978,10 @@
       "defects": [
         {
           "file": "src/cli/local.ts",
-          "lines": [96, 111],
+          "lines": [
+            96,
+            111
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "'limitless local up' unconditionally overwrites the existing twilight limitless-llama.service with a bare generated unit (twilightUnit lines 27-43 lacks GPU offload/context/--jinja/alias flags and puts the API key on the command line) and restarts it, losing host tuning.",
@@ -954,7 +990,10 @@
         },
         {
           "file": "src/cli/local.ts",
-          "lines": [64, 72],
+          "lines": [
+            64,
+            72
+          ],
           "severity": "minor",
           "category": "correctness",
           "summary": "Health probes send no API key although both local servers require one, so status reports 'unreachable' for healthy servers. (In the fix commit message; not in the orchestrator's brief.)",
@@ -1074,7 +1113,10 @@
       "defects": [
         {
           "file": "src/concierge.ts",
-          "lines": [232, 263],
+          "lines": [
+            232,
+            263
+          ],
           "severity": "major",
           "category": "completeness",
           "summary": "PR #9 routes tool-less roles (triage/chat/summarize) to the direct-HTTP 'llm' harness in RunContext.invoke (context.ts useHttp), but the concierge (merged from PR #8) dispatches chat itself via harnesses[target.harness] and passes no zod schema, so chat never uses the HTTP path and keeps spawning the agent CLI. concierge.ts is unchanged by this diff - a missed call site / semantic merge conflict.",
@@ -1214,7 +1256,10 @@
       "defects": [
         {
           "file": "src/cli/service.ts",
-          "lines": [232, 238],
+          "lines": [
+            232,
+            238
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "deploy() always calls requestAdmin('drain') before restarting; the currently running daemon predates the drain endpoint and answers 404, which localDeployClient (deploy-wait.ts:69) turns into a generic error, so deploying this change always fails and rolls back - even with --now. No bootstrap path from a pre-drain daemon.",
@@ -1596,7 +1641,10 @@
       "defects": [
         {
           "file": "src/text.ts",
-          "lines": [69, 73],
+          "lines": [
+            69,
+            73
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "stripPunctuation deletes the punctuation base of RGI emoji: the keycaps U+0023 and U+002A + U+FE0F + U+20E3, and U+203C, U+2049, U+3030 and U+303D + U+FE0F, whose bases are \\p{P}. It leaves orphaned U+FE0F and U+20E3 in the output, although the issue says to keep emoji and the spec preserves emoji sequences, and the CLI inherits it. A standalone # can still be removed while keycaps are kept.",
@@ -1729,7 +1777,10 @@
       "defects": [
         {
           "file": "src/gc.ts",
-          "lines": [25, 31],
+          "lines": [
+            25,
+            31
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "canonical() calls realpathSync on each worktree's parent; a stale entry whose parent was deleted throws and blocks cleanup for the whole repository",
@@ -1738,7 +1789,10 @@
         },
         {
           "file": "src/gc.ts",
-          "lines": [90, 96],
+          "lines": [
+            90,
+            96
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "GC removes a registered worktree at paths.work/<run-id> without checking it is still on the run's branch",
@@ -1865,7 +1919,10 @@
       "defects": [
         {
           "file": "src/integrations/discord.ts",
-          "lines": [93, 106],
+          "lines": [
+            93,
+            106
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "The discord.js Client has no 'error' listener; an emitted error event can crash the daemon",
@@ -1874,7 +1931,10 @@
         },
         {
           "file": "src/integrations/discord.ts",
-          "lines": [300, 312],
+          "lines": [
+            300,
+            312
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "The run can emit events before its Discord thread id is persisted, so early events are dropped",
@@ -1883,7 +1943,10 @@
         },
         {
           "file": "src/integrations/discord.ts",
-          "lines": [220, 228],
+          "lines": [
+            220,
+            228
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "The terminal summary is marked delivered before the send succeeds, so a failed send is never retried",
@@ -2009,7 +2072,10 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [270, 284],
+          "lines": [
+            270,
+            284
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "A quota rejection is attributed to the earliest-resetting known window, not the exhausted one, mislabeling alerts and allowing a duplicate alert later",
@@ -2018,7 +2084,10 @@
         },
         {
           "file": "src/router/router.ts",
-          "lines": [60, 75],
+          "lines": [
+            60,
+            75
+          ],
           "severity": "minor",
           "category": "correctness",
           "summary": "describeFallback mixes candidates from unrelated roles before a route is selected",
@@ -2151,7 +2220,10 @@
       "defects": [
         {
           "file": "src/integrations/github.ts",
-          "lines": [41, 44],
+          "lines": [
+            41,
+            44
+          ],
           "severity": "major",
           "category": "security",
           "summary": "mapGitHubEvent checked the actor login but not that repository.full_name belongs to cfg.githubOwner, so an owner action on someone else's repo could start a run.",
@@ -2160,7 +2232,10 @@
         },
         {
           "file": "src/integrations/github.ts",
-          "lines": [115, 127],
+          "lines": [
+            115,
+            127
+          ],
           "severity": "blocker",
           "category": "spec-mismatch",
           "summary": "A Dependabot run is a quick 'verify and fix breakages' run; when the bump needs no fix the implementer makes no changes, the audit's empty-diff rule blocks every round, and clean bumps can never succeed",
@@ -2286,7 +2361,10 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [265, 271],
+          "lines": [
+            265,
+            271
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "A quota rejection with no known window alerts on window 'hard_limit' with boundary = detail.exhaustedUntil, which codex.ts sets to Date.now()+30min on every rejection, so each rejection creates a new alert (alert storm)",
@@ -2295,7 +2373,10 @@
         },
         {
           "file": "src/router/providers.ts",
-          "lines": [261, 264],
+          "lines": [
+            261,
+            264
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "A subscription quota rejection is attributed to the earliest-resetting known window rather than the exhausted one, mislabelling alerts and allowing a duplicate alert after the wrong window resets.",
@@ -2419,7 +2500,10 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [700, 716],
+          "lines": [
+            700,
+            716
+          ],
           "severity": "major",
           "category": "error-handling",
           "summary": "Delivery throws and discards already-reviewed work when the base changed during the rebase, advanced again after the conflict-resolution round, or no longer descends from the recorded base, instead of delivering the checked head without rebasing",
@@ -2428,7 +2512,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [824, 830],
+          "lines": [
+            824,
+            830
+          ],
           "severity": "major",
           "category": "error-handling",
           "summary": "Same root cause as the delivery-rebase refusals above: a base change just before publication throws 'refusing to publish' instead of publishing the checked head (optional so the defect counts once)",
@@ -2556,7 +2643,10 @@
       "defects": [
         {
           "file": "src/router/router.ts",
-          "lines": [238, 251],
+          "lines": [
+            238,
+            251
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "In free_first mode the preferred (escalated) implementer is only re-pinned within its billing partition, so after escalating to a paid model the next round puts free models first again and returns to the free model that failed twice.",
@@ -2686,7 +2776,10 @@
       "defects": [
         {
           "file": "src/db/migration-runner.ts",
-          "lines": [83, 107],
+          "lines": [
+            83,
+            107
+          ],
           "severity": "blocker",
           "category": "data-migration",
           "summary": "On first start the runner rebuilds schema_migrations without the version column; the previous release then fails at startup with 'no such column: version', so deploy's automatic rollback leaves the daemon down.",
@@ -2695,7 +2788,10 @@
         },
         {
           "file": "src/db/migration-runner.ts",
-          "lines": [42, 57],
+          "lines": [
+            42,
+            57
+          ],
           "severity": "major",
           "category": "test-gap",
           "summary": "verifyShipped checks an empty manifest that no code ever populates, so editing an applied migration file passes every test.",
@@ -2704,7 +2800,10 @@
         },
         {
           "file": "scripts/check-migration-copy.ts",
-          "lines": [28, 33],
+          "lines": [
+            28,
+            33
+          ],
           "severity": "minor",
           "category": "data-migration",
           "summary": "The deploy-time check opens the live production database read-write just to copy it, and passes silently when the path does not exist.",
@@ -2829,7 +2928,10 @@
       "defects": [
         {
           "file": "src/cli/service.ts",
-          "lines": [277, 285],
+          "lines": [
+            277,
+            285
+          ],
           "severity": "blocker",
           "category": "logic",
           "summary": "If the release checkout already matches the target (e.g. a previous deploy died mid-check, or two deploys interleave), deploy skips bun install and bun run check and restarts onto unverified code; there is no deploy lock.",
@@ -2838,7 +2940,10 @@
         },
         {
           "file": "src/cli/deploy-wait.ts",
-          "lines": [204, 206],
+          "lines": [
+            204,
+            206
+          ],
           "severity": "blocker",
           "category": "logic",
           "summary": "waitForHealthy requires the new daemon to report the target sha; releases older than this change report none ('unknown'), so rolling back past it drains, restarts, fails and rolls back again.",
@@ -2847,7 +2952,10 @@
         },
         {
           "file": "src/cli/service.ts",
-          "lines": [263, 276],
+          "lines": [
+            263,
+            276
+          ],
           "severity": "minor",
           "category": "logic",
           "summary": "When the daemon already runs the target but the checkout differs, deploy reports 'already deployed' and leaves them mismatched, so a later launchd restart boots different code.",
@@ -2988,7 +3096,10 @@
       "defects": [
         {
           "file": "src/evals/runner.ts",
-          "lines": [325, 325],
+          "lines": [
+            325,
+            325
+          ],
           "severity": "major",
           "category": "spec-mismatch",
           "summary": "Eval implement trials use the reading-role budget of 150 tool calls instead of the pipeline's 400 for edit mode, so tool-heavy candidates hit the cap and are graded as failures.",
@@ -2997,7 +3108,10 @@
         },
         {
           "file": "src/evals/runner.ts",
-          "lines": [123, 124],
+          "lines": [
+            123,
+            124
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "Implement trials reject any pin whose history contains evals/triage or evals/review, so impl-007 and impl-011 would score 0% for every model.",
@@ -3006,7 +3120,10 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [108, 120],
+          "lines": [
+            108,
+            120
+          ],
           "severity": "blocker",
           "category": "security",
           "summary": "After the candidate runs, grading's git calls (discardChanges, diffSince, git add) honour candidate-controlled .git/config, hooks and index flags: diff.external empties the audited diff, hooks run during cleanup, skip-worktree makes the tested tree differ from the audited commit",
@@ -3015,7 +3132,10 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [112, 118],
+          "lines": [
+            112,
+            118
+          ],
           "severity": "minor",
           "category": "error-handling",
           "summary": "If baseline gate setup fails or times out, the trial still invokes (and pays for) the candidate and grades it 'timeout' instead of failing at preparation; baselines also rerun per trial.",
@@ -3024,7 +3144,10 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [49, 55],
+          "lines": [
+            49,
+            55
+          ],
           "severity": "minor",
           "category": "logic",
           "summary": "writeFileSync drops the executable bit, so hidden commands like ./run.sh exit 126; a test enshrined the 126.",
@@ -3139,7 +3262,10 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [672, 674],
+          "lines": [
+            672,
+            674
+          ],
           "severity": "major",
           "category": "security",
           "summary": "[preview] is read from the changed worktree at verify time instead of the base at prepare (as gates are), so a change can weaken or skip its own preview, and a bad section fails runs only after paid stages.",
@@ -3148,7 +3274,10 @@
         },
         {
           "file": "scripts/preview-seed.ts",
-          "lines": [19, 27],
+          "lines": [
+            19,
+            27
+          ],
           "severity": "major",
           "category": "resource",
           "summary": "The seed script creates runs with the default queued status; a normal daemon would execute them against paid providers (seed-demo.ts forbids this).",
@@ -3157,7 +3286,10 @@
         },
         {
           "file": "src/pipeline/preview.ts",
-          "lines": [131, 145],
+          "lines": [
+            131,
+            145
+          ],
           "severity": "major",
           "category": "security",
           "summary": "User env is spread after HOME/TMPDIR, so config can override HOME, GH_TOKEN and GIT_* protections; values containing '..' are not rejected.",
@@ -3166,7 +3298,10 @@
         },
         {
           "file": "src/pipeline/preview.ts",
-          "lines": [52, 53],
+          "lines": [
+            52,
+            53
+          ],
           "severity": "major",
           "category": "security",
           "summary": "The ready path check rejects '//' but not '/\\\\evil.example/x', which new URL() resolves to an external host.",
@@ -3175,7 +3310,10 @@
         },
         {
           "file": "src/pipeline/preview.ts",
-          "lines": [87, 108],
+          "lines": [
+            87,
+            108
+          ],
           "severity": "major",
           "category": "resource",
           "summary": "stopTree waits for 'close', which never fires while a grandchild that left the process group holds the stdout pipe (12 s stall reproduced; a daemonizing server hangs the run).",
@@ -3312,7 +3450,10 @@
       "defects": [
         {
           "file": "src/evals/implement.ts",
-          "lines": [239, 244],
+          "lines": [
+            239,
+            244
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "Claude models have no default effort and codex/astra starts at high (xhigh skipped), so --strategy effort stops after round 0 ('strategy exhausted') and caches a complete trial with 0% recovery.",
@@ -3321,7 +3462,10 @@
         },
         {
           "file": "src/evals/stats.ts",
-          "lines": [133, 137],
+          "lines": [
+            133,
+            137
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "Budget/cancel stops between rounds and operational round-1 failures count as failed recoveries, and the round-0 grade is replaced.",
@@ -3330,7 +3474,10 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [222, 237],
+          "lines": [
+            222,
+            237
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "The next model comes from the live policy and quota (router.route with side effects); a briefly unavailable tier is skipped and the result cached as complete.",
@@ -3339,7 +3486,10 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [159, 167],
+          "lines": [
+            159,
+            167
+          ],
           "severity": "major",
           "category": "security",
           "summary": "The grader runs candidate code with the hidden tests present and the real HOME/TMPDIR, so a candidate can copy the tests outside the worktree and read them in a later round.",
@@ -3348,7 +3498,10 @@
         },
         {
           "file": "src/evals/runner.ts",
-          "lines": [379, 386],
+          "lines": [
+            379,
+            386
+          ],
           "severity": "minor",
           "category": "error-handling",
           "summary": "If resuming the previous session fails, the round fails instead of retrying once in a fresh session with the same feedback.",
@@ -3357,7 +3510,10 @@
         },
         {
           "file": "src/evals/format.ts",
-          "lines": [17, 25],
+          "lines": [
+            17,
+            25
+          ],
           "severity": "minor",
           "category": "logic",
           "summary": "Every one-round report now prints pass@1 twice and a 'recovery 0.0%' line (regression in existing output).",
@@ -3477,7 +3633,10 @@
       "defects": [
         {
           "file": "src/pipeline/context.ts",
-          "lines": [294, 297],
+          "lines": [
+            294,
+            297
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "Drain can park before audit/review/preview/verify, but resume only skips whole implement rounds, so a parked run redoes gates, audit and review (2 reviewer calls for 1 implementation; the verdict can flip).",
@@ -3486,7 +3645,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [937, 942],
+          "lines": [
+            937,
+            942
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "environmentRetryRound is saved before the retry stage starts, so a park there makes the resumed run go straight to needs_human without retrying.",
@@ -3628,7 +3790,10 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [426, 437],
+          "lines": [
+            426,
+            437
+          ],
           "severity": "major",
           "category": "concurrency",
           "summary": "Delivery commands now honour the abort signal; stopping during gh pr merge --delete-branch can kill gh after the merge, and resume re-pushes (recreating the branch) and reports 'merge failed'.",
@@ -3637,7 +3802,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [665, 681],
+          "lines": [
+            665,
+            681
+          ],
           "severity": "minor",
           "category": "logic",
           "summary": "The restructure dropped the 'Implementer ended with <status>' warning and the commit SHA / 'no changes' summary, and renders implementerIssue as 'timeout: ' with an empty message.",
@@ -3646,7 +3814,10 @@
         },
         {
           "file": "src/pipeline/context.ts",
-          "lines": [26, 26],
+          "lines": [
+            26,
+            26
+          ],
           "severity": "minor",
           "category": "other",
           "summary": "RunContext imports parseFakeStream from src/harness/fake.ts, coupling production to the fake.",
@@ -3866,7 +4037,10 @@
       "defects": [
         {
           "file": "ui/components/InvocationsTable.tsx",
-          "lines": [51, 52],
+          "lines": [
+            51,
+            52
+          ],
           "severity": "major",
           "category": "accessibility",
           "summary": "Role help disappears when the pointer moves onto its explanation, violating WCAG 1.4.13 hoverable content.",
@@ -4204,7 +4378,10 @@
       "defects": [
         {
           "file": "src/pipeline/verification.ts",
-          "lines": [17, 18],
+          "lines": [
+            17,
+            18
+          ],
           "severity": "major",
           "category": "privacy",
           "summary": "Public criterion ID collisions bypass holdout redaction, and unexpected IDs copy private text verbatim into the pre-delivery artifact.",
@@ -4335,7 +4512,10 @@
       "defects": [
         {
           "file": "src/integrations/github-notifier.ts",
-          "lines": [28, 37],
+          "lines": [
+            28,
+            37
+          ],
           "severity": "major",
           "category": "performance",
           "summary": "Merge reconciliation repeatedly scans every needs_human PR sequentially with no backoff, causing hundreds of gh calls per pass.",
@@ -4575,7 +4755,10 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [999, 999],
+          "lines": [
+            999,
+            999
+          ],
           "severity": "major",
           "category": "delivery",
           "summary": "Fallback cannot rewind a branch already pushed by normal delivery: force-with-lease rejects stale info and no PR is opened.",
@@ -4584,7 +4767,10 @@
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [332, 338],
+          "lines": [
+            332,
+            338
+          ],
           "severity": "major",
           "category": "delivery",
           "summary": "Fallback reusing an existing ready PR only edits its body, leaving it ready and without the needs human title.",
@@ -4593,7 +4779,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [964, 968],
+          "lines": [
+            964,
+            968
+          ],
           "severity": "major",
           "category": "delivery",
           "summary": "Restart between recording verification and advancing phase can bypass verified fallback and publish unverified retry edits.",
@@ -4984,7 +5173,10 @@
       "defects": [
         {
           "file": "src/db/store.ts",
-          "lines": [820, 829],
+          "lines": [
+            820,
+            829
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "A dependency that ends needs_human without a PR (for example because its own dependency failed) is treated as still pending: only missing, failed, cancelled or closed-unmerged dependencies fail a waiting run, and a retry creates a new run that cannot satisfy the old dependency. For A → B → C, A failing moves B to needs_human, but C stays waiting forever across reconciliations, so a queued plan's tail silently stalls.",
@@ -5110,7 +5302,10 @@
       "defects": [
         {
           "file": "src/db/store.ts",
-          "lines": [779, 790],
+          "lines": [
+            779,
+            790
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "providerSpendBetween attributes local cost to a reading window by started_at, so a call that starts before an OpenRouter reading and finishes after it is counted in the wrong window (or an in-flight call is missed), producing false spend-drift warnings.",
@@ -5119,7 +5314,10 @@
         },
         {
           "file": "src/router/providers.ts",
-          "lines": [171, 176],
+          "lines": [
+            171,
+            176
+          ],
           "severity": "minor",
           "category": "logic",
           "summary": "Drift is only checked when usage did not decrease, which is also the only month-rollover signal. After a monthly reset where new usage already exceeds the prior reading, the reset is missed and the drift check compares spend across the reset.",
@@ -5281,7 +5479,10 @@
       "defects": [
         {
           "file": "src/git/merge.ts",
-          "lines": [78, 84],
+          "lines": [
+            78,
+            84
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "Leftover conflict markers are detected only as exactly `<<<<<<< HEAD` and `>>>>>>> <base>`. Markers with a path suffix (`<<<<<<< HEAD:f.txt`, e.g. after a rename) or a configured conflict-marker-size are missed, so a merge is committed with conflict markers in it.",
@@ -5290,7 +5491,10 @@
         },
         {
           "file": "src/git/merge.ts",
-          "lines": [91, 97],
+          "lines": [
+            91,
+            97
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "completeMerge scans only unmerged, untracked and worktree-modified files. A file the resolver already staged with markers still in it shows no worktree diff and escapes the scan, so the unresolved file is committed.",
@@ -5299,7 +5503,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [878, 883],
+          "lines": [
+            878,
+            883
+          ],
           "severity": "major",
           "category": "data-migration",
           "summary": "Delivery after a conflict round now requires preRebaseHead, but the previous release cleared it when a delivery rebase conflicted. A run that entered a conflict round under the previous release throws 'Missing pre-merge HEAD at delivery' here (or 'Missing expected merge state' in its resolution round) and cannot recover.",
@@ -5325,7 +5532,10 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [573, 574],
+          "lines": [
+            573,
+            574
+          ],
           "severity": "major",
           "category": "data-migration",
           "summary": "A run saved by the previous release has lastReview but no reviewHistory, so at its next review it throws 'Previous review has no round history' and ends needs_human. A deploy restarts the daemon, so every run past its first review at upgrade time is affected (reproduced by resuming a restart-during-verify run with reviewHistory stripped).",
@@ -5351,7 +5561,10 @@
       "defects": [
         {
           "file": "src/evals/policy.ts",
-          "lines": [117, 121],
+          "lines": [
+            117,
+            121
+          ],
           "severity": "major",
           "category": "logic",
           "summary": "Implement evidence is attributed to the run's starting target: a multi-round trial that only passed after an effort raise or a model switch counts as a pass for the starting model, so the policy generator can qualify a model on passes it did not earn.",
@@ -5360,7 +5573,10 @@
         },
         {
           "file": "src/evals/policy.ts",
-          "lines": [293, 339],
+          "lines": [
+            293,
+            339
+          ],
           "severity": "major",
           "category": "completeness",
           "summary": "The B1 escalation evidence handling is unreachable: no caller passes `escalation` to generatePolicy (the CLI path in app.ts omits it), so effort-before-switch recommendations can never be emitted.",
@@ -5386,7 +5602,10 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [971, 990],
+          "lines": [
+            971,
+            990
+          ],
           "severity": "major",
           "category": "concurrency",
           "summary": "The verify-first flow posts its success verdict on the PR without rechecking the PR's current head, so a push after verification started gets an approval comment for code that was never verified.",
@@ -5395,7 +5614,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [668, 671],
+          "lines": [
+            668,
+            671
+          ],
           "severity": "major",
           "category": "correctness",
           "summary": "The audit compares gate scripts against the base branch tip instead of the PR's merge base. When the base changed a gate script after the PR branched, a PR that never touched package.json gets a blocking gate-script-changed finding and ends needs_human.",
@@ -5404,7 +5626,10 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [191, 200],
+          "lines": [
+            191,
+            200
+          ],
           "severity": "major",
           "category": "data-migration",
           "summary": "Prepare now requires sourceRef.baseRef and baseSha for verify-change runs. A PR run queued before the upgrade has neither and fails with 'Verification requires valid PR baseRef' and no model calls.",
@@ -5871,121 +6096,113 @@
       },
       "defects": [
         {
-          "file": "src/config.ts",
-          "lines": [154, 160],
+          "file": "src/cli/setup.ts",
+          "lines": [
+            24,
+            30
+          ],
           "severity": "blocker",
           "required": true,
           "category": "privacy",
           "summary": "Configuration errors and encoded feed diagnostics can disclose registered secrets.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [200, 206],
-          "severity": "blocker",
+          "lines": [
+            203,
+            208
+          ],
+          "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "A failure after configuration replacement leaves initialization partially applied.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [195, 201],
-          "severity": "major",
-          "required": true,
+          "lines": [
+            198,
+            203
+          ],
+          "severity": "minor",
+          "required": false,
           "category": "data-migration",
           "summary": "Initialization rewrites unrelated configuration formatting without preserving a rollback copy.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [76, 82],
+          "lines": [
+            79,
+            95
+          ],
           "severity": "major",
           "required": true,
           "category": "completeness",
           "summary": "Doctor omits health probes for implicit providers and presets lacking an explicit health URL.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "test/setup-support.ts",
-          "lines": [30, 36],
+          "lines": [
+            33,
+            44
+          ],
           "severity": "major",
           "required": true,
           "category": "test-gap",
           "summary": "The command fake permits mutating operations during read-only diagnosis.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "test/init.test.ts",
-          "lines": [120, 126],
+          "lines": [
+            131,
+            150
+          ],
           "severity": "major",
           "required": true,
           "category": "test-gap",
           "summary": "The registration test does not exercise preservation of existing vendor settings.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [220, 226],
+          "lines": [
+            223,
+            224
+          ],
           "severity": "minor",
           "required": false,
           "category": "spec-mismatch",
           "summary": "Initialization does not collect the requested discreet-mode preference.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
-      ]
-    },
-    {
-      "id": "review-041",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "329ed414e8223285ed54a18b994e7e94313a8ff0",
-      "head": "9a6c615757d4922e7b9f588ed343d95d622482d9",
-      "source": "pr #367 review round-2 @ 9a6c615",
-      "split": "heldout",
-      "input": {
-        "prompt": "# limitless init and doctor: one idempotent setup command and a read-only diagnosis\n\n## Why\nSetting up Limitless on a new machine today takes a series of manual steps: provider config, secrets, the launchd service, tunnel and smoke checks. For a fresh install (M6, docs/PLAN.md), setup should be one command that is safe to re-run, plus a read-only command for diagnosis.\n\nDepends on #35 (config-defined providers).\n\n## What\n1. **`limitless doctor`** is read-only and safe any time. Each check prints ok/warn/fail with the exact fix:\n   - **git** is ≥ 2.40.\n   - **`gh auth status`** passes and has repo access. For a GitHub organization, SSO authorization is checked by a read against a configured repository; on a 403 with `X-GitHub-SSO` it prints \"sign in to your identity provider, then `gh auth refresh`\".\n   - **The claude and codex CLIs** are installed and logged in.\n   - **python3** is present, for the sandbox probe.\n   - **Every configured provider** has its `api_key_env` variable present (names only, never values) and answers its health check.\n   - **The daemon** is up, and its version matches the installed one.\n   - **The last smoke results** and **access problems recorded in the feed** are reported.\n\n   It never changes anything. `--json` gives machine-readable output.\n2. **`limitless init`** is idempotent and runs in order:\n   1. The doctor checks; it stops on a failure, printing the fix.\n   2. Provider detection: the CLI logins become `preset = \"claude\"` / `\"codex\"`, and local OpenAI- or Anthropic-compatible servers are probed on common loopback ports and offered.\n   3. It writes or updates `[[providers]]` and asks a few questions with defaults: the repositories to enable, the merge policy, and discreet mode.\n   4. It starts the service and waits until healthy.\n   5. It runs the live smoke checks.\n   6. It offers to register the MCP server with Claude Code and Codex, asking before it changes their config.\n\n   A re-run only fills gaps and shows what is already set. `--yes` accepts defaults and `--repo <owner/name>` can repeat, so an agent can run the whole setup non-interactively. `--json` gives a summary.\n3. **Docs:** GUIDE \"Getting started\" becomes `limitless init`, with doctor for troubleshooting. Placeholders only.\n\n## Tests (fakes for CLIs, gh, launchd and HTTP; no network)\n- Each doctor check passes, warns and fails with the fix text.\n- Secrets are never printed.\n- init on an empty config, on a partial config, and as a second run that changes nothing.\n- `--yes` with `--json`.\n- An init that stops on a failed check leaves no partial config.\n\n## Out of scope\nHomebrew packaging (#38), the service label rename (#287), and changing provider semantics (#35).\n\nBudget: ≤ 350 changed source lines plus tests. Gate: `bun run lint && bun run typecheck && bun test`.\n\nNever kill processes you did not start (no pkill or killall by name): other runs, deploys and the user share this machine.\n\nCloses #288",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
+      ],
+      "labelHistory": [
         {
-          "file": "test/fixtures/setup-cli-preload.ts",
-          "lines": [21, 27],
-          "severity": "major",
-          "required": true,
-          "category": "test-gap",
-          "summary": "CLI diagnosis tests can send provider probes to live endpoints.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/cli/setup.ts): A failure after configuration replacement leaves initialization partially applied. Reason: Configuration replacement precedes service installation, readiness checks, smoke and registration, with no restoration when these operations throw; the JSON summary is also bypassed. This is a realistic failure-path defect warranting major severity."
         },
         {
-          "file": "src/cli/setup-config.ts",
-          "lines": [66, 72],
-          "severity": "major",
-          "required": true,
-          "category": "correctness",
-          "summary": "Updating configuration destroys comments and formatting in unrelated inline tables.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
-        },
-        {
-          "file": "test/fixtures/setup-cli-preload.ts",
-          "lines": [5, 11],
-          "severity": "minor",
-          "required": false,
-          "category": "test-gap",
-          "summary": "The CLI command fake accepts operations outside the permitted diagnosis commands.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded major→minor (src/cli/setup.ts): Initialization rewrites unrelated configuration formatting without preserving a rollback copy. Reason: Filling a setup gap serializes all parsed settings and replaces the original without a backup, discarding comments and table formatting. The demonstrated loss is a concrete maintainability cost; these lines do not establish a major loss of configuration values."
         }
       ]
     },
@@ -6006,200 +6223,165 @@
       "defects": [
         {
           "file": "src/harness/codex.ts",
-          "lines": [811, 817],
+          "lines": [
+            814,
+            820
+          ],
           "severity": "blocker",
           "required": true,
           "category": "correctness",
           "summary": "Nesting Seatbelt around internally sandboxed CLIs prevents tool-enabled invocations from starting.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/sandbox.ts",
-          "lines": [172, 178],
+          "lines": [
+            198,
+            211
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "Scanning ordinary agent output for sandbox diagnostics can discard successful invocations.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/harness/claude.ts",
-          "lines": [246, 252],
-          "severity": "major",
-          "required": true,
-          "category": "spec-mismatch",
-          "summary": "Reader session handling was changed to accommodate a confinement wrapper that cannot run.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/run.ts",
-          "lines": [52, 58],
+          "lines": [
+            55,
+            58
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "Ordinary gate output mentioning sandbox failures can turn a successful check into a confinement error.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "test/signal-confinement.test.ts",
-          "lines": [168, 174],
+          "lines": [
+            179,
+            183
+          ],
           "severity": "major",
           "required": true,
           "category": "test-gap",
           "summary": "The live confinement smoke accepts refusal even when enforcement should work.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/db/migrations/20261004T1441-signal-warning-feed.sql",
-          "lines": [2, 8],
-          "severity": "major",
-          "required": true,
-          "category": "resource",
-          "summary": "Warning feed entries are emitted for each tool call instead of once per invocation.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "docs/research/24-signal-confinement.md",
-          "lines": [0, 4],
-          "severity": "major",
-          "required": true,
-          "category": "completeness",
-          "summary": "The confinement research document generalizes worker sandbox results to an unconfined host.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/signals.ts",
-          "lines": [25, 31],
+          "lines": [
+            28,
+            28
+          ],
           "severity": "minor",
           "required": false,
           "category": "logic",
           "summary": "Adjacent shell quote segments cause heredoc contents to be mistaken for signal commands.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/signals.ts",
-          "lines": [51, 57],
+          "lines": [
+            54,
+            66
+          ],
           "severity": "minor",
           "required": false,
           "category": "logic",
           "summary": "The signal detector misses common command wrappers and flags harmless process queries.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "test/fixtures/codex-signals.jsonl",
-          "lines": [0, 4],
-          "severity": "minor",
-          "required": false,
-          "category": "test-gap",
-          "summary": "Synthetic signal fixtures do not cover the command shapes emitted by the actual CLIs.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/prompts.ts",
-          "lines": [160, 166],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The shared-machine process restriction is absent from reviewer and verifier prompts.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/pipeline/report.ts",
-          "lines": [293, 299],
+          "lines": [
+            296,
+            301
+          ],
           "severity": "minor",
           "required": false,
           "category": "other",
           "summary": "The report layer queries event storage directly rather than through the Store interface.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/sandbox.ts",
-          "lines": [63, 69],
+          "lines": [
+            66,
+            69
+          ],
           "severity": "nit",
           "required": false,
           "category": "error-handling",
           "summary": "Repeated confinement error wrapping obscures the underlying failure.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "test/service.test.ts",
-          "lines": [509, 515],
-          "severity": "nit",
-          "required": false,
-          "category": "spec-mismatch",
-          "summary": "A service-test text change falls outside the signal-confinement request.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/harness/claude.ts",
-          "lines": [245, 251],
-          "severity": "minor",
-          "required": false,
-          "category": "delivery",
-          "summary": "The confinement branch requires conflict resolution that preserves both reader and main changes.",
-          "foundBy": "orchestrator review rev368",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
-      ]
-    },
-    {
-      "id": "review-043",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "3cb5594ba27d0ebdaebba77ab9cd18dce7bce978",
-      "head": "ae2f7ad6e3fd383de41af5d86e1da01390f0c473",
-      "source": "pr #368 review rev368b @ ae2f7ad",
-      "split": "heldout",
-      "input": {
-        "prompt": "# Run agents and gates can kill the user's processes: confine signals to the run\n\n## Why\nRun agents can signal any process the user owns. On 2026-10-03, implementers ran `pkill -f \"bun test\"` while investigating slow tests:\n- run <run-id> (codex, workspace-write sandbox), at 09:56:02 and at 11:47:16;\n- run <run-id>, at 11:16:58 and 11:21:26;\n- older runs did the same, and one started eight `yes` busy loops to simulate load.\n\nEach `pkill` killed every matching process on the machine, not only the agent's own:\n- 09:56:02: the daemon's deploy gate (`bun test`) died at that exact second, and the deploy failed. That failure had been blamed on machine load.\n- 11:47:16: a `land-pr.sh` check running in another checkout died at that second.\n- The kills also cut short other runs' gates, so those runs repeated paid work.\n\nCodex's `-s workspace-write` Seatbelt profile confines writes but not signals. The Claude edit mode has no sandbox yet (#233). At work, the same command would kill the user's own processes and other tools'.\n\n## What\n1. **Research first.** Can both CLIs be confined so that an agent and its children can signal only processes in their own run?\n   - macOS Seatbelt `signal` targets: `self`, `pgrp`, `children`, `same-sandbox`.\n   - Whether an outer `sandbox-exec` profile composes with Codex's own Seatbelt use and with the Claude CLI's sandbox (a nested `sandbox_init` may fail).\n   - A process-group or session approach for gates.\n   Record the findings in `docs/research/`.\n2. **Enforce it where the platform allows.** Agents (edit and read-only modes) and gate commands can signal only their own run's processes, applied with the #233 sandbox work. Fail closed like #233: a run that cannot be confined fails with a clear reason.\n3. **Cheap layers that don't depend on 2:**\n   - Implement and fix prompts state: never signal processes the agent did not start; never `pkill` or `killall` by name; other runs and the user share this machine.\n   - Add Claude edit-mode deny rules for `pkill`, `killall` and `kill -9 -1`, and Codex's equivalent if one exists. Pattern rules are bypassable, so they are a backstop, not the fix.\n4. **Detect it.** The harness parsers flag tool calls that signal by name or by pid (`pkill`, `killall`, `kill`, `xargs kill`, `process.kill`) in the run's event log and report as a warning. Feed a `run.warning` item when one is seen.\n\n## Acceptance checks\n- A live smoke check per harness: an agent that runs `pkill -f <marker>` cannot kill a marker process started outside the run, and can kill one it started itself.\n- A gate command cannot kill a marker process started outside the run.\n- The detector flags the commands above in a captured fixture and ignores unrelated text.\n\n## Out of scope\nNetwork and read isolation, file-write confinement (#233), and resource limits (CPU or memory) on agents and gates.\n\nBudget: research doc, then at most 250 changed source lines plus tests and smoke checks. Chain after #233 if both touch the sandbox profile code.\n\nNever kill processes you did not start (no pkill or killall by name): other runs, deploys and the user share this machine.\n\nCloses #293",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
+      ],
+      "labelHistory": [
         {
-          "file": "src/harness/sandbox.ts",
-          "lines": [128, 134],
-          "severity": "minor",
-          "required": false,
-          "category": "error-handling",
-          "summary": "The signal canary deadline is too short for a loaded host compared with the write probe.",
-          "foundBy": "orchestrator review rev368b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/harness/claude.ts): Reader session handling was changed to accommodate a confinement wrapper that cannot run. Reason: Reader session persistence was deliberately disabled consistently with the new read-only configuration boundary, and the request does not require resumable reader sessions. The separate allegation that this boundary cannot launch on an unconfined host remains unverified."
         },
         {
-          "file": "docs/ARCHITECTURE.md",
-          "lines": [250, 256],
-          "severity": "nit",
-          "required": false,
-          "category": "completeness",
-          "summary": "Architecture and research text omit parts of the new signal confinement behavior.",
-          "foundBy": "orchestrator review rev368b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/db/migrations/20261004T1441-signal-warning-feed.sql): Warning feed entries are emitted for each tool call instead of once per invocation. Reason: The request asks for a warning feed item when a signal tool call is seen; it does not require one item per invocation. The implementation deliberately deduplicates individual tool calls, and the test explicitly expects separate items for distinct calls; feed aggregation is an optional behavior chan…"
         },
         {
-          "file": "test/harness.test.ts",
-          "lines": [561, 567],
-          "severity": "nit",
-          "required": false,
-          "category": "other",
-          "summary": "Harness test cleanup changes are mixed into the signal confinement fix.",
-          "foundBy": "orchestrator review rev368b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, docs/research/24-signal-confinement.md): The confinement research document generalizes worker sandbox results to an unconfined host. Reason: The document explicitly identifies the worker as sandboxed and says the refusals do not demonstrate effective isolation. It also states that unrestricted-host compatibility remains unverified, so the alleged generalization to an unconfined host is not present."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, test/fixtures/codex-signals.jsonl): Synthetic signal fixtures do not cover the command shapes emitted by the actual CLIs. Reason: The fixtures already exercise shell-wrapped commands and the started/completed event pair. Both parsers recognized the supplied CLI-shaped events with one warning each; missing capture provenance does not establish the alleged command-shape defect."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/pipeline/prompts.ts): The shared-machine process restriction is absent from reviewer and verifier prompts. Reason: This rule and its placement are unchanged from base. The request specifically requires implement and fix prompts to contain the restriction, which they already share; it does not require adding the rule to reviewer and verifier prompts."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (nit, test/service.test.ts): A service-test text change falls outside the signal-confinement request. Reason: The change excludes nonexistent working-tree files before reading tracked text, while retaining checks for surviving files. Being unrelated to signal confinement does not by itself establish a code defect."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/harness/claude.ts): The confinement branch requires conflict resolution that preserves both reader and main changes. Reason: This candidate concerns resolving a future merge, which is delivery advice rather than a defect at the supplied HEAD. HEAD already contains the cited main-side fast-settings behavior alongside the confinement session changes."
         }
       ]
     },
@@ -6220,23 +6402,29 @@
       "defects": [
         {
           "file": "src/router/router.ts",
-          "lines": [253, 259],
+          "lines": [
+            256,
+            262
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "A historical policy edit keeps invalidating implementer selections made after that edit.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/router/router.ts",
-          "lines": [0, 4],
+          "lines": [
+            313,
+            327
+          ],
           "severity": "minor",
           "required": false,
           "category": "spec-mismatch",
           "summary": "Duplicated candidate ordering and startup merging exceed the requested source budget.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6257,23 +6445,29 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [346, 352],
+          "lines": [
+            348,
+            353
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Unlimited quota still applies utilization reserves to free and metered providers.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/router/providers.ts",
-          "lines": [571, 577],
+          "lines": [
+            571,
+            578
+          ],
           "severity": "minor",
           "required": false,
           "category": "correctness",
           "summary": "Persisted utilization warnings remain active after a provider switches to unlimited quota.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6294,23 +6488,26 @@
       "defects": [
         {
           "file": "src/pipeline/context.ts",
-          "lines": [838, 844],
-          "severity": "major",
-          "required": true,
-          "category": "error-handling",
-          "summary": "Repeated invalid spec output ends the run without trying the next pinned candidate.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/context.ts",
-          "lines": [549, 555],
+          "lines": [
+            549,
+            552
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "A pinned candidate slot deadline exits without recording the chain-exhaustion question.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/pipeline/context.ts): Repeated invalid spec output ends the run without trying the next pinned candidate. Reason: The second invalid-spec response throws the same generic error at base and HEAD. The request requires pinned-chain handling for routing/capacity exhaustion and provider rejection, but does not require changing this existing spec-validation retry limit."
         }
       ]
     },
@@ -6331,53 +6528,63 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [881, 887],
-          "severity": "blocker",
-          "required": true,
-          "category": "security",
-          "summary": "Extension-based exemptions admit executables and archive polyglots as inert media.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/gates/audit.ts",
-          "lines": [110, 116],
-          "severity": "blocker",
-          "required": true,
-          "category": "security",
-          "summary": "The inert-format allowance admits PDFs containing active scripting features.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/git/repos.ts",
-          "lines": [879, 885],
-          "severity": "blocker",
+          "lines": [
+            881,
+            884
+          ],
+          "severity": "major",
           "required": true,
           "category": "security",
           "summary": "LFS pointer exemptions skip inspection of unavailable or executable payloads.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [881, 887],
+          "lines": [
+            881,
+            884
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "A passive PDF converted from text to binary is rejected despite the requested allowance.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (blocker, src/git/repos.ts): Extension-based exemptions admit executables and archive polyglots as inert media. Reason: Extension-based exemptions and the absence of executable-mode checks already existed at base. The request specifies narrowing the extension list; it does not require magic-byte validation, polyglot detection, or mode auditing."
         },
         {
-          "file": "src/gates/audit.ts",
-          "lines": [110, 116],
-          "severity": "blocker",
-          "required": true,
-          "category": "security",
-          "summary": "PDF filters and archives with non-ASCII names still evade embedded-payload inspection.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (blocker, src/gates/audit.ts): The inert-format allowance admits PDFs containing active scripting features. Reason: PDFs were already exempt at base, and the request explicitly retains pdf in the allowed extension list. Inspecting or rejecting PDF scripting features is an additional policy requirement, not a defect introduced or requested for this change."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/git/repos.ts): LFS pointer exemptions skip inspection of unavailable or executable payloads. Reason: The unchanged base-pointer exemption violates the new acceptance requirement when an edited .wasm replaces a strict LFS pointer with inline binary WASM: it produces no binary-content finding. This narrower replacement case warrants major; the broader assertion that unavailable payloads always skip …"
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (blocker, src/gates/audit.ts): PDF filters and archives with non-ASCII names still evade embedded-payload inspection. Reason: PDF embedded-content inspection was absent at base, and the request explicitly retains the PDF exemption. Archive extensions are now excluded by a suffix regex without any ASCII restriction; no evidence establishes the claimed non-ASCII-name bypass."
         }
       ]
     },
@@ -6398,73 +6605,97 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [905, 911],
-          "severity": "blocker",
+          "lines": [
+            904,
+            911
+          ],
+          "severity": "major",
           "required": true,
           "category": "security",
           "summary": "LFS exemptions permit missing payloads and pointer replacements containing archives.",
           "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/git/repos.ts",
-          "lines": [872, 878],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "Executable images and mode-only transitions bypass the binary allowance.",
-          "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/git/repos.ts",
-          "lines": [905, 911],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "The text exemption admits an ASCII PDF with active scripting.",
-          "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/media.ts",
-          "lines": [154, 160],
-          "severity": "nit",
+          "lines": [
+            43,
+            50
+          ],
+          "severity": "minor",
           "required": false,
           "category": "spec-mismatch",
           "summary": "Pixel-content inspection extends the audit into explicitly excluded steganography.",
           "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/gates/media.ts",
-          "lines": [901, 907],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "Unused font table storage admits executable and compressed payloads.",
-          "foundBy": "orchestrator review rev382d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [766, 772],
+          "lines": [
+            904,
+            910
+          ],
           "severity": "major",
           "required": true,
           "category": "security",
           "summary": "The limited text sample exempts a TAR whose first binary byte lies beyond the sample.",
           "foundBy": "orchestrator review rev382d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/media.ts",
-          "lines": [512, 518],
+          "lines": [
+            515,
+            524
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "The WebP inspector rejects valid lossy VP8 images.",
           "foundBy": "orchestrator review rev382d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/git/repos.ts): LFS exemptions permit missing payloads and pointer replacements containing archives. Reason: Replacing a base LFS pointer with committed archive bytes bypasses binary-content classification regardless of the replacement's content, violating the requirement for edited archives. This is a special-case major defect; unavailable or uninspected LFS payloads themselves are pre-existing behavior …"
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/git/repos.ts): Executable images and mode-only transitions bypass the binary allowance. Reason: Discarding file modes is unchanged from base, and the request does not require an allowance for executable permission bits or mode-only changes. A valid PNG remains inert image content when its executable bit is set; this does not demonstrate executable code bypassing the new content inspection."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/git/repos.ts): The text exemption admits an ASCII PDF with active scripting. Reason: The exemption for Git-classified text is unchanged from base. An entirely ASCII PDF exposes its scripting in the textual diff, and the request addresses opaque binary content rather than prohibiting visible scripting or validating the extension of text files."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Upgraded nit→minor (src/gates/media.ts): Pixel-content inspection extends the audit into explicitly excluded steganography. Reason: The supplied request does not explicitly exclude steganography, but the new scan does cause a concrete PNG acceptance defect: a valid four-pixel grayscale PNG is rejected solely because its pixel values equal a ZIP signature. This limited false positive is more than a wording nit, without establish…"
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/gates/media.ts): Unused font table storage admits executable and compressed payloads. Reason: The probe confirms that unused name-table storage can contain JavaScript bytes, but TTF files already passed at base. The request expressly exempts fonts and does not require complete table-storage coverage; inert JavaScript bytes in a font do not establish an introduced execution defect or a reque…"
         }
       ]
     },
@@ -6485,23 +6716,29 @@
       "defects": [
         {
           "file": "src/gates/media.ts",
-          "lines": [605, 611],
+          "lines": [
+            607,
+            616
+          ],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "Unconsumed WebP token storage admits a recoverable archive outside the pixels.",
           "foundBy": "orchestrator review rev382e",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/media.ts",
-          "lines": [41, 47],
+          "lines": [
+            43,
+            45
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "A bare executable magic match rejects valid image bytes with an incidental signature.",
           "foundBy": "orchestrator review rev382e",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6522,33 +6759,39 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [181, 187],
+          "lines": [
+            178,
+            184
+          ],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "Legacy adoption trusts Git administration paths selected by an agent-controlled checkout.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [179, 185],
-          "severity": "blocker",
-          "required": true,
-          "category": "security",
-          "summary": "A missing sidecar is accepted as legacy even for a worktree created by the current release.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/engine.ts",
-          "lines": [175, 181],
+          "lines": [
+            173,
+            184
+          ],
           "severity": "major",
           "required": true,
           "category": "completeness",
           "summary": "Draft delivery and interrupted preparation can reuse a legacy worktree before path registration.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (blocker, src/pipeline/engine.ts): A missing sidecar is accepted as legacy even for a worktree created by the current release. Reason: The request explicitly authorizes treating a missing protected sidecar as legacy, and the confinement policy grants writes only to the checkout and scratch, excluding the sibling sidecar. Deleting a modern sidecar from outside that boundary does not establish an agent security bypass or a requireme…"
         }
       ]
     },
@@ -6569,23 +6812,29 @@
       "defects": [
         {
           "file": "src/db/migrations/20261005T134145-worktree-provenance.sql",
-          "lines": [6, 12],
+          "lines": [
+            6,
+            13
+          ],
           "severity": "major",
           "required": true,
           "category": "data-migration",
           "summary": "A fixed review-time cutoff excludes worktrees created before the sidecar-writing release actually started.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "test/git-integrity.test.ts",
-          "lines": [109, 115],
+          "lines": [
+            109,
+            112
+          ],
           "severity": "minor",
           "required": false,
           "category": "test-gap",
           "summary": "The duplicate-backlink fixture assumes temporary paths have identical spellings on macOS and Linux.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6606,43 +6855,55 @@
       "defects": [
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [323, 329],
+          "lines": [
+            321,
+            327
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Arbitrary assertion text mentioning a timeout is classified as a transient CI failure.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [301, 307],
+          "lines": [
+            297,
+            304
+          ],
           "severity": "major",
           "required": true,
           "category": "security",
           "summary": "Retry eligibility ignores security failures outside the selected error line.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/github-poller.ts",
-          "lines": [312, 318],
+          "lines": [
+            314,
+            325
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "A paused PR is not inspected again when main recovers without another PR change.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [184, 190],
+          "lines": [
+            185,
+            190
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "An accepted rerun with a lost response is never reconciled to its later result.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6663,23 +6924,29 @@
       "defects": [
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [354, 360],
+          "lines": [
+            387,
+            389
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "A definitively refused CI rerun remains pending indefinitely.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [343, 349],
+          "lines": [
+            345,
+            346
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Passing security-test output incorrectly prevents a transient CI rerun.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6700,50 +6967,29 @@
       "defects": [
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [392, 398],
+          "lines": [
+            394,
+            400
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "Rate-limit refusals leave rerun claims unresolved across cooldowns and restarts.",
           "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [44, 50],
+          "lines": [
+            42,
+            48
+          ],
           "severity": "major",
           "required": true,
           "category": "security",
           "summary": "ANSI-colored Bun failures and pytest security failures are missed by the retry exclusion.",
           "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-055",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "23752857992745a5d55b81a19208c88360ef6c85",
-      "head": "1e3f024ff6e2de1fa2e255ff66de727321be72da",
-      "source": "pr #386 review round-1 @ 1e3f024",
-      "split": "heldout",
-      "input": {
-        "prompt": "# Config: reject unknown or retired ids in [routing] prefer\n\n`[routing] prefer` entries are compared with provider ids (`src/router/router.ts:249`), but `src/config.ts:349–351` accepts any string. A config with `prefer = [\"codex/astra\"]` (a model id, or a retired one) starts normally and the entry is silently ignored.\n\nFix: validate `prefer` at load time. Each entry must be a known provider id (built-in or configured). For a model id, say so; for a retired model, give the removal reason from `src/router/targets.ts`. Fail with a clear message instead of ignoring it.\n\nAcceptance: `prefer = [\"codex/astra\"]`, `[\"claude/opus\"]` and `[\"nonexistent\"]` each fail config loading with a message naming the entry, and `prefer = [\"codex\"]` still loads.\n\nFound in the #342 review (pre-existing). Small: about 15 lines plus tests.\n\nTracking issue: #344.",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "src/config.ts",
-          "lines": [222, 228],
-          "severity": "major",
-          "required": true,
-          "category": "correctness",
-          "summary": "Configuration and runtime preference validators disagree on the same invalid provider reference.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6764,23 +7010,26 @@
       "defects": [
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [69, 75],
+          "lines": [
+            71,
+            76
+          ],
           "severity": "blocker",
           "required": true,
           "category": "data-migration",
           "summary": "Catalog mutation can invalidate a shadowed retained policy and prevent the daemon from restarting.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
         {
-          "file": "src/router/router.ts",
-          "lines": [0, 4],
-          "severity": "major",
-          "required": true,
-          "category": "delivery",
-          "summary": "Unresolved integration conflicts prevent the catalog change from landing with current routing behavior.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/router/router.ts): Unresolved integration conflicts prevent the catalog change from landing with current routing behavior. Reason: Conflicts with another branch are a delivery/process concern explicitly excluded by the adjudication rules. HEAD contains ordinary imports at the cited location, identical to base, and inspection found no conflict markers in this file."
         }
       ]
     },
@@ -6801,13 +7050,16 @@
       "defects": [
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [69, 75],
+          "lines": [
+            71,
+            76
+          ],
           "severity": "blocker",
           "required": true,
           "category": "data-migration",
           "summary": "Effort removal is persisted without checking policy cells hidden by operator overrides.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6828,70 +7080,55 @@
       "defects": [
         {
           "file": "ui/components/RetryModels.tsx",
-          "lines": [12, 18],
+          "lines": [
+            15,
+            23
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Retrying an unchanged run converts inherited model chains into explicit overrides.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "ui/pages/Setup.tsx",
-          "lines": [76, 82],
+          "lines": [
+            78,
+            88
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "Routing previews remain stale after quota or cooldown expiry without an event.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "ui/components/CatalogForm.tsx",
-          "lines": [63, 69],
+          "lines": [
+            66,
+            72
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "Clearing a default effort omits the field from PATCH and leaves the old value stored.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "ui/pages/Setup.tsx",
-          "lines": [616, 622],
+          "lines": [
+            619,
+            625
+          ],
           "severity": "major",
           "required": true,
           "category": "completeness",
           "summary": "Catalog history disappears on reload and does not include changes made by another client.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-059",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "d38da5e9ca7773d8257066a2a11c7d72abb2c2d3",
-      "head": "8c79c0791374fef405d2d26dd4bbaa29bb4852ee",
-      "source": "pr #391 review rev391 @ 8c79c07",
-      "split": "dev",
-      "input": {
-        "prompt": "# Tests: cancellation blob-scan pipeline tests are flaky under load\n\nTwo pipeline tests fail intermittently under machine load or on CI, then pass on rerun:\n- \"run cancellation stops the production diff blob scan\" (#389's post-merge gate, 2026-10-06; 5.5 s);\n- \"run cancellation stops the production publication blob scan\" (#384's CI, 2026-10-05; passed on rerun).\n\nBoth race a cancellation against a scan using wall-clock timing. Under load the scan can finish, or the cancel can land late, before the assertion. Each failure costs a factory round, because the run goes needs_human with \"post-merge gates regressed\".\n\nFix: make them deterministic. Block the scan at a known point with a fake or injected hook, cancel, then release, the same way #386's holdout restart test was fixed (cff310f). Don't rely on timing.\n\nAcceptance: both tests pass 20 times in a row under `stress`-like load (e.g. with 4 parallel CPU burners).\n\nTracking issue: #390.",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "test/pipeline.test.ts",
-          "lines": [3044, 3050],
-          "severity": "minor",
-          "required": false,
-          "category": "test-gap",
-          "summary": "The cancellation barrier stops before process launch and no longer tests termination of an active scan.",
-          "foundBy": "orchestrator review rev391",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6912,33 +7149,42 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [126, 132],
+          "lines": [
+            112,
+            124
+          ],
           "severity": "blocker",
           "required": true,
           "category": "resource",
           "summary": "Detached descendants survive invocation cleanup and keep modifying the worktree.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [143, 149],
+          "lines": [
+            146,
+            151
+          ],
           "severity": "major",
           "required": true,
           "category": "resource",
           "summary": "Process cleanup returns while owned descendants are still alive.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [1105, 1111],
+          "lines": [
+            1106,
+            1109
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "Discarding changes replaces the cleanup error that should trigger round recovery.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -6959,63 +7205,81 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [158, 164],
+          "lines": [
+            158,
+            175
+          ],
           "severity": "blocker",
           "required": true,
           "category": "resource",
           "summary": "Shutdown drops an already claimed descendant when its parent exits.",
           "foundBy": "orchestrator review rev392b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [844, 850],
-          "severity": "blocker",
+          "lines": [
+            845,
+            847
+          ],
+          "severity": "major",
           "required": true,
           "category": "resource",
           "summary": "Holdout snapshot deletion proceeds despite unconfirmed descendant termination.",
           "foundBy": "orchestrator review rev392b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/scratch.ts",
-          "lines": [179, 185],
+          "lines": [
+            182,
+            187
+          ],
           "severity": "major",
           "required": true,
           "category": "resource",
           "summary": "Production scratch directories are never registered as process ownership roots.",
           "foundBy": "orchestrator review rev392b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/util/processes-darwin.ts",
-          "lines": [132, 138],
+          "lines": [
+            132,
+            138
+          ],
           "severity": "major",
           "required": true,
           "category": "resource",
           "summary": "Replacing a descendant environment removes it from invocation discovery.",
           "foundBy": "orchestrator review rev392b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/pipeline/engine.ts): Holdout snapshot deletion proceeds despite unconfirmed descendant termination. Reason: An inspection failure rejects the process invocation without confirming descendant termination, but the holdout callback's finally still deletes its working snapshot. This bypasses the change's cleanup protection; major fits the conditional inspection-failure case better than blocker."
         },
         {
-          "file": "src/pipeline/engine.ts",
-          "lines": [993, 999],
-          "severity": "major",
-          "required": true,
-          "category": "spec-mismatch",
-          "summary": "Termination failures end the run without the requested bounded round recovery.",
-          "foundBy": "orchestrator review rev392b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/pipeline/engine.ts): Termination failures end the run without the requested bounded round recovery. Reason: The request explicitly permits escalation instead of retrying the round. Persisting the termination failure and entering needs_human is that escalation; the request does not require another implementation attempt while descendant termination remains unconfirmed."
         },
         {
-          "file": "test/hardening.test.ts",
-          "lines": [81, 87],
-          "severity": "minor",
-          "required": false,
-          "category": "test-gap",
-          "summary": "A descendant test leaves its writer running when inspection fails.",
-          "foundBy": "orchestrator review rev392b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, test/hardening.test.ts): A descendant test leaves its writer running when inspection fails. Reason: The unreferenced child, missing finally teardown, and sleep-based assertion already exist at base, and the request does not require repairing this test's failure-path teardown. HEAD actually limits the previously unbounded child lifetime to 15 seconds."
         }
       ]
     },
@@ -7036,23 +7300,39 @@
       "defects": [
         {
           "file": "src/harness/scratch.ts",
-          "lines": [182, 188],
-          "severity": "blocker",
+          "lines": [
+            184,
+            187
+          ],
+          "severity": "major",
           "required": true,
           "category": "concurrency",
           "summary": "Run-wide scratch roots let one invocation cleanup kill another invocation writer.",
           "foundBy": "orchestrator review rev392c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/util/processes-darwin.ts",
-          "lines": [156, 162],
+          "lines": [
+            156,
+            162
+          ],
           "severity": "major",
           "required": true,
           "category": "security",
           "summary": "A recycled leader PID claims unrelated processes through reused group or session identifiers.",
           "foundBy": "orchestrator review rev392c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/harness/scratch.ts): Run-wide scratch roots let one invocation cleanup kill another invocation writer. Reason: Concurrent invocations share scratch registrations, so Darwin shutdown can discover and signal another invocation's hidden orphan through its scratch directory. This requires concurrent invocation timing and a newly born hidden orphan, making it a realistic major defect rather than a blocker."
         }
       ]
     },
@@ -7073,13 +7353,16 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [0, 0],
+          "lines": [
+            365,
+            368
+          ],
           "severity": "major",
           "required": true,
           "category": "error-handling",
           "summary": "Pre-aborted shutdown with failed leader inspection references timer cleanup before initialization and never settles.",
           "foundBy": "orchestrator review rev392d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -7100,23 +7383,29 @@
       "defects": [
         {
           "file": "src/harness/reader.ts",
-          "lines": [25, 31],
+          "lines": [
+            28,
+            56
+          ],
           "severity": "blocker",
           "required": true,
           "category": "correctness",
           "summary": "The reader loopback policy cannot match the intended socket access.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
-          "file": "src/harness/sandbox.ts",
-          "lines": [26, 32],
+          "file": "src/harness/reader.ts",
+          "lines": [
+            48,
+            51
+          ],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "An allow-default reader policy weakens the established confinement boundary.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -7137,33 +7426,34 @@
       "defects": [
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [101, 107],
-          "severity": "blocker",
-          "required": true,
-          "category": "security",
-          "summary": "A model-written gate citation can satisfy verification without a matching engine record.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/gate-evidence.ts",
-          "lines": [64, 70],
-          "severity": "major",
-          "required": true,
-          "category": "logic",
-          "summary": "Retried or previously failing gate checks are accepted as clean verification evidence.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/gate-evidence.ts",
-          "lines": [29, 35],
+          "lines": [
+            32,
+            34
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "A single extracted test command is treated as proof of a multi-step criterion.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (blocker, src/pipeline/gate-evidence.ts): A model-written gate citation can satisfy verification without a matching engine record. Reason: Model-declared met rows with arbitrary evidence already produced pass at base; validating those statements was not requested. The new structured provenance is stripped from model output, and engine substitutions require a successful gate stage for the current run and SHA."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/pipeline/gate-evidence.ts): Retried or previously failing gate checks are accepted as clean verification evidence. Reason: Successful retries are explicitly valid, nonblocking gate results under the pre-existing gate policy; the request does not require failure-free history or every sibling check to pass. HEAD requires the cited final attempt to succeed without timeout or confinement failure, so accepting its successfu…"
         }
       ]
     },
@@ -7184,33 +7474,42 @@
       "defects": [
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [18, 24],
-          "severity": "blocker",
+          "lines": [
+            43,
+            50
+          ],
+          "severity": "major",
           "required": true,
           "category": "security",
           "summary": "Free-text claim detection still lets model wording steer gate-evidence substitution.",
           "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/pipeline/gate-evidence.ts): Free-text claim detection still lets model wording steer gate-evidence substitution. Reason: Free-text wording controls substitution: adding 'gate' to independently observed test evidence changes a met row to blocked, or replaces it with factory provenance when covering gates exist. This introduces a realistic correctness regression, but the evidence does not establish a blocker security b…"
         },
         {
-          "file": "test/",
-          "lines": [0, 4],
-          "severity": "major",
-          "required": true,
-          "category": "test-gap",
-          "summary": "Wording-based tests do not establish that gate provenance is owned by the engine.",
-          "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, test/): Wording-based tests do not establish that gate provenance is owned by the engine. Reason: The tests are not limited to citation wording: they explicitly check engine-generated citations, replay revalidation, rejection of different or absent gate evidence, and stripping model-schema provenance. The supplied request does not require the additional structured blockedReason design proposed …"
         },
         {
-          "file": "src/pipeline/engine.ts",
-          "lines": [0, 4],
-          "severity": "minor",
-          "required": false,
-          "category": "spec-mismatch",
-          "summary": "Intermediate verification machinery remains after the requested structural scope cut.",
-          "foundBy": "orchestrator review round 3",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/pipeline/engine.ts): Intermediate verification machinery remains after the requested structural scope cut. Reason: The supplied request permits gate-result substitution and contains no structural scope-cut or source-size limit; this machinery selects a succeeded gate stage for the exact verified commit. The proposed cleanup and final-report wording identify no concrete defect at HEAD."
         }
       ]
     },
@@ -7231,43 +7530,47 @@
       "defects": [
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [38, 44],
+          "lines": [
+            40,
+            41
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Matching a successful command does not establish the observation required by the criterion.",
           "foundBy": "orchestrator review rev393c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [62, 68],
+          "lines": [
+            60,
+            65
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Targeted Bun evidence can satisfy a criterion without proof that any tests ran.",
           "foundBy": "orchestrator review rev393c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, test/pipeline.test.ts): Linux CI suite output is not recognized as coverage for the blocked verification criterion. Reason: The parser's format restriction is visible, but no actual Linux CI output demonstrating an incompatible format was available or reproduced. The new test expects suite substitution to succeed; that assertion alone does not establish the claimed Linux failure."
         },
         {
-          "file": "test/pipeline.test.ts",
-          "lines": [7550, 7556],
-          "severity": "major",
-          "required": true,
-          "category": "correctness",
-          "summary": "Linux CI suite output is not recognized as coverage for the blocked verification criterion.",
-          "foundBy": "orchestrator review rev393c",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/gate-evidence.ts",
-          "lines": [0, 4],
-          "severity": "minor",
-          "required": false,
-          "category": "spec-mismatch",
-          "summary": "Obsolete evidence and compatibility machinery remains after the structural rewrite.",
-          "foundBy": "orchestrator review rev393c",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/pipeline/gate-evidence.ts): Obsolete evidence and compatibility machinery remains after the structural rewrite. Reason: The evidence module is actively consumed by verification, and the base already required resuming stored verifier results. No concrete obsolete detector or unnecessary compatibility path is established; neither module size nor the original review's report instructions demonstrate a defect."
         }
       ]
     },
@@ -7304,33 +7607,39 @@
       "defects": [
         {
           "file": "src/cli/digest.ts",
-          "lines": [64, 70],
-          "severity": "blocker",
-          "required": true,
-          "category": "privacy",
-          "summary": "Session digest fields are published without applying the configured privacy protection.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/cli/digest.ts",
-          "lines": [19, 25],
+          "lines": [
+            19,
+            30
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Digest actions are derived from stale records instead of current unanswered and review state.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/mcp-status.ts",
-          "lines": [84, 90],
+          "lines": [
+            87,
+            91
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "A historical failed review hides a later approval in MCP status.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (blocker, src/cli/digest.ts): Session digest fields are published without applying the configured privacy protection. Reason: The digest does print raw, quoted fields, but the documented denylist guarantee covers audit, delivery and landing publication, while base already returns raw feed content to agents through MCP. The request requires quoting those fields; the evidence does not establish a newly broken privacy guaran…"
         }
       ]
     },
@@ -7351,23 +7660,39 @@
       "defects": [
         {
           "file": "src/cli/digest.ts",
-          "lines": [112, 118],
-          "severity": "blocker",
+          "lines": [
+            115,
+            119
+          ],
+          "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Embedded short registered secrets remain visible in digest fields.",
           "foundBy": "orchestrator review rev394b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/integrations/mcp-status.ts",
-          "lines": [46, 52],
+          "lines": [
+            45,
+            50
+          ],
           "severity": "blocker",
           "required": true,
           "category": "privacy",
           "summary": "MCP status returns private land reasons unchanged on direct and proxy backends.",
           "foundBy": "orchestrator review rev394b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded blocker→major (src/cli/digest.ts): Embedded short registered secrets remain visible in digest fields. Reason: The new digest exposes embedded registered credentials shorter than eight characters when they are absent from the private-string denylist; a Store-backed probe reproduced this. Major is appropriate because exposure requires this specific credential length and embedding, rather than affecting crede…"
         }
       ]
     },
@@ -7387,24 +7712,27 @@
       },
       "defects": [
         {
-          "file": "src/integrations/mcp.ts",
-          "lines": [381, 387],
-          "severity": "major",
-          "required": true,
-          "category": "privacy",
-          "summary": "MCP error responses expose private exception text even when the privacy policy is unreadable.",
-          "foundBy": "orchestrator review rev394c",
-          "adjudication": "pending"
-        },
-        {
           "file": "src/integrations/mcp-status.ts",
-          "lines": [59, 65],
+          "lines": [
+            60,
+            64
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Unicode and URL encodings evade privacy protection in status and digest fields.",
           "foundBy": "orchestrator review rev394c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/integrations/mcp.ts): MCP error responses expose private exception text even when the privacy policy is unreadable. Reason: The raw exception response, missing-run interpolation, and HTTP-body forwarding already existed at base and were reachable through limitless_get_run. The new status tool reuses that detail backend; the cited examples do not establish a newly exposed disclosure, and the request did not require fixin…"
         }
       ]
     },
@@ -7425,13 +7753,16 @@
       "defects": [
         {
           "file": "src/gates/private.ts",
-          "lines": [46, 52],
+          "lines": [
+            47,
+            53
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Layered URL and Unicode encodings bypass the single-pass private-text decoder.",
           "foundBy": "orchestrator review rev394d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -7452,177 +7783,16 @@
       "defects": [
         {
           "file": "src/cli/digest.ts",
-          "lines": [0, 0],
+          "lines": [
+            126,
+            130
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Digest title truncation occurs before filtering and discloses private prefixes.",
           "foundBy": "orchestrator review rev394e",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-074",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "baa230a68b480684523d7066b298ff1039a62b2c",
-      "head": "0ad93faa2ce76d11fc7e6135426f2801a3e64976",
-      "source": "pr #395 review rev395 @ 0ad93fa",
-      "split": "dev",
-      "input": {
-        "prompt": "Consolidates what this project's reviews and operations have taught into the files implementers actually read (AGENTS.md is in every factory implement prompt via rule 6; hand-run sessions read it directly).\n\n## AGENTS.md\n- **How a change ships**: land re-runs `bun run check` on the merge and waits for Linux CI; deploy re-runs the checks and can roll back. So: pass on Linux CI, leave the previous release working, stay inside the issue's budget.\n- **Git**: factory runs don't run writing git or push (as the implement prompt already says); hand-run sessions branch `--no-track` and push only `HEAD:refs/heads/<branch>`.\n- **Compatibility**: positional `INSERT … VALUES` makes \"add a column\" non-additive; additive HTTP JSON; resumable steps; runs created before a change; polling-only operation.\n- **The machine is shared**: never signal processes you didn't start; targeted tests while working; no hardcoded `/tmp`; no `git stash`.\n- **Isolation, processes and git**: Seatbelt can't nest; `seatbeltSkip`; `sh`/`runProcess`; `worktreeGit`; SIP hides platform binaries' environments.\n- **Trust boundaries, privacy, the diff audit.**\n- **Defects reviews keep finding**: eleven recurring classes, each with PR examples (check-then-act across awaits, exact-SHA binding, model output as evidence, one guard on every path, canonicalize then check, bounded retries, derived state, UI response ordering, git configurability, experimental-path isolation, tests that fail without the fix).\n\n## test/AGENTS.md\n\"Tests that hold on every machine\": revert checks, no timing margins, Linux CI git differences, platform skips, subprocess ownership, port 0, `os.tmpdir()`, injected clients, evidence before calling something flaky.\n\n## src/db/migrations/README.md\nThe positional-INSERT trap.\n\nDocs only; no code changes.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "AGENTS.md",
-          "lines": [91, 97],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The contributor instructions inaccurately apply outer confinement to every harness.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [96, 102],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The Seatbelt test example uses a non-boolean skip condition and overstates landing coverage.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [30, 36],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The shipping description does not reflect configured land-queue gates.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [61, 67],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The resume description guarantees preservation of work that was never checkpointed.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [69, 75],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The polling description implies support for triggers that require webhooks.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [13, 19],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The subprocess inventory incorrectly claims every spawn uses the shared runner.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [105, 111],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The Git hardening description overstates attribute suppression and omits filters.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [132, 138],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The privacy guidance presents boundary redaction as automatically guaranteed.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [143, 149],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The audit allowance instructions omit standalone directive syntax and non-bypassable inspection failures.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [171, 177],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The retry guidance excludes the supported flaky classification.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [184, 190],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The experimental-call guidance incorrectly describes production panel review as isolated experimentation.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        },
-        {
-          "file": "test/AGENTS.md",
-          "lines": [59, 65],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The command-test guidance rules out exact assertions that protect meaningful contracts.",
-          "foundBy": "orchestrator review rev395",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-075",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "baa230a68b480684523d7066b298ff1039a62b2c",
-      "head": "22547be63a0b0c19dc00b30dad82167cbc7572b9",
-      "source": "pr #395 review rev395b @ 22547be",
-      "split": "dev",
-      "input": {
-        "prompt": "Consolidates what this project's reviews and operations have taught into the files implementers actually read (AGENTS.md is in every factory implement prompt via rule 6; hand-run sessions read it directly).\n\n## AGENTS.md\n- **How a change ships**: land re-runs `bun run check` on the merge and waits for Linux CI; deploy re-runs the checks and can roll back. So: pass on Linux CI, leave the previous release working, stay inside the issue's budget.\n- **Git**: factory runs don't run writing git or push (as the implement prompt already says); hand-run sessions branch `--no-track` and push only `HEAD:refs/heads/<branch>`.\n- **Compatibility**: positional `INSERT … VALUES` makes \"add a column\" non-additive; additive HTTP JSON; resumable steps; runs created before a change; polling-only operation.\n- **The machine is shared**: never signal processes you didn't start; targeted tests while working; no hardcoded `/tmp`; no `git stash`.\n- **Isolation, processes and git**: Seatbelt can't nest; `seatbeltSkip`; `sh`/`runProcess`; `worktreeGit`; SIP hides platform binaries' environments.\n- **Trust boundaries, privacy, the diff audit.**\n- **Defects reviews keep finding**: eleven recurring classes, each with PR examples (check-then-act across awaits, exact-SHA binding, model output as evidence, one guard on every path, canonicalize then check, bounded retries, derived state, UI response ordering, git configurability, experimental-path isolation, tests that fail without the fix).\n\n## test/AGENTS.md\n\"Tests that hold on every machine\": revert checks, no timing margins, Linux CI git differences, platform skips, subprocess ownership, port 0, `os.tmpdir()`, injected clients, evidence before calling something flaky.\n\n## src/db/migrations/README.md\nThe positional-INSERT trap.\n\nDocs only; no code changes.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "AGENTS.md",
-          "lines": [141, 147],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The revised privacy text still understates redaction performed automatically by CLI harnesses.",
-          "foundBy": "orchestrator review rev395b",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -7643,33 +7813,52 @@
       "defects": [
         {
           "file": "scripts/smoke.ts",
-          "lines": [1011, 1017],
+          "lines": [
+            1014,
+            1017
+          ],
           "severity": "blocker",
           "required": true,
           "category": "spec-mismatch",
           "summary": "Smoke invocations do not honor the configured model-origin exclusions.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [1333, 1339],
-          "severity": "major",
-          "required": true,
+          "lines": [
+            1336,
+            1342
+          ],
+          "severity": "minor",
+          "required": false,
           "category": "logic",
           "summary": "Panel verifier selection prefers an excluded target over an eligible independent model.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/concierge.ts",
-          "lines": [246, 252],
+          "lines": [
+            247,
+            253
+          ],
           "severity": "minor",
           "required": false,
           "category": "error-handling",
           "summary": "Chat failure reporting discards the origin-exclusion reason.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded major→minor (src/pipeline/engine.ts): Panel verifier selection prefers an excluded target over an eligible independent model. Reason: With the stated listed-verifier override, pickVerifier selects DeepSeek for vendor independence, then the new origin guard rejects that sole target without considering allowed Opus. This is a limited override-path defect: normal configured panels use verifier: {}, so the recorded major severity ove…"
         }
       ]
     },
@@ -7690,33 +7879,39 @@
       "defects": [
         {
           "file": "src/concierge.ts",
-          "lines": [279, 285],
+          "lines": [
+            282,
+            295
+          ],
           "severity": "blocker",
           "required": true,
           "category": "spec-mismatch",
           "summary": "Queued chat dispatch uses a target whose origin became excluded after selection.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/evals/runner.ts",
-          "lines": [845, 851],
+          "lines": [
+            841,
+            849
+          ],
           "severity": "blocker",
           "required": true,
           "category": "spec-mismatch",
           "summary": "Queued eval dispatch does not revalidate origin eligibility after catalog changes.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
-        },
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
         {
-          "file": "src/router/origins.ts",
-          "lines": [0, 4],
-          "severity": "minor",
-          "required": false,
-          "category": "spec-mismatch",
-          "summary": "The exclusion fix duplicates dispatch eligibility checks beyond the requested minimal change.",
-          "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/router/origins.ts): The exclusion fix duplicates dispatch eligibility checks beyond the requested minimal change. Reason: The new module centralizes the existing parser and exclusion predicate, and eval settings and policy reuse them. Multiple enforcement sites are required by the request's routing and explicit-choice guarantees; the candidate identifies no concrete defect or maintainability cost."
         }
       ]
     },
@@ -7769,50 +7964,26 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [957, 963],
+          "lines": [
+            960,
+            963
+          ],
           "severity": "major",
           "required": true,
           "category": "security",
           "summary": "NUL-free opaque executable content bypasses the allowance after extension matching replaces mode inspection.",
           "foundBy": "orchestrator review rev399",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/git/repos.ts",
-          "lines": [0, 0],
-          "severity": "minor",
-          "required": false,
-          "category": "security",
-          "summary": "Editing an executable image while removing its executable bit avoids the mode-change allowance.",
-          "foundBy": "orchestrator review rev399",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
-      ]
-    },
-    {
-      "id": "review-081",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "a682ada709288f5384eb88a173787c751e79007c",
-      "head": "7d24f2a4d6337eaebb7bd9b9fb6ae002b6a827d3",
-      "source": "pr #399 review rev399b @ 7d24f2a",
-      "split": "dev",
-      "input": {
-        "prompt": "#382 (d38da5e) set \\`modeRequiresAllowance\\` for every path whose new mode is 100755 and put it first in \\`binaryPaths\\`, so **any** edit to an executable text script (e.g. \\`scripts/land-pr.sh\\`) is reported as \\`[binary-content] … binary bytes, such as a NUL\\` and needs \\`Allow: binary\\`. #382's request and its test (\\`executable image additions and mode-only changes need a binary allowance\\`, all \\`.png\\`) are about executable *media* passing as inert. Run <run-id> (#376) spent three implementation rounds hunting NUL bytes that weren't there (verified: no NUL or control bytes; git's numstat treats the files as text).\n\nFix: the mode condition applies only to paths matching \\`INERT_MEDIA_PATH\\` (where it removes the inert-media exemption). Opaque binaries already need the allowance through the existing \\`!inert\\` branch; text files, executable or not, are diffed and reviewed like any other text.\n\nTests: new \\`text scripts may be executable, edited, added or chmodded without a binary allowance\\` (fails on main with 5 flagged paths, passes now); the existing executable-image test still passes; \\`test/git-integrity.test.ts\\` 188/188.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
+      ],
+      "labelHistory": [
         {
-          "file": "src/git/repos.ts",
-          "lines": [0, 0],
-          "severity": "minor",
-          "required": false,
-          "category": "security",
-          "summary": "Renaming an opaque file while dropping its executable bit skips mode-transition inspection.",
-          "foundBy": "orchestrator review rev399b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/git/repos.ts): Editing an executable image while removing its executable bit avoids the mode-change allowance. Reason: The executable-bit-removal gap already exists at base: when the blob changes and the new mode is 100644, modeRequiresAllowance is false and validated images retain their exemption. This change neither introduces nor newly exposes that behavior, and the request does not require fixing simultaneous i…"
         }
       ]
     },
@@ -7849,43 +8020,55 @@
       "defects": [
         {
           "file": "scripts/push-git.sh",
-          "lines": [20, 26],
+          "lines": [
+            23,
+            29
+          ],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "An inherited Git configuration selector redirects trusted SSH lookup into the checkout.",
           "foundBy": "orchestrator review rev400",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/push-git.sh",
-          "lines": [16, 22],
+          "lines": [
+            19,
+            25
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "Trusted remote-dependent credential and SSH settings no longer apply during push.",
           "foundBy": "orchestrator review rev400",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [64, 70],
+          "lines": [
+            65,
+            67
+          ],
           "severity": "major",
           "required": true,
           "category": "delivery",
           "summary": "Manual landing publishes a fork branch to the upstream repository.",
           "foundBy": "orchestrator review rev400",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [64, 70],
+          "lines": [
+            67,
+            67
+          ],
           "severity": "major",
           "required": true,
           "category": "delivery",
           "summary": "Forcing HTTPS during manual push bypasses working SSH authentication.",
           "foundBy": "orchestrator review rev400",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -7906,157 +8089,65 @@
       "defects": [
         {
           "file": "scripts/land-pr.sh",
-          "lines": [103, 109],
+          "lines": [
+            105,
+            110
+          ],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "Manual push reloads mutable clone configuration after its final validation snapshot.",
           "foundBy": "orchestrator review rev401",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [42, 48],
+          "lines": [
+            45,
+            48
+          ],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "Inherited Git configuration causes validation and push to inspect different settings.",
           "foundBy": "orchestrator review rev401",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [60, 66],
+          "lines": [
+            60,
+            66
+          ],
           "severity": "major",
           "required": true,
           "category": "delivery",
           "summary": "An exact upstream URL requirement rejects supported forks and alternate origin spellings.",
           "foundBy": "orchestrator review rev401",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [32, 38],
+          "lines": [
+            35,
+            38
+          ],
           "severity": "minor",
           "required": false,
           "category": "correctness",
           "summary": "The configuration fingerprint omits continued lines from multiline values.",
           "foundBy": "orchestrator review rev401",
-          "adjudication": "pending"
-        },
-        {
-          "file": "scripts/land-pr.sh",
-          "lines": [66, 72],
-          "severity": "minor",
-          "required": false,
-          "category": "privacy",
-          "summary": "A configuration parse failure exposes an include-path value in diagnostics.",
-          "foundBy": "orchestrator review rev401",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
-      ]
-    },
-    {
-      "id": "review-085",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "a682ada709288f5384eb88a173787c751e79007c",
-      "head": "5aeb3a5cf3fad2c269eef0d6041756ef24c155af",
-      "source": "pr #401 review rev401b @ 5aeb3a5",
-      "split": "heldout",
-      "input": {
-        "prompt": "Closes #376. Land/delivery pushes must not run commands named by repository config.\n\n## Why\nAfter PR code has run (unconfined in `scripts/land-pr.sh`'s `bun run check`), the land push uses hardened settings (`safe_git`: no hooks, filters, fsmonitor, commit-graph, bitmaps), but repository-level git config can still make the push execute a command: `remote.<name>.receivepack` (probed: it ran after the final scan), and by the same mechanism `remote.<name>.pushurl` pointing at an `ext::` URL, `core.sshCommand`, `credential.helper` (including URL-scoped `credential.<url>.helper`), `gpg.program`, and keys pulled in through `include.path`/`includeIf`. None can change what is pushed (the pack is built with hardened settings and the SHA is pinned); this is defence in depth for the window after the final scan.\n\n## What\nApply one rule to every factory push: `scripts/land-pr.sh`'s final push, the land queue's push (src/land/), and the delivery push (src/git/): **repository-level config is untrusted for the push; global and system config are trusted.**\n- Push to an explicit URL (the trusted remote URL the factory already knows, not one read from repository config), so `remote.<name>.*` (receivepack, pushurl, uploadpack) is never consulted; and pass `-c protocol.ext.allow=never`.\n- Command-running keys: reset them for the push and re-add only the values from trusted scopes. For example read `git config --global --get-all credential.helper` (and `--system`) and pass `-c credential.helper=` followed by `-c credential.helper=<each trusted value>`; for `core.sshCommand` use the global/system value if set, else `ssh`; never let a repository-scoped or included value apply. Credentials must keep working exactly as today (the owner's pushes use their existing global helper or SSH setup); if the trusted-scope lookup itself could be influenced by the repository, explain why it can't (e.g. `--global` reads only the global file).\n- URL-scoped keys (`credential.<url>.helper`, `url.<base>.insteadOf`/`pushInsteadOf`) from repository config must not apply either: either neutralise them explicitly or run the push with repository config excluded (if you choose an approach such as pushing from a separate trusted repository/bare cache, show that it pushes exactly the pinned SHA and keeps the hardening).\n- Keep `safe_git` hardening and the exact-SHA pin.\n\n## Tests (no network, no real gh; read test/AGENTS.md)\nFor each push path, plant in the checkout's repository config: `remote.origin.receivepack`, `remote.origin.pushurl=ext::…`, `core.sshCommand`, `credential.helper`, `credential.<url>.helper`, `url.<x>.insteadOf`, `gpg.program`, and an `include.path` file carrying one of them; each pointing at a script that would create a marker file. Push to a local bare remote (file URL) and assert: no marker file exists, the remote received exactly the pinned SHA, and a trusted GLOBAL `credential.helper` (set via GIT_CONFIG_GLOBAL in the test) is still invoked when the transport needs credentials (use a local HTTP-free approach if needed, e.g. assert the effective `-c` arguments passed, plus one end-to-end file-URL push). Note CI runners have git-lfs filters configured outside the test's global file; don't assert exact full argv.\n\nBudget: about 80 changed source lines plus tests. Out of scope: confining land-pr.sh's `bun run check` itself.",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
+      ],
+      "labelHistory": [
         {
-          "file": "scripts/land-pr.sh",
-          "lines": [24, 30],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "Filter-driver enumeration can be hidden by inherited configuration or changed before staging.",
-          "foundBy": "orchestrator review rev401b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "scripts/land-pr.sh",
-          "lines": [52, 58],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "The staged-diff check executes a clone-configured external diff helper.",
-          "foundBy": "orchestrator review rev401b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "scripts/land-pr.sh",
-          "lines": [53, 59],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "An automatic merge commit can execute a clone-configured signing program.",
-          "foundBy": "orchestrator review rev401b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "scripts/land-pr.sh",
-          "lines": [29, 35],
-          "severity": "major",
-          "required": true,
-          "category": "security",
-          "summary": "Interactive landing allows clone-configured pagers to execute.",
-          "foundBy": "orchestrator review rev401b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "scripts/land-pr.sh",
-          "lines": [29, 35],
-          "severity": "minor",
-          "required": false,
-          "category": "privacy",
-          "summary": "Git failures after lookup can disclose repository configuration values.",
-          "foundBy": "orchestrator review rev401b",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-086",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "ff4c9552000d3ae3c7ac060340910a033cde7591",
-      "head": "16199b91c2d5955e49f0a89e0cc4b948ba39257f",
-      "source": "pr #403 review rev403 @ 16199b9",
-      "split": "dev",
-      "input": {
-        "prompt": "Two lessons from today, for implementers:\n- **Diff audit:** since #382/#399, an executable or mode-changed file passes only if its content is plain reviewable text; the finding reads \\`[binary-content]\\` even when the cause is the mode (run <run-id> spent three rounds hunting NUL bytes that weren't there before #399).\n- **zsh:** \\`$var:\\` followed by a letter applies a modifier, so \\`$sha:refs/heads/x\\` and \\`git show $rev:path\\` silently do the wrong thing; write \\`\"${var}:...\"\\`.\n\nDocs only.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "AGENTS.md",
-          "lines": [0, 0],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The documented executable-bit rule omits the allowance and media-path exception.",
-          "foundBy": "orchestrator review rev403",
-          "adjudication": "pending"
-        },
-        {
-          "file": "AGENTS.md",
-          "lines": [0, 0],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The shell guidance overgeneralizes colon modifiers and misstates Git error output.",
-          "foundBy": "orchestrator review rev403",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, scripts/land-pr.sh): A configuration parse failure exposes an include-path value in diagnostics. Reason: The initial unsuppressed rev-parse calls are identical at base and HEAD, so this diagnostic exposure was not introduced or newly exposed. The supplied request does not require value-free diagnostics or fixing this existing privacy issue."
         }
       ]
     },
@@ -8077,23 +8168,29 @@
       "defects": [
         {
           "file": "scripts/land-pr.sh",
-          "lines": [71, 77],
+          "lines": [
+            74,
+            76
+          ],
           "severity": "major",
           "required": true,
           "category": "security",
           "summary": "Post-check publication scanning executes Git against mutable clone configuration.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [94, 100],
+          "lines": [
+            97,
+            104
+          ],
           "severity": "minor",
           "required": false,
           "category": "correctness",
           "summary": "The isolated dirty-worktree check no longer applies repository-local ignore rules.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8130,43 +8227,52 @@
       "defects": [
         {
           "file": "src/harness/types.ts",
-          "lines": [168, 174],
+          "lines": [
+            168,
+            171
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "The loop detector aborts before the threshold call can return evidence of progress.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/types.ts",
-          "lines": [184, 190],
+          "lines": [
+            179,
+            187
+          ],
           "severity": "minor",
           "required": false,
           "category": "concurrency",
           "summary": "Late tool completions overwrite the previous-result baseline out of call order.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/harness/types.ts",
-          "lines": [152, 158],
+          "lines": [
+            153,
+            155
+          ],
           "severity": "minor",
           "required": false,
           "category": "resource",
           "summary": "Tool-result and unresolved-call bookkeeping grows beyond the detector window.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        },
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
         {
-          "file": "src/harness/types.ts",
-          "lines": [179, 185],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "Incidental output changes can defeat stuck detection without the limitation being documented.",
-          "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (minor, src/harness/types.ts): Incidental output changes can defeat stuck detection without the limitation being documented. Reason: The request explicitly requires treating differing result text as progress and keeping the tool-call budget unchanged, with budget changes out of scope. Resetting on incidental output changes implements that policy; semantic progress detection and documenting this limitation were not requested."
         }
       ]
     },
@@ -8187,13 +8293,16 @@
       "defects": [
         {
           "file": "src/harness/types.ts",
-          "lines": [203, 209],
+          "lines": [
+            203,
+            209
+          ],
           "severity": "major",
           "required": true,
           "category": "resource",
           "summary": "Unresolved tool calls accumulate without a bound during a live invocation.",
           "foundBy": "orchestrator review round 2",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8214,13 +8323,16 @@
       "defects": [
         {
           "file": "src/harness/types.ts",
-          "lines": [224, 230],
+          "lines": [
+            225,
+            228
+          ],
           "severity": "major",
           "required": true,
           "category": "concurrency",
           "summary": "A completed parallel call is classified as repetitive before unresolved predecessors establish progress.",
           "foundBy": "orchestrator review rev406c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8257,97 +8369,55 @@
       "defects": [
         {
           "file": "src/gates/failures.ts",
-          "lines": [14, 20],
+          "lines": [
+            15,
+            17
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "Forced-color Bun result markers are not recognized by failure extraction.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [24, 30],
+          "lines": [
+            27,
+            31
+          ],
           "severity": "minor",
           "required": false,
           "category": "completeness",
           "summary": "Timeout explanations are detached from the failed test identity.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [19, 25],
+          "lines": [
+            19,
+            24
+          ],
           "severity": "minor",
           "required": false,
           "category": "completeness",
           "summary": "Clipping diagnostics can remove the failure name needed to identify the test.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
-          "file": "src/gates/run.ts",
-          "lines": [13, 19],
+          "file": "src/evals/cases.ts",
+          "lines": [
+            70,
+            79
+          ],
           "severity": "minor",
           "required": false,
           "category": "correctness",
           "summary": "Strict eval gate-result validation rejects the newly persisted optional failure excerpt.",
           "foundBy": "orchestrator review round 1",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-094",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "4c50ba4a4abff33458b84ad6f42f6761247b1211",
-      "head": "9f30f551f49f24d886a1cce30f32b6f78a1d5ac4",
-      "source": "pr #408 review rev408b @ 9f30f55",
-      "split": "dev",
-      "input": {
-        "prompt": "Fixes #407.\n\n## Problem\nA failing check's output is cut to its end before anyone reads it. `runGates` keeps only the last 6,000 characters of a check's combined output (`src/gates/run.ts`, `OUTPUT_TAIL`); `formatGateFeedback` (`src/pipeline/prompts.ts`) sends the implementer the last 3,000 of those; the deploy gate (`src/cli/service.ts`) keeps stdout/stderr tails too.\n\n`bun test` prints each failure's details (source excerpt, `error:` line, expected/received diff, stack) in the per-file section, just before that test's `(fail)` line. At the end of a long run it prints only the skipped-test list, the names of the failed tests and the counts. With this repository's ~3,000-test suite the tail therefore names the failing test without saying why it failed, in:\n- the land queue log (`<private-path><run>/land-<id>.log`): land 1 for #405 blocked on `test failed`, and the log shows only `(fail) land publishes its pinned SHA from an isolated push repository: push-failed`;\n- the deploy gate's error (seen on 10-04: one failing test, unnamed);\n- the implementer's gate feedback, so implementers re-run the full suite to find the assertion (part of the background-test polling behind #406).\n\n## Change\n1. One shared helper (for example in `src/gates/run.ts`) that extracts failure excerpts from test output: for each bun `(fail)` line and each TAP `not ok` line (ANSI control sequences stripped, as `formatGateFeedback` already does), the lines before it back to the previous test result line or file header (`<path>.test.ts:`). Cap it: at most 40 lines per failure, the first 10 failures, about 8,000 characters in total, and say when something was left out.\n2. Gate results carry the excerpts in a new optional field (for example `failures?: string`), set only for a failed check. `output` stays the tail, unchanged. The field is additive: persisted results without it render as before.\n3. Every consumer that shows a failed check uses the excerpts before the tail: the land queue log, the deploy gate's error, and `formatGateFeedback` (excerpts first, then a shorter tail, within a similar total size).\n4. The excerpts follow exactly the same redaction and storage path as `output` does today; don't add a second path.\n\n## Tests\n- Bun-format output built inline in the test (don't edit captured files under `test/fixtures/`, which is a protected path), with the failing block more than 6,000 characters before the end: the gate result's excerpt contains the `error:` line and the diff, and the implementer feedback, the land log and the deploy error contain them.\n- Several failures, the caps and the \"left out\" note; TAP `not ok`; a passing check (no field); ANSI-colored output.\n- A gate result without the new field (an older release's) still formats.\n\n## Budget\nAbout 80 net source lines, plus tests.\n\n## Out of scope\n- Raising `OUTPUT_TAIL` or storing full output in the database.\n- Formats other than bun's `(fail)` and TAP `not ok`.\n- Changing how the land queue or deploy decide pass or fail.",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "src/gates/failures.ts",
-          "lines": [76, 82],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "Consumer excerpt shortening drops failure identities that fit in the original excerpt.",
-          "foundBy": "orchestrator review rev408b",
-          "adjudication": "pending"
-        }
-      ]
-    },
-    {
-      "id": "review-095",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "4c50ba4a4abff33458b84ad6f42f6761247b1211",
-      "head": "86bec69bacf3f6700e20a468cd5eea2d3a0139d6",
-      "source": "pr #408 review rev408c @ 86bec69",
-      "split": "dev",
-      "input": {
-        "prompt": "Fixes #407.\n\n## Problem\nA failing check's output is cut to its end before anyone reads it. `runGates` keeps only the last 6,000 characters of a check's combined output (`src/gates/run.ts`, `OUTPUT_TAIL`); `formatGateFeedback` (`src/pipeline/prompts.ts`) sends the implementer the last 3,000 of those; the deploy gate (`src/cli/service.ts`) keeps stdout/stderr tails too.\n\n`bun test` prints each failure's details (source excerpt, `error:` line, expected/received diff, stack) in the per-file section, just before that test's `(fail)` line. At the end of a long run it prints only the skipped-test list, the names of the failed tests and the counts. With this repository's ~3,000-test suite the tail therefore names the failing test without saying why it failed, in:\n- the land queue log (`<private-path><run>/land-<id>.log`): land 1 for #405 blocked on `test failed`, and the log shows only `(fail) land publishes its pinned SHA from an isolated push repository: push-failed`;\n- the deploy gate's error (seen on 10-04: one failing test, unnamed);\n- the implementer's gate feedback, so implementers re-run the full suite to find the assertion (part of the background-test polling behind #406).\n\n## Change\n1. One shared helper (for example in `src/gates/run.ts`) that extracts failure excerpts from test output: for each bun `(fail)` line and each TAP `not ok` line (ANSI control sequences stripped, as `formatGateFeedback` already does), the lines before it back to the previous test result line or file header (`<path>.test.ts:`). Cap it: at most 40 lines per failure, the first 10 failures, about 8,000 characters in total, and say when something was left out.\n2. Gate results carry the excerpts in a new optional field (for example `failures?: string`), set only for a failed check. `output` stays the tail, unchanged. The field is additive: persisted results without it render as before.\n3. Every consumer that shows a failed check uses the excerpts before the tail: the land queue log, the deploy gate's error, and `formatGateFeedback` (excerpts first, then a shorter tail, within a similar total size).\n4. The excerpts follow exactly the same redaction and storage path as `output` does today; don't add a second path.\n\n## Tests\n- Bun-format output built inline in the test (don't edit captured files under `test/fixtures/`, which is a protected path), with the failing block more than 6,000 characters before the end: the gate result's excerpt contains the `error:` line and the diff, and the implementer feedback, the land log and the deploy error contain them.\n- Several failures, the caps and the \"left out\" note; TAP `not ok`; a passing check (no field); ANSI-colored output.\n- A gate result without the new field (an older release's) still formats.\n\n## Budget\nAbout 80 net source lines, plus tests.\n\n## Out of scope\n- Raising `OUTPUT_TAIL` or storing full output in the database.\n- Formats other than bun's `(fail)` and TAP `not ok`.\n- Changing how the land queue or deploy decide pass or fail.",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
-        {
-          "file": "src/gates/failures.ts",
-          "lines": [62, 68],
-          "severity": "minor",
-          "required": false,
-          "category": "completeness",
-          "summary": "The omission notice disappears when every failure identity exceeds the excerpt budget.",
-          "foundBy": "orchestrator review rev408c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8400,33 +8470,42 @@
       "defects": [
         {
           "file": "src/router/runtime-policy.ts",
-          "lines": [24, 30],
+          "lines": [
+            25,
+            31
+          ],
           "severity": "major",
           "required": true,
           "category": "data-migration",
           "summary": "Removing a built-in model leaves persisted routing overrides unable to load at startup.",
           "foundBy": "orchestrator review rev419",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/app.ts",
-          "lines": [99, 105],
+          "lines": [
+            100,
+            104
+          ],
           "severity": "major",
           "required": true,
           "category": "data-migration",
           "summary": "A runtime model attached to a retired provider prevents factory construction.",
           "foundBy": "orchestrator review rev419",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [61, 67],
+          "lines": [
+            61,
+            69
+          ],
           "severity": "major",
           "required": true,
           "category": "logic",
           "summary": "Historical run references prevent unrelated catalog mutations.",
           "foundBy": "orchestrator review rev419",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8447,23 +8526,26 @@
       "defects": [
         {
           "file": "src/router/runtime-policy.ts",
-          "lines": [114, 120],
+          "lines": [
+            113,
+            117
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Unavailable-target diagnostics expose registered credentials in routing API and Setup output.",
           "foundBy": "orchestrator review rev419b",
-          "adjudication": "pending"
-        },
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
         {
-          "file": "src/router/runtime-catalog.ts",
-          "lines": [86, 92],
-          "severity": "major",
-          "required": true,
-          "category": "logic",
-          "summary": "Finished runs still prevent removal of a runtime catalog model.",
-          "foundBy": "orchestrator review rev419b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/router/runtime-catalog.ts): Finished runs still prevent removal of a runtime catalog model. Reason: Finished runs block deletion of a referenced runtime model, but the same unconditional run validation already existed at base. The supplied request requires historical unknown IDs to render and resume; it does not require deletion of runtime models referenced by finished runs."
         }
       ]
     },
@@ -8484,13 +8566,16 @@
       "defects": [
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [29, 35],
+          "lines": [
+            27,
+            34
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Retired identifiers and catalog or routing history can publish registered credentials.",
           "foundBy": "orchestrator review rev419c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8510,111 +8595,48 @@
       },
       "defects": [
         {
-          "file": "src/pipeline/context.ts",
-          "lines": [292, 298],
-          "severity": "major",
-          "required": true,
-          "category": "privacy",
-          "summary": "Stored gate results from an earlier release reach readers without redaction.",
-          "foundBy": "orchestrator review rev421",
-          "adjudication": "pending"
-        },
-        {
           "file": "src/gates/run.ts",
-          "lines": [85, 91],
+          "lines": [
+            88,
+            98
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Raw process output is cut before gate credential redaction can match a boundary-spanning secret.",
           "foundBy": "orchestrator review rev421",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/cli/service.ts",
-          "lines": [447, 453],
-          "severity": "major",
-          "required": true,
-          "category": "privacy",
-          "summary": "A credential divided between stdout and stderr remains visible in deploy diagnostics.",
-          "foundBy": "orchestrator review rev421",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/run.ts",
-          "lines": [72, 78],
+          "lines": [
+            60,
+            62
+          ],
           "severity": "minor",
           "required": false,
           "category": "logic",
           "summary": "Output normalization can produce a confinement marker that was absent from the raw launch scan.",
           "foundBy": "orchestrator review rev421",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
-      ]
-    },
-    {
-      "id": "review-102",
-      "kind": "real",
-      "repo": "MattFlower/limitless",
-      "base": "7797973b5f348d7beda4542e5669a46256215cde",
-      "head": "e477c41786289ed9b899ba5fda3dd813197e235e",
-      "source": "pr #421 review rev421b @ e477c41",
-      "split": "dev",
-      "input": {
-        "prompt": "## Problem\nGate output is untrusted text produced by the change under test, and it leaves the process unredacted. `runGates` (`src/gates/run.ts`) keeps a tail of each check's combined output, and that text is:\n- stored as JSON in the run's artifacts, state and the gate cache (SQLite);\n- written to land queue logs (`<private-path><run>/land-<id>.log`);\n- included in the deploy gate's error;\n- sent to models in the implementer's gate feedback (`formatGateFeedback`) and in review and verify prompts.\n\nNone of these paths calls `redactCredentials`. A review of #408 confirmed it with synthetic registered credentials: they survived storage, implementer feedback and the deploy error unchanged. AGENTS.md requires redaction at every boundary where secret-bearing text is stored or sent to a model. Gate commands get an environment without factory secrets, but a check can still print a credential it reads some other way, and an honest test failure can echo one from a fixture or an error message.\n\n## Change\n- Redact gate output once, where `runGates` builds a check's result (before the tail is cut and before failure excerpts from #408 are extracted, so a secret split by the cut is still caught: decode/redact first, truncate after). Every consumer then receives redacted text from that single place.\n- Check every path that reads raw command output before that point (for example the confinement-error scan in `launchFailure`, which must keep seeing the raw text) and confirm none of them stores or forwards it.\n- The deploy gate in `src/cli/service.ts` builds its own tails; redact them the same way, through the same helper.\n\n## Tests\n- A check whose output contains a registered credential, including one that straddles the tail boundary and one inside a failure excerpt: the stored gate result, the land log, the implementer feedback, the review/verify prompt text and the deploy error contain the redaction marker, not the value.\n- Confinement-error detection still works on output that also contains a credential.\n\n## Budget\nAbout 30 net source lines, plus tests.\n\n## Out of scope\n- Redaction of other command output (agent tool results are already redacted by the harnesses).\n- Changing what gates may read.",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": [
+      ],
+      "labelHistory": [
         {
-          "file": "src/server/http.ts",
-          "lines": [420, 426],
-          "severity": "major",
-          "required": true,
-          "category": "privacy",
-          "summary": "Legacy gate feedback remains exposed through run and feed API readers.",
-          "foundBy": "orchestrator review rev421b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/pipeline/context.ts): Stored gate results from an earlier release reach readers without redaction. Reason: Legacy state restoration is unchanged from base. The request specifies redaction when constructing gate results; it does not require migrating or sanitizing previously persisted results, so this is a pre-existing defect outside the requested change."
         },
         {
-          "file": "src/gates/output.ts",
-          "lines": [30, 36],
-          "severity": "major",
-          "required": true,
-          "category": "privacy",
-          "summary": "The stream-boundary redactor misses the opposite ordering of stdout and stderr secret fragments.",
-          "foundBy": "orchestrator review rev421b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/gates/output.ts",
-          "lines": [39, 45],
-          "severity": "minor",
-          "required": false,
-          "category": "correctness",
-          "summary": "Truncation in one stream discards intact diagnostics from the other.",
-          "foundBy": "orchestrator review rev421b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/gates/run.ts",
-          "lines": [91, 97],
-          "severity": "minor",
-          "required": false,
-          "category": "correctness",
-          "summary": "Delaying the first stderr line separates a timeout explanation from its failure.",
-          "foundBy": "orchestrator review rev421b",
-          "adjudication": "pending"
-        },
-        {
-          "file": "src/pipeline/context.ts",
-          "lines": [295, 301],
-          "severity": "minor",
-          "required": false,
-          "category": "logic",
-          "summary": "Restored legacy confinement classification scans normalized output instead of raw evidence.",
-          "foundBy": "orchestrator review rev421b",
-          "adjudication": "pending"
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Removed candidate (major, src/cli/service.ts): A credential divided between stdout and stderr remains visible in deploy diagnostics. Reason: Neither independent stream contains the registered credential, and both fragments were already exposed at base. The request requires applying the shared redactor before diagnostic cuts, which HEAD does; reconstructing credentials deliberately divided across streams is not a stated requirement."
         }
       ]
     },
@@ -8635,23 +8657,29 @@
       "defects": [
         {
           "file": "src/gates/output.ts",
-          "lines": [4, 10],
+          "lines": [
+            7,
+            8
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "JSON escaping lets ordinary logged credentials evade literal gate-output redaction.",
           "foundBy": "orchestrator review rev421c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [14, 20],
+          "lines": [
+            17,
+            18
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Line callbacks store pieces of multiline credentials in failure excerpts.",
           "foundBy": "orchestrator review rev421c",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8672,33 +8700,52 @@
       "defects": [
         {
           "file": "src/gates/failures.ts",
-          "lines": [47, 53],
+          "lines": [
+            49,
+            53
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Lossy excerpt line framing prevents matching multiline credentials before storage.",
           "foundBy": "orchestrator review rev421d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [33, 39],
+          "lines": [
+            36,
+            41
+          ],
           "severity": "major",
           "required": true,
           "category": "resource",
           "summary": "Failure excerpt collection retains unbounded bytes on very long output lines.",
           "foundBy": "orchestrator review rev421d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/output.ts",
-          "lines": [30, 36],
-          "severity": "major",
-          "required": true,
+          "lines": [
+            33,
+            36
+          ],
+          "severity": "minor",
+          "required": false,
           "category": "privacy",
           "summary": "Tail-cut protection does not preserve enough overlap for JSON-escaped credential variants.",
           "foundBy": "orchestrator review rev421d",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
+          "evidence": "Downgraded major→minor (src/gates/output.ts): Tail-cut protection does not preserve enough overlap for JSON-escaped credential variants. Reason: Overlap uses literal lengths even though redaction also matches longer JSON-escaped representations; the probe leaves a credential suffix in the final 6,000-character gate tail. Minor severity fits this limited edge case requiring an unusually large, heavily escaped credential whose fragment surviv…"
         }
       ]
     },
@@ -8719,23 +8766,29 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [450, 456],
+          "lines": [
+            453,
+            458
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Redacting the carry early emits suffixes of overlapping registered credentials.",
           "foundBy": "orchestrator review rev421e",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/gates/run.ts",
-          "lines": [69, 75],
+          "lines": [
+            71,
+            74
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "ANSI stripping after framing and tail cuts leaves accidental credential fragments visible.",
           "foundBy": "orchestrator review rev421e",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8756,43 +8809,55 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [464, 470],
+          "lines": [
+            464,
+            467
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "An incomplete terminal escape consumes part of a credential before it can be matched.",
           "foundBy": "orchestrator review rev421f",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [459, 465],
+          "lines": [
+            460,
+            467
+          ],
           "severity": "major",
           "required": true,
           "category": "privacy",
           "summary": "Terminal-control stripping changes with chunk boundaries and loses state at the hold limit.",
           "foundBy": "orchestrator review rev421f",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [471, 477],
+          "lines": [
+            474,
+            482
+          ],
           "severity": "minor",
           "required": false,
           "category": "resource",
           "summary": "Moving cuts across dense overlapping secrets removes the intended carry-buffer bound.",
           "foundBy": "orchestrator review rev421f",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [623, 629],
+          "lines": [
+            625,
+            626
+          ],
           "severity": "minor",
           "required": false,
           "category": "correctness",
           "summary": "Credentials containing the redaction marker trigger repeated downstream substitutions.",
           "foundBy": "orchestrator review rev421f",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },
@@ -8813,23 +8878,29 @@
       "defects": [
         {
           "file": "test/pipeline-panel.test.ts",
-          "lines": [209, 215],
+          "lines": [
+            210,
+            212
+          ],
           "severity": "major",
           "required": true,
           "category": "test-gap",
           "summary": "Increasing panel test deadlines leaves the underlying parallel Git race undiagnosed.",
           "foundBy": "orchestrator review rev424",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         },
         {
           "file": ".limitless.toml",
-          "lines": [7, 13],
+          "lines": [
+            10,
+            10
+          ],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "Factory gate environment construction discards the configured test worker override.",
           "foundBy": "orchestrator review rev424",
-          "adjudication": "pending"
+          "adjudication": "confirmed"
         }
       ]
     },

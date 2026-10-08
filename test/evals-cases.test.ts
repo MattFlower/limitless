@@ -577,7 +577,7 @@ test("review split and adjudication fields are optional, enumerated and strict",
   }
 });
 
-test("M5.2 candidates preserve previous cases and load with pins, pending labels and private text checks", () => {
+test("M5.2 cases preserve previous cases and load with pins, adjudicated labels and private text checks", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
   // Fingerprints of the pre-M5.2 parsed cases and notes keep this check meaningful after delivery.
   const fingerprint = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -588,10 +588,25 @@ test("M5.2 candidates preserve previous cases and load with pins, pending labels
     "1918b7714b81731b47bfeac3b0c48571bb028da4915454d4edade4807b14f9b1",
   );
   const added = file.cases.slice(53);
-  expect(added).toHaveLength(69);
-  expect(added.map((item) => item.id)).toEqual(
-    Array.from({ length: 69 }, (_, index) => `review-${String(index + 40).padStart(3, "0")}`),
+  // Adjudication dropped the candidates left without a gold defect; LABELS.md records each outcome.
+  const labels = readFileSync(new URL("../evals/review/LABELS.md", import.meta.url), "utf8");
+  const outcomes = new Map(
+    [...labels.matchAll(/^\| (review-\d{3}) \| #\d+ \| (?:dev|heldout) \|(?: \d+ \|){4} ([^|]+) \|$/gm)].map(
+      (m) => [m[1], m[2]?.trim()],
+    ),
   );
+  const candidates = Array.from(
+    { length: 69 },
+    (_, index) => `review-${String(index + 40).padStart(3, "0")}`,
+  );
+  const ids = added.map((item) => item.id);
+  for (const id of candidates) {
+    const outcome = outcomes.get(id);
+    if (outcome === undefined) expect(file.cases.find((c) => c.id === id)?.defects).toEqual([]);
+    else expect(ids.includes(id)).toBe(outcome !== "dropped (no gold defect)");
+  }
+  expect(ids).toEqual(candidates.filter((id) => ids.includes(id)));
+  expect(added).toHaveLength(57);
   const categories = new Set([
     "correctness",
     "logic",
@@ -628,14 +643,17 @@ test("M5.2 candidates preserve previous cases and load with pins, pending labels
     expect(heads.has(identity)).toBe(false);
     heads.add(identity);
     expect(item.input).toMatchObject({ spec: null, implementerReport: "", gates: [] });
-    expect(item.labelHistory).toBeUndefined();
-    if (item.kind === "clean") expect(item.defects).toEqual([]);
+    for (const entry of item.labelHistory ?? []) {
+      expect(entry.on).toBe("2026-10-08");
+      expect(entry.by).toContain("codex/sol-6.1");
+    }
+    if (item.kind === "clean") expect(item.defects.filter((d) => d.required)).toEqual([]);
     else {
       expect(item.kind).toBe("real");
-      expect(item.defects.length).toBeGreaterThan(0);
+      expect(item.defects.some((d) => d.required)).toBe(true);
     }
     for (const defect of item.defects) {
-      expect(defect.adjudication).toBe("pending");
+      expect(defect.adjudication).toBe("confirmed");
       expect(categories.has(defect.category)).toBe(true);
       expect(defect.required).toBe(["blocker", "major"].includes(defect.severity));
       expect(defect.lines[0]).toBeGreaterThanOrEqual(0);
@@ -695,17 +713,23 @@ test("fixed-seed review split groups whole PRs and reproduces the pre-registered
     if (previous !== undefined) expect(item.split).toBe(previous);
     recorded.set(pr, item.split);
   }
-  const prs = [...recorded.keys()];
-  expect(assignReviewSplits(prs, REVIEW_SPLIT_SEED)).toEqual(recorded);
-  expect(assignReviewSplits([...prs].reverse().concat(prs), REVIEW_SPLIT_SEED)).toEqual(recorded);
-  expect(assignReviewSplits(prs, REVIEW_SPLIT_SEED + 1)).not.toEqual(recorded);
-  const heldout = [...recorded.values()].filter((split) => split === "heldout").length;
-  expect(heldout).toBe(Math.round(prs.length / 3));
-  expect(heldout).toBeGreaterThan(0);
-  expect(heldout).toBeLessThan(prs.length);
+  // The split is computed over the full pre-registered PR list, including PRs whose cases were dropped.
   const labels = readFileSync(new URL("../evals/review/LABELS.md", import.meta.url), "utf8");
   expect(labels).toContain(String(REVIEW_SPLIT_SEED));
-  for (const [pr, split] of recorded) expect(labels).toContain(`| #${pr} | ${split} |`);
+  const table = new Map(
+    [...labels.matchAll(/^\| #(\d+) \| (dev|heldout) \|$/gm)].map((m) => [
+      Number(m[1]),
+      m[2] as "dev" | "heldout",
+    ]),
+  );
+  expect(table.size).toBe(30);
+  for (const [pr, split] of recorded) expect(table.get(pr)).toBe(split);
+  const prs = [...table.keys()];
+  expect(assignReviewSplits(prs, REVIEW_SPLIT_SEED)).toEqual(table);
+  expect(assignReviewSplits([...prs].reverse().concat(prs), REVIEW_SPLIT_SEED)).toEqual(table);
+  expect(assignReviewSplits(prs, REVIEW_SPLIT_SEED + 1)).not.toEqual(table);
+  const heldout = [...table.values()].filter((split) => split === "heldout").length;
+  expect(heldout).toBe(Math.round(prs.length / 3));
   // Independent small-vector check protects the algorithm, not just its current dataset output.
   expect([...assignReviewSplits([3, 1, 2], 1)]).toEqual([
     [1, "dev"],
@@ -716,48 +740,49 @@ test("fixed-seed review split groups whole PRs and reproduces the pre-registered
 
 test("pending review helper prints selected defects and CLI errors without network or model calls", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
-  const item = file.cases.find((c) => c.id === "review-040");
-  if (!item) throw new Error("missing candidate");
-  const output = pendingReviewText([item.id]);
-  const records = output.split("\n\n").map((text) => JSON.parse(text));
-  expect(records).toEqual(
-    item.defects.map((defect) => ({
-      caseId: item.id,
-      split: item.split,
-      source: item.source,
-      base: item.base,
-      head: item.head,
-      file: defect.file,
-      lines: defect.lines,
-      severity: defect.severity,
-      category: defect.category,
-      summary: defect.summary,
-    })),
-  );
-  expect(pendingReviewText().split("\n\n")).toHaveLength(
-    file.cases.reduce((count, c) => count + c.defects.filter((d) => d.adjudication === "pending").length, 0),
-  );
+  const adjudicated = file.cases.find((c) => c.id === "review-040");
+  if (!adjudicated) throw new Error("missing case");
+  // Every shipped defect is adjudicated, so the helper is exercised on a candidate copy.
+  const item = {
+    ...adjudicated,
+    defects: adjudicated.defects.map((d) => ({ ...d, adjudication: "pending" as const })),
+  };
+  const home = mkdtempSync(join(tmpdir(), "pending-review-"));
+  const casePath = join(home, "cases.json");
+  try {
+    writeFileSync(casePath, JSON.stringify({ ...file, cases: [item] }));
+    const records = pendingReviewText([item.id], casePath)
+      .split("\n\n")
+      .map((text) => JSON.parse(text));
+    expect(records).toEqual(
+      item.defects.map((defect) => ({
+        caseId: item.id,
+        split: item.split,
+        source: item.source,
+        base: item.base,
+        head: item.head,
+        file: defect.file,
+        lines: defect.lines,
+        severity: defect.severity,
+        category: defect.category,
+        summary: defect.summary,
+      })),
+    );
+    expect(pendingReviewText([], casePath).split("\n\n")).toHaveLength(item.defects.length);
+    expect(() => pendingReviewText(["missing-case"], casePath)).toThrow("Unknown case ID");
+    writeFileSync(casePath, JSON.stringify({ ...file, cases: [adjudicated] }));
+    expect(pendingReviewText([], casePath)).toBe("No pending defects.");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+  expect(pendingReviewText()).toBe("No pending defects.");
   const script = new URL("../scripts/review-pending.ts", import.meta.url).pathname;
   const result = spawnSync(process.execPath, [script, item.id], { encoding: "utf8" });
   expect(result.status).toBe(0);
-  expect(result.stdout.trim()).toBe(output);
+  expect(result.stdout.trim()).toBe("No pending defects.");
   expect(result.stderr).toBe("");
   const unknown = spawnSync(process.execPath, [script, item.id, "missing-case"], { encoding: "utf8" });
   expect(unknown.status).not.toBe(0);
   expect(unknown.stdout).toBe("");
   expect(unknown.stderr).toContain("Unknown case ID: missing-case");
-  const clean = spawnSync(process.execPath, [script, "review-108"], { encoding: "utf8" });
-  expect(clean.status).toBe(0);
-  expect(clean.stdout.trim()).toBe("No pending defects.");
-
-  const home = mkdtempSync(join(tmpdir(), "pending-review-"));
-  const casePath = join(home, "cases.json");
-  try {
-    const confirmed = { ...item, defects: item.defects.map((d) => ({ ...d, adjudication: "confirmed" })) };
-    writeFileSync(casePath, JSON.stringify({ ...file, cases: [confirmed] }));
-    expect(pendingReviewText([], casePath)).toBe("No pending defects.");
-    expect(() => pendingReviewText(["missing-case"], casePath)).toThrow("Unknown case ID");
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
 });
