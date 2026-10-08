@@ -549,16 +549,23 @@ export async function sh(
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
+const credentialVariants = new Map<string, boolean>();
+let sortedCredentialVariants: [string, boolean][] = [];
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
-    if (typeof secret === "string" && secret) credentialValues.add(secret);
+    if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
+      credentialValues.add(secret);
+      for (const variant of new Set([secret, JSON.stringify(secret).slice(1, -1)]))
+        credentialVariants.set(variant, credentialVariants.get(variant) || secret.length >= 8);
+      sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
+    }
 }
 export function redactCredentials(text: string): string {
   // Substring matches require at least 8 characters to avoid redacting common short strings.
-  for (const secret of [...credentialValues].sort((a, b) => b.length - a.length))
-    if (secret.length >= 8 || text === secret) text = text.split(secret).join("[redacted]");
+  for (const [secret, substring] of sortedCredentialVariants)
+    if (substring || text === secret) text = text.split(secret).join("[redacted]");
   return text;
 }
 export const redactCredentialData = <T>(value: T): T =>

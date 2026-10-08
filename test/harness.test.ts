@@ -1311,6 +1311,19 @@ test("configured credentials never reach native children or their events, logs a
   }
 });
 
+test.each(['synthetic-json-"quoted"-\\slash', "synthetic-control-\n\r\t\b\f\u0001", '"\\\n'])(
+  "credential redaction covers literal and JSON-escaped values: %j",
+  async (secret) => {
+    const { registerCredential, redactCredentials } = await import("../src/util/proc.ts");
+    registerCredential("JSON_ESCAPED_TEST_TOKEN", secret);
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    expect(redactCredentials(secret)).toBe("[redacted]");
+    expect(redactCredentials(escaped)).toBe("[redacted]");
+    const logged = JSON.stringify({ credential: secret });
+    expect(redactCredentials(logged)).toBe(secret.length >= 8 ? '{"credential":"[redacted]"}' : logged);
+  },
+);
+
 test("short credentials only match whole values while eight-character keys match substrings", async () => {
   const { customProvider, providerFixture } = await import("./provider-config-support.ts");
   const { agentEnv, redactCredentials } = await import("../src/util/proc.ts");

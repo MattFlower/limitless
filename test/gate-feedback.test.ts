@@ -1,18 +1,99 @@
 import { expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
 import { extractFailures } from "../src/gates/failures.ts";
-import { compareGates, type GateComparison } from "../src/gates/run.ts";
+import { compareGates, type GateComparison, runGates } from "../src/gates/run.ts";
+import { confinementScope } from "../src/harness/sandbox.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { formatGateFeedback, implementPrompt, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import type { Spec } from "../src/pipeline/schemas.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
+
+test.each([
+  { kind: "JSON", secret: 'synthetic-gate-json-"quoted"-\\slash', padding: "" },
+  { kind: "multiline", secret: "synthetic-gate-multiline-key\nsecond-key-line", padding: "" },
+  {
+    kind: "multiline beyond line cap",
+    secret: Array.from({ length: 45 }, (_, i) => `synthetic-pem-key-line-${i}`).join("\n"),
+    padding: "",
+  },
+  {
+    kind: "multiline at excerpt cap",
+    secret: "synthetic-gate-capped-key\nsecond-capped-line",
+    padding: "x".repeat(7_900),
+  },
+])(
+  "$kind credentials are redacted in gate results, artifacts and feedback",
+  async ({ kind, secret, padding }) => {
+    registerCredential("ESCAPED_GATE_TEST_TOKEN", secret);
+    const fixture = providerFixture([]);
+    const factory = new Factory(fixture.load());
+    try {
+      const diagnostic = kind === "JSON" ? JSON.stringify({ credential: secret }) : secret;
+      writeFileSync(join(fixture.root, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
+      const gates = await confinementScope.run(fakeConfinement, () =>
+        runGates(
+          fixture.root,
+          {
+            setup: [],
+            checks: [{ name: "test", run: "cat output.txt; exit 1" }],
+            source: "detected",
+            protectedPaths: [],
+          },
+          new AbortController().signal,
+        ),
+      );
+      const result = gates.checks[0];
+      if (!result?.failures) throw new Error("missing failure excerpt");
+      for (const text of [result.output, result.failures]) {
+        if (!padding || text === result.output) expect(text).toContain("[redacted]");
+        expect(text).not.toContain(diagnostic);
+        for (const fragment of secret.split("\n")) expect(text).not.toContain(fragment.slice(0, 12));
+      }
+      const repo = factory.store.upsertRepo({
+        slug: "test/repo",
+        kind: "local",
+        localPath: fixture.root,
+        url: null,
+        defaultBranch: "main",
+        mergePolicy: "none",
+      });
+      const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "test" });
+      factory.store.putArtifact(run.id, "gates.json", "gates", JSON.stringify(gates));
+      const routes = createHttpRoutes(factory);
+      const route = routes["/api/runs/:id/artifacts/:name"] as Route;
+      const response = await route(
+        requestWithParams(`http://localhost:7400/api/runs/${run.id}/artifacts/gates.json`, undefined, {
+          id: run.id,
+          name: "gates.json",
+        }),
+        localServer,
+      );
+      expect(response.status).toBe(200);
+      for (const text of [
+        factory.store.getArtifact(run.id, "gates.json"),
+        await response.text(),
+        formatGateFeedback(compareGates(null, gates)),
+      ]) {
+        expect(text).toContain("[redacted]");
+        expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
+        for (const fragment of secret.split("\n")) expect(text).not.toContain(fragment.slice(0, 12));
+      }
+    } finally {
+      await factory.stop();
+      factory.store.close();
+      fixture.close();
+    }
+  },
+);
 
 test("legacy gate results are redacted on reopened state, checkpoints, HTTP and SSE reads", async () => {
   const secret = "synthetic-legacy-gate-credential-421";
