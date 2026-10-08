@@ -362,9 +362,13 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     settled ||= snap.state !== (prev?.state ?? "OPEN");
     const mainEpisode = store.getSetting<Record<string, { red: boolean }>>(`ci.main:${pr.repo}`, {});
     if (ciPending || (ciChanged && snap.ci === "SUCCESS" && Object.values(mainEpisode).some((e) => e.red))) {
-      const ciCall = async (repo: string, path: string, body?: unknown) => {
+      const ciCall = async (repo: string, path: string, body?: unknown, optionalLog = false) => {
         const res = await call(repo, path, body);
-        const access = res && res.rerunRetryAt === undefined && accessProblem(res, repo);
+        const access =
+          res &&
+          !(optionalLog && res.status === 404) &&
+          res.rerunRetryAt === undefined &&
+          accessProblem(res, repo);
         if (access) store.setGithubAccess(repo, access, head);
         return res;
       };
