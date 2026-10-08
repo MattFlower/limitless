@@ -1,5 +1,7 @@
 import { z } from "zod";
+import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { redactCredentials } from "../util/proc.ts";
 import type { ModelDef, ProviderDef } from "./catalog.ts";
 import { runtimeModel } from "./config-catalog.ts";
 import { originExclusion } from "./origins.ts";
@@ -24,16 +26,17 @@ export class RuntimeCatalog {
     return {
       history: this.store.catalogHistory(),
       ...(this.router.excludeOrigins === undefined ? {} : { excludeOrigins: this.router.excludeOrigins }),
-      models: this.models.map((m) => ({
-        ...m,
-        source: m.source ?? "code",
-        ...(retiredReason(m.provider, this.providers)
-          ? { unavailable: retiredReason(m.provider, this.providers) }
-          : {}),
-        ...(this.router.excludeOrigins === undefined
-          ? {}
-          : { excluded: originExclusion(m, this.router.excludeOrigins) }),
-      })),
+      models: this.models.map((m) => {
+        const unavailable = retiredReason(m.provider, this.providers);
+        return {
+          ...m,
+          source: m.source ?? "code",
+          ...(unavailable ? { unavailable: redactCredentials(unavailable) } : {}),
+          ...(this.router.excludeOrigins === undefined
+            ? {}
+            : { excluded: originExclusion(m, this.router.excludeOrigins) }),
+        };
+      }),
       providers: this.tracker
         .all()
         .filter((p) => p.discovery)
@@ -87,6 +90,7 @@ export class RuntimeCatalog {
       }
     }
     for (const run of this.store.listRuns({ limit: Number.MAX_SAFE_INTEGER })) {
+      if (model === null && TERMINAL_STATUSES.includes(run.status)) continue;
       if (run.models == null) continue;
       try {
         const scoped = Object.fromEntries(

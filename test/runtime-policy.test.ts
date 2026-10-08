@@ -9,6 +9,7 @@ import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { RuntimePolicy } from "../src/router/runtime-policy.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { customProvider } from "./provider-config-support.ts";
 
 let dir: string;
@@ -212,6 +213,43 @@ test("retired routing targets preserve storage, warn once per id and retain live
     runtime.setCell("chat", "default", null);
     runtime.setPrefer(null);
     expect(runtime.snapshot().unavailable ?? []).toEqual([]);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test("unavailable diagnostics redact stored ids, reasons and references once before logging", () => {
+  const credential = "synthetic-policy-credential-419";
+  registerCredential("LIMITLESS_TEST_POLICY_DIAGNOSTIC_KEY", credential);
+  const id = `retired-lan/${credential}`;
+  store.writeRouting("triage.default", [id, id], null, "previous release");
+  store.writeRouting("chat.default", [id], null, "previous release");
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const { runtime } = setup();
+    const unavailable = runtime.snapshot().unavailable;
+    expect(unavailable).toEqual([
+      {
+        id: "retired-lan/[redacted]",
+        reason: "retired reference: retired-lan/[redacted] is not in the catalog",
+        references: expect.arrayContaining([
+          "triage.default: no override; falling back to code/evals policy",
+          "chat.default: no override; falling back to code/evals policy",
+        ]),
+      },
+    ]);
+    const target = unavailable?.[0];
+    if (!target) throw new Error("missing unavailable diagnostic");
+    expect(target.references).toHaveLength(2);
+    expect(warn.mock.calls).toEqual([
+      [`[routing] ${target.id}: unavailable (${target.reason}); ${target.references.join("; ")}`],
+    ]);
+    expect(store.routingCells().find((row) => row.role === "triage")?.groups).toEqual([id, id]);
+    // Snapshot diagnostics also redact untrusted persisted reference labels.
+    store.writeRouting(`triage.${credential}`, [id], null, "previous release");
+    expect(runtime.snapshot().unavailable?.[0]?.references).toContain(
+      "triage.[redacted]: no override; falling back to code/evals policy",
+    );
   } finally {
     warn.mockRestore();
   }

@@ -2,10 +2,13 @@ import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Factory } from "../src/app.ts";
+import { loadConfig } from "../src/config.ts";
 import type { ProviderStatus, Run, RunModels } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import type { RoutePreview } from "../src/router/router.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import type { CatalogSnapshot, RoutingSnapshot } from "../ui/api.ts";
 import { deferred } from "./evals-support.ts";
 import { buildSetupUi, settle, setupLayout, type Ui } from "./setup-ui-support.ts";
@@ -699,33 +702,38 @@ test("Setup displays configured origin exclusions without an edit control", asyn
   });
 });
 
-test("Setup shows retired routing references and runtime models as unavailable", async () => {
-  await fixture(async (_sent, state) => {
-    state.routing.unavailable = [
-      {
-        id: "retired-lan/legacy",
-        reason: "retired reference: retired-lan/legacy is not in the catalog",
-        references: ["triage.default: no override; falling back to code/evals policy"],
-      },
-      {
-        id: "retired-lan",
-        reason: "retired reference: retired-lan is not in the catalog",
-        references: ["prefer"],
-      },
-    ];
-    state.catalog.models.push({
-      ...first,
-      id: "retired-lan/runtime",
-      provider: "retired-lan",
-      source: "runtime",
-      unavailable: "retired reference: retired-lan is not in the catalog",
-    });
-    ui.emit({ kind: "reconnected" });
-    await settle();
-    const html = ui.render();
-    expect(html).toContain("retired-lan/legacy: unavailable");
-    expect(html).toContain("retired-lan: unavailable");
-    expect(html).toContain("no override; falling back to code/evals policy");
-    expect(html).toContain("Unavailable: retired reference: retired-lan is not in the catalog");
+test("Setup renders redacted unavailable diagnostics from the runtime snapshots", async () => {
+  const credential = "synthetic-setup-credential-419";
+  registerCredential("LIMITLESS_TEST_SETUP_DIAGNOSTIC_KEY", credential);
+  const provider = `retired-${credential}`;
+  const store = new Store(":memory:");
+  store.writeRouting("triage.default", [`${provider}/legacy`], null, "previous release");
+  store.writeRouting("prefer", [provider], null, "previous release");
+  store.writeRuntimeModel("retired-lan/runtime", {
+    ...first,
+    id: "retired-lan/runtime",
+    provider,
+    source: "runtime",
   });
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const factory = new Factory(loadConfig({ home: dir, configDir: dir }), { store });
+    await fixture(async (_sent, state) => {
+      state.routing.unavailable = factory.routing.snapshot().unavailable;
+      const retired = factory.catalog.snapshot().models.find((m) => m.id === "retired-lan/runtime");
+      if (!retired) throw new Error("missing retired runtime model");
+      state.catalog.models.push(retired);
+      ui.emit({ kind: "reconnected" });
+      await settle();
+      const html = ui.render();
+      expect(html).not.toContain(credential);
+      expect(html).toContain("retired-[redacted]/legacy: unavailable");
+      expect(html).toContain("retired-[redacted]: unavailable");
+      expect(html).toContain("no override; falling back to code/evals policy");
+      expect(html).toContain("Unavailable: retired reference: retired-[redacted] is not in the catalog");
+    });
+  } finally {
+    warn.mockRestore();
+    store.close();
+  }
 });

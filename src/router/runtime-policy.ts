@@ -38,11 +38,7 @@ export class RuntimePolicy {
         this.providers,
       );
     for (const target of this.unavailable())
-      console.warn(
-        redactCredentials(
-          `[routing] ${target.id}: unavailable (${target.reason}); ${target.references.join("; ")}`,
-        ),
-      );
+      console.warn(`[routing] ${target.id}: unavailable (${target.reason}); ${target.references.join("; ")}`);
     // History IDs survive restart and distinguish edits even when a cell is reset to its old value.
     for (const change of store.routingHistory())
       if (this.changesCell(change) && !this.revisions.has(change.key))
@@ -114,7 +110,11 @@ export class RuntimePolicy {
       const reason = retiredReason(id, this.providers);
       if (reason) add(id, reason, "prefer");
     }
-    return [...retired.values()];
+    return [...retired.values()].map(({ id, reason, references }) => ({
+      id: redactCredentials(id),
+      reason: redactCredentials(reason),
+      references: references.map(redactCredentials),
+    }));
   }
 
   private runModels(runId?: string): RunModels | undefined {

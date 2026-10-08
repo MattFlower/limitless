@@ -1,16 +1,18 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { TERMINAL_STATUSES } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext } from "../src/pipeline/context.ts";
-import type { Policy } from "../src/router/catalog.ts";
+import { type Policy, PROVIDERS } from "../src/router/catalog.ts";
 import { runtimeModel } from "../src/router/config-catalog.ts";
 import { Auth } from "../src/server/auth.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { customModel } from "./provider-config-support.ts";
 
@@ -337,13 +339,58 @@ test.each(["code", "operator"] as const)(
   },
 );
 
-test("catalog validates stored chains beyond the default run limit and regardless of status", async () => {
+test.each(["queued", "waiting", "running", "waiting_input"] as const)(
+  "catalog validates %s run chains beyond the default run limit",
+  async (status) => {
+    expect(
+      (await client()("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "experiment" }))
+        .status,
+    ).toBe(201);
+    const repo = factory.store.upsertRepo({
+      slug: "catalog/chains",
+      kind: "local",
+      localPath: dir,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = factory.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "live pinned run",
+      models: { review: ["retired-lan/legacy|claude/opus|codex/experiment@high"] },
+    });
+    factory.store.updateRun(run.id, { status });
+    factory.store.db.query("UPDATE runs SET created_at = 0 WHERE id = ?").run(run.id);
+    for (let i = 0; i < 100; i++) factory.store.createRun(repo, { repo: repo.slug, prompt: "unpinned" });
+    const before = catalogState();
+    const events: unknown[] = [];
+    factory.store.subscribe((event) => events.push(event));
+    for (const method of ["PATCH", "DELETE"]) {
+      const response = await client()("/api/catalog/models/codex%2Fexperiment", method, {
+        efforts: ["none"],
+      });
+      expect(response.status).toBe(400);
+      const error = (await response.json()).error;
+      expect(error).toContain(`run ${run.id}`);
+      expect(error).toContain("review");
+      expect(error).toContain(method === "PATCH" ? 'Unsupported effort "high"' : "unknown model ID");
+      expect(catalogState()).toEqual(before);
+      expect(
+        factory.routing.preview("review", "small", run.id).find((p) => p.modelId === "codex/experiment@high")
+          ?.eligible,
+      ).toBe(true);
+      expect(events).toEqual([]);
+    }
+  },
+);
+
+test.each([...TERMINAL_STATUSES])("catalog removal ignores a finished %s run pin", async (status) => {
+  const call = client();
   expect(
-    (await client()("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "experiment" }))
-      .status,
+    (await call("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "finished" })).status,
   ).toBe(201);
   const repo = factory.store.upsertRepo({
-    slug: "catalog/chains",
+    slug: "catalog/finished",
     kind: "local",
     localPath: dir,
     url: null,
@@ -353,28 +400,14 @@ test("catalog validates stored chains beyond the default run limit and regardles
   const run = factory.store.createRun(repo, {
     repo: repo.slug,
     prompt: "finished pinned run",
-    models: { review: ["retired-lan/legacy|claude/opus|codex/experiment@high"] },
+    models: { review: ["codex/finished@high|claude/opus"] },
   });
-  factory.store.updateRun(run.id, { status: "succeeded" });
-  factory.store.db.query("UPDATE runs SET created_at = 0 WHERE id = ?").run(run.id);
-  for (let i = 0; i < 100; i++) factory.store.createRun(repo, { repo: repo.slug, prompt: "unpinned" });
-  const before = catalogState();
-  const events: unknown[] = [];
-  factory.store.subscribe((event) => events.push(event));
-  for (const method of ["PATCH", "DELETE"]) {
-    const response = await client()("/api/catalog/models/codex%2Fexperiment", method, { efforts: ["none"] });
-    expect(response.status).toBe(400);
-    const error = (await response.json()).error;
-    expect(error).toContain(`run ${run.id}`);
-    expect(error).toContain("review");
-    expect(error).toContain(method === "PATCH" ? 'Unsupported effort "high"' : "unknown model ID");
-    expect(catalogState()).toEqual(before);
-    expect(
-      factory.routing.preview("review", "small", run.id).find((p) => p.modelId === "codex/experiment@high")
-        ?.eligible,
-    ).toBe(true);
-    expect(events).toEqual([]);
-  }
+  factory.store.updateRun(run.id, { status, finishedAt: Date.now() });
+  const finished = factory.store.getRun(run.id);
+  expect((await call("/api/catalog/models/codex%2Ffinished", "DELETE")).status).toBe(200);
+  expect(factory.store.runtimeModels()).toEqual([]);
+  expect(factory.models.some((m) => m.id === "codex/finished")).toBe(false);
+  expect(factory.store.getRun(run.id)).toEqual(finished);
 });
 
 test.each(["code", "evals", "operator", "run"] as const)(
@@ -755,6 +788,60 @@ test("exhausted review and verify invocations never dispatch to excluded fallbac
   expect(calls).toEqual([]);
   expect(factory.store.listInvocations(run.id)).toEqual([]);
   expect(JSON.stringify(factory.store.listEvents(run.id))).toContain("origin excluded (CN; baseOrigin=CN)");
+});
+
+test("routing and catalog API unavailable diagnostics redact a stored retired credential", async () => {
+  const credential = "synthetic-http-credential-419";
+  registerCredential("LIMITLESS_TEST_HTTP_DIAGNOSTIC_KEY", credential);
+  const provider = `retired-${credential}`;
+  const id = `${provider}/legacy`;
+  factory.store.writeRouting("triage.default", [id, id], null, "previous release");
+  factory.store.writeRouting("chat.default", [id], null, "previous release");
+  factory.store.writeRouting("prefer", [provider, "codex"], null, "previous release");
+  const model = runtimeModel({ ...customModel, provider: "codex", id: "legacy" }, PROVIDERS);
+  factory.store.writeRuntimeModel("retired-lan/runtime", {
+    ...model,
+    id: "retired-lan/runtime",
+    provider,
+  });
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    factory = makeFactory(factory.store);
+    const call = client();
+    const routingResponse = await call("/api/routing");
+    expect(routingResponse.status).toBe(200);
+    const routing = await routingResponse.json();
+    expect(routing.unavailable).toEqual([
+      {
+        id: "retired-[redacted]/legacy",
+        reason: "retired reference: retired-[redacted]/legacy is not in the catalog",
+        references: expect.arrayContaining([
+          "triage.default: no override; falling back to code/evals policy",
+          "chat.default: no override; falling back to code/evals policy",
+        ]),
+      },
+      {
+        id: "retired-[redacted]",
+        reason: "retired reference: retired-[redacted] is not in the catalog",
+        references: ["prefer"],
+      },
+    ]);
+    expect(routing.unavailable[0]?.references).toHaveLength(2);
+    const catalogResponse = await call("/api/catalog");
+    expect(catalogResponse.status).toBe(200);
+    expect((await catalogResponse.json()).models).toContainEqual(
+      expect.objectContaining({
+        id: "retired-lan/runtime",
+        unavailable: "retired reference: retired-[redacted] is not in the catalog",
+      }),
+    );
+    expect(warn.mock.calls.flat().join("\n")).not.toContain(credential);
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(factory.store.routingPrefer()).toEqual([provider, "codex"]);
+    expect(factory.store.runtimeModels()[0]?.provider).toBe(provider);
+  } finally {
+    warn.mockRestore();
+  }
 });
 
 test.each([
