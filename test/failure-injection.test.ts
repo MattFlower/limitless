@@ -294,9 +294,11 @@ test.each(["disabled", "quota", "rejected"])(
   },
 );
 test.each(["unavailable", "rejected"])(
-  "pinned verifier exhaustion redacts private holdout details: %s",
+  "pinned verifier exhaustion retains private details in owner diagnostics: %s",
   async (reason) => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    const error =
+      reason === "unavailable" ? `failed on ${secret}` : `model not found while checking ${secret}`;
     const f = factory(undefined, (s) => {
       if (s.prompt.startsWith("Write holdout checks"))
         return {
@@ -305,9 +307,7 @@ test.each(["unavailable", "rejected"])(
           },
         };
       if (s.prompt.startsWith("You are the acceptance"))
-        return reason === "unavailable"
-          ? { status: "unavailable", error: `failed on ${secret}` }
-          : { status: "error", error: `model not found while checking ${secret}` };
+        return { status: reason === "unavailable" ? "unavailable" : "error", error };
       return answer(s);
     });
     const run = await f.createRun({
@@ -322,15 +322,16 @@ test.each(["unavailable", "rejected"])(
     const question = f.store.listQuestions(run.id).at(-1)?.question ?? "";
     expect(question).toContain("verify; pinned chain: b");
     expect(question).toContain(reason === "unavailable" ? "unavailable" : "model not found");
-    expect(question).toContain("[private detail]");
+    expect(invocations[0]?.error).toBe(error);
     for (const value of [
       question,
       f.store.getRun(run.id)?.error,
-      JSON.stringify(invocations),
       JSON.stringify(f.store.listStages(run.id)),
-      JSON.stringify(f.store.listEvents(run.id)),
-    ])
-      expect(value).not.toContain(secret);
+    ]) {
+      expect(value).toContain(error);
+      expect(value).not.toContain("[private detail]");
+    }
+    expect(f.store.listEvents(run.id).some((event) => event.message.includes(error))).toBe(true);
   },
 );
 async function settled(f: Factory, id: string) {
