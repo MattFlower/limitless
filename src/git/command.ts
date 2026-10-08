@@ -54,6 +54,8 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   const inspect = (path: string) => {
     const stat = lstatSync(path);
     assert(path === admin || !/\/config(?:\.worktree)?$/.test(path), unsafe);
+    if (process.env.LIMITLESS_DIAGNOSTICS_425 && !(stat.isDirectory() || (stat.isFile() && stat.nlink === 1)))
+      console.error("ADMIN INSPECTION", { path, nlink: stat.nlink, mode: stat.mode });
     assert(stat.isDirectory() || (stat.isFile() && stat.nlink === 1), unsafe);
     if (stat.isDirectory()) for (const name of readdirSync(path)) inspect(join(path, name));
   };

@@ -1,0 +1,5 @@
+[core]
+attributesFile = /dev/null
+repositoryformatversion = 1
+[extensions]
+objectformat = sha1

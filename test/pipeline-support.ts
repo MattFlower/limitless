@@ -186,6 +186,10 @@ export async function waitFor(
   } finally {
     unsubscribe();
   }
+  if (process.env.LIMITLESS_DIAGNOSTICS_425) writeFileSync(
+    join(process.cwd(), `diagnostic-425-${runId}.log`),
+    JSON.stringify({ run: f.store.getRun(runId), stages: f.store.listStages(runId), events: f.store.listEvents(runId, { limit: 10000 }) }, null, 2),
+  );
   throw new Error(`timed out waiting for ${statuses.join("|")}; status=${f.store.getRun(runId)?.status}`);
 }
 
@@ -246,6 +250,21 @@ export function pipelineSetup(state: PipelineFixture) {
   afterEach(async () => {
     process.env.PATH = originalPath;
     await state.factory?.stop();
+    if (process.env.LIMITLESS_DIAGNOSTICS_425 && state.factory) {
+      const runs = (() => {
+        try { return state.factory.store.listRuns(); }
+        catch (error) {
+          if (error instanceof RangeError && error.message === "Cannot use a closed database") return [];
+          throw error;
+        }
+      })();
+      for (const run of runs) {
+        if (run.status !== "succeeded" && run.status !== "needs_human" && !existsSync(join(process.cwd(), `diagnostic-425-${run.id}.log`))) writeFileSync(
+          join(process.cwd(), `diagnostic-425-${run.id}.log`),
+          JSON.stringify({ run, stages: state.factory.store.listStages(run.id), events: state.factory.store.listEvents(run.id, { limit: 10000 }) }, null, 2),
+        );
+      }
+    }
     state.factory?.store.close();
     state.factory = null;
     rmSync(state.home, { recursive: true, force: true });
