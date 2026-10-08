@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
+import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
   baselineCacheKey,
@@ -22,6 +23,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
+import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
@@ -91,6 +93,55 @@ describe("detectGates", () => {
 });
 
 describe("runGates / compareGates", () => {
+  test("retains early failure diagnostics in the result and its existing artifact", async () => {
+    const output =
+      "sample.test.ts:\n(pass) earlier\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +
+      "skipped summary\n".repeat(7_000);
+    const dir = tempDir({ "output.txt": output });
+    const store = new Store(":memory:");
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          checks: [
+            { name: "test", run: "cat output.txt; exit 1" },
+            { name: "pass", run: "cat output.txt" },
+          ],
+          source: "detected",
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.ok).toBe(false);
+      expect(run.checks[0]?.output).toBe(output.trim().slice(-6_000));
+      expect(run.checks[0]?.output).not.toContain("error:");
+      expect(run.checks[0]?.failures).toContain("error: values differ\nExpected: 1\nReceived: 2");
+      expect(formatGateFeedback(compareGates(null, run))).toContain(
+        "error: values differ\nExpected: 1\nReceived: 2",
+      );
+      expect(run.checks[1]?.ok).toBe(true);
+      expect(run.checks[1]).not.toHaveProperty("failures");
+      const repo = store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        localPath: null,
+        url: "https://example.com/repo",
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const savedRun = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+      store.putArtifact(savedRun.id, "gates.json", "gates", JSON.stringify(run));
+      const saved = JSON.parse(store.getArtifact(savedRun.id, "gates.json") ?? "null") as GateRun;
+      expect(saved.checks[0]?.output).toBe(output.trim().slice(-6_000));
+      expect(saved.checks[0]?.failures).toContain("Expected: 1\nReceived: 2");
+      expect(store.listArtifacts(savedRun.id)).toHaveLength(1);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("runs commands and captures output", async () => {
     const dir = tempDir({ "ok.txt": "fine" });
     const run = await runGates(
@@ -144,6 +195,151 @@ describe("runGates / compareGates", () => {
     expect(compareGates({ setupOk: true, setup: [r("setup", true)], checks: [] }, after)[0]?.blocking).toBe(
       true,
     );
+  });
+});
+
+describe("failure excerpts", () => {
+  test("extracts real FORCE_COLOR Bun failures across passing and skipped results", async () => {
+    const dir = tempDir({
+      "colored.test.ts": `import { test, expect } from "bun:test";
+test("first assertion", () => { expect({ value: "received-one" }).toEqual({ value: "expected-one" }); });
+test("passing boundary", () => { console.error("passing noise"); });
+test.skip("skipped boundary", () => {});
+test("second assertion", () => { expect({ value: "received-two" }).toEqual({ value: "expected-two" }); });`,
+    });
+    try {
+      const result = await sh([process.execPath, "test", "./colored.test.ts"], {
+        cwd: dir,
+        env: proc.agentEnv({ FORCE_COLOR: "1", NO_COLOR: "0" }),
+        timeoutMs: 10_000,
+        allowFail: true,
+      });
+      expect(result.exitCode).toBe(1);
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(output).toContain("\u001b[");
+      expect(output).toContain("✗");
+      expect(output).toContain("✓");
+      expect(output).toContain("»");
+      const excerpt = extractFailures(output);
+      expect(excerpt?.match(/✗/g)).toHaveLength(2);
+      expect(excerpt).toContain("✗ first assertion");
+      expect(excerpt).toContain("✗ second assertion");
+      for (const name of ["one", "two"]) {
+        expect(excerpt).toContain(`expected-${name}`);
+        expect(excerpt).toContain(`received-${name}`);
+      }
+      expect(excerpt).toContain("error: expect(received).toEqual(expected)");
+      expect(excerpt?.split("\n")).not.toContain("passing noise");
+      expect(excerpt).not.toContain("\u001b");
+      const skip = output.split("\n").find((line) => line.includes("»"));
+      if (!skip) throw new Error("missing colored skip result");
+      expect(extractFailures(`skip noise\n${skip}\nerror: next\n(fail) next`)).toBe(
+        "error: next\n(fail) next",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["", "next.test.ts:\n", "✓ passed\n", "» skipped\n"])(
+    "keeps trailing timeout diagnostics before %j with the timed-out failure",
+    (boundary) => {
+      const timeout = "  ^ this test timed out after 25ms.";
+      const output = `(fail) timeout-a [25.01ms]\n${timeout}\n${boundary}error: next\n(fail) next`;
+      expect(extractFailures(output)).toBe(
+        `(fail) timeout-a [25.01ms]\n${timeout}\n\nerror: next\n(fail) next`,
+      );
+      expect(extractFailures(`✗ timeout-a\n${timeout}\nnext.test.ts:`)).toBe(`✗ timeout-a\n${timeout}`);
+    },
+  );
+
+  test("reports left-out failures when no failure identity fits the budget", () => {
+    const output = Array.from(
+      { length: 12 },
+      (_, i) => `error: reason ${i}\n(fail) failure-${i}-${"n".repeat(9_000)}`,
+    ).join("\n");
+    expect(extractFailures(output)).toBe("[failure excerpts: diagnostic lines or failures left out]");
+    expect(extractFailures("(pass) fine\n")).toBeUndefined();
+  });
+
+  test("strips ANSI and stops at bun results and file headers", () => {
+    const output =
+      "old diagnostics\n(pass) earlier\nerror: first\n\u001b[31m(fail) one\u001b[0m\r\n" +
+      "discard me\npath with spaces/new.test.ts:\n\u001b[31merror: second\u001b[0m\nExpected: yes\nReceived: no\n(fail) two\n";
+    expect(extractFailures(output)).toBe(
+      "error: first\n(fail) one\n\nerror: second\nExpected: yes\nReceived: no\n(fail) two",
+    );
+  });
+
+  test("recognizes indented TAP failures and preceding TAP results", () => {
+    expect(
+      extractFailures(
+        "unrelated\n  ok 1 - passed\n  error: broken\n  \u001b[31mnot ok 2 - failed\u001b[0m\n",
+      ),
+    ).toBe("error: broken\n  not ok 2 - failed");
+    expect(extractFailures("ok 1 - passed\nno failures")).toBeUndefined();
+  });
+
+  test("caps diagnostic lines and keeps the failure line with an omission note", () => {
+    const excerpt = extractFailures(
+      `sample.test.ts:\n${Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n")}\n(fail) last`,
+    );
+    expect(excerpt).not.toContain("line 10\n");
+    expect(excerpt).toContain("line 11\n");
+    expect(excerpt?.split("\n\n")[0]?.split("\n")).toHaveLength(40);
+    expect(excerpt).toContain("(fail) last");
+    expect(excerpt).toContain("left out");
+    const timeout = extractFailures(
+      `${Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n")}\n(fail) timeout\n  ^ this test timed out after 25ms.\nnext.test.ts:`,
+    );
+    expect(timeout?.split("\n\n")[0]?.split("\n")).toHaveLength(40);
+    expect(timeout).toContain("(fail) timeout\n  ^ this test timed out after 25ms.");
+    expect(timeout).toContain("left out");
+  });
+
+  test("keeps the first ten failures and notes omitted failures", () => {
+    const excerpt = extractFailures(
+      Array.from({ length: 12 }, (_, i) => `error: ${i}\n(fail) test ${i}`).join("\n"),
+    );
+    expect(excerpt?.match(/\(fail\)/g)).toHaveLength(10);
+    expect(excerpt).toContain("error: 0\n(fail) test 0");
+    expect(excerpt).toContain("error: 9\n(fail) test 9");
+    expect(excerpt).not.toContain("test 10");
+    expect(excerpt).toContain("left out");
+  });
+
+  test("caps total characters and notes omitted diagnostics", () => {
+    const excerpt = extractFailures(`error: first\n(fail) first\n${"x".repeat(9_000)}\n(fail) second`);
+    expect(excerpt?.length).toBeLessThanOrEqual(8_000);
+    expect(excerpt).toContain("error: first\n(fail) first");
+    expect(excerpt).toContain("(fail) second");
+    expect(excerpt).toContain("left out");
+  });
+
+  test.each(["(fail) named-bun", "not ok 1 - named-tap"])(
+    "reserves the identity when clipping an overlong diagnostic before %s",
+    (result) => {
+      const excerpt = extractFailures(`error: reason\n${"x".repeat(9_000)}\n${result}`);
+      expect(excerpt).toContain("error: reason");
+      expect(excerpt).toContain(result);
+      expect(excerpt?.length).toBeLessThanOrEqual(8_000);
+      expect(excerpt?.split("\n\n")[0]?.split("\n").length).toBeLessThanOrEqual(40);
+      expect(excerpt).toContain("left out");
+    },
+  );
+
+  test.each([3_000, 9_000])("shortening to %i keeps every identity and the timeout explanation", (limit) => {
+    const timeout = "  ^ this test timed out after 25ms.";
+    const failures = extractFailures(
+      `error: first\n(fail) first\nerror: reason\n${"x".repeat(9_000)}\n✗ second\n${timeout}`,
+    );
+    const output = formatGateOutput({ output: "summary\n".repeat(800), failures }, limit);
+    expect(output).toContain("(fail) first");
+    expect(output).toContain(`✗ second\n${timeout}`);
+    expect(output.indexOf("(fail) first")).toBeLessThan(output.indexOf("✗ second"));
+    expect(output.indexOf("✗ second")).toBeLessThan(output.indexOf("summary"));
+    expect(output).toContain("left out");
+    expect(output.length).toBeLessThanOrEqual(limit);
   });
 });
 
