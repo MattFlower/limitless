@@ -199,6 +199,60 @@ describe("runGates / compareGates", () => {
 });
 
 describe("failure excerpts", () => {
+  test("extracts real FORCE_COLOR Bun failures across passing and skipped results", async () => {
+    const dir = tempDir({
+      "colored.test.ts": `import { test, expect } from "bun:test";
+test("first assertion", () => { expect({ value: "received-one" }).toEqual({ value: "expected-one" }); });
+test("passing boundary", () => { console.error("passing noise"); });
+test.skip("skipped boundary", () => {});
+test("second assertion", () => { expect({ value: "received-two" }).toEqual({ value: "expected-two" }); });`,
+    });
+    try {
+      const result = await sh([process.execPath, "test", "./colored.test.ts"], {
+        cwd: dir,
+        env: proc.agentEnv({ FORCE_COLOR: "1", NO_COLOR: "0" }),
+        timeoutMs: 10_000,
+        allowFail: true,
+      });
+      expect(result.exitCode).toBe(1);
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(output).toContain("\u001b[");
+      expect(output).toContain("✗");
+      expect(output).toContain("✓");
+      expect(output).toContain("»");
+      const excerpt = extractFailures(output);
+      expect(excerpt?.match(/✗/g)).toHaveLength(2);
+      expect(excerpt).toContain("✗ first assertion");
+      expect(excerpt).toContain("✗ second assertion");
+      for (const name of ["one", "two"]) {
+        expect(excerpt).toContain(`expected-${name}`);
+        expect(excerpt).toContain(`received-${name}`);
+      }
+      expect(excerpt).toContain("error: expect(received).toEqual(expected)");
+      expect(excerpt?.split("\n")).not.toContain("passing noise");
+      expect(excerpt).not.toContain("\u001b");
+      const skip = output.split("\n").find((line) => line.includes("»"));
+      if (!skip) throw new Error("missing colored skip result");
+      expect(extractFailures(`skip noise\n${skip}\nerror: next\n(fail) next`)).toBe(
+        "error: next\n(fail) next",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["", "next.test.ts:\n", "✓ passed\n", "» skipped\n"])(
+    "keeps trailing timeout diagnostics before %j with the timed-out failure",
+    (boundary) => {
+      const timeout = "  ^ this test timed out after 25ms.";
+      const output = `(fail) timeout-a [25.01ms]\n${timeout}\n${boundary}error: next\n(fail) next`;
+      expect(extractFailures(output)).toBe(
+        `(fail) timeout-a [25.01ms]\n${timeout}\n\nerror: next\n(fail) next`,
+      );
+      expect(extractFailures(`✗ timeout-a\n${timeout}\nnext.test.ts:`)).toBe(`✗ timeout-a\n${timeout}`);
+    },
+  );
+
   test("strips ANSI and stops at bun results and file headers", () => {
     const output =
       "old diagnostics\n(pass) earlier\nerror: first\n\u001b[31m(fail) one\u001b[0m\r\n" +
@@ -226,6 +280,12 @@ describe("failure excerpts", () => {
     expect(excerpt?.split("\n\n")[0]?.split("\n")).toHaveLength(40);
     expect(excerpt).toContain("(fail) last");
     expect(excerpt).toContain("left out");
+    const timeout = extractFailures(
+      `${Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n")}\n(fail) timeout\n  ^ this test timed out after 25ms.\nnext.test.ts:`,
+    );
+    expect(timeout?.split("\n\n")[0]?.split("\n")).toHaveLength(40);
+    expect(timeout).toContain("(fail) timeout\n  ^ this test timed out after 25ms.");
+    expect(timeout).toContain("left out");
   });
 
   test("keeps the first ten failures and notes omitted failures", () => {
@@ -243,8 +303,21 @@ describe("failure excerpts", () => {
     const excerpt = extractFailures(`error: first\n(fail) first\n${"x".repeat(9_000)}\n(fail) second`);
     expect(excerpt?.length).toBeLessThanOrEqual(8_000);
     expect(excerpt).toContain("error: first\n(fail) first");
+    expect(excerpt).toContain("(fail) second");
     expect(excerpt).toContain("left out");
   });
+
+  test.each(["(fail) named-bun", "not ok 1 - named-tap"])(
+    "reserves the identity when clipping an overlong diagnostic before %s",
+    (result) => {
+      const excerpt = extractFailures(`error: reason\n${"x".repeat(9_000)}\n${result}`);
+      expect(excerpt).toContain("error: reason");
+      expect(excerpt).toContain(result);
+      expect(excerpt?.length).toBeLessThanOrEqual(8_000);
+      expect(excerpt?.split("\n\n")[0]?.split("\n").length).toBeLessThanOrEqual(40);
+      expect(excerpt).toContain("left out");
+    },
+  );
 });
 
 describe("gate slots and flaky retry", () => {

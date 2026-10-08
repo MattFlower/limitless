@@ -74,6 +74,7 @@ const GateResultSchema = z.strictObject({
   exitCode: z.number().int().nullable(),
   durationMs: z.number().finite().nonnegative(),
   output: z.string(),
+  failures: z.string().optional(),
   timedOut: z.boolean().optional(),
   confinementError: z.boolean().optional(),
 });

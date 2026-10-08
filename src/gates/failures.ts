@@ -10,21 +10,21 @@ export class FailureExcerpts {
   private size = 0;
   private clipped = false;
   private omitted = false;
+  private failure: string | undefined;
 
   observe(raw: string): void {
     const line = stripVTControlCharacters(raw);
     const text = line.trim();
-    const failure = /^(?:\(fail\)(?:\s|$)|not ok(?:\s|$))/.test(text);
-    if (failure) {
-      const block = [...this.lines, line].join("\n").trim();
-      const room = 8_000 - OMITTED.length - 2 - this.size;
-      if (this.excerpts.length < 10 && room > 0) {
-        this.excerpts.push(block.slice(0, room));
-        this.size += Math.min(block.length, room) + 2;
-        this.omitted ||= this.clipped || block.length > room;
-      } else this.omitted = true;
+    if (this.failure !== undefined) {
+      // Bun emits the timeout explanation just after the result, unlike assertion diagnostics.
+      const timeout = /^\^ this test timed out after \d+(?:\.\d+)?ms\.$/.test(text);
+      this.finish(timeout ? line : undefined);
+      if (timeout) return;
     }
-    if (failure || /^(?:\((?:pass|skip|todo)\)(?:\s|$)|ok(?:\s|$)|.+\.test\.ts:$)/.test(text)) {
+    const failure = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/.test(text);
+    if (failure) {
+      this.failure = line;
+    } else if (/^(?:(?:\((?:pass|skip|todo)\)|✓|»)(?:\s|$)|ok(?:\s|$)|.+\.test\.ts:$)/.test(text)) {
       this.lines = [];
       this.clipped = false;
     } else {
@@ -37,7 +37,29 @@ export class FailureExcerpts {
     }
   }
 
+  private finish(timeout?: string): void {
+    if (this.failure === undefined) return;
+    const identity = [this.failure, ...(timeout ? [timeout] : [])].join("\n").trimEnd();
+    const diagnostics = this.lines
+      .slice(timeout ? -38 : -39)
+      .join("\n")
+      .trim();
+    const room = 8_000 - OMITTED.length - 2 - this.size;
+    if (this.excerpts.length < 10 && room >= identity.length) {
+      const kept = diagnostics.slice(0, Math.max(0, room - identity.length - 1)).trimEnd();
+      const block = kept ? `${kept}\n${identity}` : identity.trimStart();
+      this.excerpts.push(block);
+      this.size += block.length + 2;
+      this.omitted ||=
+        this.clipped || diagnostics.length > kept.length || (!!timeout && this.lines.length > 38);
+    } else this.omitted = true;
+    this.lines = [];
+    this.clipped = false;
+    this.failure = undefined;
+  }
+
   result(): string | undefined {
+    this.finish();
     if (!this.excerpts.length) return undefined;
     return [...this.excerpts, ...(this.omitted ? [OMITTED] : [])].join("\n\n");
   }
