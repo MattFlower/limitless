@@ -107,6 +107,21 @@ Why: the implement dataset (12 tasks) has a ceiling problem. Opus, Sol, Luna, So
 
 Revisit when the implement dataset is stratified by difficulty (harder, less-specified, multi-file tasks) and the eval measures rounds-to-converge and post-merge defects as well as first-pass tests. Until then, `routing/overrides.json` pins `implement.*` so `limitless eval policy --write` keeps these chains.
 
+## Owner decision: triage = `codex/luna@medium` → `claude/haiku-5.5@medium` (2026-10-07)
+
+Supersedes the 2026-10-01 triage decision below. Triage keeps Codex Luna at medium effort first, then Claude Haiku 5.5 at medium effort, then all existing availability fallbacks in their previous order.
+
+Evidence on the 30 held-out triage cases, k=3:
+
+| Model | Pass rate (Wilson 95% CI) | Risk under-calls | Flips | p50 latency | Eval |
+|---|---|---|---|---|---|
+| `claude/haiku-5.5@medium` | 73.3% [63%, 81%] | 0/84 | 10% | 3.4 s | eval-muyogy5fibhy |
+| `codex/luna@medium` (stored production baseline) | 71.1% [61%, 80%] | 2/84 | 23% | — | eval-mupjkaccha17 |
+
+The difference is within noise. The owner chose Haiku 5.5 as a fallback, not a replacement for Luna. `routing/overrides.json` pins `triage.default` so `limitless eval policy --write` preserves this order. No eval was rerun for this change.
+
+At startup, a persisted runtime `claude/haiku-5.5` entry is redundant: the daemon warns and uses the built-in definition without merging or deleting the stored entry, preserving compatibility with the previous release. Other catalog collisions still fail.
+
 ## Owner decision: triage = `codex/luna@medium` first (2026-10-01)
 
 Supersedes the 2026-09-29 triage decision below. Triage starts with `codex/luna@medium`, then `@low` and `@none`, the same `gpt-6-luna` model through the Codex subscription. OpenRouter Luna (`@medium`, `@low`, `@none`) follows as the metered fallback, then the existing availability fallbacks.
