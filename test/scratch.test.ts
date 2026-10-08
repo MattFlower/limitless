@@ -28,7 +28,6 @@ import {
   privateReadRoots,
   removeScratch,
   SCRATCH_NAME,
-  scratchEnv,
   withScratch,
   writeRoots,
 } from "../src/harness/scratch.ts";
@@ -1289,7 +1288,8 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
           const spec = specFor(cwd, scratchDir);
           spec.target.backend = { baseUrl: "http://backend.invalid", authToken: "backend-only-token" };
           const runner = async (opts: ProcOptions): Promise<ProcResult> => {
-            expect(opts.env).toMatchObject(scratchEnv(spec));
+            for (const key of ["TMPDIR", "TMP", "TEMP"]) expect(opts.env[key]).toBe(scratchDir);
+            expect(opts.env.TMPPREFIX).toBe(join(scratchDir, "zsh"));
             expect(opts.env.GH_TOKEN).toBe("limitless-agents-have-no-github-access");
             if (run === runClaude) {
               // The backend key reaches the CLI through its key helper, never the agent environment.
