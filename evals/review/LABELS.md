@@ -156,17 +156,27 @@ adjudicated. It applies the candidate rule above to every pending defect.
 
 ## M5.2 adjudication outcomes — 2026-10-08
 
-All 183 candidates in review-040 to review-107 were adjudicated under the rule and procedure above (codex/sol-6.1, high effort, one job per case at its head). The orchestrator re-checked every quoted line against `git show` at head and base, re-ran every reproduction (commands touching git remotes or signals ran with network denied after their targets were checked), and read every rejected, downgraded or re-rated blocker and major candidate. Clean controls (review-068, 078, 079, 082, 088, 092, 096, 097, 108) had no candidates.
+All 183 candidates in review-040 to review-107 were adjudicated under the rule and procedure above (codex/sol-6.1, high effort, one job per case at its head). The orchestrator:
 
-Result: of the 183 candidates, 91 were confirmed at blocker or major (gold), 43 at minor or nit (optional), and 49 were rejected or merged as duplicates; 13 confirmations were downgrades. Twelve cases kept no gold defect and were dropped with their 20 optional defects; no dropped case had a MERGE review. The retained cases hold 91 gold and 23 optional defects. Gold defects by split: dev 47, heldout 44.
+- re-checked every quoted line against `git show` at head and base, and every quoted requirement against the case's request;
+- re-ran every reproduction (commands that touch git remotes or signals ran with network denied, after their targets were checked);
+- read the reasons for every rejected, downgraded or re-rated blocker and major candidate, and for every confirmed gold defect in both splits.
 
-**Orchestrator overrides** (the adjudicator's verdict replaced, with the evidence in the case's defect or history):
-- review-042 #0, confirmed blocker. The adjudicator couldn't run Seatbelt inside its own sandbox. Unconfined, an inner `sandbox-exec` exits 71 under any outer profile that denies something, and head requires that nested apply before every tool-enabled Codex invocation.
+Clean controls (review-068, 078, 079, 082, 088, 092, 096, 097, 108) had no candidates.
+
+Result: of the 183 candidates, 90 were confirmed at blocker or major (gold), 43 at minor or nit (optional), and 50 were rejected or merged as duplicates; 13 confirmations were downgrades. 12 cases kept no gold defect and were dropped with their 20 optional defects; no dropped case had a MERGE review. The retained cases hold 90 gold and 23 optional defects. Gold defects by split: dev 47, heldout 43.
+
+**Orchestrator overrides.** Each replaced verdict has a `labelHistory` entry by `orchestrator, overriding codex/sol-6.1 high` with its evidence.
+
+- review-042 #0, confirmed blocker. The adjudicator couldn't run Seatbelt inside its own sandbox. Evidence is a platform probe plus head code: unconfined, an inner `sandbox-exec` exits 71 under any outer profile that denies something, and head's nested signal probe applies one under the factory's restrictive profile before every tool-enabled Codex invocation.
 - review-064 #0, confirmed blocker. Unconfined, head's reader network rules make `listen()` on an ephemeral loopback port fail with EPERM; the same probe under an allow-default profile listens and connects.
-- review-101 #3, confirmed minor. Two adjudication passes disagreed; the request keeps the raw-text launch scan authoritative, and the reproduction shows normalized output still creating a blocking confinement error.
+- review-101 #3, confirmed minor. Two adjudication passes disagreed. The request keeps the raw-text launch scan authoritative, and the reproduction shows normalized output still creating a blocking confinement error.
 - review-107 #0, confirmed major. The request says not to raise the flaky test's timeout without understanding it; head doubles the deadline while the git index-lock race that caused the failure remains.
+- review-049 #0, rejected (was a confirmed blocker). For consistency with review-047: the request defines inert media by extension and asks for no content validation, so an archive carried inside a WebP is the same polyglot class.
 
-**Rejections the orchestrator checked and kept** include findings whose defect existed at base outside the request's scope (for example #382's extension-list policy, #401's non-push git calls, and redaction of rows stored by an earlier release in #421), deliberate design choices the request allowed, delivery or process concerns, and claims the evidence did not reproduce.
+**Rejections kept after reading** include defects that existed at base outside the request's scope (for example #382's extension-list policy, #401's non-push git calls, and #421's rows stored by an earlier release), design choices the request allowed, delivery or process concerns, and claims the evidence did not reproduce.
+
+**Held-out exposure.** The orchestrator read the held-out cases in detail while labelling, including two of the overrides above. Variant and routing choices for the review stage must be justified from dev cases; held-out results are reported once per decision, as pre-registered.
 
 | Case | PR | Split | Gold | Optional | Downgraded | Rejected | Outcome |
 |---|---|---|---|---|---|---|---|
@@ -179,7 +189,7 @@ Result: of the 183 candidates, 91 were confirmed at blocker or major (gold), 43 
 | review-046 | #380 | dev | 1 | 0 | 0 | 1 | kept |
 | review-047 | #382 | heldout | 2 | 0 | 1 | 3 | kept |
 | review-048 | #382 | heldout | 3 | 1 | 1 | 3 | kept |
-| review-049 | #382 | heldout | 2 | 0 | 0 | 0 | kept |
+| review-049 | #382 | heldout | 1 | 0 | 0 | 1 | kept |
 | review-050 | #384 | dev | 2 | 0 | 0 | 1 | kept |
 | review-051 | #384 | dev | 1 | 1 | 0 | 0 | kept |
 | review-052 | #385 | dev | 4 | 0 | 0 | 0 | kept |

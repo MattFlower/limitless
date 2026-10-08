@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls. M5.2 (2026-10-08): appended orchestrator-review candidates and MERGE controls with fixed-seed PR splits; pending defects are not gold and must be adjudicated under LABELS.md before measurement.",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls. M5.2 (2026-10-08): appended cases from orchestrator reviews and MERGE controls with fixed-seed PR splits, adjudicated under LABELS.md; cases left without a gold defect were dropped, and the per-case outcomes are in LABELS.md. Routing and prompt decisions use dev cases only.",
   "cases": [
     {
       "id": "review-001",
@@ -127,10 +127,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            116,
-            118
-          ],
+          "lines": [116, 118],
           "severity": "major",
           "category": "security",
           "summary": "Existing-branch delivery (skip PR, force-push to run.deliveryBranch) is authorized by the mere presence of deliveryBranch; nothing requires the run to come from the signature-verified GitHub/Dependabot webhook. deliveryBranch/baseBranch/sourceRef are accepted verbatim from POST /api/runs (store.ts createRun), so any API caller could get a run force-pushed onto main, bypassing mergePolicy and PR review.",
@@ -261,10 +258,7 @@
       "defects": [
         {
           "file": "src/harness/codex.ts",
-          "lines": [
-            211,
-            232
-          ],
+          "lines": [211, 232],
           "severity": "blocker",
           "category": "security",
           "summary": "AgentSpec.noTools is ignored by runCodex (only mode→sandbox is honored), so a Codex-routed holdout author keeps shell/file access and is not 'blind'; Codex is the first candidate in the default holdout policy.",
@@ -273,10 +267,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            604,
-            604
-          ],
+          "lines": [604, 604],
           "severity": "major",
           "category": "correctness",
           "summary": "Verify invocation is run with privateOutput: true, which (context.ts 227-298) drops all agent events, replaces real errors with 'private invocation failed' and deletes the raw transcript for every verify call in every standard/deep run - far broader than the holdout-secrecy requirement; verify becomes undebuggable. Reviewer cited context.ts:604 (file has 370 lines); the flag is set at engine.ts:604.",
@@ -285,10 +276,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            655,
-            672
-          ],
+          "lines": [655, 672],
           "severity": "major",
           "category": "correctness",
           "summary": "publish() writes holdout-scenarios.json and the buffered verify-N.json artifacts only when success; renderReport likewise hides the holdout table unless success. needs_human draft PRs therefore lose the holdout/verify evidence, and failed runs regress to having no verify artifacts at all (previously written every round).",
@@ -419,10 +407,7 @@
       "defects": [
         {
           "file": "src/harness/codex.ts",
-          "lines": [
-            228,
-            243
-          ],
+          "lines": [228, 243],
           "severity": "blocker",
           "category": "correctness",
           "summary": "The round-1 fix for noTools passes '--strict-config' together with config keys that do not exist in Codex (tools.disable_defaults, include_apply_patch_tool, features.* via -c), so every Codex-routed holdout call fails at startup. Orchestrator replaced them with '--disable shell_tool --disable multi_agent'.",
@@ -431,10 +416,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            351,
-            352
-          ],
+          "lines": [351, 352],
           "severity": "major",
           "category": "logic",
           "summary": "The holdout invocation sets maxToolCalls: 0 as a backstop, but the Claude loop detector counts the final structured-output call as a tool call, so every Claude-routed holdout is stopped as stuck and silently re-routed to the spec author's vendor.",
@@ -560,10 +542,7 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            270,
-            284
-          ],
+          "lines": [270, 284],
           "severity": "blocker",
           "category": "correctness",
           "summary": "Hard-limit exhaustion alerts dedupe on boundary = detail.exhaustedUntil, which codex.ts computes as Date.now()+30min on every rejection when no window is known; concurrent/repeated rejections each create a new alert row and a new Discord post (violates the at-most-one-alert-per-window requirement).",
@@ -687,10 +666,7 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            146,
-            150
-          ],
+          "lines": [146, 150],
           "severity": "major",
           "category": "correctness",
           "summary": "fetchBase runs 'git fetch origin refs/heads/B:refs/remotes/origin/B' in the worktree (shared object store/refs of the bare cache) without withRepoLock; concurrent runs on the same repo race on the ref lock and delivery fails intermittently ('cannot lock ref'). Called up to 3x per delivery without allowFail.",
@@ -699,10 +675,7 @@
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            146,
-            150
-          ],
+          "lines": [146, 150],
           "severity": "major",
           "category": "correctness",
           "summary": "fetchBase's refspec has no leading '+', so a force-pushed/rewritten base branch makes git reject the non-fast-forward update and sh() throws a raw git error before the isAncestor guard can report 'base branch no longer descends from the recorded base'. Carried over: also present in this head, first flagged in review round 1; 7ee37e75 rewrote this function for the race but kept the non-'+' refspec; fixed in faf8e2ca.",
@@ -711,10 +684,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            695,
-            714
-          ],
+          "lines": [695, 714],
           "severity": "major",
           "category": "correctness",
           "summary": "When the base advances and the rebase conflicts, deliver() updates run.baseSha and sends the implementer back to 'git merge origin/<base>', but ctx.state.baselineScripts (captured once in prepare from the original base) is never refreshed; the re-run audit compares old-base scripts against the merged package.json and raises a block-severity gate-script-changed finding for upstream script changes. Reviewer cited src/gates/audit.ts:202 (the rule); the fix landed in engine.ts. Carried over: present in this head, first flagged in review round 1; fixed in faf8e2ca.",
@@ -855,10 +825,7 @@
       "defects": [
         {
           "file": "src/concierge.ts",
-          "lines": [
-            85,
-            102
-          ],
+          "lines": [85, 102],
           "severity": "major",
           "category": "correctness",
           "summary": "process() commits confirmChat (proposal -> 'confirmed') and then calls createRun; if resolveRepo throws (bad repo string from the model, non-git path, gh failure) the proposal stays 'confirmed' with no run and the conversation is stuck: new proposals, edits and re-confirmation all fail. Reviewer cited line 160; the confirm/execute/catch block is lines 85-102.",
@@ -978,10 +945,7 @@
       "defects": [
         {
           "file": "src/cli/local.ts",
-          "lines": [
-            96,
-            111
-          ],
+          "lines": [96, 111],
           "severity": "major",
           "category": "correctness",
           "summary": "'limitless local up' unconditionally overwrites the existing twilight limitless-llama.service with a bare generated unit (twilightUnit lines 27-43 lacks GPU offload/context/--jinja/alias flags and puts the API key on the command line) and restarts it, losing host tuning.",
@@ -990,10 +954,7 @@
         },
         {
           "file": "src/cli/local.ts",
-          "lines": [
-            64,
-            72
-          ],
+          "lines": [64, 72],
           "severity": "minor",
           "category": "correctness",
           "summary": "Health probes send no API key although both local servers require one, so status reports 'unreachable' for healthy servers. (In the fix commit message; not in the orchestrator's brief.)",
@@ -1113,10 +1074,7 @@
       "defects": [
         {
           "file": "src/concierge.ts",
-          "lines": [
-            232,
-            263
-          ],
+          "lines": [232, 263],
           "severity": "major",
           "category": "completeness",
           "summary": "PR #9 routes tool-less roles (triage/chat/summarize) to the direct-HTTP 'llm' harness in RunContext.invoke (context.ts useHttp), but the concierge (merged from PR #8) dispatches chat itself via harnesses[target.harness] and passes no zod schema, so chat never uses the HTTP path and keeps spawning the agent CLI. concierge.ts is unchanged by this diff - a missed call site / semantic merge conflict.",
@@ -1256,10 +1214,7 @@
       "defects": [
         {
           "file": "src/cli/service.ts",
-          "lines": [
-            232,
-            238
-          ],
+          "lines": [232, 238],
           "severity": "major",
           "category": "correctness",
           "summary": "deploy() always calls requestAdmin('drain') before restarting; the currently running daemon predates the drain endpoint and answers 404, which localDeployClient (deploy-wait.ts:69) turns into a generic error, so deploying this change always fails and rolls back - even with --now. No bootstrap path from a pre-drain daemon.",
@@ -1641,10 +1596,7 @@
       "defects": [
         {
           "file": "src/text.ts",
-          "lines": [
-            69,
-            73
-          ],
+          "lines": [69, 73],
           "severity": "major",
           "category": "correctness",
           "summary": "stripPunctuation deletes the punctuation base of RGI emoji: the keycaps U+0023 and U+002A + U+FE0F + U+20E3, and U+203C, U+2049, U+3030 and U+303D + U+FE0F, whose bases are \\p{P}. It leaves orphaned U+FE0F and U+20E3 in the output, although the issue says to keep emoji and the spec preserves emoji sequences, and the CLI inherits it. A standalone # can still be removed while keycaps are kept.",
@@ -1777,10 +1729,7 @@
       "defects": [
         {
           "file": "src/gc.ts",
-          "lines": [
-            25,
-            31
-          ],
+          "lines": [25, 31],
           "severity": "major",
           "category": "correctness",
           "summary": "canonical() calls realpathSync on each worktree's parent; a stale entry whose parent was deleted throws and blocks cleanup for the whole repository",
@@ -1789,10 +1738,7 @@
         },
         {
           "file": "src/gc.ts",
-          "lines": [
-            90,
-            96
-          ],
+          "lines": [90, 96],
           "severity": "major",
           "category": "correctness",
           "summary": "GC removes a registered worktree at paths.work/<run-id> without checking it is still on the run's branch",
@@ -1919,10 +1865,7 @@
       "defects": [
         {
           "file": "src/integrations/discord.ts",
-          "lines": [
-            93,
-            106
-          ],
+          "lines": [93, 106],
           "severity": "major",
           "category": "correctness",
           "summary": "The discord.js Client has no 'error' listener; an emitted error event can crash the daemon",
@@ -1931,10 +1874,7 @@
         },
         {
           "file": "src/integrations/discord.ts",
-          "lines": [
-            300,
-            312
-          ],
+          "lines": [300, 312],
           "severity": "major",
           "category": "correctness",
           "summary": "The run can emit events before its Discord thread id is persisted, so early events are dropped",
@@ -1943,10 +1883,7 @@
         },
         {
           "file": "src/integrations/discord.ts",
-          "lines": [
-            220,
-            228
-          ],
+          "lines": [220, 228],
           "severity": "major",
           "category": "correctness",
           "summary": "The terminal summary is marked delivered before the send succeeds, so a failed send is never retried",
@@ -2072,10 +2009,7 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            270,
-            284
-          ],
+          "lines": [270, 284],
           "severity": "major",
           "category": "correctness",
           "summary": "A quota rejection is attributed to the earliest-resetting known window, not the exhausted one, mislabeling alerts and allowing a duplicate alert later",
@@ -2084,10 +2018,7 @@
         },
         {
           "file": "src/router/router.ts",
-          "lines": [
-            60,
-            75
-          ],
+          "lines": [60, 75],
           "severity": "minor",
           "category": "correctness",
           "summary": "describeFallback mixes candidates from unrelated roles before a route is selected",
@@ -2220,10 +2151,7 @@
       "defects": [
         {
           "file": "src/integrations/github.ts",
-          "lines": [
-            41,
-            44
-          ],
+          "lines": [41, 44],
           "severity": "major",
           "category": "security",
           "summary": "mapGitHubEvent checked the actor login but not that repository.full_name belongs to cfg.githubOwner, so an owner action on someone else's repo could start a run.",
@@ -2232,10 +2160,7 @@
         },
         {
           "file": "src/integrations/github.ts",
-          "lines": [
-            115,
-            127
-          ],
+          "lines": [115, 127],
           "severity": "blocker",
           "category": "spec-mismatch",
           "summary": "A Dependabot run is a quick 'verify and fix breakages' run; when the bump needs no fix the implementer makes no changes, the audit's empty-diff rule blocks every round, and clean bumps can never succeed",
@@ -2361,10 +2286,7 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            265,
-            271
-          ],
+          "lines": [265, 271],
           "severity": "major",
           "category": "logic",
           "summary": "A quota rejection with no known window alerts on window 'hard_limit' with boundary = detail.exhaustedUntil, which codex.ts sets to Date.now()+30min on every rejection, so each rejection creates a new alert (alert storm)",
@@ -2373,10 +2295,7 @@
         },
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            261,
-            264
-          ],
+          "lines": [261, 264],
           "severity": "major",
           "category": "logic",
           "summary": "A subscription quota rejection is attributed to the earliest-resetting known window rather than the exhausted one, mislabelling alerts and allowing a duplicate alert after the wrong window resets.",
@@ -2500,10 +2419,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            700,
-            716
-          ],
+          "lines": [700, 716],
           "severity": "major",
           "category": "error-handling",
           "summary": "Delivery throws and discards already-reviewed work when the base changed during the rebase, advanced again after the conflict-resolution round, or no longer descends from the recorded base, instead of delivering the checked head without rebasing",
@@ -2512,10 +2428,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            824,
-            830
-          ],
+          "lines": [824, 830],
           "severity": "major",
           "category": "error-handling",
           "summary": "Same root cause as the delivery-rebase refusals above: a base change just before publication throws 'refusing to publish' instead of publishing the checked head (optional so the defect counts once)",
@@ -2643,10 +2556,7 @@
       "defects": [
         {
           "file": "src/router/router.ts",
-          "lines": [
-            238,
-            251
-          ],
+          "lines": [238, 251],
           "severity": "major",
           "category": "logic",
           "summary": "In free_first mode the preferred (escalated) implementer is only re-pinned within its billing partition, so after escalating to a paid model the next round puts free models first again and returns to the free model that failed twice.",
@@ -2776,10 +2686,7 @@
       "defects": [
         {
           "file": "src/db/migration-runner.ts",
-          "lines": [
-            83,
-            107
-          ],
+          "lines": [83, 107],
           "severity": "blocker",
           "category": "data-migration",
           "summary": "On first start the runner rebuilds schema_migrations without the version column; the previous release then fails at startup with 'no such column: version', so deploy's automatic rollback leaves the daemon down.",
@@ -2788,10 +2695,7 @@
         },
         {
           "file": "src/db/migration-runner.ts",
-          "lines": [
-            42,
-            57
-          ],
+          "lines": [42, 57],
           "severity": "major",
           "category": "test-gap",
           "summary": "verifyShipped checks an empty manifest that no code ever populates, so editing an applied migration file passes every test.",
@@ -2800,10 +2704,7 @@
         },
         {
           "file": "scripts/check-migration-copy.ts",
-          "lines": [
-            28,
-            33
-          ],
+          "lines": [28, 33],
           "severity": "minor",
           "category": "data-migration",
           "summary": "The deploy-time check opens the live production database read-write just to copy it, and passes silently when the path does not exist.",
@@ -2928,10 +2829,7 @@
       "defects": [
         {
           "file": "src/cli/service.ts",
-          "lines": [
-            277,
-            285
-          ],
+          "lines": [277, 285],
           "severity": "blocker",
           "category": "logic",
           "summary": "If the release checkout already matches the target (e.g. a previous deploy died mid-check, or two deploys interleave), deploy skips bun install and bun run check and restarts onto unverified code; there is no deploy lock.",
@@ -2940,10 +2838,7 @@
         },
         {
           "file": "src/cli/deploy-wait.ts",
-          "lines": [
-            204,
-            206
-          ],
+          "lines": [204, 206],
           "severity": "blocker",
           "category": "logic",
           "summary": "waitForHealthy requires the new daemon to report the target sha; releases older than this change report none ('unknown'), so rolling back past it drains, restarts, fails and rolls back again.",
@@ -2952,10 +2847,7 @@
         },
         {
           "file": "src/cli/service.ts",
-          "lines": [
-            263,
-            276
-          ],
+          "lines": [263, 276],
           "severity": "minor",
           "category": "logic",
           "summary": "When the daemon already runs the target but the checkout differs, deploy reports 'already deployed' and leaves them mismatched, so a later launchd restart boots different code.",
@@ -3096,10 +2988,7 @@
       "defects": [
         {
           "file": "src/evals/runner.ts",
-          "lines": [
-            325,
-            325
-          ],
+          "lines": [325, 325],
           "severity": "major",
           "category": "spec-mismatch",
           "summary": "Eval implement trials use the reading-role budget of 150 tool calls instead of the pipeline's 400 for edit mode, so tool-heavy candidates hit the cap and are graded as failures.",
@@ -3108,10 +2997,7 @@
         },
         {
           "file": "src/evals/runner.ts",
-          "lines": [
-            123,
-            124
-          ],
+          "lines": [123, 124],
           "severity": "major",
           "category": "logic",
           "summary": "Implement trials reject any pin whose history contains evals/triage or evals/review, so impl-007 and impl-011 would score 0% for every model.",
@@ -3120,10 +3006,7 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [
-            108,
-            120
-          ],
+          "lines": [108, 120],
           "severity": "blocker",
           "category": "security",
           "summary": "After the candidate runs, grading's git calls (discardChanges, diffSince, git add) honour candidate-controlled .git/config, hooks and index flags: diff.external empties the audited diff, hooks run during cleanup, skip-worktree makes the tested tree differ from the audited commit",
@@ -3132,10 +3015,7 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [
-            112,
-            118
-          ],
+          "lines": [112, 118],
           "severity": "minor",
           "category": "error-handling",
           "summary": "If baseline gate setup fails or times out, the trial still invokes (and pays for) the candidate and grades it 'timeout' instead of failing at preparation; baselines also rerun per trial.",
@@ -3144,10 +3024,7 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [
-            49,
-            55
-          ],
+          "lines": [49, 55],
           "severity": "minor",
           "category": "logic",
           "summary": "writeFileSync drops the executable bit, so hidden commands like ./run.sh exit 126; a test enshrined the 126.",
@@ -3262,10 +3139,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            672,
-            674
-          ],
+          "lines": [672, 674],
           "severity": "major",
           "category": "security",
           "summary": "[preview] is read from the changed worktree at verify time instead of the base at prepare (as gates are), so a change can weaken or skip its own preview, and a bad section fails runs only after paid stages.",
@@ -3274,10 +3148,7 @@
         },
         {
           "file": "scripts/preview-seed.ts",
-          "lines": [
-            19,
-            27
-          ],
+          "lines": [19, 27],
           "severity": "major",
           "category": "resource",
           "summary": "The seed script creates runs with the default queued status; a normal daemon would execute them against paid providers (seed-demo.ts forbids this).",
@@ -3286,10 +3157,7 @@
         },
         {
           "file": "src/pipeline/preview.ts",
-          "lines": [
-            131,
-            145
-          ],
+          "lines": [131, 145],
           "severity": "major",
           "category": "security",
           "summary": "User env is spread after HOME/TMPDIR, so config can override HOME, GH_TOKEN and GIT_* protections; values containing '..' are not rejected.",
@@ -3298,10 +3166,7 @@
         },
         {
           "file": "src/pipeline/preview.ts",
-          "lines": [
-            52,
-            53
-          ],
+          "lines": [52, 53],
           "severity": "major",
           "category": "security",
           "summary": "The ready path check rejects '//' but not '/\\\\evil.example/x', which new URL() resolves to an external host.",
@@ -3310,10 +3175,7 @@
         },
         {
           "file": "src/pipeline/preview.ts",
-          "lines": [
-            87,
-            108
-          ],
+          "lines": [87, 108],
           "severity": "major",
           "category": "resource",
           "summary": "stopTree waits for 'close', which never fires while a grandchild that left the process group holds the stdout pipe (12 s stall reproduced; a daemonizing server hangs the run).",
@@ -3450,10 +3312,7 @@
       "defects": [
         {
           "file": "src/evals/implement.ts",
-          "lines": [
-            239,
-            244
-          ],
+          "lines": [239, 244],
           "severity": "major",
           "category": "logic",
           "summary": "Claude models have no default effort and codex/astra starts at high (xhigh skipped), so --strategy effort stops after round 0 ('strategy exhausted') and caches a complete trial with 0% recovery.",
@@ -3462,10 +3321,7 @@
         },
         {
           "file": "src/evals/stats.ts",
-          "lines": [
-            133,
-            137
-          ],
+          "lines": [133, 137],
           "severity": "major",
           "category": "logic",
           "summary": "Budget/cancel stops between rounds and operational round-1 failures count as failed recoveries, and the round-0 grade is replaced.",
@@ -3474,10 +3330,7 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [
-            222,
-            237
-          ],
+          "lines": [222, 237],
           "severity": "major",
           "category": "logic",
           "summary": "The next model comes from the live policy and quota (router.route with side effects); a briefly unavailable tier is skipped and the result cached as complete.",
@@ -3486,10 +3339,7 @@
         },
         {
           "file": "src/evals/implement.ts",
-          "lines": [
-            159,
-            167
-          ],
+          "lines": [159, 167],
           "severity": "major",
           "category": "security",
           "summary": "The grader runs candidate code with the hidden tests present and the real HOME/TMPDIR, so a candidate can copy the tests outside the worktree and read them in a later round.",
@@ -3498,10 +3348,7 @@
         },
         {
           "file": "src/evals/runner.ts",
-          "lines": [
-            379,
-            386
-          ],
+          "lines": [379, 386],
           "severity": "minor",
           "category": "error-handling",
           "summary": "If resuming the previous session fails, the round fails instead of retrying once in a fresh session with the same feedback.",
@@ -3510,10 +3357,7 @@
         },
         {
           "file": "src/evals/format.ts",
-          "lines": [
-            17,
-            25
-          ],
+          "lines": [17, 25],
           "severity": "minor",
           "category": "logic",
           "summary": "Every one-round report now prints pass@1 twice and a 'recovery 0.0%' line (regression in existing output).",
@@ -3633,10 +3477,7 @@
       "defects": [
         {
           "file": "src/pipeline/context.ts",
-          "lines": [
-            294,
-            297
-          ],
+          "lines": [294, 297],
           "severity": "major",
           "category": "logic",
           "summary": "Drain can park before audit/review/preview/verify, but resume only skips whole implement rounds, so a parked run redoes gates, audit and review (2 reviewer calls for 1 implementation; the verdict can flip).",
@@ -3645,10 +3486,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            937,
-            942
-          ],
+          "lines": [937, 942],
           "severity": "major",
           "category": "logic",
           "summary": "environmentRetryRound is saved before the retry stage starts, so a park there makes the resumed run go straight to needs_human without retrying.",
@@ -3790,10 +3628,7 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            426,
-            437
-          ],
+          "lines": [426, 437],
           "severity": "major",
           "category": "concurrency",
           "summary": "Delivery commands now honour the abort signal; stopping during gh pr merge --delete-branch can kill gh after the merge, and resume re-pushes (recreating the branch) and reports 'merge failed'.",
@@ -3802,10 +3637,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            665,
-            681
-          ],
+          "lines": [665, 681],
           "severity": "minor",
           "category": "logic",
           "summary": "The restructure dropped the 'Implementer ended with <status>' warning and the commit SHA / 'no changes' summary, and renders implementerIssue as 'timeout: ' with an empty message.",
@@ -3814,10 +3646,7 @@
         },
         {
           "file": "src/pipeline/context.ts",
-          "lines": [
-            26,
-            26
-          ],
+          "lines": [26, 26],
           "severity": "minor",
           "category": "other",
           "summary": "RunContext imports parseFakeStream from src/harness/fake.ts, coupling production to the fake.",
@@ -4037,10 +3866,7 @@
       "defects": [
         {
           "file": "ui/components/InvocationsTable.tsx",
-          "lines": [
-            51,
-            52
-          ],
+          "lines": [51, 52],
           "severity": "major",
           "category": "accessibility",
           "summary": "Role help disappears when the pointer moves onto its explanation, violating WCAG 1.4.13 hoverable content.",
@@ -4378,10 +4204,7 @@
       "defects": [
         {
           "file": "src/pipeline/verification.ts",
-          "lines": [
-            17,
-            18
-          ],
+          "lines": [17, 18],
           "severity": "major",
           "category": "privacy",
           "summary": "Public criterion ID collisions bypass holdout redaction, and unexpected IDs copy private text verbatim into the pre-delivery artifact.",
@@ -4512,10 +4335,7 @@
       "defects": [
         {
           "file": "src/integrations/github-notifier.ts",
-          "lines": [
-            28,
-            37
-          ],
+          "lines": [28, 37],
           "severity": "major",
           "category": "performance",
           "summary": "Merge reconciliation repeatedly scans every needs_human PR sequentially with no backoff, causing hundreds of gh calls per pass.",
@@ -4755,10 +4575,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            999,
-            999
-          ],
+          "lines": [999, 999],
           "severity": "major",
           "category": "delivery",
           "summary": "Fallback cannot rewind a branch already pushed by normal delivery: force-with-lease rejects stale info and no PR is opened.",
@@ -4767,10 +4584,7 @@
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            332,
-            338
-          ],
+          "lines": [332, 338],
           "severity": "major",
           "category": "delivery",
           "summary": "Fallback reusing an existing ready PR only edits its body, leaving it ready and without the needs human title.",
@@ -4779,10 +4593,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            964,
-            968
-          ],
+          "lines": [964, 968],
           "severity": "major",
           "category": "delivery",
           "summary": "Restart between recording verification and advancing phase can bypass verified fallback and publish unverified retry edits.",
@@ -5173,10 +4984,7 @@
       "defects": [
         {
           "file": "src/db/store.ts",
-          "lines": [
-            820,
-            829
-          ],
+          "lines": [820, 829],
           "severity": "major",
           "category": "logic",
           "summary": "A dependency that ends needs_human without a PR (for example because its own dependency failed) is treated as still pending: only missing, failed, cancelled or closed-unmerged dependencies fail a waiting run, and a retry creates a new run that cannot satisfy the old dependency. For A → B → C, A failing moves B to needs_human, but C stays waiting forever across reconciliations, so a queued plan's tail silently stalls.",
@@ -5302,10 +5110,7 @@
       "defects": [
         {
           "file": "src/db/store.ts",
-          "lines": [
-            779,
-            790
-          ],
+          "lines": [779, 790],
           "severity": "major",
           "category": "correctness",
           "summary": "providerSpendBetween attributes local cost to a reading window by started_at, so a call that starts before an OpenRouter reading and finishes after it is counted in the wrong window (or an in-flight call is missed), producing false spend-drift warnings.",
@@ -5314,10 +5119,7 @@
         },
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            171,
-            176
-          ],
+          "lines": [171, 176],
           "severity": "minor",
           "category": "logic",
           "summary": "Drift is only checked when usage did not decrease, which is also the only month-rollover signal. After a monthly reset where new usage already exceeds the prior reading, the reset is missed and the drift check compares spend across the reset.",
@@ -5479,10 +5281,7 @@
       "defects": [
         {
           "file": "src/git/merge.ts",
-          "lines": [
-            78,
-            84
-          ],
+          "lines": [78, 84],
           "severity": "major",
           "category": "correctness",
           "summary": "Leftover conflict markers are detected only as exactly `<<<<<<< HEAD` and `>>>>>>> <base>`. Markers with a path suffix (`<<<<<<< HEAD:f.txt`, e.g. after a rename) or a configured conflict-marker-size are missed, so a merge is committed with conflict markers in it.",
@@ -5491,10 +5290,7 @@
         },
         {
           "file": "src/git/merge.ts",
-          "lines": [
-            91,
-            97
-          ],
+          "lines": [91, 97],
           "severity": "major",
           "category": "correctness",
           "summary": "completeMerge scans only unmerged, untracked and worktree-modified files. A file the resolver already staged with markers still in it shows no worktree diff and escapes the scan, so the unresolved file is committed.",
@@ -5503,10 +5299,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            878,
-            883
-          ],
+          "lines": [878, 883],
           "severity": "major",
           "category": "data-migration",
           "summary": "Delivery after a conflict round now requires preRebaseHead, but the previous release cleared it when a delivery rebase conflicted. A run that entered a conflict round under the previous release throws 'Missing pre-merge HEAD at delivery' here (or 'Missing expected merge state' in its resolution round) and cannot recover.",
@@ -5532,10 +5325,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            573,
-            574
-          ],
+          "lines": [573, 574],
           "severity": "major",
           "category": "data-migration",
           "summary": "A run saved by the previous release has lastReview but no reviewHistory, so at its next review it throws 'Previous review has no round history' and ends needs_human. A deploy restarts the daemon, so every run past its first review at upgrade time is affected (reproduced by resuming a restart-during-verify run with reviewHistory stripped).",
@@ -5561,10 +5351,7 @@
       "defects": [
         {
           "file": "src/evals/policy.ts",
-          "lines": [
-            117,
-            121
-          ],
+          "lines": [117, 121],
           "severity": "major",
           "category": "logic",
           "summary": "Implement evidence is attributed to the run's starting target: a multi-round trial that only passed after an effort raise or a model switch counts as a pass for the starting model, so the policy generator can qualify a model on passes it did not earn.",
@@ -5573,10 +5360,7 @@
         },
         {
           "file": "src/evals/policy.ts",
-          "lines": [
-            293,
-            339
-          ],
+          "lines": [293, 339],
           "severity": "major",
           "category": "completeness",
           "summary": "The B1 escalation evidence handling is unreachable: no caller passes `escalation` to generatePolicy (the CLI path in app.ts omits it), so effort-before-switch recommendations can never be emitted.",
@@ -5602,10 +5386,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            971,
-            990
-          ],
+          "lines": [971, 990],
           "severity": "major",
           "category": "concurrency",
           "summary": "The verify-first flow posts its success verdict on the PR without rechecking the PR's current head, so a push after verification started gets an approval comment for code that was never verified.",
@@ -5614,10 +5395,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            668,
-            671
-          ],
+          "lines": [668, 671],
           "severity": "major",
           "category": "correctness",
           "summary": "The audit compares gate scripts against the base branch tip instead of the PR's merge base. When the base changed a gate script after the PR branched, a PR that never touched package.json gets a blocking gate-script-changed finding and ends needs_human.",
@@ -5626,10 +5404,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            191,
-            200
-          ],
+          "lines": [191, 200],
           "severity": "major",
           "category": "data-migration",
           "summary": "Prepare now requires sourceRef.baseRef and baseSha for verify-change runs. A PR run queued before the upgrade has neither and fails with 'Verification requires valid PR baseRef' and no model calls.",
@@ -6097,10 +5872,7 @@
       "defects": [
         {
           "file": "src/cli/setup.ts",
-          "lines": [
-            24,
-            30
-          ],
+          "lines": [24, 30],
           "severity": "blocker",
           "required": true,
           "category": "privacy",
@@ -6110,10 +5882,7 @@
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [
-            203,
-            208
-          ],
+          "lines": [203, 208],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -6123,10 +5892,7 @@
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [
-            198,
-            203
-          ],
+          "lines": [198, 203],
           "severity": "minor",
           "required": false,
           "category": "data-migration",
@@ -6136,10 +5902,7 @@
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [
-            79,
-            95
-          ],
+          "lines": [79, 95],
           "severity": "major",
           "required": true,
           "category": "completeness",
@@ -6149,10 +5912,7 @@
         },
         {
           "file": "test/setup-support.ts",
-          "lines": [
-            33,
-            44
-          ],
+          "lines": [33, 44],
           "severity": "major",
           "required": true,
           "category": "test-gap",
@@ -6162,10 +5922,7 @@
         },
         {
           "file": "test/init.test.ts",
-          "lines": [
-            131,
-            150
-          ],
+          "lines": [131, 150],
           "severity": "major",
           "required": true,
           "category": "test-gap",
@@ -6175,10 +5932,7 @@
         },
         {
           "file": "src/cli/setup.ts",
-          "lines": [
-            223,
-            224
-          ],
+          "lines": [223, 224],
           "severity": "minor",
           "required": false,
           "category": "spec-mismatch",
@@ -6223,10 +5977,7 @@
       "defects": [
         {
           "file": "src/harness/codex.ts",
-          "lines": [
-            814,
-            820
-          ],
+          "lines": [814, 820],
           "severity": "blocker",
           "required": true,
           "category": "correctness",
@@ -6236,10 +5987,7 @@
         },
         {
           "file": "src/harness/sandbox.ts",
-          "lines": [
-            198,
-            211
-          ],
+          "lines": [198, 211],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -6249,10 +5997,7 @@
         },
         {
           "file": "src/gates/run.ts",
-          "lines": [
-            55,
-            58
-          ],
+          "lines": [55, 58],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -6262,10 +6007,7 @@
         },
         {
           "file": "test/signal-confinement.test.ts",
-          "lines": [
-            179,
-            183
-          ],
+          "lines": [179, 183],
           "severity": "major",
           "required": true,
           "category": "test-gap",
@@ -6275,10 +6017,7 @@
         },
         {
           "file": "src/harness/signals.ts",
-          "lines": [
-            28,
-            28
-          ],
+          "lines": [28, 28],
           "severity": "minor",
           "required": false,
           "category": "logic",
@@ -6288,10 +6027,7 @@
         },
         {
           "file": "src/harness/signals.ts",
-          "lines": [
-            54,
-            66
-          ],
+          "lines": [54, 66],
           "severity": "minor",
           "required": false,
           "category": "logic",
@@ -6301,10 +6037,7 @@
         },
         {
           "file": "src/pipeline/report.ts",
-          "lines": [
-            296,
-            301
-          ],
+          "lines": [296, 301],
           "severity": "minor",
           "required": false,
           "category": "other",
@@ -6314,10 +6047,7 @@
         },
         {
           "file": "src/harness/sandbox.ts",
-          "lines": [
-            66,
-            69
-          ],
+          "lines": [66, 69],
           "severity": "nit",
           "required": false,
           "category": "error-handling",
@@ -6327,6 +6057,14 @@
         }
       ],
       "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "orchestrator, overriding codex/sol-6.1 high",
+          "evidence": "Adjudicator verdict rejected (blocker) replaced by confirmed (blocker) for candidate (src/harness/codex.ts): Nesting Seatbelt around internally sandboxed CLIs prevents tool-enabled invocations from starting. Orchestrator platform probe plus HEAD code (the adjudicator could not run Seatbelt inside its own sandbox): on macOS an inner sandbox-exec exits 71 'sandbox_apply: Operation not permitted' under any outer profile that denies something, and HEAD's nested signal probe applies an inner sandbox-exec under the factory's restrictive profile before every tool-enabled Codex invocation, so those invocations are refused."
+        },
         {
           "from": "real",
           "to": "real",
@@ -6402,10 +6140,7 @@
       "defects": [
         {
           "file": "src/router/router.ts",
-          "lines": [
-            256,
-            262
-          ],
+          "lines": [256, 262],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -6415,10 +6150,7 @@
         },
         {
           "file": "src/router/router.ts",
-          "lines": [
-            313,
-            327
-          ],
+          "lines": [313, 327],
           "severity": "minor",
           "required": false,
           "category": "spec-mismatch",
@@ -6445,10 +6177,7 @@
       "defects": [
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            348,
-            353
-          ],
+          "lines": [348, 353],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -6458,10 +6187,7 @@
         },
         {
           "file": "src/router/providers.ts",
-          "lines": [
-            571,
-            578
-          ],
+          "lines": [571, 578],
           "severity": "minor",
           "required": false,
           "category": "correctness",
@@ -6488,10 +6214,7 @@
       "defects": [
         {
           "file": "src/pipeline/context.ts",
-          "lines": [
-            549,
-            552
-          ],
+          "lines": [549, 552],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -6528,10 +6251,7 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            881,
-            884
-          ],
+          "lines": [881, 884],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -6541,10 +6261,7 @@
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            881,
-            884
-          ],
+          "lines": [881, 884],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -6605,10 +6322,7 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            904,
-            911
-          ],
+          "lines": [904, 911],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -6618,10 +6332,7 @@
         },
         {
           "file": "src/gates/media.ts",
-          "lines": [
-            43,
-            50
-          ],
+          "lines": [43, 50],
           "severity": "minor",
           "required": false,
           "category": "spec-mismatch",
@@ -6631,10 +6342,7 @@
         },
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            904,
-            910
-          ],
+          "lines": [904, 910],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -6644,10 +6352,7 @@
         },
         {
           "file": "src/gates/media.ts",
-          "lines": [
-            515,
-            524
-          ],
+          "lines": [515, 524],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -6716,29 +6421,23 @@
       "defects": [
         {
           "file": "src/gates/media.ts",
-          "lines": [
-            607,
-            616
-          ],
-          "severity": "blocker",
-          "required": true,
-          "category": "security",
-          "summary": "Unconsumed WebP token storage admits a recoverable archive outside the pixels.",
-          "foundBy": "orchestrator review rev382e",
-          "adjudication": "confirmed"
-        },
-        {
-          "file": "src/gates/media.ts",
-          "lines": [
-            43,
-            45
-          ],
+          "lines": [43, 45],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "A bare executable magic match rejects valid image bytes with an incidental signature.",
           "foundBy": "orchestrator review rev382e",
           "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "orchestrator, overriding codex/sol-6.1 high",
+          "evidence": "Adjudicator verdict confirmed (blocker) replaced by rejected (blocker) for candidate (src/gates/media.ts): Unconsumed WebP token storage admits a recoverable archive outside the pixels. Orchestrator consistency check: the request defines inert media by extension and does not ask for content validation, so an archive carried inside a WebP is the same polyglot class rejected for review-047; base also exempted WebP, and the change's own validator gap is neither a regression nor an unmet requirement."
         }
       ]
     },
@@ -6759,10 +6458,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            178,
-            184
-          ],
+          "lines": [178, 184],
           "severity": "blocker",
           "required": true,
           "category": "security",
@@ -6772,10 +6468,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            173,
-            184
-          ],
+          "lines": [173, 184],
           "severity": "major",
           "required": true,
           "category": "completeness",
@@ -6812,10 +6505,7 @@
       "defects": [
         {
           "file": "src/db/migrations/20261005T134145-worktree-provenance.sql",
-          "lines": [
-            6,
-            13
-          ],
+          "lines": [6, 13],
           "severity": "major",
           "required": true,
           "category": "data-migration",
@@ -6825,10 +6515,7 @@
         },
         {
           "file": "test/git-integrity.test.ts",
-          "lines": [
-            109,
-            112
-          ],
+          "lines": [109, 112],
           "severity": "minor",
           "required": false,
           "category": "test-gap",
@@ -6855,10 +6542,7 @@
       "defects": [
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            321,
-            327
-          ],
+          "lines": [321, 327],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -6868,10 +6552,7 @@
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            297,
-            304
-          ],
+          "lines": [297, 304],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -6881,10 +6562,7 @@
         },
         {
           "file": "src/integrations/github-poller.ts",
-          "lines": [
-            314,
-            325
-          ],
+          "lines": [314, 325],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -6894,10 +6572,7 @@
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            185,
-            190
-          ],
+          "lines": [185, 190],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -6924,10 +6599,7 @@
       "defects": [
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            387,
-            389
-          ],
+          "lines": [387, 389],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -6937,10 +6609,7 @@
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            345,
-            346
-          ],
+          "lines": [345, 346],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -6967,10 +6636,7 @@
       "defects": [
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            394,
-            400
-          ],
+          "lines": [394, 400],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -6980,10 +6646,7 @@
         },
         {
           "file": "src/integrations/ci-classifier.ts",
-          "lines": [
-            42,
-            48
-          ],
+          "lines": [42, 48],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -7010,10 +6673,7 @@
       "defects": [
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [
-            71,
-            76
-          ],
+          "lines": [71, 76],
           "severity": "blocker",
           "required": true,
           "category": "data-migration",
@@ -7050,10 +6710,7 @@
       "defects": [
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [
-            71,
-            76
-          ],
+          "lines": [71, 76],
           "severity": "blocker",
           "required": true,
           "category": "data-migration",
@@ -7080,10 +6737,7 @@
       "defects": [
         {
           "file": "ui/components/RetryModels.tsx",
-          "lines": [
-            15,
-            23
-          ],
+          "lines": [15, 23],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -7093,10 +6747,7 @@
         },
         {
           "file": "ui/pages/Setup.tsx",
-          "lines": [
-            78,
-            88
-          ],
+          "lines": [78, 88],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -7106,10 +6757,7 @@
         },
         {
           "file": "ui/components/CatalogForm.tsx",
-          "lines": [
-            66,
-            72
-          ],
+          "lines": [66, 72],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -7119,10 +6767,7 @@
         },
         {
           "file": "ui/pages/Setup.tsx",
-          "lines": [
-            619,
-            625
-          ],
+          "lines": [619, 625],
           "severity": "major",
           "required": true,
           "category": "completeness",
@@ -7149,10 +6794,7 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            112,
-            124
-          ],
+          "lines": [112, 124],
           "severity": "blocker",
           "required": true,
           "category": "resource",
@@ -7162,10 +6804,7 @@
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            146,
-            151
-          ],
+          "lines": [146, 151],
           "severity": "major",
           "required": true,
           "category": "resource",
@@ -7175,10 +6814,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            1106,
-            1109
-          ],
+          "lines": [1106, 1109],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -7205,10 +6841,7 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            158,
-            175
-          ],
+          "lines": [158, 175],
           "severity": "blocker",
           "required": true,
           "category": "resource",
@@ -7218,10 +6851,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            845,
-            847
-          ],
+          "lines": [845, 847],
           "severity": "major",
           "required": true,
           "category": "resource",
@@ -7231,10 +6861,7 @@
         },
         {
           "file": "src/harness/scratch.ts",
-          "lines": [
-            182,
-            187
-          ],
+          "lines": [182, 187],
           "severity": "major",
           "required": true,
           "category": "resource",
@@ -7244,10 +6871,7 @@
         },
         {
           "file": "src/util/processes-darwin.ts",
-          "lines": [
-            132,
-            138
-          ],
+          "lines": [132, 138],
           "severity": "major",
           "required": true,
           "category": "resource",
@@ -7300,10 +6924,7 @@
       "defects": [
         {
           "file": "src/harness/scratch.ts",
-          "lines": [
-            184,
-            187
-          ],
+          "lines": [184, 187],
           "severity": "major",
           "required": true,
           "category": "concurrency",
@@ -7313,10 +6934,7 @@
         },
         {
           "file": "src/util/processes-darwin.ts",
-          "lines": [
-            156,
-            162
-          ],
+          "lines": [156, 162],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -7353,10 +6971,7 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            365,
-            368
-          ],
+          "lines": [365, 368],
           "severity": "major",
           "required": true,
           "category": "error-handling",
@@ -7383,10 +6998,7 @@
       "defects": [
         {
           "file": "src/harness/reader.ts",
-          "lines": [
-            28,
-            56
-          ],
+          "lines": [28, 56],
           "severity": "blocker",
           "required": true,
           "category": "correctness",
@@ -7396,16 +7008,23 @@
         },
         {
           "file": "src/harness/reader.ts",
-          "lines": [
-            48,
-            51
-          ],
+          "lines": [48, 51],
           "severity": "blocker",
           "required": true,
           "category": "security",
           "summary": "An allow-default reader policy weakens the established confinement boundary.",
           "foundBy": "orchestrator review round 1",
           "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "orchestrator, overriding codex/sol-6.1 high",
+          "evidence": "Adjudicator verdict rejected (blocker) replaced by confirmed (blocker) for candidate (src/harness/reader.ts): The reader loopback policy cannot match the intended socket access. Orchestrator unconfined reproduction: with HEAD's network rules (deny network*, loopback bind, require-all localhost plus ephemeral-port lists), listen() on 127.0.0.1:0 fails with EPERM, while the same probe under an allow-default profile listens and connects. Readers therefore cannot run the loopback servers the change was meant to allow."
         }
       ]
     },
@@ -7426,10 +7045,7 @@
       "defects": [
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [
-            32,
-            34
-          ],
+          "lines": [32, 34],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -7474,10 +7090,7 @@
       "defects": [
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [
-            43,
-            50
-          ],
+          "lines": [43, 50],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -7530,10 +7143,7 @@
       "defects": [
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [
-            40,
-            41
-          ],
+          "lines": [40, 41],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -7543,10 +7153,7 @@
         },
         {
           "file": "src/pipeline/gate-evidence.ts",
-          "lines": [
-            60,
-            65
-          ],
+          "lines": [60, 65],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -7607,10 +7214,7 @@
       "defects": [
         {
           "file": "src/cli/digest.ts",
-          "lines": [
-            19,
-            30
-          ],
+          "lines": [19, 30],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -7620,10 +7224,7 @@
         },
         {
           "file": "src/integrations/mcp-status.ts",
-          "lines": [
-            87,
-            91
-          ],
+          "lines": [87, 91],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -7660,10 +7261,7 @@
       "defects": [
         {
           "file": "src/cli/digest.ts",
-          "lines": [
-            115,
-            119
-          ],
+          "lines": [115, 119],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -7673,10 +7271,7 @@
         },
         {
           "file": "src/integrations/mcp-status.ts",
-          "lines": [
-            45,
-            50
-          ],
+          "lines": [45, 50],
           "severity": "blocker",
           "required": true,
           "category": "privacy",
@@ -7713,10 +7308,7 @@
       "defects": [
         {
           "file": "src/integrations/mcp-status.ts",
-          "lines": [
-            60,
-            64
-          ],
+          "lines": [60, 64],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -7753,10 +7345,7 @@
       "defects": [
         {
           "file": "src/gates/private.ts",
-          "lines": [
-            47,
-            53
-          ],
+          "lines": [47, 53],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -7783,10 +7372,7 @@
       "defects": [
         {
           "file": "src/cli/digest.ts",
-          "lines": [
-            126,
-            130
-          ],
+          "lines": [126, 130],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -7813,10 +7399,7 @@
       "defects": [
         {
           "file": "scripts/smoke.ts",
-          "lines": [
-            1014,
-            1017
-          ],
+          "lines": [1014, 1017],
           "severity": "blocker",
           "required": true,
           "category": "spec-mismatch",
@@ -7826,10 +7409,7 @@
         },
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            1336,
-            1342
-          ],
+          "lines": [1336, 1342],
           "severity": "minor",
           "required": false,
           "category": "logic",
@@ -7839,10 +7419,7 @@
         },
         {
           "file": "src/concierge.ts",
-          "lines": [
-            247,
-            253
-          ],
+          "lines": [247, 253],
           "severity": "minor",
           "required": false,
           "category": "error-handling",
@@ -7879,10 +7456,7 @@
       "defects": [
         {
           "file": "src/concierge.ts",
-          "lines": [
-            282,
-            295
-          ],
+          "lines": [282, 295],
           "severity": "blocker",
           "required": true,
           "category": "spec-mismatch",
@@ -7892,10 +7466,7 @@
         },
         {
           "file": "src/evals/runner.ts",
-          "lines": [
-            841,
-            849
-          ],
+          "lines": [841, 849],
           "severity": "blocker",
           "required": true,
           "category": "spec-mismatch",
@@ -7964,10 +7535,7 @@
       "defects": [
         {
           "file": "src/git/repos.ts",
-          "lines": [
-            960,
-            963
-          ],
+          "lines": [960, 963],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -8020,10 +7588,7 @@
       "defects": [
         {
           "file": "scripts/push-git.sh",
-          "lines": [
-            23,
-            29
-          ],
+          "lines": [23, 29],
           "severity": "blocker",
           "required": true,
           "category": "security",
@@ -8033,10 +7598,7 @@
         },
         {
           "file": "scripts/push-git.sh",
-          "lines": [
-            19,
-            25
-          ],
+          "lines": [19, 25],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -8046,10 +7608,7 @@
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            65,
-            67
-          ],
+          "lines": [65, 67],
           "severity": "major",
           "required": true,
           "category": "delivery",
@@ -8059,10 +7618,7 @@
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            67,
-            67
-          ],
+          "lines": [67, 67],
           "severity": "major",
           "required": true,
           "category": "delivery",
@@ -8089,10 +7645,7 @@
       "defects": [
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            105,
-            110
-          ],
+          "lines": [105, 110],
           "severity": "blocker",
           "required": true,
           "category": "security",
@@ -8102,10 +7655,7 @@
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            45,
-            48
-          ],
+          "lines": [45, 48],
           "severity": "blocker",
           "required": true,
           "category": "security",
@@ -8115,10 +7665,7 @@
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            60,
-            66
-          ],
+          "lines": [60, 66],
           "severity": "major",
           "required": true,
           "category": "delivery",
@@ -8128,10 +7675,7 @@
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            35,
-            38
-          ],
+          "lines": [35, 38],
           "severity": "minor",
           "required": false,
           "category": "correctness",
@@ -8168,10 +7712,7 @@
       "defects": [
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            74,
-            76
-          ],
+          "lines": [74, 76],
           "severity": "major",
           "required": true,
           "category": "security",
@@ -8181,10 +7722,7 @@
         },
         {
           "file": "scripts/land-pr.sh",
-          "lines": [
-            97,
-            104
-          ],
+          "lines": [97, 104],
           "severity": "minor",
           "required": false,
           "category": "correctness",
@@ -8227,10 +7765,7 @@
       "defects": [
         {
           "file": "src/harness/types.ts",
-          "lines": [
-            168,
-            171
-          ],
+          "lines": [168, 171],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -8240,10 +7775,7 @@
         },
         {
           "file": "src/harness/types.ts",
-          "lines": [
-            179,
-            187
-          ],
+          "lines": [179, 187],
           "severity": "minor",
           "required": false,
           "category": "concurrency",
@@ -8253,10 +7785,7 @@
         },
         {
           "file": "src/harness/types.ts",
-          "lines": [
-            153,
-            155
-          ],
+          "lines": [153, 155],
           "severity": "minor",
           "required": false,
           "category": "resource",
@@ -8293,10 +7822,7 @@
       "defects": [
         {
           "file": "src/harness/types.ts",
-          "lines": [
-            203,
-            209
-          ],
+          "lines": [203, 209],
           "severity": "major",
           "required": true,
           "category": "resource",
@@ -8323,10 +7849,7 @@
       "defects": [
         {
           "file": "src/harness/types.ts",
-          "lines": [
-            225,
-            228
-          ],
+          "lines": [225, 228],
           "severity": "major",
           "required": true,
           "category": "concurrency",
@@ -8369,10 +7892,7 @@
       "defects": [
         {
           "file": "src/gates/failures.ts",
-          "lines": [
-            15,
-            17
-          ],
+          "lines": [15, 17],
           "severity": "major",
           "required": true,
           "category": "correctness",
@@ -8382,10 +7902,7 @@
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [
-            27,
-            31
-          ],
+          "lines": [27, 31],
           "severity": "minor",
           "required": false,
           "category": "completeness",
@@ -8395,10 +7912,7 @@
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [
-            19,
-            24
-          ],
+          "lines": [19, 24],
           "severity": "minor",
           "required": false,
           "category": "completeness",
@@ -8408,10 +7922,7 @@
         },
         {
           "file": "src/evals/cases.ts",
-          "lines": [
-            70,
-            79
-          ],
+          "lines": [70, 79],
           "severity": "minor",
           "required": false,
           "category": "correctness",
@@ -8470,10 +7981,7 @@
       "defects": [
         {
           "file": "src/router/runtime-policy.ts",
-          "lines": [
-            25,
-            31
-          ],
+          "lines": [25, 31],
           "severity": "major",
           "required": true,
           "category": "data-migration",
@@ -8483,10 +7991,7 @@
         },
         {
           "file": "src/app.ts",
-          "lines": [
-            100,
-            104
-          ],
+          "lines": [100, 104],
           "severity": "major",
           "required": true,
           "category": "data-migration",
@@ -8496,10 +8001,7 @@
         },
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [
-            61,
-            69
-          ],
+          "lines": [61, 69],
           "severity": "major",
           "required": true,
           "category": "logic",
@@ -8526,10 +8028,7 @@
       "defects": [
         {
           "file": "src/router/runtime-policy.ts",
-          "lines": [
-            113,
-            117
-          ],
+          "lines": [113, 117],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8566,10 +8065,7 @@
       "defects": [
         {
           "file": "src/router/runtime-catalog.ts",
-          "lines": [
-            27,
-            34
-          ],
+          "lines": [27, 34],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8596,10 +8092,7 @@
       "defects": [
         {
           "file": "src/gates/run.ts",
-          "lines": [
-            88,
-            98
-          ],
+          "lines": [88, 98],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8609,10 +8102,7 @@
         },
         {
           "file": "src/gates/run.ts",
-          "lines": [
-            60,
-            62
-          ],
+          "lines": [60, 62],
           "severity": "minor",
           "required": false,
           "category": "logic",
@@ -8637,6 +8127,14 @@
           "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
           "by": "codex/sol-6.1 high; evidence checked by the orchestrator",
           "evidence": "Removed candidate (major, src/cli/service.ts): A credential divided between stdout and stderr remains visible in deploy diagnostics. Reason: Neither independent stream contains the registered credential, and both fragments were already exposed at base. The request requires applying the shared redactor before diagnostic cuts, which HEAD does; reconstructing credentials deliberately divided across streams is not a stated requirement."
+        },
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "orchestrator, overriding codex/sol-6.1 high",
+          "evidence": "Adjudicator verdict rejected (minor) replaced by confirmed (minor) for candidate (src/gates/run.ts): Output normalization can produce a confinement marker that was absent from the raw launch scan. Orchestrator decision between two adjudication passes that disagreed: the request requires the raw-text launch scan to stay authoritative, and confinementFailed still scans the normalized output, so an escape-split marker becomes a blocking confinement error (reproduced)."
         }
       ]
     },
@@ -8657,10 +8155,7 @@
       "defects": [
         {
           "file": "src/gates/output.ts",
-          "lines": [
-            7,
-            8
-          ],
+          "lines": [7, 8],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8670,10 +8165,7 @@
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [
-            17,
-            18
-          ],
+          "lines": [17, 18],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8700,10 +8192,7 @@
       "defects": [
         {
           "file": "src/gates/failures.ts",
-          "lines": [
-            49,
-            53
-          ],
+          "lines": [49, 53],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8713,10 +8202,7 @@
         },
         {
           "file": "src/gates/failures.ts",
-          "lines": [
-            36,
-            41
-          ],
+          "lines": [36, 41],
           "severity": "major",
           "required": true,
           "category": "resource",
@@ -8726,10 +8212,7 @@
         },
         {
           "file": "src/gates/output.ts",
-          "lines": [
-            33,
-            36
-          ],
+          "lines": [33, 36],
           "severity": "minor",
           "required": false,
           "category": "privacy",
@@ -8766,10 +8249,7 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            453,
-            458
-          ],
+          "lines": [453, 458],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8779,10 +8259,7 @@
         },
         {
           "file": "src/gates/run.ts",
-          "lines": [
-            71,
-            74
-          ],
+          "lines": [71, 74],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8809,10 +8286,7 @@
       "defects": [
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            464,
-            467
-          ],
+          "lines": [464, 467],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8822,10 +8296,7 @@
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            460,
-            467
-          ],
+          "lines": [460, 467],
           "severity": "major",
           "required": true,
           "category": "privacy",
@@ -8835,10 +8306,7 @@
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            474,
-            482
-          ],
+          "lines": [474, 482],
           "severity": "minor",
           "required": false,
           "category": "resource",
@@ -8848,10 +8316,7 @@
         },
         {
           "file": "src/util/proc.ts",
-          "lines": [
-            625,
-            626
-          ],
+          "lines": [625, 626],
           "severity": "minor",
           "required": false,
           "category": "correctness",
@@ -8878,10 +8343,7 @@
       "defects": [
         {
           "file": "test/pipeline-panel.test.ts",
-          "lines": [
-            210,
-            212
-          ],
+          "lines": [210, 212],
           "severity": "major",
           "required": true,
           "category": "test-gap",
@@ -8891,16 +8353,23 @@
         },
         {
           "file": ".limitless.toml",
-          "lines": [
-            10,
-            10
-          ],
+          "lines": [10, 10],
           "severity": "major",
           "required": true,
           "category": "correctness",
           "summary": "Factory gate environment construction discards the configured test worker override.",
           "foundBy": "orchestrator review rev424",
           "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "real",
+          "to": "real",
+          "on": "2026-10-08",
+          "rule": "M5.2 candidate rule and adjudication procedure, 2026-10-08 (LABELS.md)",
+          "by": "orchestrator, overriding codex/sol-6.1 high",
+          "evidence": "Adjudicator verdict rejected (major) replaced by confirmed (major) for candidate (test/pipeline-panel.test.ts): Increasing panel test deadlines leaves the underlying parallel Git race undiagnosed. Orchestrator check: the request says not to raise the flaky panel test's timeout without understanding the failure; HEAD doubles the waitFor deadline (20 s to 40 s) while discardChanges (src/git/repos.ts:482) still runs git status with its optional index refresh. The race between that refresh and the parallel finders' admin-directory check was the cause, fixed later on the same PR by --no-optional-locks with the original deadlines restored."
         }
       ]
     },
