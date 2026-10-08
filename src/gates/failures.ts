@@ -62,7 +62,8 @@ export class FailureExcerpts {
 
   result(): string | undefined {
     this.finish();
-    if (!this.excerpts.length) return undefined;
+    // Failures whose identities alone overflow the budget still say that something was left out.
+    if (!this.excerpts.length) return this.omitted ? OMITTED : undefined;
     return [...this.excerpts, ...(this.omitted ? [OMITTED] : [])].join("\n\n");
   }
 }

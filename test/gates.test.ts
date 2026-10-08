@@ -253,6 +253,15 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
     },
   );
 
+  test("reports left-out failures when no failure identity fits the budget", () => {
+    const output = Array.from(
+      { length: 12 },
+      (_, i) => `error: reason ${i}\n(fail) failure-${i}-${"n".repeat(9_000)}`,
+    ).join("\n");
+    expect(extractFailures(output)).toBe("[failure excerpts: diagnostic lines or failures left out]");
+    expect(extractFailures("(pass) fine\n")).toBeUndefined();
+  });
+
   test("strips ANSI and stops at bun results and file headers", () => {
     const output =
       "old diagnostics\n(pass) earlier\nerror: first\n\u001b[31m(fail) one\u001b[0m\r\n" +
