@@ -227,6 +227,13 @@ export const Setup = () => {
           {errors().load}
         </div>
       </Show>
+      <For each={routing()?.unavailable ?? []}>
+        {(target) => (
+          <p>
+            {target.id}: unavailable ({target.reason}); {target.references.join("; ")}
+          </p>
+        )}
+      </For>
       <section class="stack" aria-label="Routing grid">
         <h2>Routing</h2>
         <Show when={routing()} fallback={<p>Loading routing…</p>}>
@@ -565,6 +572,9 @@ export const Setup = () => {
                 <article class="card card-pad stack">
                   <strong>{id}</strong>
                   <span class="chip-tag">{model()?.source}</span>
+                  <Show when={model()?.unavailable}>
+                    <p>Unavailable: {model()?.unavailable}</p>
+                  </Show>
                   <Show when={model()?.excluded}>
                     <p>{model()?.excluded}</p>
                   </Show>

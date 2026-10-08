@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 
 export interface SshForward {
-  host: string; // ssh destination, e.g. "twilight"
+  host: string; // ssh destination, e.g. "example.com"
   localPort: number;
   remotePort: number;
 }

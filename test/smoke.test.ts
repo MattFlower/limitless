@@ -54,7 +54,7 @@ const result: AgentResult = {
 const now = () => performance.now();
 
 test("excluded backend smoke preserves missing-key and failed-health skips without invoking a checker", async () => {
-  const providers = PROVIDERS.filter((p) => ["omlx", "twilight", "openrouter", "typesafe"].includes(p.id));
+  const providers = PROVIDERS.filter((p) => ["omlx", "openrouter", "typesafe"].includes(p.id));
   const models = MODELS.filter((m) => providers.some((p) => p.id === m.provider)).map((m) => ({
     ...m,
     origin: "CN",
@@ -79,7 +79,6 @@ test("excluded backend smoke preserves missing-key and failed-health skips witho
   expect(missing.map((r) => [r.name, r.status, r.reason])).toEqual([
     ["omlx structured", "skip", "missing OMLX_API_KEY"],
     ["omlx claude-harness edit", "skip", "missing OMLX_API_KEY"],
-    ["twilight structured", "skip", "missing TWILIGHT_API_KEY"],
     ["openrouter structured", "skip", "missing OPENROUTER_API_KEY"],
     ["typesafe decisions", "skip", "missing TYPESAFE_API_KEY"],
   ]);
@@ -87,19 +86,19 @@ test("excluded backend smoke preserves missing-key and failed-health skips witho
   expect(probes).toBe(0);
   const local = { providers: providers.filter((p) => p.healthUrl), models };
   const down = await runChecks(
-    backendChecks({ OMLX_API_KEY: "key", TWILIGHT_API_KEY: "key" }, probe, check, decide, local, ["CN"]),
+    backendChecks({ OMLX_API_KEY: "key" }, probe, check, decide, local, ["CN"]),
     now,
     noDelay,
   );
-  expect(down).toHaveLength(3);
+  expect(down).toHaveLength(2);
   expect(down.every((r) => r.status === "skip" && r.reason === "health probe returned HTTP 503")).toBe(true);
   expect(exitCode(down)).toBe(0);
-  expect(probes).toBe(6);
+  expect(probes).toBe(4);
   expect(calls).toEqual([]);
 });
 
 test("backend smoke excludes origins before structured, edit and decisions calls and selects allowed alternatives", async () => {
-  const providers = ["omlx", "twilight", "openrouter", "typesafe"].map((id) => {
+  const providers = ["omlx", "openrouter", "typesafe"].map((id) => {
     const provider = PROVIDERS.find((p) => p.id === id);
     if (!provider) throw new Error(`missing ${id} provider`);
     return provider;
@@ -1052,7 +1051,7 @@ test("TypeSafe decisions smoke skips without its key and checks answers, usage a
 });
 
 test("an optional backend that is down late in the run is still skipped", async () => {
-  // Scaled clock: an earlier check uses 530 s, so twilight's 330 s timeout no longer fits a retry.
+  // Scaled clock: an earlier check uses 530 s, so omlx's 330 s timeout no longer fits a retry.
   let clock = 0;
   const earlier: SmokeCheck = {
     name: "earlier",
@@ -1065,15 +1064,13 @@ test("an optional backend that is down late in the run is still skipped", async 
     clock += 3_000;
     throw new Error("offline");
   }) as unknown as typeof fetch;
-  const twilight = backendChecks({ TWILIGHT_API_KEY: "key" }, down).filter((c) =>
-    c.name.startsWith("twilight"),
-  );
-  const rows = await runChecks([earlier, ...twilight], () => clock, noDelay, { budgetMs: SMOKE_BUDGET_MS });
+  const omlx = backendChecks({ OMLX_API_KEY: "key" }, down).filter((c) => c.name === "omlx structured");
+  const rows = await runChecks([earlier, ...omlx], () => clock, noDelay, { budgetMs: SMOKE_BUDGET_MS });
   expect(rows.map((row) => [row.name, row.status, row.reason])).toEqual([
     ["earlier", "pass", undefined],
-    ["twilight structured", "skip", "health probe failed"],
+    ["omlx structured", "skip", "health probe failed"],
   ]);
-  expect(formatReport(rows)).toMatch(/twilight structured\s+SKIP\s/);
+  expect(formatReport(rows)).toMatch(/omlx structured\s+SKIP\s/);
   expect(exitCode(rows)).toBe(0);
 });
 

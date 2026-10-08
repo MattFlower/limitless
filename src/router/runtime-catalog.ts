@@ -1,10 +1,13 @@
 import { z } from "zod";
+import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { redactCredentials } from "../util/proc.ts";
 import type { ModelDef, ProviderDef } from "./catalog.ts";
 import { runtimeModel } from "./config-catalog.ts";
 import { originExclusion } from "./origins.ts";
 import { validatePolicy, validateRunModels } from "./policy.ts";
 import type { ProviderTracker } from "./providers.ts";
+import { filterRetiredTargets, retiredReason } from "./retired.ts";
 import type { Router } from "./router.ts";
 import type { RuntimePolicy } from "./runtime-policy.ts";
 import { parseTarget } from "./targets.ts";
@@ -23,13 +26,17 @@ export class RuntimeCatalog {
     return {
       history: this.store.catalogHistory(),
       ...(this.router.excludeOrigins === undefined ? {} : { excludeOrigins: this.router.excludeOrigins }),
-      models: this.models.map((m) => ({
-        ...m,
-        source: m.source ?? "code",
-        ...(this.router.excludeOrigins === undefined
-          ? {}
-          : { excluded: originExclusion(m, this.router.excludeOrigins) }),
-      })),
+      models: this.models.map((m) => {
+        const unavailable = retiredReason(m.provider, this.providers);
+        return {
+          ...m,
+          source: m.source ?? "code",
+          ...(unavailable ? { unavailable: redactCredentials(unavailable) } : {}),
+          ...(this.router.excludeOrigins === undefined
+            ? {}
+            : { excluded: originExclusion(m, this.router.excludeOrigins) }),
+        };
+      }),
       providers: this.tracker
         .all()
         .filter((p) => p.discovery)
@@ -47,9 +54,33 @@ export class RuntimeCatalog {
   private apply(id: string, model: ModelDef | null, note: string | null = null) {
     const next = this.models.filter((m) => m.id !== id);
     if (model) next.push(model);
+    // Only references valid before this edit can be newly invalidated by it.
+    const affected = (role: string, groups: string[]) =>
+      filterRetiredTargets(groups, this.models, this.providers).flatMap((group) =>
+        group.split("|").filter((ref) => {
+          if (parseTarget(ref).modelId !== id) return false;
+          try {
+            validatePolicy({ [role]: { default: [ref] } }, this.models, this.providers);
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      );
     for (const [layer, policy] of Object.entries(this.routing.snapshot().layers)) {
       try {
-        validatePolicy(policy, next, this.providers);
+        const scoped = Object.fromEntries(
+          Object.entries(policy).map(([role, cells]) => [
+            role,
+            Object.fromEntries(
+              Object.entries(cells).flatMap(([cell, groups]) => {
+                const refs = affected(role, groups);
+                return refs.length ? [[cell, refs]] : [];
+              }),
+            ),
+          ]),
+        );
+        validatePolicy(scoped, next, this.providers);
       } catch (error) {
         const reason =
           error instanceof z.ZodError
@@ -59,9 +90,16 @@ export class RuntimeCatalog {
       }
     }
     for (const run of this.store.listRuns({ limit: Number.MAX_SAFE_INTEGER })) {
+      if (model === null && TERMINAL_STATUSES.includes(run.status)) continue;
       if (run.models == null) continue;
       try {
-        validateRunModels(run.models, next, this.providers);
+        const scoped = Object.fromEntries(
+          Object.entries(run.models).flatMap(([role, groups]) => {
+            const refs = affected(role, groups);
+            return refs.length ? [[role, refs]] : [];
+          }),
+        );
+        validateRunModels(scoped, next, this.providers);
       } catch (error) {
         throw new Error(`run ${run.id}: ${String(error)}`);
       }
@@ -106,13 +144,6 @@ export class RuntimeCatalog {
 
   remove(id: string) {
     this.editable(id);
-    const cells = this.store
-      .routingCells()
-      .filter((cell) => cell.groups.some((g) => g.split("|").some((ref) => parseTarget(ref).modelId === id)));
-    if (cells.length)
-      throw new Error(
-        `${id} is referenced by operator policy: ${cells.map((c) => `${c.role}.${c.cell}`).join(", ")}`,
-      );
     return this.apply(id, null);
   }
 }

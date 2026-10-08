@@ -742,11 +742,11 @@ test.each(["triage", "implement"] as const)(
         const cell = role === "implement" ? "small" : "default";
         const matching = generatePolicy(input([row]));
         expect(matching.generated[role]?.[cell]).toEqual([subscription, metered]);
-        const models = MODELS.map((m) => (m.id === metered ? { ...m, provider: "twilight" } : m));
+        const models = MODELS.map((m) => (m.id === metered ? { ...m, provider: "omlx" } : m));
         // Even one mismatching row must reject a target whose other rows match the new provider.
         if (mixed)
           for (const t of row.trials)
-            if (t.modelId === metered && t.caseId !== "case-39") t.details.provider = "twilight";
+            if (t.modelId === metered && t.caseId !== "case-39") t.details.provider = "omlx";
         const result = generatePolicy(input([row], { models }));
         const decision = result.roles.find((r) => r.role === role && r.cell === cell);
         const rejected = decision?.candidates.find((c) => c.modelId === metered);
@@ -757,7 +757,7 @@ test.each(["triage", "implement"] as const)(
         expect(rejected?.costPerCase).toBeNull();
         expect(rejected?.billing).toBeNull();
         expect(rejected?.summary.costUsd).toBeCloseTo(16);
-        const reason = "recorded provider openrouter differs from catalog provider twilight";
+        const reason = "recorded provider openrouter differs from catalog provider omlx";
         expect(rejected?.reasons).toContain(reason);
         expect(renderEvidence(result)).toContain(reason);
       }
@@ -766,9 +766,9 @@ test.each(["triage", "implement"] as const)(
 );
 
 test("implement rejects the exact non-inferiority margin and limits provider fallbacks", () => {
-  const twilight = "twilight/qwen-27b";
+  const omlx = "omlx/qwen-27b";
   const otherSubscription = "codex/luna@low";
-  const row = evidence("implement", [metered, subscription, local, otherSubscription, twilight], { k: 10 });
+  const row = evidence("implement", [metered, subscription, local, otherSubscription, omlx], { k: 10 });
   for (const t of row.trials) {
     t.details.complexity = "medium";
     if (recordedTarget(t) !== metered && t.trial === 0) t.pass = false;
@@ -776,8 +776,8 @@ test("implement rejects the exact non-inferiority margin and limits provider fal
   const result = generatePolicy(input([row]));
   const cell = result.roles.find((r) => r.role === "implement" && r.cell === "medium");
   expect(cell?.candidates.find((c) => c.modelId === local)?.comparison.lowerBound).toBeCloseTo(-0.1);
-  expect(cell?.order).toEqual([metered, local, twilight, otherSubscription]);
-  expect(cell?.availabilityFallbacks).toEqual([local, twilight, otherSubscription]);
+  expect(cell?.order).toEqual([metered, local, omlx, otherSubscription]);
+  expect(cell?.availabilityFallbacks).toEqual([local, omlx, otherSubscription]);
   expect(cell?.order).not.toContain(subscription);
   expect(renderEvidence(result)).toContain("lower=-0.1000");
 });
@@ -863,7 +863,7 @@ test("round diagnostics use recorded targets, providers and incremental costs wi
   initial.provider = "openrouter";
   trial.costUsd = 999;
   trial.costEquivUsd = 888;
-  const models = MODELS.map((m) => (m.id === metered ? { ...m, provider: "twilight" } : m));
+  const models = MODELS.map((m) => (m.id === metered ? { ...m, provider: "omlx" } : m));
   const result = generatePolicy(input([row], { models }));
   expect(result.rounds).toMatchObject([
     { modelId: metered, provider: "openrouter", pass: false, costUsd: 0.11, billing: "metered", cost: 0.11 },
@@ -905,10 +905,10 @@ test("round diagnostics use recorded targets, providers and incremental costs wi
 });
 
 test("each uncovered provider contributes at most one availability fallback", () => {
-  const twilight = "twilight/qwen-27b@none";
+  const omlx = "omlx/qwen-27b@none";
   const mtplx = "mtplx/qwen-27b@none";
-  const row = evidence("triage", [metered, twilight, mtplx]);
-  for (const id of [twilight, mtplx].map((m) => parseTarget(m).modelId))
+  const row = evidence("triage", [metered, omlx, mtplx]);
+  for (const id of [omlx, mtplx].map((m) => parseTarget(m).modelId))
     for (const t of row.trials.filter((t) => t.modelId === id).slice(0, 8)) {
       t.pass = false;
       if (t.details.grade) {
@@ -919,7 +919,7 @@ test("each uncovered provider contributes at most one availability fallback", ()
   const role = generatePolicy(input([row])).roles[0];
   // Both local providers are uncovered by the eligible chain, so each adds one fallback after it.
   expect(role?.order[0]).toBe(metered);
-  expect(new Set(role?.availabilityFallbacks)).toEqual(new Set([twilight, mtplx]));
+  expect(new Set(role?.availabilityFallbacks)).toEqual(new Set([omlx, mtplx]));
   expect(role?.order.slice(1)).toEqual(role?.availabilityFallbacks);
 });
 

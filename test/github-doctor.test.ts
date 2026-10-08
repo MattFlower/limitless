@@ -102,7 +102,6 @@ test("limitless doctor reads access problems through the daemon API, never the d
       "GET https://openrouter.ai/api/v1/key",
       "GET http://127.0.0.1:8989/v1/models",
       "GET http://127.0.0.1:8000/v1/models",
-      "GET http://twilight:8080/v1/models",
       `GET ${url}/api/health`,
       `GET ${url}/api/github/access`,
     ]);

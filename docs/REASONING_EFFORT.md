@@ -61,7 +61,7 @@ These values do not represent separate numeric thinking budgets. HTTP structured
 repair requests retain the same mapping. Unset effort omits all effort fields.
 
 Effort support therefore depends on the role as well as the model. Providers reached
-through the Claude CLI's Anthropic-compatible backend (OpenRouter, mtplx, twilight) only
+through the Claude CLI's Anthropic-compatible backend (OpenRouter, mtplx, the remote llama.cpp host) only
 carry effort in the tool-free roles (triage, chat, summarize), which run over direct HTTP.
 In every other role an effort-qualified reference for them (e.g. `review:
 openrouter/gpt-6-luna@low`, `implement: mtplx/qwen-27b@none`) is rejected up front:

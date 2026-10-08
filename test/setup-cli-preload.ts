@@ -54,8 +54,7 @@ globalThis.fetch = Object.assign(
       if (url === "https://openrouter.ai/api/v1/key") return Response.json({ data: {} });
       if ([1234, 8000, 8080, 8989, 11434, 10240].some((port) => url === `http://127.0.0.1:${port}/v1/models`))
         return Response.json({ data: url.includes(":1234/") ? [{ id: "local-model" }] : [] });
-      if (["http://twilight:8080/v1/models", "http://192.0.2.10:8080/v1/models"].includes(url))
-        return Response.json({ data: [{ id: "lan-model" }] });
+      if (url === "http://192.0.2.10:8080/v1/models") return Response.json({ data: [{ id: "lan-model" }] });
       const daemon = process.env.LIMITLESS_URL;
       if (
         daemon &&

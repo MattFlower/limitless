@@ -105,10 +105,10 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
     PROVIDERS,
     store,
     reserves,
-    { OPENROUTER_API_KEY: "fake-key", TWILIGHT_API_KEY: "fake-key" },
+    { OPENROUTER_API_KEY: "fake-key" },
     { openrouter: 50 },
   );
-  for (const provider of ["twilight", "mtplx"]) tracker.setHealthy(provider, true);
+  tracker.setHealthy("mtplx", true);
   const committed = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
   const router = new Router(tracker, committed, MODELS);
   const ids = () => router.route("triage", "small").candidates.map((c) => c.targetId);
@@ -120,7 +120,6 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
     "openrouter/gpt-6-luna@medium",
     "openrouter/gpt-6-luna@low",
     "openrouter/gpt-6-luna@none",
-    "twilight/qwen-27b@none",
     "mtplx/qwen-27b@high",
     "claude/sonnet-5.5@low",
   ]);
@@ -130,7 +129,6 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
     "openrouter/gpt-6-luna@medium",
     "openrouter/gpt-6-luna@low",
     "openrouter/gpt-6-luna@none",
-    "twilight/qwen-27b@none",
     "mtplx/qwen-27b@high",
     "claude/sonnet-5.5@low",
   ]);
@@ -604,13 +602,13 @@ describe("Router", () => {
   });
   test("OpenAI URLs are distinct from agentic backends and protected providers need keys", () => {
     const targets = new Router(
-      new ProviderTracker(PROVIDERS, store, reserves, { OPENROUTER_API_KEY: "or", TWILIGHT_API_KEY: "tw" }),
+      new ProviderTracker(PROVIDERS, store, reserves, { OPENROUTER_API_KEY: "or", OMLX_API_KEY: "om" }),
       policy,
       MODELS,
     );
     for (const [id, url] of [
       ["mtplx/qwen-27b", "http://127.0.0.1:8000/v1"],
-      ["twilight/qwen-27b", "http://twilight:8080/v1"],
+      ["omlx/qwen-27b", "http://127.0.0.1:8989/v1"],
       ["openrouter/deepseek-v4-pro", "https://openrouter.ai/api/v1"],
     ] as const) {
       const model = targets.model(id);
@@ -622,7 +620,7 @@ describe("Router", () => {
     }
     const withoutKeys = new ProviderTracker(PROVIDERS, store, reserves, {});
     expect(withoutKeys.isAvailable("openrouter")).toBe(false);
-    expect(withoutKeys.isAvailable("twilight")).toBe(false);
+    expect(withoutKeys.isAvailable("omlx")).toBe(false);
   });
   test("orders interchangeable models by quota headroom", () => {
     const { tracker, router } = setup();

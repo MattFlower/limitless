@@ -236,7 +236,7 @@ export function resolveCatalog(raw: unknown = undefined) {
       else models[at] = model;
     }
   }
-  const notes = ["omlx", "mtplx", "twilight"]
+  const notes = ["omlx", "mtplx"]
     .filter((id) => !explicit.has(id))
     .map((id) => `${id}: deprecated implicit provider; migrate with limitless providers export --write`);
   return { providers, models, providerMaxConcurrent, notes };

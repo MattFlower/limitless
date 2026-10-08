@@ -24,11 +24,12 @@ import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
+import { retiredReason } from "./router/retired.ts";
 import { Router } from "./router/router.ts";
 import { RuntimeCatalog } from "./router/runtime-catalog.ts";
 import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
-import { redactCredentialData } from "./util/proc.ts";
+import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
@@ -106,8 +107,8 @@ export class Factory {
         }
         throw new Error(`catalog collision: ${model.id}`);
       }
-      if (!this.providerDefs.some((p) => p.id === model.provider))
-        throw new Error(`unknown provider ${model.provider}`);
+      const reason = retiredReason(model.provider, this.providerDefs);
+      if (reason) console.warn(redactCredentials(`[catalog] ${model.id}: unavailable (${reason})`));
       this.models.push(model);
     }
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, console.warn);
