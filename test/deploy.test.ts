@@ -684,6 +684,29 @@ test("a failed smoke gate reports the tail of both output streams and restores t
   expect(f.selected()).toBe("previous");
 });
 
+test("a failed deploy gate keeps early test diagnostics before the summary tail", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== "bun test") return command(args, options);
+    return {
+      stdout: "",
+      stderr:
+        "sample.test.ts:\n\u001b[31merror: values differ\u001b[0m\nExpected: 1\nReceived: 2\n\u001b[31m(fail) assertion\u001b[0m\n" +
+        "skipped summary\n".repeat(700),
+      exitCode: 1,
+    };
+  };
+  const message = String(await deploy(7400, "feature", false, f.opts).catch((e: unknown) => e));
+  expect(message).toContain("deploy gate failed; staying on previous");
+  expect(message).toContain("error: values differ\nExpected: 1\nReceived: 2");
+  expect(message.indexOf("error:")).toBeLessThan(message.indexOf("skipped summary"));
+  expect(message).not.toContain("\u001b");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
+  expect(f.selected()).toBe("previous");
+});
+
 test("a failed gate tail keeps stderr first and stays within 4000 bytes", async () => {
   const f = setup();
   const command = f.opts.command;

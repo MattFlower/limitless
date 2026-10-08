@@ -6,6 +6,7 @@ import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
+import { formatGateOutput } from "../gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { runGates } from "../gates/run.ts";
 import { worktreeGit, worktreeGitScope } from "../git/command.ts";
@@ -313,7 +314,8 @@ export class LandQueue {
       // The gate slot comes from runGates itself: one lease, never a second one on top.
       const run = await runGates(cwd, detectGates(base), signal, {
         holder: "land",
-        onResult: (r) => appendFileSync(log, `\n$ ${r.command}\n${r.output}\n`),
+        onResult: (r) =>
+          appendFileSync(log, `\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
       });
       this.store.updateLandEntry(entry.id, { logPath: log });
       const failed = run.setupOk ? run.checks.filter((c) => !c.ok) : run.setup.filter((c) => !c.ok);
