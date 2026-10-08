@@ -93,6 +93,108 @@ describe("detectGates", () => {
 });
 
 describe("runGates / compareGates", () => {
+  test("redacts setup, checks and retries before tail cuts, callbacks and persistence", async () => {
+    const credential = "synthetic-gate-boundary-credential-409";
+    proc.registerCredential("GATE_BOUNDARY_TEST_TOKEN", credential);
+    const output =
+      `${credential}.test.ts:\n(pass) earlier\nerror: credential ${credential}\n(fail) assertion\n${"summary\n".repeat(1_000)}` +
+      `${credential}${"z".repeat(5_980)}`;
+    const dir = tempDir({ "output.txt": output });
+    const db = join(dir, "store.db");
+    let store = new Store(db);
+    try {
+      const cfg: GateConfig = {
+        setup: ["cat output.txt"],
+        checks: [
+          { name: "test", run: "cat output.txt; exit 1" },
+          { name: "pass", run: "cat output.txt" },
+        ],
+        source: "detected",
+        protectedPaths: [],
+      };
+      const observed: string[] = [];
+      const signal = new AbortController().signal;
+      const run = await runGates(dir, cfg, signal, {
+        onResult: (result) => observed.push(JSON.stringify(result)),
+      });
+      for (const result of [...run.setup, ...run.checks]) {
+        expect(result.output).toContain("[redacted]");
+        expect(result.output).not.toContain(credential.slice(-20));
+      }
+      expect(run.checks[0]?.failures).toContain("error: credential [redacted]");
+      expect(observed).toHaveLength(3);
+      const retried = await retryBaselineFailures(run, dir, cfg, signal);
+      expect(retried.checks[0]?.firstAttempt).toBe(run.checks[0]);
+      expect(retried.checks[0]?.failures).toContain("error: credential [redacted]");
+      const failed = run.checks[0];
+      if (!failed) throw new Error("missing check result");
+      const regression = await retryRegressions(
+        [{ name: "test", verdict: "regressed", blocking: true, result: failed }],
+        dir,
+        cfg,
+        [],
+        signal,
+      );
+      expect(regression[0]?.result.failures).toContain("error: credential [redacted]");
+      for (const text of [...observed, JSON.stringify(retried), JSON.stringify(regression)]) {
+        expect(text).not.toContain(credential);
+        expect(text).not.toContain(credential.slice(-20));
+      }
+      const repo = store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        localPath: null,
+        url: "https://example.com/repo",
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const saved = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+      const key = { repoId: repo.id, baseSha: "base", gatesHash: "gates", envHash: "env" };
+      store.putArtifact(saved.id, "gates.json", "gates", JSON.stringify(retried));
+      store.setRunState(saved.id, retried);
+      // Only successful checks are cached in production.
+      store.putBaselineCache(key, { ...run, checks: run.checks.filter((r) => r.ok) }, saved.id);
+      store.close();
+      store = new Store(db);
+      for (const text of [
+        store.getArtifact(saved.id, "gates.json"),
+        JSON.stringify(store.getRunState(saved.id)),
+        JSON.stringify(store.getBaselineCache(key, 0)),
+      ]) {
+        expect(text).toContain("[redacted]");
+        expect(text).not.toContain(credential);
+        expect(text).not.toContain(credential.slice(-20));
+      }
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts terminal-formatted credentials before failure excerpt bounds", async () => {
+    const credential = "synthetic-excerpt-credential-409";
+    proc.registerCredential("EXCERPT_TEST_TOKEN", credential);
+    const colored = `${credential.slice(0, 12)}\u001b[31m${credential.slice(12)}\u001b[0m`;
+    const dir = tempDir({ "output.txt": `${"x".repeat(7_900)}${colored}\n(fail) assertion\n` });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          checks: [{ name: "test", run: "cat output.txt; exit 1" }],
+          source: "detected",
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.failures).toContain("[redacted]");
+      expect(JSON.stringify(run)).not.toContain(credential);
+      expect(JSON.stringify(run)).not.toContain(credential.slice(0, 12));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("retains early failure diagnostics in the result and its existing artifact", async () => {
     const output =
       "sample.test.ts:\n(pass) earlier\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +
@@ -1234,7 +1336,9 @@ test.skipIf(process.platform !== "darwin")(
 
 for (const padding of [0, 70_000])
   test(`nested sandbox diagnostic blocks despite identical baseline and ${padding} trailing bytes`, async () => {
-    const cwd = tempDir({});
+    const credential = "sandbox_apply: Operation not permitted synthetic-confinement-409";
+    proc.registerCredential("CONFINEMENT_DIAGNOSTIC_TEST_TOKEN", credential);
+    const cwd = tempDir({ "credential.txt": `credential: ${credential}\n` });
     try {
       const cfg: GateConfig = {
         setup: [],
@@ -1243,12 +1347,14 @@ for (const padding of [0, 70_000])
         checks: [
           {
             name: "nested",
-            run: `printf 'sandbox_apply: Operation not permitted\n'; printf '%${padding}s' ''; exit 1`,
+            run: `cat credential.txt; printf '%${padding}s' ''; cat credential.txt; exit 1`,
           },
         ],
       };
       const signal = new AbortController().signal;
       const baseline = await runGates(cwd, cfg, signal);
+      expect(baseline.checks[0]?.output).toContain("credential: [redacted]");
+      expect(baseline.checks[0]?.output).not.toContain(credential);
       const retried = await retryBaselineFailures(baseline, cwd, cfg, signal);
       expect(retried).toBe(baseline);
       const cmp = compareGates(baseline, await runGates(cwd, cfg, signal));

@@ -1,7 +1,29 @@
 import { expect, test } from "bun:test";
 import { extractFailures } from "../src/gates/failures.ts";
-import type { GateComparison } from "../src/gates/run.ts";
+import { compareGates, type GateComparison } from "../src/gates/run.ts";
 import { formatGateFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
+import { credentialGate, gateCredential } from "./gate-output-support.ts";
+
+test("gate feedback and review receive redacted early diagnostics and tails", async () => {
+  const gates = compareGates(null, await credentialGate());
+  const messages = [
+    formatGateFeedback(gates),
+    reviewPrompt({
+      prompt: "fix tests",
+      spec: null,
+      baseSha: "base",
+      stat: "",
+      gates,
+      audit: [],
+      implementerReport: "",
+    }),
+  ];
+  for (const message of messages) {
+    expect(message).toContain("error: credential [redacted]");
+    expect(message).toContain("(fail) assertion");
+    expect(message).not.toContain(gateCredential);
+  }
+});
 
 function comparison(output: string, failures?: string, timedOut = true): GateComparison[] {
   return [

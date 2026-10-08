@@ -24,7 +24,7 @@ import {
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
 import type { HealthResponse } from "../src/core/types.ts";
-import type { sh } from "../src/util/proc.ts";
+import { registerCredential, type sh } from "../src/util/proc.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -685,6 +685,8 @@ test("a failed smoke gate reports the tail of both output streams and restores t
 });
 
 test("a failed deploy gate keeps early test diagnostics before the summary tail", async () => {
+  const credential = "synthetic-deploy-excerpt-credential-409";
+  registerCredential("DEPLOY_EXCERPT_TEST_TOKEN", credential);
   const f = setup();
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
@@ -692,7 +694,7 @@ test("a failed deploy gate keeps early test diagnostics before the summary tail"
     return {
       stdout: "",
       stderr:
-        "sample.test.ts:\n\u001b[31merror: values differ\u001b[0m\nExpected: 1\nReceived: 2\n\u001b[31m(fail) assertion\u001b[0m\n" +
+        `sample.test.ts:\n\u001b[31merror: values differ\u001b[0m\nExpected: 1\nReceived: 2\ncredential: ${credential}\n\u001b[31m(fail) assertion\u001b[0m\n` +
         "skipped summary\n".repeat(700),
       exitCode: 1,
     };
@@ -702,10 +704,36 @@ test("a failed deploy gate keeps early test diagnostics before the summary tail"
   expect(message).toContain("error: values differ\nExpected: 1\nReceived: 2");
   expect(message.indexOf("error:")).toBeLessThan(message.indexOf("skipped summary"));
   expect(message).not.toContain("\u001b");
+  expect(message).toContain("credential: [redacted]");
+  expect(message).not.toContain(credential);
   expect(f.calls).not.toContain("drain");
   expect(f.calls).not.toContain("restart");
   expect(f.selected()).toBe("previous");
 });
+
+test.each(["stdout", "stderr"])(
+  "a failed deploy gate redacts %s before cutting a long tail row",
+  async (stream) => {
+    const credential = "synthetic-deploy-tail-credential-409";
+    registerCredential("DEPLOY_TAIL_TEST_TOKEN", credential);
+    const f = setup();
+    const command = f.opts.command;
+    f.opts.command = async (args, options) => {
+      if (args.join(" ") !== "bun test") return command(args, options);
+      return {
+        stdout: "",
+        stderr: "",
+        [stream]: `${"x".repeat(800)}${credential}${"z".repeat(480)}\n`,
+        exitCode: 1,
+      };
+    };
+    const message = String(await deploy(7400, "feature", false, f.opts).catch((e: unknown) => e));
+    expect(message).toContain("[redacted]");
+    expect(message).not.toContain(credential);
+    expect(message).not.toContain(credential.slice(-20));
+    expect(f.selected()).toBe("previous");
+  },
+);
 
 test("a failed gate tail keeps stderr first and stays within 4000 bytes", async () => {
   const f = setup();

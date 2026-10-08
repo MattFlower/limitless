@@ -3,6 +3,7 @@ import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { FailureExcerpts } from "./failures.ts";
+import { redactGateOutput } from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -69,7 +70,9 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
   const observe = (line: string) => {
+    // Redaction can hide the launch diagnostic; inspect it before retaining any text.
     confinementError ||= launchFailure(line);
+    line = redactGateOutput(line);
     coverage.observe(line);
     excerpts.observe(line);
   };
@@ -82,7 +85,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     onStdoutLine: observe,
     onStderrLine: observe,
   });
-  const combined = `${res.stdout}\n${res.stderr}`.trim();
+  const combined = redactGateOutput(`${res.stdout}\n${res.stderr}`).trim();
   const testCoverage = coverage.result();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
