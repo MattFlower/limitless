@@ -2,6 +2,7 @@ import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
+import { redactHoldoutText } from "./prompts.ts";
 import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
 
@@ -22,6 +23,7 @@ function table(header: string[], rows: string[][]): string {
 }
 
 export interface ReportInput {
+  verifierText?: (value: string) => string;
   signalWarnings?: number;
   models?: RunModels;
   success: boolean;
@@ -56,6 +58,7 @@ export interface ReportInput {
 /** Markdown evidence report used as the PR body. Each block is one markdown element. */
 export function renderReport(input: ReportInput): string {
   const { state } = input;
+  const text = input.verifierText ?? ((value: string) => value);
   const blocks: string[] = [
     input.success
       ? state.flow === "verify-change"
@@ -67,11 +70,11 @@ export function renderReport(input: ReportInput): string {
       ? [`Verified commit: \`${state.reviewedSha}\``]
       : []),
     ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
-    ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
+    ...(state.terminalReason ? [`🚧 ${text(state.terminalReason)}`] : []),
     ...(input.verifiedFailure
       ? [
           "## Failed after verification",
-          `Verified at \`${input.verifiedFailure.sha}\`; failed after verification at \`${input.verifiedFailure.stage}\`: \`${input.verifiedFailure.reason}\`. The PR may conflict with \`${input.verifiedFailure.base}\`.`,
+          `Verified at \`${input.verifiedFailure.sha}\`; failed after verification at \`${input.verifiedFailure.stage}\`: \`${text(input.verifiedFailure.reason)}\`. The PR may conflict with \`${input.verifiedFailure.base}\`.`,
         ]
       : []),
     ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),
@@ -110,7 +113,11 @@ export function renderReport(input: ReportInput): string {
                 : v.status === "blocked"
                   ? "🚧 blocked"
                   : "❔";
-          return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
+          return [
+            `${icon} ${ac.id}`,
+            escapeCell(ac.criterion),
+            escapeCell(text(v?.evidence ?? "not verified")),
+          ];
         }),
       ),
     );
@@ -135,13 +142,13 @@ export function renderReport(input: ReportInput): string {
         ["", "Scenario", "Result", "Evidence"],
         results.map(({ scenario, result }) => [
           scenario.id,
-          escapeCell(scenario.description),
+          escapeCell(text(scenario.description)),
           result?.status === "blocked"
             ? "🚧 blocked"
             : result?.status === "unmet"
               ? `unmet (${result.requirement ? result.requirement.replace("_", " ") : "unclassified"})`
               : (result?.status ?? "unclear"),
-          escapeCell(result?.evidence ?? "not verified"),
+          escapeCell(text(result?.evidence ?? "not verified")),
         ]),
       ),
     );
@@ -153,7 +160,7 @@ export function renderReport(input: ReportInput): string {
         followUps
           .map(
             ({ scenario, result }) =>
-              `- ${scenario.id}: ${escapeCell(scenario.description)} — ${escapeCell(result?.evidence ?? "")}`,
+              `- ${scenario.id}: ${escapeCell(text(scenario.description))} — ${escapeCell(text(result?.evidence ?? ""))}`,
           )
           .join("\n"),
       );
@@ -205,13 +212,13 @@ export function renderReport(input: ReportInput): string {
           : [],
     );
     if (schedule.length) blocks.push(schedule.join("\n"));
-    blocks.push(`**${r.verdict}** — ${r.summary}`);
+    blocks.push(`**${r.verdict}** — ${text(r.summary)}`);
     if (r.findings.length) {
       blocks.push(
         r.findings
           .map(
             (f) =>
-              `- ${severity(f)}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
+              `- ${severity(f)}: ${text(`${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`)}`,
           )
           .join("\n"),
       );
@@ -223,7 +230,7 @@ export function renderReport(input: ReportInput): string {
       state.reviewFollowUps
         .map(
           (f) =>
-            `- ${severity(f)}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
+            `- ${severity(f)}${f.security ? " (security)" : ""}: ${text(`${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`)}`,
         )
         .join("\n"),
     );
@@ -289,9 +296,11 @@ export function buildReport(
   ctx: RunContext,
   success: boolean,
   verifiedFailure?: ReportInput["verifiedFailure"],
+  verifierText?: ReportInput["verifierText"],
 ): string {
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
   return renderReport({
+    verifierText,
     success,
     signalWarnings: ctx.store.countEvents(ctx.run.id, "signal_attempt"),
     runId: ctx.run.id,
@@ -305,6 +314,26 @@ export function buildReport(
     models: ctx.run.models,
     ...(issueClosedBy(ctx) ? { closesIssue: issueClosedBy(ctx) as number } : {}),
   });
+}
+
+/** Redact publication copies; the owner's report and verification records retain their evidence. */
+export async function buildPublicationReport(
+  ctx: RunContext,
+  success: boolean,
+  verifiedFailure?: ReportInput["verifiedFailure"],
+): Promise<string> {
+  const state = verifiedFailure ? verifiedFailureState(ctx.state) : ctx.state;
+  const holdout = state.holdout;
+  const sources = holdout ? await ctx.publicHoldoutSources() : "";
+  const text = (value: string) => {
+    if (!holdout) return value;
+    for (const [index, c] of (state.lastVerify?.criteria ?? []).entries()) {
+      if (rowKind(c.id, state.spec ?? null, holdout) === "unknown")
+        value = value.replaceAll(`${c.id}: ${c.evidence}`, `unknown-${index + 1}: private evidence withheld`);
+    }
+    return redactHoldoutText(value, holdout, sources);
+  };
+  return buildReport(ctx, success, verifiedFailure, text);
 }
 
 function issueClosedBy(ctx: RunContext): number | null {

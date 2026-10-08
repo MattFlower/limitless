@@ -1,10 +1,11 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { redactJsonLine } from "../src/harness/types.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { renderReport } from "../src/pipeline/report.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import {
   approve,
   type Handler,
@@ -42,6 +43,58 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("failed verify retains structured API diagnostics and ordinary tool arguments", async () => {
+    const credential = "fake-api-credential-423";
+    registerCredential("HOLDOUT_TEST_KEY", credential);
+    const error = JSON.stringify({
+      type: "error",
+      error: {
+        message: `Unsupported limit ${credential}`,
+        type: "invalid_request_error",
+        param: "max_output_tokens",
+        code: "unsupported_value",
+      },
+      status: 400,
+    });
+    const retained = error.replace(credential, "[redacted]");
+    const command = "sed -n 1,20p file";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        // Fake the CLI's transcript writer using the redactor supplied by the pipeline.
+        writeFileSync(s.logPath, `${redactJsonLine(error, s.redactOutput)}\n`);
+        return {
+          status: "error",
+          error,
+          text: error,
+          events: [{ type: "tool_call", id: "tool-423", name: "Shell", input: { command } }],
+        };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["failed", "needs_human"])).toBe("needs_human");
+    const invocations = f.store.listInvocations(run.id).filter((i) => i.role === "verify");
+    expect(invocations).toHaveLength(2);
+    for (const invocation of invocations) {
+      expect(invocation.error).toBe(retained);
+      expect(readFileSync(join(f.cfg.paths.runs, run.id, `inv-${invocation.id}.log`), "utf8")).toBe(
+        `${retained}\n`,
+      );
+    }
+    expect(f.store.getRun(run.id)?.error).toContain(retained);
+    const events = f.store.listEvents(run.id);
+    expect(events.some((e) => e.message === retained)).toBe(true);
+    const tool = events.find((e) => e.type === "tool_call" && e.message.startsWith("Shell:"));
+    expect(tool?.message).toBe(`Shell: ${command}`);
+    expect(tool?.data).toEqual({ id: "tool-423", input: { command } });
+    expect(JSON.stringify(events)).not.toContain(credential);
+  });
+
   test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
     // These values are observed at runtime, not spelled out by the holdout author.
@@ -73,7 +126,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     let implementCalls = 0;
     let verifies = 0;
     let retryFeedbackChecked = false;
-    const redactedOutputs: (string | undefined)[] = [];
+    const diagnosticOutputs: (string | undefined)[] = [];
     let runId = "";
     const f = start((s) => {
       const role = roleOf(s);
@@ -84,10 +137,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "verify") {
         expect(s.prompt).toContain(secret);
         verifies++;
-        redactedOutputs.push(s.redactOutput?.(`retryIdentifier ${secret}`));
+        diagnosticOutputs.push(s.redactOutput?.(`retryIdentifier ${secret}`));
         const transcript = s.redactOutput?.(observed);
-        expect(transcript).toContain("5 private details withheld");
-        for (const literal of observedLiterals) expect(transcript).not.toContain(literal);
+        expect(transcript).toBe(observed);
+        writeFileSync(
+          s.logPath,
+          `${redactJsonLine(JSON.stringify({ diagnostic: observed }), s.redactOutput)}\n`,
+        );
         return verifies <= 2
           ? {
               text: `ordinary verifier diagnostic; retryIdentifier; private input ${secret}; ${observed}`,
@@ -112,7 +168,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (implementCalls > 1) {
         for (const literal of observedLiterals) {
           expect(s.prompt).not.toContain(literal);
-          expect(JSON.stringify(f.store.listEvents(runId))).not.toContain(literal);
+          expect(JSON.stringify(f.store.listEvents(runId))).toContain(literal);
           for (const artifact of f.store.listArtifacts(runId))
             expect(f.store.getArtifact(runId, artifact.name)).not.toContain(literal);
         }
@@ -129,7 +185,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("holdout-scenarios.json");
         expect(f.store.getArtifact(runId, "verify-0.json")).toContain("Observed failure");
         expect(f.store.getArtifact(runId, "verify-0.json")).not.toContain(secret);
-        expect(JSON.stringify(f.store.listEvents(runId))).not.toContain("retryIdentifier");
+        expect(JSON.stringify(f.store.listEvents(runId))).toContain(
+          `retryIdentifier; private input ${secret}`,
+        );
         expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
         for (const artifact of f.store.listArtifacts(runId))
           expect(f.store.getArtifact(runId, artifact.name)).not.toContain(secret);
@@ -145,7 +203,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getArtifact(runId, "verify-1.json")).toContain(summary);
         expect(f.store.getArtifact(runId, "verify-1.json")).not.toContain(secret);
         expect(JSON.stringify(f.store.listEvents(runId))).toContain(
-          "ordinary verifier diagnostic; retryIdentifier; private input [private detail]",
+          `ordinary verifier diagnostic; retryIdentifier; private input ${secret}`,
         );
         retryFeedbackChecked = true;
       }
@@ -161,8 +219,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(implementCalls).toBe(3);
     expect(retryFeedbackChecked).toBe(true);
-    expect(redactedOutputs[0]).toBe("[private detail] [private detail] [2 private details withheld]");
-    expect(redactedOutputs[1]).toBe("retryIdentifier [private detail] [1 private details withheld]");
+    expect(diagnosticOutputs.slice(0, 2)).toEqual([`retryIdentifier ${secret}`, `retryIdentifier ${secret}`]);
     expect(f.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
     expect(f.store.getArtifact(run.id, "verify-0.json")).toContain("ERR_RETRY_EXHAUSTED");
     const report = f.store.getArtifact(run.id, "report.md") ?? "";
@@ -179,11 +236,19 @@ describe("pipeline (fake agents, real git + gates)", () => {
         runUrl: "u",
       }),
     ).toContain("## Holdout scenarios");
-    expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain(secret);
+    expect(JSON.stringify(f.store.listEvents(run.id))).toContain(secret);
     expect(JSON.stringify(f.store.listEvents(run.id))).toContain("ordinary verifier diagnostic");
     const firstVerify = f.store.listInvocations(run.id).find((inv) => inv.role === "verify");
     expect(firstVerify?.error).toContain("verifier diagnostic included");
-    expect(firstVerify?.error).not.toContain(secret);
+    expect(firstVerify?.error).toContain(secret);
+    expect(firstVerify?.error).toContain(observed);
+    if (!firstVerify) throw new Error("missing verify invocation");
+    expect(readFileSync(join(f.cfg.paths.runs, run.id, `inv-${firstVerify.id}.log`), "utf8")).toContain(
+      "ERR_RETRY_EXHAUSTED",
+    );
+    expect(f.store.getRunState<RunState>(run.id)?.verifyResults?.[0]?.criteria[2]?.evidence).toContain(
+      secret,
+    );
   });
 
   describe("unmet holdout classification", () => {
@@ -619,7 +684,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     }
   });
 
-  test("blocked verification redacts legacy collisions and unexpected ids before stopping", async () => {
+  test("blocked verification retains legacy collisions and unexpected ids in owner diagnostics", async () => {
     const secret = "privateBlockedToken_731";
     const unexpectedId = "H-1 unexpected private words";
     const sources = RunContext.prototype.publicHoldoutSources;
@@ -682,9 +747,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(verifies).toBe(2);
       const state = f.store.getRunState<RunState>(run.id);
       for (const output of [state?.terminalReason, state?.needsHumanReason, f.store.getRun(run.id)?.error]) {
-        expect(output).toContain("unknown-");
         for (const text of [secret, unexpectedId, "unexpected private evidence prose"])
-          expect(output).not.toContain(text);
+          expect(output).toContain(text);
       }
       expect(state?.terminalReason).toContain("EPERM");
     } finally {

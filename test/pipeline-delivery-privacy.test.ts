@@ -1,13 +1,15 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { buildPublicationReport } from "../src/pipeline/report.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
-import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 let home: string;
@@ -35,6 +37,78 @@ const { start, githubFixture, registerGithub } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["met", "blocked"] as const)(
+    "%s verifier wording is redacted only in GitHub report copies",
+    async (status) => {
+      const bare = await githubFixture();
+      const secret = "PrivateScenario_423";
+      const observed = "ERR_OBSERVED_423 --private-mode 48231";
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout")
+          return {
+            structured: {
+              scenarios: holdout.scenarios.map((c) =>
+                c.id === "H-2" ? { ...c, description: `private ${secret}`, steps: `run ${secret}` } : c,
+              ),
+            },
+          };
+        if (role === "review") return { structured: approve };
+        if (role === "verify")
+          return {
+            structured: {
+              ...pass,
+              criteria: [
+                ...pass.criteria.map((c) =>
+                  c.id === "H-2" ? { ...c, status, evidence: `Observed ${secret}: ${observed}` } : c,
+                ),
+                ...(status === "blocked"
+                  ? [
+                      {
+                        id: "PrivateUnknown_423",
+                        status,
+                        evidence: "unexpected private evidence prose",
+                        publicSummary: "",
+                      },
+                    ]
+                  : []),
+              ],
+            },
+          };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "needs_human", "failed"])).toBe(
+        status === "met" ? "succeeded" : "needs_human",
+      );
+      const body = readFileSync(join(home, "gh-body"), "utf8");
+      expect(body).toContain("[private detail]");
+      for (const literal of [secret, "ERR_OBSERVED_423", "--private-mode", "48231"])
+        expect(body).not.toContain(literal);
+      expect(body).not.toContain("PrivateUnknown_423");
+      expect(body).not.toContain("unexpected private evidence prose");
+      const report = f.store.getArtifact(run.id, "report.md");
+      expect(report).toContain(secret);
+      expect(report).toContain(observed);
+      const source = f.store.getRunState<RunState>(run.id);
+      if (!source) throw new Error("missing run state");
+      expect(source.lastVerify?.criteria[2]?.evidence).toBe(`Observed ${secret}: ${observed}`);
+      if (status === "blocked") {
+        expect(f.store.getRun(run.id)?.error).toContain(observed);
+        expect(f.store.getRun(run.id)?.error).toContain("unexpected private evidence prose");
+      }
+      const repo = f.store.getRepo(run.repoId);
+      if (!repo) throw new Error("missing repo");
+      const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+      expect(await buildPublicationReport(ctx, status === "met")).not.toContain(secret);
+      expect(f.store.getRunState<RunState>(run.id)).toEqual(source);
+      expect(ctx.state).toEqual(source);
+    },
+  );
+
   test.each([
     "commit",
     "title",

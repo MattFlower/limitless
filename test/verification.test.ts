@@ -869,6 +869,8 @@ test.each(["H-1", "h-1", " H-1 "])(
       holdout,
       "",
     );
+    expect(verify.criteria[1]?.evidence).toBe(privateText);
+    expect(verify.criteria[2]?.evidence).toBe("arbitrary private prose");
     const rows = JSON.parse(artifact) as Verify;
     expect(rows.criteria.map((c) => c.id)).toEqual(["AC-1", legacyId, "unknown-3", "unknown-4", "unknown-5"]);
     for (const row of rows.criteria.slice(2)) {
@@ -877,6 +879,7 @@ test.each(["H-1", "h-1", " H-1 "])(
       expect(row.requirementCitation).toBe("");
     }
     const feedback = formatVerifyFeedback(verify, legacy, holdout);
+    expect(verify.criteria[1]?.publicSummary).toBe(privateText);
     for (const output of [artifact, feedback]) {
       expect(output).toContain("public evidence at code.ts:12");
       for (const secret of [

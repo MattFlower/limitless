@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseRunModels } from "../src/core/run-models.ts";
+import { Store } from "../src/db/store.ts";
 
 type Seen = { method: string; path: string; type: string | null; body: unknown };
 
@@ -37,6 +38,75 @@ async function cli(args: string[], respond: (path: string) => Response, command 
     server.stop();
   }
 }
+
+test("show and logs display retained holdout-run diagnostics from the store", async () => {
+  const store = new Store(":memory:");
+  try {
+    const repo = store.upsertRepo({
+      slug: "test/repo",
+      kind: "github",
+      url: "unused",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "Add farewell" });
+    store.setRunState(run.id, {
+      holdout: {
+        scenarios: [
+          {
+            id: "H-1",
+            description: "private",
+            steps: "run privateToken_423",
+            expected: "done",
+            edge_case: true,
+          },
+        ],
+      },
+    });
+    const error =
+      '{"type":"error","error":{"message":"Unsupported limit","type":"invalid_request_error","param":"max_output_tokens","code":"unsupported_value"},"status":400}';
+    store.updateRun(run.id, { status: "failed", error });
+    const stage = store.startStage(run.id, "verify", 0);
+    const invocation = store.createInvocation({
+      runId: run.id,
+      stageId: stage.id,
+      role: "verify",
+      harness: "fake",
+      provider: "fake",
+      model: "fake",
+      modelId: "fake/model",
+    });
+    store.updateInvocation(invocation.id, { status: "error", error });
+    store.addEvent({
+      runId: run.id,
+      invocationId: invocation.id,
+      type: "error",
+      level: "error",
+      message: error,
+    });
+    store.addEvent({
+      runId: run.id,
+      invocationId: invocation.id,
+      type: "tool_call",
+      level: "info",
+      message: "Shell: sed -n 1,20p file",
+      data: { input: { command: "sed -n 1,20p file" } },
+    });
+    const respond = (path: string) =>
+      Response.json(path.endsWith("/events") ? store.listEvents(run.id) : store.getRunDetail(run.id));
+    for (const command of ["show", "logs"]) {
+      const result = await cli([run.id], respond, command);
+      expect(result.exit).toBe(0);
+      expect(result.stdout).toContain(error);
+      expect(result.stdout).not.toContain("[private detail]");
+      if (command === "logs") expect(result.stdout).toContain("sed -n 1,20p file");
+      else expect(result.stdout.match(/unsupported_value/g)).toHaveLength(2);
+    }
+  } finally {
+    store.close();
+  }
+});
 
 test("run and retry send repeatable --model chains, show displays them", async () => {
   const flags = [

@@ -38,7 +38,7 @@ import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
-import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
+import { FACTORY_PREAMBLE } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
@@ -221,8 +221,6 @@ export interface InvokeOptions {
   privateOutput?: boolean;
   /** Prevent the CLI from persisting a private prompt in its own session store. */
   privateSession?: boolean;
-  /** Redact holdout content from observable verifier events and transcripts. */
-  redactHoldout?: boolean;
   /** Run in this directory instead of the worktree (e.g. a base-commit snapshot). */
   cwd?: string;
   /** Paths a tool-enabled reader must not read (see AgentSpec.denyRead). */
@@ -700,11 +698,6 @@ export class RunContext {
       };
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
-      const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
-      const redact =
-        opts.redactHoldout && this.state.holdout
-          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout, publicSources)
-          : undefined;
       try {
         const spec: AgentSpec = {
           fast: invocation.fast,
@@ -725,7 +718,7 @@ export class RunContext {
           privateSession: opts.privateOutput || opts.privateSession,
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
-          redactOutput: opts.privateOutput ? withholdText : redact,
+          redactOutput: opts.privateOutput ? withholdText : undefined,
           signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
@@ -734,7 +727,7 @@ export class RunContext {
                   this.onAgentEvent(invocation.id, { ...ev, id: String(Bun.hash(ev.id)) }, opts.role);
               }
             : (ev) => {
-                this.onAgentEvent(invocation.id, ev, opts.role, redact);
+                this.onAgentEvent(invocation.id, ev, opts.role);
               },
         };
         const faultContext = {
@@ -842,9 +835,7 @@ export class RunContext {
         error:
           opts.privateOutput && result.error && result.confinement?.ok !== false
             ? "private invocation failed"
-            : result.error && redact
-              ? redact(result.error)
-              : result.error,
+            : result.error,
         finishedAt: Date.now(),
       });
       // Shadow outcomes never reach provider health, quota telemetry or model blocks.
@@ -857,20 +848,13 @@ export class RunContext {
           ...(result.modelCooldownMs === undefined
             ? {}
             : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
-          error:
-            opts.privateOutput && result.error
-              ? "private invocation failed"
-              : result.error && redact
-                ? redact(result.error)
-                : result.error,
+          error: opts.privateOutput && result.error ? "private invocation failed" : result.error,
         });
       this.run = store.refreshRunTotals(this.run.id);
       if (result.status !== "ok")
         failures.set(
           target.targetId ?? target.modelId,
-          opts.privateOutput
-            ? result.status
-            : `${result.status}: ${redact?.(result.error ?? "already tried") ?? result.error ?? "already tried"}`,
+          opts.privateOutput ? result.status : `${result.status}: ${result.error ?? "already tried"}`,
         );
 
       if (this.termination) throw this.termination;
@@ -878,9 +862,7 @@ export class RunContext {
       if (result.status === "cancelled" || signal.aborted) throw new CancelledError();
       if (result.status === "declined") {
         // Not a failure and not a routing attempt: each decision model declines at most once.
-        const reason = opts.privateOutput
-          ? "private invocation declined"
-          : (redact?.(result.error ?? "") ?? result.error ?? "");
+        const reason = opts.privateOutput ? "private invocation declined" : (result.error ?? "");
         lastFailure = `${target.targetId ?? target.modelId}: declined (${reason})`.slice(0, 300);
         this.log(`${target.targetId ?? target.modelId} declined: ${reason}; trying the next model`);
         if (result.decline?.lastResort) lastResort = { result, target, invocation: updated };
@@ -899,15 +881,9 @@ export class RunContext {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
         health?.blockModel(
           target.modelId,
-          opts.privateOutput
-            ? "private invocation rejected"
-            : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
+          opts.privateOutput ? "private invocation rejected" : (result.error ?? "rejected"),
         );
-        lastFailure =
-          `${target.targetId ?? target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
-            0,
-            300,
-          );
+        lastFailure = `${target.targetId ?? target.modelId}: ${result.error ?? ""}`.slice(0, 300);
         this.log(
           `${target.targetId ?? target.modelId} rejected by provider; blocking it for 24h and falling back`,
           "warn",
@@ -915,11 +891,10 @@ export class RunContext {
         continue;
       }
       if (result.status === "quota" || result.status === "unavailable") {
-        lastFailure =
-          `${target.targetId ?? target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
-            0,
-            300,
-          );
+        lastFailure = `${target.targetId ?? target.modelId}: ${result.status} (${result.error ?? ""})`.slice(
+          0,
+          300,
+        );
         this.log(`${target.targetId ?? target.modelId} ${result.status}; falling back`, "warn");
         continue;
       }
@@ -937,11 +912,10 @@ export class RunContext {
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {
-        lastFailure =
-          `${target.targetId ?? target.modelId}: ${redact?.(result.error ?? "no structured output") ?? result.error ?? "no structured output"}`.slice(
-            0,
-            300,
-          );
+        lastFailure = `${target.targetId ?? target.modelId}: ${result.error ?? "no structured output"}`.slice(
+          0,
+          300,
+        );
         this.log(
           `${target.targetId ?? target.modelId} failed to produce structured output; trying next model`,
           "warn",
@@ -958,12 +932,7 @@ export class RunContext {
     );
   }
 
-  private onAgentEvent(
-    invocationId: number,
-    ev: AgentEvent,
-    role: Role,
-    redact?: (value: string) => string,
-  ): void {
+  private onAgentEvent(invocationId: number, ev: AgentEvent, role: Role): void {
     const runId = this.run.id;
     const add = (
       type: RunEvent["type"],
@@ -976,17 +945,8 @@ export class RunContext {
         invocationId,
         type,
         level,
-        message: redact ? redact(message) : message,
-        data:
-          redact && data !== undefined
-            ? JSON.parse(
-                JSON.stringify(data, (_key, value: unknown) =>
-                  typeof value === "string" && !(_key === "code" && value === "signal_attempt")
-                    ? redact(value)
-                    : value,
-                ),
-              )
-            : data,
+        message,
+        data,
       });
     switch (ev.type) {
       case "init":

@@ -79,12 +79,11 @@ import {
   formatVerifyFeedback,
   holdoutPrompt,
   implementPrompt,
-  redactHoldoutText,
   specPrompt,
   triagePrompt,
   verifyPrompt,
 } from "./prompts.ts";
-import { buildReport } from "./report.ts";
+import { buildPublicationReport, buildReport } from "./report.ts";
 import {
   blockingReviewFindings,
   FinderSkipped,
@@ -107,7 +106,6 @@ import {
   type Review,
   type ReviewScope,
   renderSpec,
-  rowKind,
   type Spec,
   SpecSchema,
   TriageSchema,
@@ -1571,7 +1569,6 @@ async function oneRound(
             schema: VerifySchema,
             requireStructured: true,
             privateSession: true,
-            redactHoldout: true,
           });
           await discardChanges(cwd);
           if ((await headSha(cwd)) !== verifiedSha)
@@ -1634,17 +1631,9 @@ async function oneRound(
       const stop = async (routing = ""): Promise<never> => {
         const evidence = verify.criteria
           .filter((c) => c.status === "blocked")
-          .map((c, index) =>
-            rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown"
-              ? `unknown-${index + 1}: private evidence withheld`
-              : `${c.id}: ${c.evidence}`,
-          )
+          .map((c) => `${c.id}: ${c.evidence}`)
           .join("\n");
-        const detail = redactHoldoutText(
-          `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
-          ctx.state.holdout as Holdout,
-          publicSources,
-        );
+        const detail = `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`;
         ctx.state.terminalReason = detail;
         // Recorded apart from the retry reservation: an exhausted retry leaves no attempt row behind.
         ctx.state.needsHumanReason = detail;
@@ -1783,13 +1772,15 @@ async function deliverVerifiedDraft(
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
   await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}` });
+  const body = await buildPublicationReport(ctx, false, { sha, stage, reason, base });
+  await checkPublication(ctx, body);
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
     base,
     title: `[needs human] ${ctx.run.title}`,
-    body: report,
+    body,
     cwd,
     draft: true,
     signal: ctx.signal,
@@ -1996,7 +1987,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
-              const body = `${marker}\n${report}`;
+              await checkPublication(ctx, report);
+              const body = `${marker}\n${await buildPublicationReport(ctx, true)}`;
               await checkPublication(ctx, body);
               await runner([...comment, "--body", body], ctx.signal);
             },
@@ -2059,6 +2051,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const report = buildReport(ctx, success);
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     await checkPublication(ctx, report, { sha: await headSha(cwd), title });
+    const body = await buildPublicationReport(ctx, success);
+    await checkPublication(ctx, body);
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
@@ -2120,7 +2114,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       branch: ctx.run.branch as string,
       base: ctx.run.baseBranch as string,
       title,
-      body: report,
+      body,
       cwd,
       draft: !success,
       signal: ctx.signal,
