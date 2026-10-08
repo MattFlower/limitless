@@ -16,6 +16,70 @@ import { Router } from "../src/router/router.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
 
+test("built-in endpoints use only loopback or documented public API hosts", () => {
+  const catalog = resolveCatalog();
+  const approved = new Set(["localhost", "127.0.0.1", "openrouter.ai", "api.typesafe.ai"]);
+  for (const provider of catalog.providers)
+    for (const url of [
+      provider.baseUrl,
+      provider.openaiBaseUrl,
+      provider.healthUrl,
+      provider.decisionsBaseUrl,
+    ])
+      if (url) expect(approved.has(new URL(url).hostname)).toBe(true);
+  expect(catalog.providers.map((p) => p.id)).toEqual([
+    "claude",
+    "codex",
+    "openrouter",
+    "omlx",
+    "mtplx",
+    "typesafe",
+  ]);
+  expect(catalog.models.every((m) => catalog.providers.some((p) => p.id === m.provider))).toBe(true);
+});
+
+test("GUIDE LAN provider routes tool-free work and probes its configured authenticated endpoint", async () => {
+  const guide = await Bun.file(join(import.meta.dir, "../docs/GUIDE.md")).text();
+  const example = guide.split("LAN llama.cpp inference requires")[1]?.match(/```toml\n([\s\S]*?)```/)?.[1];
+  if (!example) throw new Error("LAN example missing");
+  const fixture = providerFixture();
+  const store = new Store(":memory:");
+  try {
+    writeFileSync(fixture.file, example.replaceAll("<host>", "example.com"));
+    writeFileSync(join(fixture.configDir, "secrets.env"), "REMOTE_API_KEY=lan-key\n");
+    const cfg = fixture.load();
+    const catalog = cfg.catalog ?? resolveCatalog();
+    const probes: string[] = [];
+    const fetchHealth = (async (url, init) => {
+      probes.push(String(url));
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer lan-key");
+      return Response.json({ data: [{ id: "local" }] });
+    }) as typeof fetch;
+    const tracker = new ProviderTracker(
+      catalog.providers.filter((p) => p.id === "lan"),
+      store,
+      cfg.reserves,
+      cfg.secrets,
+      {},
+      Date.now,
+      undefined,
+      undefined,
+      fetchHealth,
+    );
+    const router = new Router(tracker, DEFAULT_POLICY, catalog.models);
+    await tracker.probe();
+    expect(probes).toEqual(["http://example.com:8080/v1/models"]);
+    expect(router.route("triage", "small", { only: "lan/local@none" }).candidates[0]).toMatchObject({
+      provider: "lan",
+      openai: { baseUrl: "http://example.com:8080/v1", authToken: "lan-key" },
+    });
+    expect(router.route("implement", "small", { only: "lan/local" }).candidates).toEqual([]);
+  } finally {
+    store.close();
+    fixture.close();
+  }
+});
+
 test("authenticated discovery replaces the served set, preserves history, and skips absent targets in routes and previews", async () => {
   const f = providerFixture(
     [{ ...customProvider, health_url: "http://localhost/v1/models" }],
@@ -621,9 +685,8 @@ test("presets, same-id definitions, partial metadata and legacy concurrency pres
       ],
     },
     { preset: "codex", id: "work", max_concurrent: 7, models: [{ id: "sol", notes: "overridden" }] },
-    { id: "twilight", ssh_forward: { host: "example.com", local_port: 18080, remote_port: 8080 } },
+    { id: "mtplx", ssh_forward: { host: "example.com", local_port: 18080, remote_port: 8080 } },
     { id: "omlx", max_concurrent: 8 },
-    { id: "mtplx" },
   ]);
   expect(custom.providers.map((p) => p.id)).toEqual([...defaults.providers.map((p) => p.id), "work"]);
   expect(custom.models.slice(0, defaults.models.length).map((m) => m.id)).toEqual(
@@ -640,14 +703,14 @@ test("presets, same-id definitions, partial metadata and legacy concurrency pres
     notes: "overridden",
   });
   expect(custom.providers.find((p) => p.id === "work")?.maxConcurrent).toBe(7);
-  expect(custom.providers.find((p) => p.id === "twilight")?.sshForward).toEqual({
+  expect(custom.providers.find((p) => p.id === "mtplx")?.sshForward).toEqual({
     host: "example.com",
     localPort: 18080,
     remotePort: 8080,
   });
   expect(custom.notes).toEqual([]);
   expect(resolveCatalog({ omlx: { max_concurrent: 8 } }).notes).toEqual(defaults.notes);
-  expect(defaults.notes.map((n) => n.split(":")[0])).toEqual(["omlx", "mtplx", "twilight"]);
+  expect(defaults.notes.map((n) => n.split(":")[0])).toEqual(["omlx", "mtplx"]);
 });
 
 test("credentials use arbitrary file names first, empty file values fall back to env, and missing keys cannot be enabled", () => {
@@ -775,7 +838,7 @@ test("configured targets validate policy groups and production pins before any p
 
 test("GUIDE provider configuration is loadable and startup notes name migration and missing variables only", async () => {
   const guide = await Bun.file(join(import.meta.dir, "../docs/GUIDE.md")).text();
-  const section = guide.split("## Providers\n")[1]?.split("\n## ")[0];
+  const section = guide.split("\n## Providers\n")[1]?.split("\n## ")[0];
   const example = section?.match(/```toml\n([\s\S]*?)```/)?.[1];
   if (!example) throw new Error("Providers example missing");
   const fixture = providerFixture();

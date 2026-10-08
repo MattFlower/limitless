@@ -14,7 +14,7 @@ test("export round-trips ordered catalog identities, metadata, nested fields and
     resolveCatalog([
       customProvider,
       {
-        id: "twilight",
+        id: "omlx",
         ssh_forward: { host: "example.com", local_port: 18080, remote_port: 8080 },
         models: [{ id: "qwen-27b", price: { input: 0.25 } }],
       },

@@ -410,6 +410,42 @@ describe("runGates / compareGates", () => {
     }
   });
 
+  test.each([
+    ["2", "2"],
+    ["invalid", "4"],
+  ])("gate command receives validated test workers: %s", async (value, expected) => {
+    const previous = process.env.LIMITLESS_TEST_WORKERS;
+    const secret = process.env.LIMITLESS_TEST_SECRET;
+    const dir = tempDir({});
+    try {
+      process.env.LIMITLESS_TEST_WORKERS = value;
+      process.env.LIMITLESS_TEST_SECRET = "must-stay-private";
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          checks: [
+            {
+              name: "workers",
+              run: `printf '%s\\n' "$LIMITLESS_TEST_WORKERS" "\${LIMITLESS_TEST_SECRET-unset}"; "${process.execPath}" "${resolve("scripts/test-workers.ts")}"`,
+            },
+          ],
+          source: "detected",
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.ok).toBe(true);
+      expect(run.checks[0]?.output).toBe(`${expected}\nunset\n${expected}`);
+    } finally {
+      if (previous === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
+      else process.env.LIMITLESS_TEST_WORKERS = previous;
+      if (secret === undefined) delete process.env.LIMITLESS_TEST_SECRET;
+      else process.env.LIMITLESS_TEST_SECRET = secret;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("retains early failure diagnostics in the result and its existing artifact", async () => {
     const output =
       "sample.test.ts:\n(pass) earlier\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +

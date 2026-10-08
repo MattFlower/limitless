@@ -8,7 +8,6 @@
       "openrouter/gpt-6-luna@medium",
       "openrouter/gpt-6-luna@low",
       "openrouter/gpt-6-luna@none",
-      "twilight/qwen-27b@none",
       "mtplx/qwen-27b@high",
       "claude/sonnet-5.5@low"
     ]

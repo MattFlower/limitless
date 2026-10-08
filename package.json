@@ -15,9 +15,9 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit -p .",
-    "test": "bun test",
+    "test": "bun test --parallel=$(bun scripts/test-workers.ts)",
     "smoke": "bun scripts/smoke.ts",
-    "check": "bun run lint && bun run typecheck && bun test"
+    "check": "bun run lint && bun run typecheck && bun run test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",

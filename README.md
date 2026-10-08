@@ -56,7 +56,7 @@ diffs, reviews, quota gauges, cost).
 | `limitless show <run>` / `logs <run> [-f]` | Details / event log |
 | `limitless cancel <run>` / `answer <run> "<text>"` | Cancel / answer an open question |
 | `limitless providers` | Health and quota of every provider |
-| `limitless local up\|down\|status` | Report oMLX health and manage twilight (see [operations](docs/OPERATIONS.md)) |
+| `limitless local up\|down\|status` | Report oMLX health and manage a configured remote llama.cpp host (see [operations](docs/OPERATIONS.md)) |
 | `limitless gc [--dry-run]` | Clean up expired worktrees, invocation logs and debug events |
 | `limitless service install\|uninstall\|status` | Run the daemon (and Cloudflare tunnel) under launchd |
 | `limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]` | Gate the release, drain active runs, restart, auto-rollback |

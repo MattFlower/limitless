@@ -137,7 +137,6 @@ for (const source of ["implicit", "lan", "unexpected"])
           "https://openrouter.ai/api/v1/key",
           "http://127.0.0.1:8989/v1/models",
           "http://127.0.0.1:8000/v1/models",
-          "http://twilight:8080/v1/models",
         ])
           expect(trace.requests).toContain(`GET ${url}`);
       } else expect(trace.requests).toContain(`GET ${provider.health_url}`);

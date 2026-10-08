@@ -15,6 +15,7 @@ import { basename, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
 import { redactGateStreams } from "../gates/output.ts";
 import { sh } from "../util/proc.ts";
+import { resolveTestWorkers } from "../util/test-workers.ts";
 import {
   bounded,
   DEFAULT_MAX_WAIT_MS,
@@ -414,11 +415,14 @@ export async function uninstall(): Promise<void> {
  * parent directory's node_modules/.bin first on PATH, so a stray CLI under $HOME (an older `codex`,
  * say) would be checked and smoke-tested instead of the one the daemon runs.
  */
-const GATES = [
-  ["bun", "run", "lint"],
-  ["bun", "run", "typecheck"],
-  ["bun", "test"],
-];
+// Resolve the override when gates run, rather than capturing the environment at module load.
+const GATES = () => {
+  return [
+    ["bun", "run", "lint"],
+    ["bun", "run", "typecheck"],
+    ["bun", "test", `--parallel=${resolveTestWorkers()}`],
+  ];
+};
 const SMOKE = ["bun", "scripts/smoke.ts"];
 
 const GATE_TAIL_LINES = 60;
@@ -485,12 +489,11 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
       ].join("\n"),
     );
   };
-  // The full suite takes 8–11 minutes alone and over 20 while runs use the machine; the
-  // repository's own test gate allows 30 minutes (.limitless.toml), and so does this one.
+  // Keep the repository's 30-minute test bound (.limitless.toml) under parallel load too.
   await withGateLease(
     "deploy",
     async () => {
-      for (const args of GATES) await gate(args, args.includes("test") ? 1_800_000 : 600_000);
+      for (const args of GATES()) await gate(args, args.includes("test") ? 1_800_000 : 600_000);
     },
     lease,
   );

@@ -69,7 +69,8 @@ Usage:
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
   limitless service uninstall|status
-  limitless local up|down|status          Report oMLX health; manage twilight
+  limitless local up|down|status          Report oMLX health; manage configured remote llama.cpp ([local].remote_host)
+                                         [local].remote_model_path / remote_llama_binary configure new units
   limitless gate-slot [--name <holder>] [--max-wait <seconds>] -- <command...>
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
@@ -321,11 +322,12 @@ async function main(): Promise<void> {
       const cfg = loadConfig();
       const local = (cfg.raw.local ?? {}) as Record<string, unknown>;
       const report = await manageLocal(action, {
-        modelPath: typeof local.twilight_model_path === "string" ? local.twilight_model_path : "",
-        twilightHost: typeof local.twilight_host === "string" ? local.twilight_host : undefined,
-        llamaBinary:
-          typeof local.twilight_llama_binary === "string" ? local.twilight_llama_binary : undefined,
+        remoteModelPath: typeof local.remote_model_path === "string" ? local.remote_model_path : "",
+        remoteHost: typeof local.remote_host === "string" ? local.remote_host : undefined,
+        remoteLlamaBinary:
+          typeof local.remote_llama_binary === "string" ? local.remote_llama_binary : undefined,
         secrets: cfg.secrets,
+        providers: cfg.catalog?.providers,
         setEnabled: async (id, enabled) => {
           await api(`/api/providers/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`, {
             method: "POST",

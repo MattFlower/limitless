@@ -31,7 +31,7 @@ and delivers a pull request — while spending as little of your paid AI capacit
    signal, stderr) is persisted and streamed to the UI. If a run fails you can see exactly what
    the agent saw and did.
 6. **Portable single binary-ish daemon.** One Bun process, one SQLite file, one data directory.
-   Runs on the Mac today; moving to twilight is a config change.
+   Runs on the Mac today; moving to another host is a config change.
 
 ## 2. System overview
 
@@ -164,7 +164,7 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 | 5 | Claude Opus 5.5 | (OpenRouter frontier — last resort) |
 | 4 | Claude Sonnet 5.5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
-| 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, opt-in), twilight llama.cpp models |
+| 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, opt-in), config-defined LAN llama.cpp models |
 
 The primary Mac backend is **oMLX**, managed externally by oMLX.app / `omlx start` at
 `http://127.0.0.1:8989` (port 8989). Set `OMLX_API_KEY` in
@@ -184,8 +184,8 @@ among free models the policy does not name, take catalog order, so they use Flas
 Agentic roles require the bare ID, preserving server-default thinking. Built-in triage,
 summarize and chat prefer oMLX; the committed `routing/policy.json` overlay remains authoritative
 where present. `limitless local up|down|status` only reports Mac endpoint reachability, including
-on `down`; it does not manage the Mac server or provider enablement. Twilight retains lifecycle
-controls. For rollback, `limitless service install --mtplx` explicitly installs the old agent;
+on `down`; it does not manage the Mac server or provider enablement. Remote llama.cpp lifecycle
+controls require an explicit [local].remote_host. For rollback, `limitless service install --mtplx` explicitly installs the old agent;
 enable `mtplx` if disabled and select `mtplx/qwen-27b`. Default installation omits that agent and
 does not remove existing installations.
 

@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
+import { resolveTestWorkers } from "../util/test-workers.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { FailureExcerpts } from "./failures.ts";
 import { launchFailure, launchFailureScan, redactGateOutput, redactGateStreams } from "./output.ts";
@@ -61,7 +62,13 @@ export const confinementFailed = (r?: GateResult): boolean =>
   !!r && ((r.confinementError ?? launchFailure(r.output)) || confinementFailed(r.firstAttempt));
 
 /** Gates execute code the agent wrote; give them the same scrubbed environment as agents. */
-export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" });
+export const gateEnv = (): Record<string, string> =>
+  agentEnv({
+    CI: "1",
+    NO_COLOR: "1",
+    FORCE_COLOR: "0",
+    LIMITLESS_TEST_WORKERS: String(resolveTestWorkers()),
+  });
 
 /** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
