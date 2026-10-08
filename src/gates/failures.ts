@@ -1,4 +1,3 @@
-import { registeredCredentials } from "../util/proc.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
 import type { GateResult } from "./run.ts";
 
@@ -6,7 +5,7 @@ const FAILURE_RESULT = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/;
 const TIMEOUT = /^\^ this test timed out after \d+(?:\.\d+)?ms\.$/;
 const OMITTED = "[failure excerpts: diagnostic lines or failures left out]";
 
-/** Capture before the process runner truncates output, retaining only bounded diagnostics. */
+/** Capture already-redacted lines before runner tail cuts, retaining only bounded diagnostics. */
 export class FailureExcerpts {
   private lines: string[] = [];
   private excerpts: string[] = [];
@@ -14,8 +13,6 @@ export class FailureExcerpts {
   private clipped = false;
   private omitted = false;
   private failure: string | undefined;
-  // Keep enough overlap for a multiline credential before discarding old diagnostic lines.
-  private lineLimit = 39 + Math.max(0, ...registeredCredentials().map((s) => s.split("\n").length - 1));
 
   observe(raw: string): void {
     const line = redactGateOutput(raw);
@@ -33,29 +30,19 @@ export class FailureExcerpts {
       this.lines = [];
       this.clipped = false;
     } else {
-      this.lines.push(line);
-      if (this.lines.length > this.lineLimit) {
-        this.lines = redactGateOutput(this.lines.join("\n")).split("\n");
-        while (this.lines.length > this.lineLimit) {
-          this.lines.shift();
-          this.clipped = true;
-        }
+      this.lines.push(line.slice(0, 8_000));
+      this.clipped ||= line.length > 8_000;
+      if (this.lines.length > 39) {
+        this.lines.shift();
+        this.clipped = true;
       }
     }
   }
 
   private finish(timeout?: string): void {
     if (this.failure === undefined) return;
-    // Line callbacks may split a credential: redact the assembled text before trimming or capping it.
-    const assembled = redactGateOutput(
-      [...this.lines, this.failure, ...(timeout ? [timeout] : [])].join("\n"),
-    );
-    const lines = assembled.split("\n");
-    const identity = lines
-      .splice(timeout ? -2 : -1)
-      .join("\n")
-      .trimEnd();
-    const diagnostics = lines
+    const identity = [this.failure, ...(timeout ? [timeout] : [])].join("\n").trimEnd();
+    const diagnostics = this.lines
       .slice(timeout ? -38 : -39)
       .join("\n")
       .trim();
@@ -65,7 +52,8 @@ export class FailureExcerpts {
       const block = kept ? `${kept}\n${identity}` : identity.trimStart();
       this.excerpts.push(block);
       this.size += block.length + 2;
-      this.omitted ||= this.clipped || diagnostics.length > kept.length || lines.length > (timeout ? 38 : 39);
+      this.omitted ||=
+        this.clipped || diagnostics.length > kept.length || (!!timeout && this.lines.length > 38);
     } else this.omitted = true;
     this.lines = [];
     this.clipped = false;

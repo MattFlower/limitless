@@ -160,6 +160,21 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   expect(f.calls.slice(-3)).toEqual(["health", "restart", "health"]);
 });
 
+test("deploy enables runner redaction for every gate including smoke", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  const redacted: string[] = [];
+  f.opts.command = async (args, opts) => {
+    if (args[0] === "bun" && args[1] !== "install") {
+      expect(opts.redactOutput).toBe(true);
+      redacted.push(args.join(" "));
+    } else expect(opts.redactOutput).toBeUndefined();
+    return command(args, opts);
+  };
+  await deploy(7400, "feature", true, f.opts);
+  expect(redacted).toEqual(["bun run lint", "bun run typecheck", "bun test", "bun scripts/smoke.ts"]);
+});
+
 test("deploy waits for three current stages, not the queued work after them", async () => {
   const f = setup();
   const health = f.client.health;

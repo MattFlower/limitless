@@ -23,8 +23,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
-import { redactGateStreams } from "../src/gates/output.ts";
+import { extractFailures, FailureExcerpts, formatGateOutput } from "../src/gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
@@ -125,18 +124,11 @@ describe("runGates / compareGates", () => {
   });
 
   test.each(["stdout", "stderr"])(
-    "only the truncated %s stream loses its credential overlap",
+    "the untruncated %s stream keeps its failure diagnostics",
     async (stream) => {
       const secret = "synthetic-per-stream-cut-credential-421";
       proc.registerCredential("PER_STREAM_CUT_TEST_TOKEN", secret);
       const diagnostic = "(fail) retained identity\n^ this test timed out after 100ms.\n";
-      const streams = redactGateStreams(
-        stream === "stdout" ? "x".repeat(64_000) : diagnostic,
-        stream === "stderr" ? "x".repeat(64_000) : diagnostic,
-        { stdoutTruncated: stream === "stdout", stderrTruncated: stream === "stderr" },
-      );
-      expect(streams[stream === "stdout" ? "stderr" : "stdout"]).toBe(diagnostic);
-      expect(streams[stream].length).toBeLessThan(64_000);
       const dir = tempDir({ "long.txt": "x".repeat(65_000), "short.txt": diagnostic });
       try {
         const run = await runGates(
@@ -165,6 +157,45 @@ describe("runGates / compareGates", () => {
       }
     },
   );
+
+  test.each(["literal", "JSON"])("huge %s credentials leave no fragments at tail cuts", async (form) => {
+    const prefix = "synthetic-huge-key-";
+    const suffix = "-huge-key-footer";
+    const secret = prefix + "\\".repeat(35_000 - prefix.length - suffix.length) + suffix;
+    proc.registerCredential("HUGE_STREAM_TEST_TOKEN", secret);
+    const encoded = form === "JSON" ? JSON.stringify(secret).slice(1, -1) : secret;
+    const dir = tempDir({
+      "huge.txt": `error: ${encoded}\n(fail) huge\n${"\u001b[0m".repeat(8_000)}${"z".repeat(5_950)}`,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [
+            { name: "stdout", run: "cat huge.txt; exit 1" },
+            { name: "stderr", run: "cat huge.txt >&2; exit 1" },
+          ],
+        },
+        new AbortController().signal,
+      );
+      for (const result of run.checks) {
+        expect(result.failures).toContain("error: [redacted]");
+        expect(result.output.length).toBeLessThanOrEqual(6_000);
+        const text = JSON.stringify(result);
+        for (const value of [secret, encoded]) {
+          const fragments = new Set(
+            Array.from({ length: value.length - 7 }, (_, i) => value.slice(i, i + 8)),
+          );
+          for (const fragment of fragments) expect(text).not.toContain(fragment);
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   test("credential fragments cannot survive the runner cap or normalized tail cuts", async () => {
     const secret = "synthetic-runner-cap-credential-421";
@@ -520,6 +551,23 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
       ),
     ).toBe("error: broken\n  not ok 2 - failed");
     expect(extractFailures("ok 1 - passed\nno failures")).toBeUndefined();
+  });
+
+  test("forty-five 1 MiB lines keep failure excerpt retention bounded", () => {
+    const collector = new FailureExcerpts();
+    // Inspect retained data, since a final excerpt cap alone does not bound live memory.
+    const retained = collector as unknown as { lines: string[] };
+    for (let i = 0; i < 45; i++) {
+      collector.observe(`${i}: ${"x".repeat(1_048_576)}`);
+      expect(retained.lines.length).toBeLessThanOrEqual(39);
+      expect(retained.lines.every((line) => line.length <= 8_000)).toBe(true);
+      expect(retained.lines.reduce((size, line) => size + line.length, 0)).toBeLessThanOrEqual(39 * 8_000);
+    }
+    collector.observe("(fail) bounded diagnostics");
+    const result = collector.result();
+    expect(result?.length).toBeLessThanOrEqual(8_000);
+    expect(result).toContain("(fail) bounded diagnostics");
+    expect(result).toContain("left out");
   });
 
   test("caps diagnostic lines and keeps the failure line with an omission note", () => {

@@ -19,6 +19,16 @@ import { providerFixture } from "./provider-config-support.ts";
 
 test.each([
   { kind: "JSON", secret: 'synthetic-gate-json-"quoted"-\\slash', padding: "" },
+  {
+    kind: "multiline with blank and result lines",
+    secret: "synthetic-blank-header\n\n(fail) x\nsynthetic-result-footer",
+    padding: "",
+  },
+  {
+    kind: "multiline across many chunks",
+    secret: `synthetic-chunk-header\n\n(fail) x\n${"chunk-body".repeat(20_000)}\nsynthetic-chunk-footer`,
+    padding: "",
+  },
   { kind: "multiline", secret: "synthetic-gate-multiline-key\nsecond-key-line", padding: "" },
   {
     kind: "multiline beyond line cap",
@@ -44,7 +54,12 @@ test.each([
           fixture.root,
           {
             setup: [],
-            checks: [{ name: "test", run: "cat output.txt; exit 1" }],
+            checks: [
+              {
+                name: "test",
+                run: `"${process.execPath}" -e 'process.stdout.write(require("fs").readFileSync("output.txt")); process.exitCode = 1'`,
+              },
+            ],
             source: "detected",
             protectedPaths: [],
           },
@@ -56,7 +71,8 @@ test.each([
       for (const text of [result.output, result.failures]) {
         if (!padding || text === result.output) expect(text).toContain("[redacted]");
         expect(text).not.toContain(diagnostic);
-        for (const fragment of secret.split("\n")) expect(text).not.toContain(fragment.slice(0, 12));
+        for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
+          expect(text).not.toContain(fragment.slice(0, 12));
       }
       const repo = factory.store.upsertRepo({
         slug: "test/repo",
@@ -85,7 +101,8 @@ test.each([
       ]) {
         expect(text).toContain("[redacted]");
         expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
-        for (const fragment of secret.split("\n")) expect(text).not.toContain(fragment.slice(0, 12));
+        for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
+          expect(text).not.toContain(fragment.slice(0, 12));
       }
     } finally {
       await factory.stop();

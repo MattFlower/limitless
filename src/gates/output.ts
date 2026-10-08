@@ -1,7 +1,22 @@
 import { stripVTControlCharacters } from "node:util";
-import { type ProcResult, redactCredentials, registeredCredentials } from "../util/proc.ts";
+import { redactCredentials } from "../util/proc.ts";
 
-export const launchFailure = (output: string) => output.includes("sandbox_apply: Operation not permitted");
+const LAUNCH_FAILURE = "sandbox_apply: Operation not permitted";
+export const launchFailure = (output: string) => output.includes(LAUNCH_FAILURE);
+
+/** Scan raw streams independently so redaction and terminal normalization cannot alter the verdict. */
+export function launchFailureScan() {
+  const pending = { stdout: "", stderr: "" };
+  let failed = false;
+  return {
+    observe(chunk: string, stream: "stdout" | "stderr") {
+      const text = pending[stream] + chunk;
+      failed ||= launchFailure(text);
+      pending[stream] = text.slice(-(LAUNCH_FAILURE.length - 1));
+    },
+    failed: () => failed,
+  };
+}
 
 /** Remove terminal formatting before redaction, and redact before any diagnostic or tail cuts. */
 export const redactGateOutput = (output: string): string =>
@@ -22,17 +37,8 @@ export const redactGateData = <T>(value: T): T =>
         }),
       );
 
-/** A raw runner cut may have removed a credential's prefix. Drop only that stream's overlap. */
-export function redactGateStreams(
-  stdout: string,
-  stderr: string,
-  cuts: Pick<ProcResult, "stdoutTruncated" | "stderrTruncated"> = {},
-) {
-  // Literal redaction covers accidental disclosure: one write stays on one stream. Deliberate splits,
-  // interleaving or encoding require keeping credentials out of gate commands' reach (#335).
-  const overlap = Math.max(0, ...registeredCredentials().map((secret) => secret.length - 1));
-  return {
-    stdout: redactGateOutput(stdout).slice(cuts.stdoutTruncated ? overlap : 0),
-    stderr: redactGateOutput(stderr).slice(cuts.stderrTruncated ? overlap : 0),
-  };
+/** Runner redaction covers accidental disclosure before framing or cuts. Deliberate cross-stream
+ * splitting, interleaving or encoding requires keeping credentials out of gates' reach (#335). */
+export function redactGateStreams(stdout: string, stderr: string) {
+  return { stdout: redactGateOutput(stdout), stderr: redactGateOutput(stderr) };
 }

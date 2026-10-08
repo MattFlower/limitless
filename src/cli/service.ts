@@ -445,7 +445,7 @@ function tailLines(lines: string[], maxLines: number, maxBytes: number): string[
 
 async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOptions): Promise<void> {
   const gate = async (args: string[], timeoutMs: number) => {
-    const res = await run(args, { cwd: dir, timeoutMs, allowFail: true });
+    const res = await run(args, { cwd: dir, timeoutMs, allowFail: true, redactOutput: true });
     if (res.exitCode === 0) return;
     const { stdout, stderr } = redactGateStreams(res.stdout, res.stderr);
     const failures = extractFailures(`${stdout}\n${stderr}`);

@@ -3,7 +3,7 @@ import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { FailureExcerpts } from "./failures.ts";
-import { launchFailure, redactGateOutput, redactGateStreams } from "./output.ts";
+import { launchFailure, launchFailureScan, redactGateOutput, redactGateStreams } from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -65,12 +65,10 @@ export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLO
 
 /** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
-  let confinementError = false;
+  const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
   const observe = (line: string) => {
-    // Redaction can hide the launch diagnostic; inspect it before retaining any text.
-    confinementError ||= launchFailure(line);
     line = redactGateOutput(line);
     coverage.observe(line);
     excerpts.observe(line);
@@ -81,12 +79,15 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     env: gateEnv(),
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
+    redactOutput: true,
+    onRawChunk: launch.observe,
     onStdoutLine: observe,
     onStderrLine: observe,
   });
-  const output = redactGateStreams(res.stdout, res.stderr, res);
+  const output = redactGateStreams(res.stdout, res.stderr);
   const combined = `${output.stdout}\n${output.stderr}`.trim();
   const testCoverage = coverage.result();
+  const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
   return {

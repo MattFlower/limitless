@@ -245,6 +245,10 @@ export interface ProcOptions {
   timeoutMs?: number;
   /** Kill when neither stdout nor stderr produced output for this long. */
   idleTimeoutMs?: number;
+  /** Redact decoded streams before line framing and tail cuts. */
+  redactOutput?: boolean;
+  /** Raw decoded chunks for internal checks only; never retain or forward them. */
+  onRawChunk?: (chunk: string, stream: "stdout" | "stderr") => void;
   onStdoutLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
   /** Keep at most this many characters of stdout/stderr (the tail). Default 64k. */
@@ -434,24 +438,49 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      lastActivity = Date.now();
-      stdout = appendTail(stdout, chunk, "stdout");
-      out.push(chunk);
-    });
-    child.stderr.on("data", (chunk: string) => {
-      lastActivity = Date.now();
-      stderr = appendTail(stderr, chunk, "stderr");
-      err.push(chunk);
-    });
+    const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
+      let pending = "";
+      const emit = (text: string) => {
+        if (stream === "stdout") stdout = appendTail(stdout, text, stream);
+        else stderr = appendTail(stderr, text, stream);
+        lines.push(text);
+      };
+      return {
+        push(chunk: string) {
+          lastActivity = Date.now();
+          opts.onRawChunk?.(chunk, stream);
+          if (!opts.redactOutput) return emit(chunk);
+          pending = redactCredentials(pending + chunk);
+          // Retain possible credential prefixes, including JSON-escaped forms, across chunks.
+          const overlap = Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
+          const cut = Math.max(0, pending.length - overlap);
+          emit(pending.slice(0, cut));
+          pending = pending.slice(cut);
+        },
+        flush() {
+          emit(redactCredentials(pending));
+          pending = "";
+        },
+      };
+    };
+    const stdoutOutput = streamOutput("stdout", out);
+    const stderrOutput = streamOutput("stderr", err);
+    child.stdout.on("data", stdoutOutput.push);
+    child.stderr.on("data", stderrOutput.push);
+    child.stdout.on("end", stdoutOutput.flush);
+    child.stderr.on("end", stderrOutput.flush);
 
     child.on("error", (e) => {
-      stderr = appendTail(stderr, `\n[spawn error] ${e.message}`, "stderr");
+      const text = `\n[spawn error] ${e.message}`;
+      if (opts.redactOutput) stderrOutput.push(text);
+      else stderr = appendTail(stderr, text, "stderr");
     });
 
     child.on("close", async (code, sig) => {
       if (settled) return;
       settled = true;
+      stdoutOutput.flush();
+      stderrOutput.flush();
       out.flush();
       err.flush();
       finishTimers();
@@ -479,7 +508,9 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
     // A child that exits before reading its input raises EPIPE on stdin; that must not crash us.
     child.stdin.on("error", (e) => {
-      stderr = appendTail(stderr, `\n[stdin error] ${e.message}`, "stderr");
+      const text = `\n[stdin error] ${e.message}`;
+      if (opts.redactOutput) stderrOutput.push(text);
+      else stderr = appendTail(stderr, text, "stderr");
     });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
@@ -512,6 +543,7 @@ export async function sh(
     stdin?: string;
     signal?: AbortSignal;
     encoding?: BufferEncoding;
+    redactOutput?: boolean;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   opts.signal?.throwIfAborted();
@@ -524,6 +556,7 @@ export async function sh(
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
     tailLimit: SH_OUTPUT_LIMIT,
     encoding: opts.encoding,
+    redactOutput: opts.redactOutput,
     ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
   });
   // Cancellation must stop command sequences even when a nonzero exit is allowed.
