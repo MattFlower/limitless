@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Land a factory PR from a merge worktree: check, commit everything, push, wait for CI, squash-merge.
+# Land a factory PR from a merge worktree: check committed work, push, wait for CI, squash-merge.
 # Usage: scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir]
 # Every step checks its own exit status; nothing is piped, so a failure always stops the merge.
 set -euo pipefail
@@ -18,7 +18,7 @@ push_repo=""
 trap '[ -z "$push_repo" ] || rm -rf -- "$push_repo"' EXIT
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
 # The worktree's bunfig.toml (preload) and .env must not reach the checker.
-check_private() { bun --config=/dev/null --no-env-file "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
+check_private() { (cd "${check_dir:-$PWD}"; exec bun --config=/dev/null --no-env-file "$private_check" "$@") & checker=$!; wait "$checker"; checker=""; }
 # Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
 export LIMITLESS_GIT_EMPTY_HOOK=""
 safe_git() {
@@ -29,7 +29,7 @@ safe_git() {
   local IFS=$'\n'
   for key in $keys; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done
   set +f
-  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
+  git --no-pager -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
     ${flags[@]+"${flags[@]}"} "$@"
 }
 if ! admin="$(git rev-parse --absolute-git-dir 2>/dev/null)" || ! admin="$(cd "$admin" && pwd -P)" ||
@@ -43,28 +43,10 @@ paths="$(check_private --record)"
 # A planted graft or shallow file could hide ancestry from the scan and still be pushed.
 export GIT_GRAFT_FILE=/dev/null/none GIT_SHALLOW_FILE=""
 export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
-env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
-log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
-if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
-  echo "bun run check failed; see $log" >&2
+if ! sha="$(safe_git rev-parse HEAD 2>/dev/null)"; then
+  echo "Cannot read landing commit; refusing to land" >&2
   exit 1
 fi
-
-safe_git add -A
-check_private "$pr" "$repo" "$subject"
-if ! safe_git diff --cached --quiet || [ -f "$(safe_git rev-parse --git-path MERGE_HEAD)" ]; then
-  safe_git commit --no-verify -q -m "Merge main into PR $pr
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-fi
-if [ -n "$(safe_git status --porcelain)" ]; then
-  echo "worktree still dirty after commit" >&2
-  exit 1
-fi
-
-sha="$(safe_git rev-parse HEAD)"
-head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
-check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
 # Read all values once so ambiguous origins fail closed; preserve trailing newlines.
 if ! url="$(safe_git config --get-all remote.origin.url 2>/dev/null && printf '.')"; then
   echo "Cannot read origin URL; refusing to push" >&2
@@ -76,27 +58,73 @@ if [[ -z "$url" || "$url" = *$'\n'* ]]; then
   echo "Origin URL is missing or multi-valued; refusing to push" >&2
   exit 1
 fi
+# Keep the snapshot in shell memory so PR code cannot replace it during checks.
+if [ -e "$common/info/exclude" ] || [ -L "$common/info/exclude" ]; then
+  if ! exclude="$(cat "$common/info/exclude" 2>/dev/null && printf '.')"; then
+    echo "Cannot snapshot repository exclusions; refusing to land" >&2
+    exit 1
+  fi
+  exclude="${exclude%.}"
+else
+  exclude=""
+fi
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
+log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
+if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
+  echo "bun run check failed; see $log" >&2
+  exit 1
+fi
+
+for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+  if [ -e "$admin/$state" ] || [ -L "$admin/$state" ]; then
+    echo "Merge, cherry-pick or revert in progress; refusing to land" >&2
+    exit 1
+  fi
+done
 push_repo="$(mktemp -d "${TMPDIR:-/tmp}/land-pr-push.XXXXXXXX")"
 chmod 0700 "$push_repo"
-(
-  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG
-  cd "$push_repo"
-  if ! git -C "$push_repo" init --bare -q 2>/dev/null; then
-    echo "Cannot initialize push repository; refusing to push" >&2
-    exit 1
-  fi
-  printf '%s\n' "$common/objects" > "$push_repo/objects/info/alternates"
-  # Keep global hasconfig:remote.*.url includes working without copying clone config.
-  if ! safe_git -C "$push_repo" config remote.origin.url "$url" 2>/dev/null ||
-     ! safe_git -C "$push_repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
-    echo "Cannot prepare pinned commit in push repository; refusing to push" >&2
-    exit 1
-  fi
-  # A PR process still running as the user can act as the user directly; this script
-  # cannot defend against it. The land queue runs checks confined instead.
-  safe_git -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
-    push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"
-)
+clone="$GIT_WORK_TREE"
+unset GIT_WORK_TREE GIT_CONFIG
+export GIT_DIR="$push_repo" GIT_COMMON_DIR="$push_repo" GIT_INDEX_FILE="$push_repo/index"
+if ! git -C "$push_repo" init --bare -q 2>/dev/null; then
+  echo "Cannot initialize push repository; refusing to push" >&2
+  exit 1
+fi
+export GIT_WORK_TREE="$clone"
+printf '%s\n' "$common/objects" > "$push_repo/objects/info/alternates"
+printf '%s' "$exclude" > "$push_repo/info/exclude"
+# Local LFS payloads remain source data, not Git configuration.
+ln -s "$common/lfs" "$push_repo/lfs"
+# Keep global hasconfig:remote.*.url includes working without copying clone config.
+if ! safe_git -C "$push_repo" config remote.origin.url "$url" 2>/dev/null ||
+   ! safe_git -C "$push_repo" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  echo "Cannot prepare pinned commit in push repository; refusing to push" >&2
+  exit 1
+fi
+# Status must compare the private index with the pinned commit, not an unborn HEAD.
+printf '%s\n' "$sha" > "$push_repo/HEAD"
+if ! safe_git --git-dir="$push_repo" --work-tree="$clone" read-tree "$sha" 2>/dev/null; then
+  echo "Cannot inspect worktree; refusing to land" >&2
+  exit 1
+fi
+# Running outside the clone prevents worktreeGit from restoring its recorded admin paths.
+check_dir="$push_repo"
+export LIMITLESS_LAND_SOURCE_DIR="$clone" LIMITLESS_LAND_SOURCE_COMMON_DIR="$common"
+check_private "$pr" "$repo" "$subject"
+head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
+check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
+if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
+  echo "Cannot inspect worktree; refusing to land" >&2
+  exit 1
+fi
+if [ -n "$dirty" ]; then
+  echo "Worktree differs from landing commit; refusing to land" >&2
+  exit 1
+fi
+# A PR process still running as the user can act as the user directly; this script
+# cannot defend against it. The land queue runs checks confined instead.
+safe_git -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
+  push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""
