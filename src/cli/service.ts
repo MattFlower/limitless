@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
+import { extractFailures } from "../gates/failures.ts";
 import { sh } from "../util/proc.ts";
 import {
   bounded,
@@ -445,6 +446,8 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
   const gate = async (args: string[], timeoutMs: number) => {
     const res = await run(args, { cwd: dir, timeoutMs, allowFail: true });
     if (res.exitCode === 0) return;
+    const failures = extractFailures(`${res.stdout}\n${res.stderr}`);
+    const tailBytes = failures ? 1_000 : GATE_TAIL_BYTES;
     // The failing check (a smoke row, a test name) is usually near the end of the output.
     const out = res.stdout.trimEnd().split("\n").filter(Boolean);
     const err = res.stderr.trimEnd().split("\n").filter(Boolean);
@@ -453,14 +456,14 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
     const failRows = tailLines(
       out.filter((line) => SMOKE_FAIL_ROW.test(line)),
       GATE_FAIL_ROWS,
-      GATE_TAIL_BYTES / 4,
+      tailBytes / 4,
     );
-    const errTail = tailLines(err, GATE_TAIL_LINES - failRows.length, GATE_TAIL_BYTES - bytes(failRows));
+    const errTail = tailLines(err, GATE_TAIL_LINES - failRows.length, tailBytes - bytes(failRows));
     const outTail = (reserved: string[]) =>
       tailLines(
         out,
         GATE_TAIL_LINES - errTail.length - reserved.length,
-        GATE_TAIL_BYTES - bytes(errTail) - bytes(reserved),
+        tailBytes - bytes(errTail) - bytes(reserved),
       );
     let outKept = outTail([]);
     const missed = failRows.filter((line) => !outKept.includes(line));
@@ -473,7 +476,11 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
       ...section("stderr", err, errTail),
     ];
     throw new Error(
-      [`Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`, ...tail].join("\n"),
+      [
+        `Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`,
+        ...(failures ? [failures] : []),
+        ...tail,
+      ].join("\n"),
     );
   };
   // The full suite takes 8–11 minutes alone and over 20 while runs use the machine; the

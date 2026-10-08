@@ -521,9 +521,15 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
 
 test("a failing land check blocks the entry with the check names and no output", async () => {
   writeFileSync(
-    join(seed, ".limitless.toml"),
-    `[gates]\nchecks = [{ name = "lint", run = "echo 'secret in output'; false" }]\n`,
+    join(seed, "output.txt"),
+    "sample.test.ts:\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +
+      "skipped summary\n".repeat(700),
   );
+  writeFileSync(
+    join(seed, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = "lint", run = "cat output.txt; echo 'secret in output'; false" }]\n`,
+  );
+  await sh(["git", "add", "output.txt"], { cwd: seed });
   await sh(["git", "commit", "-qam", "failing check"], { cwd: seed });
   await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
   const pr = delivered(1, "pr-1");
@@ -538,6 +544,9 @@ test("a failing land check blocks the entry with the check names and no output",
   // Check names only: the output is in the log, never in the reason.
   expect(blocked?.reason).toMatch(/^lint failed \(/);
   expect(blocked?.reason).not.toContain("secret in output");
+  const log = readFileSync(blocked?.logPath ?? "", "utf8");
+  expect(log).toContain("error: values differ\nExpected: 1\nReceived: 2");
+  expect(log.indexOf("error:")).toBeLessThan(log.indexOf("skipped summary"));
   expect(ghCalls("pr merge")).toEqual([]);
 });
 

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { formatGateFeedback } from "../src/pipeline/prompts.ts";
 
-function feedback(output: string): string {
+function feedback(output: string, failures?: string, timedOut = true): string {
   return formatGateFeedback([
     {
       name: "test",
@@ -12,13 +12,33 @@ function feedback(output: string): string {
         command: "fake-test",
         ok: false,
         exitCode: 1,
-        timedOut: true,
+        timedOut,
         durationMs: 900_000,
         output,
+        ...(failures ? { failures } : {}),
       },
     },
   ]);
 }
+
+test.each([false, true])(
+  "failure feedback puts bounded excerpts before a shorter tail (timeout: %s)",
+  (timedOut) => {
+    const reason = "error: values differ\nExpected: 1\nReceived: 2\n(fail) assertion";
+    const message = feedback("summary\n".repeat(800), `${reason}\n${"x".repeat(8_000)}`, timedOut);
+    expect(message).toContain(reason);
+    expect(message.indexOf("error:")).toBeLessThan(message.indexOf("summary"));
+    expect(message).toContain("left out");
+    expect(message.length).toBeLessThan(3_300);
+  },
+);
+
+test("legacy failed gate feedback still shows the tail", () => {
+  const message = feedback(`early\n${"x".repeat(4_000)}\nlegacy failure tail`, undefined, false);
+  expect(message).toContain("legacy failure tail");
+  expect(message).not.toContain("early");
+  expect(message.length).toBeLessThan(3_300);
+});
 
 test.each([
   "ok 1 - completed test\n  ---\n  duration_ms: 0.1\n  ...\n",
