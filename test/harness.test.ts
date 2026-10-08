@@ -297,10 +297,9 @@ describe("LoopDetector", () => {
       expect(d.observe("shell", "poll", "missing")).toBeNull();
       for (let i = 1; i < 6; i++) {
         expect(d.observe("shell", "poll", String(i))).toBeNull();
-        expect(d.observeResult(String(i), changed && i === 5 ? "progress" : "waiting")).toBe(
-          !changed && i === 5 ? "repeated the same shell call 6 times" : null,
-        );
+        expect(d.observeResult(String(i), changed && i === 5 ? "progress" : "waiting")).toBeNull();
       }
+      if (!changed) expect(d.observe("shell", "poll", "next")).toBe("repeated the same shell call 6 times");
       if (changed) {
         // An older completion must not replace the sixth call's newer baseline.
         expect(d.observeResult("missing", "waiting")).toBeNull();
@@ -333,7 +332,8 @@ describe("LoopDetector", () => {
         expect(d.observeResult(String(i), i === 0 ? "waiting" : "progress")).toBeNull();
       }
     }
-    expect(d.observeResult("1", "progress")).toBe("repeated the same shell call 6 times");
+    expect(d.observeResult("1", "progress")).toBeNull();
+    expect(d.observeResult("2", "progress")).toBe("repeated the same shell call 6 times");
   });
 
   test("results match IDs across interleaved calls and late completions in call order", () => {
@@ -441,6 +441,53 @@ for (const harness of ["codex", "claude"] as const) {
     harness === "codex"
       ? ["shell", "apply_patch", "test.poll", "web_search"]
       : ["Bash", "Edit", "mcp__test__poll"];
+  test(`${harness} parser waits for a late predecessor to establish progress`, () => {
+    const detector = new LoopDetector(100);
+    const onEvent = (event: AgentEvent) => {
+      if (event.type === "tool_call") expect(detector.observe(event.name, event.input, event.id)).toBeNull();
+      if (event.type === "tool_result") expect(detector.observeResult(event.id, event.output)).toBeNull();
+    };
+    const parser = harness === "codex" ? new CodexStreamParser(onEvent) : new ClaudeStreamParser(onEvent);
+    const call = (i: number) =>
+      parser.feed(
+        JSON.stringify(
+          harness === "codex"
+            ? { type: "item.started", item: { type: "command_execution", id: String(i), command: "poll" } }
+            : {
+                type: "assistant",
+                message: {
+                  content: [{ type: "tool_use", id: String(i), name: "Bash", input: { command: "poll" } }],
+                },
+              },
+        ),
+      );
+    const complete = (i: number, output: string) =>
+      parser.feed(
+        JSON.stringify(
+          harness === "codex"
+            ? {
+                type: "item.completed",
+                item: {
+                  type: "command_execution",
+                  id: String(i),
+                  command: "poll",
+                  aggregated_output: output,
+                  exit_code: 0,
+                },
+              }
+            : {
+                type: "user",
+                message: { content: [{ type: "tool_result", tool_use_id: String(i), content: output }] },
+              },
+        ),
+      );
+    call(1);
+    complete(1, "A");
+    for (let i = 2; i <= 6; i++) call(i);
+    for (let i = 6; i >= 3; i--) complete(i, "A");
+    complete(2, "B");
+    expect(detector.finish()).toBeNull();
+  });
   for (const tool of tools) {
     test(`${harness} ${tool} parser events detect loops during the invocation`, async () => {
       const modes =
@@ -457,6 +504,8 @@ for (const harness of ["codex", "claude"] as const) {
               "parallel-changing",
               "parallel-threshold",
               "parallel-identical",
+              "parallel-changing-reverse",
+              "parallel-identical-reverse",
               "late",
               "budget",
             ]
@@ -560,9 +609,24 @@ for (const harness of ["codex", "claude"] as const) {
               const parallel = mode.startsWith("parallel");
               const count = mode === "missing-stream" ? 20 : mode === "late" ? 9 : mode === "budget" ? 7 : 6;
               if (parallel) {
-                for (let i = 0; i < count; i++) {
-                  call(i);
+                if (harness === "claude") {
+                  emit({
+                    type: "assistant",
+                    message: {
+                      content: Array.from({ length: count }, (_, i) => ({
+                        type: "tool_use",
+                        id: `poll-${i}`,
+                        name: tool,
+                        input: { command: "tail test.log" },
+                      })),
+                    },
+                  });
                   expect(opts.signal?.aborted).toBe(false);
+                } else {
+                  for (let i = 0; i < count; i++) {
+                    call(i);
+                    expect(opts.signal?.aborted).toBe(false);
+                  }
                 }
               }
               for (let i = 0; i < count; i++) {
@@ -579,15 +643,16 @@ for (const harness of ["codex", "claude"] as const) {
                 // Searches have no result text; the sixth call must stop before completion.
                 expect(opts.signal?.aborted).toBe(tool === "web_search" && i === 5);
                 if (mode === "late" && i === 1) continue;
+                const resultIndex = mode.endsWith("reverse") ? count - 1 - i : i;
                 const output =
                   mode.includes("changing") || mode === "budget"
-                    ? String(1_000_000 + i)
+                    ? String(1_000_000 + resultIndex)
                     : (mode.includes("threshold") && i === 5) || (mode === "late" && i >= 2)
                       ? "progress"
                       : mode === "truncated"
                         ? `${"x".repeat(20_000)}${i}`
                         : "waiting";
-                if (!mode.startsWith("missing")) complete(i, output);
+                if (!mode.startsWith("missing")) complete(resultIndex, output);
                 if (mode === "late" && i === 2) complete(1, "waiting");
                 // A result without a corresponding call must not affect another call's baseline.
                 emit(
@@ -601,7 +666,7 @@ for (const harness of ["codex", "claude"] as const) {
                       },
                 );
                 const stopped =
-                  ((mode.endsWith("identical") || mode === "truncated") && i === 5) ||
+                  ((mode.includes("identical") || mode === "truncated") && i === 5) ||
                   (mode === "late" && i === 8);
                 expect(opts.signal?.aborted).toBe(stopped);
               }

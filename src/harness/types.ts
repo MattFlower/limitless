@@ -224,7 +224,13 @@ export class LoopDetector {
     }
     for (const { same, last } of counts.values()) {
       if (same < this.maxIdenticalInWindow) continue;
-      if (!finished && last.id !== undefined && last.hash === undefined) continue;
+      if (
+        !finished &&
+        this.recent.some(
+          (entry) => entry.key === last.key && entry.id !== undefined && entry.hash === undefined,
+        )
+      )
+        continue;
       return `repeated the same ${last.name} call ${this.maxIdenticalInWindow} times`;
     }
     return null;
