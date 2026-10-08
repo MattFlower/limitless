@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
+import { FailureExcerpts } from "./failures.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -12,6 +13,7 @@ export interface GateResult {
   exitCode: number | null;
   durationMs: number;
   output: string; // tail
+  failures?: string;
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
   confinementError?: boolean;
@@ -65,9 +67,11 @@ export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLO
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
   let confinementError = false;
   const coverage = new BunTestCoverage(cwd);
+  const excerpts = new FailureExcerpts();
   const observe = (line: string) => {
     confinementError ||= launchFailure(line);
     coverage.observe(line);
+    excerpts.observe(line);
   };
   const res = await runConfined({
     command: cmd.run,
@@ -80,13 +84,16 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   });
   const combined = `${res.stdout}\n${res.stderr}`.trim();
   const testCoverage = coverage.result();
+  const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
+  const failures = ok ? undefined : excerpts.result();
   return {
     name: cmd.name,
     command: cmd.run,
-    ok: !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled,
+    ok,
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
+    ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Present only when set, like timedOut, so results stay readable by strict schemas and older releases.
     ...(confinementError ? { confinementError: true } : {}),

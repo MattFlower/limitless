@@ -13,6 +13,7 @@ interface GateResultJson {
   exitCode: number | null;
   durationMs: number;
   output: string;
+  failures?: string;
 }
 interface GateComparisonJson {
   name: string;
@@ -102,7 +103,11 @@ const GateOutputRow: Component<{ r: GateResultJson; label: string; badgeClass: s
       <Show when={open()}>
         <tr>
           <td colspan={5}>
-            <pre class="log-detail">{props.r.output || "(no output)"}</pre>
+            <pre class="log-detail">
+              {props.r.failures
+                ? `${props.r.failures}\n\n${props.r.output.slice(-1_000)}`
+                : props.r.output || "(no output)"}
+            </pre>
           </td>
         </tr>
       </Show>
