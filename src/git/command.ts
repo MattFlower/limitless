@@ -55,7 +55,8 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   // implement commits), so Git may rename or remove its own lock file between the listing and lstat.
   // Only these top-level locks may vanish: Git creates them exclusively, so one recreated after the
   // check makes Git refuse rather than read it. Any other missing entry (including reftable data that
-  // happens to end in .lock) still fails.
+  // happens to end in .lock) still fails. The inspection validates the directory as it is when it
+  // runs; only factory Git writes here, and a concurrent writer could change it after this returns.
   const disposable = /^(?:HEAD|ORIG_HEAD|index)\.lock$/;
   const inspect = (path: string) => {
     const lock = dirname(path) === admin && disposable.test(basename(path));
