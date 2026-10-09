@@ -1,10 +1,23 @@
-#!/bin/zsh
-# 30 consecutive iterations: target file plus three other pipeline files under --parallel=4.
-pass=0
-for i in $(seq 1 30); do
-  out=$(bun test --parallel=4 test/pipeline-verification.test.ts test/pipeline-holdout-lifecycle.test.ts test/pipeline-panel.test.ts test/pipeline-gates.test.ts 2>&1)
-  if echo "$out" | grep -q "(fail)"; then echo "iter $i FAIL"; echo "$out" | grep -A20 "(fail)" | head -60; else pass=$((pass+1)); fi
-  echo "$out" | grep -E "environment verification retry: passes" | head -1
-  echo "$out" | grep -E "^ *[0-9]+ (pass|fail)$" | tr '\n' ' '; echo
+#!/usr/bin/env bash
+# Preserve complete output and require both a successful invocation and the target pass.
+set -u
+phase=${1:-validation}
+iterations=${2:-30}
+root=$(cd "$(dirname "$0")" && pwd)
+logs="$root/$phase"
+mkdir -p "$logs"
+export PIPELINE_DIAGNOSTICS="$logs"
+passed=0
+for ((i=1; i<=iterations; i++)); do
+  output="$logs/iteration-$i.log"
+  bun test --parallel=4 test/pipeline-verification.test.ts test/pipeline-holdout-lifecycle.test.ts test/pipeline-panel.test.ts test/pipeline-gates.test.ts >"$output" 2>&1
+  status=$?
+  if ((status != 0)) || ! rg -q '^\(pass\) environment verification retry: passes \[' "$output"; then
+    cat "$output"
+    echo "iteration $i failed (exit $status); passed iterations: $passed/$iterations"
+    exit 1
+  fi
+  passed=$((passed+1))
+  echo "iteration $i passed"
 done
-echo "passed iterations: $pass/30"
+echo "passed iterations: $passed/$iterations"

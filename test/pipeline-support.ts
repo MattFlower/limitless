@@ -18,7 +18,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { sh } from "../src/util/proc.ts";
+import { redactCredentials, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { seeded } from "./seeded.ts";
 
@@ -245,6 +245,25 @@ export function pipelineSetup(state: PipelineFixture) {
 
   afterEach(async () => {
     process.env.PATH = originalPath;
+    if (process.env.PIPELINE_DIAGNOSTICS && state.factory) {
+      for (const run of state.factory.store.listRuns()) {
+        if (run.status === "succeeded") continue;
+        console.error(`Pipeline run diagnostics: ${run.id}`);
+        writeFileSync(
+          join(process.env.PIPELINE_DIAGNOSTICS, `${run.id}.json.log`),
+          JSON.stringify(
+            {
+              run,
+              stages: state.factory.store.listStages(run.id),
+              events: state.factory.store.listEvents(run.id, { limit: 100000 }),
+              state: state.factory.store.getRunState(run.id),
+            },
+            (_key: string, value: unknown) => (typeof value === "string" ? redactCredentials(value) : value),
+            2,
+          ),
+        );
+      }
+    }
     await state.factory?.stop();
     state.factory?.store.close();
     state.factory = null;
