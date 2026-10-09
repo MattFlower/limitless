@@ -72,11 +72,12 @@ beforeEach(async () => {
   await sh(["git", "init", "-q", "-b", "main"], { cwd: seed });
   writeFileSync(join(seed, "README.md"), "base\n");
   // Each check brackets its own run in a log, so overlapping land checks are visible.
+  // Keep the overlap window even when the release file already exists.
   // Most tests release checks immediately; stop tests hold them until shutdown.
   writeFileSync(gateReleasePath(), "");
   writeFileSync(
     join(seed, ".limitless.toml"),
-    `[gates]\nchecks = [{ name = "land", run = "echo start >> '${gateLogPath()}'; while [ ! -e '${gateReleasePath()}' ]; do sleep 0.05; done; echo end >> '${gateLogPath()}'" }]\n`,
+    `[gates]\nchecks = [{ name = "land", run = "echo start >> '${gateLogPath()}'; sleep 0.3; while [ ! -e '${gateReleasePath()}' ]; do sleep 0.05; done; echo end >> '${gateLogPath()}'" }]\n`,
   );
   await sh(["git", "add", "."], { cwd: seed });
   await sh(["git", "commit", "-qm", "base"], { cwd: seed });
