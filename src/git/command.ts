@@ -53,9 +53,10 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   const unsafe = "Unsafe worktree Git administration";
   // Factory commands can share a worktree concurrently (the holdout exports its base snapshot while
   // implement commits), so Git may rename or remove its own lock file (HEAD.lock, index.lock) between
-  // the listing and lstat. An entry that is gone cannot be used; everything still present is checked.
+  // the listing and lstat. Only lock files may vanish: Git creates them exclusively, so one recreated
+  // after the check makes Git refuse rather than read it. Any other missing entry still fails.
   const inspect = (path: string) => {
-    const stat = lstatSync(path, { throwIfNoEntry: path === admin });
+    const stat = lstatSync(path, { throwIfNoEntry: path === admin || !path.endsWith(".lock") });
     if (!stat) return;
     assert(path === admin || !/\/config(?:\.worktree)?$/.test(path), unsafe);
     assert(stat.isDirectory() || (stat.isFile() && stat.nlink === 1), unsafe);

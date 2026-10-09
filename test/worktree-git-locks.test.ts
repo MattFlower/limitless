@@ -54,3 +54,20 @@ test("a lock file another factory command releases mid-inspection is not unsafe;
   linkSync(join(dir, "outside"), lock);
   await expect(factory("rev-parse", "HEAD")).rejects.toThrow("Unsafe worktree Git administration");
 });
+
+test("any other admin entry that vanishes mid-inspection still fails", async () => {
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  const entry = join(admin, "config.worktree");
+  writeFileSync(entry, "[core]\n");
+  const lstat = fs.lstatSync;
+  // A writer could delete it before lstat and recreate it as a link afterwards, so it isn't skipped.
+  const vanished = spyOn(fs, "lstatSync").mockImplementation(((path: string, options?: fs.StatOptions) => {
+    if (path === entry) rmSync(entry, { force: true });
+    return lstat(path, options);
+  }) as typeof fs.lstatSync);
+  try {
+    await expect(factory("rev-parse", "HEAD")).rejects.toThrow("ENOENT");
+  } finally {
+    vanished.mockRestore();
+  }
+});
