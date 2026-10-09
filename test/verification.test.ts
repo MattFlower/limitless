@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { compareGates } from "../src/gates/run.ts";
 import {
   formatVerifyFeedback,
   holdoutPrompt,
@@ -19,6 +20,7 @@ import {
   VerifySchema,
 } from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import { credentialGate, gateCredential } from "./gate-output-support.ts";
 
 const spec: Spec = {
   summary: "test",
@@ -344,7 +346,7 @@ test("private literals do not match inside longer words or dollar-prefixed ident
   );
 });
 
-test("verifier leaves gate citations to the engine instead of rerunning whole suites", () => {
+test("verifier leaves gate citations to the engine instead of rerunning whole suites", async () => {
   const result = (name: string, ok: boolean) => ({
     name,
     command: `bun run ${name}`,
@@ -361,6 +363,7 @@ test("verifier leaves gate citations to the engine instead of rerunning whole su
     checks: [
       { name: "lint", verdict: "pass", blocking: false, result: result("lint", true) },
       { name: "test", verdict: "still_failing", blocking: false, result: result("test", false) },
+      ...compareGates(null, await credentialGate()),
     ],
   });
   expect(prompt).toContain("- lint `bun run lint`: pass");
@@ -371,6 +374,8 @@ test("verifier leaves gate citations to the engine instead of rerunning whole su
   expect(prompt).toContain('blockedReason "sandbox"');
   expect(prompt).toContain("Do not cite factory gate runs");
   expect(prompt).toContain("The factory will evaluate its own gate results");
+  expect(prompt).not.toContain(gateCredential);
+  expect(prompt).not.toContain("error: credential");
   const withoutGates = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" });
   expect(withoutGates).not.toContain("Repository checks");
   expect(withoutGates).toContain('blockedReason "sandbox"');

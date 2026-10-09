@@ -4,6 +4,7 @@ import { agentEnv } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { FailureExcerpts } from "./failures.ts";
+import { launchFailure, launchFailureScan, redactGateOutput, redactGateStreams } from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -57,9 +58,8 @@ export interface GateHooks {
 }
 
 const OUTPUT_TAIL = 6_000;
-const launchFailure = (output: string) => output.includes("sandbox_apply: Operation not permitted");
-const confinementFailed = (r?: GateResult): boolean =>
-  !!r && (!!r.confinementError || launchFailure(r.output) || confinementFailed(r.firstAttempt));
+export const confinementFailed = (r?: GateResult): boolean =>
+  !!r && ((r.confinementError ?? launchFailure(r.output)) || confinementFailed(r.firstAttempt));
 
 /** Gates execute code the agent wrote; give them the same scrubbed environment as agents. */
 export const gateEnv = (): Record<string, string> =>
@@ -72,11 +72,11 @@ export const gateEnv = (): Record<string, string> =>
 
 /** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
-  let confinementError = false;
+  const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
   const observe = (line: string) => {
-    confinementError ||= launchFailure(line);
+    line = redactGateOutput(line);
     coverage.observe(line);
     excerpts.observe(line);
   };
@@ -86,11 +86,15 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     env: gateEnv(),
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
+    redactOutput: true,
+    onRawChunk: launch.observe,
     onStdoutLine: observe,
     onStderrLine: observe,
   });
-  const combined = `${res.stdout}\n${res.stderr}`.trim();
+  const output = redactGateStreams(res.stdout, res.stderr);
+  const combined = `${output.stdout}\n${output.stderr}`.trim();
   const testCoverage = coverage.result();
+  const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
   return {
@@ -102,8 +106,8 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
-    // Present only when set, like timedOut, so results stay readable by strict schemas and older releases.
-    ...(confinementError ? { confinementError: true } : {}),
+    // Both true and false record that the raw scan, rather than normalized output, is authoritative.
+    confinementError,
     ...(testCoverage.summary || testCoverage.passedFiles.length || testCoverage.skippedFiles.length
       ? { testCoverage }
       : {}),
