@@ -13,6 +13,7 @@ import {
 import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
+import { redactGateStreams } from "../gates/output.ts";
 import { sh } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import {
@@ -448,13 +449,14 @@ function tailLines(lines: string[], maxLines: number, maxBytes: number): string[
 
 async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOptions): Promise<void> {
   const gate = async (args: string[], timeoutMs: number) => {
-    const res = await run(args, { cwd: dir, timeoutMs, allowFail: true });
+    const res = await run(args, { cwd: dir, timeoutMs, allowFail: true, redactOutput: true });
     if (res.exitCode === 0) return;
-    const failures = extractFailures(`${res.stdout}\n${res.stderr}`);
+    const { stdout, stderr } = redactGateStreams(res.stdout, res.stderr);
+    const failures = extractFailures(`${stdout}\n${stderr}`);
     const tailBytes = failures ? 1_000 : GATE_TAIL_BYTES;
     // The failing check (a smoke row, a test name) is usually near the end of the output.
-    const out = res.stdout.trimEnd().split("\n").filter(Boolean);
-    const err = res.stderr.trimEnd().split("\n").filter(Boolean);
+    const out = stdout.trimEnd().split("\n").filter(Boolean);
+    const err = stderr.trimEnd().split("\n").filter(Boolean);
     // A smoke FAIL row names the failed check, so room is reserved for it; stderr comes next so a
     // `bun test` failure summary is not pushed out by stdout lines, and stdout gets what is left.
     const failRows = tailLines(

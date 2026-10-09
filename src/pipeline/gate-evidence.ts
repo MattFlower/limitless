@@ -1,4 +1,4 @@
-import type { GateComparison } from "../gates/run.ts";
+import { confinementFailed, type GateComparison } from "../gates/run.ts";
 import { BunTestCoverage } from "../gates/test-coverage.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
 
@@ -69,8 +69,7 @@ function passed(check: GateEvidence["checks"][number]): boolean {
     result.ok &&
     result.exitCode === 0 &&
     !result.timedOut &&
-    !result.confinementError &&
-    !result.output.includes("sandbox_apply: Operation not permitted") &&
+    !confinementFailed(result) &&
     !result.testCoverage?.skippedFiles.length &&
     !incompleteTestOutput.test(result.output) &&
     !result.firstAttempt;

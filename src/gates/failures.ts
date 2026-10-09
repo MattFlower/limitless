@@ -1,11 +1,11 @@
-import { stripVTControlCharacters } from "node:util";
+import { redactGateData, redactGateOutput } from "./output.ts";
 import type { GateResult } from "./run.ts";
 
 const FAILURE_RESULT = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/;
 const TIMEOUT = /^\^ this test timed out after \d+(?:\.\d+)?ms\.$/;
 const OMITTED = "[failure excerpts: diagnostic lines or failures left out]";
 
-/** Capture before the process runner truncates output, retaining only bounded diagnostics. */
+/** Capture already-redacted lines before runner tail cuts, retaining only bounded diagnostics. */
 export class FailureExcerpts {
   private lines: string[] = [];
   private excerpts: string[] = [];
@@ -15,7 +15,7 @@ export class FailureExcerpts {
   private failure: string | undefined;
 
   observe(raw: string): void {
-    const line = stripVTControlCharacters(raw);
+    const line = redactGateOutput(raw);
     const text = line.trim();
     if (this.failure !== undefined) {
       // Bun emits the timeout explanation just after the result, unlike assertion diagnostics.
@@ -100,6 +100,7 @@ function shortenFailureExcerpts(excerpt: string, limit: number): string {
 
 /** Excerpts come first; legacy results keep their original tail budget. */
 export function formatGateOutput(result: Pick<GateResult, "output" | "failures">, limit = 3_000): string {
+  result = redactGateData(result);
   if (!result.failures) return result.output.slice(-limit);
   const failures = shortenFailureExcerpts(result.failures, limit - 1_002);
   return `${failures}\n\n${result.output.slice(-1_000)}`;

@@ -23,7 +23,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
+import { extractFailures, FailureExcerpts, formatGateOutput } from "../src/gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
@@ -93,6 +93,323 @@ describe("detectGates", () => {
 });
 
 describe("runGates / compareGates", () => {
+  test("intact credentials on either stream are redacted without holding failure lines", async () => {
+    const secret = "synthetic-intact-stream-credential-421";
+    proc.registerCredential("INTACT_STREAM_TEST_TOKEN", secret);
+    const dir = tempDir({
+      "stdout.txt": `error: ${secret}\n(fail) stdout assertion\n`,
+      "stderr.txt": `(fail) stderr ${secret}\n^ this test timed out after 100ms.\n`,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [{ name: "test", run: "cat stdout.txt; cat stderr.txt >&2; exit 1" }],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.output).toBe(
+        "error: [redacted]\n(fail) stdout assertion\n\n(fail) stderr [redacted]\n^ this test timed out after 100ms.",
+      );
+      expect(run.checks[0]?.failures).toContain(
+        "(fail) stderr [redacted]\n^ this test timed out after 100ms.",
+      );
+      expect(JSON.stringify(run)).not.toContain(secret);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["stdout", "stderr"])(
+    "the untruncated %s stream keeps its failure diagnostics",
+    async (stream) => {
+      const secret = "synthetic-per-stream-cut-credential-421";
+      proc.registerCredential("PER_STREAM_CUT_TEST_TOKEN", secret);
+      const diagnostic = "(fail) retained identity\n^ this test timed out after 100ms.\n";
+      const dir = tempDir({ "long.txt": "x".repeat(65_000), "short.txt": diagnostic });
+      try {
+        const run = await runGates(
+          dir,
+          {
+            setup: [],
+            source: "detected",
+            protectedPaths: [],
+            checks: [
+              {
+                name: "test",
+                run:
+                  stream === "stdout"
+                    ? "cat long.txt; cat short.txt >&2; exit 1"
+                    : "cat long.txt >&2; cat short.txt; exit 1",
+              },
+            ],
+          },
+          new AbortController().signal,
+        );
+        // The stdout tail can itself fall outside the combined tail, but its early excerpt must survive.
+        if (stream === "stdout") expect(run.checks[0]?.output).toContain(diagnostic.trim());
+        expect(run.checks[0]?.failures).toContain(diagnostic.trim());
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["literal", "JSON"])("huge %s credentials leave no fragments at tail cuts", async (form) => {
+    const prefix = "synthetic-huge-key-";
+    const suffix = "-huge-key-footer";
+    const secret = prefix + "\\".repeat(35_000 - prefix.length - suffix.length) + suffix;
+    proc.registerCredential("HUGE_STREAM_TEST_TOKEN", secret);
+    const encoded = form === "JSON" ? JSON.stringify(secret).slice(1, -1) : secret;
+    const dir = tempDir({
+      "huge.txt": `error: ${encoded}\n(fail) huge\n${"\u001b[0m".repeat(8_000)}${"z".repeat(5_950)}`,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [
+            { name: "stdout", run: "cat huge.txt; exit 1" },
+            { name: "stderr", run: "cat huge.txt >&2; exit 1" },
+          ],
+        },
+        new AbortController().signal,
+      );
+      for (const result of run.checks) {
+        expect(result.failures).toContain("error: [redacted]");
+        expect(result.output.length).toBeLessThanOrEqual(6_000);
+        const text = JSON.stringify(result);
+        for (const value of [secret, encoded]) {
+          const fragments = new Set(
+            Array.from({ length: value.length - 7 }, (_, i) => value.slice(i, i + 8)),
+          );
+          for (const fragment of fragments) expect(text).not.toContain(fragment);
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("credential fragments cannot survive the runner cap or normalized tail cuts", async () => {
+    const secret = "synthetic-runner-cap-credential-421";
+    proc.registerCredential("RUNNER_CAP_TEST_TOKEN", secret);
+    const dir = tempDir({
+      "cap.txt": `${secret}${"\u001b[0m".repeat(15_995)}`,
+      "tail.txt": `${secret}${"\u001b[0mz".repeat(5_980)}`,
+      "excerpt.txt": `error: ${secret}\n${"x".repeat(9_000)}${secret}\n(fail) assertion\n`,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: ["cap", "tail", "excerpt"].flatMap((name) => [
+            { name: `${name}-stdout`, run: `cat ${name}.txt; exit 1` },
+            { name: `${name}-stderr`, run: `cat ${name}.txt >&2; exit 1` },
+          ]),
+        },
+        new AbortController().signal,
+      );
+      for (const result of run.checks) {
+        const text = `${result.output}\n${result.failures ?? ""}`;
+        for (let i = 0; i <= secret.length - 8; i++) expect(text).not.toContain(secret.slice(i, i + 8));
+      }
+      expect(run.checks).toHaveLength(6);
+      expect(run.checks[2]?.output).toContain("[redacted]");
+      expect(run.checks[4]?.failures).toContain("[redacted]");
+      expect(run.checks[4]?.failures).toContain("left out");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("raw confinement classification survives redaction and cannot be created by ANSI normalization", async () => {
+    const marker = "sandbox_apply: Operation not permitted";
+    const secret = `${marker} synthetic-raw-confinement-421`;
+    proc.registerCredential("RAW_CONFINEMENT_TEST_TOKEN", secret);
+    const dir = tempDir({
+      "interrupted.txt": marker.replace("Operation", "Oper\u001b[0mation"),
+      "raw.txt": secret,
+    });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [
+            { name: "interrupted", run: "cat interrupted.txt; exit 1" },
+            { name: "raw", run: "cat raw.txt; exit 1" },
+          ],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]).toMatchObject({ output: marker, confinementError: false });
+      expect(run.checks[1]).toMatchObject({ output: "[redacted]", confinementError: true });
+      expect(compareGates(null, run).map((c) => c.verdict)).toEqual(["new_failure", "confinement_error"]);
+      const legacy = { ...run, checks: run.checks.slice(0, 1).map(({ confinementError: _flag, ...r }) => r) };
+      expect(compareGates(null, legacy)[0]?.verdict).toBe("confinement_error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts setup, checks and retries before tail cuts, callbacks and persistence", async () => {
+    const credential = "synthetic-gate-boundary-credential-409";
+    proc.registerCredential("GATE_BOUNDARY_TEST_TOKEN", credential);
+    const output =
+      `${credential}.test.ts:\n(pass) earlier\nerror: credential ${credential}\n(fail) assertion\n${"summary\n".repeat(1_000)}` +
+      `${credential}${"z".repeat(5_980)}`;
+    const dir = tempDir({ "output.txt": output });
+    const db = join(dir, "store.db");
+    let store = new Store(db);
+    try {
+      const cfg: GateConfig = {
+        setup: ["cat output.txt"],
+        checks: [
+          { name: "test", run: "cat output.txt; exit 1" },
+          { name: "pass", run: "cat output.txt" },
+        ],
+        source: "detected",
+        protectedPaths: [],
+      };
+      const observed: string[] = [];
+      const signal = new AbortController().signal;
+      const run = await runGates(dir, cfg, signal, {
+        onResult: (result) => observed.push(JSON.stringify(result)),
+      });
+      for (const result of [...run.setup, ...run.checks]) {
+        expect(result.output).toContain("[redacted]");
+        expect(result.output).not.toContain(credential.slice(-20));
+      }
+      expect(run.checks[0]?.failures).toContain("error: credential [redacted]");
+      expect(observed).toHaveLength(3);
+      const retried = await retryBaselineFailures(run, dir, cfg, signal);
+      expect(retried.checks[0]?.firstAttempt).toBe(run.checks[0]);
+      expect(retried.checks[0]?.failures).toContain("error: credential [redacted]");
+      const failed = run.checks[0];
+      if (!failed) throw new Error("missing check result");
+      const regression = await retryRegressions(
+        [{ name: "test", verdict: "regressed", blocking: true, result: failed }],
+        dir,
+        cfg,
+        [],
+        signal,
+      );
+      expect(regression[0]?.result.failures).toContain("error: credential [redacted]");
+      for (const text of [...observed, JSON.stringify(retried), JSON.stringify(regression)]) {
+        expect(text).not.toContain(credential);
+        expect(text).not.toContain(credential.slice(-20));
+      }
+      const repo = store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        localPath: null,
+        url: "https://example.com/repo",
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const saved = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+      const key = { repoId: repo.id, baseSha: "base", gatesHash: "gates", envHash: "env" };
+      store.putArtifact(saved.id, "gates.json", "gates", JSON.stringify(retried));
+      store.setRunState(saved.id, retried);
+      // Only successful checks are cached in production.
+      store.putBaselineCache(key, { ...run, checks: run.checks.filter((r) => r.ok) }, saved.id);
+      store.close();
+      store = new Store(db);
+      for (const text of [
+        store.getArtifact(saved.id, "gates.json"),
+        JSON.stringify(store.getRunState(saved.id)),
+        JSON.stringify(store.getBaselineCache(key, 0)),
+      ]) {
+        expect(text).toContain("[redacted]");
+        expect(text).not.toContain(credential);
+        expect(text).not.toContain(credential.slice(-20));
+      }
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts terminal-formatted credentials before failure excerpt bounds", async () => {
+    const credential = "synthetic-excerpt-credential-409";
+    proc.registerCredential("EXCERPT_TEST_TOKEN", credential);
+    const colored = `${credential.slice(0, 12)}\u001b[31m${credential.slice(12)}\u001b[0m`;
+    const dir = tempDir({ "output.txt": `${"x".repeat(7_900)}${colored}\n(fail) assertion\n` });
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          checks: [{ name: "test", run: "cat output.txt; exit 1" }],
+          source: "detected",
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.failures).toContain("[redacted]");
+      expect(JSON.stringify(run)).not.toContain(credential);
+      expect(JSON.stringify(run)).not.toContain(credential.slice(0, 12));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts ANSI on every line of a multiline credential before excerpts and artifacts", async () => {
+    const secret = "synthetic-colored-first-paragraph\n\nsynthetic-colored-last-paragraph";
+    proc.registerCredential("COLORED_MULTILINE_TEST_TOKEN", secret);
+    const colored = secret
+      .split("\n")
+      .map((line) => `\u001b[31m${line}\u001b[0m`)
+      .join("\n");
+    const output = `error: ${colored}\n(fail) colored assertion\n`;
+    const dir = tempDir({
+      "emit.ts": `process.stdout.write(${JSON.stringify(output)}); process.exitCode = 1;`,
+    });
+    const store = new Store(":memory:");
+    try {
+      const run = await runGates(
+        dir,
+        {
+          setup: [],
+          source: "detected",
+          protectedPaths: [],
+          checks: [{ name: "test", run: `'${process.execPath}' emit.ts` }],
+        },
+        new AbortController().signal,
+      );
+      expect(run.checks[0]?.output).toBe("error: [redacted]\n(fail) colored assertion");
+      expect(run.checks[0]?.failures).toBe("error: [redacted]\n(fail) colored assertion");
+      const repo = store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        localPath: null,
+        url: "https://example.com/repo",
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const saved = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+      store.putArtifact(saved.id, "gates.json", "gates", JSON.stringify(run));
+      const artifact = store.getArtifact(saved.id, "gates.json");
+      expect(artifact).toContain("[redacted]");
+      for (const fragment of secret.split("\n").filter(Boolean)) expect(artifact).not.toContain(fragment);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test.each([
     ["2", "2"],
     ["invalid", "4"],
@@ -314,6 +631,23 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
       ),
     ).toBe("error: broken\n  not ok 2 - failed");
     expect(extractFailures("ok 1 - passed\nno failures")).toBeUndefined();
+  });
+
+  test("forty-five 1 MiB lines keep failure excerpt retention bounded", () => {
+    const collector = new FailureExcerpts();
+    // Inspect retained data, since a final excerpt cap alone does not bound live memory.
+    const retained = collector as unknown as { lines: string[] };
+    for (let i = 0; i < 45; i++) {
+      collector.observe(`${i}: ${"x".repeat(1_048_576)}`);
+      expect(retained.lines.length).toBeLessThanOrEqual(39);
+      expect(retained.lines.every((line) => line.length <= 8_000)).toBe(true);
+      expect(retained.lines.reduce((size, line) => size + line.length, 0)).toBeLessThanOrEqual(39 * 8_000);
+    }
+    collector.observe("(fail) bounded diagnostics");
+    const result = collector.result();
+    expect(result?.length).toBeLessThanOrEqual(8_000);
+    expect(result).toContain("(fail) bounded diagnostics");
+    expect(result).toContain("left out");
   });
 
   test("caps diagnostic lines and keeps the failure line with an omission note", () => {
@@ -1270,7 +1604,9 @@ test.skipIf(process.platform !== "darwin")(
 
 for (const padding of [0, 70_000])
   test(`nested sandbox diagnostic blocks despite identical baseline and ${padding} trailing bytes`, async () => {
-    const cwd = tempDir({});
+    const credential = "sandbox_apply: Operation not permitted synthetic-confinement-409";
+    proc.registerCredential("CONFINEMENT_DIAGNOSTIC_TEST_TOKEN", credential);
+    const cwd = tempDir({ "credential.txt": `credential: ${credential}\n` });
     try {
       const cfg: GateConfig = {
         setup: [],
@@ -1279,12 +1615,14 @@ for (const padding of [0, 70_000])
         checks: [
           {
             name: "nested",
-            run: `printf 'sandbox_apply: Operation not permitted\n'; printf '%${padding}s' ''; exit 1`,
+            run: `cat credential.txt; printf '%${padding}s' ''; cat credential.txt; exit 1`,
           },
         ],
       };
       const signal = new AbortController().signal;
       const baseline = await runGates(cwd, cfg, signal);
+      expect(baseline.checks[0]?.output).toContain("credential: [redacted]");
+      expect(baseline.checks[0]?.output).not.toContain(credential);
       const retried = await retryBaselineFailures(baseline, cwd, cfg, signal);
       expect(retried).toBe(baseline);
       const cmp = compareGates(baseline, await runGates(cwd, cfg, signal));
