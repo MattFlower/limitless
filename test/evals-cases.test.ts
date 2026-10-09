@@ -31,6 +31,13 @@ test("committed 90 cases load (60 development + 30 held out), including notes an
   expect(file.cases.some((c) => Array.isArray(c.gold.complexity))).toBe(true);
 });
 
+test.each(["review", "implement"] as const)("%s cases contain no absolute home-directory paths", (role) => {
+  const leaked = loadRoleCases(role)
+    .cases.filter((item) => /\/(?:Users|home)\/[^/]+\//.test(JSON.stringify(item)))
+    .map((item) => item.id);
+  expect(leaked).toEqual([]);
+});
+
 test("dataset diagnostics reject malformed JSON and invalid fields", () => {
   const file = loadCases();
   const item = file.cases[0];
@@ -579,10 +586,10 @@ test("review split and adjudication fields are optional, enumerated and strict",
 
 test("M5.2 cases preserve previous cases and load with pins, adjudicated labels and private text checks", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
-  // Fingerprints of the pre-M5.2 parsed cases and notes keep this check meaningful after delivery.
+  // Fingerprints of the pre-M5.2 parsed cases (with local paths sanitized) and notes.
   const fingerprint = (text: string) => createHash("sha256").update(text).digest("hex");
   expect(fingerprint(JSON.stringify(file.cases.slice(0, 53)))).toBe(
-    "3eb00b51b95a621bf9876fca831e55c697a2f9e28c89155a8bce289d1b3a4787",
+    "69c3cb320be6c11b41eee86c86413d191969b57665f9c4300d480c17e093097e",
   );
   expect(fingerprint(file.notes?.split(" M5.2 (")[0] ?? "")).toBe(
     "1918b7714b81731b47bfeac3b0c48571bb028da4915454d4edade4807b14f9b1",
