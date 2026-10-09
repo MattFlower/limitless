@@ -7,6 +7,7 @@ import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
+import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { gateSlots } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
@@ -23,8 +24,17 @@ export interface HttpExtras {
   ui?: Record<string, Blob>;
 }
 
+const serialize = (data: unknown) => JSON.stringify(redactGateData(data));
 const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+  new Response(serialize(data), { status, headers: { "content-type": "application/json" } });
+
+function redactGateArtifact(content: string): string {
+  try {
+    return serialize(JSON.parse(content));
+  } catch {
+    return redactGateOutput(content);
+  }
+}
 
 const error = (message: string, status = 400) => json({ error: message }, status);
 
@@ -46,7 +56,7 @@ function sse(
       const send = (msg: unknown) => {
         try {
           controller.enqueue(
-            encoder.encode(`${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${JSON.stringify(msg)}\n\n`),
+            encoder.encode(`${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${serialize(msg)}\n\n`),
           );
         } catch {
           cleanup?.();
@@ -481,7 +491,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const content = store.getArtifact(req.params.id as string, req.params.name as string);
       return content === null
         ? error("not found", 404)
-        : new Response(content, { headers: { "content-type": "text/plain; charset=utf-8" } });
+        : new Response(redactGateArtifact(content), {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+          });
     }),
     "/api/runs/:id/stream": handle((req, server) => {
       const runId = req.params.id as string;

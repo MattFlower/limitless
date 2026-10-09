@@ -3,6 +3,7 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
@@ -245,6 +246,10 @@ export interface ProcOptions {
   timeoutMs?: number;
   /** Kill when neither stdout nor stderr produced output for this long. */
   idleTimeoutMs?: number;
+  /** Strip terminal controls and redact decoded streams before line framing and tail cuts. */
+  redactOutput?: boolean;
+  /** Raw decoded chunks for internal checks only; never retain or forward them. */
+  onRawChunk?: (chunk: string, stream: "stdout" | "stderr") => void;
   onStdoutLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
   /** Keep at most this many characters of stdout/stderr (the tail). Default 64k. */
@@ -261,10 +266,17 @@ export interface ProcResult {
   stderr: string; // tail, bounded by tailLimit
   /** True when output exceeded tailLimit and the head was dropped. */
   truncated: boolean;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
   durationMs: number;
 }
 
 const DEFAULT_TAIL = 64_000;
+const VT_ESCAPE = "\u001b";
+const MAX_PENDING_VT = 4_096;
+const INCOMPLETE_VT = new RegExp(
+  String.raw`(?:${VT_ESCAPE}(?:\][^${"\u0007\u001b\u009c"}]*(?:${VT_ESCAPE})?|\[[0-?]*[ -/]*|[ -/]*)|${"\u009b"}[0-?]*[ -/]*)$`,
+);
 
 function lineSplitter(onLine?: (line: string) => void) {
   let pending = "";
@@ -334,11 +346,11 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     );
 
     const limit = opts.tailLimit ?? DEFAULT_TAIL;
-    let truncated = false;
-    const appendTail = (buf: string, chunk: string): string => {
+    const truncated = { stdout: false, stderr: false };
+    const appendTail = (buf: string, chunk: string, stream: "stdout" | "stderr"): string => {
       const next = buf + chunk;
       if (next.length <= limit) return next;
-      truncated = true;
+      truncated[stream] = true;
       return next.slice(next.length - limit);
     };
     let stdout = "";
@@ -432,24 +444,68 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      lastActivity = Date.now();
-      stdout = appendTail(stdout, chunk);
-      out.push(chunk);
-    });
-    child.stderr.on("data", (chunk: string) => {
-      lastActivity = Date.now();
-      stderr = appendTail(stderr, chunk);
-      err.push(chunk);
-    });
+    const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
+      let pending = "";
+      let terminalPending = "";
+      const emit = (text: string) => {
+        if (stream === "stdout") stdout = appendTail(stdout, text, stream);
+        else stderr = appendTail(stderr, text, stream);
+        lines.push(text);
+      };
+      return {
+        push(chunk: string) {
+          lastActivity = Date.now();
+          opts.onRawChunk?.(chunk, stream);
+          if (!opts.redactOutput) return emit(chunk);
+          const decoded = terminalPending + chunk;
+          // Hold incomplete CSI, OSC and ESC sequences until stripping can see them whole.
+          const incomplete = decoded.match(INCOMPLETE_VT);
+          // An unterminated sequence (a stray ESC ] in binary output) must not hold the stream forever.
+          const held = incomplete?.index !== undefined && decoded.length - incomplete.index <= MAX_PENDING_VT;
+          const terminalCut = held ? (incomplete?.index ?? decoded.length) : decoded.length;
+          terminalPending = decoded.slice(terminalCut);
+          pending += stripVTControlCharacters(decoded.slice(0, terminalCut));
+          // Retain possible credential prefixes, including JSON-escaped forms, across chunks.
+          const overlap = Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
+          let cut = Math.max(0, pending.length - overlap);
+          // A complete match crossing the cut must also stay raw: replacing a shorter
+          // prefix in the carry would destroy a longer credential arriving next.
+          let previousCut: number;
+          do {
+            previousCut = cut;
+            for (const [secret] of sortedCredentialVariants) {
+              const start = pending.indexOf(secret, Math.max(0, cut - secret.length + 1));
+              if (start >= 0 && start < cut && start + secret.length > cut) cut = start;
+            }
+          } while (cut !== previousCut);
+          emit(redactCredentials(pending.slice(0, cut)));
+          pending = pending.slice(cut);
+        },
+        flush() {
+          emit(redactCredentials(pending + stripVTControlCharacters(terminalPending)));
+          pending = "";
+          terminalPending = "";
+        },
+      };
+    };
+    const stdoutOutput = streamOutput("stdout", out);
+    const stderrOutput = streamOutput("stderr", err);
+    child.stdout.on("data", stdoutOutput.push);
+    child.stderr.on("data", stderrOutput.push);
+    child.stdout.on("end", stdoutOutput.flush);
+    child.stderr.on("end", stderrOutput.flush);
 
     child.on("error", (e) => {
-      stderr = appendTail(stderr, `\n[spawn error] ${e.message}`);
+      const text = `\n[spawn error] ${e.message}`;
+      if (opts.redactOutput) stderrOutput.push(text);
+      else stderr = appendTail(stderr, text, "stderr");
     });
 
     child.on("close", async (code, sig) => {
       if (settled) return;
       settled = true;
+      stdoutOutput.flush();
+      stderrOutput.flush();
       out.flush();
       err.flush();
       finishTimers();
@@ -468,14 +524,18 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         idleTimedOut,
         stdout,
         stderr,
-        truncated,
+        truncated: truncated.stdout || truncated.stderr,
+        stdoutTruncated: truncated.stdout,
+        stderrTruncated: truncated.stderr,
         durationMs: Date.now() - started,
       });
     });
 
     // A child that exits before reading its input raises EPIPE on stdin; that must not crash us.
     child.stdin.on("error", (e) => {
-      stderr = appendTail(stderr, `\n[stdin error] ${e.message}`);
+      const text = `\n[stdin error] ${e.message}`;
+      if (opts.redactOutput) stderrOutput.push(text);
+      else stderr = appendTail(stderr, text, "stderr");
     });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
@@ -508,6 +568,7 @@ export async function sh(
     stdin?: string;
     signal?: AbortSignal;
     encoding?: BufferEncoding;
+    redactOutput?: boolean;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   opts.signal?.throwIfAborted();
@@ -520,6 +581,7 @@ export async function sh(
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
     tailLimit: SH_OUTPUT_LIMIT,
     encoding: opts.encoding,
+    redactOutput: opts.redactOutput,
     ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
   });
   // Cancellation must stop command sequences even when a nonzero exit is allowed.
@@ -545,16 +607,23 @@ export async function sh(
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
+const credentialVariants = new Map<string, boolean>();
+let sortedCredentialVariants: [string, boolean][] = [];
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
-    if (typeof secret === "string" && secret) credentialValues.add(secret);
+    if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
+      credentialValues.add(secret);
+      for (const variant of new Set([secret, JSON.stringify(secret).slice(1, -1)]))
+        credentialVariants.set(variant, credentialVariants.get(variant) || secret.length >= 8);
+      sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
+    }
 }
 export function redactCredentials(text: string): string {
   // Substring matches require at least 8 characters to avoid redacting common short strings.
-  for (const secret of [...credentialValues].sort((a, b) => b.length - a.length))
-    if (secret.length >= 8 || text === secret) text = text.split(secret).join("[redacted]");
+  for (const [secret, substring] of sortedCredentialVariants)
+    if (substring || text === secret) text = text.split(secret).join("[redacted]");
   return text;
 }
 export const redactCredentialData = <T>(value: T): T =>

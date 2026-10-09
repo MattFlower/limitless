@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type { DeployClient, DeployClock } from "../src/cli/deploy-wait.ts";
 import { DrainUnsupportedError } from "../src/cli/deploy-wait.ts";
 import type { sh } from "../src/util/proc.ts";
+import * as proc from "../src/util/proc.ts";
 
 const home = process.env.SERVICE_TEST_HOME;
 if (!home) throw new Error("missing isolated test home");
@@ -286,7 +287,8 @@ const client: DeployClient = {
     return { stage: "review" };
   },
 };
-mock.module("../src/util/proc.ts", () => ({ sh: command }));
+const nativeProc = { ...proc };
+mock.module("../src/util/proc.ts", () => ({ ...nativeProc, sh: command }));
 spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ ok: true }));
 if (scenario.startsWith("recover") && existsSync(join(home, "loaded.json"))) {
   for (const label of JSON.parse(readFileSync(join(home, "loaded.json"), "utf8"))) loaded.add(label);

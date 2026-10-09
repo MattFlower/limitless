@@ -9,7 +9,7 @@ export function loadOutputPrivacy(): OutputPrivacy | null {
     const entries = loadPrivateStrings();
     return (text, truncated = false) => {
       const protectedEntries = [...entries, ...registeredCredentials().map((value) => ({ value, entry: 0 }))];
-      return privateMatches(text, protectedEntries, truncated).length
+      return text.includes("[redacted]") || privateMatches(text, protectedEntries, truncated).length
         ? "[withheld: private text]"
         : redactCredentials(text);
     };

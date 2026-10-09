@@ -20,7 +20,7 @@ import { observerRoots } from "../src/harness/sandbox.ts";
 import type { GitHubPrView } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -523,10 +523,13 @@ test.each([
   ["(fail) identifier", "(fail) identifier"],
   ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
 ])("a failing land check keeps its identity after a long diagnostic: %s", async (result, identity) => {
+  const credential = "synthetic-land-gate-credential-409";
+  registerCredential("LAND_GATE_TEST_TOKEN", credential);
   writeFileSync(
     join(seed, "output.txt"),
-    `sample.test.ts:\nerror: values differ\nExpected: 1\nReceived: 2\n${"x".repeat(9_000)}\n${result}\n` +
-      "skipped summary\n".repeat(700),
+    `sample.test.ts:\nerror: values differ\nExpected: 1\nReceived: 2\ncredential: ${credential}\n${"x".repeat(9_000)}\n${result}\n` +
+      "skipped summary\n".repeat(700) +
+      `credential: ${credential}\n`,
   );
   writeFileSync(
     join(seed, ".limitless.toml"),
@@ -551,6 +554,8 @@ test.each([
   expect(log).toContain("error: values differ\nExpected: 1\nReceived: 2");
   expect(log).toContain(identity);
   expect(log).toContain("left out");
+  expect(log).toContain("credential: [redacted]");
+  expect(log).not.toContain(credential);
   expect(log.indexOf(identity)).toBeLessThan(log.indexOf("skipped summary"));
   expect(log.indexOf("error:")).toBeLessThan(log.indexOf("skipped summary"));
   expect(ghCalls("pr merge")).toEqual([]);

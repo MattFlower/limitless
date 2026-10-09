@@ -102,6 +102,7 @@ export const ReviewCaseSchema = z
   .strictObject({
     ...repositoryCase,
     kind: reviewKind,
+    split: z.enum(["dev", "heldout"]).optional(),
     labelHistory: z
       .array(
         z.strictObject({
@@ -133,6 +134,7 @@ export const ReviewCaseSchema = z
         summary: nonempty,
         required: z.boolean(),
         foundBy: z.string(),
+        adjudication: z.enum(["pending", "confirmed"]).optional(),
       }),
     ),
     seedPatch: nonempty

@@ -106,6 +106,18 @@ test.skipIf(seatbeltSkip !== null)(
   },
 );
 
+const zshSkip = seatbeltSkip ?? (existsSync("/bin/zsh") ? null : "requires zsh");
+test.skipIf(zshSkip !== null)(`confined zsh here-documents use scratch ${zshSkip ?? ""}`, async () => {
+  const command = "/bin/zsh -lc 'cat <<EOF\nhere-doc\nEOF'";
+  const opts = { command, cwd: work, env: agentEnv() };
+  const fixed = await runConfined(opts);
+  expect(fixed.exitCode).toBe(0);
+  expect(fixed.stdout).toBe("here-doc\n");
+  const unfixed = await runConfined({ ...opts, command: `unset TMPPREFIX; ${command}` });
+  expect(unfixed.exitCode).not.toBe(0);
+  expect(unfixed.stderr).toContain("can't create temp file for here document");
+});
+
 test.skipIf(seatbeltSkip !== null)(
   `an agent cannot plant '*.ts -diff' or a clean filter in the shared repository ${seatbeltSkip ?? ""}`,
   async () => {
@@ -256,13 +268,14 @@ test("command scratch persists across setup, checks and retry scopes, with reada
   let scratch = "";
   // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
   const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
-  const opts = { command: "unused", cwd: work, env };
+  const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
   mkdirSync(join(home, ".cargo"));
   writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
   const run = async (opts: ProcOptions) => {
     expect(opts.env.HOME).toBe(opts.env.TMPDIR);
     expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
     const current = opts.env.TMPDIR ?? "";
+    expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
     expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
     if (scratch) {
       expect(current).toBe(scratch);
