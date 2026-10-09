@@ -51,8 +51,12 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   const path = z.string().startsWith("/");
   const [work, admin, common] = z.tuple([path, path, path]).parse(JSON.parse(readFileSync(record, "utf8")));
   const unsafe = "Unsafe worktree Git administration";
+  // Factory commands can share a worktree concurrently (the holdout exports its base snapshot while
+  // implement commits), so Git may rename or remove its own lock file (HEAD.lock, index.lock) between
+  // the listing and lstat. An entry that is gone cannot be used; everything still present is checked.
   const inspect = (path: string) => {
-    const stat = lstatSync(path);
+    const stat = lstatSync(path, { throwIfNoEntry: path === admin });
+    if (!stat) return;
     assert(path === admin || !/\/config(?:\.worktree)?$/.test(path), unsafe);
     assert(stat.isDirectory() || (stat.isFile() && stat.nlink === 1), unsafe);
     if (stat.isDirectory()) for (const name of readdirSync(path)) inspect(join(path, name));

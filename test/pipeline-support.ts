@@ -18,7 +18,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { redactCredentials, sh } from "../src/util/proc.ts";
+import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { seeded } from "./seeded.ts";
 
@@ -159,26 +159,6 @@ export const pass = {
   notes: "",
 };
 
-function dumpRunDiagnostics(f: Factory, runId: string): void {
-  if (!process.env.LIMITLESS_DIAGNOSTICS_425) return;
-  const path = join(process.cwd(), `diagnostic-425-${runId}.log`);
-  if (existsSync(path)) return;
-  writeFileSync(
-    path,
-    redactCredentials(
-      JSON.stringify(
-        {
-          run: f.store.getRun(runId),
-          stages: f.store.listStages(runId),
-          events: f.store.listEvents(runId, { limit: 10000 }),
-        },
-        null,
-        2,
-      ),
-    ),
-  );
-}
-
 export async function waitFor(
   f: Factory,
   runId: string,
@@ -194,11 +174,7 @@ export async function waitFor(
   try {
     while (Date.now() < deadline) {
       const run = f.store.getRun(runId);
-      if (run && statuses.includes(run.status)) {
-        // Preserve the failing stage before fixture shutdown can cancel in-flight work.
-        if (run.status === "failed") dumpRunDiagnostics(f, runId);
-        return run.status;
-      }
+      if (run && statuses.includes(run.status)) return run.status;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, 25);
         wake = () => {
@@ -210,7 +186,6 @@ export async function waitFor(
   } finally {
     unsubscribe();
   }
-  dumpRunDiagnostics(f, runId);
   throw new Error(`timed out waiting for ${statuses.join("|")}; status=${f.store.getRun(runId)?.status}`);
 }
 
@@ -271,20 +246,6 @@ export function pipelineSetup(state: PipelineFixture) {
   afterEach(async () => {
     process.env.PATH = originalPath;
     await state.factory?.stop();
-    if (process.env.LIMITLESS_DIAGNOSTICS_425 && state.factory) {
-      const runs = (() => {
-        try {
-          return state.factory.store.listRuns();
-        } catch (error) {
-          if (error instanceof RangeError && error.message === "Cannot use a closed database") return [];
-          throw error;
-        }
-      })();
-      for (const run of runs) {
-        if (run.status !== "succeeded" && run.status !== "needs_human")
-          dumpRunDiagnostics(state.factory, run.id);
-      }
-    }
     state.factory?.store.close();
     state.factory = null;
     rmSync(state.home, { recursive: true, force: true });

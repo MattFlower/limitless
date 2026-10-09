@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import {
   chmodSync,
   existsSync,
@@ -2601,6 +2602,26 @@ for (const attack of [
     expect(snapshot()).toEqual(before);
     expect(existsSync(sentinel)).toBe(false);
   });
+
+test("a lock file another factory command releases mid-inspection is not unsafe; a linked one still is", async () => {
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  const lock = join(admin, "HEAD.lock");
+  const lstat = fs.lstatSync;
+  // The concurrent command finishes after the listing and before lstat, as a commit renames HEAD.lock.
+  const released = spyOn(fs, "lstatSync").mockImplementation(((path: string, options?: fs.StatOptions) => {
+    if (path === lock) rmSync(lock, { force: true });
+    return lstat(path, options);
+  }) as typeof fs.lstatSync);
+  try {
+    writeFileSync(lock, `${base}\n`);
+    expect((await factory("rev-parse", "HEAD")).stdout.trim()).toBe(base);
+  } finally {
+    released.mockRestore();
+  }
+  writeFileSync(join(dir, "outside"), "linked");
+  linkSync(join(dir, "outside"), lock);
+  await expect(factory("rev-parse", "HEAD")).rejects.toThrow("Unsafe worktree Git administration");
+});
 
 test("recorded directories override inherited Git authority; missing records fail closed", async () => {
   writeFileSync(join(work, "sample.test.ts"), edited);
