@@ -34,12 +34,28 @@ export const processInspection = new AsyncLocalStorage<
 const inspectionPlatform = process.platform;
 const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwin.ts") : undefined;
 
+function callerAncestors(): Set<number> {
+  if (darwin) return darwin.darwinCallerAncestors();
+  if (inspectionPlatform !== "linux") throw new Error("Process ancestry inspection is unsupported");
+  const protectedPids = new Set([1, process.pid]);
+  let pid = process.ppid;
+  while (pid > 1 && !protectedPids.has(pid)) {
+    protectedPids.add(pid);
+    const row = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const parent = Number(row.slice(row.lastIndexOf(")") + 2).split(/\s+/)[1]);
+    if (!Number.isInteger(parent) || parent < 0) throw new Error(`Invalid process parent for ${pid}`);
+    pid = parent;
+  }
+  return protectedPids;
+}
+
 async function markedProcesses(
   marker: string,
   group: number,
   started: number,
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
+  protectedPids: ReadonlySet<number>,
   attempt = 0,
 ): Promise<number[]> {
   const uid = process.getuid?.();
@@ -49,20 +65,20 @@ async function markedProcesses(
   const nativeProcesses = async () => {
     if (!darwin) throw new Error("Native process inspection is unavailable");
     try {
-      return darwin.markedDarwinProcesses(uid, marker, group, started, directories, leader);
+      return darwin.markedDarwinProcesses(uid, marker, group, started, directories, leader, protectedPids);
     } catch (error) {
       // Unreadable argv uses hidden membership rules. Retry only inspection failures
       // that still prevent proving ownership or confirming a claimed process's identity.
       if (attempt >= 10) throw error;
       await Bun.sleep(10);
-      return markedProcesses(marker, group, started, directories, leader, attempt + 1);
+      return markedProcesses(marker, group, started, directories, leader, protectedPids, attempt + 1);
     }
   };
   if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
   const tokens = [`LIMITLESS_INVOCATION=${marker}`, `LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1`];
   const carriesMarker = (entries: string[]) => tokens.some((token) => entries.includes(token));
   if (inspectionPlatform === "linux" && !processInspection.getStore())
-    return linuxMarkedProcesses(uid, carriesMarker);
+    return linuxMarkedProcesses(uid, carriesMarker, protectedPids);
   const env = { ...process.env };
   delete env.LIMITLESS_INVOCATION;
   env.LIMITLESS_PROCESS_SCAN = marker;
@@ -109,7 +125,11 @@ async function markedProcesses(
     throw new Error("Process environment inspection could not be confirmed");
   const candidates = environments.filter(
     (row) =>
-      row && Number(row[2]) === uid && !row[3]?.startsWith("Z") && carriesMarker((row[4] ?? "").split(/\s+/)),
+      row &&
+      !protectedPids.has(Number(row[1])) &&
+      Number(row[2]) === uid &&
+      !row[3]?.startsWith("Z") &&
+      carriesMarker((row[4] ?? "").split(/\s+/)),
   );
   if (!candidates.length) return [];
   const commands = rows(
@@ -133,7 +153,8 @@ async function markedProcesses(
   });
   if (!changed) return pids;
   // A shell may exec between snapshots; never signal it based on mismatched argv.
-  if (attempt < 3) return markedProcesses(marker, group, started, directories, leader, attempt + 1);
+  if (attempt < 3)
+    return markedProcesses(marker, group, started, directories, leader, protectedPids, attempt + 1);
   throw new Error("Process arguments changed during inspection");
 }
 
@@ -143,12 +164,16 @@ async function markedProcesses(
  * cannot select an unmarked process. An environment we may not read (a non-dumpable process)
  * is skipped, as ps showed none for it.
  */
-function linuxMarkedProcesses(uid: number, carriesMarker: (entries: string[]) => boolean): number[] {
+function linuxMarkedProcesses(
+  uid: number,
+  carriesMarker: (entries: string[]) => boolean,
+  protectedPids: ReadonlySet<number>,
+): number[] {
   const marked: number[] = [];
   // procfs is in memory: synchronous reads take microseconds, while hundreds of awaited ones
   // per scan (twice per command) dominated short commands.
   for (const name of readdirSync("/proc")) {
-    if (!/^\d+$/.test(name)) continue;
+    if (!/^\d+$/.test(name) || protectedPids.has(Number(name))) continue;
     try {
       if (statSync(`/proc/${name}`).uid !== uid) continue;
       const status = readFileSync(`/proc/${name}/stat`, "utf8");
@@ -196,13 +221,14 @@ async function stopMarkedProcesses(
 ): Promise<void> {
   const group = child.pid;
   if (group === undefined) return;
+  const protectedPids = callerAncestors();
   const started = performance.now();
   const claimed = new Map<number, { birth: string; termed: boolean }>();
   let empty = false;
   for (;;) {
-    const pids = await markedProcesses(marker, group, invokedAt, directories, leader);
+    const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
     for (const pid of pids) {
-      if (claimed.has(pid)) continue;
+      if (protectedPids.has(pid) || claimed.has(pid)) continue;
       const birth = await processBirth(pid);
       if (birth !== null) claimed.set(pid, { birth, termed: false });
     }

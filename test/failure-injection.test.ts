@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -593,6 +593,7 @@ exec '${realGit}' "$@"
       expect(result.cancelled).toBe(true);
       expect(writerPid).toBeGreaterThan(0);
       expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      writerPid = undefined;
       return {
         status: "stuck",
         error: `repeated shell call ${invocationSecret}`,
@@ -1108,11 +1109,11 @@ for (const kind of ["harness", "gate", "preview"] as const)
     });
     const id = await run(f);
     await wait(() => existsSync(pidFile));
-    const pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
+    const pids = new Set(readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
     try {
       f.cancelRun(id);
       await settled(f, id);
-      for (const pid of pids)
+      for (const pid of pids) {
         await wait(() => {
           try {
             process.kill(pid, 0);
@@ -1121,6 +1122,8 @@ for (const kind of ["harness", "gate", "preview"] as const)
             return true;
           }
         });
+        pids.delete(pid);
+      }
       expect(f.store.getRun(id)?.status).toBe("cancelled");
       expect(existsSync(f.store.getRunState<RunState>(id)?.worktreePath ?? "")).toBe(true);
       history(f, id);
@@ -1214,7 +1217,7 @@ for (const operation of [
     const pidFile = join(root, "delivery-pids");
     const calls = join(root, "delivery-calls");
     const restore = fakeGh(pr);
-    let pids: number[] = [];
+    const pids = new Set<number>();
     try {
       const pattern = {
         fetch: "git fetch origin +refs/heads/*",
@@ -1307,13 +1310,13 @@ exec '${path}-delegate' "$@"
         f = await reopen(f);
       }
       await wait(() => existsSync(pidFile));
-      pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
-      expect(pids).toHaveLength(2);
+      for (const pid of readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number)) pids.add(pid);
+      expect(pids.size).toBe(2);
       expect(f.store.getRun(id)).toMatchObject({ status: "running", stage: "deliver" });
       const beforeCancel = readFileSync(calls, "utf8");
       f.cancelRun(id);
       await settled(f, id);
-      for (const pid of pids)
+      for (const pid of pids) {
         await wait(() => {
           try {
             process.kill(pid, 0);
@@ -1322,6 +1325,8 @@ exec '${path}-delegate' "$@"
             return true;
           }
         });
+        pids.delete(pid);
+      }
       expect(f.store.getRun(id)?.status).toBe("cancelled");
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
       expect(existsSync(cwd)).toBe(true);
@@ -1608,12 +1613,26 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
   );
   const child = Bun.spawn([process.execPath, worker], { stdout: "ignore", stderr: "pipe" });
   let gatePid: number | undefined;
+  const groupSignals: number[] = [];
+  const kill = process.kill.bind(process);
+  const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid < 0 && signal === "SIGKILL") {
+      groupSignals.push(pid);
+      // Record a stale repeat without risking a signal to a recycled group.
+      if (groupSignals.filter((target) => target === pid).length > 1) return true;
+    }
+    return kill(pid, signal);
+  });
   try {
     await wait(() => existsSync(entered));
     gatePid = Number(readFileSync(entered, "utf8"));
     child.kill("SIGKILL");
     await child.exited;
-    process.kill(-gatePid, "SIGKILL");
+    try {
+      process.kill(-gatePid, "SIGKILL");
+    } finally {
+      gatePid = undefined;
+    }
     const stopped = factory();
     const state = stopped.store.getRunState<RunState>(r.id);
     const cwd = state?.worktreePath ?? "";
@@ -1661,7 +1680,9 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
         process.kill(-gatePid, "SIGKILL");
       } catch {}
     }
+    killSpy.mockRestore();
   }
+  expect(groupSignals).toHaveLength(1);
 });
 
 test("unconfigured seams leave a successful run and release gate capacity", async () => {

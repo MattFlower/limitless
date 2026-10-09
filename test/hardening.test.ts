@@ -106,6 +106,39 @@ describe("process handling", () => {
     expect(scope.scratchDirs.size).toBe(0);
   });
 
+  test("native discovery excludes marked ancestors before deriving descendant membership", async () => {
+    const native = await loadNativeInspection(dir);
+    native.setProtectedMarker("protected-caller");
+    native.setUnreadableProcess({ parent: process.pid, born: 0n, cwd: { path: dir } });
+    const leader = native.captureDarwinInvocationLeader(native.leaderPid);
+    expect(
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "protected-caller",
+        native.leaderPid,
+        100,
+        [dir],
+        leader,
+      ),
+    ).toEqual([native.memberPid, native.leaderPid]);
+  });
+
+  test.each(["caller-session", "caller-group"] as const)(
+    "native discovery never claims a process solely through the %s",
+    async (membership) => {
+      const native = await loadNativeInspection(dir);
+      native.setMembership(membership);
+      expect(
+        native.markedDarwinProcesses(process.getuid?.() ?? 0, "unmarked", process.pid, 100, [dir], {
+          pid: process.pid,
+          birth: "1:0",
+          session: process.pid,
+          group: process.pid,
+        }),
+      ).toEqual([]);
+    },
+  );
+
   test("native discovery rejects a recycled leader's session/group identity", async () => {
     const native = await loadNativeInspection(dir);
     const selected = (leader: ReturnType<typeof native.captureDarwinInvocationLeader>) =>
@@ -525,6 +558,73 @@ describe("process handling", () => {
       if (pid !== undefined) {
         try {
           process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+  });
+
+  test("marked caller and ancestors are never signalled, while an owned child is stopped", async () => {
+    const uid = process.getuid?.() ?? 0;
+    const protectedPids = [process.pid, process.ppid];
+    const control = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const controller = new AbortController();
+    const kill = process.kill.bind(process);
+    const signals: number[] = [];
+    let pid: number | undefined;
+    const killSpy = spyOn(process, "kill").mockImplementation((target, signal) => {
+      if (signal === "SIGTERM" || signal === "SIGKILL") {
+        signals.push(target);
+        // A regression must record the unsafe target without killing the test or its ancestors.
+        if (protectedPids.includes(target)) throw new Error("protected process signalled");
+      }
+      return kill(target, signal);
+    });
+    try {
+      await processInspection.run(
+        async (withEnvironment, marker) => {
+          const tagged = (target: number, command: string) =>
+            `${target} ${uid} S ${command}${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`;
+          let alive = false;
+          if (pid !== undefined) {
+            try {
+              alive = kill(pid, 0);
+            } catch {}
+          }
+          return [
+            ...protectedPids.map(
+              (target) =>
+                tagged(target, "protected") +
+                (target === process.pid && withEnvironment ? ` LIMITLESS_PROCESS_SCAN=${marker}` : ""),
+            ),
+            // This unmarked sibling shares the caller's group/session, but is not owned.
+            `${control.pid} ${uid} S control`,
+            ...(alive && pid !== undefined ? [tagged(pid, "child")] : []),
+          ].join("\n");
+        },
+        () =>
+          runProcess({
+            cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+            cwd: dir,
+            env: {},
+            signal: controller.signal,
+            onStdoutLine: (line) => {
+              pid = Number(line);
+              controller.abort();
+            },
+          }),
+      );
+      expect(signals).toContain(pid ?? 0);
+      expect(signals.some((target) => protectedPids.includes(target))).toBe(false);
+      expect(signals).not.toContain(control.pid);
+      expect(kill(control.pid ?? 0, 0)).toBe(true);
+      expect(() => kill(pid ?? 0, 0)).toThrow();
+      pid = undefined;
+    } finally {
+      killSpy.mockRestore();
+      control.kill("SIGKILL");
+      if (pid !== undefined) {
+        try {
+          kill(pid, "SIGKILL");
         } catch {}
       }
     }
