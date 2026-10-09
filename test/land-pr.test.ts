@@ -473,7 +473,7 @@ if (args[1] === "gate-slot") {
   args = command[0] === "bun" ? command.slice(1) : command;
 }
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
-appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths }) + "\\n");
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths, landLog: process.env.LAND_PR_LOG ?? null }) + "\\n");
 if (args[0] === "install" || args[0] === "run") {
   if (${JSON.stringify(scenario)} === "checks:private-repository") {
     const repos = readdirSync(process.env.TMPDIR).filter(name => name.startsWith("land-pr-push."));
@@ -612,6 +612,7 @@ else if (args[1] === "view") {
         GIT_CONFIG_GLOBAL: globalConfig,
         GIT_CONFIG_SYSTEM: join(root, "system.config"),
         ...(scenario === "git-config-env" ? { GIT_CONFIG: externalConfig } : {}),
+        LAND_PR_LOG: join(root, "land-check.log"),
         TMPDIR: root,
       },
       allowFail: true,
@@ -623,6 +624,7 @@ else if (args[1] === "view") {
       tool: string;
       args: string[];
       paths?: (string | null)[];
+      landLog?: string | null;
       config?: string | null;
       index?: string | null;
       checked?: boolean;
@@ -733,6 +735,8 @@ else if (args[1] === "view") {
     expect(recordedAt).toBeGreaterThan(0);
     expect(installed).toBeGreaterThan(recordedAt);
     const checkedAt = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "run");
+    // The suite under check runs this script in its own tests, which would write over the outer log.
+    expect(logged[checkedAt]?.landLog).toBeNull();
     for (const call of logged
       .slice(recordedAt + 1, checkedAt + 1)
       .filter((call) => call.tool === "git" || call.tool === "bun")) {
