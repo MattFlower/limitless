@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import {
   approve,
@@ -201,6 +202,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("cancelled");
     const stopped = f.store.getRunState<RunState>(run.id);
     f.store.setRunState(run.id, { ...stopped, holdout: oldHoldout });
+    // Resume a database from before owner diagnostics were introduced.
+    f.store.db.exec(
+      "DROP TABLE owner_diagnostics; DELETE FROM applied_migrations WHERE name = '20261009T223115-owner-diagnostics.sql'",
+    );
     f.store.close();
     blockImplement = false;
     restarted = start(handler);
@@ -210,6 +215,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(privacyChecked).toBe(true);
     expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(oldHoldout.scenarios);
     expect(restarted.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
+    expect(ownerDiagnostics(restarted.store.db, run.id)).toEqual([]);
   });
 
   test("interrupted holdout is retried after restart and remains unpublished while stopped", async () => {

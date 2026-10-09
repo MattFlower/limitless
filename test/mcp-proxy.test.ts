@@ -853,6 +853,58 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
   }
 });
 
+test("stdio MCP returns only public records across every tool and error", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "private diagnostics" });
+  const marker = "OWNER_MCP_STDIO_ONLY_423";
+  f.factory.store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public");
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const server = createMcpServer(factoryBackend(f.factory));
+  const direct = await connect(factoryBackend(f.factory));
+  const tools = (await direct.client.listTools()).tools;
+  await direct.close();
+  const responses = new Map<number, (value: unknown) => void>();
+  let buffer = "";
+  stdout.on("data", (chunk) => {
+    buffer += String(chunk);
+    for (let i = buffer.indexOf("\n"); i >= 0; i = buffer.indexOf("\n")) {
+      const message = JSON.parse(buffer.slice(0, i));
+      buffer = buffer.slice(i + 1);
+      responses.get(message.id)?.(message);
+    }
+  });
+  await server.connect(new StdioServerTransport(stdin, stdout));
+  let id = 0;
+  const call = (method: string, params: unknown) =>
+    new Promise<unknown>((resolve) => {
+      responses.set(++id, resolve);
+      stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+  try {
+    await call("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    });
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    for (const tool of tools) {
+      const args =
+        tool.name === "limitless_get_run"
+          ? { id: run.id }
+          : tool.name === "limitless_status"
+            ? { run: run.id }
+            : {};
+      expect(JSON.stringify(await call("tools/call", { name: tool.name, arguments: args }))).not.toContain(
+        marker,
+      );
+    }
+  } finally {
+    await server.close();
+    stdin.destroy();
+    stdout.destroy();
+  }
+});
+
 test("proxy feed tools match the direct backend and allow a 45-second long poll", async () => {
   const routes = createHttpRoutes(f.factory);
   const fetcher: Fetch = async (url, init) => {

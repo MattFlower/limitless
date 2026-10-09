@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import type { AuditAllowance, CreateRunRequest, Run } from "../src/core/types.ts";
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
+import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { Store } from "../src/db/store.ts";
 import { customModel } from "./provider-config-support.ts";
 
@@ -75,6 +76,39 @@ function legacyDatabase(path: string): void {
   db.exec("INSERT INTO settings VALUES ('sentinel', 'unchanged')");
   db.close();
 }
+
+test("pre-diagnostics runs open and previous-release writes survive the additive migration", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-owner-diagnostics.sql"),
+    });
+    let store = new Store(path, before);
+    const repo = store.upsertRepo({
+      slug: "local/old",
+      kind: "local",
+      localPath: directory,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "old run" });
+    expect(ownerDiagnostics(store.db, run.id)).toEqual([]);
+    store.close();
+    store = new Store(path);
+    expect(store.getRunDetail(run.id)?.run.prompt).toBe("old run");
+    expect(ownerDiagnostics(store.db, run.id)).toEqual([]);
+    store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: "owner" }, "public");
+    store.close();
+    store = new Store(path, before);
+    expect(store.createRun(repo, { repo: repo.slug, prompt: "rollback write" }).prompt).toBe(
+      "rollback write",
+    );
+    expect(ownerDiagnostics(store.db, run.id)[0]?.text).toBe("owner");
+    store.close();
+  });
+});
 
 test("model chains upgrade legacy runs, persist on reopen and preserve prior-schema reads and writes", () => {
   temporary((_directory, path) => {

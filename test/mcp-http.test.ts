@@ -26,6 +26,28 @@ const rpc = (method: string, params: unknown = {}, id: number | undefined = 1) =
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
   });
 
+test("no HTTP MCP tool result or error includes owner diagnostics", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "diagnostic transport" });
+  const marker = "OWNER_MCP_HTTP_ONLY_423";
+  f.factory.store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public");
+  const tools = (await (await route(rpc("tools/list"), localServer)).json()).result.tools as {
+    name: string;
+  }[];
+  for (const tool of tools) {
+    const argumentsForTool =
+      tool.name === "limitless_get_run"
+        ? { id: run.id }
+        : tool.name === "limitless_status"
+          ? { run: run.id }
+          : {};
+    const response = await route(
+      rpc("tools/call", { name: tool.name, arguments: argumentsForTool }),
+      localServer,
+    );
+    expect(await response.text()).not.toContain(marker);
+  }
+});
+
 test("mounted endpoint initializes, discovers and calls tools without sessions", async () => {
   const init = await route(
     rpc("initialize", {

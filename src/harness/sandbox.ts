@@ -36,6 +36,7 @@ export function seatbeltProfile(roots: WriteRoots): string {
     "(deny file-write*)",
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
+    ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
   ].join("\n");
 }
 
@@ -127,6 +128,23 @@ async function probeSeatbelt(
         `Write confinement not verified: Seatbelt did not enforce its profile; ${proc.stderr.trim()}`,
       );
     const profile = seatbeltProfile(roots ?? { write: [allowed], protect: [] });
+    for (const file of roots?.denyRead ?? []) {
+      if (!existsSync(file)) continue;
+      const read = await run({
+        cmd: [executable, "-p", profile, "/bin/sh", "-c", 'cat "$1" >/dev/null', "sh", file],
+        cwd: root,
+        env: agentEnv(),
+        timeoutMs: 30_000,
+        signal,
+      });
+      if (
+        read.exitCode !== 1 ||
+        read.cancelled ||
+        read.timedOut ||
+        !/Operation not permitted|Permission denied/.test(read.stderr)
+      )
+        throw new ConfinementError("Private database read confinement not verified");
+    }
     const cmd = ["/bin/sh", "-c", SIGNAL_PROBE, "sh", executable, profile, join(allowed, "ready")];
     const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 30_000, signal });
     // An interrupted probe is inconclusive even when its marker was printed.

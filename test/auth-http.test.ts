@@ -81,6 +81,61 @@ test("loopback needs no session; proxied requests without one get 401 for the AP
   f.factory.cfg.auth = "required";
 });
 
+test("owner diagnostics stay out of local and proxy REST, artifacts and SSE", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "private diagnostics" });
+  const marker = "OWNER_HTTP_ONLY_423";
+  const store = f.factory.store;
+  store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public detail");
+  store.putArtifact(run.id, "public.txt", "report", "public detail");
+  const table = createHttpRoutes(f.factory);
+  for (const address of ["127.0.0.1", proxy]) {
+    const peer = { requestIP: () => ({ address }), timeout: () => {} } as unknown as Server<undefined>;
+    for (const [key, suffix, params] of [
+      ["/api/runs/:id", "", { id: run.id }],
+      ["/api/runs/:id/events", "/events", { id: run.id }],
+      ["/api/runs/:id/artifacts/:name", "/artifacts/public.txt", { id: run.id, name: "public.txt" }],
+      [
+        "/api/runs/:id/artifacts/:name",
+        "/artifacts/owner_diagnostics",
+        { id: run.id, name: "owner_diagnostics" },
+      ],
+      ["/api/runs/:id/stream", "/stream", { id: run.id }],
+      ["/api/stream", "", {}],
+    ] as const) {
+      const route = table[key] as Route;
+      const path = key === "/api/stream" ? key : `/api/runs/${run.id}${suffix}`;
+      const res = await route(
+        requestWithParams(
+          `http://localhost:7400${path}`,
+          { headers: { host: "limitless.example.test" } },
+          { ...params },
+        ),
+        peer,
+      );
+      if (address === proxy) {
+        expect(res.status).toBe(401);
+        expect(await res.text()).not.toContain(marker);
+        continue;
+      }
+      if (key.endsWith("stream")) {
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error("missing SSE");
+        let output = new TextDecoder().decode((await reader.read()).value);
+        store.recordOwnerDiagnostic(
+          { runId: run.id, kind: "run-error", text: `${marker}-live` },
+          "public detail",
+        );
+        store.addEvent({ runId: run.id, type: "log", message: "public sentinel" });
+        if (key === "/api/stream") store.updateRun(run.id, { title: "public sentinel" });
+        while (!output.includes("public sentinel"))
+          output += new TextDecoder().decode((await reader.read()).value);
+        expect(output).not.toContain(marker);
+        await reader.cancel();
+      } else expect(await res.text()).not.toContain(marker);
+    }
+  }
+});
+
 test("a password sign-in sets a Strict, Secure, HttpOnly cookie, stored hashed, that the API and SSE accept", async () => {
   const { call, admin, signIn } = routes();
   expect((await signIn(password)).status).toBe(401);
