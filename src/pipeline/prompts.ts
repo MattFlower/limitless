@@ -3,6 +3,7 @@ import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
+import { redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
   citationInSource,
@@ -131,6 +132,7 @@ export function implementPrompt(input: {
   externalChange?: boolean;
   resolution?: boolean;
 }): string {
+  input = redactGateData(input);
   const specText = input.spec
     ? renderSpec(input.spec)
     : "No separate specification — work directly from the request.";
@@ -169,6 +171,7 @@ Reply with a concise report: files changed, how you verified (commands and resul
 }
 
 export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): string {
+  cmp = redactGateData(cmp);
   const bad = cmp.filter((c) => c.blocking);
   if (!bad.length) return "";
   return bad
@@ -382,6 +385,7 @@ export function reviewPrompt(input: {
   /** A lens finder's focus, from the finder roster or the base commit's `.limitless.toml`. */
   lens?: ReviewLens;
 }): string {
+  input = redactGateData(input);
   const fix = input.fixReview && input.previous ? input.previous.sha : undefined;
   const range = fix
     ? `${fix}..${input.headSha ?? "HEAD"}`
@@ -604,6 +608,7 @@ export function verifyPrompt(input: {
   baseSha: string;
   checks?: GateComparison[];
 }): string {
+  input = redactGateData(input);
   // The factory's gate results are authoritative: a whole-suite rerun inside the verifier's
   // sandbox fails for environmental reasons and used to mark such criteria unmet.
   const checks = input.checks?.length

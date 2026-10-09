@@ -1,6 +1,7 @@
 import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
+import { redactGateData } from "../gates/output.ts";
 import type { RunContext, RunState } from "./context.ts";
 import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
@@ -55,6 +56,7 @@ export interface ReportInput {
 
 /** Markdown evidence report used as the PR body. Each block is one markdown element. */
 export function renderReport(input: ReportInput): string {
+  input = redactGateData(input);
   const { state } = input;
   const blocks: string[] = [
     input.success

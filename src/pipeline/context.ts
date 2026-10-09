@@ -22,6 +22,7 @@ import type {
 import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
+import { redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
@@ -302,6 +303,7 @@ export class RunContext {
       feedback: null,
       toolCommands: [],
     };
+    this.state = redactGateData(this.state);
   }
 
   get store(): Store {
@@ -397,7 +399,7 @@ export class RunContext {
     const checkSha =
       cacheable && this.state.worktreePath ? await headSha(this.state.worktreePath) : undefined;
     if (cacheable && cache?.round === round && cache.sha === checkSha && Object.hasOwn(cache.values, name))
-      return cache.values[name] as T;
+      return redactGateData(cache.values[name]) as T;
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
