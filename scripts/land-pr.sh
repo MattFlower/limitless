@@ -68,9 +68,9 @@ if [ -e "$common/info/exclude" ] || [ -L "$common/info/exclude" ]; then
 else
   exclude=""
 fi
-env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
+# The suite (and install scripts) can run this script; an inherited LAND_PR_LOG would write over this log.
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE -u LAND_PR_LOG bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
-# The suite runs this script in its own tests; an inherited LAND_PR_LOG would make them write over this log.
 if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE -u LAND_PR_LOG bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
   echo "bun run check failed; see $log" >&2
   exit 1

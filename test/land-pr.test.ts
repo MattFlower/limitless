@@ -736,6 +736,7 @@ else if (args[1] === "view") {
     expect(installed).toBeGreaterThan(recordedAt);
     const checkedAt = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "run");
     // The suite under check runs this script in its own tests, which would write over the outer log.
+    expect(logged[installed]?.landLog).toBeNull();
     expect(logged[checkedAt]?.landLog).toBeNull();
     for (const call of logged
       .slice(recordedAt + 1, checkedAt + 1)
