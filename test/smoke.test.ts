@@ -1187,6 +1187,54 @@ for (const outcome of [
   });
 }
 
+function processState(pid: number): string {
+  try {
+    process.kill(pid, 0);
+    if (process.platform !== "linux") {
+      const ps = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)]);
+      return ps.stdout.toString().trim() || "unknown";
+    }
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) || "unknown";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH" || (process.platform === "linux" && code === "ENOENT")) return "";
+    return `unknown: ${(error as Error).message}`;
+  }
+}
+async function gone(pids: number[]) {
+  const until = performance.now() + 1000;
+  for (const pid of pids) {
+    let state = processState(pid);
+    while (state && !state.startsWith("Z") && performance.now() < until) {
+      await Bun.sleep(Math.max(0, Math.min(10, until - performance.now())));
+      state = processState(pid);
+    }
+    expect(!state || state.startsWith("Z"), `pid ${pid}: state ${state}`).toBe(true);
+  }
+}
+
+const selfState = processState(process.pid);
+const stateSkip = !selfState || selfState.startsWith("unknown");
+test.skipIf(stateSkip)(
+  `cleanup accepts an unreaped zombie but rejects a sleeper${stateSkip ? ` (process state unavailable: ${selfState})` : ""}`,
+  async () => {
+    const script =
+      "import os,sys\npid=os.fork()\nif pid==0: os._exit(0)\nprint(pid,flush=True)\nsys.stdin.readline()\nos.waitpid(pid,0)";
+    const parent = Bun.spawn(["python3", "-c", script], { stdin: "pipe", stdout: "pipe" });
+    try {
+      const pid = Number(new TextDecoder().decode((await parent.stdout.getReader().read()).value));
+      await gone([pid]);
+      expect(processState(pid)).toMatch(/^Z/);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      await expect(gone([parent.pid])).rejects.toThrow(String(parent.pid));
+    } finally {
+      parent.stdin.end();
+      await parent.exited;
+    }
+  },
+);
+
 const processModes = ["SIGINT", "SIGTERM", "stubborn", "probe", "completed"] as const;
 const interruptModes = ["escaped-SIGINT", "escaped-SIGTERM", "second-SIGINT", "second-SIGTERM"] as const;
 // These wait out real timeouts and kill grace periods, each in its own directory and processes, so they overlap.
@@ -1201,9 +1249,6 @@ for (const mode of [...processModes, ...interruptModes, ...timeoutModes]) {
       existsSync(join(dir, "pids"))
         ? readFileSync(join(dir, "pids"), "utf8").trim().split(/\s+/).map(Number).filter(Boolean)
         : [];
-    const gone = () => {
-      for (const pid of pids()) expect(() => process.kill(pid, 0)).toThrow();
-    };
     const timed = mode === "timeout" || mode === "budget" || mode === "escaped-timeout";
     writeFileSync(
       join(dir, "claude"),
@@ -1291,7 +1336,7 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       if (!timed && !ownTimeout && mode !== "completed" && mode !== "probe")
         expect(dirs.length).toBeGreaterThan(0);
       for (const path of dirs) expect(existsSync(path)).toBe(false);
-      gone();
+      await gone(pids());
       const output = await new Response(child.stdout).text();
       if (timed) {
         expect(output).toContain("FAIL");
