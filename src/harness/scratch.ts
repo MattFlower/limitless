@@ -78,8 +78,10 @@ export function removeScratch(scratchDir: string): void {
   }
 }
 
-export function scratchEnv(spec: AgentSpec): Record<string, string> {
-  return spec.scratchDir ? { TMPDIR: spec.scratchDir, TMP: spec.scratchDir, TEMP: spec.scratchDir } : {};
+export function scratchEnv({ scratchDir }: Pick<AgentSpec, "scratchDir">): Record<string, string> {
+  return scratchDir
+    ? { TMPDIR: scratchDir, TMP: scratchDir, TEMP: scratchDir, TMPPREFIX: join(scratchDir, "zsh") }
+    : {};
 }
 
 export function validateScratch(spec: AgentSpec): string {

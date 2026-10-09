@@ -11,7 +11,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
-import { type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
+import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 
@@ -225,9 +225,7 @@ export async function runConfined(
           GIT_OPTIONAL_LOCKS: "0",
           LIMITLESS_CONFINED: "1",
           HOME: scratch,
-          TMPDIR: scratch,
-          TMP: scratch,
-          TEMP: scratch,
+          ...scratchEnv({ scratchDir: scratch }),
           XDG_CACHE_HOME: join(scratch, "cache"),
           npm_config_cache: join(scratch, "npm"),
           CARGO_HOME: cargo,
