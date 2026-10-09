@@ -55,9 +55,13 @@ test("a lock file another factory command releases mid-inspection is not unsafe;
   await expect(factory("rev-parse", "HEAD")).rejects.toThrow("Unsafe worktree Git administration");
 });
 
-test("any other admin entry that vanishes mid-inspection still fails", async () => {
+test.each([
+  ["config.worktree", "config.worktree"],
+  ["a nested .lock entry such as reftable data", "reftable/reference-data.lock"],
+])("any other admin entry that vanishes mid-inspection still fails: %s", async (_label, name) => {
   const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
-  const entry = join(admin, "config.worktree");
+  const entry = join(admin, name);
+  mkdirSync(join(entry, ".."), { recursive: true });
   writeFileSync(entry, "[core]\n");
   const lstat = fs.lstatSync;
   // A writer could delete it before lstat and recreate it as a link afterwards, so it isn't skipped.

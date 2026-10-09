@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
 import { harden } from "./hardening.ts";
@@ -52,11 +52,14 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   const [work, admin, common] = z.tuple([path, path, path]).parse(JSON.parse(readFileSync(record, "utf8")));
   const unsafe = "Unsafe worktree Git administration";
   // Factory commands can share a worktree concurrently (the holdout exports its base snapshot while
-  // implement commits), so Git may rename or remove its own lock file (HEAD.lock, index.lock) between
-  // the listing and lstat. Only lock files may vanish: Git creates them exclusively, so one recreated
-  // after the check makes Git refuse rather than read it. Any other missing entry still fails.
+  // implement commits), so Git may rename or remove its own lock file between the listing and lstat.
+  // Only these top-level locks may vanish: Git creates them exclusively, so one recreated after the
+  // check makes Git refuse rather than read it. Any other missing entry (including reftable data that
+  // happens to end in .lock) still fails.
+  const disposable = /^(?:HEAD|ORIG_HEAD|index)\.lock$/;
   const inspect = (path: string) => {
-    const stat = lstatSync(path, { throwIfNoEntry: path === admin || !path.endsWith(".lock") });
+    const lock = dirname(path) === admin && disposable.test(basename(path));
+    const stat = lstatSync(path, { throwIfNoEntry: !lock });
     if (!stat) return;
     assert(path === admin || !/\/config(?:\.worktree)?$/.test(path), unsafe);
     assert(stat.isDirectory() || (stat.isFile() && stat.nlink === 1), unsafe);
