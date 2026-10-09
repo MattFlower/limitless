@@ -580,6 +580,9 @@ test("stopping mid-check leaves a later entry unstarted", async () => {
   q.request({ target: second.run.id });
   await waitFor(() => gateLog().length === 1);
   await q.stop(); // the daemon stops with the second entry still queued
+  // A check that survived the stop would now finish its 0.3 s sleep and 50 ms poll and log "end".
+  writeFileSync(gateReleasePath(), "");
+  await Bun.sleep(800);
   expect(store.getLandEntry(1)?.state).toBe("checking");
   for (let i = 0; i < 20; i++) await settleIdle();
   expect(store.getLandEntry(2)?.state).toBe("queued");
