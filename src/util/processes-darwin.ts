@@ -121,12 +121,11 @@ export function darwinCallerAncestors(): Set<number> {
     if (symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength) !== info.byteLength) {
       const address = symbols.__error();
       const errno = address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);
-      // Retain known ancestors when one disappears or is inaccessible mid-walk.
-      if ([1 /* EPERM */, 2 /* ENOENT */, 3 /* ESRCH */, 13 /* EACCES */].includes(errno)) break;
-      throw new Error(`Process ancestry inspection failed for ${pid}`);
+      throw new Error(`Process ancestry could not be confirmed for ${pid} (errno ${errno})`);
     }
     pid = info[1] ?? 0;
   }
+  if (pid > 1) throw new Error(`Process ancestry could not be confirmed for ${pid}: cycle`);
   return protectedPids;
 }
 

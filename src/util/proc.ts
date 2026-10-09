@@ -31,10 +31,13 @@ export function assertProcessesStopped(): void {
 export const processInspection = new AsyncLocalStorage<
   (withEnvironment: boolean, marker: string, pids?: number[]) => Promise<string>
 >();
+export const linuxAncestryInspection = new AsyncLocalStorage<(pid: number) => string>();
 const inspectionPlatform = process.platform;
 const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwin.ts") : undefined;
 
 function callerAncestors(): Set<number> {
+  const readStat = linuxAncestryInspection.getStore();
+  if (readStat) return linuxCallerAncestors(readStat);
   if (darwin) return darwin.darwinCallerAncestors();
   if (inspectionPlatform !== "linux") throw new Error("Process ancestry inspection is unsupported");
   return linuxCallerAncestors();
@@ -53,14 +56,13 @@ export function linuxCallerAncestors(
     try {
       row = readStat(pid);
     } catch (error) {
-      // Gone or hidden ancestors cannot be selected by the /proc marker scan either.
-      if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) break;
-      throw error;
+      throw new Error(`Process ancestry could not be confirmed for ${pid}`, { cause: error });
     }
     const parent = Number(row.slice(row.lastIndexOf(")") + 2).split(/\s+/)[1]);
     if (!Number.isInteger(parent) || parent < 0) throw new Error(`Invalid process parent for ${pid}`);
     pid = parent;
   }
+  if (pid > 1) throw new Error(`Process ancestry could not be confirmed for ${pid}: cycle`);
   return protectedPids;
 }
 
@@ -204,7 +206,7 @@ function linuxMarkedProcesses(
 }
 
 /** Confirm identity and disappearance without relying on marker membership. */
-async function processBirth(pid: number): Promise<string | null> {
+export async function processBirth(pid: number): Promise<string | null> {
   if (inspectionPlatform === "darwin") {
     if (!darwin) throw new Error("Native process inspection is unavailable");
     return darwin.darwinProcessBirth(pid);

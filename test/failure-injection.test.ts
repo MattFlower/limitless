@@ -44,6 +44,7 @@ import {
   CommandError,
   type ProcOptions,
   type ProcResult,
+  processBirth,
   processInspection,
   runProcess,
   sh,
@@ -184,13 +185,36 @@ function factory(
   factories.push(f);
   return f;
 }
-async function wait(check: () => boolean) {
+async function wait(check: () => boolean | Promise<boolean>) {
   const end = Date.now() + 10_000;
-  while (!check()) {
+  while (!(await check())) {
     if (Date.now() > end) throw new Error("barrier timed out");
     await Bun.sleep(5);
   }
 }
+async function retainPids(pids: Map<number, string>, values: number[], readBirth = processBirth) {
+  for (const pid of values) {
+    const birth = await readBirth(pid);
+    if (birth !== null) pids.set(pid, birth);
+  }
+}
+
+async function killRetainedPids(
+  pids: Map<number, string>,
+  readBirth = processBirth,
+  signal = (pid: number) => process.kill(pid, "SIGKILL"),
+) {
+  for (const [pid, birth] of pids) {
+    try {
+      if ((await readBirth(pid)) === birth) signal(pid);
+    } catch {
+      // An unconfirmed identity must never be signalled.
+    } finally {
+      pids.delete(pid);
+    }
+  }
+}
+
 async function run(f: Factory) {
   const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
@@ -1073,6 +1097,39 @@ test("startup finalizes abandoned running rows before retrying the stage", async
   history(next, r.id);
 });
 
+test("both cancellation failure paths reject recycled PIDs and stop an identical descendant", async () => {
+  const pids = new Map<number, string>();
+  const births = new Map<number, string | null>([
+    [41, "original-shell"],
+    [42, "original-sleep"],
+    [43, "original-gone"],
+    [44, "still-owned"],
+  ]);
+  const readBirth = async (pid: number) => births.get(pid) ?? null;
+  await retainPids(pids, [41, 42, 43, 44], readBirth);
+  const signals: number[] = [];
+  const failure = new Error("injected settlement failure");
+  const settle = async () => {
+    births.set(41, "recycled-shell");
+    births.set(43, null);
+    births.set(42, "recycled-sleep");
+    throw failure;
+  };
+  const cancellation = async () => {
+    try {
+      await settle();
+    } finally {
+      await killRetainedPids(pids, readBirth, (pid) => {
+        signals.push(pid);
+        return true;
+      });
+    }
+  };
+  await expect(cancellation()).rejects.toBe(failure);
+  expect(signals).toEqual([44]);
+  expect(pids.size).toBe(0);
+});
+
 for (const kind of ["harness", "gate", "preview"] as const)
   test(`cancel active ${kind} kills its process group and retains worktree`, async () => {
     const pidFile = join(root, "pids");
@@ -1109,30 +1166,20 @@ for (const kind of ["harness", "gate", "preview"] as const)
     });
     const id = await run(f);
     await wait(() => existsSync(pidFile));
-    const pids = new Set(readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
+    const pids = new Map<number, string>();
     try {
+      await retainPids(pids, readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
       f.cancelRun(id);
       await settled(f, id);
-      for (const pid of pids) {
-        await wait(() => {
-          try {
-            process.kill(pid, 0);
-            return false;
-          } catch {
-            return true;
-          }
-        });
+      for (const pid of pids.keys()) {
+        await wait(async () => (await processBirth(pid)) !== pids.get(pid));
         pids.delete(pid);
       }
       expect(f.store.getRun(id)?.status).toBe("cancelled");
       expect(existsSync(f.store.getRunState<RunState>(id)?.worktreePath ?? "")).toBe(true);
       history(f, id);
     } finally {
-      for (const pid of pids) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {}
-      }
+      await killRetainedPids(pids);
     }
   });
 
@@ -1217,7 +1264,7 @@ for (const operation of [
     const pidFile = join(root, "delivery-pids");
     const calls = join(root, "delivery-calls");
     const restore = fakeGh(pr);
-    const pids = new Set<number>();
+    const pids = new Map<number, string>();
     try {
       const pattern = {
         fetch: "git fetch origin +refs/heads/*",
@@ -1310,21 +1357,14 @@ exec '${path}-delegate' "$@"
         f = await reopen(f);
       }
       await wait(() => existsSync(pidFile));
-      for (const pid of readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number)) pids.add(pid);
+      await retainPids(pids, readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
       expect(pids.size).toBe(2);
       expect(f.store.getRun(id)).toMatchObject({ status: "running", stage: "deliver" });
       const beforeCancel = readFileSync(calls, "utf8");
       f.cancelRun(id);
       await settled(f, id);
-      for (const pid of pids) {
-        await wait(() => {
-          try {
-            process.kill(pid, 0);
-            return false;
-          } catch {
-            return true;
-          }
-        });
+      for (const pid of pids.keys()) {
+        await wait(async () => (await processBirth(pid)) !== pids.get(pid));
         pids.delete(pid);
       }
       expect(f.store.getRun(id)?.status).toBe("cancelled");
@@ -1344,11 +1384,7 @@ exec '${path}-delegate' "$@"
       expect(readFileSync(calls, "utf8")).toBe(beforeCancel);
       history(next, id);
     } finally {
-      for (const pid of pids) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {}
-      }
+      await killRetainedPids(pids);
       await restore();
     }
   });

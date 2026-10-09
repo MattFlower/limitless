@@ -28,6 +28,7 @@ import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import {
   invocationScratch,
+  linuxAncestryInspection,
   linuxCallerAncestors,
   ProcessTerminationError,
   processInspection,
@@ -85,46 +86,78 @@ async function loadNativeInspection(directory: string) {
 }
 
 describe("process handling", () => {
-  test("Linux ancestry retains known PIDs when an ancestor disappears or is inaccessible", () => {
+  test("Linux ancestry fails closed when an ancestor disappears or is inaccessible", () => {
     const ancestor = 424245;
-    for (const code of ["ENOENT", "ESRCH", "EACCES", "EPERM"])
+    for (const code of ["ENOENT", "ESRCH", "EACCES", "EPERM", "EIO"])
       for (const failedPid of [process.ppid, ancestor]) {
         const inspected: number[] = [];
-        const protectedPids = linuxCallerAncestors((pid) => {
-          inspected.push(pid);
-          if (pid === failedPid) throw Object.assign(new Error("ancestor unavailable"), { code });
-          return `${pid} (parent with spaces) S ${ancestor} 0 0`;
-        });
-        expect([...protectedPids]).toEqual([
-          1,
-          process.pid,
-          process.ppid,
-          ...(failedPid === ancestor ? [ancestor] : []),
-        ]);
+        expect(() =>
+          linuxCallerAncestors((pid) => {
+            inspected.push(pid);
+            if (pid === failedPid) throw Object.assign(new Error("ancestor unavailable"), { code });
+            return `${pid} (parent with spaces) S ${ancestor} 0 0`;
+          }),
+        ).toThrow("Process ancestry could not be confirmed");
         expect(inspected).toEqual(failedPid === ancestor ? [process.ppid, ancestor] : [process.ppid]);
       }
-    expect(() =>
-      linuxCallerAncestors(() => {
-        throw Object.assign(new Error("unexpected inspection failure"), { code: "EIO" });
-      }),
-    ).toThrow("unexpected inspection failure");
+    expect(
+      linuxCallerAncestors((pid) => `${pid} (parent) S ${pid === process.ppid ? ancestor : 1} 0 0`),
+    ).toEqual(new Set([1, process.pid, process.ppid, ancestor]));
   });
 
-  test("Darwin ancestry tolerates unavailable ancestors while discovery still cleans owned members", async () => {
+  test("unreadable Linux parent prevents discovery and signalling of a marked grandparent", async () => {
+    const ancestor = 424245;
+    const uid = process.getuid?.() ?? 0;
+    const controller = new AbortController();
+    const selected: number[] = [];
+    const signals: number[] = [];
+    const kill = process.kill.bind(process);
+    const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (signal === "SIGTERM" || signal === "SIGKILL") {
+        signals.push(pid);
+        if (pid === ancestor) return true;
+      }
+      return kill(pid, signal);
+    });
+    try {
+      const outcome = await linuxAncestryInspection.run(
+        (pid) => {
+          if (pid === process.ppid) throw Object.assign(new Error("hidden parent"), { code: "EACCES" });
+          return `${pid} (ancestor) S 1 0 0`;
+        },
+        () =>
+          processInspection.run(
+            async (withEnvironment, marker, pids) => {
+              if (pids) selected.push(...pids);
+              return [
+                `${process.pid} ${uid} S scanner LIMITLESS_PROCESS_SCAN=${marker}`,
+                `${ancestor} ${uid} S ancestor${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`,
+              ].join("\n");
+            },
+            () =>
+              runProcess({
+                cmd: [process.execPath, "-e", "console.log('ready'); setInterval(() => {}, 1000)"],
+                cwd: dir,
+                env: {},
+                signal: controller.signal,
+                onStdoutLine: () => controller.abort(),
+              }).catch((error: unknown) => error),
+          ),
+      );
+      expect(outcome).toBeInstanceOf(ProcessTerminationError);
+      expect(String(outcome)).toContain("Process ancestry could not be confirmed");
+      expect(selected).toEqual([]);
+      expect(signals).not.toContain(ancestor);
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  test("Darwin discovery fails closed on unavailable ancestry and still cleans confirmed members", async () => {
     const native = await loadNativeInspection(dir);
     native.setProtectedMarker("protected-caller");
     const leader = native.captureDarwinInvocationLeader(native.leaderPid);
-    for (const errno of [1, 2, 3, 13])
-      for (const pid of [process.ppid, native.ancestorPid]) {
-        native.setAncestorFailure({ pid, errno });
-        expect([...native.darwinCallerAncestors()]).toEqual([
-          1,
-          process.pid,
-          process.ppid,
-          ...(pid === native.ancestorPid ? [native.ancestorPid] : []),
-        ]);
-      }
-    expect(
+    const discover = () =>
       native.markedDarwinProcesses(
         process.getuid?.() ?? 0,
         "protected-caller",
@@ -132,10 +165,15 @@ describe("process handling", () => {
         100,
         [dir],
         leader,
-      ),
-    ).toEqual([native.memberPid, native.leaderPid]);
-    native.setAncestorFailure({ pid: native.ancestorPid, errno: 5 });
-    expect(() => native.darwinCallerAncestors()).toThrow("Process ancestry inspection failed");
+      );
+    for (const errno of [1, 2, 3, 13, 5])
+      for (const pid of [process.ppid, native.ancestorPid]) {
+        native.setAncestorFailure({ pid, errno });
+        expect(() => native.darwinCallerAncestors()).toThrow("Process ancestry could not be confirmed");
+        expect(discover).toThrow("Process ancestry could not be confirmed");
+      }
+    native.setAncestorFailure(null);
+    expect(discover()).toEqual([native.memberPid, native.leaderPid]);
   });
 
   test("nested scratch restores the invocation root and unregisters cleaned paths", async () => {
