@@ -1,3 +1,0 @@
-#!/bin/sh
-for arg in "$@"; do [ "$arg" = push ] && echo push >> '/Users/mflower/.limitless/work/mv01mqhw4ofi/.scratch-425/limitless-e2e-69Pnae/push-calls'; done
-exec '/opt/homebrew/bin/git' "$@"

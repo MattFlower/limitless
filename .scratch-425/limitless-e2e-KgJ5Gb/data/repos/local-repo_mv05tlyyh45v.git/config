@@ -1,9 +1,0 @@
-[core]
-	repositoryformatversion = 0
-	filemode = true
-	bare = true
-[remote "origin"]
-	url = /Users/mflower/.limitless/work/mv01mqhw4ofi/.scratch-425/limitless-e2e-KgJ5Gb/target
-	fetch = +refs/heads/*:refs/remotes/origin/*
-[user]
-	name = Limitless

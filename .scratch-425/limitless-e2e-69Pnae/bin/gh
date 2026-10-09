@@ -1,6 +1,0 @@
-#!/bin/sh
-echo "$*" >> '/Users/mflower/.limitless/work/mv01mqhw4ofi/.scratch-425/limitless-e2e-69Pnae/gh-calls'
-case "$2" in
-  list) exit 0 ;;
-  create) cat > '/Users/mflower/.limitless/work/mv01mqhw4ofi/.scratch-425/limitless-e2e-69Pnae/gh-body'; echo https://github.com/test/repo/pull/1 ;;
-esac
