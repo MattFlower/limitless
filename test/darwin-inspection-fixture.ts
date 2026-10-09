@@ -6,6 +6,7 @@ export const ancestorPid = 424245;
 let birth: bigint | null = 1n;
 let membership: "session" | "group" | "caller-session" | "caller-group" = "session";
 let protectedMarker: string | null = null;
+let ancestorFailure: { pid: number; errno: number } | null = null;
 let unreadable: {
   parent: number;
   born: bigint | { errno: number };
@@ -22,6 +23,9 @@ export function setMembership(value: typeof membership): void {
 }
 export function setProtectedMarker(value: string): void {
   protectedMarker = value;
+}
+export function setAncestorFailure(value: typeof ancestorFailure): void {
+  ancestorFailure = value;
 }
 export function setUnreadableProcess(value: typeof unreadable): void {
   unreadable = value;
@@ -52,6 +56,10 @@ export const dlopen = () => ({
       size: number,
     ) => {
       buffer.fill(0);
+      if (kind === 13 && pid === ancestorFailure?.pid) {
+        errno = ancestorFailure.errno;
+        return 0;
+      }
       if (kind === 3) {
         const born = pid === unreadablePid && unreadable ? unreadable.born : birth;
         if (pid !== leaderPid && pid !== unreadablePid && pid !== process.pid)

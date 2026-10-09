@@ -37,11 +37,26 @@ const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwi
 function callerAncestors(): Set<number> {
   if (darwin) return darwin.darwinCallerAncestors();
   if (inspectionPlatform !== "linux") throw new Error("Process ancestry inspection is unsupported");
-  const protectedPids = new Set([1, process.pid]);
+  return linuxCallerAncestors();
+}
+
+export function linuxCallerAncestors(
+  readStat: (pid: number) => string = (pid) => readFileSync(`/proc/${pid}/stat`, "utf8"),
+): Set<number> {
+  const protectedPids = new Set([1, process.pid, process.ppid]);
   let pid = process.ppid;
-  while (pid > 1 && !protectedPids.has(pid)) {
+  const seen = new Set<number>();
+  while (pid > 1 && !seen.has(pid)) {
+    seen.add(pid);
     protectedPids.add(pid);
-    const row = readFileSync(`/proc/${pid}/stat`, "utf8");
+    let row: string;
+    try {
+      row = readStat(pid);
+    } catch (error) {
+      // Gone or hidden ancestors cannot be selected by the /proc marker scan either.
+      if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) break;
+      throw error;
+    }
     const parent = Number(row.slice(row.lastIndexOf(")") + 2).split(/\s+/)[1]);
     if (!Number.isInteger(parent) || parent < 0) throw new Error(`Invalid process parent for ${pid}`);
     pid = parent;

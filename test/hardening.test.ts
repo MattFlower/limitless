@@ -28,6 +28,7 @@ import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import {
   invocationScratch,
+  linuxCallerAncestors,
   ProcessTerminationError,
   processInspection,
   processScope,
@@ -84,6 +85,59 @@ async function loadNativeInspection(directory: string) {
 }
 
 describe("process handling", () => {
+  test("Linux ancestry retains known PIDs when an ancestor disappears or is inaccessible", () => {
+    const ancestor = 424245;
+    for (const code of ["ENOENT", "ESRCH", "EACCES", "EPERM"])
+      for (const failedPid of [process.ppid, ancestor]) {
+        const inspected: number[] = [];
+        const protectedPids = linuxCallerAncestors((pid) => {
+          inspected.push(pid);
+          if (pid === failedPid) throw Object.assign(new Error("ancestor unavailable"), { code });
+          return `${pid} (parent with spaces) S ${ancestor} 0 0`;
+        });
+        expect([...protectedPids]).toEqual([
+          1,
+          process.pid,
+          process.ppid,
+          ...(failedPid === ancestor ? [ancestor] : []),
+        ]);
+        expect(inspected).toEqual(failedPid === ancestor ? [process.ppid, ancestor] : [process.ppid]);
+      }
+    expect(() =>
+      linuxCallerAncestors(() => {
+        throw Object.assign(new Error("unexpected inspection failure"), { code: "EIO" });
+      }),
+    ).toThrow("unexpected inspection failure");
+  });
+
+  test("Darwin ancestry tolerates unavailable ancestors while discovery still cleans owned members", async () => {
+    const native = await loadNativeInspection(dir);
+    native.setProtectedMarker("protected-caller");
+    const leader = native.captureDarwinInvocationLeader(native.leaderPid);
+    for (const errno of [1, 2, 3, 13])
+      for (const pid of [process.ppid, native.ancestorPid]) {
+        native.setAncestorFailure({ pid, errno });
+        expect([...native.darwinCallerAncestors()]).toEqual([
+          1,
+          process.pid,
+          process.ppid,
+          ...(pid === native.ancestorPid ? [native.ancestorPid] : []),
+        ]);
+      }
+    expect(
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "protected-caller",
+        native.leaderPid,
+        100,
+        [dir],
+        leader,
+      ),
+    ).toEqual([native.memberPid, native.leaderPid]);
+    native.setAncestorFailure({ pid: native.ancestorPid, errno: 5 });
+    expect(() => native.darwinCallerAncestors()).toThrow("Process ancestry inspection failed");
+  });
+
   test("nested scratch restores the invocation root and unregisters cleaned paths", async () => {
     const scope = {
       signal: new AbortController().signal,

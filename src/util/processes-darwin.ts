@@ -111,13 +111,20 @@ export function captureDarwinInvocationLeader(pid: number): DarwinInvocationLead
 }
 
 export function darwinCallerAncestors(): Set<number> {
-  const protectedPids = new Set([1, process.pid]);
+  const protectedPids = new Set([1, process.pid, process.ppid]);
   const info = new Uint32Array(16);
   let pid = process.ppid;
-  while (pid > 1 && !protectedPids.has(pid)) {
+  const seen = new Set<number>();
+  while (pid > 1 && !seen.has(pid)) {
+    seen.add(pid);
     protectedPids.add(pid);
-    if (symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength) !== info.byteLength)
+    if (symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength) !== info.byteLength) {
+      const address = symbols.__error();
+      const errno = address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);
+      // Retain known ancestors when one disappears or is inaccessible mid-walk.
+      if ([1 /* EPERM */, 2 /* ENOENT */, 3 /* ESRCH */, 13 /* EACCES */].includes(errno)) break;
       throw new Error(`Process ancestry inspection failed for ${pid}`);
+    }
     pid = info[1] ?? 0;
   }
   return protectedPids;
