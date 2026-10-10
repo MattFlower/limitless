@@ -19,6 +19,7 @@ import { ensureCache } from "../src/git/repos.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { GitHubPrView } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
+import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -128,6 +129,7 @@ if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
 if(flag("--auto")) writeFileSync(file+".auto","");
 if(flag("--disable-auto")){ rmSync(file+".auto",{force:true}); process.exit(0); }
 if(existsSync(file+".hang")) await Bun.sleep(600000);
+while(existsSync(file+".hold-merge")) await Bun.sleep(10);
 const pin=args[args.indexOf("--match-head-commit")+1];
 if(pin&&pin!==head()){ console.error("head ref was modified; not merging"); process.exit(1); }
 if(existsSync(file+".reject")){ console.error("Pull request is not mergeable"); process.exit(1); }
@@ -561,6 +563,107 @@ test("a rejected merge blocks, arms no auto-merge, and a later head never lands"
   expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
   expect(store.getRun(pr.run.id)?.merged).toBe(false);
   expect(existsSync(join(root, "gh.merged-1"))).toBe(false);
+});
+
+test("a CI trigger waits through a held merge and skips the landed PR without lookup", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  store.updateRun(pr.run.id, {
+    baseSha: (await sh(["git", "rev-parse", "main"], { cwd: seed })).stdout.trim(),
+  });
+  observe(1, head);
+  approve(1, head);
+  writeFileSync(join(root, "gh.hold-merge"), "");
+  const q = queue();
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => ghCalls("pr merge").some((call) => call.includes("--match-head-commit")));
+    expect(store.getLandEntry(entry.id)?.state).toBe("merging");
+    store.recordCiFixTrigger(
+      pr.prUrl,
+      head,
+      "failure",
+      { check: "test", line: "FAIL", excerpt: "FAIL" },
+      clock.now(),
+    );
+    const gh = async () => {
+      throw new Error("unexpected CI lookup during landing");
+    };
+    await processConflictTriggers(store, clock.now, gh);
+    expect(store.reviewRounds(pr.prUrl)).toHaveLength(0);
+    expect(store.db.query("SELECT state, attempts FROM ci_fix_triggers").get()).toEqual({
+      state: "pending",
+      attempts: 0,
+    });
+    expect((await sh(["git", "rev-parse", "pr-1"], { cwd: bare })).stdout.trim()).toBe(head);
+    rmSync(join(root, "gh.hold-merge"));
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: head });
+    await processConflictTriggers(store, clock.now, gh);
+    expect(store.db.query("SELECT state, reason FROM ci_fix_triggers").get()).toEqual({
+      state: "skipped",
+      reason: "PR is not open",
+    });
+    expect(store.reviewRounds(pr.prUrl)).toHaveLength(0);
+  } finally {
+    rmSync(join(root, "gh.hold-merge"), { force: true });
+    await q.stop();
+  }
+});
+
+test("a conflict round starting during CI blocks the land before merging", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  store.updateRun(pr.run.id, {
+    baseSha: (await sh(["git", "rev-parse", "main"], { cwd: seed })).stdout.trim(),
+  });
+  observe(1, head);
+  approve(1, head);
+  let reached = () => {};
+  let release = () => {};
+  const ready = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const q = queue({
+    polling: false,
+    client: async () => {
+      reached();
+      await hold;
+      return {
+        url: pr.prUrl,
+        state: "OPEN",
+        mergedAt: null,
+        mergedBy: null,
+        headRefOid: head,
+        ci: "SUCCESS",
+        failing: [],
+      };
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await ready;
+    store.recordConflictTrigger(pr.prUrl, head, "poller", clock.now());
+    const trigger = store.pendingConflictTriggers()[0];
+    if (!trigger) throw new Error("missing conflict trigger");
+    expect(
+      store.startConflictTrigger(trigger.id, { state: "OPEN", headRefOid: head }, clock.now()),
+    ).not.toBeNull();
+    release();
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: "blocked",
+      reason: "a conflict round is in flight for this pull request",
+    });
+    expect(ghCalls("pr merge")).toHaveLength(0);
+    expect(existsSync(join(root, "gh.merged-1"))).toBe(false);
+  } finally {
+    release();
+    await q.stop();
+  }
 });
 
 test("a pinned merge whose head moved is refused", async () => {

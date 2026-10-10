@@ -18,6 +18,7 @@ export async function processConflictTriggers(
   for (const trigger of triggers) {
     signal?.throwIfAborted();
     if (trigger.nextAttemptAt > now()) continue;
+    if (trigger.kind === "ci" && !store.ciFixTriggerReady(trigger.id)) continue;
     let pr: Awaited<ReturnType<typeof readPrHead>>;
     try {
       pr = await readPrHead(gh, trigger.prUrl, signal);

@@ -1192,6 +1192,41 @@ export class Store {
     return this.startRoundTrigger("ci", id, observation, now);
   }
 
+  /** Waiting on landing is not a failed lookup and must not consume the retry budget. */
+  ciFixTriggerReady(id: number): boolean {
+    return this.db.transaction(() => {
+      const trigger = this.pendingCiFixTriggers().find((t) => t.id === id);
+      if (!trigger) return false;
+      const latest = this.db
+        .query<{ state: string }, [string]>(
+          "SELECT state FROM land_entries WHERE pr_url = ? ORDER BY id DESC LIMIT 1",
+        )
+        .get(trigger.prUrl);
+      const saved = this.db
+        .query<{ state: string }, [string]>("SELECT data ->> 'state' AS state FROM github_prs WHERE url = ?")
+        .get(trigger.prUrl);
+      if (latest?.state === "landed" || saved?.state === "MERGED" || saved?.state === "CLOSED") {
+        this.db
+          .query("UPDATE ci_fix_triggers SET state = 'skipped', reason = 'PR is not open' WHERE id = ?")
+          .run(id);
+        return false;
+      }
+      return !this.db
+        .query(
+          "SELECT 1 FROM land_entries WHERE pr_url = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')",
+        )
+        .get(trigger.prUrl);
+    })();
+  }
+
+  assertNoRoundInFlight(prUrl: string): void {
+    const round = this.reviewRounds(prUrl).find((r) => !TERMINAL_STATUSES.includes(r.status));
+    if (round)
+      throw new Error(
+        `a ${round.kind === "ci" ? "CI fix" : round.kind} round is in flight for this pull request`,
+      );
+  }
+
   private startRoundTrigger(
     kind: "conflict" | "ci",
     id: number,
@@ -1202,6 +1237,7 @@ export class Store {
     return this.chatTransaction(() => {
       const trigger = this.pendingRoundTriggers(kind).find((t) => t.id === id);
       if (!trigger || trigger.nextAttemptAt > now) return null;
+      if (kind === "ci" && !this.ciFixTriggerReady(id)) return null;
       const row = this.db
         .query(`${RUN_SELECT} WHERE runs.pr_url = ? AND runs.delivery_branch IS NULL
         AND coalesce(json_extract(runs.source_ref, '$.kind'), '') NOT IN ('pull_request', 'review-round')
@@ -1209,6 +1245,20 @@ export class Store {
         .get(trigger.prUrl) as Row | null;
       const owner = row && toRun(row);
       const repo = owner && this.getRepo(owner.repoId);
+      if (kind === "ci" && repo) {
+        const failure = this.db
+          .query<{ check: string }, [number]>(
+            "SELECT check_name AS 'check' FROM ci_fix_triggers WHERE id = ?",
+          )
+          .get(id);
+        const main = this.getSetting<Record<string, { red: boolean }>>(`ci.main:${repo.slug}`, {});
+        if (failure && main[failure.check]?.red) {
+          this.db
+            .query(`UPDATE ${table} SET state = 'skipped', reason = 'default branch red' WHERE id = ?`)
+            .run(id);
+          return null;
+        }
+      }
       const seen = observation;
       const rounds = this.reviewRounds(trigger.prUrl);
       const conflicts = rounds.filter((r) => r.kind === "conflict");
@@ -1377,9 +1427,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       const round = this.reviewRound(runId);
       if (round?.kind === "ci") {
         this.db
-          .query(`UPDATE land_entries SET state = 'blocked', reason = ?, updated_at = ?, finished_at = ?
-          WHERE pr_url = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging', 'blocked')`)
-          .run(`CI fix at ${sha}; approve the new head to land`, Date.now(), Date.now(), round.prUrl);
+          .query(`UPDATE land_entries SET reason = ?
+          WHERE pr_url = ? AND state = 'blocked' AND (approved_sha = ? OR pushed_sha = ?)`)
+          .run(
+            `CI fix at ${sha}; approve the new head to land`,
+            round.prUrl,
+            round.reviewedSha,
+            round.reviewedSha,
+          );
       }
       if (round?.kind === "conflict") {
         this.db
@@ -2518,22 +2573,25 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     const now = Date.now();
     let id: number;
     try {
-      const res = this.db
-        .query(
-          `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
+      id = this.db.transaction(() => {
+        this.assertNoRoundInFlight(entry.prUrl);
+        const res = this.db
+          .query(
+            `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
-        )
-        .run(
-          entry.runId,
-          entry.repo,
-          entry.prUrl,
-          entry.baseBranch,
-          entry.headBranch,
-          entry.approvedSha,
-          now,
-          now,
-        );
-      id = Number(res.lastInsertRowid);
+          )
+          .run(
+            entry.runId,
+            entry.repo,
+            entry.prUrl,
+            entry.baseBranch,
+            entry.headBranch,
+            entry.approvedSha,
+            now,
+            now,
+          );
+        return Number(res.lastInsertRowid);
+      })();
     } catch (error) {
       // The partial unique index holds at most one in-flight entry per PR.
       if (String(error).includes("land_entries.pr_url")) throw new Error("PR is already in the land queue");

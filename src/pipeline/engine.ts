@@ -320,7 +320,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !terminationBlocked &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
-      !ctx.state.pendingRebaseSha
+      !ctx.state.pendingRebaseSha &&
+      !(reviewRound(ctx)?.kind === "ci" && ctx.run.headSha === reviewRound(ctx)?.reviewedSha)
     ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
       try {
@@ -1109,6 +1110,15 @@ async function oneRound(
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  const ciRound = reviewRound(ctx);
+  if (ciRound?.kind === "ci" && (await headSha(cwd)) === ciRound.reviewedSha) {
+    ctx.state.needsHumanReason =
+      redactCredentials(ctx.state.implementerReport ?? "")
+        .trim()
+        .slice(0, 2000) || "CI fix round made no change";
+    await ctx.save("needs-human");
+    throw new NeedsHumanError(ctx.state.needsHumanReason);
+  }
   if (resolution) {
     if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
       throw new Error("Missing expected merge state for resolution checks");

@@ -744,7 +744,6 @@ test("delivery keeps a new-head approval recorded after an uncheckpointed push",
 
 test("delivery changes only its trigger's land entry with the exact conflict reason", async () => {
   await advanceBase();
-  const entry = await blockedLand();
   const second = factory.store.createLandEntry({
     runId: owner.id,
     repo: owner.repoSlug,
@@ -754,6 +753,7 @@ test("delivery changes only its trigger's land entry with the exact conflict rea
     approvedSha: await remoteHead(),
   });
   factory.store.updateLandEntry(second.id, { state: "blocked", reason: "conflicts with main" });
+  const entry = await blockedLand();
   const id = triggers()[0]?.run_id as string;
   expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("succeeded");
   expect(factory.store.getLandEntry(entry.id)?.reason).toBe(
