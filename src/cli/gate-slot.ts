@@ -155,6 +155,7 @@ export async function runLeasedCommand(
   command: string[],
   lease?: LeaseOptions & { name: string },
   signalExitCode = false,
+  env?: NodeJS.ProcessEnv,
 ): Promise<number> {
   const executable = command[0];
   if (!executable) throw new Error("missing executable");
@@ -179,7 +180,7 @@ export async function runLeasedCommand(
   try {
     const work = () =>
       new Promise<number>((resolve, reject) => {
-        child = spawn(executable, command.slice(1), { stdio: "inherit", detached: true });
+        child = spawn(executable, command.slice(1), { stdio: "inherit", detached: true, env });
         child.once("error", reject);
         child.once("exit", (code, signal) => resolve(code ?? (signal ? 128 + constants.signals[signal] : 1)));
       });

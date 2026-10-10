@@ -57,14 +57,18 @@ export async function withSlottedCommands<T>(
     });
     const config: WrapperConfig = { directory, commands, port, unix, token: session.token };
     const configPath = join(directory, "config.json"),
-      entry = join(directory, "entry.js");
+      entry = join(directory, "entry.js"),
+      bunfig = join(directory, "bunfig.toml");
     writeFileSync(configPath, JSON.stringify(config), { mode: 0o400 });
     writeFileSync(entry, source, { mode: 0o400 });
+    writeFileSync(bunfig, "preload = []\n", { mode: 0o400 });
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     for (const name of new Set(commands.map((c) => c[0]).filter((name): name is string => !!name)))
       writeFileSync(
         join(directory, name),
-        // An absolute interpreter also works when "bash" itself is one of the wrapped names.
-        `#!${process.execPath}\nimport { wrapperMain } from ${JSON.stringify(entry)};\nprocess.exitCode = await wrapperMain([${JSON.stringify(configPath)}, ${JSON.stringify(name)}, ...process.argv.slice(2)]);\n`,
+        // Start outside the checkout so its env files and Bun preloads cannot affect the wrapper.
+        // Absolute interpreters also work when the shell or Bun itself is a wrapped executable.
+        `#!/bin/sh\nexec ${quote(process.execPath)} --no-env-file --config=${quote(bunfig)} --cwd ${quote(directory)} ${quote(entry)} "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`,
         { mode: 0o500 },
       );
     return await invoke(`${directory}${delimiter}${process.env.PATH ?? ""}`);

@@ -101,7 +101,9 @@ export async function agentTestCommand(
   const prefix = config.commands
     .filter((p) => p.every((token, i) => argv[i] === token))
     .sort((a, b) => b.length - a.length)[0];
-  if (!prefix) return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
+  // Descendants share their parent's slot, including scripts that re-enter a slotted command.
+  if (!prefix || process.env.LIMITLESS_AGENT_TEST_SLOT === config.token)
+    return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
   const lane = testLane(argv, prefix);
   return runLeasedCommand(
     [executable, ...argv.slice(1)],
@@ -111,6 +113,7 @@ export async function agentTestCommand(
       warn: (message) => console.warn(redactCredentials(message)),
     },
     true,
+    { ...process.env, LIMITLESS_AGENT_TEST_SLOT: config.token },
   );
 }
 
@@ -124,4 +127,7 @@ export async function wrapperMain(args: string[]): Promise<number> {
   }
 }
 
-if (import.meta.main) process.exitCode = await wrapperMain(process.argv.slice(2));
+if (import.meta.main) {
+  process.chdir(process.argv[2] ?? "");
+  process.exitCode = await wrapperMain(process.argv.slice(3));
+}

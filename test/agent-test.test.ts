@@ -334,3 +334,85 @@ test("empty commands install no wrappers and pass no PATH override", async () =>
   );
   expect(existsSync(join(f.root, "config.json"))).toBe(false);
 });
+
+test.each(["development", "production"])(
+  "wrapper startup preserves cwd and inherited env without loading repository configuration (%s)",
+  async (mode) => {
+    const f = fixture(),
+      scratch = join(f.root, SCRATCH_NAME),
+      cwd = join(f.root, "checkout with 'quotes'");
+    mkdirSync(scratch);
+    mkdirSync(cwd);
+    writeFileSync(join(cwd, ".env"), "TEST_WRAPPER_ENV=dotenv\n");
+    writeFileSync(join(cwd, ".env.local"), "TEST_WRAPPER_LOCAL=local\n");
+    writeFileSync(join(cwd, `.env.${mode}`), "TEST_WRAPPER_MODE=mode\n");
+    writeFileSync(join(cwd, "bunfig.toml"), 'preload = ["./preload.js"]\n');
+    writeFileSync(join(cwd, "preload.js"), 'process.env.TEST_WRAPPER_PRELOAD = "loaded";\n');
+    const binary = `#!/bin/sh\nprintf "%s\\n" "$PWD" "$*" "\${TEST_WRAPPER_ENV-unset}" "\${TEST_WRAPPER_LOCAL-unset}" "\${TEST_WRAPPER_MODE-unset}" "\${TEST_WRAPPER_PRELOAD-unset}" "$TEST_INHERITED"\nexit 3\n`;
+    writeFileSync(f.fake, binary, { mode: 0o755 });
+    writeFileSync(join(f.real, "npm"), binary, { mode: 0o755 });
+    await withSlottedCommands(
+      [
+        ["bun", "test"],
+        ["npm", "test"],
+      ],
+      scratch,
+      1,
+      () => {},
+      async (path) => {
+        for (const argv of [
+          ["bun", "install"],
+          ["bun", "test"],
+          ["npm", "test"],
+        ]) {
+          const result = await sh(argv, {
+            cwd,
+            env: { PATH: path ?? "", NODE_ENV: mode, TEST_INHERITED: "preserved" },
+            allowFail: true,
+          });
+          expect(result.exitCode).toBe(3);
+          expect(result.stdout).toBe(
+            `${cwd}\n${argv.slice(1).join(" ")}\nunset\nunset\nunset\nunset\npreserved\n`,
+          );
+        }
+      },
+    );
+  },
+);
+
+test("a leased full suite lets nested slotted commands reuse its slot", async () => {
+  const f = fixture(),
+    scratch = join(f.root, SCRATCH_NAME),
+    old = gateSlots.limit;
+  mkdirSync(scratch);
+  writeFileSync(
+    f.fake,
+    '#!/bin/sh\nif [ "$TEST_INNER" = 1 ]; then printf "inner\\n" >> "$TEST_MARKER"; exit 3; fi\nprintf "outer\\n" >> "$TEST_MARKER"\nTEST_INNER=1 bun test\n',
+    { mode: 0o755 },
+  );
+  gateSlots.setLimit(1);
+  const requests = spyOn(gateSlots, "lease");
+  try {
+    await withSlottedCommands(
+      f.config.commands,
+      scratch,
+      1,
+      () => {},
+      async (path) => {
+        const result = await sh(["bun", "test"], {
+          cwd: f.root,
+          env: { PATH: path ?? "", TEST_MARKER: f.marker },
+          allowFail: true,
+          timeoutMs: 10000,
+        });
+        expect(result.exitCode).toBe(3);
+        expect(readFileSync(f.marker, "utf8")).toBe("outer\ninner\n");
+        expect(requests).toHaveBeenCalledTimes(1);
+        expect(gateSlots.snapshot().occupied).toBe(0);
+      },
+    );
+  } finally {
+    requests.mockRestore();
+    gateSlots.setLimit(old);
+  }
+}, 15000);
