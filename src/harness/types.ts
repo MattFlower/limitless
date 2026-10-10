@@ -46,6 +46,8 @@ export interface AgentSpec {
   cwd: string;
   /** Disposable write root owned by the invocation lifecycle, outside cwd. */
   scratchDir?: string;
+  /** Factory-owned command wrappers, supplied only to agent processes. */
+  commandPath?: string;
   prompt: string;
   systemAppend?: string;
   target: ModelTarget;

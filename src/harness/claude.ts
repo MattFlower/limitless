@@ -358,6 +358,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     env: agentEnv({
       ...envExtra,
       ...scratchEnv(spec),
+      ...(spec.commandPath ? { PATH: spec.commandPath } : {}),
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
       // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
       // cwd record) must land in the scratch directly: its parent is outside the boundary.

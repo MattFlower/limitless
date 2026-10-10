@@ -275,7 +275,7 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
 }
 
 /** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
-function editorProfile(spec: AgentSpec): string[] {
+export function editorProfile(spec: AgentSpec): string[] {
   const { write, protect, denyRead = [] } = writeRoots(spec.cwd, validateScratch(spec));
   const entries = [
     ["/", "read"],
@@ -841,7 +841,7 @@ export async function runCodex(
   const proc = await processRunner({
     cmd: args,
     cwd: spec.cwd,
-    env: agentEnv(scratchEnv(spec)),
+    env: agentEnv({ ...scratchEnv(spec), ...(spec.commandPath ? { PATH: spec.commandPath } : {}) }),
     stdin: prompt,
     signal,
     timeoutMs: spec.timeoutMs,

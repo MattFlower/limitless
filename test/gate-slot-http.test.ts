@@ -1,10 +1,89 @@
 import { expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Server } from "bun";
+import { Factory } from "../src/app.ts";
+import { loadConfig } from "../src/config.ts";
 import type { HealthResponse } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
+import { AgentTestSession } from "../src/gates/agent-tests.ts";
 import { gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
+
+test("agent-test HTTP leases record run wait events and duration, and reject forged ownership", async () => {
+  const limit = gateSlots.limit;
+  const home = mkdtempSync(join(tmpdir(), "agent-slot-http-"));
+  const store = new Store(":memory:");
+  const factory = new Factory(loadConfig({ home, configDir: join(home, "config") }), { store });
+  gateSlots.setLimit(1);
+  const repo = store.upsertRepo({
+    slug: "test",
+    kind: "local",
+    url: null,
+    localPath: ".",
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = store.createRun(repo, { repo: "test", prompt: "tests" });
+  const acquired = Promise.withResolvers<void>();
+  const session = new AgentTestSession((data) => {
+    store.addEvent({
+      runId: run.id,
+      type: "log",
+      message: `Agent test ${data.command} (${data.lane}): ${data.phase}`,
+      data,
+    });
+    if (data.phase === "acquired") acquired.resolve();
+  });
+  const release = await gateSlots.acquire(new AbortController().signal);
+  try {
+    const route = (createHttpRoutes(factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+    const request = (payload: unknown) =>
+      route(
+        requestWithParams("http://localhost/api/admin/gate-slot", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }),
+        localServer,
+      );
+    expect((await request({ token: "forged", runId: run.id, name: "bun test", lane: "gate" })).status).toBe(
+      400,
+    );
+    expect(store.listEvents(run.id)).toHaveLength(0);
+    const pending = await request({ token: session.token, name: "bun test", lane: "gate" });
+    const lease = (await pending.json()) as { id: string; acquired: boolean };
+    expect(lease.acquired).toBe(false);
+    expect(store.listEvents(run.id)[0]?.data).toMatchObject({
+      kind: "agent-test",
+      command: "bun test",
+      lane: "gate",
+      phase: "wait",
+    });
+    release();
+    await acquired.promise;
+    expect(store.listEvents(run.id)[1]?.data).toMatchObject({
+      kind: "agent-test",
+      phase: "acquired",
+      waitMs: expect.any(Number),
+    });
+    await request({ token: session.token, id: lease.id });
+    const events = store.listEvents(run.id);
+    expect(events).toHaveLength(2);
+    expect(events.every((event) => !event.message.includes("max_concurrent_gates"))).toBe(true);
+    expect((await request({ token: session.token, id: lease.id, release: true })).status).toBe(200);
+  } finally {
+    release();
+    session.close();
+    await factory.stop();
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+    gateSlots.setLimit(limit);
+  }
+});
 
 test("gate leases share health occupancy and admin mutation protections", async () => {
   const f = await fixture("lease-test");

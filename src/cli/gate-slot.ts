@@ -6,15 +6,16 @@ import { bounded, DaemonTimeoutError, type DeployClock, deployClock, parseMaxWai
 
 type Reply = { id: string; acquired: boolean; expired?: boolean };
 export type LeaseClient = (body: Record<string, unknown>, signal: AbortSignal) => Promise<Reply>;
-class LeaseRejected extends Error {}
+export class LeaseRejected extends Error {}
 export const localLeaseClient =
-  (port = Number(process.env.LIMITLESS_PORT ?? 7400)): LeaseClient =>
+  (port = Number(process.env.LIMITLESS_PORT ?? 7400), unix?: string): LeaseClient =>
   async (body, signal) => {
     const response = await fetch(`http://127.0.0.1:${port}/api/admin/gate-slot`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
       signal,
+      ...(unix ? { unix } : {}),
     });
     if ([404, 405, 501].includes(response.status)) throw new Error("gate-slot endpoint unsupported");
     if (!response.ok) throw new LeaseRejected(`gate-slot: HTTP ${response.status}`);
@@ -146,9 +147,22 @@ export async function gateSlotCommand(args: string[], client?: LeaseClient): Pro
     maxWaitMs = parseMaxWait(values["max-wait"] ?? "1800");
   if (split < 0 || !executable)
     throw new Error("usage: limitless gate-slot [--name holder] [--max-wait seconds] -- command...");
+  return runLeasedCommand(command, { client, name: values.name ?? executable, maxWaitMs });
+}
+
+/** The wrapper and gate-slot CLI share process-group signal and exit-code handling. */
+export async function runLeasedCommand(
+  command: string[],
+  lease?: LeaseOptions & { name: string },
+  signalExitCode = false,
+): Promise<number> {
+  const executable = command[0];
+  if (!executable) throw new Error("missing executable");
   const controller = new AbortController();
+  let interrupted: NodeJS.Signals | undefined;
   let child: ReturnType<typeof spawn> | undefined;
   const interrupt = (signal: NodeJS.Signals) => {
+    interrupted = signal;
     controller.abort();
     if (child?.pid) {
       try {
@@ -163,18 +177,16 @@ export async function gateSlotCommand(args: string[], client?: LeaseClient): Pro
   process.on("SIGINT", int);
   process.on("SIGTERM", term);
   try {
-    return await withGateLease(
-      values.name ?? executable,
-      () =>
-        new Promise<number>((resolve, reject) => {
-          child = spawn(executable, command.slice(1), { stdio: "inherit", detached: true });
-          child.once("error", reject);
-          child.once("exit", (code, signal) =>
-            resolve(code ?? (signal ? 128 + constants.signals[signal] : 1)),
-          );
-        }),
-      { client, maxWaitMs, signal: controller.signal },
-    );
+    const work = () =>
+      new Promise<number>((resolve, reject) => {
+        child = spawn(executable, command.slice(1), { stdio: "inherit", detached: true });
+        child.once("error", reject);
+        child.once("exit", (code, signal) => resolve(code ?? (signal ? 128 + constants.signals[signal] : 1)));
+      });
+    return await (lease ? withGateLease(lease.name, work, { ...lease, signal: controller.signal }) : work());
+  } catch (error) {
+    if (signalExitCode && interrupted) return 128 + constants.signals[interrupted];
+    throw error;
   } finally {
     process.off("SIGINT", int);
     process.off("SIGTERM", term);

@@ -217,10 +217,32 @@ branch:
 setup = ["bun install --frozen-lockfile"]
 checks = [{ name = "test", run = "bun test", timeoutSec = 900 }]
 
+[limits]
+slotted_commands = ["bun test"]   # optional argv prefixes for agents' own test commands
+
 [policy]
 merge = "pr"                      # auto | pr | none
 protected_paths = ["migrations/**"]
 ```
+
+`[limits] slotted_commands` is opt-in and comes only from the run's trusted base commit;
+the value is saved for resume and review. Unset or `[]` leaves agent PATH unchanged.
+Invalid values warn and disable slotting: use nonempty command strings with executable
+names, without path separators. Prefixes match argv tokens, including calls inside shell
+commands and package scripts; absolute executable paths bypass PATH wrappers.
+
+Bare matched commands use the shared gate lane (`max_concurrent_gates`). File/path
+arguments or `-t`/`--test-name-pattern` use a separate small lane, fixed at two concurrent
+agent tests. Flags such as `--coverage` alone still count as full suites. Small commands
+never wait behind a full suite. Health reports this lane as `agentTestSlots` next to
+`gateSlots`; timeline events carry `kind: "agent-test"`, command, lane and queued wait ms.
+Gates, baselines, land checks and deploys keep their existing leases and PATH.
+
+Wrappers use loopback HTTP, with a scratch Unix socket fallback, without expanding
+sandbox permissions. If both transports are unavailable they warn and run the command,
+following gate-slot coordination semantics; a rejected lease or cancellation fails.
+Private holdout authors with read confinement do not receive wrappers, since they cannot
+read the factory-owned wrapper location. Run and stage concurrency limits stay unchanged.
 
 > [!IMPORTANT]
 > When `.limitless.toml` exists, gates come **only** from it. Automatic detection (package.json

@@ -1336,10 +1336,12 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
         await withScratch(cwd, async (scratchDir) => {
           paths.push(scratchDir);
           const spec = specFor(cwd, scratchDir);
+          spec.commandPath = `${join(dirname(scratchDir), "commands")}:${process.env.PATH ?? ""}`;
           spec.target.backend = { baseUrl: "http://backend.invalid", authToken: "backend-only-token" };
           const runner = async (opts: ProcOptions): Promise<ProcResult> => {
             for (const key of ["TMPDIR", "TMP", "TEMP"]) expect(opts.env[key]).toBe(scratchDir);
             expect(opts.env.TMPPREFIX).toBe(join(scratchDir, "zsh"));
+            expect(opts.env.PATH).toBe(spec.commandPath);
             expect(opts.env.GH_TOKEN).toBe("limitless-agents-have-no-github-access");
             if (run === runClaude) {
               // The backend key reaches the CLI through its key helper, never the agent environment.
