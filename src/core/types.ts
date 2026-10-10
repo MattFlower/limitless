@@ -446,6 +446,7 @@ export interface RoutingChange {
 }
 
 export type FeedKind =
+  | `ci.${"round_started" | "round_delivered" | "fix_cap_reached"}`
   | `conflict.${"round_started" | "round_delivered"}`
   | "run.warning"
   | "run.gate_timeout_retry"

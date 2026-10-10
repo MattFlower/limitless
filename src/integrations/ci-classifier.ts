@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { CiFailure, GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { redactCredentials } from "../util/proc.ts";
 import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
 
 const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
@@ -43,7 +44,7 @@ type Call = (
   body?: unknown,
   optionalLog?: boolean,
 ) => Promise<GitHubResponse | null>;
-const bounded = (text: string) => text.trim().slice(0, 500);
+const bounded = (text: string) => redactCredentials(text).trim().slice(0, 500);
 const logLines = (log: string) =>
   Bun.stripANSI(log)
     .split(/\r?\n/)
@@ -76,7 +77,7 @@ export function ciSignature(check: string, log: string, fallback: string, labels
     ) || null;
   return { check, line, image, signature: JSON.stringify([check, line, image]) };
 }
-const quote = (s: string) => `> ${s.replace(/\r?\n/g, "\n> ")}`;
+const quote = (s: string) => `> ${redactCredentials(s).replace(/\r?\n/g, "\n> ")}`;
 
 /** Serial REST inspection. False retains the persisted pending inspection for a later poll. */
 async function inspectCi(
@@ -190,27 +191,33 @@ async function inspectCi(
     key: string,
     repository = false,
     excerpt = f.line,
+    unsafe = false,
   ) => {
     if (kind === "ci.needs_fix") onFailure();
-    store.saveGithubPr(null, false, [
-      {
-        kind,
-        repo: pr.repo,
-        runId: repository ? null : pr.runId,
-        key,
-        summary: repository ? "Default branch CI is failing" : "CI failure needs a code or environment fix",
-        data: {
-          ...(repository ? {} : { url: pr.url, head: snap.headRefOid }),
-          signature: { check: quote(f.check), line: quote(f.line), image: f.image && quote(f.image) },
-          excerpt: quote(excerpt.trim().slice(0, 2000)),
-          untrusted: true,
+    const evidence = redactCredentials(excerpt).trim().slice(0, 2000);
+    store.db.transaction(() => {
+      if (kind === "ci.needs_fix" && !repository && !unsafe && !state.get(f.check)?.red)
+        store.recordCiFixTrigger(pr.url, snap.headRefOid, key, { ...f, excerpt: evidence }, Date.now());
+      store.saveGithubPr(null, false, [
+        {
+          kind,
+          repo: pr.repo,
+          runId: repository ? null : pr.runId,
+          key: redactCredentials(key),
+          summary: repository ? "Default branch CI is failing" : "CI failure needs a code or environment fix",
+          data: {
+            ...(repository ? {} : { url: pr.url, head: snap.headRefOid }),
+            signature: { check: quote(f.check), line: quote(f.line), image: f.image && quote(f.image) },
+            excerpt: quote(evidence),
+            untrusted: true,
+          },
         },
-      },
-    ]);
+      ]);
+    })();
   };
-  const reject = (f: CiFailure, excerpt = f.line) => {
+  const reject = (f: CiFailure, excerpt = f.line, unsafe = false) => {
     store.finishCiFailure(f, "rerun_rejected");
-    emit("ci.needs_fix", f, `${pr.url}:${f.sha}:${f.signature}`, false, excerpt);
+    emit("ci.needs_fix", f, `${pr.url}:${f.sha}:${f.signature}`, false, excerpt, unsafe);
   };
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
     const res = await call(pr.repo, `${root}/actions/jobs/${job}/rerun`, {});
@@ -306,7 +313,14 @@ async function inspectCi(
       if (!current()) return true;
       if (!unsafe) store.recordCiFailure(failure);
       store.finishCiFailure(f, "failed_again");
-      emit("ci.needs_fix", failure, `${pr.url}:${f.sha}:${failure.signature}`, false, log || failure.line);
+      emit(
+        "ci.needs_fix",
+        failure,
+        `${pr.url}:${f.sha}:${failure.signature}`,
+        false,
+        log || failure.line,
+        unsafe,
+      );
     } else continue;
     resolved.add(job.id);
   }
@@ -411,12 +425,12 @@ async function inspectCi(
         const refused = prior.find((p) => pending(p) && p.rerunRetryAt != null);
         if (!refused) continue;
         // Older versions deferred explicit refusals; they also retain the head's claim.
-        reject(refused, log || f.line);
+        reject(refused, log || f.line, unsafe);
         continue;
       }
       if (!unsafe) store.recordCiFailure(f);
       const needsFix = () =>
-        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line);
+        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line, unsafe);
       const transient =
         [c.conclusion, job?.conclusion].some((v) =>
           ["timed_out", "startup_failure", "cancelled"].includes(v ?? ""),

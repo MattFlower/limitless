@@ -283,6 +283,14 @@ export class LandQueue {
   private async process(entry: LandEntry): Promise<void> {
     const controller = new AbortController();
     this.inFlight.set(entry.id, controller);
+    const unsubscribe = this.store.subscribe((message) => {
+      if (
+        message.kind === "feed" &&
+        message.item.kind === "ci.round_delivered" &&
+        message.item.data.prUrl === entry.prUrl
+      )
+        controller.abort();
+    });
     const signal = controller.signal;
     const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
     const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
@@ -304,6 +312,7 @@ export class LandQueue {
         if (!signal.aborted) this.log(redactCredentials(`[conflict] ${String(error)}`));
       });
     } finally {
+      unsubscribe();
       clear(heartbeat);
       this.inFlight.delete(entry.id);
     }
@@ -338,6 +347,7 @@ export class LandQueue {
         await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
+        signal.throwIfAborted();
         this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
       }
       if (entry.pushedSha)
@@ -558,6 +568,7 @@ export class LandQueue {
     sha: string,
     signal: AbortSignal,
   ): Promise<void> {
+    signal.throwIfAborted();
     this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.

@@ -373,7 +373,7 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
 /** A review round's record and the grant it alone gives to push onto its original run's PR branch. */
 function reviewRound(ctx: RunContext) {
   const review = ctx.store.reviewRound(ctx.run.id);
-  if (review && review.kind !== "review" && review.kind !== "conflict")
+  if (review && review.kind !== "review" && review.kind !== "conflict" && review.kind !== "ci")
     throw new Error(`Unsupported review round kind: ${redactCredentials(review.kind)}`);
   return (
     review && { ...review, grant: { owner: review.owner, prUrl: review.prUrl, head: review.reviewedSha } }
@@ -1981,13 +1981,17 @@ async function deliverReviewRound(
       stored();
       ctx.store.markRoundDelivered(ctx.run.id, head);
     }
-    if (review.kind === "conflict") {
-      const marker = `<!-- limitless-conflict-round:${ctx.run.id} -->`;
+    if (review.kind === "conflict" || review.kind === "ci") {
+      const marker = `<!-- limitless-${review.kind === "ci" ? "ci" : "conflict"}-round:${ctx.run.id} -->`;
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
         .comments as { body?: string }[] | undefined;
       if (!comments?.some((comment) => comment.body?.includes(marker))) {
+        const failure = ctx.store.ciFixFailure(ctx.run.id);
+        if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
         const text = redactCredentials(
-          `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
+          review.kind === "ci"
+            ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${JSON.stringify(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
+            : `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
         );
         await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
         await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);

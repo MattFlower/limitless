@@ -674,6 +674,7 @@ test.each(["step", "annotation", "later annotation", "log", "test line"])(
     expect(reruns()).toHaveLength(0);
     expect(items("ci.needs_fix")).toHaveLength(1);
     expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
+    expect(h.store.pendingCiFixTriggers()).toHaveLength(0);
     if (source === "later annotation") expect(h.gh.rest().some((c) => c.path === `${page}2`)).toBe(true);
   },
 );
@@ -752,6 +753,7 @@ test.each(["passing output", "step", "annotation", "test line", ...securityRecor
     expect(ledger).toHaveLength(source === "passing output" ? 2 : 1);
     expect(ledger.find((row) => row.signature === original?.signature)?.outcome).toBe("failed_again");
     expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(h.store.pendingCiFixTriggers()).toHaveLength(source === "passing output" ? 1 : 0);
     expect(reruns()).toHaveLength(1);
     expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
   },
