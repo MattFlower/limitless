@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { parseArgs } from "node:util";
-import { bounded, type DeployClock, deployClock, parseMaxWait } from "./deploy-wait.ts";
+import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
+import { bounded, DaemonTimeoutError, type DeployClock, deployClock, parseMaxWait } from "./deploy-wait.ts";
 
 type Reply = { id: string; acquired: boolean; expired?: boolean };
 export type LeaseClient = (body: Record<string, unknown>, signal: AbortSignal) => Promise<Reply>;
@@ -74,17 +75,34 @@ export async function withGateLease<T>(
   try {
     try {
       opts.signal?.throwIfAborted();
-      let state = await request({ name, immediate: maxWait === 0 }, maxWait ? Math.min(2000, maxWait) : 2000);
-      id = state.id;
-      while (!state.acquired) {
+      let state: Reply | undefined,
+        lastReply = clock.now(),
+        first = true;
+      const pastDeadline = () => new Error("gate-slot wait passed the acquisition deadline");
+      while (!state?.acquired) {
         opts.signal?.throwIfAborted();
-        if (clock.now() >= deadline) throw new Error("gate-slot acquisition deadline exceeded");
-        await clock.sleep(Math.min(250, deadline - clock.now()));
-        if (clock.now() >= deadline) throw new Error("gate-slot acquisition deadline exceeded");
-        state = await request({ id }, Math.max(1, Math.min(2000, deadline - clock.now())));
-        if (state.expired) throw new Error("gate-slot lease expired");
+        if (!first) {
+          if (clock.now() >= deadline) throw pastDeadline();
+          await clock.sleep(Math.min(250, deadline - clock.now()));
+          if (clock.now() >= deadline) throw pastDeadline();
+        }
+        try {
+          state = await request(
+            id ? { id } : { name, immediate: maxWait === 0 },
+            maxWait ? Math.max(1, Math.min(2000, deadline - clock.now())) : 2000,
+          );
+          id = state.id;
+          lastReply = clock.now();
+        } catch (e) {
+          if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
+          if ((first && !(e instanceof DaemonTimeoutError)) || clock.now() - lastReply > GATE_LEASE_EXPIRY_MS)
+            throw new Error(`gate-slot daemon is unreachable: ${e}`);
+          if (clock.now() >= deadline) throw pastDeadline();
+        }
+        first = false;
+        if (state?.expired && maxWait) throw new Error("gate-slot lease expired");
       }
-      if (maxWait && clock.now() >= deadline) throw new Error("gate-slot acquisition deadline exceeded");
+      if (maxWait && clock.now() >= deadline) throw pastDeadline();
       const beat = (ms = 10_000) => {
         cancel = clock.timeout(() => {
           const leaseId = id;

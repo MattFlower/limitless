@@ -1,5 +1,7 @@
 import { availableParallelism } from "node:os";
 
+export const GATE_LEASE_EXPIRY_MS = 30_000;
+
 /** A full gate suite is CPU-heavy, so by default one suite runs per four cores. */
 export function defaultGateSlots(cores = availableParallelism()): number {
   return Math.max(1, Math.floor(cores / 4));
@@ -86,7 +88,7 @@ export class Semaphore {
         this.leases.delete(id);
         controller.abort();
         release?.();
-      } else expiry = timer(() => touch(true), 30_000);
+      } else expiry = timer(() => touch(true), GATE_LEASE_EXPIRY_MS);
       return !!release;
     };
     this.leases.set(id, touch);
