@@ -308,7 +308,7 @@ export interface ReviewApproval {
 }
 
 export interface ReviewRound {
-  kind: "review" | "conflict";
+  kind: string;
   runId: string;
   round: number;
   status: RunStatus;

@@ -1096,11 +1096,22 @@ export class Store {
       .run(prUrl, head, source, now, landEntryId);
   }
 
-  /** Draft deferrals are rechecked so the same head can start once the PR is ready. */
+  /** Draft deferrals wait for a changed poller observation. */
+  recheckDraftConflictTriggers(
+    prUrl: string,
+    seen: { state: string; isDraft?: boolean; headRefOid: string },
+  ) {
+    this.db
+      .query(`UPDATE conflict_triggers SET state = 'pending', reason = NULL
+        WHERE pr_url = ? AND state = 'skipped' AND reason = 'PR is draft'
+        AND (? <> 'OPEN' OR ? = 0 OR observed_sha <> ?)`)
+      .run(prUrl, seen.state, seen.isDraft === false ? 0 : 1, seen.headRefOid);
+  }
+
   pendingConflictTriggers(): { id: number; prUrl: string; head: string; nextAttemptAt: number }[] {
     return this.db
       .query<{ id: number; prUrl: string; head: string; nextAttemptAt: number }, []>(
-        "SELECT id, pr_url AS prUrl, observed_sha AS head, next_attempt_at AS nextAttemptAt FROM conflict_triggers WHERE state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft') ORDER BY id",
+        "SELECT id, pr_url AS prUrl, observed_sha AS head, next_attempt_at AS nextAttemptAt FROM conflict_triggers WHERE state = 'pending' ORDER BY id",
       )
       .all();
   }
@@ -1239,7 +1250,6 @@ export class Store {
     const owner = row && this.getRun(row.sourceRunId);
     if (!row || !owner) return null;
     const { prUrl, round, reviewedSha, kind, deliveredSha } = row;
-    validateRoundKind(kind);
     return { owner, kind, prUrl, round, reviewedSha, deliveredSha, findings: parse(row.findings, []) };
   }
 
@@ -1248,7 +1258,6 @@ export class Store {
         rr.delivered_sha AS deliveredSha, rr.findings, rr.created_at AS createdAt
       FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
     const rows = this.db.query(sql).all(prUrl) as Row[];
-    for (const row of rows) validateRoundKind(row.kind);
     return rows.map((r) => ({
       ...(r as unknown as ReviewRound),
       findings: parse(r.findings, []),
@@ -2779,8 +2788,4 @@ export class Store {
       .query("DELETE FROM auth_sessions WHERE created_at <= ? OR last_seen_at <= ?")
       .run(createdBefore, seenBefore).changes;
   }
-}
-
-function validateRoundKind(kind: unknown): asserts kind is ReviewRound["kind"] {
-  if (kind !== "review" && kind !== "conflict") throw new Error("Invalid review round kind");
 }

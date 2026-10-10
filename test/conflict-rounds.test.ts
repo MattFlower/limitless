@@ -778,7 +778,12 @@ function cachePr(headRefOid: string, isDraft = false) {
       repo: "test/repo",
       runId: owner.id,
       nodeId: null,
-      data: JSON.stringify({ state: "OPEN", isDraft, headRefOid }),
+      data: JSON.stringify({
+        state: "OPEN",
+        isDraft,
+        headRefOid,
+        activity: { review: [], review_comment: [], comment: [] },
+      }),
       delivered: 1,
     },
     false,
@@ -796,20 +801,62 @@ test("a land trigger uses the live head despite an older cached observation", as
   expect(factory.store.reviewRounds(url)).toHaveLength(1);
 });
 
-test("live draft status overrides the cache and a later observation can start the same trigger", async () => {
-  const head = await remoteHead();
-  cachePr(head);
-  draft = true;
-  await trigger();
-  expect(triggers()).toMatchObject([{ state: "skipped", reason: "PR is draft" }]);
-  expect(factory.store.reviewRounds(url)).toHaveLength(0);
-  draft = false;
-  cachePr(head, true);
-  await processConflictTriggers(factory.store, clock.now, factory.deps.gh);
-  await processConflictTriggers(factory.store, clock.now, factory.deps.gh);
-  expect(triggers()).toMatchObject([{ state: "started", reason: null }]);
-  expect(factory.store.reviewRounds(url)).toHaveLength(1);
-});
+test.each(["ready", "head", "closed"] as const)(
+  "a draft deferral waits for the poller to observe %s",
+  async (change) => {
+    const head = await remoteHead();
+    cachePr(head);
+    draft = true;
+    await trigger();
+    expect(triggers()).toMatchObject([{ state: "skipped", reason: "PR is draft" }]);
+    expect(factory.store.reviewRounds(url)).toHaveLength(0);
+    await clock.advance(60_000);
+    await processConflictTriggers(factory.store, clock.now, factory.deps.gh);
+    expect(calls.filter((args) => args[1] === "view")).toHaveLength(1);
+    const github = fakeGitHub(clock.now);
+    const node = github.add("test/repo", 1);
+    node.headRefOid = head;
+    Object.assign(node, { isDraft: true, headRefName: branch });
+    const start = spyOn(factory.store, "startConflictTrigger");
+    const stop = startGitHubPoller(factory.store, {
+      client: github.client,
+      gh: factory.deps.gh,
+      clock: {
+        now: clock.now,
+        set: clock.timer.set as unknown as typeof setTimeout,
+        clear: clock.timer.clear as unknown as typeof clearTimeout,
+      },
+      log: () => {},
+    });
+    const advance = async (ms: number) => {
+      await clock.advance(ms);
+      for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+    };
+    try {
+      await advance(0);
+      for (let i = 0; i < 4; i++) await advance(60_000);
+      expect(github.graphql().length).toBeGreaterThan(1);
+      expect(start).not.toHaveBeenCalled();
+      expect(calls.filter((args) => args[1] === "view")).toHaveLength(1);
+      if (change === "ready") Object.assign(node, { isDraft: false });
+      if (change === "head") node.headRefOid = "b".repeat(40);
+      if (change === "closed") node.state = "CLOSED";
+      await advance(60_000);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(triggers()).toMatchObject([
+        change === "ready"
+          ? { state: "started", reason: null }
+          : { state: "skipped", reason: change === "head" ? "PR is draft" : "PR is not open" },
+      ]);
+      expect(factory.store.reviewRounds(url)).toHaveLength(change === "ready" ? 1 : 0);
+      await advance(60_000);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(calls.filter((args) => args[1] === "view")).toHaveLength(1);
+    } finally {
+      stop();
+    }
+  },
+);
 
 test("startup uses a live lookup rather than a cached non-draft PR", async () => {
   cachePr(await remoteHead());
@@ -978,9 +1025,48 @@ test("shared numbering survives previous-release inserts while the review cap ig
   expect(factory.store.createReviewRound(repo, owner, review, request)).toHaveProperty("limited");
 });
 
-test("round kinds are validated in code without a database CHECK", async () => {
+test("unknown round kinds remain readable, block in-flight rounds, and count toward neither cap", async () => {
   const id = await trigger();
-  factory.store.db.query("UPDATE review_rounds SET kind = 'unknown' WHERE run_id = ?").run(id);
-  expect(() => factory.store.reviewRound(id)).toThrow("Invalid review round kind");
-  expect(() => factory.store.reviewRounds(url)).toThrow("Invalid review round kind");
+  factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(id);
+  expect(factory.store.reviewRound(id)?.kind).toBe("ci");
+  expect(factory.store.reviewRounds(url)).toMatchObject([{ kind: "ci" }]);
+  const review = () =>
+    submitReview(factory, owner.id, {
+      verdict: "changes",
+      reviewedSha: owner.headSha,
+      findings: [{ severity: "major", title: "Fix it", detail: "Handle empty input" }],
+    });
+  await expect(review()).rejects.toThrow("still in flight");
+  await trigger();
+  expect(triggers().at(-1)?.reason).toBe("round in flight");
+  factory.store.updateRun(id, { status: "succeeded" });
+  // Three terminal unknown rows must not consume the daily conflict cap.
+  for (let i = 0; i < 2; i++) {
+    const next = await trigger();
+    factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(next);
+    factory.store.updateRun(next, { status: "succeeded" });
+  }
+  const conflict = await trigger();
+  expect(factory.store.reviewRounds(url).map((r) => r.kind)).toEqual(["ci", "ci", "ci", "conflict"]);
+  factory.store.updateRun(conflict, { status: "succeeded" });
+  await expect(review()).resolves.toHaveProperty("round");
+  expect(factory.store.reviewRounds(url).at(-1)).toMatchObject({ kind: "review", round: 5 });
 });
+
+test.each(["prepare", "deliver"] as const)(
+  "an unknown-kind round fails before %s without pushing",
+  async (phase) => {
+    const head = await remoteHead();
+    const id = await trigger();
+    factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(id);
+    if (phase === "deliver") factory.store.setRunState(id, { phase });
+    const push = spyOn(repos, "pushExistingBranch");
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("failed");
+    expect(factory.store.getRun(id)?.error).toBe("Unsupported review round kind: ci");
+    expect(push).not.toHaveBeenCalled();
+    expect(await remoteHead()).toBe(head);
+    expect(implementations).toBe(0);
+    expect(calls.filter((args) => args[1] === "comment")).toHaveLength(0);
+    expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
+  },
+);
