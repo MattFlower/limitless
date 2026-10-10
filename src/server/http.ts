@@ -550,7 +550,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (typeof target !== "string" || !target.trim())
           return error("target is required: a run id, a PR URL or a PR number");
         if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
-        return json(factory.land.request({ target, sha: input.sha as string | undefined }), 201);
+        return json(await factory.land.request({ target, sha: input.sha as string | undefined }), 201);
       }, true),
     },
     "/api/land/:id/cancel": {

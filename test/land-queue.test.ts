@@ -32,6 +32,7 @@ setDefaultTimeout(30_000);
 const SLUG = "test/repo";
 const url = (n: number) => `https://github.com/${SLUG}/pull/${n}`;
 const gateLogPath = () => join(root, "gates.log");
+const gateReleasePath = () => join(root, "release");
 
 let root: string;
 let bare: string;
@@ -71,9 +72,12 @@ beforeEach(async () => {
   await sh(["git", "init", "-q", "-b", "main"], { cwd: seed });
   writeFileSync(join(seed, "README.md"), "base\n");
   // Each check brackets its own run in a log, so overlapping land checks are visible.
+  // Keep the overlap window even when the release file already exists.
+  // Most tests release checks immediately; stop tests hold them until shutdown.
+  writeFileSync(gateReleasePath(), "");
   writeFileSync(
     join(seed, ".limitless.toml"),
-    `[gates]\nchecks = [{ name = "land", run = "echo start >> '${gateLogPath()}'; sleep 0.3; echo end >> '${gateLogPath()}'" }]\n`,
+    `[gates]\nchecks = [{ name = "land", run = "echo start >> '${gateLogPath()}'; sleep 0.3; while [ ! -e '${gateReleasePath()}' ]; do sleep 0.05; done; echo end >> '${gateLogPath()}'" }]\n`,
   );
   await sh(["git", "add", "."], { cwd: seed });
   await sh(["git", "commit", "-qm", "base"], { cwd: seed });
@@ -113,10 +117,11 @@ if(args[0]==="run") {
 }
 const pr=args[2].match(/pull\\/(\\d+)/)?.[1]??"0", merged=existsSync(file+".merged-"+pr);
 const branch=existsSync(file+".branch-"+pr)?readFileSync(file+".branch-"+pr,"utf8").trim():"";
+const baseRefName=existsSync(file+".base-"+pr)?readFileSync(file+".base-"+pr,"utf8").trim():undefined;
 const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
 const flag=(n)=>args.includes(n);
 if(args[0]!=="pr"||args[1]!=="merge"){
- if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({title:"PR text",body:"PR body",headRefOid:head(),state:merged?"MERGED":"OPEN",statusCheckRollup:[]}));
+ if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",statusCheckRollup:[]}));
  process.exit(0);
 }
 if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
@@ -217,9 +222,14 @@ async function pushBranch(name: string, file: string, text: string, pr = 1): Pro
 }
 
 /** The base moves on: a new commit on main, as another landed PR would leave it. */
-async function advanceBase(): Promise<void> {
+async function advanceBase(checkMerged = false): Promise<void> {
   await sh(["git", "checkout", "-q", "main"], { cwd: seed });
   writeFileSync(join(seed, "base.txt"), "moved\n");
+  if (checkMerged)
+    writeFileSync(
+      join(seed, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "land", run = "test -f one.txt && cat base.txt >> '${gateLogPath()}'" }]\n`,
+    );
   await sh(["git", "add", "."], { cwd: seed });
   await sh(["git", "commit", "-qm", "base moves"], { cwd: seed });
   await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
@@ -227,6 +237,26 @@ async function advanceBase(): Promise<void> {
 
 const remoteHead = (branch: string) =>
   sh(["git", "rev-parse", `refs/heads/${branch}`], { cwd: bare }).then((r) => r.stdout.trim());
+
+function roundRun(ownerId: string, prUrl: string, head: string, db = store): Run {
+  const owner = db.getRun(ownerId);
+  const repo = owner && db.getRepo(owner.repoId);
+  if (!owner || !repo || !owner.branch) throw new Error("missing round owner");
+  const result = db.createReviewRound(
+    repo,
+    owner,
+    { prUrl, reviewedSha: head, findings: [], cap: 3 },
+    (round) => ({
+      repo: repo.slug,
+      prompt: "review round",
+      baseBranch: owner.branch ?? undefined,
+      deliveryBranch: owner.branch ?? undefined,
+      sourceRef: { kind: "review-round", runId: owner.id, round, prUrl, reviewedSha: head },
+    }),
+  );
+  if (!("run" in result)) throw new Error("round refused");
+  return db.updateRun(result.run.id, { status: "succeeded", title: "Reviewed PR" });
+}
 
 function queue(
   opts: {
@@ -314,8 +344,8 @@ test("two approved entries on one repository land in order, never checking at on
   observe(2, head2);
   approve(2, head2);
   const q = queue();
-  q.request({ target: first.run.id });
-  q.request({ target: second.run.id });
+  await q.request({ target: first.run.id });
+  await q.request({ target: second.run.id });
   await settle();
   const entries = store.listLandEntries();
   expect(entries.map((e) => [e.id, e.state])).toEqual([
@@ -336,7 +366,7 @@ test("three requests submitted together all land, with no further request", asyn
     approve(n, head);
   }
   const q = queue();
-  for (const pr of prs) q.request({ target: pr.run.id });
+  await Promise.all(prs.map((pr) => q.request({ target: pr.run.id })));
   await settle();
   expect(store.listLandEntries().map((e) => e.state)).toEqual(["landed", "landed", "landed"]);
   expect(gateLog()).toEqual(["start", "end", "start", "end", "start", "end"]);
@@ -384,8 +414,8 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   observe(2, head2);
   approve(2, head2);
   const q = queue();
-  q.request({ target: behind.run.id });
-  q.request({ target: upToDate.run.id });
+  await q.request({ target: behind.run.id });
+  await q.request({ target: upToDate.run.id });
   await settle();
   const merged = store.getLandEntry(1);
   expect(merged?.state).toBe("landed");
@@ -417,7 +447,7 @@ for (const moved of [false, true]) {
     ci = () => null;
     let caughtUp = false;
     let reads = 0;
-    const entry = queue({
+    const entry = await queue({
       polling: false,
       ciPollMs: 100,
       client: async () => {
@@ -467,7 +497,7 @@ test("poller head versions catching up to a base merge do not block CI inspectio
   await advanceBase();
   ci = () => null;
   let reads = 0;
-  const entry = queue({
+  const entry = await queue({
     polling: false,
     ciPollMs: 100,
     client: async () => {
@@ -517,7 +547,7 @@ test("a rejected merge blocks, arms no auto-merge, and a later head never lands"
   approve(1, head);
   writeFileSync(join(root, "gh.reject"), "");
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "merge failed" });
   expect(ghCalls("pr merge").some((c) => c.includes("--auto"))).toBe(false);
@@ -540,7 +570,7 @@ test("a pinned merge whose head moved is refused", async () => {
   approve(1, head);
   writeFileSync(join(root, "gh.hang"), ""); // hold the merge while the head moves underneath it
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await waitFor(() => ghCalls("pr merge").some((call) => call.includes("--match-head-commit")));
   const pinned = store.getLandEntry(entry.id)?.pushedSha ?? head;
   await q.stop();
@@ -570,7 +600,7 @@ test("a push to the PR after approval blocks the entry and merges nothing", asyn
   approve(1, head1);
   await advanceBase(); // forces the factory merge commit, so the entry has to push
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   // Someone pushes to the branch after the operator approved the head.
   const pushedByHand = await pushBranch("pr-1", "one.txt", "one\nedited\n", 1);
   observe(1, pushedByHand);
@@ -596,7 +626,7 @@ test("a conflicting base blocks the entry without pushing", async () => {
   await sh(["git", "commit", "-qm", "base takes the file"], { cwd: seed });
   await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "conflicts with main" });
   expect(await remoteHead("pr-1")).toBe(approved);
@@ -609,7 +639,7 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
   observe(1, approved);
   approve(1, approved);
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await settle({ ci: "FAILURE", failing: ["build", "typecheck"] });
   expect(store.getLandEntry(entry.id)).toMatchObject({
     state: "blocked",
@@ -646,7 +676,7 @@ test.each([
   observe(1, head1);
   approve(1, head1);
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await settle();
   const blocked = store.getLandEntry(entry.id);
   expect(blocked).toMatchObject({ state: "blocked" });
@@ -665,6 +695,7 @@ test.each([
 });
 
 test("stopping mid-check leaves a later entry unstarted", async () => {
+  rmSync(gateReleasePath());
   const first = delivered(1, "pr-1");
   const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
@@ -674,10 +705,13 @@ test("stopping mid-check leaves a later entry unstarted", async () => {
   observe(2, head2);
   approve(2, head2);
   const q = queue();
-  q.request({ target: first.run.id });
-  q.request({ target: second.run.id });
+  await q.request({ target: first.run.id });
+  await q.request({ target: second.run.id });
   await waitFor(() => gateLog().length === 1);
   await q.stop(); // the daemon stops with the second entry still queued
+  // A check that survived the stop would now finish its 0.3 s sleep and 50 ms poll and log "end".
+  writeFileSync(gateReleasePath(), "");
+  await Bun.sleep(800);
   expect(store.getLandEntry(1)?.state).toBe("checking");
   for (let i = 0; i < 20; i++) await settleIdle();
   expect(store.getLandEntry(2)?.state).toBe("queued");
@@ -727,8 +761,8 @@ test("two queues on one database never run two checks for the same repository", 
   approve(2, head2);
   const a = queue({ start: false });
   const b = queue({ start: false });
-  a.request({ target: first.run.id });
-  a.request({ target: second.run.id });
+  await a.request({ target: first.run.id });
+  await a.request({ target: second.run.id });
   b.start();
   a.start();
   await settle();
@@ -737,17 +771,19 @@ test("two queues on one database never run two checks for the same repository", 
 });
 
 test("a restart during checking re-runs the checks from the start", async () => {
+  rmSync(gateReleasePath());
   const pr = delivered(1, "pr-1");
   const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   const first = queue();
-  const entry = first.request({ target: pr.run.id });
+  const entry = await first.request({ target: pr.run.id });
   await waitFor(() => gateLog().length === 1); // the check is running
   expect(store.getLandEntry(entry.id)?.state).toBe("checking");
   await first.stop(); // the daemon stopped mid-check
   expect(store.getLandEntry(entry.id)?.state).toBe("checking");
   expect(gateLog()).toEqual(["start"]);
+  writeFileSync(gateReleasePath(), "");
   queue();
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", attempts: 2 });
@@ -769,7 +805,7 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
     failing: [],
   };
   const q = queue({ polling: false, client: async () => ({ ...view }) });
-  const entry = q.request({ target: pr.run.id, sha: approved });
+  const entry = await q.request({ target: pr.run.id, sha: approved });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   await q.stop();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "waiting_ci", pushedSha: approved });
@@ -787,7 +823,7 @@ test("a restart during merging takes an already merged PR as landed without merg
   approve(1, head1);
   writeFileSync(join(root, "gh.hang"), "");
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "merging");
   await q.stop();
   expect(store.getLandEntry(entry.id)?.state).toBe("merging");
@@ -808,7 +844,7 @@ test("CI that never finishes gives up with a reason", async () => {
   observe(1, head1);
   approve(1, head1);
   const q = queue({ ciTimeoutMs: 5_000 });
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await settle({ ci: "PENDING" });
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "CI did not finish" });
   expect(ghCalls("pr merge")).toEqual([]);
@@ -821,7 +857,7 @@ test("a CI feed item lands the entry without the clock moving", async () => {
   approve(1, head);
   ci = () => null; // only the test publishes an observation, and no clock ever advances
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
   expect(clock.pending).toBeGreaterThan(0); // the fallback read is armed, and is not what wakes it
   observers.get(url(1))?.(store.getLandEntry(entry.id)?.pushedSha ?? "", "SUCCESS");
@@ -878,7 +914,7 @@ test("a transient CI failure is re-run once and lands", async () => {
   approve(1, head);
   ci = () => null; // the test answers CI itself, one verdict at a time
   const q = queue();
-  const entry = q.request({ target: flaky.run.id });
+  const entry = await q.request({ target: flaky.run.id });
   const published = async () => store.getLandEntry(entry.id)?.pushedSha ?? "";
   await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
   workflow(await published(), 1, "failure");
@@ -916,7 +952,7 @@ test("a transient CI failure twice blocks, and a real one is not re-run", async 
   approve(1, head);
   ci = () => null;
   const q = queue();
-  const entry = q.request({ target: broken.run.id });
+  const entry = await q.request({ target: broken.run.id });
   await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
   const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
   workflow(pinned, 1, "failure");
@@ -933,7 +969,7 @@ test("a transient CI failure twice blocks, and a real one is not re-run", async 
   approve(2, head2);
   ci = () => null;
   landLog.length = 0;
-  const second = q.request({ target: real.run.id });
+  const second = await q.request({ target: real.run.id });
   await waitFor(() => !!store.getLandEntry(second.id)?.pushedSha);
   observers.get(url(2))?.(store.getLandEntry(second.id)?.pushedSha ?? "", "FAILURE", ["build"]);
   await settle();
@@ -962,7 +998,7 @@ test("non-transient main-red CI blocks with names", async () => {
       })),
     }),
   );
-  const entry = queue().request({ target: pr.run.id });
+  const entry = await queue().request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const before = clock.now();
   observe(1, store.getLandEntry(entry.id)?.pushedSha ?? "", "FAILURE", ["build", "lint"]);
@@ -985,7 +1021,7 @@ test.each(["pushed", "unrelated"])(
     approve(1, approved);
     await advanceBase();
     ci = () => null;
-    const entry = queue().request({ target: pr.run.id });
+    const entry = await queue().request({ target: pr.run.id });
     await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
     const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
     expect(pinned).not.toBe(approved);
@@ -1030,7 +1066,7 @@ test("moved head discovered by rerun preflight blocks immediately", async () => 
   observe(1, head);
   approve(1, head);
   ci = () => null;
-  const entry = queue().request({ target: pr.run.id });
+  const entry = await queue().request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
   workflow(pinned, 1, "failure");
@@ -1052,7 +1088,7 @@ test("moved head interrupts a stalled classifier read", async () => {
   observe(1, head);
   approve(1, head);
   ci = () => null;
-  const entry = queue().request({ target: pr.run.id });
+  const entry = await queue().request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
   github.hold = new Promise<void>(() => {});
@@ -1078,7 +1114,7 @@ test("a saved moved head blocks without advancing the clock even when a CI read 
   approve(1, head);
   ci = () => null;
   let reads = 0;
-  const entry = queue({
+  const entry = await queue({
     client: (_url, signal) =>
       new Promise<GitHubPrView | null>((_resolve, reject) => {
         reads++;
@@ -1116,47 +1152,164 @@ test("a cancel interrupts a CI read that never answers", async () => {
         signal?.addEventListener("abort", () => resolve(null), { once: true });
       }),
   });
-  const entry = q.request({ target: pr.run.id, sha: head });
+  const entry = await q.request({ target: pr.run.id, sha: head });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   q.cancel(entry.id);
   await q.stop();
   expect(store.getLandEntry(entry.id)?.state).toBe("cancelled");
 });
 
-test("a land request names a run, a pull request URL or its number", async () => {
+test("a review-round land merges current main into the approved head before checking", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  const round = roundRun(pr.run.id, url(1), head);
+  observe(1, head);
+  store.recordApproval(round.id, url(1), head, "orchestrator");
+  await advanceBase(true);
+  const entry = await queue().request({ target: round.id });
+  expect(entry.baseBranch).toBe("main");
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect(gateLog()).toEqual(["moved"]);
+  const landed = await remoteHead("pr-1");
+  for (const sha of [head, await remoteHead("main")])
+    expect((await sh(["git", "merge-base", "--is-ancestor", sha, landed], { cwd: bare })).exitCode).toBe(0);
+});
+
+for (const state of ["queued", "waiting_ci"] as const) {
+  test(`a stored ${state} land with its head as base resolves main before checking`, async () => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const round = roundRun(pr.run.id, url(1), head);
+    observe(1, head);
+    await advanceBase(true);
+    const entry = store.createLandEntry({
+      runId: round.id,
+      repo: SLUG,
+      prUrl: url(1),
+      baseBranch: "pr-1",
+      headBranch: "pr-1",
+      approvedSha: head,
+    });
+    if (state === "waiting_ci") {
+      store.updateRun(pr.run.id, { baseBranch: "" });
+      writeFileSync(join(root, "gh.base-1"), "main");
+      store.updateLandEntry(entry.id, {
+        state,
+        pushedSha: head,
+        ciRerun: JSON.stringify([
+          { databaseId: 1, headSha: head, attempt: 1, status: "completed", conclusion: "failure" },
+        ]),
+      });
+    }
+    queue();
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      baseBranch: "main",
+      state: "landed",
+      ciRerun: null,
+    });
+    expect(gateLog()).toEqual(["moved"]);
+    expect(
+      (
+        await sh(["git", "merge-base", "--is-ancestor", await remoteHead("main"), await remoteHead("pr-1")], {
+          cwd: bare,
+        })
+      ).exitCode,
+    ).toBe(0);
+  });
+}
+
+test("a round with an unavailable owner base uses GitHub's PR base, not the default", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  const round = roundRun(pr.run.id, url(1), head);
+  store.updateRun(pr.run.id, { baseBranch: "" });
+  writeFileSync(join(root, "gh.base-1"), "release");
+  observe(1, head);
+  store.recordApproval(round.id, url(1), head, "orchestrator");
+  const q = queue({ start: false });
+  await q.stop();
+  const entry = await q.request({ target: round.id });
+  expect(entry).toMatchObject({ baseBranch: "release", state: "queued" });
+  expect(ghCalls("pr view")).toHaveLength(1);
+});
+
+for (const mode of ["request", "stored"] as const) {
+  test(`an undeterminable PR base blocks a ${mode} land before checks or publication`, async () => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const round = roundRun(pr.run.id, url(1), head);
+    store.updateRun(pr.run.id, { baseBranch: "pr-1" });
+    if (mode === "stored") writeFileSync(join(root, "gh.base-1"), "pr-1");
+    observe(1, head);
+    store.recordApproval(round.id, url(1), head, "orchestrator");
+    const entry =
+      mode === "request"
+        ? await queue().request({ target: round.id })
+        : store.createLandEntry({
+            runId: round.id,
+            repo: SLUG,
+            prUrl: url(1),
+            baseBranch: "pr-1",
+            headBranch: "pr-1",
+            approvedSha: head,
+          });
+    if (mode === "stored") queue();
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: "blocked",
+      reason: expect.stringContaining("cannot determine PR base branch"),
+      pushedSha: null,
+      logPath: null,
+    });
+    expect(gateLog()).toEqual([]);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(existsSync(join(paths.repos, "test__repo.git"))).toBe(false);
+    expect(
+      store.readFeed({ limit: 100 }).items.find((i) => i.kind === "land.blocked")?.data.reason,
+    ).toContain("cannot determine PR base branch");
+  });
+}
+
+test("a land request names a review round, a pull request URL or its number", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head);
-  approve(1, head);
+  const round = roundRun(pr.run.id, url(1), head);
+  store.recordApproval(round.id, url(1), head, "orchestrator");
   const q = queue({ start: false });
-  expect(q.request({ target: url(1) }).runId).toBe(pr.run.id);
-  store.updateLandEntry(1, { state: "blocked", reason: "reset" });
-  expect(q.request({ target: "1" }).runId).toBe(pr.run.id);
-  store.updateLandEntry(2, { state: "blocked", reason: "reset" });
-  expect(q.request({ target: "#1" }).runId).toBe(pr.run.id);
-  store.updateLandEntry(3, { state: "blocked", reason: "reset" });
-  expect(q.request({ target: pr.run.id }).runId).toBe(pr.run.id);
+  await q.stop();
+  for (const target of [url(1), "1", "#1", round.id, pr.run.id]) {
+    const entry = await q.request({ target });
+    expect(entry.baseBranch).toBe("main");
+    expect(entry.runId).toBe(target === pr.run.id ? pr.run.id : round.id);
+    store.updateLandEntry(entry.id, { state: "blocked", reason: "reset" });
+  }
 });
 
-test("a request needs a review approval, or an explicit head that is the PR's", () => {
+test("a request needs a review approval, or an explicit head that is the PR's", async () => {
   const pr = delivered(1, "pr-1");
   const q = queue({ start: false });
-  expect(() => q.request({ target: "missing" })).toThrow("run not found");
-  expect(() => q.request({ target: pr.run.id })).toThrow("no review approval");
-  expect(() => q.request({ target: pr.run.id, sha: "c".repeat(40) })).toThrow(
+  await expect(q.request({ target: "missing" })).rejects.toThrow("run not found");
+  await expect(q.request({ target: pr.run.id })).rejects.toThrow("no review approval");
+  await expect(q.request({ target: pr.run.id, sha: "c".repeat(40) })).rejects.toThrow(
     "not the pull request's current head",
   );
   observe(1, "c".repeat(40));
   approve(1, "c".repeat(40));
   // A head that moved after the approval makes it stale.
   store.observePrHead(url(1), "b".repeat(40));
-  expect(() => q.request({ target: pr.run.id })).toThrow("approval is stale");
-  expect(q.request({ target: pr.run.id, sha: "c".repeat(40) }).approvedSha).toBe("c".repeat(40));
-  expect(() => q.request({ target: pr.run.id, sha: "d".repeat(40) })).toThrow(
+  await expect(q.request({ target: pr.run.id })).rejects.toThrow("approval is stale");
+  expect((await q.request({ target: pr.run.id, sha: "c".repeat(40) })).approvedSha).toBe("c".repeat(40));
+  await expect(q.request({ target: pr.run.id, sha: "d".repeat(40) })).rejects.toThrow(
     "not the pull request's current head",
   );
-  expect(() => q.request({ target: pr.run.id, sha: "short" })).toThrow("full commit id");
-  expect(() => q.request({ target: pr.run.id, sha: "c".repeat(40) })).toThrow("already in the land queue");
+  await expect(q.request({ target: pr.run.id, sha: "short" })).rejects.toThrow("full commit id");
+  await expect(q.request({ target: pr.run.id, sha: "c".repeat(40) })).rejects.toThrow(
+    "already in the land queue",
+  );
   store.saveGithubPr({
     url: url(1),
     repo: SLUG,
@@ -1165,7 +1318,7 @@ test("a request needs a review approval, or an explicit head that is the PR's", 
     nodeId: "PR_1",
     data: JSON.stringify({ headRefOid: "c".repeat(40), state: "MERGED", ci: "SUCCESS", failing: [] }),
   });
-  expect(() => q.request({ target: pr.run.id })).toThrow("MERGED");
+  await expect(q.request({ target: pr.run.id })).rejects.toThrow("MERGED");
   expect(store.listLandEntries({ limit: 100 }).filter((e) => e.state === "landed")).toHaveLength(0);
 });
 
@@ -1204,6 +1357,7 @@ test("the API queues, lists and cancels lands behind the loopback and content-ty
     });
     const run = f.factory.store.createRun(repo, { repo: SLUG, prompt: "api" });
     f.factory.store.updateRun(run.id, { prUrl: url(7), branch: "pr-7", baseBranch: "main" });
+    const round = roundRun(run.id, url(7), "b".repeat(40), f.factory.store);
     f.factory.store.saveGithubPr({
       url: url(7),
       repo: SLUG,
@@ -1225,12 +1379,13 @@ test("the API queues, lists and cancels lands behind the loopback and content-ty
         }),
         localServer,
       );
-    expect((await post({ target: run.id }, { "content-type": "text/plain" })).status).toBe(415);
+    expect((await post({ target: round.id }, { "content-type": "text/plain" })).status).toBe(415);
     expect((await post({})).status).toBe(400);
     expect((await post({ target: "missing" })).status).toBe(400);
-    const created = (await (await post({ runId: run.id, sha: "b".repeat(40) })).json()) as LandEntry;
+    const created = (await (await post({ runId: round.id, sha: "b".repeat(40) })).json()) as LandEntry;
     expect(created).toMatchObject({
-      runId: run.id,
+      runId: round.id,
+      baseBranch: "main",
       prUrl: url(7),
       approvedSha: "b".repeat(40),
       state: "queued",
@@ -1306,7 +1461,7 @@ for (const location of ["commit", "author email", "subject", "body"]) {
     observe(1, head);
     approve(1, head);
     await advanceBase();
-    const entry = queue().request({ target: pr.run.id });
+    const entry = await queue().request({ target: pr.run.id });
     await settle();
     expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked" });
     expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
@@ -1323,7 +1478,7 @@ test("an empty report sends an explicit empty merge body", async () => {
   observe(1, head);
   approve(1, head);
   store.putArtifact(pr.run.id, "report.md", "report", "");
-  const entry = queue().request({ target: pr.run.id });
+  const entry = await queue().request({ target: pr.run.id });
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
   expect(ghCalls("pr merge")[0]).toContain("--body-file -");
@@ -1337,7 +1492,7 @@ test("a second process cannot reclaim a heartbeating land, but can reclaim its e
   approve(1, head);
   ci = () => null;
   const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const second = async (now: number) => {
     const code = `import { Store } from ${JSON.stringify(join(process.cwd(), "src/db/store.ts"))};
@@ -1383,7 +1538,7 @@ test("a head observation received during a CI read blocks without a timer", asyn
     },
   });
   const before = clock.now();
-  const entry = q.request({ target: pr.run.id });
+  const entry = await q.request({ target: pr.run.id });
   const deadline = Date.now() + 5_000;
   while (store.getLandEntry(entry.id)?.state !== "blocked") {
     if (Date.now() > deadline) throw new Error("CI read lost the head observation");
@@ -1411,7 +1566,7 @@ test("land ignores an inherited local Git scope and a graft hiding private ances
   const previous = process.env.GIT_GRAFT_FILE;
   process.env.GIT_GRAFT_FILE = graft;
   try {
-    const entry = worktreeGitScope.run(false, () => queue().request({ target: pr.run.id }));
+    const entry = await worktreeGitScope.run(false, () => queue().request({ target: pr.run.id }));
     await settle();
     expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
     expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
