@@ -1647,7 +1647,9 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     return row ? toRun(row) : null;
   }
 
-  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string; ids?: string[] } = {}): Run[] {
+  listRuns(
+    opts: { status?: RunStatus[]; limit?: number; repoId?: string; repoSlug?: string; ids?: string[] } = {},
+  ): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (opts.ids) {
@@ -1663,6 +1665,10 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     if (opts.repoId) {
       where.push("runs.repo_id = ?");
       params.push(opts.repoId);
+    }
+    if (opts.repoSlug) {
+      where.push("repos.slug = ?");
+      params.push(opts.repoSlug);
     }
     const sql = `${RUN_SELECT} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY runs.created_at DESC LIMIT ?`;
     params.push(opts.limit ?? 100);
