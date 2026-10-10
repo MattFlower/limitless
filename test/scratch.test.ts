@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { Store } from "../src/db/store.ts";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -26,6 +27,7 @@ import { ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
+  readConfinement,
   removeScratch,
   SCRATCH_NAME,
   withScratch,
@@ -68,6 +70,38 @@ const procResult: ProcResult = {
   truncated: false,
   durationMs: 1,
 };
+
+test("private database and sidecars are denied for both editors and readers with a configured factory home", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-database-profile-"));
+  const cwd = join(root, "work");
+  const home = join(root, "configured-factory-home");
+  mkdirSync(cwd);
+  mkdirSync(home);
+  const store = new Store(join(home, "limitless.db"));
+  try {
+    await withScratch(cwd, async (scratch) => {
+      const paths = [
+        join(home, "limitless.db"),
+        join(home, "limitless.db-wal"),
+        join(home, "limitless.db-shm"),
+      ];
+      for (const mode of ["edit", "readonly"] as const) {
+        const spec = { ...specFor(cwd, scratch), mode, confineReads: mode === "readonly" };
+        const codex = buildCodexArgs(spec).join(" ");
+        const claude = buildClaudeArgs(spec, "test-session").join(" ");
+        for (const path of paths) {
+          expect(codex).toContain(`${JSON.stringify(path)}="none"`);
+          expect(claude).toContain(`Read(/${path})`);
+          expect(readConfinement(spec, scratch).deny).toContain(path);
+          expect(writeRoots(cwd, scratch).denyRead).toContain(path);
+        }
+      }
+    });
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 // Inside a confined gate the only writable temp roots are the checkout and its scratch, so there is no
 // directory outside an inherited in-checkout TMPDIR to pick; the property is checked in development and at landing.
@@ -422,6 +456,22 @@ const writeGrant = (cmd: string[]) =>
       .join("")
       .match(/("(?:[^"\\]|\\.)*")="write"/)?.[1] ?? '""',
   ) as string;
+
+test("a private database read leak prevents Codex exec", async () => {
+  const { cwd, spec, cleanup } = confinedFixture();
+  const store = new Store(join(cwd, "../private-diagnostics.db"));
+  const file = realpathSync(join(cwd, "../private-diagnostics.db"));
+  const fake = fakeCodex((path, opts) => (path === file ? { exitCode: 0 } : enforcing(path, opts)));
+  try {
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.confinement?.ok).toBe(false);
+    expect(fake.execs).toHaveLength(0);
+    expect(fake.sandboxReads.some((read) => read.file === file && read.access === "none")).toBe(true);
+  } finally {
+    store.close();
+    cleanup();
+  }
+});
 
 test("an enforcing CLI runs exec only after a readable cwd and a denial in every private root", async () => {
   const { cwd, scratch, spec, cleanup } = confinedFixture();

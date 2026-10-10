@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { mountMcp } from "../src/integrations/mcp-http.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let mcp: ReturnType<typeof mountMcp>;
@@ -25,6 +26,49 @@ const rpc = (method: string, params: unknown = {}, id: number | undefined = 1) =
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
   });
+
+test("no HTTP MCP tool result or error includes owner diagnostics", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "diagnostic transport" });
+  const marker = "OWNER_MCP_HTTP_ONLY_423";
+  f.factory.store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public");
+  expect(ownerDiagnostics(f.factory.store.db, run.id)).toMatchObject([{ text: marker }]);
+  f.factory.store.updateRun(run.id, { status: "failed", error: "public" });
+  f.factory.store.addEvent({ runId: run.id, type: "log", message: "public event" });
+  const reads = [
+    [
+      "limitless_get_run",
+      { id: run.id },
+      {
+        id: run.id,
+        error: "public",
+        events: expect.arrayContaining([expect.objectContaining({ message: "public event" })]),
+      },
+    ],
+    ["limitless_list_runs", { status: "failed", limit: 1 }, [{ id: run.id, error: "public" }]],
+    ["limitless_feed", { after: 0, wait: 0 }, { items: [{ runId: run.id }] }],
+    ["limitless_status", { run: run.id }, { run: run.id, state: "Failed" }],
+    ["limitless_providers", {}, [{ id: "fake" }]],
+  ] as const;
+  for (const [name, args, expected] of reads) {
+    const response = await route(rpc("tools/call", { name, arguments: args }), localServer);
+    expect(response.status).toBe(200);
+    const message = await response.json();
+    expect(message.error).toBeUndefined();
+    expect(message.result.isError).not.toBe(true);
+    expect(resultValue(message.result)).toMatchObject(expected);
+    expect(JSON.stringify(message)).not.toContain(marker);
+  }
+  const tools = (await (await route(rpc("tools/list"), localServer)).json()).result.tools as {
+    name: string;
+  }[];
+  for (const tool of tools) {
+    if (reads.some(([name]) => name === tool.name)) continue;
+    const response = await route(rpc("tools/call", { name: tool.name, arguments: {} }), localServer);
+    const message = await response.json();
+    expect(message.result.isError).toBe(true);
+    expect(JSON.stringify(message)).not.toContain(marker);
+  }
+});
 
 test("mounted endpoint initializes, discovers and calls tools without sessions", async () => {
   const init = await route(

@@ -58,6 +58,10 @@ const securityFailure = (log: string) =>
 const timeoutDiagnostic =
   /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
 const pending = (f: CiFailure) => f.outcome === "rerunning" || f.outcome === "rerun_requested";
+/** The approved head can lag a factory push; any other head supersedes the pinned commit. */
+export const headMoved = (head: string, sha: string, approvedSha?: string): boolean =>
+  head !== sha && head !== approvedSha;
+
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
   const lines = logLines(log);
@@ -85,6 +89,7 @@ async function inspectCi(
   current: () => boolean,
   onFailure: () => void,
   consumer: "poller" | "land",
+  approvedSha?: string,
 ): Promise<boolean | "head_moved"> {
   const root = `repos/${pr.repo}`;
   const read = async (path: string, optionalLog = false, fallback = "") => {
@@ -431,7 +436,8 @@ async function inspectCi(
         const remote = z
           .object({ head: z.object({ sha: z.string() }), state: z.string() })
           .parse(await read(`pulls/${pr.url.split("/").at(-1)}`));
-        if (remote.head.sha !== snap.headRefOid) return "head_moved";
+        if (headMoved(remote.head.sha, snap.headRefOid, approvedSha)) return "head_moved";
+        if (remote.head.sha !== snap.headRefOid) return false;
         if (remote.state !== "open" || !current()) continue;
         if (!ready()) return false;
         if (
@@ -473,6 +479,7 @@ export function ciDecision(
   ready: () => boolean,
   current: () => boolean,
   consumer: "poller" | "land" = "poller",
+  approvedSha?: string,
 ): Promise<CiDecision> {
   let active = inspections.get(store);
   if (!active) {
@@ -497,6 +504,7 @@ export function ciDecision(
         failed = true;
       },
       consumer,
+      approvedSha,
     );
     if (complete === "head_moved") return { complete: false, state: "head_moved" };
     const waiting = store.ciFailures(pr.url, snap.headRefOid).some(pending);

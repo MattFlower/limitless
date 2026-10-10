@@ -15,6 +15,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
+import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import {
   createScratch,
@@ -275,8 +276,13 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
 
 /** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
 function editorProfile(spec: AgentSpec): string[] {
-  const { write, protect } = writeRoots(spec.cwd, validateScratch(spec));
-  const entries = [["/", "read"], ...write.map((p) => [p, "write"]), ...protect.map((p) => [p, "read"])];
+  const { write, protect, denyRead = [] } = writeRoots(spec.cwd, validateScratch(spec));
+  const entries = [
+    ["/", "read"],
+    ...write.map((p) => [p, "write"]),
+    ...protect.map((p) => [p, "read"]),
+    ...denyRead.map((p) => [p, "none"]),
+  ];
   const filesystem = entries.map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
   return [
     "-c",
@@ -454,7 +460,7 @@ export class CodexReaderProbe {
     if (spec.signal.aborted) return unverified;
     if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
     // The list is encoded separately so a denied path can never stand in for the CLI path or version.
-    const key = `${spec.mode}\0${path}\0${lookup.version}\0${JSON.stringify([...deny].sort())}`;
+    const key = `${spec.mode}\0${path}\0${lookup.version}\0${JSON.stringify([...deny, ...privateReadPaths()].sort())}`;
     for (;;) {
       const verdict = this.verdicts.get(key);
       if (verdict) return verdict;
@@ -588,7 +594,9 @@ async function sandboxProbe(
     // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
     codexHome = temp(tmp, "limitless-probe-home-");
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
-    negatives = roots(deny).map((root) => canary(temp(root, "limitless-canary-")));
+    negatives = roots(deny.filter((p) => !privateReadPaths().includes(p))).map((root) =>
+      canary(temp(root, "limitless-canary-")),
+    );
     const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
     if (!negatives.length || negatives.some((file) => granted(file.path))) return result(INCONCLUSIVE, null);
     if (editing) {
@@ -627,6 +635,20 @@ async function sandboxProbe(
       signal,
     });
   let last: number | null = null;
+  for (const file of privateReadPaths().filter(existsSync)) {
+    const proc = await run({
+      cmd: [path, "sandbox", ...profile, "--", "/bin/sh", "-c", 'cat "$1" >/dev/null', "sh", file],
+      cwd: spec.cwd,
+      env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
+      timeoutMs: 60_000,
+      signal,
+    });
+    if (signal.aborted || proc.cancelled || proc.signal || proc.exitCode === null)
+      return result(INCONCLUSIVE, proc.exitCode);
+    if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
+    if (proc.exitCode === 0) return result(NOT_ENFORCED, proc.exitCode);
+    if (proc.exitCode !== 1 || !deniedRead(proc.stderr, file)) return result(INCONCLUSIVE, proc.exitCode);
+  }
   for (const file of [...negatives, ...positives]) {
     let proc: ProcResult;
     const token = `written-${randomUUID()}`;

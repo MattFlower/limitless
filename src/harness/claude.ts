@@ -199,7 +199,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     if (spec.mode === "edit") {
       // The outer Seatbelt profile covers Bash and native tools. These permission rules also
       // refuse native edits outside the roots before they reach the filesystem.
-      const { write, protect } = writeRoots(spec.cwd, scratch);
+      const { write, protect, denyRead = [] } = writeRoots(spec.cwd, scratch);
+      denied.push(...denyRead.flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       editTools = write.map((p) => `Edit(/${p}/**)`);
       denied.push(...protect.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
       filesystem = { allowWrite: write, denyWrite: protect, disabled: false };
@@ -208,7 +209,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
       const denyRead = confined?.deny ?? explicit;
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
-      denied.push(...explicit.map((p) => `Read(/${p}/**)`));
+      denied.push(...explicit.flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
       // reader is allowed Read (which also governs Grep and Glob) only there; a bare Grep or Glob
       // allow would search anywhere. dontAsk refuses every other path.

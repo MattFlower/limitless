@@ -2,9 +2,10 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { renderReport } from "../src/pipeline/report.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import {
   approve,
   type Handler,
@@ -42,6 +43,21 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("ordinary verify diagnostics need no owner copy", async () => {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify")
+        return { structured: pass, text: "ordinary verifier diagnostic", error: "ordinary error" };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(ownerDiagnostics(f.store.db, run.id)).toEqual([]);
+  });
   test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
     // These values are observed at runtime, not spelled out by the holdout author.
@@ -92,6 +108,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
           ? {
               text: `ordinary verifier diagnostic; retryIdentifier; private input ${secret}; ${observed}`,
               error: `verifier diagnostic included ${secret}; ${observed}`,
+              events: [
+                {
+                  type: "tool_call",
+                  name: "Bash",
+                  id: "private-tool",
+                  input: { command: `echo ${secret}; ${observed}` },
+                },
+              ],
               structured: {
                 ...pass,
                 criteria: pass.criteria.map((c) =>
@@ -184,6 +208,65 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const firstVerify = f.store.listInvocations(run.id).find((inv) => inv.role === "verify");
     expect(firstVerify?.error).toContain("verifier diagnostic included");
     expect(firstVerify?.error).not.toContain(secret);
+    const diagnostics = ownerDiagnostics(f.store.db, run.id).filter(
+      (d) => d.invocationId === firstVerify?.id,
+    );
+    expect(diagnostics.find((d) => d.kind === "error")?.text).toBe(
+      `verifier diagnostic included ${secret}; ${observed}`,
+    );
+    expect(diagnostics.find((d) => d.kind === "result")?.text).toContain(
+      `private input ${secret}; ${observed}`,
+    );
+    const event = diagnostics.find((d) => d.eventId !== null && d.text.includes("echo"));
+    expect(JSON.parse(event?.text ?? "{}").data.input.command).toBe(`echo ${secret}; ${observed}`);
+    expect(f.store.listEvents(run.id).find((e) => e.id === event?.eventId)?.data).toEqual({
+      id: "private-tool",
+      input: {
+        command:
+          'echo [private detail]; [private detail] [private detail] [private detail] "[private detail]" [private detail] [6 private details withheld]',
+      },
+    });
+  });
+
+  test("withheld holdout failures keep credential-redacted owner diagnostics, never provider reasons", async () => {
+    const marker = "OWNER_HOLDOUT_FAILURE_423";
+    const credential = "owner-diagnostic-credential-423";
+    registerCredential("OWNER_DIAGNOSTIC_TEST", credential);
+    let calls = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      if (role === "holdout") {
+        if (++calls === 1)
+          return {
+            status: "error",
+            error: `${marker} ${credential}`,
+            text: `${marker} result ${credential}`,
+            events: [{ type: "stderr", text: `${marker} event ${credential}` }],
+          };
+        return { structured: holdout };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const diagnosticText = JSON.stringify(ownerDiagnostics(f.store.db, run.id));
+    for (const suffix of ["", " result", " event"])
+      expect(diagnosticText).toContain(`${marker}${suffix} [redacted]`);
+    expect(diagnosticText).not.toContain(credential);
+    expect(f.store.listInvocations(run.id).find((i) => i.role === "holdout")?.error).toBe(
+      "private invocation failed",
+    );
+    for (const record of [
+      f.store.getRunDetail(run.id),
+      f.store.getRunState(run.id),
+      f.store.listEvents(run.id),
+      f.store.db.query("SELECT * FROM provider_state").all(),
+    ])
+      expect(JSON.stringify(record)).not.toContain(marker);
   });
 
   describe("unmet holdout classification", () => {
@@ -621,6 +704,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
 
   test("blocked verification redacts legacy collisions and unexpected ids before stopping", async () => {
     const secret = "privateBlockedToken_731";
+    const credential = "run-error-owner-credential-423";
+    registerCredential("OWNER_RUN_ERROR_TEST", credential);
     const unexpectedId = "H-1 unexpected private words";
     const sources = RunContext.prototype.publicHoldoutSources;
     const legacy = spyOn(RunContext.prototype, "publicHoldoutSources").mockImplementation(async function (
@@ -660,7 +745,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
             criteria: [
               ...pass.criteria.map((c) =>
                 c.id === "H-1"
-                  ? { ...c, status: "blocked", evidence: `EPERM ${secret}`, publicSummary: secret }
+                  ? {
+                      ...c,
+                      status: "blocked",
+                      evidence: `EPERM ${secret} ${credential}`,
+                      publicSummary: secret,
+                    }
                   : c,
               ),
               {
@@ -687,6 +777,16 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(output).not.toContain(text);
       }
       expect(state?.terminalReason).toContain("EPERM");
+      expect(JSON.stringify(ownerDiagnostics(f.store.db, run.id))).not.toContain(credential);
+      expect(ownerDiagnostics(f.store.db, run.id).find((d) => d.kind === "run-error")?.text).toContain(
+        "[redacted]",
+      );
+      expect(ownerDiagnostics(f.store.db, run.id).find((d) => d.kind === "run-error")?.text).toContain(
+        secret,
+      );
+      expect(ownerDiagnostics(f.store.db, run.id).find((d) => d.kind === "run-error")?.text).toContain(
+        "unexpected private evidence prose",
+      );
     } finally {
       legacy.mockRestore();
     }

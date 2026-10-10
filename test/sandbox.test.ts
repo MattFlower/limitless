@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Store } from "../src/db/store.ts";
 import {
   ConfinementError,
   confinementScope,
@@ -55,6 +56,30 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const common = () => join(cache, ".git");
 const privateDir = () => join(common(), "worktrees", "work");
+
+test.skipIf(seatbeltSkip !== null)(
+  `private database reads are denied while checkout reads work ${seatbeltSkip ?? ""}`,
+  async () => {
+    const store = new Store(join(home, "limitless.db"));
+    try {
+      for (const file of ["limitless.db", "limitless.db-wal", "limitless.db-shm"]) {
+        expect(existsSync(join(home, file))).toBe(true);
+        const result = await runConfined({
+          command: `cat "${join(home, file)}" >/dev/null`,
+          cwd: work,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+      }
+      const allowed = await runConfined({ command: "cat a.ts", cwd: work, env: agentEnv() });
+      expect(allowed.exitCode).toBe(0);
+      expect(allowed.stdout).toContain("test('ok'");
+    } finally {
+      store.close();
+    }
+  },
+);
 
 /** Each target is written by a child of a child; the exit status says whether the write landed. */
 async function attempt(target: string): Promise<boolean> {
