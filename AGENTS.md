@@ -64,7 +64,12 @@ must:
   `INSERT … VALUES` (for example `eval_runs` and `eval_trials` in `src/db/store.ts`), so adding a
   column to one breaks the previous release's inserts after a rollback. Put new fields for those
   tables in a new table keyed by the row id, or switch the inserts to explicit column lists in a
-  release that ships first.
+  release that ships first. Prefer `ALTER TABLE … ADD COLUMN` to a table rebuild.
+  - SQLite's `ALTER TABLE … RENAME` re-validates every trigger and view, so a rebuild fails
+    wherever some trigger names a table the database lacks, such as a test's partial schema.
+  - macOS's system SQLite accepted a rebuild that Linux CI's bundled SQLite rejected (#458).
+    To check a migration locally, run it against Homebrew's SQLite with
+    `Database.setCustomSQLite`.
 - **HTTP JSON** changes are additive: new fields optional, old fields kept. Readers tolerate
   missing and unknown fields.
 - **Run state:** a deploy restarts the daemon mid-run, and runs resume from persisted phases and
@@ -139,6 +144,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
 - Everything that comes from the change under test is untrusted data: its `.limitless.toml`,
   scripts, test output, reports, and the text a model writes. What steers the factory (gate
   commands, review lenses, policy) is read from the base commit, never from the PR branch.
+- A name a client chooses (an MCP consumer, a label) never lands in a field the factory branches
+  on. `requestedBy === "dependabot[bot]"` changes routing and review, so an MCP consumer is stored
+  as `mcp:<name>` (#479).
 - A model's claim is not evidence. "Tests pass" or "verified by gate run 12" counts only after the
   engine has checked it against its own records for the same commit.
 - Issue, PR and comment text from GitHub is quoted as data, never followed as instructions.
