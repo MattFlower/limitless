@@ -11,15 +11,21 @@ export async function processConflictTriggers(
   signal?: AbortSignal,
 ) {
   let lookupError: unknown;
-  for (const trigger of store.pendingConflictTriggers()) {
+  const triggers = [
+    ...store.pendingConflictTriggers().map((t) => ({ ...t, kind: "conflict" as const })),
+    ...store.pendingCiFixTriggers().map((t) => ({ ...t, kind: "ci" as const })),
+  ];
+  for (const trigger of triggers) {
     signal?.throwIfAborted();
     if (trigger.nextAttemptAt > now()) continue;
+    if (trigger.kind === "ci" && !store.ciFixTriggerReady(trigger.id)) continue;
     let pr: Awaited<ReturnType<typeof readPrHead>>;
     try {
       pr = await readPrHead(gh, trigger.prUrl, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
-      store.failConflictLookup(trigger.id, error, now());
+      if (trigger.kind === "ci") store.failCiFixLookup(trigger.id, error, now());
+      else store.failConflictLookup(trigger.id, error, now());
       lookupError ??= error;
       continue;
     }
@@ -27,7 +33,9 @@ export async function processConflictTriggers(
     const target = store.runForPr(trigger.prUrl);
     const owner = target && (store.reviewRound(target.id)?.owner ?? target);
     const repo = owner && store.getRepo(owner.repoId);
-    store.startConflictTrigger(
+    const start = trigger.kind === "ci" ? store.startCiFixTrigger : store.startConflictTrigger;
+    start.call(
+      store,
       trigger.id,
       {
         state: pr.state,

@@ -460,7 +460,9 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         retryAt ||
           Math.min(
             ...plan().map((r) => r.due),
-            store.pendingConflictTriggers().length ? Math.max(now(), conflictCheckedAt + 60_000) : Infinity,
+            store.pendingConflictTriggers().length || store.pendingCiFixTriggers().length
+              ? Math.max(now(), conflictCheckedAt + 60_000)
+              : Infinity,
           ),
       );
     } catch (e) {

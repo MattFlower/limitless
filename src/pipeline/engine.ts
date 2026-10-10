@@ -320,7 +320,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !terminationBlocked &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
-      !ctx.state.pendingRebaseSha
+      !ctx.state.pendingRebaseSha &&
+      !(reviewRound(ctx)?.kind === "ci" && ctx.run.headSha === reviewRound(ctx)?.reviewedSha)
     ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
       try {
@@ -373,7 +374,7 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
 /** A review round's record and the grant it alone gives to push onto its original run's PR branch. */
 function reviewRound(ctx: RunContext) {
   const review = ctx.store.reviewRound(ctx.run.id);
-  if (review && review.kind !== "review" && review.kind !== "conflict")
+  if (review && review.kind !== "review" && review.kind !== "conflict" && review.kind !== "ci")
     throw new Error(`Unsupported review round kind: ${redactCredentials(review.kind)}`);
   return (
     review && { ...review, grant: { owner: review.owner, prUrl: review.prUrl, head: review.reviewedSha } }
@@ -1109,6 +1110,15 @@ async function oneRound(
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  const ciRound = reviewRound(ctx);
+  if (ciRound?.kind === "ci" && (await headSha(cwd)) === ciRound.reviewedSha) {
+    ctx.state.needsHumanReason =
+      redactCredentials(ctx.state.implementerReport ?? "")
+        .trim()
+        .slice(0, 2000) || "CI fix round made no change";
+    await ctx.save("needs-human");
+    throw new NeedsHumanError(ctx.state.needsHumanReason);
+  }
   if (resolution) {
     if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
       throw new Error("Missing expected merge state for resolution checks");
@@ -1955,7 +1965,7 @@ async function deliverReviewRound(
       stored();
     } else {
       if (review.kind === "conflict" && pr.isDraft) throw new Error("the PR is draft");
-      if (review.kind === "conflict" && pr.autoMerge)
+      if ((review.kind === "conflict" || review.kind === "ci") && pr.autoMerge)
         await gh(["pr", "merge", prUrl, "--disable-auto"], ctx.signal);
       const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
       const pushed = remote === head;
@@ -1981,13 +1991,17 @@ async function deliverReviewRound(
       stored();
       ctx.store.markRoundDelivered(ctx.run.id, head);
     }
-    if (review.kind === "conflict") {
-      const marker = `<!-- limitless-conflict-round:${ctx.run.id} -->`;
+    if (review.kind === "conflict" || review.kind === "ci") {
+      const marker = `<!-- limitless-${review.kind === "ci" ? "ci" : "conflict"}-round:${ctx.run.id} -->`;
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
         .comments as { body?: string }[] | undefined;
       if (!comments?.some((comment) => comment.body?.includes(marker))) {
+        const failure = ctx.store.ciFixFailure(ctx.run.id);
+        if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
         const text = redactCredentials(
-          `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
+          review.kind === "ci"
+            ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${JSON.stringify(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
+            : `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
         );
         await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
         await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);

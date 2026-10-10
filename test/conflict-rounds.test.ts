@@ -521,7 +521,7 @@ test("the migration preserves existing review rows and previous-release inserts"
   const migrations = join(root, "old-migrations");
   mkdirSync(migrations);
   for (const name of readdirSync(MIGRATION_DIR)) {
-    if (name.endsWith(".sql") && !name.endsWith("-conflict-rounds.sql"))
+    if (name.endsWith(".sql") && name < "20261010T044322-conflict-rounds.sql")
       writeFileSync(join(migrations, name), readFileSync(join(MIGRATION_DIR, name)));
   }
   const path = join(root, "previous.sqlite");
@@ -744,7 +744,6 @@ test("delivery keeps a new-head approval recorded after an uncheckpointed push",
 
 test("delivery changes only its trigger's land entry with the exact conflict reason", async () => {
   await advanceBase();
-  const entry = await blockedLand();
   const second = factory.store.createLandEntry({
     runId: owner.id,
     repo: owner.repoSlug,
@@ -754,6 +753,7 @@ test("delivery changes only its trigger's land entry with the exact conflict rea
     approvedSha: await remoteHead(),
   });
   factory.store.updateLandEntry(second.id, { state: "blocked", reason: "conflicts with main" });
+  const entry = await blockedLand();
   const id = triggers()[0]?.run_id as string;
   expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("succeeded");
   expect(factory.store.getLandEntry(entry.id)?.reason).toBe(
@@ -1027,9 +1027,9 @@ test("shared numbering survives previous-release inserts while the review cap ig
 
 test("unknown round kinds remain readable, block in-flight rounds, and count toward neither cap", async () => {
   const id = await trigger();
-  factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(id);
-  expect(factory.store.reviewRound(id)?.kind).toBe("ci");
-  expect(factory.store.reviewRounds(url)).toMatchObject([{ kind: "ci" }]);
+  factory.store.db.query("UPDATE review_rounds SET kind = 'future' WHERE run_id = ?").run(id);
+  expect(factory.store.reviewRound(id)?.kind).toBe("future");
+  expect(factory.store.reviewRounds(url)).toMatchObject([{ kind: "future" }]);
   const review = () =>
     submitReview(factory, owner.id, {
       verdict: "changes",
@@ -1043,11 +1043,16 @@ test("unknown round kinds remain readable, block in-flight rounds, and count tow
   // Three terminal unknown rows must not consume the daily conflict cap.
   for (let i = 0; i < 2; i++) {
     const next = await trigger();
-    factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(next);
+    factory.store.db.query("UPDATE review_rounds SET kind = 'future' WHERE run_id = ?").run(next);
     factory.store.updateRun(next, { status: "succeeded" });
   }
   const conflict = await trigger();
-  expect(factory.store.reviewRounds(url).map((r) => r.kind)).toEqual(["ci", "ci", "ci", "conflict"]);
+  expect(factory.store.reviewRounds(url).map((r) => r.kind)).toEqual([
+    "future",
+    "future",
+    "future",
+    "conflict",
+  ]);
   factory.store.updateRun(conflict, { status: "succeeded" });
   await expect(review()).resolves.toHaveProperty("round");
   expect(factory.store.reviewRounds(url).at(-1)).toMatchObject({ kind: "review", round: 5 });
@@ -1058,11 +1063,11 @@ test.each(["prepare", "deliver"] as const)(
   async (phase) => {
     const head = await remoteHead();
     const id = await trigger();
-    factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(id);
+    factory.store.db.query("UPDATE review_rounds SET kind = 'future' WHERE run_id = ?").run(id);
     if (phase === "deliver") factory.store.setRunState(id, { phase });
     const push = spyOn(repos, "pushExistingBranch");
     expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("failed");
-    expect(factory.store.getRun(id)?.error).toBe("Unsupported review round kind: ci");
+    expect(factory.store.getRun(id)?.error).toBe("Unsupported review round kind: future");
     expect(push).not.toHaveBeenCalled();
     expect(await remoteHead()).toBe(head);
     expect(implementations).toBe(0);

@@ -191,6 +191,18 @@ export function pollerHarness(repos = ["o/r"]) {
     start(seconds?: number, ciReruns?: boolean) {
       stop = startGitHubPoller(h.store, {
         client: gh.client,
+        gh: async (args) => {
+          const node = [...gh.nodes.values()].find((n) => n.url === args[2]);
+          if (!node) throw new Error("Unknown fake PR");
+          const repo = node.url.split("/").slice(3, 5);
+          return JSON.stringify({
+            ...node,
+            headRefName: "limitless/test",
+            isCrossRepository: false,
+            headRepository: { name: repo[1] },
+            headRepositoryOwner: { login: repo[0] },
+          });
+        },
         seconds,
         ciReruns,
         log: (m) => logs.push(m),

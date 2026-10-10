@@ -60,6 +60,13 @@ test("MCP land resolves a review round's base through its owning run", async () 
   );
   if (!("run" in result)) throw new Error("round refused");
   store.recordApproval(owner.id, prUrl, sha, "orchestrator");
+  for (const args of [{ run: result.run.id }, { run: result.run.id, sha }]) {
+    const response = await call("land", args);
+    expect(response.isError).toBe(true);
+    expect(() => resultValue(response)).toThrow(/review round.*in flight/i);
+  }
+  expect(store.listLandEntries()).toHaveLength(0);
+  store.updateRun(result.run.id, { status: "succeeded" });
   expect(resultValue(await call("land", { run: result.run.id }))).toMatchObject({
     runId: result.run.id,
     baseBranch: "main",
