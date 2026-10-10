@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -44,6 +44,7 @@ import {
   CommandError,
   type ProcOptions,
   type ProcResult,
+  processBirth,
   processInspection,
   runProcess,
   sh,
@@ -186,13 +187,36 @@ function factory(
 }
 // Confined gates and land checks run the restart scenarios about 3x slower than an unconfined run
 // (13 s vs 4.3 s measured on 2026-10-09), so a 10 s barrier failed land checks with nothing wrong.
-async function wait(check: () => boolean) {
+async function wait(check: () => boolean | Promise<boolean>) {
   const end = Date.now() + 25_000;
-  while (!check()) {
+  while (!(await check())) {
     if (Date.now() > end) throw new Error("barrier timed out");
     await Bun.sleep(5);
   }
 }
+async function retainPids(pids: Map<number, string>, values: number[], readBirth = processBirth) {
+  for (const pid of values) {
+    const birth = await readBirth(pid);
+    if (birth !== null) pids.set(pid, birth);
+  }
+}
+
+async function killRetainedPids(
+  pids: Map<number, string>,
+  readBirth = processBirth,
+  signal = (pid: number) => process.kill(pid, "SIGKILL"),
+) {
+  for (const [pid, birth] of pids) {
+    try {
+      if ((await readBirth(pid)) === birth) signal(pid);
+    } catch {
+      // An unconfirmed identity must never be signalled.
+    } finally {
+      pids.delete(pid);
+    }
+  }
+}
+
 async function run(f: Factory) {
   const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
@@ -595,6 +619,7 @@ exec '${realGit}' "$@"
       expect(result.cancelled).toBe(true);
       expect(writerPid).toBeGreaterThan(0);
       expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      writerPid = undefined;
       return {
         status: "stuck",
         error: `repeated shell call ${invocationSecret}`,
@@ -1074,6 +1099,39 @@ test("startup finalizes abandoned running rows before retrying the stage", async
   history(next, r.id);
 });
 
+test("both cancellation failure paths reject recycled PIDs and stop an identical descendant", async () => {
+  const pids = new Map<number, string>();
+  const births = new Map<number, string | null>([
+    [41, "original-shell"],
+    [42, "original-sleep"],
+    [43, "original-gone"],
+    [44, "still-owned"],
+  ]);
+  const readBirth = async (pid: number) => births.get(pid) ?? null;
+  await retainPids(pids, [41, 42, 43, 44], readBirth);
+  const signals: number[] = [];
+  const failure = new Error("injected settlement failure");
+  const settle = async () => {
+    births.set(41, "recycled-shell");
+    births.set(43, null);
+    births.set(42, "recycled-sleep");
+    throw failure;
+  };
+  const cancellation = async () => {
+    try {
+      await settle();
+    } finally {
+      await killRetainedPids(pids, readBirth, (pid) => {
+        signals.push(pid);
+        return true;
+      });
+    }
+  };
+  await expect(cancellation()).rejects.toBe(failure);
+  expect(signals).toEqual([44]);
+  expect(pids.size).toBe(0);
+});
+
 for (const kind of ["harness", "gate", "preview"] as const)
   test(`cancel active ${kind} kills its process group and retains worktree`, async () => {
     const pidFile = join(root, "pids");
@@ -1110,28 +1168,20 @@ for (const kind of ["harness", "gate", "preview"] as const)
     });
     const id = await run(f);
     await wait(() => existsSync(pidFile));
-    const pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
+    const pids = new Map<number, string>();
     try {
+      await retainPids(pids, readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
       f.cancelRun(id);
       await settled(f, id);
-      for (const pid of pids)
-        await wait(() => {
-          try {
-            process.kill(pid, 0);
-            return false;
-          } catch {
-            return true;
-          }
-        });
+      for (const pid of pids.keys()) {
+        await wait(async () => (await processBirth(pid)) !== pids.get(pid));
+        pids.delete(pid);
+      }
       expect(f.store.getRun(id)?.status).toBe("cancelled");
       expect(existsSync(f.store.getRunState<RunState>(id)?.worktreePath ?? "")).toBe(true);
       history(f, id);
     } finally {
-      for (const pid of pids) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {}
-      }
+      await killRetainedPids(pids);
     }
   });
 
@@ -1216,7 +1266,7 @@ for (const operation of [
     const pidFile = join(root, "delivery-pids");
     const calls = join(root, "delivery-calls");
     const restore = fakeGh(pr);
-    let pids: number[] = [];
+    const pids = new Map<number, string>();
     try {
       const pattern = {
         fetch: "git fetch origin +refs/heads/*",
@@ -1309,21 +1359,16 @@ exec '${path}-delegate' "$@"
         f = await reopen(f);
       }
       await wait(() => existsSync(pidFile));
-      pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
-      expect(pids).toHaveLength(2);
+      await retainPids(pids, readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
+      expect(pids.size).toBe(2);
       expect(f.store.getRun(id)).toMatchObject({ status: "running", stage: "deliver" });
       const beforeCancel = readFileSync(calls, "utf8");
       f.cancelRun(id);
       await settled(f, id);
-      for (const pid of pids)
-        await wait(() => {
-          try {
-            process.kill(pid, 0);
-            return false;
-          } catch {
-            return true;
-          }
-        });
+      for (const pid of pids.keys()) {
+        await wait(async () => (await processBirth(pid)) !== pids.get(pid));
+        pids.delete(pid);
+      }
       expect(f.store.getRun(id)?.status).toBe("cancelled");
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
       expect(existsSync(cwd)).toBe(true);
@@ -1341,11 +1386,7 @@ exec '${path}-delegate' "$@"
       expect(readFileSync(calls, "utf8")).toBe(beforeCancel);
       history(next, id);
     } finally {
-      for (const pid of pids) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {}
-      }
+      await killRetainedPids(pids);
       await restore();
     }
   });
@@ -1610,12 +1651,26 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
   );
   const child = Bun.spawn([process.execPath, worker], { stdout: "ignore", stderr: "pipe" });
   let gatePid: number | undefined;
+  const groupSignals: number[] = [];
+  const kill = process.kill.bind(process);
+  const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid < 0 && signal === "SIGKILL") {
+      groupSignals.push(pid);
+      // Record a stale repeat without risking a signal to a recycled group.
+      if (groupSignals.filter((target) => target === pid).length > 1) return true;
+    }
+    return kill(pid, signal);
+  });
   try {
     await wait(() => existsSync(entered));
     gatePid = Number(readFileSync(entered, "utf8"));
     child.kill("SIGKILL");
     await child.exited;
-    process.kill(-gatePid, "SIGKILL");
+    try {
+      process.kill(-gatePid, "SIGKILL");
+    } finally {
+      gatePid = undefined;
+    }
     const stopped = factory();
     const state = stopped.store.getRunState<RunState>(r.id);
     const cwd = state?.worktreePath ?? "";
@@ -1663,7 +1718,9 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
         process.kill(-gatePid, "SIGKILL");
       } catch {}
     }
+    killSpy.mockRestore();
   }
+  expect(groupSignals).toHaveLength(1);
 });
 
 test("unconfigured seams leave a successful run and release gate capacity", async () => {
