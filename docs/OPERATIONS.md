@@ -43,8 +43,11 @@ Only requested tunnel and mtplx agents migrate; they restart with rollback witho
    - checks out `origin/main` in `~/.limitless/app`, runs `bun install --frozen-lockfile` and
      the checks there (`bun run lint`, `bun run typecheck`, and `bun test` run directly, so
      `PATH` matches the daemon's) before draining, even when the checkout is already at that
-     commit — **a failing check aborts the deploy and keeps the old daemon running**;
-   - restarts the daemon via launchd and waits for `/api/health`;
+     target commit — **a failing check aborts the deploy and keeps the old daemon running**.
+     If the daemon already reports that SHA, it returns `already deployed <sha>` without checks
+     or restart unless `--smoke` requests checks and smoke;
+   - drains new scheduling, waits up to 2700 seconds for active runs (or `--max-wait`), then
+     restarts via launchd and waits for `/api/health`; `--now` skips the drain wait;
    - **rolls back** to the previous commit and restarts again if the new version doesn't come up.
    Add `--smoke` (with or without an explicit ref) to run live CLI contract checks in the release
    checkout after the checks and before restart (`bun scripts/smoke.ts`, run directly for the same
@@ -59,8 +62,10 @@ or `[review.rosters]`. Leave both unset until the release that added them is kno
 to an older release fails at startup until they are removed.
 
 Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
-An interrupted deploy logs `interrupted, rolling back...` and attempts to restore the previous
-checkout and resume the scheduler. If the process was killed during rollback, inspect
+An interrupted deploy logs `interrupted, rolling back...`. Before restart begins, it attempts
+to restore the previous checkout and resume the scheduler. After restart begins, an interrupt
+leaves the new version starting and exits; ordinary startup/health failures still attempt rollback.
+If the process was killed during rollback, inspect
 `limitless service status` and the release checkout before retrying `limitless deploy`. If the
 daemon has no boot SHA while the checkout already matches the target, restart it with
 `launchctl kickstart -k gui/$UID/dev.limitless.daemon` (or `limitless service install`),
@@ -144,7 +149,7 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 |---|---|---|
 | A provider shows `down` | model server not reachable | check the server's log above; the daemon re-probes every minute |
 | A model shows "model rejected" in a run | the provider refused that model (plan, CLI version) | it's blocked for 24h automatically; check the CLI version in the daemon log |
-| Runs stuck in `queued` | concurrency limit, or no provider available | `limitless providers`; UI Models page shows why candidates were skipped |
+| Runs stuck in `queued` | run slots full, or scheduler draining | Inspect active runs and `/api/health`; resume an interrupted drain. No provider capacity ends a run `needs_human`, rather than leaving it queued. |
 | `exhausted` on a subscription | reserve reached (Claude 80% of 5h, Codex per `config.toml`) | wait for the window reset shown in the UI, or raise the reserve |
 | Deploy says "deploy gate failed" | a check failed on `main` in the release checkout | fix `main`; production keeps running the previous commit. If `bun run check` passes elsewhere, compare `which -a codex claude` with the daemon's `PATH`: a CLI in a parent directory's `node_modules/.bin` is picked up only by `bun run` scripts |
 | Run failed with a git error in `prepare` | repo cache problem | delete `~/.limitless/repos/<owner>__<name>.git`; it is re-cloned on the next run |
@@ -164,7 +169,7 @@ limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
 limitless eval run review --systems panel.json --follow     # mode "panel": parallel finders, prompt "standard" | "adversarial" | "careful", plus verifier: {target}
 limitless eval run review --systems roster.json --follow    # {name, roster: "standard", targets: [one per roster finder, then per lens], lenses?, verifier: {target}, implementerReport}
-limitless eval run verify --models openrouter/gpt-6-luna --follow
+limitless eval run verify --models openrouter/gpt-6-luna --follow # requires a curated verify dataset
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
 limitless eval regrade <eval-id>   # review: recompute grades from stored outputs, no model calls
@@ -245,7 +250,8 @@ terminal state and prints a final report. The Evals UI lists runs, displays per-
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 
 Review/verify dataset contracts and formulas are detailed in [EVALS.md](EVALS.md#implemented-repository-reading-evaluations).
-The real verify dataset is separately curated; the three-case test fixture is never a fallback.
+There is no committed verify dataset yet; supply a separately curated one before running verify
+evals. The three-case test fixture is never a fallback.
 Repository-reading cache keys include role, repository identity, base/head pins and seed content;
 same-stat code changes invalidate them, while seed timestamps and temporary paths do not.
 Review reports pooled blocking recall (Wilson 95%; only round-1 blocking findings catch a defect),
@@ -287,7 +293,11 @@ daemon's `[review] implementer_report`.
 The [policy configuration and formulas](EVALS.md#policy-generation-and-review) specify inclusive Wilson
 lower-bound floors on pass rate and blocking recall, inclusive Wilson upper-bound ceilings on risk under-call,
 clean false-block and false-accept, strict paired non-inferiority, optional origin exclusions, and
-subscription_weight (default 0.25).
+subscription_weight (default 0.25). Review clean false-block and verify false-accept ceilings
+default to 0.50 and 0.25, using Wilson 95% upper bounds rather than observed rates.
+After cost-ordering eligible candidates, a nonempty chain adds the cheapest candidate from each
+provider not yet covered that clears every floor/ceiling and fails only non-inferiority. These
+availability fallbacks are identified in the evidence; they never bypass missing evidence or origins.
 Cost/case averages attempts over repetitions; local is zero, metered is recorded dollars, subscriptions
 use weighted API-equivalent dollars, and cache estimates use original provenance without increasing
 recorded spend. Prediction and latency coverage and unavailable values are disclosed.

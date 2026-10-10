@@ -9,7 +9,9 @@ limitless run "Add a --json flag to the export command" --repo MattFlower/some-r
 ```
 
 New to Limitless? Start with the **[user guide](docs/GUIDE.md)**: install, first run, triggers,
-reading a run, routing, costs, operations and troubleshooting.
+reading a run, routing, costs, operations and troubleshooting. Agents can follow
+**[Working with Limitless as an agent](docs/GUIDE.md#working-with-limitless-as-an-agent)**
+from request through review to a landed PR.
 
 ## How a run works
 
@@ -85,12 +87,15 @@ See [local operations](docs/OPERATIONS.md#local-models) for eval examples.
 Everything is optional. Files live in `~/.config/limitless/`:
 
 - `secrets.env` — `OMLX_API_KEY`, `OPENROUTER_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID`,
-  `GITHUB_WEBHOOK_SECRET` (chmod 600).
+  `GITHUB_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` (chmod 600).
 - `config.toml`:
 
 ```toml
 [server]
 port = 7400
+host = "127.0.0.1"
+ui_url = "http://localhost:7400"  # run links and an allowed browser origin
+# public_url = "https://limitless.example.com" # hostname for service install --tunnel
 
 [limits]
 max_concurrent_runs = 3
@@ -114,12 +119,20 @@ debug_event_days = 14
 [reserves]            # stop using a subscription at this fraction of its window
 claude_five_hour = 0.80
 claude_seven_day = 0.85
+codex_five_hour = 0.90
 codex_weekly = 0.90   # keeps 10% of ChatGPT usage free for you
 
 # Optional: reserve for an additional subscription provider/window.
 # Unspecified windows use 1.0 (the reported hard quota).
 [reserves.windows.my_provider]
 daily = 0.80
+
+[routing]
+prefer = []                 # provider preference among interchangeable models
+dependabot = "free_first"    # free_first | policy
+wait_budget_s = { triage = 20, summarize = 20, chat = 20 }
+# Other roles wait without limit; 0 falls through, "unbounded" removes a limit.
+# exclude_origins = ["CN"]   # optional; omit for no origin filter
 
 [owners]
 github = "MattFlower"
@@ -223,7 +236,9 @@ Use absolute paths for local repositories; paths resolve on the daemon machine.
 `limitless mcp` is a stdio proxy to the daemon, with stdout reserved for MCP protocol messages.
 `LIMITLESS_URL` selects the daemon; otherwise it uses `http://127.0.0.1:${LIMITLESS_PORT ?? 7400}`.
 It never starts another factory. Disconnecting leaves runs running. Connection failures after a
-mutation can have uncertain outcomes: inspect existing runs before retrying.
+mutation can have uncertain outcomes: inspect existing runs before retrying. The
+[agent workflow](docs/GUIDE.md#working-with-limitless-as-an-agent) covers inbox acknowledgements,
+review rounds, exact-head landing and recovery.
 
 The daemon also exposes stateless **Streamable HTTP** at `http://127.0.0.1:7400/mcp`. It supports
 initialization, discovery and tool calls via POST, without sessions or subscriptions (GET and DELETE
