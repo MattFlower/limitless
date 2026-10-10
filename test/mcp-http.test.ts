@@ -53,8 +53,8 @@ test("mounted MCP exposes only the protected change view", async () => {
     available: true,
     headSha: c.headSha,
     baseSha: c.baseSha,
-    diff: { text: "[withheld: holdout text]" },
-    reports: [{ text: "[withheld: holdout text]" }],
+    diff: { text: expect.stringContaining(" hello\n+[private detail]\n") },
+    reports: [{ text: "[private detail] [1 private details withheld]" }],
   });
 });
 

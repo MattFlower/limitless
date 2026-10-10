@@ -1,10 +1,11 @@
+import { constants } from "node:os";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
-import { privateHoldoutDetails } from "../pipeline/prompts.ts";
-import { type Holdout, HoldoutSchema } from "../pipeline/schemas.ts";
+import { holdoutBoundaryPattern, privateHoldoutDetails } from "../pipeline/prompts.ts";
+import { HoldoutSchema, renderSpec, SpecSchema } from "../pipeline/schemas.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 
 export const commitSha = z.string().regex(/^[a-fA-F0-9]{40}$/);
@@ -29,6 +30,23 @@ export const ChangeQuerySchema = z
 const PATCH_CAP = 16_000;
 const REPORT_CAP = 4_000;
 const FILES_CAP = 50;
+const DISTINCTIVE_LENGTH = 12;
+// Platform error names are public diagnostics, as in verifier feedback.
+const errnoNames = Object.keys(constants.errno);
+
+/**
+ * Header lines (whose only free text is the already-vetted path) and hunk ranges are Git's
+ * own structure; holdout redaction applies to code lines and hunk context only.
+ */
+function patchStructure() {
+  let header = true;
+  return (line: string) => {
+    if (line.startsWith("diff --git ")) header = true;
+    const hunk = /^@@ [^@]* @@/.exec(line);
+    if (hunk) header = false;
+    return header ? line.length : (hunk?.[0].length ?? 0);
+  };
+}
 
 /** Saved observations only: no fetch, working-tree bytes, arbitrary paths, or artifact reads. */
 export async function getChange(factory: Factory, input: unknown, signal?: AbortSignal) {
@@ -62,22 +80,54 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   if (!repo) return { available: false, reason: "Repository unavailable." };
   const rounds = owner.prUrl ? store.reviewRounds(owner.prUrl) : [];
   // Holdouts from earlier rounds remain private even after a later round delivers.
-  const holdouts: Holdout[] = [];
+  const details = new Set<string>();
   for (const id of [owner.id, ...rounds.map((round) => round.runId)]) {
-    const state = z.object({ holdout: HoldoutSchema.optional() }).safeParse(store.getRunState(id) ?? {});
+    const state = z
+      .object({ holdout: HoldoutSchema.optional(), spec: SpecSchema.nullish().catch(null) })
+      .safeParse(store.getRunState(id) ?? {});
     if (!state.success) return { available: false, reason: "Holdout policy unavailable; content withheld." };
-    if (state.data.holdout) holdouts.push(state.data.holdout);
+    const { holdout, spec } = state.data;
+    if (!holdout) continue;
+    // Same exemption as verifier feedback: what the run's request and spec already state is public.
+    const publicSources = [store.getRun(id)?.prompt ?? "", spec ? renderSpec(spec) : "", ...errnoNames].join(
+      "\n",
+    );
+    for (const detail of privateHoldoutDetails(holdout, publicSources)) details.add(detail);
   }
-  const holdoutEntries = holdouts
-    .flatMap((holdout) => [
-      ...privateHoldoutDetails(holdout),
-      ...holdout.scenarios.flatMap((s) => [s.id, s.description, s.steps, s.expected]),
-    ])
+  const pattern = details.size
+    ? new RegExp(
+        [...details]
+          .sort((a, b) => b.length - a.length)
+          .map(holdoutBoundaryPattern)
+          .join("|"),
+        "giu",
+      )
+    : null;
+  // Long, distinctive details are also caught when escaped or encoded; short literals are not.
+  const distinctive = [...details]
+    .filter((detail) => detail.length >= DISTINCTIVE_LENGTH)
     .map((value) => ({ value, entry: 0 }));
-  const protect = (value: string) => {
-    if (privateMatches(value, holdoutEntries).length) return "[withheld: holdout text]";
-    return privacy(value);
+  const holdoutRedact = (value: string, keep?: (line: string) => number) => {
+    if (!pattern) return value;
+    let removed = 0;
+    const replace = (text: string) =>
+      text.replace(pattern, () => {
+        removed++;
+        return "[private detail]";
+      });
+    const safe = keep
+      ? value
+          .split("\n")
+          .map((line) => {
+            const kept = keep(line);
+            return line.slice(0, kept) + replace(line.slice(kept));
+          })
+          .join("\n")
+      : replace(value);
+    if (privateMatches(safe, distinctive).length) return "[withheld: holdout text]";
+    return removed ? `${safe}${keep ? "\n" : " "}[${removed} private details withheld]` : safe;
   };
+  const protect = (value: string, keep?: (line: string) => number) => privacy(holdoutRedact(value, keep));
   const safe = (value: string) => protect(value) === value;
   const cwd = cachePath(factory.cfg.paths, repo);
   const git = async (args: string[]) =>
@@ -119,6 +169,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
               "--",
               `:(literal)${selected.path}`,
             ]),
+            patchStructure(),
           )
         : "";
     const pin = { run: owner.id, headSha, baseSha };

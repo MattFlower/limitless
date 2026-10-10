@@ -217,7 +217,7 @@ export function formatReviewFeedback(findings: Review["findings"], panel = false
     .join("\n")}`;
 }
 
-const holdoutBoundaryPattern = (detail: string) => {
+export const holdoutBoundaryPattern = (detail: string) => {
   const escaped = detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
 };

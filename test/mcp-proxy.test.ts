@@ -87,6 +87,92 @@ test("HTTP-backed change pages match direct MCP for the pinned code and report",
   }
 });
 
+test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and report intact", async () => {
+  const c = await changeFixture(f, {
+    "hello.txt": "hello\nnew greeting\n",
+    "src/count.ts": "export const limit = 3;\n",
+  });
+  const report = "AC-1 met: src/count.ts sets the limit to 3 (verified at 100%).";
+  f.factory.store.setRunState(c.run.id, {
+    spec: {
+      summary: "Add src/count.ts with a word limit of 3.",
+      assumptions: [],
+      requirements: ["Export the limit from src/count.ts."],
+      acceptance_criteria: [{ id: "AC-1", criterion: "The limit is 3.", how_to_verify: "bun test" }],
+      out_of_scope: [],
+      blocking_questions: [],
+    },
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "Count words in src/count.ts with 2 inputs and a limit of 3.",
+          steps: "Run wc --verbose on fixtures/words.txt with maxWords set to 42.",
+          expected: "Prints 2 lines and exits 0.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", report);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const read = async (file: number) =>
+        resultValue<ChangePage>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, file },
+          }),
+        );
+      const first = await read(0);
+      expect(first.files.map((file) => [file.path, file.additions, file.deletions])).toEqual([
+        ["hello.txt", 1, 0],
+        ["src/count.ts", 1, 0],
+      ]);
+      // "2" is a private holdout literal, yet Git's hunk range and the code stay readable.
+      expect(first.diff.text).toContain("@@ -1 +1,2 @@\n hello\n+new greeting\n");
+      expect((await read(1)).diff.text).toContain("+export const limit = 3;\n");
+      expect(first.reports[0]?.text).toBe(report);
+      for (const text of [first.diff.text, (await read(1)).diff.text, first.reports[0]?.text])
+        expect(text).not.toMatch(/private detail|withheld/);
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("holdout literals inside code are redacted at word boundaries, not by withholding the patch", async () => {
+  const c = await changeFixture(f, { "hello.txt": "hello\nconst maxWords = 42;\nconst total = 420;\n" });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "Use maxWords of 42.",
+          steps: "Run it.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      expect(page.diff.text).toContain("@@ -1 +1,3 @@\n hello\n");
+      expect(page.diff.text).toContain("+const [private detail] = [private detail];\n+const total = 420;\n");
+      expect(page.diff.text).toEndWith("[2 private details withheld]");
+      expect(page.diff.text).not.toMatch(/maxWords|\b42\b/);
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
 test("change view withholds private paths, complete patches, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";
   const c = await changeFixture(f, {
@@ -177,6 +263,17 @@ test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [in
         });
         const output = JSON.stringify(result);
         for (const secret of [hidden, ...privacyTexts]) expect(output).not.toContain(secret);
+        if (report === hidden) {
+          // Holdout text is redacted in the complete report, so later pages carry the placeholder.
+          const tail = resultValue<ChangePage>(
+            await conn.client.callTool({
+              name: "limitless_get_change",
+              arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, reportOffset: 8000 },
+            }),
+          );
+          expect(tail.reports[0]?.text).toEndWith("safe line\n[private detail] [1 private details withheld]");
+          continue;
+        }
         // The whole report is withheld before applying the offset, even when the secret is later.
         expect(resultValue<ChangePage>(result)).toMatchObject({
           available: true,

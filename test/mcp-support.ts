@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Factory } from "../src/app.ts";
@@ -133,8 +133,10 @@ export async function changeFixture(
       "image.bin": "\0binary sentinel\0",
       ...Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`extra-${i}.txt`, "extra\n"])),
     },
-  ))
+  )) {
+    mkdirSync(dirname(join(f.repo, path)), { recursive: true });
     writeFileSync(join(f.repo, path), text);
+  }
   await sh(["git", "add", "."], { cwd: f.repo });
   await sh(["git", "commit", "-qm", "change"], { cwd: f.repo });
   const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
