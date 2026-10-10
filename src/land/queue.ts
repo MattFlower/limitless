@@ -27,7 +27,7 @@ import {
   removeWorktree,
 } from "../git/repos.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
-import { ciDecision } from "../integrations/ci-classifier.ts";
+import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import {
   ciRunsSchema,
@@ -41,9 +41,12 @@ import {
   type PrSnapshot,
   savedSnapshot,
 } from "../integrations/github-poller.ts";
+import { processConflictTriggers } from "../pipeline/conflict-round.ts";
+import { redactCredentials } from "../util/proc.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
+class LandConflict extends LandBlocked {}
 
 /** What one observation says about the PR the entry is landing. */
 export interface LandObservation {
@@ -106,6 +109,7 @@ export class LandQueue {
   private readonly workers = new Map<string, Promise<void>>();
   private readonly inFlight = new Map<number, AbortController>();
   private stopped = false;
+  private conflictStartup?: { controller: AbortController; work: Promise<void> };
   private readonly owner = randomUUID();
 
   constructor(private readonly deps: LandDeps) {}
@@ -123,6 +127,15 @@ export class LandQueue {
   /** Resume unowned or expired claims, then wait for new requests. */
   start(): void {
     this.stopped = false;
+    if (!this.conflictStartup) {
+      const controller = new AbortController();
+      const work = processConflictTriggers(this.store, this.now, this.deps.gh, controller.signal).catch(
+        (error: unknown) => {
+          if (!controller.signal.aborted) this.log(redactCredentials(`[conflict] ${String(error)}`));
+        },
+      );
+      this.conflictStartup = { controller, work };
+    }
     if (!this.workers.size) this.store.releaseLandClaims(this.owner);
     for (const entry of this.store.listLandEntries({ active: true })) this.pump(entry.repo);
   }
@@ -130,7 +143,10 @@ export class LandQueue {
   /** Abort in-flight git, gates and `gh` calls; entries keep their state for the next start. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.conflictStartup?.controller.abort();
     for (const controller of this.inFlight.values()) controller.abort();
+    await this.conflictStartup?.work;
+    this.conflictStartup = undefined;
     if (!this.workers.size) return;
     await Promise.all([...this.workers.values()].map((worker) => worker.catch(() => undefined)));
     this.store.releaseLandClaims(this.owner);
@@ -282,7 +298,11 @@ export class LandQueue {
     } catch (error) {
       // A cancel or a shutdown aborts on purpose: the entry keeps its state for the next start.
       if (controller.signal.aborted) return;
-      this.block(entry.id, (error as Error).message);
+      clear(heartbeat);
+      this.block(entry.id, (error as Error).message, error instanceof LandConflict);
+      await processConflictTriggers(this.store, this.now, this.deps.gh, signal).catch((error: unknown) => {
+        if (!signal.aborted) this.log(redactCredentials(`[conflict] ${String(error)}`));
+      });
     } finally {
       clear(heartbeat);
       this.inFlight.delete(entry.id);
@@ -340,7 +360,7 @@ export class LandQueue {
   private async mergeBase(cwd: string, entry: LandEntry, baseSha: string): Promise<string> {
     if (await isAncestor(cwd, baseSha, entry.approvedSha)) return entry.approvedSha;
     const conflicts = await prepareMerge(cwd, entry.approvedSha, baseSha);
-    if (conflicts.length) throw new LandBlocked(`conflicts with ${entry.baseBranch}`);
+    if (conflicts.length) throw new LandConflict(`conflicts with ${entry.baseBranch}`);
     return completeMerge(cwd, entry.approvedSha, baseSha);
   }
 
@@ -391,18 +411,18 @@ export class LandQueue {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
     const rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     // GitHub may still report the approved head while our base merge propagates.
-    const headMoved = (head?: string) => !!head && head !== sha && head !== entry.approvedSha;
+    const unexpectedHead = (head?: string) => !!head && headMoved(head, sha, entry.approvedSha);
     for (;;) {
       signal.throwIfAborted();
       const snapshot = this.store.githubPrData(entry.prUrl);
       const saved = savedSnapshot(snapshot);
       // The approved head can lag our push; any other head must block before a read can stall.
-      if (saved?.state !== "MERGED" && headMoved(saved?.headRefOid))
+      if (saved?.state !== "MERGED" && unexpectedHead(saved?.headRefOid))
         throw new LandBlocked("head moved after approval");
       const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
-      if (headMoved(seen?.head)) throw new LandBlocked("head moved after approval");
+      if (unexpectedHead(seen?.head)) throw new LandBlocked("head moved after approval");
       if (rerun) {
         const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
         const attempts = rerun.map((old) => current.find((run) => run.databaseId === old.databaseId));
@@ -430,12 +450,13 @@ export class LandQueue {
         if (seen.ci === "SUCCESS" && !outstanding) return "green";
         if (
           !this.store.observePrHead(entry.prUrl, sha, since) &&
-          headMoved(this.store.prHead(entry.prUrl)?.sha)
+          unexpectedHead(this.store.prHead(entry.prUrl)?.sha)
         )
           throw new LandBlocked("head moved after approval");
         const inspection = new AbortController();
         const inspectionSignal = AbortSignal.any([signal, inspection.signal]);
-        const current = () => !inspectionSignal.aborted && !headMoved(this.store.prHead(entry.prUrl)?.sha);
+        const current = () =>
+          !inspectionSignal.aborted && !unexpectedHead(this.store.prHead(entry.prUrl)?.sha);
         const snap: PrSnapshot = {
           ...(saved?.headRefOid === sha ? saved : {}),
           id: saved?.id ?? "",
@@ -465,7 +486,7 @@ export class LandQueue {
         let decision: Awaited<ReturnType<typeof ciDecision>> | undefined;
         const checkHead = () => {
           const observed = this.savedReport(entry.prUrl);
-          if (!current() || (observed?.state !== "MERGED" && headMoved(observed?.head)))
+          if (!current() || (observed?.state !== "MERGED" && unexpectedHead(observed?.head)))
             inspection.abort(new LandBlocked("head moved after approval"));
         };
         const unsubscribe = this.store.subscribe((msg) => {
@@ -482,6 +503,7 @@ export class LandQueue {
             current,
             current,
             "land",
+            entry.approvedSha,
           );
         } catch (error) {
           signal.throwIfAborted();
@@ -654,11 +676,16 @@ export class LandQueue {
       : null;
   }
 
-  private block(id: number, reason: string): void {
+  private block(id: number, reason: string, conflict = false): void {
     const current = this.store.getLandEntry(id);
     if (!current || !this.isActive(current)) return;
     this.log(`[land] ${id} blocked: ${reason}`);
-    const entry = this.finish(id, "blocked", reason);
+    const entry = this.store.db.transaction(() => {
+      const blocked = this.finish(id, "blocked", reason);
+      if (conflict)
+        this.store.recordConflictTrigger(blocked.prUrl, blocked.approvedSha, "land", this.now(), id);
+      return blocked;
+    })();
     this.store.landFeed("land.blocked", entry, reason, { reason, pushedSha: entry.pushedSha });
   }
 

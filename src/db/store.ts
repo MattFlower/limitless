@@ -1051,8 +1051,9 @@ export class Store {
     request: (round: number) => CreateRunRequest,
   ): { run: Run } | { active: ReviewRound } | { limited: Run } {
     return this.chatTransaction(() => {
-      const rounds = this.reviewRounds(review.prUrl);
-      const active = rounds.find((r) => !TERMINAL_STATUSES.includes(r.status));
+      const all = this.reviewRounds(review.prUrl);
+      const rounds = all.filter((r) => r.kind === "review");
+      const active = all.find((r) => !TERMINAL_STATUSES.includes(r.status));
       if (active) return { active };
       // The newest verdict wins: changes requested now outrank an earlier approval, even over the cap.
       this.db
@@ -1062,7 +1063,7 @@ export class Store {
         return {
           limited: this.updateRun(owner.id, { status: "needs_human", error: "review round limit reached" }),
         };
-      const round = rounds.length + 1;
+      const round = all.length + 1;
       const grant = { owner, prUrl: review.prUrl, head: review.reviewedSha };
       const run = this.insertRun(repo, request(round), false, { prUrl: review.prUrl, grant });
       this.db
@@ -1082,39 +1083,200 @@ export class Store {
     });
   }
 
+  recordConflictTrigger(
+    prUrl: string,
+    head: string,
+    source: "land" | "poller",
+    now: number,
+    landEntryId: number | null = null,
+  ): void {
+    this.db
+      .query(`INSERT INTO conflict_triggers (pr_url, observed_sha, source, created_at, land_entry_id)
+      VALUES (?, ?, ?, ?, ?)`)
+      .run(prUrl, head, source, now, landEntryId);
+  }
+
+  /** Draft deferrals are rechecked so the same head can start once the PR is ready. */
+  pendingConflictTriggers(): { id: number; prUrl: string; head: string; nextAttemptAt: number }[] {
+    return this.db
+      .query<{ id: number; prUrl: string; head: string; nextAttemptAt: number }, []>(
+        "SELECT id, pr_url AS prUrl, observed_sha AS head, next_attempt_at AS nextAttemptAt FROM conflict_triggers WHERE state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft') ORDER BY id",
+      )
+      .all();
+  }
+
+  failConflictLookup(id: number, error: unknown, now: number): void {
+    const reason = redactCredentials(error instanceof Error ? error.message : String(error));
+    this.db
+      .query(`UPDATE conflict_triggers SET attempts = attempts + 1, reason = ?,
+      state = CASE WHEN attempts + 1 >= 5 THEN 'skipped' ELSE 'pending' END,
+      next_attempt_at = CASE WHEN attempts + 1 >= 5 THEN 0 ELSE ? + 60000 * (1 << attempts) END
+      WHERE id = ? AND (state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft'))`)
+      .run(reason, now, id);
+  }
+
+  startConflictTrigger(
+    id: number,
+    observation: {
+      state: string;
+      isDraft?: boolean;
+      headRefOid: string;
+      problem?: string;
+      isCrossRepository?: boolean;
+      headRefName?: string;
+      headRepository?: { nameWithOwner: string } | null;
+    },
+    now: number,
+  ): Run | null {
+    return this.chatTransaction(() => {
+      const trigger = this.pendingConflictTriggers().find((t) => t.id === id);
+      if (!trigger || trigger.nextAttemptAt > now) return null;
+      const row = this.db
+        .query(`${RUN_SELECT} WHERE runs.pr_url = ? AND runs.delivery_branch IS NULL
+        AND coalesce(json_extract(runs.source_ref, '$.kind'), '') NOT IN ('pull_request', 'review-round')
+        ORDER BY runs.created_at LIMIT 1`)
+        .get(trigger.prUrl) as Row | null;
+      const owner = row && toRun(row);
+      const repo = owner && this.getRepo(owner.repoId);
+      const seen = observation;
+      const rounds = this.reviewRounds(trigger.prUrl);
+      const conflicts = rounds.filter((r) => r.kind === "conflict");
+      const reason =
+        !owner ||
+        repo?.kind !== "github" ||
+        !owner.branch ||
+        !owner.baseSha ||
+        !/^[a-f0-9]{40}$/.test(trigger.head) ||
+        trigger.prUrl
+          .match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/)?.[1]
+          ?.toLowerCase() !== repo.slug.toLowerCase() ||
+        !["succeeded", "needs_human"].includes(owner.status)
+          ? "not a factory PR"
+          : owner.status === "needs_human"
+            ? "owner needs_human"
+            : (observation.problem ??
+              (seen.state !== "OPEN"
+                ? "PR is not open"
+                : seen.isCrossRepository ||
+                    (typeof seen.headRepository?.nameWithOwner === "string" &&
+                      seen.headRepository.nameWithOwner.toLowerCase() !== repo.slug.toLowerCase())
+                  ? "PR head is in another repository"
+                  : seen.headRefName && seen.headRefName !== owner.branch
+                    ? "PR head branch changed"
+                    : seen.isDraft
+                      ? "PR is draft"
+                      : seen.headRefOid !== trigger.head
+                        ? "PR head moved"
+                        : rounds.some((r) => !TERMINAL_STATUSES.includes(r.status))
+                          ? "round in flight"
+                          : conflicts.some((r) => r.reviewedSha === trigger.head && r.deliveredSha)
+                            ? "head already resolved"
+                            : conflicts.filter((r) => (r.createdAt ?? 0) > now - 86_400_000).length >= 3
+                              ? "conflict round daily cap reached"
+                              : null));
+      if (reason || !owner || !repo || !owner.branch) {
+        this.db
+          .query("UPDATE conflict_triggers SET state = 'skipped', reason = ? WHERE id = ?")
+          .run(reason, id);
+        return null;
+      }
+      const round = rounds.length + 1;
+      const run = this.insertRun(
+        repo,
+        {
+          repo: repo.slug,
+          title: `Conflict round ${round}: ${owner.title}`,
+          prompt: `Resolve the conflict with the current base, preserving both changes' intent without widening scope. Original request:\n${owner.prompt}`,
+          profile: "quick",
+          source: "ui",
+          requestedBy: owner.requestedBy ?? undefined,
+          baseBranch: owner.branch,
+          deliveryBranch: owner.branch,
+          allow: owner.allow,
+          sourceRef: {
+            kind: "review-round",
+            runId: owner.id,
+            round,
+            prUrl: trigger.prUrl,
+            reviewedSha: trigger.head,
+          },
+        },
+        false,
+        { prUrl: trigger.prUrl, grant: { owner, prUrl: trigger.prUrl, head: trigger.head } },
+      );
+      this.db
+        .query(`INSERT INTO review_rounds (run_id, source_run_id, pr_url, round, kind, reviewed_sha, findings, created_at)
+        VALUES (?, ?, ?, ?, 'conflict', ?, '[]', ?)`)
+        .run(run.id, owner.id, trigger.prUrl, round, trigger.head, now);
+      this.db
+        .query("UPDATE conflict_triggers SET state = 'started', run_id = ?, reason = NULL WHERE id = ?")
+        .run(run.id, id);
+      return run;
+    });
+  }
+
   /** The review handler's record for `runId`, which alone authorizes it to push onto `owner`'s PR branch. */
-  reviewRound(
-    runId: string,
-  ): { owner: Run; prUrl: string; round: number; reviewedSha: string; findings: ReviewFinding[] } | null {
-    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, reviewed_sha AS reviewedSha, findings
+  reviewRound(runId: string): {
+    owner: Run;
+    kind: ReviewRound["kind"];
+    prUrl: string;
+    round: number;
+    reviewedSha: string;
+    findings: ReviewFinding[];
+    deliveredSha: string | null;
+  } | null {
+    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, kind, reviewed_sha AS reviewedSha, delivered_sha AS deliveredSha, findings
       FROM review_rounds WHERE run_id = ?`;
     const row = this.db.query(sql).get(runId) as {
       sourceRunId: string;
+      kind: ReviewRound["kind"];
       prUrl: string;
       round: number;
       reviewedSha: string;
       findings: string;
+      deliveredSha: string | null;
     } | null;
     const owner = row && this.getRun(row.sourceRunId);
     if (!row || !owner) return null;
-    const { prUrl, round, reviewedSha } = row;
-    return { owner, prUrl, round, reviewedSha, findings: parse(row.findings, []) };
+    const { prUrl, round, reviewedSha, kind, deliveredSha } = row;
+    validateRoundKind(kind);
+    return { owner, kind, prUrl, round, reviewedSha, deliveredSha, findings: parse(row.findings, []) };
   }
 
   reviewRounds(prUrl: string): ReviewRound[] {
-    const sql = `SELECT rr.run_id AS runId, rr.round, runs.status, rr.reviewed_sha AS reviewedSha,
+    const sql = `SELECT rr.run_id AS runId, rr.round, rr.kind, runs.status, rr.reviewed_sha AS reviewedSha,
         rr.delivered_sha AS deliveredSha, rr.findings, rr.created_at AS createdAt
       FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
-    return (this.db.query(sql).all(prUrl) as Row[]).map((r) => ({
+    const rows = this.db.query(sql).all(prUrl) as Row[];
+    for (const row of rows) validateRoundKind(row.kind);
+    return rows.map((r) => ({
       ...(r as unknown as ReviewRound),
       findings: parse(r.findings, []),
     }));
   }
 
   markRoundDelivered(runId: string, sha: string): void {
-    this.db
-      .query("UPDATE review_rounds SET delivered_sha = ? WHERE run_id = ? AND delivered_sha IS NULL")
-      .run(sha, runId);
+    this.db.transaction(() => {
+      const changed = this.db
+        .query("UPDATE review_rounds SET delivered_sha = ? WHERE run_id = ? AND delivered_sha IS NULL")
+        .run(sha, runId).changes;
+      if (!changed) return;
+      const round = this.reviewRound(runId);
+      if (round?.kind === "conflict") {
+        this.db
+          .query(
+            `UPDATE land_entries SET reason = ? WHERE id IN
+              (SELECT land_entry_id FROM conflict_triggers WHERE run_id = ?)
+              AND state = 'blocked' AND reason = 'conflicts with ' || base_branch`,
+          )
+          .run(`conflict resolved at ${sha}; approve the new head to land`, runId);
+        this.db
+          .query(
+            "UPDATE review_approvals SET stale_reason = ? WHERE pr_url = ? AND stale_reason IS NULL AND sha <> ?",
+          )
+          .run(`conflict resolved at ${sha}`, round.prUrl, sha);
+      }
+    })();
     this.publishFeed();
   }
 
@@ -2495,6 +2657,11 @@ export class Store {
         const state = pr.data && (JSON.parse(pr.data) as { state?: string }).state;
         if (state) this.observeGithubPrState(pr.url, state, now);
       }
+      for (const item of items)
+        if (item.kind === "pr.conflicting" && pr) {
+          const head = (JSON.parse(pr.data ?? "{}") as { headRefOid?: string }).headRefOid;
+          if (head) this.recordConflictTrigger(pr.url, head, "poller", now);
+        }
       this.addFeedItems(items);
     })();
     this.publishFeed();
@@ -2612,4 +2779,8 @@ export class Store {
       .query("DELETE FROM auth_sessions WHERE created_at <= ? OR last_seen_at <= ?")
       .run(createdBefore, seenBefore).changes;
   }
+}
+
+function validateRoundKind(kind: unknown): asserts kind is ReviewRound["kind"] {
+  if (kind !== "review" && kind !== "conflict") throw new Error("Invalid review round kind");
 }

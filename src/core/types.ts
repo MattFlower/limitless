@@ -308,6 +308,7 @@ export interface ReviewApproval {
 }
 
 export interface ReviewRound {
+  kind: "review" | "conflict";
   runId: string;
   round: number;
   status: RunStatus;
@@ -445,6 +446,7 @@ export interface RoutingChange {
 }
 
 export type FeedKind =
+  | `conflict.${"round_started" | "round_delivered"}`
   | "run.warning"
   | "run.gate_timeout_retry"
   | LandFeedKind
