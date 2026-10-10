@@ -11,7 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { agentTestCommand, realExecutable, testLane, type WrapperConfig } from "../src/cli/agent-test.ts";
+import {
+  agentTestCommand,
+  enterCallerDirectory,
+  realExecutable,
+  testLane,
+  type WrapperConfig,
+} from "../src/cli/agent-test.ts";
 import { type LeaseClient, LeaseRejected } from "../src/cli/gate-slot.ts";
 import { AgentTestSession, agentTestLease, type TestWait } from "../src/gates/agent-tests.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
@@ -416,3 +422,25 @@ test("a leased full suite lets nested slotted commands reuse its slot", async ()
     gateSlots.setLimit(old);
   }
 }, 15000);
+
+test("an unresolvable caller directory falls back instead of throwing", () => {
+  const f = fixture(),
+    previous = { cwd: process.cwd(), pwd: process.env.PWD };
+  cleanup.push(() => {
+    process.chdir(previous.cwd);
+    if (previous.pwd === undefined) delete process.env.PWD;
+    else process.env.PWD = previous.pwd;
+  });
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanup.push(() => warn.mockRestore());
+  process.env.PWD = f.real;
+  enterCallerDirectory("");
+  expect(process.cwd()).toBe(f.real);
+  enterCallerDirectory(join(f.root, "deleted"));
+  expect(process.cwd()).toBe(f.real);
+  delete process.env.PWD;
+  process.chdir(f.root);
+  expect(() => enterCallerDirectory(join(f.root, "deleted"))).not.toThrow();
+  expect(process.cwd()).toBe(f.root);
+  expect(warn).toHaveBeenCalledTimes(1);
+});

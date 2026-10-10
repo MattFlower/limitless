@@ -127,7 +127,19 @@ export async function wrapperMain(args: string[]): Promise<number> {
   }
 }
 
+/** Returns to the caller's directory; a cwd the shell could not resolve must not stop the real binary. */
+export function enterCallerDirectory(directory: string | undefined): void {
+  for (const candidate of [directory, process.env.PWD]) {
+    if (!candidate) continue;
+    try {
+      process.chdir(candidate);
+      return;
+    } catch {}
+  }
+  console.warn("agent-test: could not enter the caller's directory; running from the wrapper directory");
+}
+
 if (import.meta.main) {
-  process.chdir(process.argv[2] ?? "");
+  enterCallerDirectory(process.argv[2]);
   process.exitCode = await wrapperMain(process.argv.slice(3));
 }
