@@ -347,22 +347,19 @@ export class LandQueue {
   private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
     const rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
+    // GitHub may still report the approved head while our base merge propagates.
+    const unexpectedHead = (head?: string) => !!head && headMoved(head, sha, entry.approvedSha);
     for (;;) {
       signal.throwIfAborted();
       const snapshot = this.store.githubPrData(entry.prUrl);
       const saved = savedSnapshot(snapshot);
       // The approved head can lag our push; any other head must block before a read can stall.
-      if (
-        saved?.state !== "MERGED" &&
-        saved?.headRefOid &&
-        headMoved(saved.headRefOid, sha, entry.approvedSha)
-      )
+      if (saved?.state !== "MERGED" && unexpectedHead(saved?.headRefOid))
         throw new LandBlocked("head moved after approval");
       const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
-      if (seen?.head && headMoved(seen.head, sha, entry.approvedSha))
-        throw new LandBlocked("head moved after approval");
+      if (unexpectedHead(seen?.head)) throw new LandBlocked("head moved after approval");
       if (rerun) {
         const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
         const attempts = rerun.map((old) => current.find((run) => run.databaseId === old.databaseId));
@@ -388,13 +385,15 @@ export class LandQueue {
           .ciFailures(entry.prUrl, sha)
           .some((f) => f.outcome === "rerunning" || f.outcome === "rerun_requested");
         if (seen.ci === "SUCCESS" && !outstanding) return "green";
-        if (!this.store.observePrHead(entry.prUrl, sha, since))
+        if (
+          !this.store.observePrHead(entry.prUrl, sha, since) &&
+          unexpectedHead(this.store.prHead(entry.prUrl)?.sha)
+        )
           throw new LandBlocked("head moved after approval");
-        const version = this.store.prHead(entry.prUrl)?.version;
         const inspection = new AbortController();
         const inspectionSignal = AbortSignal.any([signal, inspection.signal]);
         const current = () =>
-          !inspectionSignal.aborted && this.store.prHead(entry.prUrl)?.version === version;
+          !inspectionSignal.aborted && !unexpectedHead(this.store.prHead(entry.prUrl)?.sha);
         const snap: PrSnapshot = {
           ...(saved?.headRefOid === sha ? saved : {}),
           id: saved?.id ?? "",
@@ -424,12 +423,7 @@ export class LandQueue {
         let decision: Awaited<ReturnType<typeof ciDecision>> | undefined;
         const checkHead = () => {
           const observed = this.savedReport(entry.prUrl);
-          if (
-            !current() ||
-            (observed?.state !== "MERGED" &&
-              observed?.head &&
-              headMoved(observed.head, sha, entry.approvedSha))
-          )
+          if (!current() || (observed?.state !== "MERGED" && unexpectedHead(observed?.head)))
             inspection.abort(new LandBlocked("head moved after approval"));
         };
         const unsubscribe = this.store.subscribe((msg) => {
