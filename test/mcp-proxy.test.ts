@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,7 +9,16 @@ import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
-import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
+import {
+  type ChangePage,
+  changeFixture,
+  connect,
+  fixture,
+  localServer,
+  type Route,
+  requestWithParams,
+  resultValue,
+} from "./mcp-support.ts";
 import { privacyTexts } from "./privacy-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -18,6 +27,208 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await f.close();
+});
+
+async function changeConnections() {
+  const routes = createHttpRoutes(f.factory);
+  const proxy = await connect(
+    httpBackend("http://daemon.invalid", async (url, init) => {
+      const parsed = new URL(url);
+      const key =
+        parsed.pathname === "/api/land"
+          ? "/api/land"
+          : parsed.pathname.endsWith("/change")
+            ? "/api/runs/:id/change"
+            : "/api/runs/:id";
+      const route = routes[key];
+      const handler = (typeof route === "function" ? route : (route as { GET: Route }).GET) as Route;
+      return handler(requestWithParams(url, init, { id: parsed.pathname.split("/")[3] ?? "" }), localServer);
+    }),
+  );
+  const direct = await connect(factoryBackend(f.factory));
+  return {
+    proxy,
+    direct,
+    async close() {
+      await proxy.close();
+      await direct.close();
+    },
+  };
+}
+
+test("HTTP-backed change pages match direct MCP for the pinned code and report", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const connections = await changeConnections();
+  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+  try {
+    for (const args of [pin, { ...pin, reportOffset: 4000 }]) {
+      const read = (conn: typeof connections.direct) =>
+        conn.client.callTool({ name: "limitless_get_change", arguments: args });
+      const direct = resultValue<ChangePage>(await read(connections.direct));
+      expect(resultValue<ChangePage>(await read(connections.proxy))).toEqual(direct);
+      expect(direct).toMatchObject({
+        headSha: c.headSha,
+        baseSha: c.baseSha,
+        files: [{ path: "hello.txt", additions: 1, deletions: 1 }],
+      });
+      expect(direct.diff.text).toContain("-hello\n+new greeting\n");
+    }
+    c.observe(c.baseSha);
+    expect(
+      resultValue(
+        await connections.proxy.client.callTool({
+          name: "limitless_get_change",
+          arguments: { ...pin, diffOffset: 1 },
+        }),
+      ),
+    ).toMatchObject({ available: false, reason: expect.stringContaining("superseded") });
+  } finally {
+    await connections.close();
+  }
+});
+
+test("change view withholds private paths, complete patches, reports and errors on both backends", async () => {
+  const hidden = "hiddenScenarioSentinel";
+  const c = await changeFixture(f, {
+    "hello.txt": `hello\n${"safe line\n".repeat(3000)}${privacyTexts.join("\n")}\n`,
+    "holdout-patch.txt": [...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join(""),
+    [`${hidden}.txt`]: "private path\n",
+    "secret-host.example.txt": "private configured path\n",
+    "privacy-test-credential.txt": "private credential path\n",
+  });
+  writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "secret-host.example\n");
+  registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: `Check '${hidden}'`,
+          steps: `Read '${hidden}'`,
+          expected: hidden,
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", `${hidden}\n${privacyTexts.join("\n")}`);
+  const connections = await changeConnections();
+  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const read = (args: Record<string, unknown>) =>
+        conn.client.callTool({ name: "limitless_get_change", arguments: args });
+      const first = resultValue<ChangePage>(await read(pin));
+      expect(first.files).toHaveLength(5);
+      for (const args of [
+        pin,
+        ...first.files.map((file) => ({ ...pin, file: file.index, diffOffset: 1, reportOffset: 1 })),
+        { ...pin, [hidden]: "invalid" },
+      ]) {
+        const output = JSON.stringify(await read(args));
+        for (const secret of [hidden, ...privacyTexts]) expect(output).not.toContain(secret);
+        expect(output).not.toContain([...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join(""));
+      }
+      expect(first.diff.text).toContain("withheld");
+      expect(first.reports[0]?.text).toContain("withheld");
+      for (const report of [hidden, ...privacyTexts]) {
+        f.factory.store.putArtifact(
+          c.run.id,
+          "report.md",
+          "report",
+          `${"safe line\n".repeat(1000)}${report}`,
+        );
+        const output = JSON.stringify(await read({ ...pin, reportOffset: 4000 }));
+        expect(output).not.toContain(report);
+      }
+    }
+    rmSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
+    mkdirSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
+    for (const conn of [connections.direct, connections.proxy]) {
+      const result = await conn.client.callTool({ name: "limitless_get_change", arguments: pin });
+      expect(resultValue<unknown>(result)).toEqual({
+        message: "Tool output withheld; privacy policy unavailable.",
+      });
+    }
+    const routes = createHttpRoutes(f.factory);
+    const handler = routes["/api/runs/:id/change"] as Route;
+    const response = await handler(
+      requestWithParams("http://daemon.invalid/api/runs/id/change", undefined, { id: c.run.id }),
+      localServer,
+    );
+    expect(await response.json()).toEqual({
+      available: false,
+      reason: "Privacy policy unavailable; content withheld.",
+    });
+  } finally {
+    await connections.close();
+  }
+});
+
+test("original-run status follows in-flight, failed and delivered rounds and reviews the observed head", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" }, true);
+  const { store } = f.factory;
+  c.observe(c.baseSha);
+  const created = store.createReviewRound(
+    c.repo,
+    store.getRun(c.run.id) as Run,
+    { prUrl: c.prUrl, reviewedSha: c.baseSha, findings: [], cap: 3 },
+    (round) => ({
+      repo: c.repo.slug,
+      prompt: "Fix review",
+      baseBranch: "limitless/feature",
+      deliveryBranch: "limitless/feature",
+      sourceRef: { kind: "review-round", runId: c.run.id, round, prUrl: c.prUrl, reviewedSha: c.baseSha },
+    }),
+  );
+  if (!("run" in created)) throw new Error("Round refused");
+  const connections = await changeConnections();
+  try {
+    for (const status of ["running", "failed", "succeeded"] as const) {
+      store.updateRun(created.run.id, { status });
+      if (status === "succeeded") {
+        store.markRoundDelivered(created.run.id, c.headSha);
+        c.observe(c.headSha);
+        store.putArtifact(created.run.id, "report.md", "report", "Round report");
+      }
+      for (const conn of [connections.direct, connections.proxy]) {
+        const value = resultValue<{ state: string; nextAction: string }>(
+          await conn.client.callTool({ name: "limitless_status", arguments: { run: c.run.id } }),
+        );
+        expect(value).toMatchObject({
+          run: c.run.id,
+          headSha: status === "succeeded" ? c.headSha : c.baseSha,
+          latestRound: {
+            runId: created.run.id,
+            status,
+            deliveredSha: status === "succeeded" ? c.headSha : null,
+          },
+        });
+        expect(value.state).toBe(
+          status === "running"
+            ? "Review changes in progress"
+            : status === "failed"
+              ? "Review changes failed"
+              : "Review needed",
+        );
+        if (status === "succeeded") {
+          expect(value.nextAction).toContain(c.headSha);
+          expect(value.nextAction).toContain("limitless_get_change");
+          expect(value.nextAction).toContain(c.run.id);
+        }
+      }
+    }
+    const view = resultValue<ChangePage>(
+      await connections.proxy.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+    );
+    expect(view.reports.map((report) => [report.run, report.available])).toEqual([
+      [c.run.id, true],
+      [created.run.id, true],
+    ]);
+    expect(view.reports[1]?.text).toBe("Round report");
+  } finally {
+    await connections.close();
+  }
 });
 
 test("proxy maps all six tools to REST and matches Factory results, including filtered event tail", async () => {
@@ -329,6 +540,9 @@ test("status explains review, input, land and terminal states using saved observ
   try {
     for (const [patch, land, state, action] of [
       [{}, [], "Review needed", "limitless_review"],
+      [{ prSnapshot: { state: "OPEN" } }, [], "PR head unknown", "current PR head"],
+      [{ prSnapshot: { state: "OPEN", headRefOid: "bad" } }, [], "PR head unknown", "current PR head"],
+      [{ prSnapshot: { state: "OPEN", headRefOid: null } }, [], "PR head unknown", "current PR head"],
       [{ prSnapshot: null }, [], "PR state unknown", "Inspect the PR"],
       [
         { prSnapshot: { state: "OPEN" }, review: { approval: { sha, stale: false }, rounds: [] } },
@@ -413,6 +627,11 @@ test("status explains review, input, land and terminal states using saved observ
       const result = resultValue<{ state: string; nextAction: string }>(await read());
       expect(result.state).toBe(state);
       expect(result.nextAction).toContain(action);
+      if (state === "Review needed") {
+        expect(result.nextAction).toMatch(/[a-f0-9]{40}/);
+        expect(result.nextAction).toContain("limitless_get_change");
+      }
+      if (state === "PR head unknown") expect(result.nextAction).not.toContain("limitless_review");
     }
     lands = [
       { ...entry, id: 2, state: "landed" },
@@ -802,7 +1021,7 @@ test("connection, HTTP and malformed responses are MCP errors and mutations are 
       });
       expect(resolved.isError).toBe(true);
       expect(calls).toBe(1);
-      expect((await proxy.client.listTools()).tools).toHaveLength(12);
+      expect((await proxy.client.listTools()).tools).toHaveLength(13);
     } finally {
       await proxy.close();
     }
@@ -847,7 +1066,7 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
     expect(messages).toHaveLength(3);
     expect(messages.every((message) => message.jsonrpc === "2.0")).toBe(true);
     expect(messages.find((m) => m.id === 2).result.isError).toBe(true);
-    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(12);
+    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(13);
   } finally {
     await server.close();
     stdin.destroy();

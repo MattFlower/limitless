@@ -217,20 +217,15 @@ export function formatReviewFeedback(findings: Review["findings"], panel = false
     .join("\n")}`;
 }
 
-export function redactHoldoutText(
-  value: string,
-  holdout: Holdout,
-  publicSources = "",
-  includeObservedLiterals = true,
-): string {
-  if (!holdout.scenarios.length) return value;
+const holdoutBoundaryPattern = (detail: string) => {
+  const escaped = detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
+};
+
+export function privateHoldoutDetails(holdout: Holdout, publicSources = "", observed?: string): Set<string> {
   const details = new Set<string>();
-  const boundaryPattern = (detail: string) => {
-    const escaped = detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
-  };
   const collect = (detail: string) => {
-    if (detail && !new RegExp(boundaryPattern(detail), "iu").test(publicSources)) details.add(detail);
+    if (detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources)) details.add(detail);
   };
   const collectLiterals = (source: string) => {
     for (const literal of source.match(
@@ -249,12 +244,23 @@ export function redactHoldoutText(
     }
   }
   // Observed values and runtime error identifiers need not occur in the authored scenarios.
-  if (includeObservedLiterals) collectLiterals(value);
+  if (observed !== undefined) collectLiterals(observed);
+  return details;
+}
+
+export function redactHoldoutText(
+  value: string,
+  holdout: Holdout,
+  publicSources = "",
+  includeObservedLiterals = true,
+): string {
+  if (!holdout.scenarios.length) return value;
+  const details = privateHoldoutDetails(holdout, publicSources, includeObservedLiterals ? value : undefined);
   if (!details.size) return value;
   const pattern = new RegExp(
     [...details]
       .sort((a, b) => b.length - a.length)
-      .map(boundaryPattern)
+      .map(holdoutBoundaryPattern)
       .join("|"),
     "giu",
   );

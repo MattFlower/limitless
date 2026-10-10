@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
+import { commitSha } from "./mcp-change.ts";
 
 export const statusDetailSchema = z.object({
   run: z.object({
@@ -12,7 +13,7 @@ export const statusDetailSchema = z.object({
   prSnapshot: z
     .object({
       state: z.string().optional(),
-      headRefOid: z.string().optional(),
+      headRefOid: z.unknown().optional(),
       isDraft: z.boolean().optional(),
     })
     .nullable()
@@ -21,7 +22,15 @@ export const statusDetailSchema = z.object({
     .object({
       approval: z.object({ sha: z.string(), stale: z.boolean() }).nullable(),
       approvedAt: z.number().optional(),
-      rounds: z.array(z.object({ runId: z.string(), status: z.string(), createdAt: z.number().optional() })),
+      rounds: z.array(
+        z.object({
+          runId: z.string(),
+          status: z.string(),
+          createdAt: z.number().optional(),
+          round: z.number().optional(),
+          deliveredSha: z.string().nullable().optional(),
+        }),
+      ),
     })
     .optional(),
 });
@@ -41,6 +50,11 @@ export function explainStatus(
   privacy: OutputPrivacy | null = loadOutputPrivacy(),
 ) {
   const { run, prSnapshot: pr, review, questions } = detail;
+  const latestRound = review?.rounds
+    .toSorted((a, b) => (a.round ?? a.createdAt ?? 0) - (b.round ?? b.createdAt ?? 0))
+    .at(-1);
+  const observedHead = commitSha.safeParse(pr?.headRefOid);
+  const headSha = observedHead.success ? observedHead.data : null;
   const land = lands
     .filter((entry) => entry.runId === run.id || (run.prUrl && entry.prUrl === run.prUrl))
     .sort((a, b) => b.id - a.id)[0];
@@ -52,7 +66,14 @@ export function explainStatus(
         openQuestions: questions.filter((q) => q.answer === null).length,
       };
     }
-    const output = { run: run.id, state, nextAction, land: land ?? null };
+    const output = {
+      run: run.id,
+      state,
+      nextAction,
+      headSha,
+      latestRound: latestRound ?? null,
+      land: land ?? null,
+    };
     // Redact the whole result so nested metadata and generated guidance share the digest's policy.
     return privateOutputData(output, privacy);
   };
@@ -88,7 +109,6 @@ export function explainStatus(
       "Inspect limitless_get_run and address the stopping error or resolve the run.",
     );
   const approval = review?.approval;
-  const latestRound = review?.rounds.toSorted((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0)).at(-1);
   const approvalPredatesRound =
     review?.approvedAt !== undefined &&
     latestRound?.createdAt !== undefined &&
@@ -129,7 +149,7 @@ export function explainStatus(
       "Draft PR needs attention",
       "Inspect the draft and its delivery evidence before reviewing.",
     );
-  if (approval && !approval.stale && !pr.headRefOid)
+  if (!headSha)
     return result("PR head unknown", "Inspect the current PR head before requesting limitless_land.");
   if (
     !approval ||
@@ -139,7 +159,7 @@ export function explainStatus(
   )
     return result(
       "Review needed",
-      "Review the current PR head; submit limitless_review with its full SHA and findings.",
+      `Read limitless_get_change for run ${run.id} and review PR head ${headSha}; submit limitless_review with run ${run.id}, this full SHA and findings.`,
     );
   return result(
     "Approved; landing not queued",

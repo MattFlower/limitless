@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
+import { cachePath } from "../src/git/repos.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
-import { connect, fixture, resultValue } from "./mcp-support.ts";
+import { sh } from "../src/util/proc.ts";
+import { type ChangePage, changeFixture, connect, fixture, resultValue } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let connection: Awaited<ReturnType<typeof connect>>;
@@ -17,6 +20,92 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
   connection.client.callTool({ name: `limitless_${name}`, arguments: args });
 const create = async (args: Record<string, unknown> = {}) =>
   resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "Add a greeting", ...args }));
+
+test("change view pins and pages local code, metadata and reports", async () => {
+  const { run, baseSha, headSha, report } = await changeFixture(f);
+  const pin = { run: run.id, baseSha, headSha };
+  const read = async (args: Record<string, unknown> = {}) =>
+    resultValue<ChangePage>(await call("get_change", { ...pin, ...args }));
+  const first = await read();
+  expect(first).toMatchObject({
+    available: true,
+    headSha,
+    baseSha,
+    comparisonSha: baseSha,
+    baseBranch: "main",
+  });
+  expect(first.files).toHaveLength(50);
+  const rest = await read({ filesOffset: first.nextFilesOffset });
+  const files = [...first.files, ...rest.files];
+  expect(files.map((file) => file.path).sort()).toEqual(
+    ["hello.txt", "image.bin", "large.txt", ...Array.from({ length: 51 }, (_, i) => `extra-${i}.txt`)].sort(),
+  );
+  expect(files.find((file) => file.path === "hello.txt")).toMatchObject({ additions: 1, deletions: 0 });
+  const large = files.find((file) => file.path === "large.txt");
+  if (!large) throw new Error("Missing large file");
+  let diff = "",
+    offset = 0;
+  do {
+    const page = await read({ file: large.index, diffOffset: offset });
+    expect(page.diff.text.length).toBeLessThanOrEqual(16000);
+    expect(page.headSha).toBe(headSha);
+    diff += page.diff.text;
+    offset = page.diff.nextOffset ?? 0;
+  } while (offset);
+  const expected = await sh(
+    ["git", "diff", "--no-ext-diff", "--no-textconv", baseSha, headSha, "--", "large.txt"],
+    { cwd: f.repo },
+  );
+  expect(diff).toBe(expected.stdout);
+  let reportText = "",
+    reportOffset = 0;
+  do {
+    const page = await read({ reportOffset });
+    const saved = page.reports[0];
+    if (!saved) throw new Error("Missing report");
+    expect(saved.text.length).toBeLessThanOrEqual(4000);
+    reportText += saved.text;
+    reportOffset = saved.nextOffset ?? 0;
+  } while (reportOffset);
+  expect(reportText).toBe(report);
+  const binary = files.find((file) => file.binary);
+  expect(binary).toMatchObject({ path: "image.bin", additions: null, deletions: null });
+  expect((await read({ file: binary?.index })).diff).toMatchObject({ text: "", binary: true });
+  expect((await call("get_change", { run: run.id, diffOffset: 16000 })).isError).toBe(true);
+});
+
+test("change view refuses moved heads, missing comparisons and unavailable reports", async () => {
+  const c = await changeFixture(f, { "hello.txt": "changed\n" });
+  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+  c.observe(c.baseSha);
+  expect(resultValue(await call("get_change", pin))).toMatchObject({
+    available: false,
+    reason: expect.stringContaining("superseded"),
+  });
+  c.observe(c.headSha);
+  f.factory.store.updateRun(c.run.id, { baseSha: "f".repeat(40) });
+  expect(resultValue(await call("get_change", pin))).toMatchObject({
+    available: false,
+    reason: expect.stringContaining("unavailable"),
+  });
+  f.factory.store.updateRun(c.run.id, { baseSha: c.baseSha });
+  f.factory.store.db.query("DELETE FROM artifacts WHERE run_id = ? AND name = 'report.md'").run(c.run.id);
+  expect(resultValue<ChangePage>(await call("get_change", pin)).reports[0]).toMatchObject({
+    available: false,
+    reason: "Persisted report unavailable.",
+  });
+  c.observe("malformed");
+  expect(resultValue(await call("get_change", { run: c.run.id }))).toMatchObject({
+    available: false,
+    reason: "Observed PR head unavailable.",
+  });
+  c.observe(c.headSha);
+  rmSync(cachePath(f.factory.cfg.paths, c.repo), { recursive: true });
+  expect(resultValue(await call("get_change", pin))).toMatchObject({
+    available: false,
+    reason: expect.stringContaining("unavailable"),
+  });
+});
 
 test("MCP create_run accepts and validates per-run chains", async () => {
   const models = { implement: ["fake/m"], review: ["fake/m"] };
@@ -86,7 +175,7 @@ test("model-written MCP prompts cannot opt in through Allow lines", async () => 
   expect((await call("create_run", { repo: f.repo, prompt, allow: ["anything"] })).isError).toBe(true);
 });
 
-test("twelve discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
+test("discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
   const { tools } = await connection.client.listTools();
   expect(tools.map((t) => t.name).sort()).toEqual(
     [
@@ -95,6 +184,7 @@ test("twelve discoverable tools, create defaults and overrides, get and queued c
       "create_run",
       "feed",
       "feed_ack",
+      "get_change",
       "get_run",
       "land",
       "list_runs",
@@ -126,6 +216,9 @@ test("twelve discoverable tools, create defaults and overrides, get and queued c
     properties: { run: { type: "string" }, sha: { type: "string" } },
   });
   expect(tools.find((t) => t.name === "limitless_status")?.inputSchema.required).toEqual(["run"]);
+  expect(tools.find((t) => t.name === "limitless_get_change")?.annotations).toMatchObject({
+    readOnlyHint: true,
+  });
   const run = await create();
   expect(run).toMatchObject({ profile: "auto", source: "mcp", status: "queued" });
   expect(f.factory.store.getRun(run.id)?.source).toBe("mcp");

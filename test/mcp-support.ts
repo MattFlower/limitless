@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { cachePath } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { createMcpServer, type McpBackend } from "../src/integrations/mcp.ts";
 import type { Policy } from "../src/router/catalog.ts";
@@ -100,3 +101,80 @@ export const localServer = {
   timeout: () => {},
   requestIP: () => ({ address: "127.0.0.1", family: "IPv4", port: 40000 }),
 } as unknown as import("bun").Server<undefined>;
+
+/** Local history and saved PR observation; never invokes GitHub or a model. */
+export async function changeFixture(
+  f: Awaited<ReturnType<typeof fixture>>,
+  contents?: Record<string, string>,
+  github = false,
+) {
+  const run = github
+    ? f.factory.store.createRun(
+        f.factory.store.upsertRepo({
+          slug: "test/repo",
+          kind: "github",
+          url: "https://github.com/test/repo.git",
+          localPath: null,
+          defaultBranch: "main",
+          mergePolicy: "pr",
+        }),
+        { repo: "test/repo", prompt: "Review this change" },
+      )
+    : await f.factory.createRun({ repo: f.repo, prompt: "Review this change" });
+  const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
+  for (const [path, text] of Object.entries(
+    contents ?? {
+      "hello.txt": "hello\nnew greeting\n",
+      "large.txt": Array.from({ length: 4000 }, (_, i) => `line ${i}\n`).join(""),
+      "image.bin": "\0binary sentinel\0",
+      ...Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`extra-${i}.txt`, "extra\n"])),
+    },
+  ))
+    writeFileSync(join(f.repo, path), text);
+  await sh(["git", "add", "."], { cwd: f.repo });
+  await sh(["git", "commit", "-qm", "change"], { cwd: f.repo });
+  const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
+  const repo = f.factory.store.getRepo(run.repoId);
+  if (!repo) throw new Error("Missing fixture repo");
+  mkdirSync(f.factory.cfg.paths.repos, { recursive: true });
+  await sh(["git", "clone", "--bare", f.repo, cachePath(f.factory.cfg.paths, repo)], { cwd: f.home });
+  const prUrl = "https://github.com/test/repo/pull/1";
+  f.factory.store.updateRun(run.id, {
+    prUrl,
+    status: "succeeded",
+    baseSha,
+    baseBranch: "main",
+    branch: "limitless/feature",
+  });
+  const observe = (head: string) =>
+    f.factory.store.saveGithubPr({
+      url: prUrl,
+      repo: repo.slug,
+      runId: run.id,
+      delivered: 1,
+      nodeId: "PR_fixture",
+      data: JSON.stringify({ state: "OPEN", headRefOid: head, baseRefName: "main" }),
+    });
+  observe(headSha);
+  const report = `Factory report\n${"Reviewed locally.\n".repeat(400)}`;
+  f.factory.store.putArtifact(run.id, "report.md", "report", report);
+  return { run, repo, prUrl, baseSha, headSha, report, observe };
+}
+
+export interface ChangePage {
+  available: boolean;
+  headSha: string;
+  baseSha: string;
+  comparisonSha: string;
+  baseBranch: string;
+  files: {
+    index: number;
+    path: string;
+    additions: number | null;
+    deletions: number | null;
+    binary: boolean;
+  }[];
+  nextFilesOffset: number | null;
+  diff: { text: string; total: number; truncated: boolean; nextOffset: number | null; binary: boolean };
+  reports: { run: string; available: boolean; text: string; truncated: boolean; nextOffset: number | null }[];
+}
