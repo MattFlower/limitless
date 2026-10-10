@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { privateReadPaths } from "../util/private-reads.ts";
 import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
 import type { AgentSpec } from "./types.ts";
 
@@ -97,6 +98,7 @@ export function validateScratch(spec: AgentSpec): string {
 }
 
 export interface WriteRoots {
+  denyRead?: string[];
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
   /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
@@ -131,7 +133,7 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
       throw new Error("Worktree .git does not name its own linked worktree directory");
     protectedPaths.push(gitDir);
   } else if (stat && !stat.isDirectory()) throw new Error("Worktree .git must be a file or directory");
-  return { write: spellings(granted), protect: spellings(protectedPaths) };
+  return { write: spellings(granted), protect: spellings(protectedPaths), denyRead: privateReadPaths() };
 }
 
 /** Each path as given and, when it exists, canonical: what a confined profile actually denies. */
@@ -142,7 +144,7 @@ export function spellings(paths: string[]): string[] {
 /** `denyRead` as given and canonical (either spelling reaches it); cwd and scratch must stay readable. */
 export function validateDenyRead(spec: AgentSpec, scratch: string): string[] {
   const cwd = realpathSync(spec.cwd);
-  const paths = spellings(spec.denyRead ?? []);
+  const paths = spellings([...(spec.denyRead ?? []), ...privateReadPaths()]);
   for (const path of paths)
     if (within(path, cwd) || within(path, scratch))
       throw new Error(`Reader cwd and scratch must be outside ${path}`);

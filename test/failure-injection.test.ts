@@ -40,6 +40,7 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
+import { privateReadPaths } from "../src/util/private-reads.ts";
 import {
   CommandError,
   type ProcOptions,
@@ -849,7 +850,11 @@ test("codex 0.154.0, which denies home and TMPDIR but allows /tmp, diverts confi
     if (opts.cmd[1] === "sandbox") {
       // 0.154.0 accepts the profile but leaves /tmp readable; stderr echoes config.
       const file = opts.cmd.at(-1) ?? "";
-      if (file.startsWith(`${roots.TMPDIR}/`) || file.startsWith(`${roots.home}/`))
+      if (
+        privateReadPaths().includes(file) ||
+        file.startsWith(`${roots.TMPDIR}/`) ||
+        file.startsWith(`${roots.home}/`)
+      )
         return {
           ...done,
           exitCode: 1,
@@ -869,12 +874,17 @@ test("codex 0.154.0, which denies home and TMPDIR but allows /tmp, diverts confi
     harnesses: { fake: fakeHarness(answer), codex: (s) => runCodex(s, cli, probe) },
   });
   const { run: r, invoke } = await confinedHoldout(f);
+  const privateFiles = privateReadPaths().filter(existsSync);
   const outcome = await invoke(true);
   expect(outcome.target.provider).toBe("b");
   expect(commands.map((cmd) => cmd[1])).not.toContain("exec");
   // Home and TMPDIR were denied; the /tmp canary is the one that leaked.
   const reads = commands.filter((cmd) => cmd[1] === "sandbox").map((cmd) => cmd.at(-1) ?? "");
-  expect(reads.map((file) => file.startsWith(`${roots.tmp}/`))).toEqual([false, false, true]);
+  expect(privateFiles.length).toBeGreaterThan(0);
+  expect(reads.filter((file) => privateFiles.includes(file))).toEqual(privateFiles);
+  expect(
+    reads.filter((file) => !privateFiles.includes(file)).map((file) => file.startsWith(`${roots.tmp}/`)),
+  ).toEqual([false, false, true]);
   const [rejected, fallback] = f.store.listInvocations(r.id);
   expect(fallback).toMatchObject({ provider: "b", status: "ok" });
   expect(rejected).toMatchObject({ provider: "a", status: "unavailable" });
