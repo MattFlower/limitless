@@ -411,6 +411,109 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   ]);
 });
 
+for (const moved of [false, true]) {
+  test(`after a base merge, lagging head reads ${moved ? "still block someone else's push" : "wait and land"}`, async () => {
+    const pr = delivered(1, "pr-1");
+    const approved = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, approved);
+    approve(1, approved);
+    await advanceBase();
+    ci = () => null;
+    let caughtUp = false;
+    let reads = 0;
+    const entry = queue({
+      polling: false,
+      ciPollMs: 100,
+      client: async () => {
+        reads++;
+        return {
+          url: url(1),
+          state: "OPEN",
+          mergedAt: null,
+          mergedBy: null,
+          headRefOid: caughtUp ? (moved ? "c".repeat(40) : await remoteHead("pr-1")) : approved,
+          ci: "SUCCESS",
+          failing: [],
+        };
+      },
+    }).request({ target: pr.run.id });
+    await waitFor(() => reads > 0);
+    await settleIdle();
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+    await clock.advance(100);
+    await waitWithoutClock(() => reads >= 2);
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+    expect(ghCalls("pr merge")).toEqual([]); // green CI on the approved head cannot land the merge
+    const pushed = store.getLandEntry(entry.id)?.pushedSha;
+    expect(pushed).toBe(await remoteHead("pr-1"));
+    expect(pushed).not.toBe(approved);
+    caughtUp = true;
+    await settle();
+    if (moved) {
+      expect(store.getLandEntry(entry.id)).toMatchObject({
+        state: "blocked",
+        reason: "head moved after approval",
+      });
+      expect(ghCalls("pr merge")).toEqual([]);
+    } else {
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${pushed}`);
+    }
+  });
+}
+
+test("poller head versions catching up to a base merge do not block CI inspection", async () => {
+  const pr = delivered(1, "pr-1");
+  const approved = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, approved);
+  store.observePrHead(url(1), approved);
+  approve(1, approved);
+  await advanceBase();
+  ci = () => null;
+  let reads = 0;
+  const entry = queue({
+    polling: false,
+    ciPollMs: 100,
+    client: async () => {
+      const pushed = await remoteHead("pr-1");
+      if (++reads === 1) {
+        workflow(pushed, 1, "failure");
+        // The poller records our merge while the fallback read is in flight.
+        store.observePrHead(url(1), pushed);
+        observe(1, pushed, "FAILURE", ["network"]);
+        github.responses.set(`repos/${SLUG}/commits/main`, () => {
+          // Different reads can catch up while classification is in flight, too.
+          store.observePrHead(url(1), approved);
+          observe(1, approved);
+          store.observePrHead(url(1), pushed);
+          observe(1, pushed, "FAILURE", ["network"]);
+          return respond(200, { sha: "b".repeat(40) });
+        });
+      }
+      return {
+        url: url(1),
+        state: "OPEN",
+        mergedAt: null,
+        mergedBy: null,
+        headRefOid: pushed,
+        ci: reads === 1 ? "FAILURE" : "SUCCESS",
+        failing: reads === 1 ? ["network"] : [],
+      };
+    },
+  }).request({ target: pr.run.id });
+  await waitFor(
+    () =>
+      landLog.some((line) => line.includes("transient CI failure")) ||
+      store.getLandEntry(entry.id)?.state === "blocked",
+  );
+  expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+  const pushed = store.getLandEntry(entry.id)?.pushedSha ?? "";
+  workflow(pushed, 2, "success");
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${pushed}`);
+});
+
 test("a rejected merge blocks, arms no auto-merge, and a later head never lands", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
