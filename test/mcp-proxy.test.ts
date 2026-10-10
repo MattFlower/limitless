@@ -131,16 +131,6 @@ test("change view withholds private paths, complete patches, reports and errors 
       }
       expect(first.diff.text).toContain("withheld");
       expect(first.reports[0]?.text).toContain("withheld");
-      for (const report of [hidden, ...privacyTexts]) {
-        f.factory.store.putArtifact(
-          c.run.id,
-          "report.md",
-          "report",
-          `${"safe line\n".repeat(1000)}${report}`,
-        );
-        const output = JSON.stringify(await read({ ...pin, reportOffset: 4000 }));
-        expect(output).not.toContain(report);
-      }
     }
     rmSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
     mkdirSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
@@ -164,6 +154,40 @@ test("change view withholds private paths, complete patches, reports and errors 
     await connections.close();
   }
 });
+
+test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [index, report] as const))(
+  "change view protects the complete report before paging on both backends (encoding %i)",
+  async (_index, report) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    const hidden = "hiddenScenarioSentinel";
+    writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "secret-host.example\n");
+    registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+    f.factory.store.setRunState(c.run.id, {
+      holdout: {
+        scenarios: [{ id: "H-1", description: hidden, steps: hidden, expected: hidden, edge_case: false }],
+      },
+    });
+    f.factory.store.putArtifact(c.run.id, "report.md", "report", `${"safe line\n".repeat(1000)}${report}`);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const result = await conn.client.callTool({
+          name: "limitless_get_change",
+          arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, reportOffset: 4000 },
+        });
+        const output = JSON.stringify(result);
+        for (const secret of [hidden, ...privacyTexts]) expect(output).not.toContain(secret);
+        // The whole report is withheld before applying the offset, even when the secret is later.
+        expect(resultValue<ChangePage>(result)).toMatchObject({
+          available: true,
+          reports: [{ available: true, text: "", truncated: false, nextOffset: null }],
+        });
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
 
 test("original-run status follows in-flight, failed and delivered rounds and reviews the observed head", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" }, true);

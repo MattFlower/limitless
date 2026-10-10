@@ -10,14 +10,9 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import { createMcpServer, type McpBackend } from "../src/integrations/mcp.ts";
 import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { seeded } from "./seeded.ts";
 
-export async function fixture(
-  bootSha?: string | ((repo: string) => Promise<string | undefined>),
-  excludeOrigins?: string[],
-) {
-  const home = mkdtempSync(join(tmpdir(), "limitless-mcp-"));
-  const repo = join(home, "local repo");
-  mkdirSync(repo);
+const seedRepo = seeded(async (repo) => {
   writeFileSync(join(repo, "hello.txt"), "hello\n");
   await sh(["git", "init", "-q", "-b", "main"], { cwd: repo });
   await sh(["git", "add", "."], { cwd: repo });
@@ -25,6 +20,15 @@ export async function fixture(
     ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "init"],
     { cwd: repo },
   );
+});
+
+export async function fixture(
+  bootSha?: string | ((repo: string) => Promise<string | undefined>),
+  excludeOrigins?: string[],
+) {
+  const home = mkdtempSync(join(tmpdir(), "limitless-mcp-"));
+  const repo = join(home, "local repo");
+  await seedRepo(repo);
   const resolvedBootSha = typeof bootSha === "function" ? await bootSha(repo) : bootSha;
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "config"), port: 7400 });
   mkdirSync(cfg.paths.configDir);
