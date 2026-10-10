@@ -1366,6 +1366,7 @@ exec '${path}-delegate' "$@"
       if (operation === "comments") {
         await settled(f, id);
         expect(f.store.getRun(id)?.status).toBe("running");
+        rmSync(pidFile, { force: true });
         f = await reopen(f);
       }
       await wait(() => existsSync(pidFile));
