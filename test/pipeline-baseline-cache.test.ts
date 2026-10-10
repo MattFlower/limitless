@@ -123,10 +123,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         slots = gateSlots.limit;
       });
       afterEach(() => gateSlots.setLimit(slots));
-      // Each baseline attempt logs start and end around a sleep; adjacent starts mean overlap.
+      // Each attempt waits for its peers (bounded to 10 s); adjacent starts mean overlap.
       const overlapping = (log: string) => readFileSync(log, "utf8").includes("start\nstart\n");
-      const timed = (log: string, exit: number) =>
-        `test -f farewell.txt && exit 0; echo start >> '${log}'; sleep 1; echo end >> '${log}'; exit ${exit}`;
+      const timed = (log: string, exit: number) => {
+        // The failing flight logs two attempts before its two waiters can start.
+        const starts = exit === 0 ? "3" : `$(( $(grep -c '^start$' '${log}') <= 2 ? 2 : 4 ))`;
+        return `test -f farewell.txt && exit 0; echo start >> '${log}'; starts=${starts}; deadline=$(($(date +%s) + 10)); while [ $(grep -c '^start$' '${log}') -lt $starts ] && [ $(date +%s) -lt $deadline ]; do sleep 0.05; done; echo end >> '${log}'; exit ${exit}`;
+      };
 
       test("with the kill switch, same-base runs execute their baselines concurrently", async () => {
         const log = join(home, "gate-log");
