@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import type { Server } from "bun";
+import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, type Route, requestWithParams } from "./mcp-support.ts";
 import { fakeAuthenticator } from "./webauthn-fake.ts";
@@ -86,24 +87,38 @@ test("owner diagnostics stay out of local and proxy REST, artifacts and SSE", as
   const marker = "OWNER_HTTP_ONLY_423";
   const store = f.factory.store;
   store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public detail");
+  expect(ownerDiagnostics(store.db, run.id)).toMatchObject([{ text: marker }]);
+  store.updateRun(run.id, { status: "failed", error: "public detail" });
+  store.addEvent({ runId: run.id, type: "log", message: "public detail" });
   store.putArtifact(run.id, "public.txt", "report", "public detail");
   const table = createHttpRoutes(f.factory);
   for (const address of ["127.0.0.1", proxy]) {
     const peer = { requestIP: () => ({ address }), timeout: () => {} } as unknown as Server<undefined>;
-    for (const [key, suffix, params] of [
-      ["/api/runs/:id", "", { id: run.id }],
-      ["/api/runs/:id/events", "/events", { id: run.id }],
-      ["/api/runs/:id/artifacts/:name", "/artifacts/public.txt", { id: run.id, name: "public.txt" }],
+    for (const [key, path, params, status, publicText] of [
+      ["/api/runs", `/api/runs?ids=${run.id}`, {}, 200, run.id],
+      ["/api/feed", "/api/feed?after=0", {}, 200, run.id],
+      ["/api/providers", "/api/providers", {}, 200, "fake"],
+      ["/api/runs/:id", `/api/runs/${run.id}`, { id: run.id }, 200, "public detail"],
+      ["/api/runs/:id/events", `/api/runs/${run.id}/events`, { id: run.id }, 200, "public detail"],
       [
         "/api/runs/:id/artifacts/:name",
-        "/artifacts/owner_diagnostics",
-        { id: run.id, name: "owner_diagnostics" },
+        `/api/runs/${run.id}/artifacts/public.txt`,
+        { id: run.id, name: "public.txt" },
+        200,
+        "public detail",
       ],
-      ["/api/runs/:id/stream", "/stream", { id: run.id }],
-      ["/api/stream", "", {}],
+      [
+        "/api/runs/:id/artifacts/:name",
+        `/api/runs/${run.id}/artifacts/owner_diagnostics`,
+        { id: run.id, name: "owner_diagnostics" },
+        404,
+        "not found",
+      ],
+      ["/api/runs/:id/stream", `/api/runs/${run.id}/stream`, { id: run.id }, 200, ": connected"],
+      ["/api/stream", "/api/stream", {}, 200, ": connected"],
     ] as const) {
-      const route = table[key] as Route;
-      const path = key === "/api/stream" ? key : `/api/runs/${run.id}${suffix}`;
+      const entry = table[key];
+      const route = (typeof entry === "function" ? entry : (entry as { GET: Route }).GET) as Route;
       const res = await route(
         requestWithParams(
           `http://localhost:7400${path}`,
@@ -117,21 +132,35 @@ test("owner diagnostics stay out of local and proxy REST, artifacts and SSE", as
         expect(await res.text()).not.toContain(marker);
         continue;
       }
+      expect(res.status).toBe(status);
       if (key.endsWith("stream")) {
+        expect(res.headers.get("content-type")).toBe("text/event-stream");
         const reader = res.body?.getReader();
         if (!reader) throw new Error("missing SSE");
-        let output = new TextDecoder().decode((await reader.read()).value);
-        store.recordOwnerDiagnostic(
-          { runId: run.id, kind: "run-error", text: `${marker}-live` },
-          "public detail",
-        );
-        store.addEvent({ runId: run.id, type: "log", message: "public sentinel" });
-        if (key === "/api/stream") store.updateRun(run.id, { title: "public sentinel" });
-        while (!output.includes("public sentinel"))
-          output += new TextDecoder().decode((await reader.read()).value);
+        try {
+          let output = new TextDecoder().decode((await reader.read()).value);
+          expect(output).toContain(publicText);
+          store.recordOwnerDiagnostic(
+            { runId: run.id, kind: "run-error", text: `${marker}-live` },
+            "public detail",
+          );
+          expect(ownerDiagnostics(store.db, run.id).at(-1)?.text).toBe(`${marker}-live`);
+          store.addEvent({ runId: run.id, type: "log", message: "public sentinel" });
+          if (key === "/api/stream") store.updateRun(run.id, { title: "public sentinel" });
+          while (!output.includes("public sentinel")) {
+            const chunk = await reader.read();
+            expect(chunk.done).toBe(false);
+            output += new TextDecoder().decode(chunk.value);
+          }
+          expect(output).not.toContain(marker);
+        } finally {
+          await reader.cancel();
+        }
+      } else {
+        const output = await res.text();
+        expect(output).toContain(publicText);
         expect(output).not.toContain(marker);
-        await reader.cancel();
-      } else expect(await res.text()).not.toContain(marker);
+      }
     }
   }
 });
