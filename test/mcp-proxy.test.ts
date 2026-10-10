@@ -175,47 +175,62 @@ test("holdout literals inside code are redacted at word boundaries, not by withh
   }
 });
 
-test("short holdout literals are withheld when percent- or Unicode-encoded in paths, patches and reports", async () => {
-  const percent = [..."maxWords"].map((ch) => `%${ch.charCodeAt(0).toString(16)}`).join("");
-  const unicode = [..."maxWords"]
-    .map((ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`)
-    .join("");
-  const c = await changeFixture(f, {
-    "hello.txt": `hello\n${percent}\n`,
-    "unicode.txt": `const label = "${unicode}";\n`,
-    [`${percent}.txt`]: "path\n",
-  });
-  f.factory.store.setRunState(c.run.id, {
-    holdout: {
-      scenarios: [
-        { id: "H-1", description: "Use maxWords.", steps: "Run it.", expected: "Done.", edge_case: false },
-      ],
-    },
-  });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", `Saw ${unicode} and ${percent}.`);
-  const connections = await changeConnections();
-  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
-  try {
-    for (const conn of [connections.direct, connections.proxy]) {
-      const read = async (file: number) =>
-        resultValue<ChangePage>(
-          await conn.client.callTool({ name: "limitless_get_change", arguments: { ...pin, file } }),
-        );
-      const first = await read(0);
-      expect(first.files).toHaveLength(3);
-      const pages = [first, await read(1), await read(2)];
-      for (const page of pages) {
-        const output = JSON.stringify(page);
-        for (const secret of [percent, unicode, unicode.replaceAll("\\", "\\\\"), "maxWords"])
-          expect(output).not.toContain(secret);
+test.each(["maxWords", "cafe\u0301"])(
+  "short holdout literal %s is withheld when percent- or Unicode-encoded in paths, patches and reports",
+  async (literal) => {
+    const percent = [...Buffer.from(literal)]
+      .map((byte) => `%${byte.toString(16).padStart(2, "0")}`)
+      .join("");
+    const unicode = [...literal].map((ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
+    const c = await changeFixture(f, {
+      "hello.txt": `hello\n${percent}\n`,
+      "unicode.txt": `const label = "${unicode}";\n`,
+      [`${percent}.txt`]: "path\n",
+    });
+    f.factory.store.setRunState(c.run.id, {
+      holdout: {
+        scenarios: [
+          {
+            id: "H-1",
+            description: `Use "${literal}".`,
+            steps: "Run it.",
+            expected: "Done.",
+            edge_case: false,
+          },
+        ],
+      },
+    });
+    f.factory.store.putArtifact(c.run.id, "report.md", "report", `Saw ${unicode} and ${percent}.`);
+    const connections = await changeConnections();
+    const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const read = async (file: number) =>
+          resultValue<ChangePage>(
+            await conn.client.callTool({ name: "limitless_get_change", arguments: { ...pin, file } }),
+          );
+        const first = await read(0);
+        expect(first.files).toHaveLength(3);
+        const pages = [first, await read(1), await read(2)];
+        for (const page of pages) {
+          const output = JSON.stringify(page);
+          for (const secret of [
+            percent,
+            unicode,
+            unicode.replaceAll("\\", "\\\\"),
+            literal,
+            literal.normalize("NFKC"),
+          ])
+            expect(output).not.toContain(secret);
+        }
+        expect(first.reports[0]?.text).toBe("[withheld: holdout text]");
+        expect(pages.filter((page) => page.diff.text === "[withheld: holdout text]")).toHaveLength(2);
       }
-      expect(first.reports[0]?.text).toBe("[withheld: holdout text]");
-      expect(pages.filter((page) => page.diff.text === "[withheld: holdout text]")).toHaveLength(2);
+    } finally {
+      await connections.close();
     }
-  } finally {
-    await connections.close();
-  }
-});
+  },
+);
 
 test("a rendered report never exposes a clipped holdout scenario description", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });

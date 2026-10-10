@@ -119,7 +119,12 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const distinctive = [...details]
     .filter((detail) => detail.length >= DISTINCTIVE_LENGTH)
     .map((value) => ({ value, entry: 0 }));
-  const boundary = pattern && new RegExp(pattern.source, "iu");
+  const boundary =
+    pattern &&
+    new RegExp(
+      [...details].map((detail) => holdoutBoundaryPattern(detail.normalize("NFKC").toLowerCase())).join("|"),
+      "iu",
+    );
   // Any detail, however short, that appears once text is decoded or normalized withholds the value.
   const encoded = (text: string) => {
     const layers = normalizedLayers(text);
