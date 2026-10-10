@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -14,6 +14,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
+
+// Each scenario drives the real script, git and fake tools (about 4 s on an idle machine); under CPU
+// load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const script = resolve("scripts/land-pr.sh");
 const entry = "secret-host.example";
