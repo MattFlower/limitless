@@ -110,6 +110,25 @@ export function captureDarwinInvocationLeader(pid: number): DarwinInvocationLead
   return { pid, birth, session, group: info[2] ?? 0 };
 }
 
+export function darwinCallerAncestors(): Set<number> {
+  const protectedPids = new Set([1, process.pid, process.ppid]);
+  const info = new Uint32Array(16);
+  let pid = process.ppid;
+  const seen = new Set<number>();
+  while (pid > 1 && !seen.has(pid)) {
+    seen.add(pid);
+    protectedPids.add(pid);
+    if (symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength) !== info.byteLength) {
+      const address = symbols.__error();
+      const errno = address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);
+      throw new Error(`Process ancestry could not be confirmed for ${pid} (errno ${errno})`);
+    }
+    pid = info[1] ?? 0;
+  }
+  if (pid > 1) throw new Error(`Process ancestry could not be confirmed for ${pid}: cycle`);
+  return protectedPids;
+}
+
 export function markedDarwinProcesses(
   uid: number,
   marker: string,
@@ -117,6 +136,7 @@ export function markedDarwinProcesses(
   started: number,
   directories: readonly string[],
   leader: DarwinInvocationLeader | null = null,
+  protectedPids: ReadonlySet<number> = darwinCallerAncestors(),
 ): number[] {
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
@@ -126,6 +146,11 @@ export function markedDarwinProcesses(
     throw new Error("Process enumeration could not be confirmed");
 
   const info = new Uint32Array(16); // proc_bsdshortinfo: 64 bytes
+  if (symbols.proc_pidinfo(process.pid, 13, 0, ptr(info), info.byteLength) !== info.byteLength)
+    throw new Error("Caller process group inspection failed");
+  const callerGroup = info[2];
+  const callerSession = symbols.getsid(process.pid);
+  if (callerSession < 0) throw new Error("Caller process session inspection failed");
   const args = new Uint8Array(1024 * 1024);
   const size = new BigUint64Array(1);
   const token = Buffer.from(`\0LIMITLESS_INVOCATION=${marker}\0`);
@@ -145,7 +170,8 @@ export function markedDarwinProcesses(
     return errno() === 3 /* ESRCH */;
   };
   for (const pid of processes.subarray(0, count / 4)) {
-    if (!pid) continue;
+    // A marked caller must not seed ancestry membership for unrelated children.
+    if (!pid || protectedPids.has(pid)) continue;
     if (
       symbols.proc_pidinfo(pid, 13 /* PROC_PIDT_SHORTBSDINFO */, 0, ptr(info), info.byteLength) !==
       info.byteLength
@@ -197,6 +223,8 @@ export function markedDarwinProcesses(
     // environment. Detached descendants also belong through a proven parent chain.
     if (
       leader?.pid === group &&
+      group !== callerSession &&
+      group !== callerGroup &&
       ((leader.session === group && session === group) || (leader.group === group && processGroup === group))
     )
       membership.add(pid);
