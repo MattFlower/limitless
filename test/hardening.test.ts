@@ -28,6 +28,8 @@ import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import {
   invocationScratch,
+  linuxAncestryInspection,
+  linuxCallerAncestors,
   ProcessTerminationError,
   processInspection,
   processScope,
@@ -84,6 +86,96 @@ async function loadNativeInspection(directory: string) {
 }
 
 describe("process handling", () => {
+  test("Linux ancestry fails closed when an ancestor disappears or is inaccessible", () => {
+    const ancestor = 424245;
+    for (const code of ["ENOENT", "ESRCH", "EACCES", "EPERM", "EIO"])
+      for (const failedPid of [process.ppid, ancestor]) {
+        const inspected: number[] = [];
+        expect(() =>
+          linuxCallerAncestors((pid) => {
+            inspected.push(pid);
+            if (pid === failedPid) throw Object.assign(new Error("ancestor unavailable"), { code });
+            return `${pid} (parent with spaces) S ${ancestor} 0 0`;
+          }),
+        ).toThrow("Process ancestry could not be confirmed");
+        expect(inspected).toEqual(failedPid === ancestor ? [process.ppid, ancestor] : [process.ppid]);
+      }
+    expect(
+      linuxCallerAncestors((pid) => `${pid} (parent) S ${pid === process.ppid ? ancestor : 1} 0 0`),
+    ).toEqual(new Set([1, process.pid, process.ppid, ancestor]));
+  });
+
+  test("unreadable Linux parent prevents discovery and signalling of a marked grandparent", async () => {
+    const ancestor = 424245;
+    const uid = process.getuid?.() ?? 0;
+    const controller = new AbortController();
+    const selected: number[] = [];
+    const signals: number[] = [];
+    const kill = process.kill.bind(process);
+    const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (signal === "SIGTERM" || signal === "SIGKILL") {
+        signals.push(pid);
+        if (pid === ancestor) return true;
+      }
+      return kill(pid, signal);
+    });
+    try {
+      const outcome = await linuxAncestryInspection.run(
+        (pid) => {
+          if (pid === process.ppid) throw Object.assign(new Error("hidden parent"), { code: "EACCES" });
+          return `${pid} (ancestor) S 1 0 0`;
+        },
+        () =>
+          processInspection.run(
+            async (withEnvironment, marker, pids) => {
+              if (pids) selected.push(...pids);
+              return [
+                `${process.pid} ${uid} S scanner LIMITLESS_PROCESS_SCAN=${marker}`,
+                `${ancestor} ${uid} S ancestor${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`,
+              ].join("\n");
+            },
+            () =>
+              runProcess({
+                cmd: [process.execPath, "-e", "console.log('ready'); setInterval(() => {}, 1000)"],
+                cwd: dir,
+                env: {},
+                signal: controller.signal,
+                onStdoutLine: () => controller.abort(),
+              }).catch((error: unknown) => error),
+          ),
+      );
+      expect(outcome).toBeInstanceOf(ProcessTerminationError);
+      expect(String(outcome)).toContain("Process ancestry could not be confirmed");
+      expect(selected).toEqual([]);
+      expect(signals).not.toContain(ancestor);
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  test("Darwin discovery fails closed on unavailable ancestry and still cleans confirmed members", async () => {
+    const native = await loadNativeInspection(dir);
+    native.setProtectedMarker("protected-caller");
+    const leader = native.captureDarwinInvocationLeader(native.leaderPid);
+    const discover = () =>
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "protected-caller",
+        native.leaderPid,
+        100,
+        [dir],
+        leader,
+      );
+    for (const errno of [1, 2, 3, 13, 5])
+      for (const pid of [process.ppid, native.ancestorPid]) {
+        native.setAncestorFailure({ pid, errno });
+        expect(() => native.darwinCallerAncestors()).toThrow("Process ancestry could not be confirmed");
+        expect(discover).toThrow("Process ancestry could not be confirmed");
+      }
+    native.setAncestorFailure(null);
+    expect(discover()).toEqual([native.memberPid, native.leaderPid]);
+  });
+
   test("nested scratch restores the invocation root and unregisters cleaned paths", async () => {
     const scope = {
       signal: new AbortController().signal,
@@ -105,6 +197,39 @@ describe("process handling", () => {
     expect(invocationScratch.getStore()).toBeUndefined();
     expect(scope.scratchDirs.size).toBe(0);
   });
+
+  test("native discovery excludes marked ancestors before deriving descendant membership", async () => {
+    const native = await loadNativeInspection(dir);
+    native.setProtectedMarker("protected-caller");
+    native.setUnreadableProcess({ parent: process.pid, born: 0n, cwd: { path: dir } });
+    const leader = native.captureDarwinInvocationLeader(native.leaderPid);
+    expect(
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "protected-caller",
+        native.leaderPid,
+        100,
+        [dir],
+        leader,
+      ),
+    ).toEqual([native.memberPid, native.leaderPid]);
+  });
+
+  test.each(["caller-session", "caller-group"] as const)(
+    "native discovery never claims a process solely through the %s",
+    async (membership) => {
+      const native = await loadNativeInspection(dir);
+      native.setMembership(membership);
+      expect(
+        native.markedDarwinProcesses(process.getuid?.() ?? 0, "unmarked", process.pid, 100, [dir], {
+          pid: process.pid,
+          birth: "1:0",
+          session: process.pid,
+          group: process.pid,
+        }),
+      ).toEqual([]);
+    },
+  );
 
   test("native discovery rejects a recycled leader's session/group identity", async () => {
     const native = await loadNativeInspection(dir);
@@ -525,6 +650,73 @@ describe("process handling", () => {
       if (pid !== undefined) {
         try {
           process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+  });
+
+  test("marked caller and ancestors are never signalled, while an owned child is stopped", async () => {
+    const uid = process.getuid?.() ?? 0;
+    const protectedPids = [process.pid, process.ppid];
+    const control = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const controller = new AbortController();
+    const kill = process.kill.bind(process);
+    const signals: number[] = [];
+    let pid: number | undefined;
+    const killSpy = spyOn(process, "kill").mockImplementation((target, signal) => {
+      if (signal === "SIGTERM" || signal === "SIGKILL") {
+        signals.push(target);
+        // A regression must record the unsafe target without killing the test or its ancestors.
+        if (protectedPids.includes(target)) throw new Error("protected process signalled");
+      }
+      return kill(target, signal);
+    });
+    try {
+      await processInspection.run(
+        async (withEnvironment, marker) => {
+          const tagged = (target: number, command: string) =>
+            `${target} ${uid} S ${command}${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`;
+          let alive = false;
+          if (pid !== undefined) {
+            try {
+              alive = kill(pid, 0);
+            } catch {}
+          }
+          return [
+            ...protectedPids.map(
+              (target) =>
+                tagged(target, "protected") +
+                (target === process.pid && withEnvironment ? ` LIMITLESS_PROCESS_SCAN=${marker}` : ""),
+            ),
+            // This unmarked sibling shares the caller's group/session, but is not owned.
+            `${control.pid} ${uid} S control`,
+            ...(alive && pid !== undefined ? [tagged(pid, "child")] : []),
+          ].join("\n");
+        },
+        () =>
+          runProcess({
+            cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+            cwd: dir,
+            env: {},
+            signal: controller.signal,
+            onStdoutLine: (line) => {
+              pid = Number(line);
+              controller.abort();
+            },
+          }),
+      );
+      expect(signals).toContain(pid ?? 0);
+      expect(signals.some((target) => protectedPids.includes(target))).toBe(false);
+      expect(signals).not.toContain(control.pid);
+      expect(kill(control.pid ?? 0, 0)).toBe(true);
+      expect(() => kill(pid ?? 0, 0)).toThrow();
+      pid = undefined;
+    } finally {
+      killSpy.mockRestore();
+      control.kill("SIGKILL");
+      if (pid !== undefined) {
+        try {
+          kill(pid, "SIGKILL");
         } catch {}
       }
     }
