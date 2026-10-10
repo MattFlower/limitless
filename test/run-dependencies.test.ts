@@ -50,7 +50,9 @@ test("shared validation rejects malformed, unknown, self and cyclic graphs witho
   for (const input of [null, "id", {}, [1], [null], [" "], [first.id, ""]]) reject(input, /depend/i);
   reject(["absent"], "absent");
   const time = spyOn(Date, "now").mockReturnValue(123456);
-  const random = spyOn(Math, "random").mockReturnValue(0.5);
+  const random = spyOn(crypto, "getRandomValues").mockImplementation(
+    <T extends ArrayBufferView>(array: T) => array,
+  );
   try {
     reject([newId()], "self-dependency");
   } finally {
