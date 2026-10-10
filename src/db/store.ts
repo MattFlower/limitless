@@ -64,7 +64,9 @@ const RUN_ID = /^[0-9a-z]{1,32}$/;
 
 export function newId(prefix = ""): string {
   const time = Date.now().toString(36);
-  const rand = Math.random().toString(36).slice(2, 6).padEnd(4, "0");
+  const rand = Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) =>
+    n.toString(36).padStart(7, "0"),
+  ).join("");
   return `${prefix}${time}${rand}`;
 }
 

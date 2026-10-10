@@ -583,6 +583,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     },
   );
 
+  // Six full pipeline runs (about 17 s alone), so under the parallel suite it needs more than 30 s.
   test("quota headroom is checked only for providers the shadow roster can reach, and unknown headroom skips it", async () => {
     const omega: ProviderDef = {
       id: "omega",
@@ -639,7 +640,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       expect(shadow).toMatchObject({ status: "skipped", reason, usage: { invocations: 0 } });
       expect(calls.shadow.length + calls.verifier.length).toBe(0);
     }
-  });
+  }, 60_000);
 
   /** Quick roster: a finder that answers at once and a lens finder that waits until released or aborted. */
   const slowShadow = (calls: Calls, gate: Promise<void>, ignoreAbort = false) => {
