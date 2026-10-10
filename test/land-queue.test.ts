@@ -32,6 +32,7 @@ setDefaultTimeout(30_000);
 const SLUG = "test/repo";
 const url = (n: number) => `https://github.com/${SLUG}/pull/${n}`;
 const gateLogPath = () => join(root, "gates.log");
+const gateReleasePath = () => join(root, "release");
 
 let root: string;
 let bare: string;
@@ -71,9 +72,12 @@ beforeEach(async () => {
   await sh(["git", "init", "-q", "-b", "main"], { cwd: seed });
   writeFileSync(join(seed, "README.md"), "base\n");
   // Each check brackets its own run in a log, so overlapping land checks are visible.
+  // Keep the overlap window even when the release file already exists.
+  // Most tests release checks immediately; stop tests hold them until shutdown.
+  writeFileSync(gateReleasePath(), "");
   writeFileSync(
     join(seed, ".limitless.toml"),
-    `[gates]\nchecks = [{ name = "land", run = "echo start >> '${gateLogPath()}'; sleep 0.3; echo end >> '${gateLogPath()}'" }]\n`,
+    `[gates]\nchecks = [{ name = "land", run = "echo start >> '${gateLogPath()}'; sleep 0.3; while [ ! -e '${gateReleasePath()}' ]; do sleep 0.05; done; echo end >> '${gateLogPath()}'" }]\n`,
   );
   await sh(["git", "add", "."], { cwd: seed });
   await sh(["git", "commit", "-qm", "base"], { cwd: seed });
@@ -665,6 +669,7 @@ test.each([
 });
 
 test("stopping mid-check leaves a later entry unstarted", async () => {
+  rmSync(gateReleasePath());
   const first = delivered(1, "pr-1");
   const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
@@ -678,6 +683,9 @@ test("stopping mid-check leaves a later entry unstarted", async () => {
   q.request({ target: second.run.id });
   await waitFor(() => gateLog().length === 1);
   await q.stop(); // the daemon stops with the second entry still queued
+  // A check that survived the stop would now finish its 0.3 s sleep and 50 ms poll and log "end".
+  writeFileSync(gateReleasePath(), "");
+  await Bun.sleep(800);
   expect(store.getLandEntry(1)?.state).toBe("checking");
   for (let i = 0; i < 20; i++) await settleIdle();
   expect(store.getLandEntry(2)?.state).toBe("queued");
@@ -737,6 +745,7 @@ test("two queues on one database never run two checks for the same repository", 
 });
 
 test("a restart during checking re-runs the checks from the start", async () => {
+  rmSync(gateReleasePath());
   const pr = delivered(1, "pr-1");
   const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
@@ -748,6 +757,7 @@ test("a restart during checking re-runs the checks from the start", async () => 
   await first.stop(); // the daemon stopped mid-check
   expect(store.getLandEntry(entry.id)?.state).toBe("checking");
   expect(gateLog()).toEqual(["start"]);
+  writeFileSync(gateReleasePath(), "");
   queue();
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", attempts: 2 });
