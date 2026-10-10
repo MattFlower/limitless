@@ -52,6 +52,7 @@ import {
 } from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -1035,7 +1036,7 @@ export class Store {
         return {
           limited: this.updateRun(owner.id, { status: "needs_human", error: "review round limit reached" }),
         };
-      const round = rounds.length + 1;
+      const round = all.length + 1;
       const grant = { owner, prUrl: review.prUrl, head: review.reviewedSha };
       const run = this.insertRun(repo, request(round), false, { prUrl: review.prUrl, grant });
       this.db
@@ -1068,12 +1069,22 @@ export class Store {
       .run(prUrl, head, source, now, landEntryId);
   }
 
+  /** Draft deferrals are rechecked so the same head can start once the PR is ready. */
   pendingConflictTriggers(): { id: number; prUrl: string; head: string }[] {
     return this.db
       .query<{ id: number; prUrl: string; head: string }, []>(
-        "SELECT id, pr_url AS prUrl, observed_sha AS head FROM conflict_triggers WHERE state = 'pending' ORDER BY id",
+        "SELECT id, pr_url AS prUrl, observed_sha AS head FROM conflict_triggers WHERE state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft') ORDER BY id",
       )
       .all();
+  }
+
+  failConflictLookup(id: number, error: unknown): void {
+    const reason = redactCredentials(error instanceof Error ? error.message : String(error));
+    this.db
+      .query(`UPDATE conflict_triggers SET attempts = attempts + 1, reason = ?,
+      state = CASE WHEN attempts + 1 >= 5 THEN 'skipped' ELSE 'pending' END
+      WHERE id = ? AND (state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft'))`)
+      .run(reason, id);
   }
 
   startConflictTrigger(
@@ -1099,7 +1110,7 @@ export class Store {
         .get(trigger.prUrl) as Row | null;
       const owner = row && toRun(row);
       const repo = owner && this.getRepo(owner.repoId);
-      const seen = parse<typeof observation>(this.githubPrData(trigger.prUrl), observation);
+      const seen = observation;
       const rounds = this.reviewRounds(trigger.prUrl);
       const conflicts = rounds.filter((r) => r.kind === "conflict");
       const reason =
@@ -1128,22 +1139,20 @@ export class Store {
                       ? "PR is draft"
                       : seen.headRefOid !== trigger.head
                         ? "PR head moved"
-                        : this.prHead(trigger.prUrl)?.sha && this.prHead(trigger.prUrl)?.sha !== trigger.head
-                          ? "PR head observation moved"
-                          : rounds.some((r) => !TERMINAL_STATUSES.includes(r.status))
-                            ? "round in flight"
-                            : conflicts.some((r) => r.reviewedSha === trigger.head && r.deliveredSha)
-                              ? "head already resolved"
-                              : conflicts.filter((r) => (r.createdAt ?? 0) > now - 86_400_000).length >= 3
-                                ? "conflict round daily cap reached"
-                                : null));
+                        : rounds.some((r) => !TERMINAL_STATUSES.includes(r.status))
+                          ? "round in flight"
+                          : conflicts.some((r) => r.reviewedSha === trigger.head && r.deliveredSha)
+                            ? "head already resolved"
+                            : conflicts.filter((r) => (r.createdAt ?? 0) > now - 86_400_000).length >= 3
+                              ? "conflict round daily cap reached"
+                              : null));
       if (reason || !owner || !repo || !owner.branch) {
         this.db
           .query("UPDATE conflict_triggers SET state = 'skipped', reason = ? WHERE id = ?")
           .run(reason, id);
         return null;
       }
-      const round = conflicts.length + 1;
+      const round = rounds.length + 1;
       const run = this.insertRun(
         repo,
         {
@@ -1172,7 +1181,7 @@ export class Store {
         VALUES (?, ?, ?, ?, 'conflict', ?, '[]', ?)`)
         .run(run.id, owner.id, trigger.prUrl, round, trigger.head, now);
       this.db
-        .query("UPDATE conflict_triggers SET state = 'started', run_id = ? WHERE id = ?")
+        .query("UPDATE conflict_triggers SET state = 'started', run_id = ?, reason = NULL WHERE id = ?")
         .run(run.id, id);
       return run;
     });
@@ -1186,8 +1195,9 @@ export class Store {
     round: number;
     reviewedSha: string;
     findings: ReviewFinding[];
+    deliveredSha: string | null;
   } | null {
-    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, kind, reviewed_sha AS reviewedSha, findings
+    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, kind, reviewed_sha AS reviewedSha, delivered_sha AS deliveredSha, findings
       FROM review_rounds WHERE run_id = ?`;
     const row = this.db.query(sql).get(runId) as {
       sourceRunId: string;
@@ -1196,18 +1206,22 @@ export class Store {
       round: number;
       reviewedSha: string;
       findings: string;
+      deliveredSha: string | null;
     } | null;
     const owner = row && this.getRun(row.sourceRunId);
     if (!row || !owner) return null;
-    const { prUrl, round, reviewedSha, kind } = row;
-    return { owner, kind, prUrl, round, reviewedSha, findings: parse(row.findings, []) };
+    const { prUrl, round, reviewedSha, kind, deliveredSha } = row;
+    validateRoundKind(kind);
+    return { owner, kind, prUrl, round, reviewedSha, deliveredSha, findings: parse(row.findings, []) };
   }
 
   reviewRounds(prUrl: string): ReviewRound[] {
     const sql = `SELECT rr.run_id AS runId, rr.round, rr.kind, runs.status, rr.reviewed_sha AS reviewedSha,
         rr.delivered_sha AS deliveredSha, rr.findings, rr.created_at AS createdAt
       FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
-    return (this.db.query(sql).all(prUrl) as Row[]).map((r) => ({
+    const rows = this.db.query(sql).all(prUrl) as Row[];
+    for (const row of rows) validateRoundKind(row.kind);
+    return rows.map((r) => ({
       ...(r as unknown as ReviewRound),
       findings: parse(r.findings, []),
     }));
@@ -1223,12 +1237,16 @@ export class Store {
       if (round?.kind === "conflict") {
         this.db
           .query(
-            "UPDATE land_entries SET reason = ? WHERE pr_url = ? AND state = 'blocked' AND reason LIKE 'conflicts with %'",
+            `UPDATE land_entries SET reason = ? WHERE id IN
+              (SELECT land_entry_id FROM conflict_triggers WHERE run_id = ?)
+              AND state = 'blocked' AND reason = 'conflicts with ' || base_branch`,
           )
-          .run(`conflict resolved at ${sha}; approve the new head to land`, round.prUrl);
+          .run(`conflict resolved at ${sha}; approve the new head to land`, runId);
         this.db
-          .query("UPDATE review_approvals SET stale_reason = ? WHERE pr_url = ? AND stale_reason IS NULL")
-          .run(`conflict resolved at ${sha}`, round.prUrl);
+          .query(
+            "UPDATE review_approvals SET stale_reason = ? WHERE pr_url = ? AND stale_reason IS NULL AND sha <> ?",
+          )
+          .run(`conflict resolved at ${sha}`, round.prUrl, sha);
       }
     })();
     this.publishFeed();
@@ -2733,4 +2751,8 @@ export class Store {
       .query("DELETE FROM auth_sessions WHERE created_at <= ? OR last_seen_at <= ?")
       .run(createdBefore, seenBefore).changes;
   }
+}
+
+function validateRoundKind(kind: unknown): asserts kind is ReviewRound["kind"] {
+  if (kind !== "review" && kind !== "conflict") throw new Error("Invalid review round kind");
 }

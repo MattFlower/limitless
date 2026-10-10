@@ -383,6 +383,36 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 
+  test("an empty delivery-time resolution stops without pushing or repeating the resolver", async () => {
+    const bare = await githubFixture();
+    let implementations = 0;
+    let reviews = 0;
+    const f = start(async (s): Promise<FakeReply> => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "verify") return { structured: pass };
+      if (role === "review") {
+        reviews++;
+        await advanceBase(bare, "greeting.txt", "base intent\n");
+        return { structured: approve };
+      }
+      implementations++;
+      return { files: { "greeting.txt": implementations === 1 ? "PR intent\n" : "base intent\n" } };
+    });
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Change the greeting", profile: "standard" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    const finished = f.store.getRun(run.id);
+    expect(finished?.error).toBe("the resolution leaves no change against main");
+    expect(implementations).toBe(2); // Original implementation, then one resolution.
+    expect(reviews).toBe(1);
+    expect(
+      (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+    ).toBe("");
+  });
+
   test("quick approval is the verified fallback when post-merge gates fail", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),

@@ -49,7 +49,7 @@ async function printDigest(
     },
     {
       label: "PRs awaiting review",
-      kinds: ["run.pr_opened", "review.round_delivered", "review.approved"],
+      kinds: ["run.pr_opened", "review.round_delivered", "conflict.round_delivered", "review.approved"],
       items: new Map<string, FeedItem>(),
     },
     {

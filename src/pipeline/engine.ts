@@ -284,7 +284,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (verifiedFailure && !terminationBlocked) {
+    if (
+      verifiedFailure &&
+      !terminationBlocked &&
+      !ctx.state.terminalReason?.startsWith("the resolution leaves no change against ")
+    ) {
       try {
         ctx.state.needsHumanReason = message;
         await ctx.save("needs-human");
@@ -1104,6 +1108,15 @@ async function oneRound(
     if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
       throw new Error("Missing expected merge state for resolution checks");
     await validateMerge(cwd, ctx.state.preRebaseHead, baseSha);
+    const trees = await worktreeGit(["git", "rev-parse", "HEAD^{tree}", `${baseSha}^{tree}`], { cwd });
+    const [headTree, baseTree] = trees.stdout.trim().split("\n");
+    if (headTree === baseTree) {
+      const owner = reviewRound(ctx)?.owner;
+      const base = (owner ? owner.baseBranch : ctx.run.baseBranch) ?? ctx.repo.defaultBranch;
+      ctx.state.terminalReason = `the resolution leaves no change against ${base}`;
+      await ctx.save();
+      throw new NeedsHumanError(ctx.state.terminalReason);
+    }
   }
 
   // --- gates
@@ -1220,7 +1233,6 @@ async function oneRound(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
-        allowEmpty: resolution,
         configDir: ctx.deps.cfg.paths.configDir,
         allow: ctx.run.allow ?? [],
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
@@ -1330,6 +1342,29 @@ async function oneRound(
         ...(fixSha ? { resolved: resolvedPriorFindings(earlierReviews) } : {}),
       }
     : undefined;
+  const firstParentPatch =
+    resolution && ctx.state.conflictFiles?.length
+      ? redactPrivate(
+          redactCredentials(
+            (
+              await worktreeGit(
+                [
+                  "git",
+                  "--literal-pathspecs",
+                  "diff",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  `${reviewedSha}^1..${reviewedSha}`,
+                  "--",
+                  ...ctx.state.conflictFiles,
+                ],
+                { cwd },
+              )
+            ).stdout,
+          ),
+          privateStrings(),
+        )
+      : undefined;
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
@@ -1359,6 +1394,7 @@ async function oneRound(
           previous: previousReview,
           headSha: reviewedSha,
           resolution,
+          firstParentPatch,
           ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
@@ -1861,32 +1897,38 @@ async function deliverReviewRound(
   };
   await withPrLock(prUrl, async () => {
     const pr = await readPrHead(gh, prUrl, ctx.signal);
-    if (review.kind === "conflict" && pr.isDraft) throw new Error("the PR is draft");
-    if (review.kind === "conflict" && pr.autoMerge)
-      await gh(["pr", "merge", prUrl, "--disable-auto"], ctx.signal);
-    const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
-    const pushed = remote === head;
-    const { grant, run } = stored();
-    assertFactoryBranchPush(ctx.repo, run, grant, pr, remote, pushed ? head : reviewedSha);
-    // An earlier attempt's push: record it, ending any push mark that attempt left behind.
-    if (pushed) ctx.store.endPrPush(prUrl, head);
-    else {
-      // A barrier around the push: lookups from before it, or made while it runs, cannot record a
-      // head or an approval afterwards, even if the push lands but its acknowledgement is lost.
-      ctx.store.beginPrPush(prUrl, head, ctx.run.id);
-      let landed: string | null = head;
-      try {
-        await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget, head);
-      } catch (error) {
-        // An uncertain outcome: what the remote holds decides.
-        landed = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
-        if (landed !== head) throw error;
-      } finally {
-        ctx.store.endPrPush(prUrl, landed);
+    const deliveredSha = ctx.store.reviewRound(ctx.run.id)?.deliveredSha;
+    if (deliveredSha) {
+      head = deliveredSha;
+      stored();
+    } else {
+      if (review.kind === "conflict" && pr.isDraft) throw new Error("the PR is draft");
+      if (review.kind === "conflict" && pr.autoMerge)
+        await gh(["pr", "merge", prUrl, "--disable-auto"], ctx.signal);
+      const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
+      const pushed = remote === head;
+      const { grant, run } = stored();
+      assertFactoryBranchPush(ctx.repo, run, grant, pr, remote, pushed ? head : reviewedSha);
+      // An earlier attempt's push: record it, ending any push mark that attempt left behind.
+      if (pushed) ctx.store.endPrPush(prUrl, head);
+      else {
+        // A barrier around the push: lookups from before it, or made while it runs, cannot record a
+        // head or an approval afterwards, even if the push lands but its acknowledgement is lost.
+        ctx.store.beginPrPush(prUrl, head, ctx.run.id);
+        let landed: string | null = head;
+        try {
+          await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget, head);
+        } catch (error) {
+          // An uncertain outcome: what the remote holds decides.
+          landed = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
+          if (landed !== head) throw error;
+        } finally {
+          ctx.store.endPrPush(prUrl, landed);
+        }
       }
+      stored();
+      ctx.store.markRoundDelivered(ctx.run.id, head);
     }
-    stored();
-    ctx.store.markRoundDelivered(ctx.run.id, head);
     if (review.kind === "conflict") {
       const marker = `<!-- limitless-conflict-round:${ctx.run.id} -->`;
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")

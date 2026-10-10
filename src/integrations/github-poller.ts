@@ -1,7 +1,9 @@
 import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { sh } from "../util/proc.ts";
+import { processConflictTriggers } from "../pipeline/conflict-round.ts";
+import { redactCredentials, sh } from "../util/proc.ts";
 import { ciDecision } from "./ci-classifier.ts";
+import type { GhRunner } from "./github.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
 
 export type GitHubResponse = {
@@ -277,6 +279,7 @@ export function observedPrs(store: Store, fallback?: GitHubPrClient): GitHubPrCl
 
 export interface PollerOptions {
   client?: GitHubClient;
+  gh?: GhRunner;
   seconds?: number;
   ciReruns?: boolean;
   log?: (message: string) => void;
@@ -288,11 +291,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   const { client = ghClient, log = console.warn } = opts;
   const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
   const normal = Math.max(15, opts.seconds ?? 45) * 1000;
-  for (const trigger of store.pendingConflictTriggers()) {
-    const snapshot = saved(store.githubPrData(trigger.prUrl));
-    if (snapshot) store.startConflictTrigger(trigger.id, snapshot, now());
-  }
   const observedAt = new Map<string, number>();
+  let conflictCheckedAt = -Infinity;
   const blocks = new Map<string, { until: number; failures: number }>();
   const abort = new AbortController();
   let [cooldownUntil, failures, running, stopped, settled] = [0, 0, false, false, false];
@@ -453,7 +453,14 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     clear(timer);
     let next = now() + 60_000;
     try {
-      next = Math.max(cooldownUntil, retryAt || Math.min(...plan().map((r) => r.due)));
+      next = Math.max(
+        cooldownUntil,
+        retryAt ||
+          Math.min(
+            ...plan().map((r) => r.due),
+            store.pendingConflictTriggers().length ? Math.max(now(), conflictCheckedAt + 60_000) : Infinity,
+          ),
+      );
     } catch (e) {
       log(`GitHub poll scheduling failed: ${String(e)}`);
     }
@@ -463,6 +470,11 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     if (stopped || running) return;
     running = true;
     try {
+      conflictCheckedAt = now();
+      await processConflictTriggers(store, now, opts.gh, abort.signal).catch((error: unknown) => {
+        if (!stopped) log(redactCredentials(`GitHub conflict lookup failed: ${String(error)}`));
+      });
+      if (stopped) return;
       const order = plan().sort((a, b) => Number(a.repo <= first) - Number(b.repo <= first));
       first = order[0]?.repo ?? ""; // round robin: the next pass starts after this one's first repository
       for (const { repo, prs, due, key } of order) {

@@ -47,7 +47,11 @@ const fixtureApi =
       const id = decodeURIComponent(url.pathname.slice("/api/runs/".length));
       const related = items.filter((i) => i.runId === id);
       const prItem = related.find(
-        (i) => i.kind === "run.pr_opened" || i.kind.startsWith("review.") || i.kind.startsWith("land."),
+        (i) =>
+          i.kind === "run.pr_opened" ||
+          i.kind.startsWith("review.") ||
+          i.kind.startsWith("conflict.") ||
+          i.kind.startsWith("land."),
       );
       const prUrl = prItem ? (prItem.data.prUrl ?? prItem.data.url ?? `pr/${id}`) : null;
       const terminal = related.findLast((i) =>
@@ -567,4 +571,19 @@ test("digest shows the remaining open question and keeps a newly delivered unobs
   } finally {
     f.close();
   }
+});
+
+test("digest lists delivered conflict rounds under PRs awaiting review", async () => {
+  const items = [item(1, "conflict.round_delivered", { data: { prUrl: "https://github.com/o/r/pull/1" } })];
+  const lines: string[] = [];
+  await digestCommand(
+    [],
+    {},
+    {
+      api: fixtureApi(items, async <T>() => ({ items, nextAfter: 1, pruned: false }) as T),
+      print: (line) => lines.push(line),
+    },
+  );
+  expect(lines[1]).toContain("PRs awaiting review: 1");
+  expect(lines[2]).toContain("PRs awaiting review: #1");
 });
