@@ -1177,7 +1177,8 @@ for (const kind of ["harness", "gate", "preview"] as const)
       },
     });
     const id = await run(f);
-    await wait(() => existsSync(pidFile));
+    // The shell creates the file before it writes both pids into it.
+    await wait(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim().split(/\s+/).length === 2);
     const pids = new Map<number, string>();
     try {
       await retainPids(pids, readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
@@ -1369,7 +1370,8 @@ exec '${path}-delegate' "$@"
         rmSync(pidFile, { force: true });
         f = await reopen(f);
       }
-      await wait(() => existsSync(pidFile));
+      // The shell creates the file before it writes both pids into it.
+      await wait(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim().split(/\s+/).length === 2);
       await retainPids(pids, readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number));
       expect(pids.size).toBe(2);
       expect(f.store.getRun(id)).toMatchObject({ status: "running", stage: "deliver" });
