@@ -373,6 +373,8 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
 /** A review round's record and the grant it alone gives to push onto its original run's PR branch. */
 function reviewRound(ctx: RunContext) {
   const review = ctx.store.reviewRound(ctx.run.id);
+  if (review && review.kind !== "review" && review.kind !== "conflict")
+    throw new Error(`Unsupported review round kind: ${redactCredentials(review.kind)}`);
   return (
     review && { ...review, grant: { owner: review.owner, prUrl: review.prUrl, head: review.reviewedSha } }
   );

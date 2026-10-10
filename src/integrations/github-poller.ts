@@ -370,6 +370,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     };
     // One nudge per UNKNOWN episode on a head: a known value ends the episode.
     save(unknown ? (prev?.nudged ?? null) : null);
+    if (!same || snap.isDraft === false || snap.state !== "OPEN")
+      store.recheckDraftConflictTriggers(pr.url, snap);
     for (const trigger of store.pendingConflictTriggers()) {
       if (trigger.prUrl === pr.url) store.startConflictTrigger(trigger.id, snap, now());
     }
