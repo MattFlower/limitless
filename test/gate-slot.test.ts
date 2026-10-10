@@ -2,9 +2,9 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { DeployClock } from "../src/cli/deploy-wait.ts";
+import { DaemonTimeoutError, type DeployClock } from "../src/cli/deploy-wait.ts";
 import { gateSlotCommand, type LeaseClient, localLeaseClient, withGateLease } from "../src/cli/gate-slot.ts";
-import { Semaphore } from "../src/gates/slots.ts";
+import { GATE_LEASE_EXPIRY_MS, Semaphore } from "../src/gates/slots.ts";
 import { waitClock } from "./wait-clock.ts";
 
 function rig(limit = 1) {
@@ -494,6 +494,7 @@ test("late acquisition responses are retired after bounded fallback", async () =
   let executions = 0;
   const work = withGateLease("late", async () => ++executions, {
     ...f,
+    maxWaitMs: 2000,
     client: (body, signal) => (body.name ? late.promise : f.client(body, signal)),
     warn: (s) => warnings.push(s),
   });
@@ -503,7 +504,174 @@ test("late acquisition responses are retired after bounded fallback", async () =
   late.resolve({ id, acquired: true });
   await f.time.flush();
   expect(f.slots.snapshot().occupied).toBe(0);
-  expect(warnings.join()).toContain("timed out");
+  expect(warnings.join()).toContain("deadline");
+});
+
+test("a failed waiting poll retries the same lease and starts only after acquisition", async () => {
+  for (const timeout of [false, true]) {
+    const f = rig();
+    const release = await f.slots.acquire(signal, undefined, "pipeline");
+    const warnings: string[] = [];
+    let polls = 0,
+      executions = 0;
+    const requests: Record<string, unknown>[] = [];
+    const work = withGateLease(
+      "land",
+      async () => {
+        executions++;
+        expect(f.slots.snapshot().holders).toEqual(["land"]);
+      },
+      {
+        ...f,
+        clock: { ...f.clock, sleep: (ms) => new Promise((resolve) => f.clock.timeout(resolve, ms)) },
+        warn: (s) => warnings.push(s),
+        client: (body, signal) => {
+          requests.push(body);
+          if (body.id && !body.release && ++polls === 1) {
+            if (timeout) return new Promise(() => {});
+            throw new Error("ECONNREFUSED");
+          }
+          return f.client(body, signal);
+        },
+      },
+    );
+    try {
+      await f.time.flush();
+      await f.time.advance(250);
+      if (timeout) await f.time.advance(2000);
+      expect(executions).toBe(0);
+      expect(warnings).toEqual([]);
+      release();
+      await f.time.flush();
+      await f.time.advance(250);
+      await work;
+      expect(executions).toBe(1);
+      expect(polls).toBe(2);
+      expect(requests[2]).toEqual(requests[1]);
+      expect(warnings).toEqual([]);
+    } finally {
+      release();
+    }
+    expect(f.slots.snapshot().occupied).toBe(0);
+    expect(f.time.pending).toBe(0);
+  }
+});
+
+test("failed polls fall back only after silence exceeds lease expiry or the wait deadline", async () => {
+  for (const maxWaitMs of [500, 60_000]) {
+    const f = rig();
+    const release = await f.slots.acquire(signal);
+    const warnings: string[] = [];
+    const start = f.clock.now();
+    let lastReply = start,
+      executions = 0;
+    try {
+      await withGateLease(
+        "land",
+        async () => {
+          executions++;
+          const elapsed = f.clock.now() - start;
+          if (maxWaitMs === 500) expect(elapsed).toBe(maxWaitMs);
+          else {
+            expect(f.clock.now() - lastReply).toBeGreaterThan(GATE_LEASE_EXPIRY_MS);
+            expect(elapsed).toBeLessThan(maxWaitMs);
+          }
+        },
+        {
+          ...f,
+          maxWaitMs,
+          warn: (s) => warnings.push(s),
+          client: (body, signal) => {
+            if (!body.release && body.id && f.clock.now() - start >= (maxWaitMs === 500 ? 250 : 10_000))
+              throw new DaemonTimeoutError();
+            if (!body.release) lastReply = f.clock.now();
+            return f.client(body, signal);
+          },
+        },
+      );
+      expect(executions).toBe(1);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(maxWaitMs === 500 ? "deadline" : "daemon is unreachable");
+    } finally {
+      release();
+    }
+    expect(f.slots.snapshot().occupied).toBe(0);
+    expect(f.time.pending).toBe(0);
+  }
+});
+
+test("a refused first request falls back immediately with an unreachable warning", async () => {
+  const f = rig();
+  const warnings: string[] = [];
+  const start = f.clock.now();
+  let requests = 0;
+  expect(
+    await withGateLease("offline", async () => 7, {
+      ...f,
+      warn: (s) => warnings.push(s),
+      client: async () => {
+        requests++;
+        throw new Error("ECONNREFUSED");
+      },
+    }),
+  ).toBe(7);
+  expect(requests).toBe(1);
+  expect(f.clock.now()).toBe(start);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toContain("daemon is unreachable");
+  expect(warnings[0]).toContain("ECONNREFUSED");
+  expect(f.time.pending).toBe(0);
+});
+
+test("a timed-out first registration is retired while its retry waits for acquisition", async () => {
+  const f = rig();
+  const release = await f.slots.acquire(signal, undefined, "pipeline");
+  const late = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>();
+  const warnings: string[] = [];
+  let abandoned: Awaited<ReturnType<LeaseClient>> | undefined,
+    registrations = 0,
+    executions = 0;
+  const work = withGateLease(
+    "land",
+    async () => {
+      executions++;
+      expect(f.slots.snapshot().holders).toEqual(["land"]);
+    },
+    {
+      ...f,
+      clock: { ...f.clock, sleep: (ms) => new Promise((resolve) => f.clock.timeout(resolve, ms)) },
+      warn: (s) => warnings.push(s),
+      client: async (body, signal) => {
+        const result = await f.client(body, signal);
+        if (body.name && ++registrations === 1) {
+          abandoned = result;
+          return late.promise;
+        }
+        return result;
+      },
+    },
+  );
+  try {
+    await f.time.flush();
+    await f.time.advance(2000);
+    expect(executions).toBe(0);
+    await f.time.advance(250);
+    expect(registrations).toBe(2);
+    if (!abandoned) throw new Error("missing first registration");
+    late.resolve(abandoned);
+    await f.time.flush();
+    expect(f.slots.heartbeat(abandoned.id)).toBeUndefined();
+    release();
+    await f.time.flush();
+    await f.time.advance(250);
+    await work;
+    expect(executions).toBe(1);
+    expect(warnings).toEqual([]);
+  } finally {
+    release();
+  }
+  expect(f.slots.snapshot().occupied).toBe(0);
+  expect(f.time.pending).toBe(0);
 });
 
 test("CLI preserves arguments, environment, cwd and statuses; rejects invalid options and spawn errors", async () => {

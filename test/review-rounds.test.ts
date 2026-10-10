@@ -816,3 +816,19 @@ test("an approve that agrees only with a push's intended head is refused, and st
   await restart();
   expect(factory.store.approvalFor(PR_URL)).toBeNull();
 });
+
+test("a delivered review round finishes after restart without undoing a branch reset", async () => {
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  await restart({
+    "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-complete" },
+  });
+  expect(await settle(roundId, (run) => run.status === "running")).toMatchObject({ status: "running" });
+  expect(factory.store.reviewRound(roundId)?.deliveredSha).toBe(await remoteHead());
+  await sh(["git", "update-ref", `refs/heads/${BRANCH}`, reviewed], { cwd: remote });
+  await restart();
+  expect(await settle(roundId)).toMatchObject({ status: "succeeded" });
+  expect(await remoteHead()).toBe(reviewed);
+  expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+});
