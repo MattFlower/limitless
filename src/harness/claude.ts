@@ -206,12 +206,13 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
         ...[...denyRead, ...(commands?.root ?? [])].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]),
       );
       editTools = write.map((p) => `Edit(/${p}/**)`);
-      denied.push(...protect.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
-      filesystem = { allowWrite: write, denyWrite: protect, disabled: false };
+      const denyWrite = [...protect, ...(commands?.root ?? [])];
+      denied.push(...denyWrite.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
+      filesystem = { allowWrite: write, denyWrite, disabled: false };
     } else {
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
-      const commands = invocationCommands(scratch);
+      const commands = invocationCommands(scratch, spec.cwd);
       const denyRead = [...(confined?.deny ?? explicit), ...commands.root];
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
       denied.push(...[...explicit, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
@@ -222,7 +223,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       if (confined) readTools = readable.map((p) => `Read(/${p}/**)`);
       filesystem = {
         allowWrite: [scratch],
-        denyWrite: [realpathSync(spec.cwd)],
+        denyWrite: [realpathSync(spec.cwd), ...commands.root],
         ...(denyRead.length ? { denyRead } : {}),
         // Takes precedence over denyRead, so the private roots may contain cwd and scratch. Only an
         // unconfined reader receives command wrappers, so only it may read its own.

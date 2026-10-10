@@ -139,27 +139,50 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
     write: spellings(granted),
     protect: spellings(protectedPaths),
     denyRead: privateReadPaths(),
-    commands: invocationCommands(scratchDir),
+    commands: invocationCommands(scratchDir, cwd),
   };
 }
 
 const COMMAND_ROOT = `limitless-commands-${process.getuid?.() ?? 0}`;
+let sharedCommandRoot: string | undefined;
 
 /** Both spellings of the factory-owned root that holds each invocation's wrappers and lease capability. */
-export function commandRoots(): string[] {
-  return [...new Set([join(tmpdir(), COMMAND_ROOT), join(realpathSync(tmpdir()), COMMAND_ROOT)])];
+export function commandRoots(cwd = process.cwd(), scratchDir?: string): string[] {
+  const writable = spellings([cwd, ...(scratchDir ? [scratchDir] : [])]);
+  const overlaps = (root: string) => writable.some((path) => within(path, root) || within(root, path));
+  if (!sharedCommandRoot) {
+    // Scratch's parent is outside the checkout even when the daemon inherits an in-checkout TMPDIR.
+    const candidates = [
+      tmpdir(),
+      ...(scratchDir && basename(scratchDir) === SCRATCH_NAME ? [dirname(scratchParent(scratchDir))] : []),
+    ];
+    for (const base of candidates) {
+      const root = join(realpathSync(base), COMMAND_ROOT);
+      if (!spellings([root]).some(overlaps)) {
+        sharedCommandRoot = root;
+        break;
+      }
+    }
+  }
+  if (!sharedCommandRoot || spellings([sharedCommandRoot]).some(overlaps))
+    throw new Error("Command wrapper root must be outside the checkout and scratch");
+  // Keep one root across invocations; changing TMPDIR must not expose an earlier capability.
+  return spellings([sharedCommandRoot]);
 }
 
 /** One invocation's wrapper directory, named for its scratch so every profile can grant it alone. */
-export function commandDir(scratchDir: string): string {
+export function commandDir(scratchDir: string, cwd = process.cwd()): string {
   const parent = realpathSync(scratchParent(scratchDir));
   const name = new Bun.CryptoHasher("sha256").update(parent).digest("hex").slice(0, 32);
-  return join(realpathSync(tmpdir()), COMMAND_ROOT, name);
+  const root = commandRoots(cwd, scratchDir)[0];
+  if (!root) throw new Error("Missing command wrapper root");
+  return join(root, name);
 }
 
 /** Creates the root for this user only; a pre-existing root someone else controls is refused. */
-export function createCommandRoot(): string {
-  const root = join(realpathSync(tmpdir()), COMMAND_ROOT);
+export function createCommandRoot(cwd = process.cwd(), scratchDir?: string): string {
+  const root = commandRoots(cwd, scratchDir)[0];
+  if (!root) throw new Error("Missing command wrapper root");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const stat = lstatSync(root);
   if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
@@ -174,10 +197,10 @@ export interface InvocationCommands {
   own: string[];
 }
 
-export function invocationCommands(scratchDir: string): InvocationCommands {
-  const root = commandRoots();
+export function invocationCommands(scratchDir: string, cwd = process.cwd()): InvocationCommands {
+  const root = commandRoots(cwd, scratchDir);
   if (basename(scratchDir) !== SCRATCH_NAME) return { root, own: [] };
-  const own = commandDir(scratchDir);
+  const own = commandDir(scratchDir, cwd);
   // Only an invocation given wrappers has a directory to read; nothing else is granted.
   return { root, own: existsSync(own) ? root.map((r) => join(r, basename(own))) : [] };
 }

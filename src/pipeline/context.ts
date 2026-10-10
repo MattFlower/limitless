@@ -789,6 +789,7 @@ export class RunContext {
             dispatch();
             return withSlottedCommands(
               opts.confineReads ? [] : (this.state.slottedCommands ?? []),
+              spec.cwd,
               scratchDir,
               this.deps.cfg.port,
               (data) =>

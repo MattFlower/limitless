@@ -36,13 +36,26 @@ two. The worker did not independently recompute the aggregate or measure a new d
 
 Factory-owned wrapper scripts and their bundled client/config live in one per-invocation
 directory under a private factory root in the system temporary directory, outside the writable
-roots. Its `config.json` holds the bearer capability for the invocation's leases, so every agent
+roots. Root selection canonicalizes and checks both the checkout and scratch; if inherited
+`TMPDIR` overlaps either, it tries the scratch parent's base. The selected root stays fixed
+for the daemon's lifetime, and later invocations whose writable roots overlap it are refused.
+Its `config.json` holds the bearer capability for the invocation's leases, so every agent
 and gate profile denies reads under that root and grants only the invocation's own directory:
 the Seatbelt profile denies `file-read-data` (contents and listings), Codex profiles mark the
 root `none` and the own directory `read`, and Claude denies native `Read` there and adds the root
-to the reader sandbox's `denyRead` with the own directory in `allowRead`. The capability is
+to the reader sandbox's `denyRead` with the own directory in `allowRead`. Seatbelt explicitly
+denies `file-write*` under the shared root, including relocation; Claude's native edit rules
+and reader sandbox also deny writes there. The capability is
 never placed in the environment; nested commands are recognized by a separate nonce. The
 probe tests also check, per sandbox, that the own capability is readable and another
 invocation's is not. Private holdout authors have stronger read confinement
 that denies that location, so receive no wrapper. Implement, verify and review invocations
 receive it. Gate/baseline/land/deploy processes retain their existing command environments.
+
+The capability-root regression was checked on 2026-10-10 (UTC, from `date -u`) with a fresh
+process inheriting `TMPDIR` inside a fixture checkout. It selected a root outside the checkout
+and scratch, retained it after a `TMPDIR` change, and refused a later overlapping invocation.
+That test failed against the previous implementation. The real Seatbelt regression additionally
+attempts cross-invocation reads, capability forgery and relocation of both another invocation's
+directory and the shared root, with an allowed checkout write as its control. It is skipped here
+because nested confinement is unavailable; no live confinement result is claimed.

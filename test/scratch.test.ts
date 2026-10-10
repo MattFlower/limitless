@@ -171,7 +171,7 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
       enabled: true,
       failIfUnavailable: true,
       allowUnsandboxedCommands: false,
-      filesystem: { allowWrite: [realpathSync(scratch)], denyWrite: [realpathSync(cwd)] },
+      filesystem: { allowWrite: [realpathSync(scratch)], denyWrite: [realpathSync(cwd), ...commandRoots()] },
     });
     expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
     // Claude derives its sandbox TMPDIR from the parent; another name would silently diverge.
@@ -1537,7 +1537,7 @@ test("claude editors confine Bash and native edits to the same roots; project se
       failIfUnavailable: true,
       allowUnsandboxedCommands: true,
       excludedCommands: [],
-      filesystem: { denyWrite: [join(cwd, ".git"), admin], disabled: false },
+      filesystem: { denyWrite: [join(cwd, ".git"), admin, ...commandRoots()], disabled: false },
     });
     expect(sandbox.filesystem.allowWrite.sort()).toEqual([cwd, realpathSync(scratchDir)].sort());
     const allowed = args.slice(args.indexOf("--allowedTools") + 1, args.indexOf("--disallowedTools"));

@@ -61,12 +61,14 @@ async function withTwoInvocations(
   const dir = (path?: string) => path?.split(delimiter)[0] ?? "";
   await withSlottedCommands(
     [["bun", "test"]],
+    a.cwd,
     a.scratch,
     1,
     () => {},
     (pathA) =>
       withSlottedCommands(
         [["bun", "test"]],
+        b.cwd,
         b.scratch,
         1,
         () => {},
@@ -85,6 +87,7 @@ test("every profile denies the shared capability root and grants only the invoca
     // Claude editors' outer Seatbelt profile (and gates, which share writeRoots).
     const profile = seatbeltProfile(writeRoots(a.cwd, a.scratch));
     expect(profile).toContain(`(deny file-read-data (subpath "${root}")`);
+    expect(profile).toContain(`(deny file-write* (subpath "${root}")`);
     expect(profile).toMatch(new RegExp(`\\(allow file-read-data[^\\n]*\\(subpath "${a.dir}"\\)`));
     expect(profile).not.toContain(b.dir);
 
@@ -103,9 +106,11 @@ test("every profile denies the shared capability root and grants only the invoca
     };
     const editor = settings("edit");
     expect(editor.args).toContain(`Read(/${root}/**)`);
+    expect(editor.sandbox.filesystem.denyWrite).toContain(root);
     const reader = settings("readonly");
     expect(reader.args).toContain(`Read(/${root}/**)`);
     expect(reader.sandbox.filesystem.denyRead).toContain(root);
+    expect(reader.sandbox.filesystem.denyWrite).toContain(root);
     expect(reader.sandbox.filesystem.allowRead).toEqual(commandRoots().map((r) => join(r, basename(a.dir))));
     const confined = buildClaudeArgs({ ...a.spec, mode: "readonly", confineReads: true }, "s");
     expect(
@@ -113,6 +118,85 @@ test("every profile denies the shared capability root and grants only the invoca
     ).not.toContain(a.dir);
   });
 });
+
+// A fresh process must choose its root with TMPDIR already in the checkout, rather than reuse
+// the safe root selected by an earlier test. All paths remain inside this test's private fixture.
+async function inCheckoutTmpdir(probe: boolean) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "capability-tmpdir-")));
+  cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+  const cwd = join(root, "checkout"),
+    scratch = join(root, "scratch", `claude-${process.getuid?.() ?? 0}`);
+  mkdirSync(cwd);
+  mkdirSync(scratch, { recursive: true });
+  const code = `
+    import {dirname, join} from 'node:path';
+    import {mkdirSync, readFileSync, existsSync} from 'node:fs';
+    import {createCommandRoot, commandDir, commandRoots, writeRoots} from ${JSON.stringify(join(import.meta.dir, "../src/harness/scratch.ts"))};
+    import {seatbeltProfile, SANDBOX_EXEC} from ${JSON.stringify(join(import.meta.dir, "../src/harness/sandbox.ts"))};
+    import {runProcess, agentEnv} from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
+    const cwd=${JSON.stringify(cwd)}, scratch=${JSON.stringify(scratch)};
+    const root=createCommandRoot(cwd,scratch), own=commandDir(scratch,cwd), other=join(root,'other');
+    mkdirSync(own); mkdirSync(other);
+    await Bun.write(join(own,'config.json'),'own'); await Bun.write(join(other,'config.json'),'other');
+    const profile=seatbeltProfile(writeRoots(cwd,scratch));
+    let overlapping=false;
+    try {writeRoots(dirname(root),scratch)} catch {overlapping=true}
+    // A later environment change must not switch which capabilities the profiles protect.
+    process.env.TMPDIR=scratch;
+    const stable=commandRoots(cwd,scratch).includes(root);
+    const results={root,profile,overlapping,stable,probes:[]};
+    if (${probe}) {
+      const run=(script,...args)=>runProcess({cmd:[SANDBOX_EXEC,'-p',profile,'/bin/sh','-c',script,'sh',...args],cwd,env:agentEnv(),timeoutMs:10000});
+      for(const [script,args] of [
+        ['cat "$1"',[join(own,'config.json')]],
+        ['cat "$1"',[join(other,'config.json')]],
+        ['mv "$1" "$2" && cat "$2/config.json"',[other,join(cwd,'stolen')]],
+        ['mv "$1" "$2"',[root,join(cwd,'relocated')]],
+        ['printf forged > "$1"',[join(own,'config.json')]],
+        ['printf allowed > "$1"',[join(cwd,'allowed')]],
+      ]) {const p=await run(script,...args); results.probes.push({exit:p.exitCode,stdout:p.stdout});}
+      if(readFileSync(join(other,'config.json'),'utf8')!=='other'||!existsSync(root)) throw Error('capability moved');
+    }
+    console.log(JSON.stringify(results));
+  `;
+  const result = await runProcess({
+    cmd: [process.execPath, "--eval", code],
+    cwd,
+    env: agentEnv({ TMPDIR: cwd }),
+    timeoutMs: 10000,
+  });
+  expect(result.exitCode).toBe(0);
+  const observed: {
+    root: string;
+    profile: string;
+    overlapping: boolean;
+    stable: boolean;
+    probes: { exit: number; stdout: string }[];
+  } = JSON.parse(result.stdout);
+  return { cwd, scratch, observed };
+}
+
+test("in-checkout daemon TMPDIR selects a stable capability root outside writable roots and refuses overlapping invocations", async () => {
+  const { cwd, scratch, observed } = await inCheckoutTmpdir(false);
+  expect(observed.root.startsWith(`${cwd}/`)).toBe(false);
+  expect(observed.root.startsWith(`${scratch}/`)).toBe(false);
+  expect(observed.overlapping).toBe(true);
+  expect(observed.stable).toBe(true);
+  expect(observed.profile).toContain(`(deny file-write* (subpath "${observed.root}")`);
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `in-checkout daemon TMPDIR capabilities cannot be relocated, forged or read across invocations (${seatbeltSkip ?? "available"})`,
+  async () => {
+    const { observed } = await inCheckoutTmpdir(true);
+    expect(observed.probes[0]).toEqual({ exit: 0, stdout: "own" });
+    for (const p of observed.probes.slice(1, 5)) {
+      expect(p.exit).not.toBe(0);
+      expect(p.stdout).toBe("");
+    }
+    expect(observed.probes[5]).toEqual({ exit: 0, stdout: "" });
+  },
+);
 
 test("a capability presented to another invocation's socket is refused, and dies with its invocation", async () => {
   let stolen: WrapperConfig | undefined;

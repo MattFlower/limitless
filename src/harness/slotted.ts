@@ -19,6 +19,7 @@ const wrapperBundle = () =>
 /** Outside the invocation's writable roots and unreadable to other invocations. Unset config allocates nothing. */
 export async function withSlottedCommands<T>(
   commands: SlottedCommands,
+  cwd: string,
   scratch: string,
   port: number,
   event: (data: TestWait) => void,
@@ -26,9 +27,9 @@ export async function withSlottedCommands<T>(
 ): Promise<T> {
   if (!commands.length) return invoke();
   const source = await wrapperBundle();
-  createCommandRoot();
+  createCommandRoot(cwd, scratch);
   // Every agent and gate profile denies reads under the shared root except to this directory's owner.
-  const directory = commandDir(scratch);
+  const directory = commandDir(scratch, cwd);
   mkdirSync(directory, { mode: 0o700 });
   const session = new AgentTestSession(event);
   const unix = join(scratch, `slot-${crypto.randomUUID().slice(0, 8)}.sock`);

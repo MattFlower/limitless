@@ -252,6 +252,7 @@ function findKey(obj: unknown, key: string): unknown {
  */
 function readerFilesystem(spec: AgentSpec, scratch: string): string {
   const entries: [string, string][] = [];
+  const commands = invocationCommands(scratch, spec.cwd);
   if (spec.confineReads) {
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
     entries.push([":minimal", "read"]);
@@ -261,7 +262,7 @@ function readerFilesystem(spec: AgentSpec, scratch: string): string {
   } else {
     entries.push(["/", "read"]);
     for (const path of validateDenyRead(spec, scratch)) entries.push([path, "none"]);
-    entries.push(...commandEntries(invocationCommands(scratch)));
+    entries.push(...commandEntries(commands));
     entries.push([scratch, "write"]);
   }
   const unique = new Map(entries);

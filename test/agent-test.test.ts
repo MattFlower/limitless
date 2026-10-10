@@ -278,6 +278,7 @@ test("installed wrappers catch cd/env and nested scripts, use scratch transport 
   try {
     await withSlottedCommands(
       [...f.config.commands, ["bash", "test"]],
+      f.root,
       scratch,
       1,
       (data) => {
@@ -330,6 +331,7 @@ test("empty commands install no wrappers and pass no PATH override", async () =>
   const f = fixture();
   await withSlottedCommands(
     [],
+    f.root,
     "unused scratch",
     1,
     () => {
@@ -363,6 +365,7 @@ test.each(["development", "production"])(
         ["bun", "test"],
         ["npm", "test"],
       ],
+      cwd,
       scratch,
       1,
       () => {},
@@ -402,6 +405,7 @@ test("a leased full suite lets nested slotted commands reuse its slot", async ()
   try {
     await withSlottedCommands(
       f.config.commands,
+      f.root,
       scratch,
       1,
       () => {},

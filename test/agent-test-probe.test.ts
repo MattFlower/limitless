@@ -55,8 +55,8 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
         },
       };
       // A capability of this invocation and of another one, in the shared factory-owned root.
-      const own = commandDir(scratch),
-        other = join(createCommandRoot(), `probe-other-${crypto.randomUUID()}`);
+      const own = commandDir(scratch, cwd),
+        other = join(createCommandRoot(cwd, scratch), `probe-other-${crypto.randomUUID()}`);
       for (const dir of [own, other]) {
         mkdirSync(dir, { mode: 0o700 });
         writeFileSync(join(dir, "config.json"), "{}", { mode: 0o400 });
