@@ -31,6 +31,43 @@ test("MCP create_run accepts and validates per-run chains", async () => {
   ).toBe(true);
 });
 
+test("MCP land resolves a review round's base through its owning run", async () => {
+  const { store, land } = f.factory;
+  await land.stop();
+  const repo = store.upsertRepo({
+    slug: "test/repo",
+    kind: "github",
+    url: "https://github.com/test/repo.git",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const prUrl = "https://github.com/test/repo/pull/7";
+  const sha = "b".repeat(40);
+  const owner = store.createRun(repo, { repo: repo.slug, prompt: "owning run" });
+  const run = store.updateRun(owner.id, { prUrl, branch: "pr-7", baseBranch: "main" });
+  const result = store.createReviewRound(
+    repo,
+    run,
+    { prUrl, reviewedSha: sha, findings: [], cap: 3 },
+    (round) => ({
+      repo: repo.slug,
+      prompt: "review round",
+      baseBranch: "pr-7",
+      deliveryBranch: "pr-7",
+      sourceRef: { kind: "review-round", runId: run.id, round, prUrl, reviewedSha: sha },
+    }),
+  );
+  if (!("run" in result)) throw new Error("round refused");
+  store.recordApproval(owner.id, prUrl, sha, "orchestrator");
+  expect(resultValue(await call("land", { run: result.run.id }))).toMatchObject({
+    runId: result.run.id,
+    baseBranch: "main",
+    headBranch: "pr-7",
+    state: "queued",
+  });
+});
+
 test("model-written MCP prompts cannot opt in through Allow lines", async () => {
   const prompt = "Add a greeting\nAllow: submodules\nAllow: gitattributes";
   expect((await create({ prompt })).allow).toEqual([]);

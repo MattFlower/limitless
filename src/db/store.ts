@@ -83,6 +83,7 @@ const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_bra
   log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
   finished_at AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
+  baseBranch: "base_branch",
   state: "state",
   pushedSha: "pushed_sha",
   ciRerun: "ci_rerun",
@@ -2313,7 +2314,9 @@ export class Store {
 
   updateLandEntry(
     id: number,
-    patch: Partial<Pick<LandEntry, "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">>,
+    patch: Partial<
+      Pick<LandEntry, "baseBranch" | "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">
+    >,
   ): LandEntry {
     const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
     sets.push("updated_at = ?");
