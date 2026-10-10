@@ -37,14 +37,18 @@ test("no HTTP MCP tool result or error includes owner diagnostics", async () => 
   const reads = [
     [
       "limitless_get_run",
-      { id: run.id },
+      { id: run.id, full: true },
       {
         id: run.id,
         error: "public",
         events: expect.arrayContaining([expect.objectContaining({ message: "public event" })]),
       },
     ],
-    ["limitless_list_runs", { status: "failed", limit: 1 }, [{ id: run.id, error: "public" }]],
+    [
+      "limitless_list_runs",
+      { status: "failed", limit: 1 },
+      { runs: [{ id: run.id, error: "public" }], hasMore: false },
+    ],
     ["limitless_feed", { after: 0, wait: 0 }, { items: [{ runId: run.id }] }],
     ["limitless_status", { run: run.id }, { run: run.id, state: "Failed" }],
     ["limitless_providers", {}, [{ id: "fake" }]],
