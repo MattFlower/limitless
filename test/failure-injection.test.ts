@@ -185,8 +185,10 @@ function factory(
   factories.push(f);
   return f;
 }
+// Confined gates and land checks run the restart scenarios about 3x slower than an unconfined run
+// (13 s vs 4.3 s measured on 2026-10-09), so a 10 s barrier failed land checks with nothing wrong.
 async function wait(check: () => boolean | Promise<boolean>) {
-  const end = Date.now() + 10_000;
+  const end = Date.now() + 25_000;
   while (!(await check())) {
     if (Date.now() > end) throw new Error("barrier timed out");
     await Bun.sleep(5);
