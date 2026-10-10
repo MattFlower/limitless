@@ -57,7 +57,13 @@ import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
-import { assertProcessesStopped, CommandError, ProcessTerminationError, processScope } from "../util/proc.ts";
+import {
+  assertProcessesStopped,
+  CommandError,
+  ProcessTerminationError,
+  processScope,
+  redactCredentials,
+} from "../util/proc.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -402,7 +408,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     // A round's change is measured from the PR merged with its current base, not from the PR head.
-    const merged = review && (await mergeReviewBase(ctx, wt.path, review));
+    const merged = review?.kind === "review" && (await mergeReviewBase(ctx, wt.path, review));
     const baseSha =
       merged ||
       (reusingWorktree && ctx.state.flow !== "verify-change"
@@ -531,7 +537,25 @@ async function prepare(ctx: RunContext): Promise<void> {
         });
       }
     }
-    await ctx.setPhase("triage");
+    if (review?.kind === "conflict") {
+      ctx.run = store.updateRun(ctx.run.id, { resolvedProfile: "quick" });
+      const tip =
+        ctx.state.reviewBaseSha ??
+        (await fetchBase(cfg.paths, ctx.repo, review.owner.baseBranch ?? ctx.repo.defaultBranch, ctx.signal));
+      ctx.state.reviewBaseSha = tip;
+      await ctx.save("review-base-chosen");
+      if (await isAncestor(wt.path, tip, review.reviewedSha)) await ctx.setPhase("done");
+      else {
+        const result = await mergeForDelivery(ctx, wt.path, tip, review.reviewedSha);
+        if (result === "done") {
+          ctx.state.conflictRound = ctx.state.round;
+          ctx.state.pendingRebaseSha = tip;
+          ctx.state.preRebaseHead = review.reviewedSha;
+          ctx.state.implementedRound = ctx.state.round;
+        }
+        await ctx.setPhase("loop");
+      }
+    } else await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
       summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}${ctx.state.baselineCached ? "; baseline reused from cache" : ""}`,
@@ -1196,6 +1220,7 @@ async function oneRound(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
+        allowEmpty: resolution,
         configDir: ctx.deps.cfg.paths.configDir,
         allow: ctx.run.allow ?? [],
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
@@ -1824,6 +1849,7 @@ async function deliverReviewRound(
     const fresh = reviewRound(ctx);
     if (
       fresh?.prUrl !== prUrl ||
+      fresh.kind !== review.kind ||
       fresh.reviewedSha !== reviewedSha ||
       fresh.owner.id !== review.owner.id ||
       fresh.owner.branch !== branch
@@ -1835,6 +1861,9 @@ async function deliverReviewRound(
   };
   await withPrLock(prUrl, async () => {
     const pr = await readPrHead(gh, prUrl, ctx.signal);
+    if (review.kind === "conflict" && pr.isDraft) throw new Error("the PR is draft");
+    if (review.kind === "conflict" && pr.autoMerge)
+      await gh(["pr", "merge", prUrl, "--disable-auto"], ctx.signal);
     const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
     const pushed = remote === head;
     const { grant, run } = stored();
@@ -1847,7 +1876,7 @@ async function deliverReviewRound(
       ctx.store.beginPrPush(prUrl, head, ctx.run.id);
       let landed: string | null = head;
       try {
-        await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget);
+        await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget, head);
       } catch (error) {
         // An uncertain outcome: what the remote holds decides.
         landed = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
@@ -1858,6 +1887,19 @@ async function deliverReviewRound(
     }
     stored();
     ctx.store.markRoundDelivered(ctx.run.id, head);
+    if (review.kind === "conflict") {
+      const marker = `<!-- limitless-conflict-round:${ctx.run.id} -->`;
+      const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
+        .comments as { body?: string }[] | undefined;
+      if (!comments?.some((comment) => comment.body?.includes(marker))) {
+        const text = redactCredentials(
+          `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
+        );
+        await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
+        await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);
+      }
+      return;
+    }
     const { marker, text } = roundSection(ctx.run.id, review.round, review.findings);
     if (!pr.body.includes(marker))
       await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, pr.body + text);
@@ -2200,6 +2242,7 @@ async function mergeForDelivery(
   if (!before) throw new Error("Missing pre-merge HEAD");
   const conflicts = await prepareMerge(cwd, before, fetched);
   if (conflicts.length) {
+    ctx.state.conflictFiles = conflicts;
     ctx.state.round++;
     ctx.state.conflictRound = ctx.state.round;
     ctx.state.completedChecks = undefined;

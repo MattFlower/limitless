@@ -34,7 +34,7 @@ export const ghClient: GitHubClient = async (path, body, signal) => {
 };
 
 export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest {
-  id url headRefOid state isDraft mergeable mergeStateStatus updatedAt mergedAt mergedBy { login }
+  id url headRefOid headRefName isCrossRepository headRepository { nameWithOwner } state isDraft mergeable mergeStateStatus updatedAt mergedAt mergedBy { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion status completedAt url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
@@ -59,29 +59,36 @@ export type Context = {
 };
 const REQUIRED = ["id", "url", "headRefOid", "state", "mergeable", "mergeStateStatus", "updatedAt"] as const;
 type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState;
-type GqlPr = Base & {
-  isDraft?: boolean;
-  commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
-  reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
-  comments?: Conn<Activity>;
-  latestReviews?: Conn<{ state: string; author?: { login: string } | null }>;
+type HeadIdentity = {
+  headRefName?: string;
+  isCrossRepository?: boolean;
+  headRepository?: { nameWithOwner: string } | null;
 };
+type GqlPr = Base &
+  HeadIdentity & {
+    isDraft?: boolean;
+    commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
+    reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
+    comments?: Conn<Activity>;
+    latestReviews?: Conn<{ state: string; author?: { login: string } | null }>;
+  };
 /** A PR's normalized state; `failing` is reduced and sorted so reordering is not a change. */
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
 type Known = Omit<Base, (typeof MERGE)[number]> & Record<(typeof MERGE)[number], string | null>;
-export type PrSnapshot = Known & {
-  isDraft?: boolean;
-  ci: string | null;
-  ciKey?: string;
-  passing?: string[];
-  completed?: { name: string; time: string }[];
-  statusNames?: string[];
-  failing: { name: string; url: string | null }[];
-  truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
-  reviews?: string[]; // `login:state` of each reviewer's latest review
-  reviewComments?: Record<string, string[]>; // each review connection has its own oldest-first order
-  activity: Record<"review" | "review_comment" | "comment", string[]>;
-};
+export type PrSnapshot = Known &
+  HeadIdentity & {
+    isDraft?: boolean;
+    ci: string | null;
+    ciKey?: string;
+    passing?: string[];
+    completed?: { name: string; time: string }[];
+    statusNames?: string[];
+    failing: { name: string; url: string | null }[];
+    truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
+    reviews?: string[]; // `login:state` of each reviewer's latest review
+    reviewComments?: Record<string, string[]>; // each review connection has its own oldest-first order
+    activity: Record<"review" | "review_comment" | "comment", string[]>;
+  };
 type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null; ciPending?: boolean };
 const FAILING = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const PENDING = new Set(["PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED"]);
@@ -281,6 +288,10 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   const { client = ghClient, log = console.warn } = opts;
   const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
   const normal = Math.max(15, opts.seconds ?? 45) * 1000;
+  for (const trigger of store.pendingConflictTriggers()) {
+    const snapshot = saved(store.githubPrData(trigger.prUrl));
+    if (snapshot) store.startConflictTrigger(trigger.id, snapshot, now());
+  }
   const observedAt = new Map<string, number>();
   const blocks = new Map<string, { until: number; failures: number }>();
   const abort = new AbortController();
@@ -359,6 +370,9 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     };
     // One nudge per UNKNOWN episode on a head: a known value ends the episode.
     save(unknown ? (prev?.nudged ?? null) : null);
+    for (const trigger of store.pendingConflictTriggers()) {
+      if (trigger.prUrl === pr.url) store.startConflictTrigger(trigger.id, snap, now());
+    }
     settled ||= snap.state !== (prev?.state ?? "OPEN");
     const mainEpisode = store.getSetting<Record<string, { red: boolean }>>(`ci.main:${pr.repo}`, {});
     if (ciPending || (ciChanged && snap.ci === "SUCCESS" && Object.values(mainEpisode).some((e) => e.red))) {
