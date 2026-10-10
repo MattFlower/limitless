@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { z } from "zod";
 import type { Paths } from "../config.ts";
+import { isBranchName } from "../core/delivery.ts";
 import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
@@ -26,7 +28,7 @@ import {
 } from "../git/repos.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision } from "../integrations/ci-classifier.ts";
-import type { GhRunner } from "../integrations/github.ts";
+import { type GhRunner, runGh } from "../integrations/github.ts";
 import {
   ciRunsSchema,
   type GitHubPrView,
@@ -164,7 +166,7 @@ export class LandQueue {
    * Queue a land for a run id, a pull request URL or a pull request number. The approval is the
    * PR's recorded review approval; `sha` names one explicitly and must be the PR's current head.
    */
-  request(input: { target: string; sha?: string }): LandEntry {
+  async request(input: { target: string; sha?: string }): Promise<LandEntry> {
     const run = this.store.getRun(input.target) ?? this.store.runForPr(this.prRef(input.target));
     if (!run) throw new Error("run not found");
     const repo = this.store.getRepoBySlug(run.repoSlug);
@@ -172,22 +174,57 @@ export class LandQueue {
     if (!run.prUrl) throw new Error("run has no pull request");
     const observed = this.savedReport(run.prUrl);
     if (observed && observed.state !== "OPEN") throw new Error(`pull request is ${observed.state}`);
-    const approved = this.approval(run.prUrl, input.sha, observed?.head);
+    this.approval(run.prUrl, input.sha, observed?.head);
     const headBranch = run.deliveryBranch ?? run.branch;
     if (!headBranch) throw new Error("run has no delivery branch");
+    let baseBranch = "";
+    let blocked: string | undefined;
+    try {
+      baseBranch = await this.resolveBase(run, run.prUrl, headBranch);
+    } catch (error) {
+      if (!(error instanceof LandBlocked)) throw error;
+      blocked = error.message;
+    }
+    // A GitHub lookup may have been overtaken by a new head or review verdict.
+    const current = this.savedReport(run.prUrl);
+    if (current && current.state !== "OPEN") throw new Error(`pull request is ${current.state}`);
+    const approved = this.approval(run.prUrl, input.sha, current?.head);
     const entry = this.store.createLandEntry({
       runId: run.id,
       repo: repo.slug,
       prUrl: run.prUrl,
-      baseBranch: run.baseBranch ?? repo.defaultBranch,
+      baseBranch,
       headBranch,
       approvedSha: approved,
     });
     this.store.landFeed("land.queued", entry, `land queued at ${approved.slice(0, 12)}`, {
       state: entry.state,
     });
+    if (blocked) {
+      this.block(entry.id, blocked);
+      return this.store.getLandEntry(entry.id) ?? entry;
+    }
     this.pump(entry.repo);
     return entry;
+  }
+
+  /** Round delivery targets the PR head; only its owning run can supply the PR base. */
+  private async resolveBase(run: Run, prUrl: string, headBranch: string, signal?: AbortSignal) {
+    const round = this.store.reviewRound(run.id);
+    const owner = round?.owner ?? (run.sourceRef?.kind === "review-round" ? null : run);
+    const valid = (branch: unknown): branch is string =>
+      typeof branch === "string" && isBranchName(branch) && branch !== headBranch;
+    if (owner?.sourceRef?.kind !== "review-round" && valid(owner?.baseBranch)) return owner.baseBranch;
+    try {
+      const json = await (this.deps.gh ?? runGh)(["pr", "view", prUrl, "--json", "baseRefName"], signal);
+      const view = z.object({ baseRefName: z.string() }).safeParse(JSON.parse(String(json)));
+      if (view.success && valid(view.data.baseRefName)) return view.data.baseRefName;
+    } catch {
+      signal?.throwIfAborted();
+    }
+    throw new LandBlocked(
+      "cannot determine PR base branch: owning run and GitHub provide no valid base distinct from the head branch",
+    );
   }
 
   /** The approval that may land: the recorded review approval, or an explicit head that is the PR's. */
@@ -282,6 +319,12 @@ export class LandQueue {
    */
   private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
     const { repo, run } = this.context(entry);
+    if (!entry.baseBranch || entry.baseBranch === entry.headBranch) {
+      const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);
+      signal.throwIfAborted();
+      // Checks recorded against the head as its own base do not cover the resolved base.
+      entry = this.store.updateLandEntry(entry.id, { baseBranch, pushedSha: null, ciRerun: null });
+    }
     // The claim already moved the entry into `checking` and counted this attempt.
     this.log(`[land] ${entry.id}: checking ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`);
     const cache = await ensureCache(this.deps.paths, repo, signal);
