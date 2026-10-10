@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import * as baselineCache from "../src/gates/cache.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -123,10 +124,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         slots = gateSlots.limit;
       });
       afterEach(() => gateSlots.setLimit(slots));
-      // Each baseline attempt logs start and end around a sleep; adjacent starts mean overlap.
+      // Each attempt waits for its peers (bounded to 10 s); adjacent starts mean overlap.
       const overlapping = (log: string) => readFileSync(log, "utf8").includes("start\nstart\n");
-      const timed = (log: string, exit: number) =>
-        `test -f farewell.txt && exit 0; echo start >> '${log}'; sleep 1; echo end >> '${log}'; exit ${exit}`;
+      const timed = (log: string, exit: number) => {
+        // The failing leader's two sequential attempts skip waiting; only its waiters overlap.
+        const starts = exit === 0 ? "3" : `$(( $(grep -c '^start$' '${log}') <= 2 ? 0 : 4 ))`;
+        return `test -f farewell.txt && exit 0; echo start >> '${log}'; starts=${starts}; deadline=$(($(date +%s) + 10)); while [ $(grep -c '^start$' '${log}') -lt $starts ] && [ $(date +%s) -lt $deadline ]; do sleep 0.05; done; echo end >> '${log}'; exit ${exit}`;
+      };
 
       test("with the kill switch, same-base runs execute their baselines concurrently", async () => {
         const log = join(home, "gate-log");
@@ -144,7 +148,20 @@ describe("pipeline (fake agents, real git + gates)", () => {
         await commitGates(`[gates]\nchecks = [{ name = "check", run = "${timed(log, 1)}" }]\n`);
         const f = start(quick);
         gateSlots.setLimit(3);
-        const runs = await Promise.all([finish(f), finish(f), finish(f)]);
+        // All callers must reach the flight before the leader's immediate failure can finish.
+        const ready = Promise.withResolvers<void>();
+        let callers = 0;
+        const singleFlight = baselineCache.singleFlight;
+        const synchronized: typeof singleFlight = async (...args) => {
+          if (++callers === 3) ready.resolve();
+          await ready.promise;
+          return singleFlight(...args);
+        };
+        const flight = spyOn(baselineCache, "singleFlight").mockImplementation(synchronized);
+        const runs = await Promise.all([finish(f), finish(f), finish(f)]).finally(() => {
+          ready.resolve();
+          flight.mockRestore();
+        });
         expect(runs.map((r) => r.state?.baseline?.checks[0]?.ok)).toEqual([false, false, false]);
         expect(cacheRows(f)).toEqual([]);
         expect(overlapping(log)).toBe(true);

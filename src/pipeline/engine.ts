@@ -287,6 +287,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     });
     if (
       verifiedFailure &&
+      !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       !ctx.state.terminalReason?.startsWith("the resolution leaves no change against ")
     ) {
@@ -315,6 +316,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       }
     } else if (
       e instanceof NeedsHumanError &&
+      !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
@@ -1763,6 +1765,42 @@ async function oneRound(
 // ---------------------------------------------------------------------------
 // deliver
 
+class DeliveryHeadError extends NeedsHumanError {}
+
+/** Only round evidence, or a factory merge already validated and gated, authorizes delivery. */
+async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> {
+  const expected = ctx.state.reviewedSha;
+  const gates = ctx.state.gateEvidence;
+  const stage = gates && ctx.store.getStage(gates.stageId);
+  const reason = `Delivery refused: expected checked SHA ${expected ?? "missing"}, actual HEAD ${head}`;
+  if (
+    !expected ||
+    gates?.sha !== expected ||
+    stage?.runId !== ctx.run.id ||
+    stage.name !== "gates" ||
+    stage.round !== ctx.state.round ||
+    stage.status !== "succeeded" ||
+    (ctx.state.flow !== "verify-change" && ctx.state.lastVerifiedSha !== expected) ||
+    gates.checks.some((c) => c.blocking) ||
+    ctx.state.lastReview?.verdict !== "approve" ||
+    !ctx.state.lastAudit ||
+    ctx.state.lastAudit.some((f) => f.severity === "block")
+  )
+    throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
+  if (head === expected) return;
+  // A completed clean merge records both run SHAs only after validation and post-merge gates.
+  const base = ctx.state.pendingRebaseSha ?? (head === ctx.run.headSha ? ctx.run.baseSha : null);
+  if (base && (!ctx.state.pendingRebaseSha || ctx.state.preRebaseHead === expected)) {
+    try {
+      await validateMerge(ctx.state.worktreePath as string, expected, base);
+      return; // Pending merges still go through post-merge gates before pushing.
+    } catch {
+      ctx.checkCancelled();
+    }
+  }
+  throw new DeliveryHeadError(reason);
+}
+
 async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   ctx.state.lastVerifiedSha = sha;
   ctx.state.lastVerifiedEvidence = {
@@ -2126,7 +2164,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       ctx.state.pendingRebaseSha || ctx.state.conflictRound !== undefined
         ? null
         : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
-    const head = sha ?? (await headSha(cwd));
+    let head = sha ?? (await headSha(cwd));
+    if (success || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {
       const baseBranch = ctx.run.baseBranch as string;
@@ -2157,6 +2196,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const report = buildReport(ctx, success);
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     await checkPublication(ctx, report, { sha: await headSha(cwd), title });
+    head = await headSha(cwd);
+    if (success || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
@@ -2200,6 +2241,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             ctx.run.baseSha as string,
             ctx.signal,
             budget,
+            head,
           );
         if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number")
           ctx.run = ctx.store.updateRun(ctx.run.id, {
@@ -2212,7 +2254,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${branch}`, value: undefined };
     }
     ctx.checkCancelled();
-    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal, budget);
+    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, head, ctx.signal, budget);
     ctx.checkCancelled();
     const url = await createPullRequest(ctx.repo, {
       branch: ctx.run.branch as string,
