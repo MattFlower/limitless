@@ -111,11 +111,17 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
     f.store.ackFeed("orchestrator", first.nextAfter);
     f.reopen();
     const second = f.store.readFeed({ consumer: "orchestrator", limit: 2 });
-    expect<unknown>(second).toEqual({ items: [items[2]], nextAfter: items[2]?.id ?? -1, pruned: false });
+    expect<unknown>(second).toEqual({
+      items: [items[2]],
+      nextAfter: items[2]?.id ?? -1,
+      pruned: false,
+      hasMore: false,
+    });
     expect(f.store.readFeed({ consumer: "orchestrator", after: second.nextAfter })).toEqual({
       items: [],
       nextAfter: second.nextAfter,
       pruned: false,
+      hasMore: false,
     });
   } finally {
     f.close();
@@ -286,8 +292,84 @@ test("retention reports pruned items to stale cursors only, durably and without 
       items: [],
       nextAfter: ids[0] ?? -1,
       pruned: true,
+      hasMore: false,
     });
     expect(f.store.readFeed({ after: (ids[3] ?? 0) + 6 }).pruned).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  { count: 105, data: {}, expectedCount: 100 },
+  { count: 30, data: { message: "🙂".repeat(500) }, expectedCount: undefined },
+])("fresh consumers get bounded, complete pagination ($count items)", ({ count, data, expectedCount }) => {
+  const f = feedStore();
+  try {
+    const insert = f.store.db.query(
+      "INSERT INTO feed (ts, kind, title, summary, data, dedupe_key) VALUES (1, 'daemon.started', 't', 's', ?, ?)",
+    );
+    f.store.db.transaction(() => {
+      for (let i = 0; i < count; i++) insert.run(JSON.stringify(data), `item-${i}`);
+    })();
+    let page = f.store.readFeed({ consumer: "fresh" });
+    expect(page.hasMore).toBe(true);
+    if (expectedCount !== undefined) expect(page.items).toHaveLength(expectedCount);
+    const ids: number[] = [];
+    for (let reads = 0; reads < count; reads++) {
+      expect(page.items.length).toBeGreaterThan(0);
+      expect(page.items.length).toBeLessThanOrEqual(100);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(16 * 1024);
+      expect(page.nextAfter).toBe(page.items.at(-1)?.id ?? -1);
+      expect(
+        page.items.every(
+          (item) => item.truncated === undefined && JSON.stringify(item.data) === JSON.stringify(data),
+        ),
+      ).toBe(true);
+      ids.push(...page.items.map((item) => item.id));
+      if (!page.hasMore) break;
+      page = f.store.readFeed({ consumer: "fresh", after: page.nextAfter });
+    }
+    expect(ids).toEqual(Array.from({ length: count }, (_, i) => i + 1));
+    expect(f.store.feedCursor("fresh")).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("one oversized item is bounded, identifiable and advances the cursor without changing saved data", () => {
+  const f = feedStore();
+  try {
+    const run = f.run('"\\\u0000'.repeat(10000));
+    f.store.updateRun(run.id, { status: "failed", error: "🙂".repeat(10000) });
+    const page = f.store.readFeed({ consumer: "fresh" });
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(16 * 1024);
+    expect(page.items).toMatchObject([{ id: 1, kind: "run.failed", runId: run.id, truncated: true }]);
+    expect(page).toMatchObject({ nextAfter: 1, hasMore: false });
+    expect(f.store.getRun(run.id)?.error).toBe("🙂".repeat(10000));
+    expect(f.store.readFeed({ after: page.nextAfter }).items).toEqual([]);
+    f.store.updateRun(f.run("later").id, { status: "succeeded" });
+    expect(f.store.readFeed({ after: page.nextAfter }).items).toMatchObject([
+      { id: 2, kind: "run.succeeded" },
+    ]);
+  } finally {
+    f.close();
+  }
+});
+
+test("a cursor beyond the end recovers to the highest issued id, even after complete pruning", () => {
+  const f = feedStore();
+  try {
+    expect(f.store.readFeed({ after: 100000 })).toMatchObject({ items: [], nextAfter: 0, hasMore: false });
+    f.store.updateRun(f.run().id, { status: "failed" });
+    f.store.pruneFeed(Date.now() + 1);
+    f.reopen();
+    const page = f.store.readFeed({ after: 100000 });
+    expect(page).toEqual({ items: [], nextAfter: 1, pruned: false, hasMore: false });
+    f.store.updateRun(f.run("new").id, { status: "succeeded" });
+    expect(f.store.readFeed({ after: page.nextAfter }).items).toMatchObject([
+      { id: 2, kind: "run.succeeded" },
+    ]);
   } finally {
     f.close();
   }

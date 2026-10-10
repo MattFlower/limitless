@@ -6,11 +6,19 @@ import type { Factory } from "../app.ts";
 import {
   type CreateRunRequest,
   type FeedAck,
+  type FeedPage,
   type ResolutionKind,
   RUN_ROLES,
   type RunStatus,
 } from "../core/types.ts";
-import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
+import {
+  FeedAckSchema,
+  FeedQuerySchema,
+  limitFeedPage,
+  mcpRequestedBy,
+  validateFeedQuery,
+  waitForFeed,
+} from "../feed.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { explainStatus, statusDetailSchema, statusLandsSchema } from "./mcp-status.ts";
@@ -78,6 +86,7 @@ const feedPageSchema = z.object({
   items: z.array(z.object({ id: z.number().int(), kind: z.string(), title: z.string() }).passthrough()),
   nextAfter: z.number().int(),
   pruned: z.boolean(),
+  hasMore: z.boolean().optional(),
 });
 const feedArgsSchema = FeedQuerySchema.omit({ limit: true }).extend({
   wait: z.number().min(0).max(45).default(0),
@@ -320,19 +329,27 @@ export function createMcpServer(backend: McpBackend): Server {
     ),
     tool(
       "limitless_create_run",
-      "Delegate asynchronous repository work to the factory. Use for long-running or background tasks. Supply repo (owner/name or absolute path on the daemon machine), a self-contained prompt, optional title and profile (auto by default), and dependsOn run IDs to wait for their PRs to merge. Returns the created run with id and current status immediately; completion and a PR are not guaranteed. Repository delivery policy applies.",
+      "Delegate asynchronous repository work to the factory. Use for long-running or background tasks. Supply repo (owner/name or absolute path on the daemon machine), a self-contained prompt, optional title and profile (auto by default), and dependsOn run IDs to wait for their PRs to merge. Supply consumer (your stable name, shared with limitless_feed) to record provenance for ownRuns filtering. Returns the created run with id and current status immediately; completion and a PR are not guaranteed. Repository delivery policy applies.",
       z
         .object({
           repo: nonblank,
           prompt: nonblank,
           title: nonblank.optional(),
+          consumer: FeedQuerySchema.shape.consumer,
           allow: z.array(z.enum(["submodules", "gitattributes", "binary"])).optional(),
           models: z.partialRecord(z.enum(RUN_ROLES), z.array(z.string()).min(1)).optional(),
           dependsOn: z.array(nonblank).optional(),
           profile: profile.default("auto"),
         })
         .strict(),
-      async (input) => runSchema.parse(await backend.create({ ...input, source: "mcp" })),
+      async ({ consumer, ...input }) =>
+        runSchema.parse(
+          await backend.create({
+            ...input,
+            requestedBy: consumer === undefined ? undefined : mcpRequestedBy(consumer),
+            source: "mcp",
+          }),
+        ),
     ),
     tool(
       "limitless_get_run",
@@ -423,9 +440,12 @@ export function createMcpServer(backend: McpBackend): Server {
     ),
     tool(
       "limitless_feed",
-      "Catch up on what needs action (PRs opened, questions, failures, needs_human, merges, finished evals, daemon restarts) across all runs. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; wait (0–45 seconds, within client timeouts) long-polls until a new item arrives. Returns {items, nextAfter, pruned} in ascending id order; pruned means retention removed items you never acknowledged. Reading never acknowledges: call limitless_feed_ack with nextAfter only after you have handled the items.",
+      'Catch up on PRs, questions, failures, merges, evals and daemon restarts. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; new consumers start at zero. Pages contain at most 100 items and 16 KiB of UTF-8 serialized JSON, in ascending id order. Returns {items, nextAfter, pruned, hasMore}; when hasMore is true, continue with after: nextAfter. An oversized item retains id, kind and runId with truncated: true; inspect its run for details. Use from: "now" without after to return no history and snapshot the newest issued id; continue with after: nextAfter. An after past the end clamps to the newest id. Filter by exact repo, or ownRuns: true with consumer to match only MCP runs created with that name; combined filters both apply. Consumer names are not access control. wait (0–45 seconds, within client timeouts) long-polls for a matching item, except from: "now" returns immediately. pruned means retention removed unseen items. Reading never acknowledges: call limitless_feed_ack only after handling the items. Acknowledgements apply across filters.',
       feedArgsSchema,
-      async (input, signal) => feedPageSchema.parse(await backend.feed(input, signal)),
+      async (input, signal) => {
+        validateFeedQuery(input);
+        return feedPageSchema.parse(await backend.feed(input, signal));
+      },
     ),
     tool(
       "limitless_feed_ack",
@@ -456,7 +476,10 @@ export function createMcpServer(backend: McpBackend): Server {
         : params.name === "limitless_status"
           ? result
           : { message: "Tool output withheld; privacy policy unavailable." };
-      return { content: [{ type: "text", text: JSON.stringify(output) }] };
+      // Apply the page budget after privacy substitutions, which can expand small strings.
+      const bounded =
+        params.name === "limitless_feed" && privacy ? limitFeedPage(output as FeedPage) : output;
+      return { content: [{ type: "text", text: JSON.stringify(bounded) }] };
     } catch (e) {
       const text = privacy
         ? privacy(e instanceof Error ? e.message : String(e))
