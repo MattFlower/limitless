@@ -8,6 +8,7 @@ import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
+import { localOwnerDiagnostics, printOwnerDiagnostics } from "./owner-diagnostics.ts";
 
 const USAGE = `limitless — personal software factory
 
@@ -133,36 +134,50 @@ function formatEvent(e: RunEvent): string {
   return line;
 }
 
-async function follow(runId: string, after = 0): Promise<void> {
+async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
   const res = await fetch(`${BASE}/api/runs/${runId}/stream?after=${after}`);
   if (!res.body) return;
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) return;
-    buf += value;
-    let idx = buf.indexOf("\n\n");
-    while (idx >= 0) {
-      const chunk = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-      idx = buf.indexOf("\n\n");
-      if (!chunk.startsWith("data: ")) continue;
-      const msg = JSON.parse(chunk.slice(6)) as { kind: string; event?: RunEvent; run?: Run };
-      if (msg.kind === "event" && msg.event && msg.event.level !== "debug")
-        console.log(formatEvent(msg.event));
-      if (
-        msg.kind === "run" &&
-        msg.run &&
-        ["succeeded", "failed", "cancelled", "needs_human", "resolved"].includes(msg.run.status)
-      ) {
-        console.log(
-          `\n${color.bold("Run")} ${runId}: ${statusColor(msg.run.status)}${msg.run.prUrl ? ` — ${msg.run.prUrl}` : ""}`,
-        );
-        if (msg.run.error) console.log(color.red(msg.run.error));
-        return;
+  const drain = () => {
+    if (diagnosticsAfter === undefined) return;
+    const rows = localOwnerDiagnostics(runId, diagnosticsAfter);
+    printOwnerDiagnostics(rows);
+    diagnosticsAfter = rows.at(-1)?.id ?? diagnosticsAfter;
+  };
+  const timer = diagnosticsAfter === undefined ? undefined : setInterval(drain, 250);
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buf += value;
+      let idx = buf.indexOf("\n\n");
+      while (idx >= 0) {
+        const chunk = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        idx = buf.indexOf("\n\n");
+        if (!chunk.startsWith("data: ")) continue;
+        const msg = JSON.parse(chunk.slice(6)) as { kind: string; event?: RunEvent; run?: Run };
+        if (msg.kind === "event" && msg.event && msg.event.level !== "debug")
+          console.log(formatEvent(msg.event));
+        drain();
+        if (
+          msg.kind === "run" &&
+          msg.run &&
+          ["succeeded", "failed", "cancelled", "needs_human", "resolved"].includes(msg.run.status)
+        ) {
+          console.log(
+            `\n${color.bold("Run")} ${runId}: ${statusColor(msg.run.status)}${msg.run.prUrl ? ` — ${msg.run.prUrl}` : ""}`,
+          );
+          if (msg.run.error) console.log(color.red(msg.run.error));
+          return;
+        }
       }
     }
+  } finally {
+    clearInterval(timer);
+    drain();
+    await reader.cancel();
   }
 }
 
@@ -393,6 +408,7 @@ async function main(): Promise<void> {
     case "show": {
       const d = await api<RunDetail>(`/api/runs/${rest[0]}`);
       const r = d.run;
+      const diagnostics = localOwnerDiagnostics(r.id);
       console.log(`${color.bold(r.title)}  (${r.id})`);
       console.log(
         `repo ${r.repoSlug}  status ${statusColor(r.status)}  profile ${r.resolvedProfile ?? r.profile}`,
@@ -401,6 +417,7 @@ async function main(): Promise<void> {
       for (const [role, chain] of Object.entries(r.models ?? {}))
         console.log(`Model experiment: ${role} = ${chain.join(", ")}`);
       if (r.error) console.log(color.red(r.error));
+      printOwnerDiagnostics(diagnostics.filter((row) => row.kind === "run-error"));
       const cost = formatCost(r.costUsd, r.costEquivUsd);
       console.log(`cost ${cost.primary}${cost.paid ? ` ${cost.paid} paid` : ""} (${cost.title})`);
       console.log(color.bold("\nStages"));
@@ -411,6 +428,7 @@ async function main(): Promise<void> {
         console.log(
           `  #${i.id} ${i.role.padEnd(10)} ${i.modelId.padEnd(28)} ${statusColor(i.status)} ${i.error ?? ""}`,
         );
+        printOwnerDiagnostics(diagnostics.filter((row) => row.invocationId === i.id));
       }
       const open = d.questions.filter((q) => !q.answer);
       if (open.length) {
@@ -422,8 +440,14 @@ async function main(): Promise<void> {
     case "logs": {
       const id = rest[0] as string;
       const events = await api<RunEvent[]>(`/api/runs/${id}/events?limit=5000`);
-      for (const e of events) if (e.level !== "debug") console.log(formatEvent(e));
-      if (values.follow) await follow(id, events.at(-1)?.id ?? 0);
+      const diagnostics = localOwnerDiagnostics(id);
+      for (const e of events) {
+        if (e.level !== "debug") console.log(formatEvent(e));
+        printOwnerDiagnostics(diagnostics.filter((row) => row.eventId === e.id));
+      }
+      const visible = new Set(events.map((event) => event.id));
+      printOwnerDiagnostics(diagnostics.filter((row) => row.eventId === null || !visible.has(row.eventId)));
+      if (values.follow) await follow(id, events.at(-1)?.id ?? 0, diagnostics.at(-1)?.id ?? 0);
       return;
     }
     case "cancel": {

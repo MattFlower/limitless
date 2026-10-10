@@ -732,6 +732,18 @@ export class RunContext {
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
             ? (ev) => {
+                if (ev.type !== "init" && ev.type !== "rate_limit")
+                  store.recordOwnerDiagnostic(
+                    {
+                      runId: this.run.id,
+                      invocationId: invocation.id,
+                      kind: "event",
+                      text: JSON.stringify(redactCredentialData(ev)),
+                    },
+                    ev.type === "warning"
+                      ? JSON.stringify(redactCredentialData({ ...ev, id: String(Bun.hash(ev.id)) }))
+                      : "",
+                  );
                 if (ev.type === "warning")
                   this.onAgentEvent(invocation.id, { ...ev, id: String(Bun.hash(ev.id)) }, opts.role);
               }
@@ -828,6 +840,22 @@ export class RunContext {
       }
 
       result = redactCredentialData(result);
+      for (const [kind, text] of [
+        ["error", result.error],
+        ["result", result.finalText],
+      ] as const) {
+        if (text && (redact || opts.privateOutput))
+          store.recordOwnerDiagnostic(
+            { runId: this.run.id, invocationId: invocation.id, kind, text },
+            opts.privateOutput
+              ? kind === "error" && result.confinement?.ok === false
+                ? text
+                : kind === "error"
+                  ? "private invocation failed"
+                  : withholdText(text)
+              : (redact?.(text) ?? text),
+          );
+      }
       const updated = store.updateInvocation(invocation.id, {
         status: result.status,
         fastModeState: result.fastModeState ?? null,
@@ -972,8 +1000,8 @@ export class RunContext {
       message: string,
       data?: unknown,
       level: RunEvent["level"] = "info",
-    ) =>
-      this.store.addEvent({
+    ) => {
+      const event = this.store.addEvent({
         runId,
         invocationId,
         type,
@@ -990,6 +1018,15 @@ export class RunContext {
               )
             : data,
       });
+      if (redact) {
+        const original = JSON.stringify(redactCredentialData({ message, data }));
+        const publicText = JSON.stringify({ message: redact(message), data: event.data ?? undefined });
+        this.store.recordOwnerDiagnostic(
+          { runId, invocationId, eventId: event.id, kind: "event", text: original },
+          publicText,
+        );
+      }
+    };
     switch (ev.type) {
       case "init":
         add("status", `session ${ev.sessionId}${ev.model ? ` (${ev.model})` : ""}`, undefined, "debug");

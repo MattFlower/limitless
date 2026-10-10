@@ -52,7 +52,10 @@ import {
 } from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
+import { protectDatabase } from "../util/private-reads.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
+import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
 
 type Row = Record<string, unknown>;
 type Listener = (msg: StreamMessage) => void;
@@ -374,6 +377,7 @@ export class Store {
   private pendingPublications: StreamMessage[] | null = null;
   private feedPublished = 0;
   private feedPublishing = false;
+  private releasePrivateReads: () => void;
 
   constructor(path: string, migrationDir = MIGRATION_DIR) {
     this.db = new Database(path, { create: true, strict: true });
@@ -388,10 +392,34 @@ export class Store {
       this.db.close();
       throw error;
     }
+    this.releasePrivateReads = protectDatabase(path);
   }
 
   close(): void {
     this.db.close();
+    this.releasePrivateReads();
+  }
+
+  recordOwnerDiagnostic(
+    diagnostic: Omit<OwnerDiagnostic, "id" | "invocationId" | "eventId"> & {
+      invocationId?: number;
+      eventId?: number;
+    },
+    publicText: string,
+  ): void {
+    const text = redactCredentials(diagnostic.text);
+    if (text === publicText) return;
+    this.db
+      .query(
+        "INSERT INTO owner_diagnostics (run_id, invocation_id, event_id, kind, text) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        diagnostic.runId,
+        diagnostic.invocationId ?? null,
+        diagnostic.eventId ?? null,
+        diagnostic.kind,
+        text,
+      );
   }
 
   createEvalRun(
