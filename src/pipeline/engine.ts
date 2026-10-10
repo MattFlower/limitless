@@ -1955,7 +1955,7 @@ async function deliverReviewRound(
       stored();
     } else {
       if (review.kind === "conflict" && pr.isDraft) throw new Error("the PR is draft");
-      if (review.kind === "conflict" && pr.autoMerge)
+      if ((review.kind === "conflict" || review.kind === "ci") && pr.autoMerge)
         await gh(["pr", "merge", prUrl, "--disable-auto"], ctx.signal);
       const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
       const pushed = remote === head;

@@ -51,6 +51,7 @@ let clock: ReturnType<typeof waitClock>;
 let calls: string[][];
 let comments: { body: string }[];
 let draft: boolean;
+let autoMerge: boolean;
 let mode: "pass" | "gates" | "review" | "audit";
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
@@ -62,6 +63,7 @@ beforeEach(async () => {
   calls = [];
   comments = [];
   draft = false;
+  autoMerge = false;
   mode = "pass";
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
   cfg.maxRounds = 1;
@@ -109,10 +111,15 @@ beforeEach(async () => {
   });
   factory.deps.gh = async (args, _signal, stdin) => {
     calls.push(args);
+    if (args[1] === "merge" && args.includes("--disable-auto")) {
+      autoMerge = false;
+      return "";
+    }
     if (args[1] === "view")
       return JSON.stringify({
         state: "OPEN",
         isDraft: draft,
+        autoMergeRequest: autoMerge ? {} : null,
         headRefOid: await remoteHead(),
         headRefName: branch,
         isCrossRepository: false,
@@ -225,8 +232,15 @@ async function classify(
   );
 }
 
-test("classifier trigger starts once, delivers to the PR branch and posts one failure/fix comment", async () => {
+test("classifier trigger starts once, disables auto-merge before pushing and posts one failure/fix comment", async () => {
   const old = await remoteHead();
+  autoMerge = true;
+  const gh = factory.deps.gh;
+  if (!gh) throw new Error("missing fake gh");
+  factory.deps.gh = async (args, signal, stdin) => {
+    if (args[1] === "merge" && args.includes("--disable-auto")) expect(await remoteHead()).toBe(old);
+    return (await gh(args, signal, stdin)) ?? "";
+  };
   await classify();
   await classify();
   expect(triggers()).toHaveLength(1);
@@ -239,6 +253,8 @@ test("classifier trigger starts once, delivers to the PR branch and posts one fa
   const head = await remoteHead();
   expect(head).not.toBe(old);
   expect(factory.store.reviewRound(id)?.deliveredSha).toBe(head);
+  expect(calls.filter((c) => c[1] === "merge")).toEqual([["pr", "merge", url, "--disable-auto"]]);
+  expect(autoMerge).toBe(false);
   expect(comments).toHaveLength(1);
   expect(comments[0]?.body).toContain('"check":"test"');
   expect(comments[0]?.body).toContain("FAIL validation");
