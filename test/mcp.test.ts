@@ -186,7 +186,7 @@ test("twelve discoverable tools, create defaults and overrides, get and queued c
     repository: run.repoSlug,
     stage: null,
     prUrl: null,
-    questions: [],
+    openQuestions: 0,
   });
   expect(resultValue<{ cancelled: boolean }>(await call("cancel_run", { id: run.id }))).toEqual({
     cancelled: true,
@@ -254,7 +254,7 @@ test("inspection selects latest qualifying events beyond 5000, with costs and op
     questions: Question[];
     costUsd: number;
     costEquivUsd: number;
-  }>(await call("get_run", { id: run.id }));
+  }>(await call("get_run", { id: run.id, full: true }));
   expect(detail.events.map((e) => e.id)).toEqual(expected.slice(-20));
   expect(detail.questions).toEqual([open]);
   expect(detail.costUsd).toBe(1.25);
@@ -262,9 +262,13 @@ test("inspection selects latest qualifying events beyond 5000, with costs and op
   // Default reads retain oldest-first behavior for existing REST/SSE callers.
   expect(store.listEvents(run.id, { limit: 1 })[0]?.message).toBe("Run created from mcp");
   const short = await create();
-  expect(resultValue<{ events: RunEvent[] }>(await call("get_run", { id: short.id })).events).toHaveLength(1);
+  expect(
+    resultValue<{ events: RunEvent[] }>(await call("get_run", { id: short.id, full: true })).events,
+  ).toHaveLength(1);
   store.db.query("DELETE FROM events WHERE run_id = ?").run(short.id);
-  expect(resultValue<{ events: RunEvent[] }>(await call("get_run", { id: short.id })).events).toEqual([]);
+  expect(
+    resultValue<{ events: RunEvent[] }>(await call("get_run", { id: short.id, full: true })).events,
+  ).toEqual([]);
 });
 
 test("list uses newest-first filtering and providers preserve telemetry and absent values", async () => {
@@ -272,11 +276,18 @@ test("list uses newest-first filtering and providers preserve telemetry and abse
   const newer = await create();
   f.factory.store.db.query("UPDATE runs SET created_at = ? WHERE id = ?").run(1, old.id);
   f.factory.store.updateRun(old.id, { status: "failed" });
-  expect(resultValue<Run[]>(await call("list_runs")).map((r) => r.id)).toEqual([newer.id, old.id]);
+  expect(resultValue<{ runs: Run[] }>(await call("list_runs")).runs.map((r) => r.id)).toEqual([
+    newer.id,
+    old.id,
+  ]);
   expect(
-    resultValue<Run[]>(await call("list_runs", { status: "failed", limit: 1 })).map((r) => r.id),
+    resultValue<{ runs: Run[] }>(await call("list_runs", { status: "failed", limit: 1 })).runs.map(
+      (r) => r.id,
+    ),
   ).toEqual([old.id]);
-  expect(resultValue<Run[]>(await call("list_runs", { limit: 1 })).map((r) => r.id)).toEqual([newer.id]);
+  expect(resultValue<{ runs: Run[] }>(await call("list_runs", { limit: 1 })).runs.map((r) => r.id)).toEqual([
+    newer.id,
+  ]);
   f.factory.tracker.observeWindows("fake", {
     five_hour: { utilization: 0.4, resetsAt: Date.now() + 100000 },
   });
@@ -295,6 +306,188 @@ test("list uses newest-first filtering and providers preserve telemetry and abse
   expect(providers[0]?.windows.five_hour?.resetsAt).toBeGreaterThan(Date.now());
   expect(providers[0]?.windows.five_hour?.observedAt).toBeGreaterThan(0);
   release();
+});
+
+test("default inspection stays within byte budgets with many large runs; full retains detail", async () => {
+  const first = await create();
+  const { store } = f.factory;
+  const repo = store.getRepo(first.repoId);
+  if (!repo) throw new Error("missing repo");
+  const large = "長い本文".repeat(10_000);
+  const runs = store.db.transaction(() =>
+    Array.from({ length: 120 }, (_, i) => {
+      const run = store.createRun(repo, { repo: repo.slug, title: large, prompt: large });
+      store.db.query("UPDATE runs SET created_at = ? WHERE id = ?").run(i + 1, run.id);
+      store.updateRun(run.id, { status: "failed", error: large });
+      return run;
+    }),
+  )();
+  store.db.query("UPDATE runs SET created_at = 0 WHERE id = ?").run(first.id);
+  const latest = runs.at(-1);
+  if (!latest) throw new Error("missing run");
+  store.askQuestion(latest.id, large);
+  store.addEvent({ runId: latest.id, type: "log", message: "Large event", data: { body: large } });
+  const listed = await call("list_runs");
+  const page = resultValue<{ runs: { id: string; prompt?: string }[]; hasMore: boolean }>(listed);
+  expect(page.runs.map((r) => r.id)).toEqual(
+    runs
+      .slice(-5)
+      .reverse()
+      .map((r) => r.id),
+  );
+  expect(page.hasMore).toBe(true);
+  expect(page.runs.every((r) => r.prompt === undefined)).toBe(true);
+  expect(Buffer.byteLength(JSON.stringify(listed))).toBeLessThan(16_384);
+  const inspected = await call("get_run", { id: latest.id });
+  expect(Buffer.byteLength(JSON.stringify(inspected))).toBeLessThan(4_096);
+  expect(resultValue(inspected)).toMatchObject({
+    id: latest.id,
+    status: "failed",
+    state: "Failed",
+    stage: null,
+    prUrl: null,
+    headSha: null,
+    deliveredRounds: 0,
+    land: null,
+    openQuestions: 1,
+  });
+  expect(resultValue(inspected)).not.toHaveProperty("events");
+  expect(resultValue(await call("get_run", { id: latest.id, full: true }))).toMatchObject({
+    prompt: large,
+    title: large,
+    error: large,
+    questions: [expect.objectContaining({ question: large })],
+    events: expect.arrayContaining([
+      expect.objectContaining({ message: "Large event", data: expect.objectContaining({ truncated: true }) }),
+    ]),
+  });
+  expect(resultValue(await call("list_runs", { limit: 1, full: true }))).toMatchObject({
+    runs: [{ id: latest.id, prompt: large, title: large, error: large }],
+    hasMore: true,
+  });
+});
+
+test("repository and status filters apply before limiting and counting remaining runs", async () => {
+  const run = await create();
+  const { store } = f.factory;
+  const otherRepo = store.upsertRepo({
+    slug: "other/repo",
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const older = store.createRun(otherRepo, { repo: otherRepo.slug, prompt: "older" });
+  const newer = store.createRun(otherRepo, { repo: otherRepo.slug, prompt: "newer" });
+  store.db.query("UPDATE runs SET created_at = 1 WHERE id = ?").run(older.id);
+  store.updateRun(older.id, { status: "failed" });
+  store.updateRun(run.id, { status: "failed" });
+  expect(resultValue(await call("list_runs", { repo: " other/repo ", limit: 1 }))).toMatchObject({
+    runs: [{ id: newer.id }],
+    hasMore: true,
+  });
+  expect(
+    resultValue(await call("list_runs", { repo: "other/repo", status: "failed", limit: 1 })),
+  ).toMatchObject({
+    runs: [{ id: older.id }],
+    hasMore: false,
+  });
+  expect(resultValue<unknown>(await call("list_runs", { repo: "missing/repo" }))).toEqual({
+    runs: [],
+    hasMore: false,
+  });
+  expect((await call("list_runs", { repo: " " })).isError).toBe(true);
+});
+
+test("compact inspection reports observed head, delivered rounds and latest land entry", async () => {
+  const { store } = f.factory;
+  const repo = store.upsertRepo({
+    slug: "test/repo",
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "owning run" });
+  const prUrl = "https://github.com/test/repo/pull/9";
+  const sha = "a".repeat(40);
+  const head = "b".repeat(40);
+  const owner = store.updateRun(run.id, { status: "succeeded", headSha: sha, prUrl, branch: "pr-9" });
+  store.saveGithubPr({
+    url: prUrl,
+    repo: repo.slug,
+    runId: run.id,
+    nodeId: "pr9",
+    delivered: 1,
+    data: JSON.stringify({ state: "OPEN", headRefOid: head }),
+  });
+  const round = store.createReviewRound(
+    repo,
+    owner,
+    { prUrl, reviewedSha: sha, findings: [], cap: 3 },
+    (n) => ({
+      repo: repo.slug,
+      prompt: "fix",
+      baseBranch: "pr-9",
+      deliveryBranch: "pr-9",
+      sourceRef: { kind: "review-round", runId: run.id, round: n, prUrl, reviewedSha: sha },
+    }),
+  );
+  if (!("run" in round)) throw new Error("round refused");
+  store.markRoundDelivered(round.run.id, head);
+  store.updateRun(round.run.id, { status: "succeeded" });
+  const undelivered = store.createReviewRound(
+    repo,
+    owner,
+    { prUrl, reviewedSha: head, findings: [], cap: 3 },
+    (n) => ({
+      repo: repo.slug,
+      prompt: "another fix",
+      baseBranch: "pr-9",
+      deliveryBranch: "pr-9",
+      sourceRef: { kind: "review-round", runId: run.id, round: n, prUrl, reviewedSha: head },
+    }),
+  );
+  if (!("run" in undelivered)) throw new Error("round refused");
+  store.updateRun(undelivered.run.id, { status: "succeeded" });
+  const land = store.createLandEntry({
+    runId: run.id,
+    repo: repo.slug,
+    prUrl,
+    baseBranch: "main",
+    headBranch: "feature",
+    approvedSha: head,
+  });
+  store.updateLandEntry(land.id, { state: "blocked", reason: "check failed" });
+  expect(resultValue(await call("get_run", { id: run.id }))).toMatchObject({
+    state: "Landing blocked",
+    headSha: head,
+    deliveredRounds: 1,
+    land: { id: land.id, state: "blocked", reason: "check failed" },
+  });
+});
+
+test("merge metadata is present only when merged and known in compact and full output", async () => {
+  const run = await create();
+  for (const [merged, mergedAt, mergedBy, expected] of [
+    [true, null, null, {}],
+    [true, 123, null, { mergedAt: 123 }],
+    [true, 123, "reviewer", { mergedAt: 123, mergedBy: "reviewer" }],
+    [false, 123, "reviewer", {}],
+  ] as const) {
+    f.factory.store.updateRun(run.id, { merged, mergedAt, mergedBy });
+    for (const full of [false, true]) {
+      const detail = resultValue<Record<string, unknown>>(await call("get_run", { id: run.id, full }));
+      const page = resultValue<{ runs: Record<string, unknown>[] }>(await call("list_runs", { full }));
+      for (const output of [detail, page.runs[0]]) {
+        expect(output).toMatchObject({ merged, ...expected });
+        if (!("mergedAt" in expected)) expect(output).not.toHaveProperty("mergedAt");
+        if (!("mergedBy" in expected)) expect(output).not.toHaveProperty("mergedBy");
+      }
+    }
+  }
 });
 
 test("validation rejects bad arguments without mutation; answers every open question only", async () => {
@@ -412,9 +605,9 @@ test("dependencies appear in create, get and waiting filters with shared validat
     dependsOn: run.dependsOn,
     status: "waiting",
   });
-  expect(resultValue<Run[]>(await call("list_runs", { status: "waiting" })).map((r) => r.id)).toEqual([
-    run.id,
-  ]);
+  expect(
+    resultValue<{ runs: Run[] }>(await call("list_runs", { status: "waiting" })).runs.map((r) => r.id),
+  ).toEqual([run.id]);
   const invalid = await call("create_run", { repo: f.repo, prompt: "bad", dependsOn: ["unknown"] });
   expect(invalid.isError).toBe(true);
   expect(JSON.stringify(invalid.content)).toContain("unknown");

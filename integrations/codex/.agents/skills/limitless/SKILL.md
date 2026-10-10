@@ -43,10 +43,12 @@ Use five verbs to manage work:
 
 Additional inspection and follow-up tools:
 
-- `limitless_get_run`: inspect id, status, nullable stage/prUrl, error, open questions and the latest
-  20 non-debug events. Check periodically or on request; avoid tight polling.
-- `limitless_list_runs`: find existing work, newest-first; optional status and limit (default 20,
-  range 1–100). Use this before resubmitting after an uncertain create response.
+- `limitless_get_run`: inspect a compact summary with state, stage, PR, head SHA, delivered round
+  count, land entry, error and open question count. Use `full:true` for all run fields, open questions
+  and the latest 20 non-debug events. Check periodically or on request; avoid tight polling.
+- `limitless_list_runs`: find existing work, newest-first; optional repo slug, status and limit
+  (default 5, range 1–100). Returns `{runs, hasMore}`; use `full:true` for all stored run fields.
+  Use this before resubmitting after an uncertain create response.
 - `limitless_answer_question`: supply id and an answer addressing every currently open question.
   Answer from known requirements; ask the user when their decision is needed. The response contains
   the answered questions. No open questions is an error.

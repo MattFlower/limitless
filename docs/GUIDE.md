@@ -1180,7 +1180,7 @@ observed. No command here creates a real sandbox or enables auto-merge.
 
    Pass this to `limitless_create_run`; save the returned `id` as `<run>`. CLI equivalent:
    `limitless run "Add a --json flag to export; preserve the default text output and test both modes." --repo <owner>/limitless-sandbox --profile standard`.
-2. On a question item, call `limitless_get_run` with `{"id":"<run>"}`. If it asks about the
+2. On a question item, call `limitless_get_run` with `{"id":"<run>","full":true}`. If it asks about the
    JSON shape, call `limitless_answer_question` with
    `{"id":"<run>","answer":"Use an object with a records array; retain record field names."}`.
    That answers all currently open questions. CLI: `limitless answer <run> "Use an object with a records array; retain record field names."`.
