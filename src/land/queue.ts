@@ -339,7 +339,13 @@ export class LandQueue {
         await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
-        this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
+        const waiting = this.store.db.transaction(() => {
+          signal.throwIfAborted();
+          if (this.store.getLandEntry(entry.id)?.state !== "checking") return false;
+          this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
+          return true;
+        })();
+        if (!waiting) return;
       }
       if (entry.pushedSha)
         await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
@@ -559,10 +565,16 @@ export class LandQueue {
     sha: string,
     signal: AbortSignal,
   ): Promise<void> {
-    this.store.db.transaction(() => {
+    const merging = this.store.db.transaction(() => {
+      signal.throwIfAborted();
       this.store.assertNoRoundInFlight(entry.prUrl);
+      // A resumed entry keeps its pushed SHA but the claim moves it back to checking.
+      const expected = entry.pushedSha ? "checking" : "waiting_ci";
+      if (this.store.getLandEntry(entry.id)?.state !== expected) return false;
       this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
+      return true;
     })();
+    if (!merging) return;
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.
     const outcome = await mergePullRequest(

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -15,6 +15,7 @@ import type { LandEntry, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
+import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { GitHubPrView } from "../src/integrations/github-notifier.ts";
@@ -1238,6 +1239,80 @@ test("a saved moved head blocks without advancing the clock even when a CI read 
   expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
   expect(reads).toBe(0);
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a cancel during the private-range check stays cancelled after a queue restart", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const check = repos.checkPrivateRange;
+  const range = spyOn(repos, "checkPrivateRange").mockImplementationOnce(async (...args) => {
+    await check(...args);
+    entered.resolve();
+    await release.promise;
+  });
+  const q = queue();
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await entered.promise;
+    expect(store.getLandEntry(entry.id)?.state).toBe("checking");
+    expect(q.cancel(entry.id)).toBe(true);
+    release.resolve();
+    await q.stop();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", pushedSha: null });
+    const restarted = queue();
+    await restarted.stop();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", attempts: 1 });
+    expect(gateLog()).toEqual(["start", "end"]);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    release.resolve();
+    await q.stop();
+    range.mockRestore();
+  }
+});
+
+test("a cancel during successful CI observation stays cancelled after a queue restart", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<GitHubPrView | null>();
+  const q = queue({
+    polling: false,
+    client: async () => {
+      entered.resolve();
+      return response.promise;
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await entered.promise;
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+    expect(q.cancel(entry.id)).toBe(true);
+    response.resolve({
+      url: url(1),
+      state: "OPEN",
+      mergedAt: null,
+      mergedBy: null,
+      headRefOid: head,
+      ci: "SUCCESS",
+      failing: [],
+    });
+    await q.stop();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", pushedSha: head });
+    const restarted = queue();
+    await restarted.stop();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", attempts: 1 });
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    response.resolve(null);
+    await q.stop();
+  }
 });
 
 test("a cancel interrupts a CI read that never answers", async () => {
