@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { WrapperConfig } from "../cli/agent-test.ts";
 import { AgentTestSession, agentTestLease, type TestWait } from "../gates/agent-tests.ts";
-import { scratchParent } from "./scratch.ts";
+import { commandDir, createCommandRoot } from "./scratch.ts";
 import type { SlottedCommands } from "./slotted-config.ts";
 
 let bundle: Promise<string> | undefined;
@@ -16,7 +16,7 @@ const wrapperBundle = () =>
     return result.outputs[0].text();
   })());
 
-/** Sibling of scratch, outside the invocation's writable roots. Unset config allocates nothing. */
+/** Outside the invocation's writable roots and unreadable to other invocations. Unset config allocates nothing. */
 export async function withSlottedCommands<T>(
   commands: SlottedCommands,
   scratch: string,
@@ -26,7 +26,9 @@ export async function withSlottedCommands<T>(
 ): Promise<T> {
   if (!commands.length) return invoke();
   const source = await wrapperBundle();
-  const directory = join(scratchParent(scratch), `commands-${crypto.randomUUID()}`);
+  createCommandRoot();
+  // Every agent and gate profile denies reads under the shared root except to this directory's owner.
+  const directory = commandDir(scratch);
   mkdirSync(directory, { mode: 0o700 });
   const session = new AgentTestSession(event);
   const unix = join(scratch, `slot-${crypto.randomUUID().slice(0, 8)}.sock`);
@@ -55,7 +57,14 @@ export async function withSlottedCommands<T>(
         }
       },
     });
-    const config: WrapperConfig = { directory, commands, port, unix, token: session.token };
+    const config: WrapperConfig = {
+      directory,
+      commands,
+      port,
+      unix,
+      token: session.token,
+      nested: crypto.randomUUID(),
+    };
     const configPath = join(directory, "config.json"),
       entry = join(directory, "entry.js"),
       bunfig = join(directory, "bunfig.toml");

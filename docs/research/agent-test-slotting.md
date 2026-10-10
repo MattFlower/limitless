@@ -2,11 +2,11 @@
 
 Probe attempted 2026-10-10 (UTC, from `date -u`).
 
-| Agent sandbox | Loopback lease POST | Scratch Unix socket | Result in this checkout |
-| --- | --- | --- | --- |
-| Codex editor profile | Unobserved | Unobserved | Skipped: nested Seatbelt unavailable |
-| Claude reader sandbox runtime | Unobserved | Unobserved | Skipped: nested Seatbelt unavailable |
-| Claude editor outer Seatbelt | Unobserved | Unobserved | Skipped: nested Seatbelt unavailable |
+| Agent sandbox | Loopback lease POST | Scratch Unix socket | Own / other capability read | Result in this checkout |
+| --- | --- | --- | --- | --- |
+| Codex editor profile | Unobserved | Unobserved | Unobserved | Skipped: nested Seatbelt unavailable |
+| Claude reader sandbox runtime | Unobserved | Unobserved | Unobserved | Skipped: nested Seatbelt unavailable |
+| Claude editor outer Seatbelt | Unobserved | Unobserved | Unobserved | Skipped: nested Seatbelt unavailable |
 
 `bun test test/agent-test-probe.test.ts` reported three skips, zero failures. The startup
 probe could not apply nested Seatbelt in this factory sandbox. No sandbox policy was
@@ -34,7 +34,15 @@ a separate small lane rather than queue priority: priority cannot preempt a runn
 Full suites share `gateSlots`; targeted file/path or name-filter runs use a fixed limit of
 two. The worker did not independently recompute the aggregate or measure a new distribution.
 
-Factory-owned wrapper scripts and their bundled client/config live beside the invocation
-scratch, outside the writable roots. Private holdout authors have stronger read confinement
+Factory-owned wrapper scripts and their bundled client/config live in one per-invocation
+directory under a private factory root in the system temporary directory, outside the writable
+roots. Its `config.json` holds the bearer capability for the invocation's leases, so every agent
+and gate profile denies reads under that root and grants only the invocation's own directory:
+the Seatbelt profile denies `file-read-data` (contents and listings), Codex profiles mark the
+root `none` and the own directory `read`, and Claude denies native `Read` there and adds the root
+to the reader sandbox's `denyRead` with the own directory in `allowRead`. The capability is
+never placed in the environment; nested commands are recognized by a separate nonce. The
+probe tests also check, per sandbox, that the own capability is readable and another
+invocation's is not. Private holdout authors have stronger read confinement
 that denies that location, so receive no wrapper. Implement, verify and review invocations
 receive it. Gate/baseline/land/deploy processes retain their existing command environments.

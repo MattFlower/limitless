@@ -25,7 +25,9 @@ import {
 } from "../src/harness/codex.ts";
 import { ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
 import {
+  commandRoots,
   createScratch,
+  invocationCommands,
   privateReadRoots,
   readConfinement,
   removeScratch,
@@ -154,8 +156,14 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
     expect(codex).not.toContain("workspace-write");
     expect(codex).not.toContain("--add-dir");
     const policy = codex.find((arg) => arg.startsWith("permissions="));
+    // Other invocations' command capabilities are unreadable; this invocation's own stays readable.
+    const commands = invocationCommands(scratch);
+    const capabilities = [
+      ...commands.root.map((p) => `${JSON.stringify(p)}="none",`),
+      ...commands.own.map((p) => `${JSON.stringify(p)}="read",`),
+    ].join("");
     expect(policy).toBe(
-      `permissions={limitless-reader={filesystem={"/"="read",${JSON.stringify(realpathSync(scratch))}="write"},network={enabled=false}}}`,
+      `permissions={limitless-reader={filesystem={"/"="read",${capabilities}${JSON.stringify(realpathSync(scratch))}="write"},network={enabled=false}}}`,
     );
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
@@ -195,7 +203,7 @@ test("denyRead keeps tool-enabled readers out of a parallel worktree", () => {
     expect(codexAccess(buildCodexArgs(spec), join(implementer, "marker.txt"))).toBe("none");
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
-    expect(settings.sandbox.filesystem.denyRead).toEqual([implementer]);
+    expect(settings.sandbox.filesystem.denyRead).toEqual([implementer, ...commandRoots()]);
     expect(claude.slice(claude.indexOf("--disallowedTools"))).toContain(`Read(/${implementer}/**)`);
     for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")]) {
       expect(() => build({ ...spec, denyRead: [root] })).toThrow("outside");
@@ -1484,6 +1492,8 @@ test("codex editors get an explicit write profile, fresh or resumed, and nothing
       [admin]: "read",
       [realpathSync(scratchDir)]: "write",
       [join(cwd, ".git")]: "read",
+      ...Object.fromEntries(commandRoots().map((p) => [p, "none"])),
+      ...Object.fromEntries(invocationCommands(scratchDir).own.map((p) => [p, "read"])),
     });
     expect(profileArgs(args).join("")).toContain("network={enabled=true}");
     for (const flag of ["--ignore-user-config", "--ignore-rules", "--strict-config"])

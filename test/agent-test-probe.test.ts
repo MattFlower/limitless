@@ -1,12 +1,18 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { buildClaudeArgs } from "../src/harness/claude.ts";
 import { editorProfile } from "../src/harness/codex.ts";
 import { seatbeltBackend } from "../src/harness/sandbox.ts";
-import { createScratch, removeScratch, writeRoots } from "../src/harness/scratch.ts";
+import {
+  commandDir,
+  createCommandRoot,
+  createScratch,
+  removeScratch,
+  writeRoots,
+} from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
@@ -48,7 +54,15 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
           billing: "subscription",
         },
       };
-      const code = `const results=[];for(const unix of [undefined,${JSON.stringify(socket)}]){try{const r=await fetch(unix?'http://localhost/api/admin/gate-slot':'http://127.0.0.1:${http.port}/api/admin/gate-slot',{unix,method:'POST',headers:{'content-type':'application/json'},body:'{"name":"probe"}',signal:AbortSignal.timeout(2000)});results.push(r.ok&&(await r.json()).acquired===true)}catch{results.push(false)}}console.log(JSON.stringify(results))`;
+      // A capability of this invocation and of another one, in the shared factory-owned root.
+      const own = commandDir(scratch),
+        other = join(createCommandRoot(), `probe-other-${crypto.randomUUID()}`);
+      for (const dir of [own, other]) {
+        mkdirSync(dir, { mode: 0o700 });
+        writeFileSync(join(dir, "config.json"), "{}", { mode: 0o400 });
+      }
+      const capabilities = JSON.stringify([join(own, "config.json"), join(other, "config.json")]);
+      const code = `const results=[];for(const unix of [undefined,${JSON.stringify(socket)}]){try{const r=await fetch(unix?'http://localhost/api/admin/gate-slot':'http://127.0.0.1:${http.port}/api/admin/gate-slot',{unix,method:'POST',headers:{'content-type':'application/json'},body:'{"name":"probe"}',signal:AbortSignal.timeout(2000)});results.push(r.ok&&(await r.json()).acquired===true)}catch{results.push(false)}}for(const f of ${capabilities}){try{require('fs').readFileSync(f);results.push(true)}catch{results.push(false)}}console.log(JSON.stringify(results))`;
       const command = [process.execPath, "--eval", code];
       try {
         let cmd: string[],
@@ -90,12 +104,17 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
         });
         expect(result.exitCode).toBe(0);
         const observed: unknown = JSON.parse(result.stdout.trim());
-        console.info(`${sandbox}: HTTP, Unix = ${JSON.stringify(observed)}`);
-        expect(observed).toEqual(sandbox === "claude-reader" ? [false, false] : [true, true]);
+        console.info(
+          `${sandbox}: HTTP, Unix, own capability, other capability = ${JSON.stringify(observed)}`,
+        );
+        const transports = sandbox === "claude-reader" ? [false, false] : [true, true];
+        expect(observed).toEqual([...transports, true, false]);
       } finally {
         if (sandbox === "claude-reader") await SandboxManager.reset();
         http.stop(true);
         unix.stop(true);
+        rmSync(own, { recursive: true, force: true });
+        rmSync(other, { recursive: true, force: true });
         removeScratch(scratch);
         rmSync(root, { recursive: true, force: true });
       }

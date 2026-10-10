@@ -239,7 +239,8 @@ never wait behind a full suite. Health reports this lane as `agentTestSlots` nex
 Gates, baselines, land checks and deploys keep their existing leases and PATH.
 
 Wrappers use loopback HTTP, with a scratch Unix socket fallback, without expanding
-sandbox permissions. If both transports are unavailable they warn and run the command,
+sandbox permissions. Each invocation's wrappers and lease capability live in a private
+factory directory that every agent and gate sandbox denies reading, except to that invocation. If both transports are unavailable they warn and run the command,
 following gate-slot coordination semantics; a rejected lease or cancellation fails.
 Private holdout authors with read confinement do not receive wrappers, since they cannot
 read the factory-owned wrapper location. Run and stage concurrency limits stay unchanged.

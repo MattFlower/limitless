@@ -36,6 +36,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
     "(deny file-write*)",
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
+    // Other invocations' lease capabilities: contents and listings, not the metadata path lookups need.
+    ...(roots.commands ? [`(deny file-read-data ${paths(roots.commands.root)})`] : []),
+    ...(roots.commands?.own.length ? [`(allow file-read-data ${paths(roots.commands.own)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
   ].join("\n");
 }

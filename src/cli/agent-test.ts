@@ -11,6 +11,8 @@ export interface WrapperConfig {
   port: number;
   unix: string;
   token: string;
+  /** Marks a leased command's descendants; never the token, which the environment would expose. */
+  nested: string;
 }
 
 export function testLane(argv: string[], prefix: string[]): TestLane {
@@ -102,7 +104,7 @@ export async function agentTestCommand(
     .filter((p) => p.every((token, i) => argv[i] === token))
     .sort((a, b) => b.length - a.length)[0];
   // Descendants share their parent's slot, including scripts that re-enter a slotted command.
-  if (!prefix || process.env.LIMITLESS_AGENT_TEST_SLOT === config.token)
+  if (!prefix || process.env.LIMITLESS_AGENT_TEST_SLOT === config.nested)
     return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
   const lane = testLane(argv, prefix);
   return runLeasedCommand(
@@ -113,7 +115,7 @@ export async function agentTestCommand(
       warn: (message) => console.warn(redactCredentials(message)),
     },
     true,
-    { ...process.env, LIMITLESS_AGENT_TEST_SLOT: config.token },
+    { ...process.env, LIMITLESS_AGENT_TEST_SLOT: config.nested },
   );
 }
 

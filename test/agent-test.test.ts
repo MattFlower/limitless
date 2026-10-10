@@ -56,6 +56,7 @@ function fixture() {
     port: 1,
     unix: join(root, "unused.sock"),
     token: "test-token",
+    nested: "test-nested",
   };
   return { root, directory, real, marker, config, fake };
 }

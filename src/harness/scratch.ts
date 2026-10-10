@@ -99,6 +99,8 @@ export function validateScratch(spec: AgentSpec): string {
 
 export interface WriteRoots {
   denyRead?: string[];
+  /** Every invocation's command capabilities are unreadable, except this invocation's own. */
+  commands?: InvocationCommands;
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
   /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
@@ -133,7 +135,51 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
       throw new Error("Worktree .git does not name its own linked worktree directory");
     protectedPaths.push(gitDir);
   } else if (stat && !stat.isDirectory()) throw new Error("Worktree .git must be a file or directory");
-  return { write: spellings(granted), protect: spellings(protectedPaths), denyRead: privateReadPaths() };
+  return {
+    write: spellings(granted),
+    protect: spellings(protectedPaths),
+    denyRead: privateReadPaths(),
+    commands: invocationCommands(scratchDir),
+  };
+}
+
+const COMMAND_ROOT = `limitless-commands-${process.getuid?.() ?? 0}`;
+
+/** Both spellings of the factory-owned root that holds each invocation's wrappers and lease capability. */
+export function commandRoots(): string[] {
+  return [...new Set([join(tmpdir(), COMMAND_ROOT), join(realpathSync(tmpdir()), COMMAND_ROOT)])];
+}
+
+/** One invocation's wrapper directory, named for its scratch so every profile can grant it alone. */
+export function commandDir(scratchDir: string): string {
+  const parent = realpathSync(scratchParent(scratchDir));
+  const name = new Bun.CryptoHasher("sha256").update(parent).digest("hex").slice(0, 32);
+  return join(realpathSync(tmpdir()), COMMAND_ROOT, name);
+}
+
+/** Creates the root for this user only; a pre-existing root someone else controls is refused. */
+export function createCommandRoot(): string {
+  const root = join(realpathSync(tmpdir()), COMMAND_ROOT);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(root);
+  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
+    throw new Error(`Command wrapper root ${root} is not private to this user`);
+  return root;
+}
+
+export interface InvocationCommands {
+  /** The shared root, both spellings: other invocations' capabilities live here. */
+  root: string[];
+  /** This invocation's own directory, both spellings; empty when it has no wrappers. */
+  own: string[];
+}
+
+export function invocationCommands(scratchDir: string): InvocationCommands {
+  const root = commandRoots();
+  if (basename(scratchDir) !== SCRATCH_NAME) return { root, own: [] };
+  const own = commandDir(scratchDir);
+  // Only an invocation given wrappers has a directory to read; nothing else is granted.
+  return { root, own: existsSync(own) ? root.map((r) => join(r, basename(own))) : [] };
 }
 
 /** Each path as given and, when it exists, canonical: what a confined profile actually denies. */

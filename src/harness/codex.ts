@@ -19,6 +19,8 @@ import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import {
   createScratch,
+  type InvocationCommands,
+  invocationCommands,
   readConfinement,
   scratchEnv,
   scratchParent,
@@ -259,10 +261,19 @@ function readerFilesystem(spec: AgentSpec, scratch: string): string {
   } else {
     entries.push(["/", "read"]);
     for (const path of validateDenyRead(spec, scratch)) entries.push([path, "none"]);
+    entries.push(...commandEntries(invocationCommands(scratch)));
     entries.push([scratch, "write"]);
   }
   const unique = new Map(entries);
   return [...unique].map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
+}
+
+/** Other invocations' command capabilities are unreadable; this invocation's own stays readable. */
+function commandEntries(commands?: InvocationCommands): [string, string][] {
+  return [
+    ...(commands?.root ?? []).map((p): [string, string] => [p, "none"]),
+    ...(commands?.own ?? []).map((p): [string, string] => [p, "read"]),
+  ];
 }
 
 function readerProfile(spec: AgentSpec, scratch: string): string[] {
@@ -276,12 +287,13 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
 
 /** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
 export function editorProfile(spec: AgentSpec): string[] {
-  const { write, protect, denyRead = [] } = writeRoots(spec.cwd, validateScratch(spec));
+  const { write, protect, denyRead = [], commands } = writeRoots(spec.cwd, validateScratch(spec));
   const entries = [
     ["/", "read"],
     ...write.map((p) => [p, "write"]),
     ...protect.map((p) => [p, "read"]),
     ...denyRead.map((p) => [p, "none"]),
+    ...commandEntries(commands),
   ];
   const filesystem = entries.map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
   return [
