@@ -1,7 +1,7 @@
 import { constants } from "node:os";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
-import { privateMatches } from "../gates/private.ts";
+import { normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
 import { holdoutBoundaryPattern, privateHoldoutDetails } from "../pipeline/prompts.ts";
@@ -46,6 +46,18 @@ function patchStructure() {
     if (hunk) header = false;
     return header ? line.length : (hunk?.[0].length ?? 0);
   };
+}
+
+/**
+ * The rendered report clips holdout scenarios, so phrase matching cannot vet them; drop the
+ * whole section. It always precedes the Checks heading, and any earlier or later lookalike
+ * headings only widen what is dropped.
+ */
+function withoutHoldoutSection(report: string) {
+  const start = report.indexOf("## Holdout scenarios");
+  if (start < 0) return report;
+  const end = report.lastIndexOf("\n\n## Checks");
+  return `${report.slice(0, start)}[Holdout scenarios withheld from agents]${end > start ? report.slice(end) : "\n"}`;
 }
 
 /** Saved observations only: no fetch, working-tree bytes, arbitrary paths, or artifact reads. */
@@ -103,18 +115,28 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         "giu",
       )
     : null;
-  // Long, distinctive details are also caught when escaped or encoded; short literals are not.
+  // Long, distinctive details are also caught embedded in other words.
   const distinctive = [...details]
     .filter((detail) => detail.length >= DISTINCTIVE_LENGTH)
     .map((value) => ({ value, entry: 0 }));
+  const boundary = pattern && new RegExp(pattern.source, "iu");
+  // Any detail, however short, that appears once text is decoded or normalized withholds the value.
+  const encoded = (text: string) => {
+    const layers = normalizedLayers(text);
+    return !layers || layers.some((layer) => boundary?.test(layer));
+  };
   const holdoutRedact = (value: string, keep?: (line: string) => number) => {
     if (!pattern) return value;
     let removed = 0;
-    const replace = (text: string) =>
-      text.replace(pattern, () => {
+    let hidden = false;
+    const replace = (text: string) => {
+      const replaced = text.replace(pattern, () => {
         removed++;
         return "[private detail]";
       });
+      if (encoded(replaced)) hidden = true;
+      return replaced;
+    };
     const safe = keep
       ? value
           .split("\n")
@@ -124,7 +146,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
           })
           .join("\n")
       : replace(value);
-    if (privateMatches(safe, distinctive).length) return "[withheld: holdout text]";
+    if (hidden || privateMatches(safe, distinctive).length) return "[withheld: holdout text]";
     return removed ? `${safe}${keep ? "\n" : " "}[${removed} private details withheld]` : safe;
   };
   const protect = (value: string, keep?: (line: string) => number) => privacy(holdoutRedact(value, keep));
@@ -184,7 +206,11 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
       const report = store.getArtifact(run, "report.md");
       return report === null
         ? { run, available: false, reason: "Persisted report unavailable." }
-        : { run, available: true, ...page(protect(report), q.reportOffset, REPORT_CAP) };
+        : {
+            run,
+            available: true,
+            ...page(protect(withoutHoldoutSection(report)), q.reportOffset, REPORT_CAP),
+          };
     });
     const listing = [];
     let size = 0;

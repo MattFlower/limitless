@@ -7,6 +7,8 @@ import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontext
 import type { FeedPage, Question, Run } from "../src/core/types.ts";
 import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
+import type { RunState } from "../src/pipeline/context.ts";
+import { renderReport } from "../src/pipeline/report.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import {
@@ -167,6 +169,92 @@ test("holdout literals inside code are redacted at word boundaries, not by withh
       expect(page.diff.text).toContain("+const [private detail] = [private detail];\n+const total = 420;\n");
       expect(page.diff.text).toEndWith("[2 private details withheld]");
       expect(page.diff.text).not.toMatch(/maxWords|\b42\b/);
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("short holdout literals are withheld when percent- or Unicode-encoded in paths, patches and reports", async () => {
+  const percent = [..."maxWords"].map((ch) => `%${ch.charCodeAt(0).toString(16)}`).join("");
+  const unicode = [..."maxWords"]
+    .map((ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`)
+    .join("");
+  const c = await changeFixture(f, {
+    "hello.txt": `hello\n${percent}\n`,
+    "unicode.txt": `const label = "${unicode}";\n`,
+    [`${percent}.txt`]: "path\n",
+  });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        { id: "H-1", description: "Use maxWords.", steps: "Run it.", expected: "Done.", edge_case: false },
+      ],
+    },
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", `Saw ${unicode} and ${percent}.`);
+  const connections = await changeConnections();
+  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const read = async (file: number) =>
+        resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { ...pin, file } }),
+        );
+      const first = await read(0);
+      expect(first.files).toHaveLength(3);
+      const pages = [first, await read(1), await read(2)];
+      for (const page of pages) {
+        const output = JSON.stringify(page);
+        for (const secret of [percent, unicode, unicode.replaceAll("\\", "\\\\"), "maxWords"])
+          expect(output).not.toContain(secret);
+      }
+      expect(first.reports[0]?.text).toBe("[withheld: holdout text]");
+      expect(pages.filter((page) => page.diff.text === "[withheld: holdout text]")).toHaveLength(2);
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("a rendered report never exposes a clipped holdout scenario description", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const description = `Callers who pass an unusually long sentence ${"through the private pipeline ".repeat(12)}see one tidy summary.`;
+  const state = {
+    flow: "build" as const,
+    holdout: {
+      scenarios: [{ id: "H-1", description, steps: "Run it.", expected: "Done.", edge_case: false }],
+    },
+    lastVerify: {
+      modelId: "verifier",
+      criteria: [{ id: "H-1", status: "met" as const, evidence: "Observed the summary." }],
+    },
+  };
+  f.factory.store.setRunState(c.run.id, state);
+  const report = renderReport({
+    success: true,
+    runId: c.run.id,
+    prompt: "Summarize text.",
+    state: state as unknown as RunState,
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+  });
+  // The report clips the description, so the full phrase never appears for redaction to find.
+  expect(report).toContain(description.slice(0, 200));
+  expect(report).not.toContain(description);
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", report);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      const text = page.reports[0]?.text ?? "";
+      expect(text).toContain("Holdout scenarios withheld from agents");
+      expect(text).toContain("## Checks");
+      expect(text).not.toContain("unusually long sentence");
+      expect(text).not.toContain("Observed the summary");
     }
   } finally {
     await connections.close();
