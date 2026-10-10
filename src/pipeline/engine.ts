@@ -12,6 +12,7 @@ import {
   singleFlight,
 } from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
+import { redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
@@ -1342,29 +1343,29 @@ async function oneRound(
         ...(fixSha ? { resolved: resolvedPriorFindings(earlierReviews) } : {}),
       }
     : undefined;
-  const firstParentPatch =
-    resolution && ctx.state.conflictFiles?.length
-      ? redactPrivate(
-          redactCredentials(
-            (
-              await worktreeGit(
-                [
-                  "git",
-                  "--literal-pathspecs",
-                  "diff",
-                  "--no-ext-diff",
-                  "--no-textconv",
-                  `${reviewedSha}^1..${reviewedSha}`,
-                  "--",
-                  ...ctx.state.conflictFiles,
-                ],
-                { cwd },
-              )
-            ).stdout,
-          ),
-          privateStrings(),
-        )
-      : undefined;
+  const reviewText = (text: string) => redactPrivate(redactGateOutput(text), privateStrings());
+  const firstParentRange = `${ctx.state.preRebaseHead}..${reviewedSha}`;
+  const firstParentFiles = resolution ? ctx.state.conflictFiles : undefined;
+  const firstParentDiff = firstParentFiles?.length
+    ? await Promise.all(
+        [[], ["--stat"]].map((options) =>
+          worktreeGit(
+            [
+              "git",
+              "--literal-pathspecs",
+              "diff",
+              "--no-ext-diff",
+              "--no-textconv",
+              ...options,
+              firstParentRange,
+              "--",
+              ...firstParentFiles,
+            ],
+            { cwd },
+          ).then(({ stdout }) => reviewText(stdout)),
+        ),
+      )
+    : undefined;
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
@@ -1394,7 +1395,10 @@ async function oneRound(
           previous: previousReview,
           headSha: reviewedSha,
           resolution,
-          firstParentPatch,
+          firstParentPatch: firstParentDiff?.[0],
+          firstParentStat: firstParentDiff?.[1],
+          firstParentRange,
+          firstParentFiles: firstParentFiles?.map(reviewText),
           ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };

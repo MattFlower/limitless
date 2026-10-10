@@ -1097,21 +1097,22 @@ export class Store {
   }
 
   /** Draft deferrals are rechecked so the same head can start once the PR is ready. */
-  pendingConflictTriggers(): { id: number; prUrl: string; head: string }[] {
+  pendingConflictTriggers(): { id: number; prUrl: string; head: string; nextAttemptAt: number }[] {
     return this.db
-      .query<{ id: number; prUrl: string; head: string }, []>(
-        "SELECT id, pr_url AS prUrl, observed_sha AS head FROM conflict_triggers WHERE state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft') ORDER BY id",
+      .query<{ id: number; prUrl: string; head: string; nextAttemptAt: number }, []>(
+        "SELECT id, pr_url AS prUrl, observed_sha AS head, next_attempt_at AS nextAttemptAt FROM conflict_triggers WHERE state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft') ORDER BY id",
       )
       .all();
   }
 
-  failConflictLookup(id: number, error: unknown): void {
+  failConflictLookup(id: number, error: unknown, now: number): void {
     const reason = redactCredentials(error instanceof Error ? error.message : String(error));
     this.db
       .query(`UPDATE conflict_triggers SET attempts = attempts + 1, reason = ?,
-      state = CASE WHEN attempts + 1 >= 5 THEN 'skipped' ELSE 'pending' END
+      state = CASE WHEN attempts + 1 >= 5 THEN 'skipped' ELSE 'pending' END,
+      next_attempt_at = CASE WHEN attempts + 1 >= 5 THEN 0 ELSE ? + 60000 * (1 << attempts) END
       WHERE id = ? AND (state = 'pending' OR (state = 'skipped' AND reason = 'PR is draft'))`)
-      .run(reason, id);
+      .run(reason, now, id);
   }
 
   startConflictTrigger(
@@ -1129,7 +1130,7 @@ export class Store {
   ): Run | null {
     return this.chatTransaction(() => {
       const trigger = this.pendingConflictTriggers().find((t) => t.id === id);
-      if (!trigger) return null;
+      if (!trigger || trigger.nextAttemptAt > now) return null;
       const row = this.db
         .query(`${RUN_SELECT} WHERE runs.pr_url = ? AND runs.delivery_branch IS NULL
         AND coalesce(json_extract(runs.source_ref, '$.kind'), '') NOT IN ('pull_request', 'review-round')

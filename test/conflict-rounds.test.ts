@@ -696,9 +696,35 @@ test.each(["single", "panel"] as const)(
     expect(reviewPrompts[0]).toContain("diff against the PR head (first parent)");
     expect(reviewPrompts[0]).toContain("-PR intent");
     expect(reviewPrompts[0]).toContain("+base intent");
+    const state = factory.store.getRunState<{ worktreePath: string }>(id);
+    if (!state) throw new Error("missing state");
+    const reviewed = await git(state.worktreePath, "rev-parse", "HEAD");
+    expect(reviewPrompts[0]).toContain(`git --literal-pathspecs diff ${head}..${reviewed} -- 'greeting.txt'`);
+    expect(reviewPrompts[0]).toContain("greeting.txt | 2 +-");
+    expect(reviewPrompts[0]).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
     expect(implementations).toBe(1);
   },
 );
+
+test("first-parent review normalizes escapes before private redaction", async () => {
+  mkdirSync(factory.cfg.paths.configDir, { recursive: true });
+  writeFileSync(join(factory.cfg.paths.configDir, "private-strings.txt"), "sensitive.fixture.invalid\n");
+  const cwd = join(root, "work");
+  await git(cwd, "checkout", "-q", branch);
+  writeFileSync(join(cwd, "greeting.txt"), "PR intent sensitive.\u001b[31mfixture.invalid\n");
+  writeFileSync(join(cwd, "survives.txt"), "another PR change\n");
+  await git(cwd, "add", ".");
+  await git(cwd, "commit", "-qm", "private PR hunk");
+  await git(cwd, "push", "-q", join(root, "remote.git"), `${branch}:refs/heads/${branch}`);
+  await git(cwd, "checkout", "-q", "main");
+  await advanceBase();
+  mode = "dropped";
+  const id = await trigger();
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  expect(reviewPrompts).toHaveLength(1);
+  expect(reviewPrompts[0]).toContain("-PR intent [redacted]");
+  expect(reviewPrompts[0]).not.toContain("sensitive.fixture.invalid");
+});
 
 test("delivery keeps a new-head approval recorded after an uncheckpointed push", async () => {
   await advanceBase();
@@ -824,19 +850,62 @@ test("startup uses a live lookup rather than a cached non-draft PR", async () =>
   }
 });
 
-test("lookup failures remain pending and end after five attempts", async () => {
-  cachePr(await remoteHead());
+test("15-second conflict ticks respect persisted backoff and skip the fifth failure", async () => {
   factory.store.recordConflictTrigger(url, await remoteHead(), "land", clock.now());
+  const started = clock.now();
+  const attempts: number[] = [];
   const gh = async () => {
+    attempts.push(clock.now() - started);
     throw new Error("lookup unavailable");
   };
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    await expect(processConflictTriggers(factory.store, clock.now, gh)).rejects.toThrow("lookup unavailable");
-    expect(triggers()[0]).toMatchObject({ state: attempt < 5 ? "pending" : "skipped", attempts: attempt });
-    expect(triggers()[0]?.reason).toContain("lookup unavailable");
+  const deadlines = [0, 60_000, 180_000, 420_000, 900_000];
+  for (let elapsed = 0; elapsed <= 900_000; elapsed += 15_000) {
+    if (elapsed) await clock.advance(15_000);
+    if (deadlines.includes(elapsed)) {
+      await expect(processConflictTriggers(factory.store, clock.now, gh)).rejects.toThrow(
+        "lookup unavailable",
+      );
+    } else {
+      await processConflictTriggers(factory.store, clock.now, gh);
+    }
+    expect(attempts).toEqual(deadlines.filter((deadline) => deadline <= elapsed));
+    expect(triggers()[0]).toMatchObject({
+      state: elapsed < 900_000 ? "pending" : "skipped",
+      attempts: attempts.length,
+    });
+    if (elapsed === 15_000) {
+      const reopened = new Store(factory.cfg.paths.db);
+      try {
+        expect(reopened.pendingConflictTriggers()[0]?.nextAttemptAt).toBe(started + 60_000);
+        const queue = new LandQueue({
+          store: reopened,
+          paths: factory.cfg.paths,
+          gh,
+          clock: {
+            now: clock.now,
+            set: clock.timer.set,
+            clear: (id) => clock.timer.clear(id as ReturnType<typeof setInterval>),
+          },
+          log: () => {},
+        });
+        queue.start();
+        await queue.stop();
+        expect(attempts).toEqual([0]);
+        const trigger = reopened.pendingConflictTriggers()[0];
+        if (!trigger) throw new Error("missing pending trigger");
+        // The poller's observation path must honor the same deadline.
+        expect(
+          reopened.startConflictTrigger(trigger.id, { state: "OPEN", headRefOid: trigger.head }, clock.now()),
+        ).toBeNull();
+        expect(reopened.reviewRounds(url)).toHaveLength(0);
+      } finally {
+        reopened.close();
+      }
+    }
   }
   await processConflictTriggers(factory.store, clock.now, gh);
-  expect(triggers()[0]?.attempts).toBe(5);
+  expect(attempts).toEqual(deadlines);
+  expect(triggers()[0]?.reason).toContain("lookup unavailable");
   expect(factory.store.listRuns()).toHaveLength(1);
 });
 

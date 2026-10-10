@@ -379,6 +379,9 @@ export function reviewPrompt(input: {
   headSha?: string;
   resolution?: boolean;
   firstParentPatch?: string;
+  firstParentStat?: string;
+  firstParentRange?: string;
+  firstParentFiles?: string[];
   /** Panel re-review number (2 or 3): only the fix diff since `previous.sha` is under review. */
   fixReview?: number;
   /** A panel finder's prompt; a single-mode review keeps the reviewer framing. */
@@ -455,7 +458,8 @@ ${
     ? `
 # Conflicted files: diff against the PR head (first parent)
 Confirm that every change the PR made to each conflicted file survives, preserving both changes' intent. Removed PR hunks in this diff must be accounted for; the diff against the base alone cannot show lost PR changes.
-${sealedFence(input.firstParentPatch || "(empty diff)")}
+${input.firstParentStat !== undefined ? `Conflicted-file counts (\`git diff --stat\`):\n${sealedFence(input.firstParentStat.trim() || "(empty diff)")}\n` : ""}${input.firstParentPatch.length > PATCH_LIMIT ? `Patch excerpt truncated to ${PATCH_LIMIT} characters. Read the full diff before accounting for removed PR hunks.\n` : ""}Read-only full diff: \`git --literal-pathspecs diff ${input.firstParentRange} -- ${(input.firstParentFiles ?? []).map((file) => `'${file.replaceAll("'", "'\\''")}'`).join(" ")}\`.
+${sealedFence(input.firstParentPatch.slice(0, PATCH_LIMIT) || "(empty diff)")}
 `
     : ""
 }${

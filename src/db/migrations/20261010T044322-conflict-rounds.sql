@@ -12,7 +12,8 @@ CREATE TABLE conflict_triggers (
   state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'started', 'skipped')),
   run_id TEXT REFERENCES runs(id),
   reason TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TRIGGER feed_review_round_started AFTER INSERT ON review_rounds BEGIN
   INSERT INTO feed_add (kind, run_id, eval_id, title, summary, data, dedupe_key)

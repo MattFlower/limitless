@@ -13,12 +13,13 @@ export async function processConflictTriggers(
   let lookupError: unknown;
   for (const trigger of store.pendingConflictTriggers()) {
     signal?.throwIfAborted();
+    if (trigger.nextAttemptAt > now()) continue;
     let pr: Awaited<ReturnType<typeof readPrHead>>;
     try {
       pr = await readPrHead(gh, trigger.prUrl, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
-      store.failConflictLookup(trigger.id, error);
+      store.failConflictLookup(trigger.id, error, now());
       lookupError ??= error;
       continue;
     }
