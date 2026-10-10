@@ -62,11 +62,11 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 
 | Role | Cases | Source | Grader | Primary metric (floor) |
 |---|---|---|---|---|
-| triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate Wilson lower bound ≥0.60; risk under-call rate ≤0.10 |
-| review | 53 | 24 real-defect diffs and 10 clean merged diffs (16 in snapshot mode), plus 19 held-out diffs `review-h01`..`review-h19` (13 clean and 6 relabelled real by the held-out audit; 18 in snapshot mode) for default decisions only; 54 required and 15 optional defects | round-1 blocking finding + file/line-window match, one finding per defect; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
-| verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept rate ≤0.10 |
-| holdout | 8 | sandbox tasks with reference solution + 3 mutants | execution | valid-on-reference × mutant kill rate |
-| implement | 12 | 8 sandbox replays + 4 small Limitless commits, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
+| triage | 90 | curated prompts and boundary cases | exact match per field, cost-weighted | pass-rate Wilson lower bound ≥0.60; risk under-call Wilson upper bound ≤0.10 |
+| review | 110 | 82 real-defect and 28 clean cases in `evals/review/cases.json` | round-1 blocking finding + file/line-window match, one finding per defect; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
+| verify | no committed dataset | separately curated criterion judgments; test fixtures are not production evidence | per-criterion match | false-accept Wilson upper bound ≤0.25 |
+| holdout | no committed dataset | planned sandbox tasks with reference solution + mutants | planned execution grader | valid-on-reference × mutant kill rate |
+| implement | 12 | curated implementation tasks, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
 | spec, chat | — | deferred (structure lint only) | — | — |
 
 Implement cases run in throwaway worktrees at the case's base commit with hidden tests copied in
@@ -92,8 +92,8 @@ only for grading (the same isolation as the holdout stage).
 ## Implemented repository-reading evaluations
 
 The repository-reading roles are `triage`, `review`, and `verify`. Review reads the committed
-`evals/review/cases.json` unchanged. The real `evals/verify/cases.json` is separately curated;
-there is no production fallback to the three-case test fixture. Missing datasets fail before scheduling.
+`evals/review/cases.json` unchanged. There is currently no committed `evals/verify/cases.json`;
+that dataset must be separately curated. There is no production fallback to the three-case test fixture. Missing datasets fail before scheduling.
 
 Review and verify use version-1 envelopes `{ role, version, notes?, cases }`, with unique,
 nonempty case IDs, `repo` as `owner/name`, and full 40-character `base` and `head` commit SHAs.
@@ -246,7 +246,7 @@ restriction is applied to runtime escalation; generated candidates respect the e
 ```sh
 limitless eval run review --models openrouter/gpt-6-luna --follow
 # After curating the real verify dataset:
-limitless eval run verify --models openrouter/gpt-6-luna --k 2 --max-usd 1 --follow
+limitless eval run verify --models openrouter/gpt-6-luna --k 2 --max-usd 1 --follow # requires a curated verify dataset
 ```
 
 
@@ -384,6 +384,12 @@ unscored); a candidate that fails a floor, ceiling or cost check can still be th
 every candidate is barred there is no reference, and candidates are not additionally flagged for
 missing paired cases. Reusing a case ID after substantive dataset
 changes can invalidate historical comparisons; dataset fingerprints are not backfilled.
+
+The generator cost-orders eligible candidates, then, if the chain is nonempty, appends an
+**availability fallback** for each provider not already covered: its cheapest candidate clearing
+every floor and ceiling whose only rejection is `non-inferiority not established`. Cost ties use
+p50 latency, then model ID. Evidence identifies these separately; missing evidence, origin
+exclusions and other rejections never qualify. With no eligible model, the cell stays unchanged.
 
 Routing cost per case is averaged over **case attempts**, including attempted failures, excluding
 unattempted skips and preparation failures. Repetitions count as separate attempts, not one

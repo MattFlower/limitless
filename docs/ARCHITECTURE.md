@@ -87,15 +87,17 @@ A **run** is one request. It moves through **stages**; each stage makes one or m
 | triage — classify task, size, risk, ambiguity → profile & routing | ✓ | ✓ | ✓ | cheap/local LLM, JSON schema |
 | clarify — ask the human *only if* triage/spec flags blocking ambiguity | – | if needed | if needed | via the run's origin channel |
 | spec — requirements + acceptance criteria (EARS-style) | – | ✓ | ✓ | mid/frontier |
-| plan + plan review (cross-vendor) | – | – | ✓ | frontier ×2 vendors |
 | holdout author — concrete acceptance scenarios, **blind to the diff** | – | ✓ | ✓ | mid/frontier, runs in parallel with implement |
 | implement — agent edits the worktree, runs tests | ✓ | ✓ | ✓ | routed by class/tier |
 | gates — setup/lint/typecheck/test, compared to baseline | ✓ | ✓ | ✓ | factory (no LLM) |
 | audit — reward-hacking & scope checks on the diff | ✓ | ✓ | ✓ | factory (no LLM) |
-| review — rubric review by a **different vendor** | light | ✓ | ×2 | cross-vendor |
+| review — rubric review (cross-vendor where available) | ✓ | ✓ | ✓ | single or configured panel |
 | preview — build/seed/serve matching UI changes on loopback | – | if configured | if configured | factory (no LLM) |
 | verify — run holdout scenarios, judge each acceptance criterion | – | ✓ | ✓ | different session/vendor |
 | deliver — commit, push, PR with evidence report, merge policy | ✓ | ✓ | ✓ | factory (no LLM) + cheap summary |
+
+`quick` skips spec, holdout and verify. `deep` routes review to the `large` cell and, in panel
+mode, adds the base repository's review lenses. It has no plan stage, plan review or double review.
 
 Failures in gates/audit/review/verify send **structured feedback** back to implement (a fresh
 session resumed with the feedback file), bounded by `max_rounds`. After repeated failure the
@@ -195,7 +197,7 @@ does not remove existing installations.
   captured from every `claude -p` call; Codex: `rate_limits.used_percent` read from its session
   rollout after every `codex exec`. Reserves are config (default: Codex stops at 90% to honor the
   "leave 10%" rule; Claude stops at 80% five-hour so your interactive use isn't starved),
-- **budget** — OpenRouter spend vs. the $50 cap (and per-run budgets),
+- **budget** — OpenRouter rolling 30-day spend vs. the $50 default cap; no per-run budget,
 - **vendor constraints** — the reviewer avoids the implementer's vendor. A panel verifier never
   reuses a model that raised the candidate; it prefers a vendor that neither raised it nor
   implemented the change, then the implementer's, then a raising vendor.
@@ -331,16 +333,16 @@ aborts in-flight git, gates and `gh` calls through one signal.
 | **Web UI** (SolidJS) | Mission control: live runs, queue, quota gauges, spend; run detail with stage timeline, invocations (model/cost/tokens/duration), live event log, spec/diff/review/verdict artifacts, questions, cancel/retry; chat to start runs. Loopback needs no sign-in; through the LAN proxy it takes a passkey (or password) and a long-lived session cookie ([OPERATIONS](OPERATIONS.md#signing-in)). |
 | **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `land` (queue, list, cancel), `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
 | **Chat concierge** | Shared by UI chat and Discord: turns free text into a confirmed run, answers status questions. Runs on a local model when available. |
-| **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; CI failure on a factory PR → fix run. |
+| **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; polling classifies CI failures and can start capped CI fix rounds on factory PRs ([GUIDE](GUIDE.md#conflict-and-ci-fix-rounds)). |
 | **Discord** | `/build`, `/runs`, `/show`, `/cancel`; one thread per run with progress, questions and the final report. |
-| **MCP + skills** | `limitless mcp` (stdio) and `/mcp` (HTTP) expose create/get/list/cancel/answer tools; `SKILL.md` for Claude Code (plugin) and Codex (`.agents/skills`). |
-| **Generic webhook** | `POST /webhooks/generic/<token>` for anything else (cron, IFTTT, scripts). |
+| **MCP + skills** | `limitless mcp` (stdio) and `/mcp` (HTTP) expose submit, feed/ack, answer, review, land and status tools ([GUIDE](GUIDE.md#working-with-limitless-as-an-agent)); `SKILL.md` for Claude Code (plugin) and Codex (`.agents/skills`). |
 
 ## 9. Self-hosting
 
 The factory runs from a **release checkout** (`~/.limitless/app`, tracking `main`) under launchd,
 never from the tree it is modifying. Improvements to Limitless are made *by Limitless*: the
 orchestrator (Claude, in this session) files runs against `MattFlower/limitless`, reviews the PRs
-the factory produces, merges, and runs `limitless deploy` (pull → install → build UI → restart).
+the factory produces, merges, and runs `limitless deploy` (fetch → install → checks → optional live smoke → drain → restart).
+Deploy does not run a UI build; see [OPERATIONS](OPERATIONS.md#shipping-a-change).
 The limitless repo's merge policy is `pr` (reviewed by the orchestrator) even though your other
 repos default to auto-merge when all gates pass.
