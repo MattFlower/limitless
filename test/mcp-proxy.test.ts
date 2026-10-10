@@ -655,6 +655,7 @@ test.each(["direct", "proxy"] as const)(
     );
     try {
       for (const text of privacyTexts) {
+        const after = f.factory.store.readFeed({ from: "now" }).nextAfter;
         const run = await f.factory.createRun({ repo: f.repo, prompt: "work", title: `Title ${text}` });
         f.factory.store.updateRun(run.id, { status: "failed", error: `Failure ${text}` });
         f.factory.store.askQuestion(run.id, `Question ${text}`);
@@ -687,7 +688,7 @@ test.each(["direct", "proxy"] as const)(
           VALUES (1, 'review.round_delivered', ?, 'Safe round title', ?, ?, ?)`)
           .run(run.id, `Round ${text}`, JSON.stringify({ nested: [{ [text]: text }] }), run.id);
         const feed = resultValue<FeedPage>(
-          await conn.client.callTool({ name: "limitless_feed", arguments: { after: 0 } }),
+          await conn.client.callTool({ name: "limitless_feed", arguments: { after } }),
         );
         expect(feed.items.filter((item) => item.runId === run.id).map((item) => item.summary)).toEqual([
           "[withheld: private text]",
