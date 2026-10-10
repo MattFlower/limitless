@@ -41,9 +41,12 @@ import {
   type PrSnapshot,
   savedSnapshot,
 } from "../integrations/github-poller.ts";
+import { processConflictTriggers } from "../pipeline/conflict-round.ts";
+import { redactCredentials } from "../util/proc.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
+class LandConflict extends LandBlocked {}
 
 /** What one observation says about the PR the entry is landing. */
 export interface LandObservation {
@@ -106,6 +109,7 @@ export class LandQueue {
   private readonly workers = new Map<string, Promise<void>>();
   private readonly inFlight = new Map<number, AbortController>();
   private stopped = false;
+  private conflictStartup?: { controller: AbortController; work: Promise<void> };
   private readonly owner = randomUUID();
 
   constructor(private readonly deps: LandDeps) {}
@@ -123,6 +127,15 @@ export class LandQueue {
   /** Resume unowned or expired claims, then wait for new requests. */
   start(): void {
     this.stopped = false;
+    if (!this.conflictStartup) {
+      const controller = new AbortController();
+      const work = processConflictTriggers(this.store, this.now, this.deps.gh, controller.signal).catch(
+        (error: unknown) => {
+          if (!controller.signal.aborted) this.log(redactCredentials(`[conflict] ${String(error)}`));
+        },
+      );
+      this.conflictStartup = { controller, work };
+    }
     if (!this.workers.size) this.store.releaseLandClaims(this.owner);
     for (const entry of this.store.listLandEntries({ active: true })) this.pump(entry.repo);
   }
@@ -130,7 +143,10 @@ export class LandQueue {
   /** Abort in-flight git, gates and `gh` calls; entries keep their state for the next start. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.conflictStartup?.controller.abort();
     for (const controller of this.inFlight.values()) controller.abort();
+    await this.conflictStartup?.work;
+    this.conflictStartup = undefined;
     if (!this.workers.size) return;
     await Promise.all([...this.workers.values()].map((worker) => worker.catch(() => undefined)));
     this.store.releaseLandClaims(this.owner);
@@ -282,7 +298,11 @@ export class LandQueue {
     } catch (error) {
       // A cancel or a shutdown aborts on purpose: the entry keeps its state for the next start.
       if (controller.signal.aborted) return;
-      this.block(entry.id, (error as Error).message);
+      clear(heartbeat);
+      this.block(entry.id, (error as Error).message, error instanceof LandConflict);
+      await processConflictTriggers(this.store, this.now, this.deps.gh, signal).catch((error: unknown) => {
+        if (!signal.aborted) this.log(redactCredentials(`[conflict] ${String(error)}`));
+      });
     } finally {
       clear(heartbeat);
       this.inFlight.delete(entry.id);
@@ -340,7 +360,7 @@ export class LandQueue {
   private async mergeBase(cwd: string, entry: LandEntry, baseSha: string): Promise<string> {
     if (await isAncestor(cwd, baseSha, entry.approvedSha)) return entry.approvedSha;
     const conflicts = await prepareMerge(cwd, entry.approvedSha, baseSha);
-    if (conflicts.length) throw new LandBlocked(`conflicts with ${entry.baseBranch}`);
+    if (conflicts.length) throw new LandConflict(`conflicts with ${entry.baseBranch}`);
     return completeMerge(cwd, entry.approvedSha, baseSha);
   }
 
@@ -656,11 +676,16 @@ export class LandQueue {
       : null;
   }
 
-  private block(id: number, reason: string): void {
+  private block(id: number, reason: string, conflict = false): void {
     const current = this.store.getLandEntry(id);
     if (!current || !this.isActive(current)) return;
     this.log(`[land] ${id} blocked: ${reason}`);
-    const entry = this.finish(id, "blocked", reason);
+    const entry = this.store.db.transaction(() => {
+      const blocked = this.finish(id, "blocked", reason);
+      if (conflict)
+        this.store.recordConflictTrigger(blocked.prUrl, blocked.approvedSha, "land", this.now(), id);
+      return blocked;
+    })();
     this.store.landFeed("land.blocked", entry, reason, { reason, pushedSha: entry.pushedSha });
   }
 

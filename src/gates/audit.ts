@@ -190,6 +190,8 @@ export function auditDiff(
   ctx: {
     configDir?: string;
     taskClass: TaskClass | null;
+    /** A validated factory merge can have the same tree as its base. */
+    allowEmpty?: boolean;
     protectedPaths: string[];
     toolCommands?: string[];
     gateScripts?: GateScripts;
@@ -199,7 +201,7 @@ export function auditDiff(
 ): AuditFinding[] {
   const entries = loadPrivateStrings(ctx.configDir);
   const findings: AuditFinding[] = [];
-  if (diff.files.length === 0 && ctx.taskClass !== "question") {
+  if (diff.files.length === 0 && ctx.taskClass !== "question" && !ctx.allowEmpty) {
     findings.push({
       rule: "empty-diff",
       severity: "block",

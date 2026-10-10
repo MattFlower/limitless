@@ -88,14 +88,14 @@ export function roundSection(runId: string, round: number, findings: ReviewFindi
 }
 
 const PR_FIELDS =
-  "state,headRefOid,headRefName,isCrossRepository,headRepository,headRepositoryOwner,body,autoMergeRequest";
+  "state,isDraft,headRefOid,headRefName,isCrossRepository,headRepository,headRepositoryOwner,body,autoMergeRequest";
 
 /** The PR's state and head identity; a failed lookup or a missing field refuses, never skips a check. */
 export async function readPrHead(
   gh: GhRunner,
   prUrl: string,
   signal?: AbortSignal,
-): Promise<PrHead & { body: string; autoMerge: boolean }> {
+): Promise<PrHead & { body: string; autoMerge: boolean; isDraft?: boolean }> {
   let pr: Record<string, unknown> | null;
   try {
     pr = JSON.parse((await gh(["pr", "view", prUrl, "--json", PR_FIELDS], signal)) || "null");
@@ -117,6 +117,7 @@ export async function readPrHead(
     throw new ReviewRefused("cannot verify PR head: the lookup is missing its state or head", 409);
   return {
     state,
+    isDraft: pr?.isDraft === true,
     crossRepository: isCrossRepository,
     headRepo: `${owner}/${name}`,
     headBranch,
