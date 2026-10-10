@@ -149,10 +149,15 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 |---|---|---|
 | A provider shows `down` | model server not reachable | check the server's log above; the daemon re-probes every minute |
 | A model shows "model rejected" in a run | the provider refused that model (plan, CLI version) | it's blocked for 24h automatically; check the CLI version in the daemon log |
-| Runs stuck in `queued` | run slots full, or scheduler draining | Inspect active runs and `/api/health`; resume an interrupted drain. No provider capacity ends a run `needs_human`, rather than leaving it queued. |
+| Runs stuck in `queued` | run slots full, or scheduler draining | Inspect active runs and `/api/health`; resume an interrupted drain. |
 | `exhausted` on a subscription | reserve reached (Claude 80% of 5h, Codex per `config.toml`) | wait for the window reset shown in the UI, or raise the reserve |
 | Deploy says "deploy gate failed" | a check failed on `main` in the release checkout | fix `main`; production keeps running the previous commit. If `bun run check` passes elsewhere, compare `which -a codex claude` with the daemon's `PATH`: a CLI in a parent directory's `node_modules/.bin` is picked up only by `bun run` scripts |
 | Run failed with a git error in `prepare` | repo cache problem | delete `~/.limitless/repos/<owner>__<name>.git`; it is re-cloned on the next run |
+
+Running out of eligible routing candidates raises `NoCapacityError` and ends the run
+`needs_human`. When eligible providers' slots are busy, the run remains `running` while waiting
+for admission, subject to the invocation deadline. Exhausting that deadline can also end the run
+`needs_human`.
 
 Every agent session's raw event stream is kept in `~/.limitless/runs/<run>/inv-<n>.log`, and the UI
 shows the same events live, so failures can be diagnosed without re-running.
