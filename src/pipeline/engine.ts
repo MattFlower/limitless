@@ -1640,10 +1640,18 @@ async function oneRound(
               : `${c.id}: ${c.evidence}`,
           )
           .join("\n");
-        const detail = redactHoldoutText(
-          `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
-          ctx.state.holdout as Holdout,
-          publicSources,
+        const rawDetail = `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`;
+        const detail = redactHoldoutText(rawDetail, ctx.state.holdout as Holdout, publicSources);
+        ctx.store.recordOwnerDiagnostic(
+          {
+            runId: ctx.run.id,
+            kind: "run-error",
+            text: `${ENVIRONMENT_BLOCKED}\n${verify.criteria
+              .filter((c) => c.status === "blocked")
+              .map((c) => `${c.id}: ${c.evidence}`)
+              .join("\n")}${routing ? `\n${routing}` : ""}`,
+          },
+          detail,
         );
         ctx.state.terminalReason = detail;
         // Recorded apart from the retry reservation: an exhausted retry leaves no attempt row behind.

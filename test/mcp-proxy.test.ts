@@ -3,7 +3,9 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { FeedPage, Question, Run } from "../src/core/types.ts";
+import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
@@ -846,6 +848,80 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
     expect(messages.every((message) => message.jsonrpc === "2.0")).toBe(true);
     expect(messages.find((m) => m.id === 2).result.isError).toBe(true);
     expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(12);
+  } finally {
+    await server.close();
+    stdin.destroy();
+    stdout.destroy();
+  }
+});
+
+test("stdio MCP returns only public records across every tool and error", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "private diagnostics" });
+  const marker = "OWNER_MCP_STDIO_ONLY_423";
+  f.factory.store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public");
+  expect(ownerDiagnostics(f.factory.store.db, run.id)).toMatchObject([{ text: marker }]);
+  f.factory.store.updateRun(run.id, { status: "failed", error: "public" });
+  f.factory.store.addEvent({ runId: run.id, type: "log", message: "public event" });
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const server = createMcpServer(factoryBackend(f.factory));
+  const direct = await connect(factoryBackend(f.factory));
+  const tools = (await direct.client.listTools()).tools;
+  await direct.close();
+  const responses = new Map<number, (value: unknown) => void>();
+  let buffer = "";
+  stdout.on("data", (chunk) => {
+    buffer += String(chunk);
+    for (let i = buffer.indexOf("\n"); i >= 0; i = buffer.indexOf("\n")) {
+      const message = JSON.parse(buffer.slice(0, i));
+      buffer = buffer.slice(i + 1);
+      responses.get(message.id)?.(message);
+    }
+  });
+  await server.connect(new StdioServerTransport(stdin, stdout));
+  let id = 0;
+  const call = (method: string, params: unknown) =>
+    new Promise<unknown>((resolve) => {
+      responses.set(++id, resolve);
+      stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+  try {
+    await call("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    });
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    const reads = [
+      [
+        "limitless_get_run",
+        { id: run.id },
+        {
+          id: run.id,
+          error: "public",
+          events: expect.arrayContaining([expect.objectContaining({ message: "public event" })]),
+        },
+      ],
+      ["limitless_list_runs", { status: "failed", limit: 1 }, [{ id: run.id, error: "public" }]],
+      ["limitless_feed", { after: 0, wait: 0 }, { items: [{ runId: run.id }] }],
+      ["limitless_status", { run: run.id }, { run: run.id, state: "Failed" }],
+      ["limitless_providers", {}, [{ id: "fake" }]],
+    ] as const;
+    for (const [name, args, expected] of reads) {
+      const message = await call("tools/call", { name, arguments: args });
+      const result = CallToolResultSchema.parse(JSONRPCResultResponseSchema.parse(message).result);
+      expect(result.isError).not.toBe(true);
+      expect(resultValue(result)).toMatchObject(expected);
+      expect(JSON.stringify(message)).not.toContain(marker);
+    }
+    for (const tool of tools) {
+      if (reads.some(([name]) => name === tool.name)) continue;
+      const message = await call("tools/call", { name: tool.name, arguments: {} });
+      expect(CallToolResultSchema.parse(JSONRPCResultResponseSchema.parse(message).result).isError).toBe(
+        true,
+      );
+      expect(JSON.stringify(message)).not.toContain(marker);
+    }
   } finally {
     await server.close();
     stdin.destroy();
