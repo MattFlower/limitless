@@ -49,6 +49,85 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    "amended HEAD",
+    "missing reviewed SHA",
+    "missing verified SHA",
+    "mismatched gate SHA",
+    "completed clean merge",
+  ])("new PR restart validates %s, including the draft fallback", async (scenario) => {
+    const bare = await githubFixture();
+    const handler: Handler = async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        if (scenario === "completed clean merge") await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler);
+    registerGithub(f, bare);
+    f.deps.faults =
+      scenario === "completed clean merge"
+        ? { "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" } }
+        : { "stage:deliver:before": { action: "kill" } };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    while (f.store.listStages(run.id).findLast((stage) => stage.name === "deliver")?.status !== "cancelled") {
+      if (Date.now() > deadline)
+        throw new Error(`delivery interruption timed out: ${f.store.getRun(run.id)?.error}`);
+      await Bun.sleep(10);
+    }
+    await f.stop();
+    const state = f.store.getRunState<RunState>(run.id);
+    if (!state?.worktreePath || !state.reviewedSha || !state.gateEvidence)
+      throw new Error("missing checked delivery state");
+    expect(state.phase).toBe("deliver");
+    const expected = state.reviewedSha;
+    const cwd = state.worktreePath;
+    if (scenario === "amended HEAD") {
+      writeFileSync(join(cwd, "farewell.txt"), "unreviewed amendment\n");
+      await sh(["git", "add", "farewell.txt"], { cwd });
+      await sh(["git", "commit", "--amend", "--no-edit", "-q"], { cwd });
+    } else if (scenario !== "completed clean merge") {
+      if (scenario === "missing reviewed SHA") state.reviewedSha = undefined;
+      else if (scenario === "missing verified SHA") state.lastVerifiedSha = undefined;
+      else
+        state.gateEvidence.sha = state.gateEvidence.sha === "a".repeat(40) ? "b".repeat(40) : "a".repeat(40);
+      f.store.setRunState(run.id, state);
+    }
+    const actual = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    f.store.close();
+    const resumed = start(() => {
+      throw new Error("delivery resume must not invoke an agent");
+    });
+    const status = await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"]);
+    const finished = resumed.store.getRun(run.id);
+    if (scenario === "completed clean merge") {
+      expect(status).toBe("succeeded");
+      expect(actual).not.toBe(expected);
+      expect(state.pendingRebaseSha).toBeUndefined();
+      expect(finished?.headSha).toBe(actual);
+      expect((await sh(["git", "rev-parse", `${actual}^1`], { cwd: bare })).stdout.trim()).toBe(expected);
+      expect(
+        (await sh(["git", "rev-parse", `refs/heads/${finished?.branch}`], { cwd: bare })).stdout.trim(),
+      ).toBe(actual);
+      expect(resumed.store.listStages(run.id).filter((stage) => stage.name === "gates")).toHaveLength(2);
+      return;
+    }
+    expect(status).toBe("needs_human");
+    expect(finished?.error).toContain(actual);
+    if (scenario === "amended HEAD") expect(finished?.error).toContain(expected);
+    else expect(finished?.error).toContain("missing or inconsistent passing round evidence");
+    expect(finished?.prUrl).toBeNull();
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+    expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+  });
+
   for (const checkpoint of [
     "post-rebase-gates",
     "post-rebase-gates-fail",

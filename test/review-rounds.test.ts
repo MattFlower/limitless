@@ -15,6 +15,7 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 
 // Real git, worktrees and gates; under load they outlast Bun's 5 s default.
@@ -96,6 +97,7 @@ let work: string;
 let factory: Factory;
 let implementPrompts: string[];
 let onImplement: () => Promise<Record<string, string>>;
+let rejectNextReview = false;
 /** The fake PR: `view` overrides fields of `gh pr view`; `fail` breaks it; `hold` delays one lookup. */
 let pr: {
   state: string;
@@ -135,14 +137,17 @@ function answer(s: AgentSpec): FakeReply | Promise<FakeReply> {
   if (s.prompt.startsWith("Classify")) return { structured: triage };
   if (s.prompt.startsWith("Write the specification")) return { structured: spec };
   if (s.prompt.startsWith("Write holdout checks")) return { structured: holdout };
-  if (s.prompt.startsWith("You are an adversarial"))
+  if (s.prompt.startsWith("You are an adversarial")) {
+    const repair = rejectNextReview;
+    rejectNextReview = false;
     return {
       structured: {
         verdict: "approve",
         summary: "ok: checked the diff against the request and every finding",
-        findings: [],
+        findings: repair ? [{ ...findings[0], security: false, ...findingEvidence }] : [],
       },
     };
+  }
   if (s.prompt.startsWith("You are the acceptance")) return { structured: verify };
   implementPrompts.push(s.prompt);
   return onImplement().then((files) => ({ files, text: "done" }));
@@ -216,6 +221,7 @@ beforeEach(async () => {
   work = join(root, "work");
   implementPrompts = [];
   onImplement = async () => ({ "fix.txt": "fixed\n" });
+  rejectNextReview = false;
   pr = {
     state: "OPEN",
     body: "Factory report",
@@ -398,6 +404,72 @@ test("a changes verdict runs one round that pushes onto the PR branch with the f
   ]);
   expect(kinds()).toEqual(expect.arrayContaining(["review.round_started", "review.round_delivered"]));
 });
+
+test.each(["amended round", "unchanged round", "amended existing branch"])(
+  "delivery restart checks the reviewed HEAD: %s",
+  async (scenario) => {
+    const original = await delivered();
+    const originalHead = await remoteHead();
+    await restart({ "stage:deliver:before": { action: "kill" } });
+    rejectNextReview = scenario === "amended existing branch";
+    const repo = factory.store.getRepo(original.repoId);
+    if (!repo) throw new Error("missing delivery repository");
+    const id =
+      scenario === "amended existing branch"
+        ? factory.store.createRun(
+            repo,
+            {
+              repo: "test/repo",
+              prompt: "Fix the feature",
+              profile: "quick",
+              source: "github",
+              requestedBy: "dependabot[bot]",
+              baseBranch: BRANCH,
+              deliveryBranch: BRANCH,
+              sourceRef: {
+                kind: "pull_request",
+                repo: "test/repo",
+                number: 5,
+                headSha: originalHead,
+                baseRef: "main",
+                baseSha: original.baseSha,
+              },
+            },
+            true,
+          ).id
+        : ((await changes(original.id)).body.round?.id as string);
+    await settle(id, (run) => run.status === "running");
+    const state = factory.store.getRunState<RunState>(id);
+    if (!state?.worktreePath || !state.reviewedSha) throw new Error("missing checked round");
+    expect(state.phase).toBe("deliver");
+    const expected = state.reviewedSha;
+    const cwd = state.worktreePath;
+    if (scenario !== "unchanged round") {
+      writeFileSync(join(cwd, "fix.txt"), "unreviewed amendment\n");
+      await sh(["git", "add", "fix.txt"], { cwd });
+      await sh(["git", "commit", "--amend", "--no-edit", "-q"], { cwd });
+    }
+    const actual = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    await restart();
+    const finished = await settle(id);
+    if (scenario === "unchanged round") {
+      expect(finished.status).toBe("succeeded");
+      expect(await remoteHead()).toBe(expected);
+      expect(factory.store.reviewRounds(PR_URL)).toMatchObject([{ deliveredSha: expected }]);
+      expect(kinds().filter((kind) => kind === "review.round_delivered")).toHaveLength(1);
+      expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+      expect(factory.store.getRunState<RunState>(id)?.reviewedSha).toBe(expected);
+    } else {
+      expect(actual).not.toBe(expected);
+      expect(finished.status).toBe("needs_human");
+      expect(finished.error).toContain(expected);
+      expect(finished.error).toContain(actual);
+      expect(await remoteHead()).toBe(originalHead);
+      expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
+      expect(kinds()).not.toContain("review.round_delivered");
+    }
+  },
+);
 
 test("a round refuses with head moved when the PR moved after the review, and pushes nothing", async () => {
   const original = await delivered();
