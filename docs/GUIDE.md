@@ -1107,7 +1107,7 @@ HTTP paths below are relative to `http://127.0.0.1:7400`. POST JSON with
 | Inbox | `limitless_feed` `{consumer, after?, wait?}` | `limitless feed --consumer <name> --wait 3600 --json` | `GET /api/feed?consumer=<name>&wait=60` |
 | Acknowledge | `limitless_feed_ack` `{consumer, id}` | `limitless feed ack <id> --consumer <name>` | `POST /api/feed/ack` `{consumer, id}` |
 | Answer | `limitless_answer_question` `{id, answer}` | `limitless answer <run> "<answer>"` | `POST /api/runs/<id>/answer` `{answer}` |
-| Review | `limitless_review` `{run, verdict, reviewedSha, findings?, reviewer?}` | `limitless review <run> --changes <findings.json> --sha <head>` or `--approve --sha <head>` | `POST /api/runs/<id>/review` `{verdict, reviewedSha, findings?, reviewer?}` |
+| Review | `limitless_review` `{run, verdict, reviewedSha, findings?}` | `limitless review <run> --changes <findings.json> --sha <head>` or `--approve --sha <head>` | `POST /api/runs/<id>/review` `{verdict, reviewedSha, findings?, reviewer?}` |
 | Status | `limitless_status` `{run}`; `limitless_get_run` `{id}` for evidence | `limitless show <run>`; `limitless land list` for landing | `GET /api/runs/<id>` and `GET /api/land?run=<id>` |
 
 `limitless_status` explains saved state and a next action; the HTTP detail response supplies
@@ -1193,8 +1193,10 @@ Supply the full **40-character commit SHA** you inspected, not a branch name or 
 The review handler checks GitHub's current head and refuses a moved head. CLI can infer the last
 delivered head if `--sha` is omitted; pass it explicitly to bind your verdict to your inspection.
 
-The strict review schema accepts `verdict` (`changes` or `approve`), `reviewedSha`, `findings`
-(default `[]`) and optional `reviewer` (trimmed, 1–100 characters). Unknown fields are refused.
+The strict HTTP review schema accepts `verdict` (`changes` or `approve`), `reviewedSha`, `findings`
+(default `[]`) and optional `reviewer` (trimmed, 1–100 characters). MCP adds `run` and accepts
+only `verdict`, `reviewedSha` and `findings` for the verdict; its reviewer defaults to `human`.
+Unknown fields are refused.
 `changes` requires at least one finding; `approve` takes none. A findings file for CLI may be
 an array or an object with `findings`; MCP/HTTP send the array in the review body.
 
