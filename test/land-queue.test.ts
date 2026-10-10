@@ -873,6 +873,54 @@ test("non-transient main-red CI blocks with names", async () => {
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
+test.each(["pushed", "unrelated"])(
+  "rerun preflight waits for the approved-head lag, then handles the %s head",
+  async (nextHead) => {
+    const pr = delivered(1, "pr-1");
+    const approved = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, approved);
+    approve(1, approved);
+    await advanceBase();
+    ci = () => null;
+    const entry = queue().request({ target: pr.run.id });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+    const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+    expect(pinned).not.toBe(approved);
+    workflow(pinned, 1, "failure");
+    let remote = approved;
+    let reads = 0;
+    github.responses.set(`repos/${SLUG}/pulls/1`, () => {
+      reads++;
+      return respond(200, { head: { sha: remote }, state: "open" });
+    });
+    observe(1, pinned, "FAILURE", ["network"]);
+    await waitWithoutClock(
+      () => reads === 1 && (clock.pending > 1 || store.getLandEntry(entry.id)?.state === "blocked"),
+    );
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+    expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+    expect(ghCalls("pr merge")).toEqual([]);
+
+    remote = nextHead === "pushed" ? pinned : "c".repeat(40);
+    observe(1, pinned, "FAILURE", ["network"]);
+    if (nextHead === "unrelated") {
+      await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+      expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+      expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+    } else {
+      await waitWithoutClock(() => landLog.some((l) => l.includes("transient CI failure")));
+      expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+      await tick();
+      expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
+      workflow(pinned, 2, "success");
+      observe(1, pinned, "SUCCESS");
+      await settle();
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
+    }
+  },
+);
+
 test("moved head discovered by rerun preflight blocks immediately", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n");

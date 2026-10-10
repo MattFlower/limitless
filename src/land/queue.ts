@@ -25,7 +25,7 @@ import {
   removeWorktree,
 } from "../git/repos.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
-import { ciDecision } from "../integrations/ci-classifier.ts";
+import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import {
   ciRunsSchema,
@@ -355,14 +355,14 @@ export class LandQueue {
       if (
         saved?.state !== "MERGED" &&
         saved?.headRefOid &&
-        saved.headRefOid !== sha &&
-        saved.headRefOid !== entry.approvedSha
+        headMoved(saved.headRefOid, sha, entry.approvedSha)
       )
         throw new LandBlocked("head moved after approval");
       const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
-      if (seen?.head && seen.head !== sha) throw new LandBlocked("head moved after approval");
+      if (seen?.head && headMoved(seen.head, sha, entry.approvedSha))
+        throw new LandBlocked("head moved after approval");
       if (rerun) {
         const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
         const attempts = rerun.map((old) => current.find((run) => run.databaseId === old.databaseId));
@@ -428,8 +428,7 @@ export class LandQueue {
             !current() ||
             (observed?.state !== "MERGED" &&
               observed?.head &&
-              observed.head !== sha &&
-              observed.head !== entry.approvedSha)
+              headMoved(observed.head, sha, entry.approvedSha))
           )
             inspection.abort(new LandBlocked("head moved after approval"));
         };
@@ -447,6 +446,7 @@ export class LandQueue {
             current,
             current,
             "land",
+            entry.approvedSha,
           );
         } catch (error) {
           signal.throwIfAborted();
