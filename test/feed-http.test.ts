@@ -48,6 +48,40 @@ async function item(title = "work"): Promise<number> {
 }
 const listeners = () => (store as unknown as { listeners: Set<unknown> }).listeners.size;
 
+test.each([101, 1000])(
+  "legacy HTTP limit=%s digests traverse full pages without a byte cap",
+  async (limit) => {
+    const data = { message: "🙂".repeat(80) };
+    const count = 1001;
+    const insert = store.db.query(
+      "INSERT INTO feed (ts, kind, title, summary, data, dedupe_key) VALUES (1, 'daemon.started', 't', 's', ?, ?)",
+    );
+    store.db.transaction(() => {
+      for (let i = 0; i < count; i++) insert.run(JSON.stringify(data), `item-${i}`);
+    })();
+    const bounded = await page("?consumer=fresh");
+    expect(bounded.items.length).toBeLessThanOrEqual(100);
+    expect(Buffer.byteLength(JSON.stringify(bounded))).toBeLessThanOrEqual(16 * 1024);
+    expect(bounded.hasMore).toBe(true);
+    const ids: number[] = [];
+    let after = 0;
+    for (let reads = 0; reads < count; reads++) {
+      const legacy = await page(`?limit=${limit}&after=${after}`);
+      ids.push(...legacy.items.map((item) => item.id));
+      expect(legacy.nextAfter).toBe(legacy.items.at(-1)?.id ?? -1);
+      expect(legacy.hasMore).toBe(ids.length < count);
+      expect(legacy.items.every((item) => item.truncated === undefined)).toBe(true);
+      if (legacy.items.length < limit) {
+        expect(ids).toHaveLength(count);
+        break;
+      }
+      expect(Buffer.byteLength(JSON.stringify(legacy))).toBeGreaterThan(16 * 1024);
+      after = legacy.nextAfter;
+    }
+    expect(ids).toEqual(Array.from({ length: count }, (_, i) => i + 1));
+  },
+);
+
 test("reads honor cursors and explicit after; acknowledgements are durable, monotonic and per consumer", async () => {
   expect(await page("?consumer=new")).toEqual({ items: [], nextAfter: 0, pruned: false, hasMore: false });
   const ids = [await item("a"), await item("b"), await item("c")];
@@ -232,13 +266,13 @@ test("a clamped long poll preserves filters and ignores unrelated feed items", a
     repo: repo.slug,
     prompt: "other",
     source: "mcp",
-    requestedBy: "other",
+    requestedBy: "mcp:other",
   });
   const mine = store.createRun(repo, {
     repo: repo.slug,
     prompt: "mine",
     source: "mcp",
-    requestedBy: "worker",
+    requestedBy: "mcp:worker",
   });
   const pending = read("?after=100000&consumer=worker&ownRuns=true&repo=owner%2Fone&wait=30");
   let settled = false;

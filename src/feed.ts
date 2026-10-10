@@ -32,6 +32,9 @@ export function validateFeedQuery(query: {
 export const FeedAckSchema = z.object({ consumer, id: feedId }).strict();
 export type FeedQuery = z.output<typeof FeedQuerySchema>;
 
+/** Consumer labels must not impersonate identities used by factory policy. */
+export const mcpRequestedBy = (consumer: string): string => `mcp:${consumer}`;
+
 export function parseFeedParams(params: URLSearchParams): FeedQuery {
   const num = (v: string | null) => (v === null ? undefined : v.trim() ? Number(v) : Number.NaN);
   const [after, limit, wait] = ["after", "limit", "wait"].map((k) => num(params.get(k)));
@@ -103,7 +106,12 @@ export function waitForFeed(store: Store, query: FeedQuery, signal?: AbortSignal
     if (query.repo !== undefined && msg.item.repo !== query.repo) return;
     if (query.ownRuns) {
       const run = msg.item.runId === null ? null : store.getRun(msg.item.runId);
-      if (run?.source !== "mcp" || run.requestedBy !== query.consumer) return;
+      if (
+        run?.source !== "mcp" ||
+        query.consumer === undefined ||
+        run.requestedBy !== mcpRequestedBy(query.consumer)
+      )
+        return;
     }
     wake();
   });

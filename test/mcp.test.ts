@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
+import { RunContext } from "../src/pipeline/context.ts";
 import { connect, fixture, resultValue } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -17,6 +18,52 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
   connection.client.callTool({ name: `limitless_${name}`, arguments: args });
 const create = async (args: Record<string, unknown> = {}) =>
   resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "Add a greeting", ...args }));
+
+test("MCP consumer labels cannot impersonate Dependabot and still match own runs", async () => {
+  const mine = await create({ consumer: " dependabot[bot] " });
+  const other = await create({ consumer: "other" });
+  const { store } = f.factory;
+  const run = store.getRun(mine.id);
+  const repo = store.getRepo(mine.repoId);
+  if (!run || !repo) throw new Error("missing created run or repo");
+  expect(run).toMatchObject({ source: "mcp", requestedBy: "mcp:dependabot[bot]" });
+  expect(f.factory.cfg.dependabotRouting).toBe("free_first");
+  const ctx = new RunContext(f.factory.deps, run, repo, new AbortController().signal);
+  expect(ctx.freeFirstRouting).toBe(false);
+  store.updateRun(other.id, { status: "failed" });
+  store.updateRun(mine.id, { status: "failed" });
+  const own = resultValue<FeedPage>(
+    await call("feed", { consumer: "dependabot[bot]", ownRuns: true, repo: mine.repoSlug }),
+  );
+  expect(own.items.map((item) => item.runId)).toEqual([mine.id]);
+  expect(own.hasMore).toBe(false);
+});
+
+test.each([
+  { count: 105, data: {} },
+  { count: 30, data: { message: "🙂".repeat(500) } },
+])("MCP first pages retain count and byte bounds ($count items)", async ({ count, data }) => {
+  const { store } = f.factory;
+  const insert = store.db.query(
+    "INSERT INTO feed (ts, kind, title, summary, data, dedupe_key) VALUES (1, 'daemon.started', 't', 's', ?, ?)",
+  );
+  store.db.transaction(() => {
+    for (let i = 0; i < count; i++) insert.run(JSON.stringify(data), `item-${i}`);
+  })();
+  let page = resultValue<FeedPage>(await call("feed", { consumer: "fresh" }));
+  expect(page.hasMore).toBe(true);
+  const ids: number[] = [];
+  for (let reads = 0; reads < count; reads++) {
+    expect(page.items.length).toBeGreaterThan(0);
+    expect(page.items.length).toBeLessThanOrEqual(100);
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(16 * 1024);
+    expect(page.nextAfter).toBe(page.items.at(-1)?.id ?? -1);
+    ids.push(...page.items.map((item) => item.id));
+    if (!page.hasMore) break;
+    page = resultValue<FeedPage>(await call("feed", { consumer: "fresh", after: page.nextAfter }));
+  }
+  expect(ids).toEqual(Array.from({ length: count }, (_, i) => i + 1));
+});
 
 test("MCP create_run accepts and validates per-run chains", async () => {
   const models = { implement: ["fake/m"], review: ["fake/m"] };

@@ -50,7 +50,7 @@ import {
   MAX_RUN_IDS,
   TERMINAL_STATUSES,
 } from "../core/types.ts";
-import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, validateFeedQuery } from "../feed.ts";
+import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
@@ -694,7 +694,7 @@ export class Store {
       opts.after ?? (opts.consumer === undefined ? 0 : this.feedCursor(opts.consumer)),
       newest,
     );
-    const limit = Math.min(opts.limit ?? MAX_FEED_ITEMS, MAX_FEED_ITEMS);
+    const limit = Math.min(opts.limit ?? MAX_FEED_ITEMS, 1000);
     const query = this.db.query(`${FEED_SELECT} WHERE id > ?
       AND (? IS NULL OR repo = ?)
       AND (? = 0 OR EXISTS (SELECT 1 FROM runs WHERE runs.id = feed.run_id
@@ -705,11 +705,22 @@ export class Store {
         opts.repo ?? null,
         opts.repo ?? null,
         opts.ownRuns ? 1 : 0,
-        opts.consumer ?? null,
+        opts.consumer === undefined ? null : mcpRequestedBy(opts.consumer),
         limit + 1,
       ) as Row[]
     ).map(toFeedItem);
-    return limitFeedPage({ items, nextAfter: after, pruned: this.getSetting(FEED_PRUNED, 0) > after }, limit);
+    const page = { items, nextAfter: after, pruned: this.getSetting(FEED_PRUNED, 0) > after };
+    // Older HTTP digests stop on a short page, so large explicit limits must bypass the byte cap too.
+    if (limit > MAX_FEED_ITEMS) {
+      const selected = items.slice(0, limit);
+      return {
+        ...page,
+        items: selected,
+        nextAfter: selected.at(-1)?.id ?? after,
+        hasMore: items.length > limit,
+      };
+    }
+    return limitFeedPage(page, limit);
   }
 
   feedCursor(consumer: string): number {

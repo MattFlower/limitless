@@ -312,7 +312,7 @@ test.each([
     f.store.db.transaction(() => {
       for (let i = 0; i < count; i++) insert.run(JSON.stringify(data), `item-${i}`);
     })();
-    let page = f.store.readFeed({ consumer: "fresh", limit: 1000 });
+    let page = f.store.readFeed({ consumer: "fresh" });
     expect(page.hasMore).toBe(true);
     if (expectedCount !== undefined) expect(page.items).toHaveLength(expectedCount);
     const ids: number[] = [];
@@ -328,7 +328,7 @@ test.each([
       ).toBe(true);
       ids.push(...page.items.map((item) => item.id));
       if (!page.hasMore) break;
-      page = f.store.readFeed({ consumer: "fresh", after: page.nextAfter, limit: 1000 });
+      page = f.store.readFeed({ consumer: "fresh", after: page.nextAfter });
     }
     expect(ids).toEqual(Array.from({ length: count }, (_, i) => i + 1));
     expect(f.store.feedCursor("fresh")).toBe(0);

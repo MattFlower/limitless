@@ -11,7 +11,14 @@ import {
   RUN_ROLES,
   type RunStatus,
 } from "../core/types.ts";
-import { FeedAckSchema, FeedQuerySchema, limitFeedPage, validateFeedQuery, waitForFeed } from "../feed.ts";
+import {
+  FeedAckSchema,
+  FeedQuerySchema,
+  limitFeedPage,
+  mcpRequestedBy,
+  validateFeedQuery,
+  waitForFeed,
+} from "../feed.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { explainStatus, statusDetailSchema, statusLandsSchema } from "./mcp-status.ts";
@@ -296,7 +303,13 @@ export function createMcpServer(backend: McpBackend): Server {
         })
         .strict(),
       async ({ consumer, ...input }) =>
-        runSchema.parse(await backend.create({ ...input, requestedBy: consumer, source: "mcp" })),
+        runSchema.parse(
+          await backend.create({
+            ...input,
+            requestedBy: consumer === undefined ? undefined : mcpRequestedBy(consumer),
+            source: "mcp",
+          }),
+        ),
     ),
     tool(
       "limitless_get_run",

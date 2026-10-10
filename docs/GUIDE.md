@@ -1131,11 +1131,14 @@ ascending ID order and never advances that cursor. `after` overrides it for an e
 Without either option, reading starts at zero. Ack is cumulative through `id`, never moves
 backwards, and affects subsequent reads for that consumer only. Sharing a name shares the inbox.
 
-HTTP and MCP pages contain at most **100 items and 16 KiB of UTF-8 serialized JSON**, including
-the page fields. HTTP `limit` can request fewer items; existing values up to 1000 remain accepted
-but are capped at 100. When `hasMore: true`, continue with `after: nextAfter` to read the next page
-without duplicates. An individually oversized item keeps its `id`, `kind` and `runId`, drops
-its data and replaces its text, and carries `truncated: true`; inspect the referenced run for detail.
+Default HTTP and all MCP pages contain at most **100 items and 16 KiB of UTF-8 serialized JSON**,
+including the page fields. HTTP `limit` can request fewer items. For compatibility with older CLI
+digests, an explicit HTTP `limit` above 100 (up to 1000) returns up to that many items without a
+byte cap or item truncation: a short page is the final page. This exception lets an older CLI
+traverse the feed during a daemon upgrade. When `hasMore: true`, continue with `after: nextAfter`
+to read the next page without duplicates. In bounded pages, an individually oversized item keeps
+its `id`, `kind` and `runId`, drops its data and replaces its text, and carries `truncated: true`;
+inspect the referenced run for detail.
 Older daemons may omit `hasMore`.
 
 To skip existing history, read `{"consumer":"sandbox-agent","from":"now"}` through MCP, or

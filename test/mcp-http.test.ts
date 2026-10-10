@@ -290,7 +290,7 @@ test("HTTP-backed MCP records consumers and filters only their MCP-created runs"
     const legacy = resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "legacy" }));
     const ui = await f.factory.createRun({ repo: f.repo, prompt: "ui", source: "ui", requestedBy: "worker" });
     const store = f.factory.store;
-    expect(store.getRun(mine.id)).toMatchObject({ source: "mcp", requestedBy: "worker" });
+    expect(store.getRun(mine.id)).toMatchObject({ source: "mcp", requestedBy: "mcp:worker" });
     const repo = store.upsertRepo({
       slug: "owner/other",
       kind: "github",
@@ -303,7 +303,7 @@ test("HTTP-backed MCP records consumers and filters only their MCP-created runs"
       repo: repo.slug,
       prompt: "elsewhere",
       source: "mcp",
-      requestedBy: "worker",
+      requestedBy: "mcp:worker",
     });
     for (const run of [mine, other, legacy, ui, elsewhere]) store.updateRun(run.id, { status: "failed" });
     store.daemonStarted("boot", "test", "sha");
