@@ -1,13 +1,15 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:os";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
-import { normalizedLayers, privateMatches } from "../gates/private.ts";
+import { loadPrivateStrings, normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
 import { holdoutBoundaryPattern, privateHoldoutDetails } from "../pipeline/prompts.ts";
 import { HoldoutSchema, renderSpec, rowKind, SpecSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
+import { registeredCredentials } from "../util/proc.ts";
 import { commitSha, reviewableHead } from "./mcp-head.ts";
 
 export const ChangeQuerySchema = z
@@ -34,6 +36,46 @@ const FILES_CAP = 50;
 const DISTINCTIVE_LENGTH = 12;
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
+type HoldoutRedactor = (value: string, keep?: (line: string) => number) => string;
+// One catalogue per store bounds retained private data. Privacy filters are loaded separately
+// on every read; this cache contains only holdout-derived patterns, never sanitized output.
+const catalogues = new WeakMap<Factory["store"], { key: string; redact: HoldoutRedactor }>();
+
+function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): string | null {
+  try {
+    const hash = createHash("sha256").update(JSON.stringify(rounds));
+    hash.update(JSON.stringify([loadPrivateStrings(), registeredCredentials()]));
+    hash.update(JSON.stringify(store.db.query("PRAGMA data_version").get()));
+    const diagnostics = store.db.query("SELECT 1 FROM sqlite_master WHERE name = 'owner_diagnostics'").get();
+    for (const id of ids) {
+      const run = store.db
+        .query<{ prompt: string; state_json: string | null }, [string]>(
+          "SELECT prompt, state_json FROM runs WHERE id = ?",
+        )
+        .get(id);
+      if (!run) return null;
+      hash.update(JSON.stringify([id, run.prompt, run.state_json]));
+      hash.update(
+        JSON.stringify(
+          store.db
+            .query("SELECT id FROM invocations WHERE run_id = ? AND role = 'verify' ORDER BY id")
+            .all(id),
+        ),
+      );
+      // Owner diagnostics are append-only. Read their watermark without loading their text.
+      if (diagnostics)
+        hash.update(
+          JSON.stringify(
+            store.db.query("SELECT MAX(id), COUNT(*) FROM owner_diagnostics WHERE run_id = ?").get(id),
+          ),
+        );
+    }
+    return hash.digest("hex");
+  } catch {
+    // If freshness cannot be established, the caller rebuilds rather than reusing patterns.
+    return null;
+  }
+}
 // Only the verifier text fields: routing and checkpoint metadata are public structure.
 const verificationText = z.object({
   notes: z.string().optional(),
@@ -76,47 +118,71 @@ function withoutHoldoutSection(report: string) {
   return `${report.slice(0, start)}[Holdout scenarios withheld from agents]${end > start ? report.slice(end) : "\n"}`;
 }
 
-/** Saved observations only: no fetch, working-tree bytes, arbitrary paths, or artifact reads. */
-export async function getChange(factory: Factory, input: unknown, signal?: AbortSignal) {
-  const privacy = loadOutputPrivacy();
-  if (!privacy) return { available: false, reason: "Privacy policy unavailable; content withheld." };
-  const query = ChangeQuerySchema.safeParse(input);
-  if (!query.success) return { available: false, reason: "Invalid change-view request." };
-  const q = query.data;
-  const { store } = factory;
-  const owner = store.getRun(q.run);
-  if (!owner) return { available: false, reason: "Run not found." };
-  let observed: unknown;
-  try {
-    observed = owner.prUrl ? JSON.parse(store.githubPrData(owner.prUrl) ?? "null") : null;
-  } catch {
-    return { available: false, reason: "Observed PR head unavailable." };
+/** Match before paging and retain a line map through decoding, including escaped line breaks. */
+function redactMultiline(value: string, pattern: RegExp, keep?: (line: string) => number): string | null {
+  const lines = value.split("\n");
+  const hidden = new Set<number>();
+  type ContentLine = { index: number; prefix: string; text: string };
+  let hunk: ContentLine[] = [];
+  const match = (content: ContentLine[]): boolean => {
+    const layers = content.map(({ text }) => normalizedLayers(text));
+    if (layers.some((layer) => layer === null)) return false;
+    const depth = Math.max(1, ...layers.map((layer) => layer?.length ?? 0));
+    for (let layer = 0; layer < depth; layer++) {
+      let text = "";
+      const ranges: { index: number; start: number; end: number }[] = [];
+      for (let i = 0; i < content.length; i++) {
+        const forms = layers[i];
+        const line = content[i];
+        if (!forms || !line) return false;
+        const decoded = (forms[Math.min(layer, forms.length - 1)] ?? "").replace(
+          /\\+[nrt]/gu,
+          (sequence) => ({ n: "\n", r: "\r", t: "\t" })[sequence.at(-1) ?? ""] ?? sequence,
+        );
+        ranges.push({ index: line.index, start: text.length, end: text.length + decoded.length });
+        text += `${decoded}\n`;
+      }
+      pattern.lastIndex = 0;
+      for (const found of text.matchAll(pattern)) {
+        const end = found.index + found[0].length;
+        for (const range of ranges) if (range.start < end && range.end > found.index) hidden.add(range.index);
+      }
+    }
+    return true;
+  };
+  const flush = () => {
+    // Old and new file projections prevent interleaved removed lines from interrupting a
+    // phrase in context and additions (and vice versa). Neither crosses a hunk boundary.
+    const ok = keep
+      ? match(hunk.filter((line) => line.prefix !== "-")) && match(hunk.filter((line) => line.prefix !== "+"))
+      : match(hunk);
+    hunk = [];
+    return ok;
+  };
+  for (const [index, line] of lines.entries()) {
+    if (!keep) hunk.push({ index, prefix: "", text: line });
+    else if (keep(line) > 0) {
+      if (!flush()) return null;
+      const suffix = line.slice(keep(line));
+      if (suffix && !match([{ index, prefix: "", text: suffix }])) return null;
+    } else if (/^[-+ ]/u.test(line)) hunk.push({ index, prefix: line[0] ?? "", text: line.slice(1) });
+    else if (line.startsWith("\\")) {
+      // Git's missing-final-newline marker is structure, not intervening file content.
+    } else if (!flush()) return null;
   }
-  const snapshot = z
-    .object({ headRefOid: commitSha, baseRefName: z.string().optional(), baseRefOid: commitSha.optional() })
-    .safeParse(observed);
-  if (!snapshot.success) return { available: false, reason: "Observed PR head unavailable." };
-  const recorded = owner.prUrl ? store.prHead(owner.prUrl) : null;
-  const head = reviewableHead(
-    snapshot.data.headRefOid,
-    recorded && { ...recorded, pushing: store.pushingTo(owner.prUrl ?? "") },
-  );
-  if (head.problem)
-    return { available: false, reason: `PR head ${head.problem}; restart limitless_get_change.` };
-  const headSha = head.headSha;
-  if (q.headSha && q.headSha !== headSha)
-    return { available: false, reason: "PR head superseded; restart limitless_get_change." };
-  const baseBranch = snapshot.data.baseRefName ?? owner.baseBranch;
-  const parsedComparison = commitSha.safeParse(snapshot.data.baseRefOid ?? owner.baseSha);
-  if (!parsedComparison.success || !baseBranch)
-    return { available: false, reason: "Recorded comparison unavailable." };
-  const comparison = parsedComparison.data;
-  const repo = store.getRepo(owner.repoId);
-  if (!repo) return { available: false, reason: "Repository unavailable." };
-  const rounds = owner.prUrl ? store.reviewRounds(owner.prUrl) : [];
+  if (!flush()) return null;
+  return lines
+    .map((line, index) => {
+      const prefix = keep ? (/^@@ [^@]* @@/u.exec(line)?.[0] ?? line.slice(0, 1)) : "";
+      return hidden.has(index) ? `${prefix}[private detail]` : line;
+    })
+    .join("\n");
+}
+
+function buildCatalogue(store: Factory["store"], ids: string[]): HoldoutRedactor | null {
   // Holdouts from earlier rounds remain private even after a later round delivers.
   const details = new Set<string>();
-  for (const id of [owner.id, ...rounds.map((round) => round.runId)]) {
+  for (const id of ids) {
     const state = z
       .object({
         holdout: HoldoutSchema.optional(),
@@ -127,21 +193,30 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
           .optional(),
       })
       .safeParse(store.getRunState(id) ?? {});
-    if (!state.success) return { available: false, reason: "Holdout policy unavailable; content withheld." };
+    if (!state.success) return null;
     const { holdout, spec } = state.data;
     if (!holdout?.scenarios.length) continue;
     // Same exemption as verifier feedback: what the run's request and spec already state is public.
     const publicSources = [store.getRun(id)?.prompt ?? "", spec ? renderSpec(spec) : "", ...errnoNames].join(
       "\n",
     );
-    const collect = (observed?: string) => {
-      for (const detail of privateHoldoutDetails(holdout, publicSources, observed)) {
+    const standalone = {
+      scenarios: holdout.scenarios.map((scenario) => ({
+        ...scenario,
+        description: /[\r\n\t]/u.test(scenario.description) ? "" : scenario.description,
+        steps: /[\r\n\t]/u.test(scenario.steps) ? "" : scenario.steps,
+        expected: /[\r\n\t]/u.test(scenario.expected) ? "" : scenario.expected,
+      })),
+    };
+    const independent = privateHoldoutDetails(standalone, publicSources);
+    // Multiline prose is matched as a phrase. Only independently distinctive literals
+    // survive on their own; short code fragments inferred from multiline text do not.
+    for (const detail of privateHoldoutDetails(holdout, publicSources))
+      if (independent.has(detail) || /[\r\n\t]/u.test(detail) || detail.length >= DISTINCTIVE_LENGTH)
         details.add(detail);
-        // Patch prefixes interrupt whole multiline phrases. Protect each constituent line
-        // before paging, including prose without syntax-shaped literals.
-        if (/[\r\n]/u.test(detail))
-          for (const line of detail.split(/\r?\n/u)) if (line.trim()) details.add(line.trim());
-      }
+    const collect = (observed?: string) => {
+      if (observed !== undefined)
+        for (const detail of privateHoldoutDetails(standalone, publicSources, observed)) details.add(detail);
     };
     const collectOutput = (value: unknown) => {
       if (typeof value === "string") collect(value);
@@ -220,7 +295,27 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     const layers = normalizedLayers(text);
     return !layers || layers.some((layer) => boundary?.test(layer));
   };
-  const holdoutRedact = (value: string, keep?: (line: string) => number) => {
+  const multilineDetails = [...details].filter((detail) => /[\r\n\t]/u.test(detail));
+  const multiline = multilineDetails.length
+    ? new RegExp(
+        multilineDetails
+          .map((detail) => {
+            const normalized = detail.normalize("NFKC").toLowerCase();
+            const literal = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return (
+              detail.length >= DISTINCTIVE_LENGTH ? literal : holdoutBoundaryPattern(normalized)
+            ).replace(/\s+/gu, "\\s+");
+          })
+          .join("|"),
+        "giu",
+      )
+    : null;
+  const holdoutRedact: HoldoutRedactor = (value, keep) => {
+    if (multiline) {
+      const matched = redactMultiline(value, multiline, keep);
+      if (matched === null) return "[withheld: holdout text]";
+      value = matched;
+    }
     if (!pattern) return value;
     let removed = 0;
     let hidden = false;
@@ -244,6 +339,53 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     if (hidden || privateMatches(safe, distinctive).length) return "[withheld: holdout text]";
     return removed ? `${safe}${keep ? "\n" : " "}[${removed} private details withheld]` : safe;
   };
+  return holdoutRedact;
+}
+
+/** Saved observations only: no fetch, working-tree bytes, arbitrary paths, or artifact reads. */
+export async function getChange(factory: Factory, input: unknown, signal?: AbortSignal) {
+  const privacy = loadOutputPrivacy();
+  if (!privacy) return { available: false, reason: "Privacy policy unavailable; content withheld." };
+  const query = ChangeQuerySchema.safeParse(input);
+  if (!query.success) return { available: false, reason: "Invalid change-view request." };
+  const q = query.data;
+  const { store } = factory;
+  const owner = store.getRun(q.run);
+  if (!owner) return { available: false, reason: "Run not found." };
+  let observed: unknown;
+  try {
+    observed = owner.prUrl ? JSON.parse(store.githubPrData(owner.prUrl) ?? "null") : null;
+  } catch {
+    return { available: false, reason: "Observed PR head unavailable." };
+  }
+  const snapshot = z
+    .object({ headRefOid: commitSha, baseRefName: z.string().optional(), baseRefOid: commitSha.optional() })
+    .safeParse(observed);
+  if (!snapshot.success) return { available: false, reason: "Observed PR head unavailable." };
+  const recorded = owner.prUrl ? store.prHead(owner.prUrl) : null;
+  const head = reviewableHead(
+    snapshot.data.headRefOid,
+    recorded && { ...recorded, pushing: store.pushingTo(owner.prUrl ?? "") },
+  );
+  if (head.problem)
+    return { available: false, reason: `PR head ${head.problem}; restart limitless_get_change.` };
+  const headSha = head.headSha;
+  if (q.headSha && q.headSha !== headSha)
+    return { available: false, reason: "PR head superseded; restart limitless_get_change." };
+  const baseBranch = snapshot.data.baseRefName ?? owner.baseBranch;
+  const parsedComparison = commitSha.safeParse(snapshot.data.baseRefOid ?? owner.baseSha);
+  if (!parsedComparison.success || !baseBranch)
+    return { available: false, reason: "Recorded comparison unavailable." };
+  const comparison = parsedComparison.data;
+  const repo = store.getRepo(owner.repoId);
+  if (!repo) return { available: false, reason: "Repository unavailable." };
+  const rounds = owner.prUrl ? store.reviewRounds(owner.prUrl) : [];
+  const ids = [...new Set([owner.id, ...rounds.map((round) => round.runId)])];
+  const key = catalogueKey(store, ids, rounds);
+  const cached = catalogues.get(store);
+  const holdoutRedact = key && cached?.key === key ? cached.redact : buildCatalogue(store, ids);
+  if (!holdoutRedact) return { available: false, reason: "Holdout policy unavailable; content withheld." };
+  if (key) catalogues.set(store, { key, redact: holdoutRedact });
   const protect = (value: string, keep?: (line: string) => number) => privacy(holdoutRedact(value, keep));
   const safe = (value: string) => protect(value) === value;
   const cwd = cachePath(factory.cfg.paths, repo);
@@ -336,6 +478,8 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         .headSha !== headSha
     )
       return { available: false, reason: "PR head superseded; restart limitless_get_change." };
+    if (key && catalogueKey(store, ids, owner.prUrl ? store.reviewRounds(owner.prUrl) : []) !== key)
+      return { available: false, reason: "Holdout policy changed; restart limitless_get_change." };
     return privateOutputData(
       {
         available: true,

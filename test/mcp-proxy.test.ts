@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { FeedPage, Question, Run } from "../src/core/types.ts";
-import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
+import * as diagnosticCatalogue from "../src/db/owner-diagnostics.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport } from "../src/pipeline/report.ts";
@@ -299,6 +299,272 @@ test.each([2, 3])(
   },
 );
 
+test.each(["\\n", "\\r", "\\r\\n", "\\t", "\\u000a", "\\u000d", "\\u0009"])(
+  "short multiline prose with %s escapes is withheld before patch and report paging",
+  async (separator) => {
+    const escaped = `Amber sky${separator}Violet sea`;
+    const c = await changeFixture(f, {
+      "hello.txt": `${"readable line\n".repeat(1500)}"${escaped}"\nreadable ending\n`,
+    });
+    f.factory.store.setRunState(c.run.id, {
+      holdout: {
+        scenarios: [
+          {
+            id: "H-1",
+            description: "Amber sky\nViolet sea",
+            steps: "Run check.",
+            expected: "Done.",
+            edge_case: false,
+          },
+        ],
+      },
+    });
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      `${"readable report\n".repeat(600)}"${escaped}"\nreport ending`,
+    );
+    const conn = await connect(factoryBackend(f.factory));
+    const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+    try {
+      for (const stream of ["diff", "report"] as const) {
+        const read = async (offset: number) => {
+          const page = resultValue<ChangePage>(
+            await conn.client.callTool({
+              name: "limitless_get_change",
+              arguments: { ...pin, [stream === "diff" ? "diffOffset" : "reportOffset"]: offset },
+            }),
+          );
+          expect(page.available).toBe(true);
+          const content = stream === "diff" ? page.diff : page.reports[0];
+          if (!content) throw new Error("Missing report");
+          expect(content.text).not.toMatch(/Amber sky|Violet sea/);
+          return content;
+        };
+        let text = "",
+          offset = 0;
+        do {
+          const page = await read(offset);
+          text += page.text;
+          offset = page.nextOffset ?? 0;
+        } while (offset);
+        expect(text).toContain("readable");
+        expect(text).toContain("ending");
+        const marker = text.indexOf("[private detail]");
+        const cap = stream === "diff" ? 16000 : 4000;
+        expect(marker).toBeGreaterThan(cap);
+        // Put the sanitized placeholder across a page boundary and read both sides.
+        const boundary = await read(marker - cap + 5);
+        expect(boundary.text).toEndWith("[priv");
+        expect(boundary.nextOffset).not.toBeNull();
+        const next = await read(boundary.nextOffset ?? 0);
+        expect(next.text).toStartWith("ate detail]");
+      }
+    } finally {
+      await conn.close();
+    }
+  },
+);
+
+test("multiline hunk matching hides complete phrases and preserves unrelated generic code", async () => {
+  writeFileSync(join(f.repo, "hello.txt"), "}\nold behavior\n");
+  await sh(["git", "commit", "-am", "public context"], { cwd: f.repo });
+  const c = await changeFixture(f, {
+    "hello.txt": `}\n  return true;\n  expect(x).toBe(1)\n${"unrelated readable line\n".repeat(800)}}\nreturn true;\nindependent assertion\nexpect(x).toBe(1)`,
+    "renamed.txt": "}\nreturn true;\nexpect(x).toBe(1)",
+  });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "}\nreturn true;\nexpect(x).toBe(1)",
+          steps: "Run check.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  const conn = await connect(factoryBackend(f.factory));
+  try {
+    for (const file of [0, 1]) {
+      let text = "",
+        offset = 0;
+      do {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, file, diffOffset: offset },
+          }),
+        );
+        expect(page.available).toBe(true);
+        text += page.diff.text;
+        offset = page.diff.nextOffset ?? 0;
+      } while (offset);
+      expect(text).toContain("[private detail]");
+      expect(text).not.toContain("  return true;");
+      expect(text).not.toContain("}\n+return true;\n+expect(x).toBe(1)");
+      if (file === 0) {
+        expect(text).toContain(" [private detail]\n-old behavior\n+[private detail]\n+[private detail]");
+        expect(text).toContain("+}\n+return true;\n+independent assertion\n+expect(x).toBe(1)");
+        expect(text).toContain("unrelated readable line");
+      } else {
+        expect(text).not.toMatch(/return true;|expect\(x\)/);
+        expect(text).toContain("\\ No newline at end of file");
+      }
+    }
+  } finally {
+    await conn.close();
+  }
+});
+
+test("escaped multiline prose in hunk annotations is hidden while Git ranges stay readable", async () => {
+  const annotation = 'const label = "Amber sky\\nViolet sea";';
+  const prefix = `${annotation}\n${"\n".repeat(12)}`;
+  writeFileSync(join(f.repo, "hello.txt"), `${prefix}old behavior\n`);
+  await sh(["git", "commit", "-am", "public annotation"], { cwd: f.repo });
+  const c = await changeFixture(f, { "hello.txt": `${prefix}new behavior\n` });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "Amber sky\nViolet sea",
+          steps: "Run check.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  const conn = await connect(factoryBackend(f.factory));
+  try {
+    const page = resultValue<ChangePage>(
+      await conn.client.callTool({
+        name: "limitless_get_change",
+        arguments: { run: c.run.id },
+      }),
+    );
+    expect(page.available).toBe(true);
+    expect(page.diff.text).toMatch(/@@ -\d+,\d+ \+\d+,\d+ @@\[private detail\]/);
+    expect(page.diff.text).not.toMatch(/Amber sky|Violet sea/);
+    expect(page.diff.text).toContain("-old behavior\n+new behavior\n");
+  } finally {
+    await conn.close();
+  }
+});
+
+test("change pages reuse the catalogue and refresh diagnostics, holdouts and privacy inputs", async () => {
+  const c = await changeFixture(
+    f,
+    {
+      "hello.txt": `${"readable line\n".repeat(1500)}diagnosticSecret\nholdoutSecret\nroundSecret\nprivacySecret\ncredentialSecret\n`,
+    },
+    true,
+  );
+  const { store } = f.factory;
+  const holdout = {
+    scenarios: [
+      {
+        id: "H-1",
+        description: "Private check.",
+        steps: "Run check.",
+        expected: "Done.",
+        edge_case: false,
+      },
+    ],
+  };
+  store.setRunState(c.run.id, { holdout });
+  const invocation = store.createInvocation({
+    runId: c.run.id,
+    stageId: null,
+    role: "verify",
+    harness: "fake",
+    provider: "fake",
+    model: "test",
+    modelId: "fake/m",
+  });
+  store.recordOwnerDiagnostic(
+    { runId: c.run.id, invocationId: invocation.id, kind: "result", text: "Observed 'initialSecret'." },
+    "Private observation.",
+  );
+  // Count full diagnostic reads, not the lightweight freshness watermark lookup.
+  const reads = spyOn(diagnosticCatalogue, "ownerDiagnostics");
+  const conn = await connect(factoryBackend(f.factory));
+  const read = async (diffOffset = 16000) =>
+    resultValue<ChangePage>(
+      await conn.client.callTool({
+        name: "limitless_get_change",
+        arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, diffOffset },
+      }),
+    );
+  try {
+    await read(0);
+    const page = await read();
+    expect(page.diff.text).toContain("diagnosticSecret");
+    expect(reads).toHaveBeenCalledTimes(1);
+    store.recordOwnerDiagnostic(
+      { runId: c.run.id, invocationId: invocation.id, kind: "result", text: "Observed 'diagnosticSecret'." },
+      "Private observation.",
+    );
+    expect((await read()).diff.text).not.toContain("diagnosticSecret");
+    expect(reads).toHaveBeenCalledTimes(2);
+    await read();
+    expect(reads).toHaveBeenCalledTimes(2);
+    store.setRunState(c.run.id, {
+      holdout: { scenarios: [{ ...holdout.scenarios[0], description: 'Use "holdoutSecret".' }] },
+    });
+    expect((await read()).diff.text).not.toContain("holdoutSecret");
+    expect(reads).toHaveBeenCalledTimes(3);
+    const round = store.createReviewRound(
+      c.repo,
+      store.getRun(c.run.id) as Run,
+      { prUrl: c.prUrl, reviewedSha: c.headSha, findings: [], cap: 3 },
+      (number) => ({
+        repo: c.repo.slug,
+        prompt: "Fix review",
+        baseBranch: "limitless/feature",
+        deliveryBranch: "limitless/feature",
+        sourceRef: {
+          kind: "review-round",
+          runId: c.run.id,
+          round: number,
+          prUrl: c.prUrl,
+          reviewedSha: c.headSha,
+        },
+      }),
+    );
+    if (!("run" in round)) throw new Error("Round refused");
+    store.setRunState(round.run.id, {
+      holdout: { scenarios: [{ ...holdout.scenarios[0], description: 'Use "roundSecret".' }] },
+    });
+    expect((await read()).diff.text).not.toContain("roundSecret");
+    expect(reads).toHaveBeenCalledTimes(5);
+    await read();
+    expect(reads).toHaveBeenCalledTimes(5);
+    writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "privacySecret\n");
+    const privatePage = await read();
+    expect(privatePage.available).toBe(true);
+    expect(privatePage.diff.text).not.toContain("privacySecret");
+    expect((await read(0)).diff.text).toBe("[withheld: private text]");
+    expect(reads).toHaveBeenCalledTimes(7);
+    writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "");
+    registerCredential("CHANGE_TEST_CREDENTIAL", "credentialSecret");
+    expect((await read(0)).diff.text).toBe("[withheld: private text]");
+    rmSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
+    // Missing optional private strings means an empty list; an unreadable policy fails closed.
+    mkdirSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
+    expect(await read()).toMatchObject({
+      message: expect.stringContaining("privacy policy unavailable"),
+    });
+  } finally {
+    reads.mockRestore();
+    await conn.close();
+  }
+});
+
 test("change pages protect persisted verifier literals and never return owner-only rows", async () => {
   const hidden = "runtimeProbeSecret",
     diagnosticOnly = "ownerOnlyProbeSecret",
@@ -406,7 +672,7 @@ test("change pages protect persisted verifier literals and never return owner-on
       expect(report).toContain("readable report");
       expect(report).toContain("[private detail]");
     }
-    expect(ownerDiagnostics(store.db, c.run.id)[0]?.text).toContain(diagnosticOnly);
+    expect(diagnosticCatalogue.ownerDiagnostics(store.db, c.run.id)[0]?.text).toContain(diagnosticOnly);
   } finally {
     await connections.close();
   }
@@ -1640,7 +1906,7 @@ test("stdio MCP returns only public records across every tool and error", async 
   const run = await f.factory.createRun({ repo: f.repo, prompt: "private diagnostics" });
   const marker = "OWNER_MCP_STDIO_ONLY_423";
   f.factory.store.recordOwnerDiagnostic({ runId: run.id, kind: "run-error", text: marker }, "public");
-  expect(ownerDiagnostics(f.factory.store.db, run.id)).toMatchObject([{ text: marker }]);
+  expect(diagnosticCatalogue.ownerDiagnostics(f.factory.store.db, run.id)).toMatchObject([{ text: marker }]);
   f.factory.store.updateRun(run.id, { status: "failed", error: "public" });
   f.factory.store.addEvent({ runId: run.id, type: "log", message: "public event" });
   const stdin = new PassThrough();
