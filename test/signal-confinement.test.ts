@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -16,6 +16,7 @@ import { withScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { agentEnv, type ProcOptions, runProcess } from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 const payload = join(import.meta.dir, "fixtures/signal-payload.ts");
 const alive = (child: ChildProcess) => child.exitCode === null && child.signalCode === null;

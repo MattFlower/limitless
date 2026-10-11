@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -6,6 +6,7 @@ import { compareGates, runGates } from "../src/gates/run.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { type ProcOptions, registerCredential, runProcess, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 type Chunk = { stream: "stdout" | "stderr"; text: string | Buffer };
 

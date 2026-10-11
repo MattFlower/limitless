@@ -1,6 +1,8 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout } from "bun:test";
 import {
+  chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,10 +14,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Store } from "../src/db/store.ts";
 import { recordWorktree } from "../src/git/command.ts";
-import { homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
+import { ancestorReadPolicy, homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
 import {
   ConfinementError,
   confinementScope,
@@ -28,6 +30,7 @@ import {
 import { writeRoots } from "../src/harness/scratch.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 // Real git and sandboxed subprocesses.
 setDefaultTimeout(30_000);
@@ -67,7 +70,7 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
   const scratch = join(root, "scratch");
   mkdirSync(scratch);
   const toolchain = join(root, "tools", "custom-toolchain");
-  readPolicyScope.run({ home: root, toolchains: [toolchain] }, () => {
+  readPolicyScope.run({ home: root, toolchains: [toolchain], environment: {} }, () => {
     const roots = writeRoots(work, scratch, true);
     const profile = seatbeltProfile(roots);
     expect(profile).toContain(`(deny file-read* (subpath "${root}")`);
@@ -82,6 +85,33 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
     expect(metadata).not.toContain("(subpath");
     expect(metadata).not.toContain(`(literal "${sibling}")`);
     expect(profile.indexOf("(allow file-read-metadata")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
+    const probes = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
+    for (const allow of roots.allowRead ?? [])
+      for (let parent = dirname(allow); ; parent = dirname(parent)) {
+        for (const name of ["package.json", "bunfig.toml", "tsconfig.json", "jsconfig.json"]) {
+          expect(probes.literals).toContain(join(parent, name));
+          expect(profile).toContain(`(literal "${join(parent, name)}")`);
+          expect(profile).not.toContain(`(subpath "${join(parent, name)}")`);
+        }
+        expect(metadata).toContain(`(literal "${join(parent, "node_modules")}")`);
+        if (parent === dirname(parent)) break;
+      }
+    for (const path of [".bun", ".cargo", ".rustup"]) expect(roots.allowRead).not.toContain(join(root, path));
+    for (const path of [
+      ".bun/bin",
+      ".bun/install/cache",
+      ".cargo/bin",
+      ".cargo/registry",
+      ".cargo/git",
+      ".cargo/config",
+      ".cargo/config.toml",
+      ".rustup/toolchains",
+      ".rustup/settings.toml",
+      ".rustup/update-hashes",
+    ])
+      expect(roots.allowRead).toContain(join(root, path));
+    for (const name of ["credentials", "credentials.toml"])
+      expect(roots.denyRead).toContain(join(root, ".cargo", name));
   });
   rmSync(`${work}.git-paths`);
   expect(() => writeRoots(work, scratch, true)).toThrow("trusted Git paths");
@@ -141,42 +171,71 @@ test.skipIf(seatbeltSkip !== null)(
     await sh(["git", "clone", "-q", "--bare", cache, bare], { cwd: root });
     await sh(["git", "--git-dir", bare, "worktree", "add", "-q", "--detach", gateWork], { cwd: root });
     await recordWorktree(gateWork);
-    await readPolicyScope.run({ home: root, toolchains: [bunHome] }, async () => {
-      for (const file of denied) {
-        const result = await runConfined({
-          command: `head -c 1 '${file}' >/dev/null`,
-          cwd: gateWork,
-          env: agentEnv(),
-        });
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
-        expect(result.stdout).toBe("");
-      }
-      // Traversal metadata must not grant directory listings of home or intermediate factory data.
-      for (const dir of [root, join(root, ".limitless"), join(root, ".limitless/work")]) {
-        const result = await runConfined({
-          command: `ls -A '${dir}' >/dev/null`,
-          cwd: gateWork,
-          env: agentEnv(),
-        });
-        expect(result.exitCode).not.toBe(0);
-        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
-        expect(result.stdout).toBe("");
-      }
-      for (const command of [
-        "head -c 1 a.ts >/dev/null",
-        'printf x > "$TMPDIR/canary" && head -c 1 "$TMPDIR/canary" >/dev/null',
-        `head -c 1 '${bare}/HEAD' >/dev/null`,
-        `head -c 1 '${bare}/worktrees/current/commondir' >/dev/null`,
-        "git status --porcelain",
-        "git diff && git log -1 --format=%s",
-        `'${bunHome}/bin/bun' -e 'require("node:fs").realpathSync(process.cwd())'`,
-        `'${bunHome}/bin/bun' --version`,
-      ]) {
-        const result = await runConfined({ command, cwd: gateWork, env: agentEnv() });
-        expect(result.exitCode, result.stderr).toBe(0);
-      }
-    });
+    const cargoHome = join(root, ".cargo");
+    for (const path of ["bin", "registry/cache"]) mkdirSync(join(cargoHome, path), { recursive: true });
+    writeFileSync(join(cargoHome, "bin/cargo"), '#!/bin/sh\nprintf "cargo stand-in\\n"\n');
+    chmodSync(join(cargoHome, "bin/cargo"), 0o700);
+    writeFileSync(join(cargoHome, "registry/cache/package"), "cached");
+    for (const name of ["credentials", "credentials.toml"]) {
+      const file = join(cargoHome, name);
+      writeFileSync(file, "stand-in");
+      denied.push(file);
+    }
+    writeFileSync(join(gateWork, "package.json"), '{"type":"module"}');
+    writeFileSync(
+      join(gateWork, "smoke.test.ts"),
+      `
+      import {test, expect} from "bun:test";
+      import {readFileSync} from "node:fs";
+      test("fixture works and credentials stay denied", () => {
+        expect(1 + 1).toBe(2);
+        for (const file of ${JSON.stringify(denied.slice(0, 2))})
+          expect(() => readFileSync(file)).toThrow(/Operation not permitted|Permission denied/);
+      });
+    `,
+    );
+    await readPolicyScope.run(
+      { home: root, environment: { BUN_INSTALL: bunHome, CARGO_HOME: cargoHome } },
+      async () => {
+        for (const file of denied) {
+          const result = await runConfined({
+            command: `head -c 1 '${file}' >/dev/null`,
+            cwd: gateWork,
+            env: agentEnv(),
+          });
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+          expect(result.stdout).toBe("");
+        }
+        // Traversal metadata must not grant directory listings of home or intermediate factory data.
+        for (const dir of [root, join(root, ".limitless"), join(root, ".limitless/work")]) {
+          const result = await runConfined({
+            command: `ls -A '${dir}' >/dev/null`,
+            cwd: gateWork,
+            env: agentEnv(),
+          });
+          expect(result.exitCode).not.toBe(0);
+          expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+          expect(result.stdout).toBe("");
+        }
+        for (const command of [
+          "head -c 1 a.ts >/dev/null",
+          'printf x > "$TMPDIR/canary" && head -c 1 "$TMPDIR/canary" >/dev/null',
+          `head -c 1 '${bare}/HEAD' >/dev/null`,
+          `head -c 1 '${bare}/worktrees/current/commondir' >/dev/null`,
+          "git status --porcelain",
+          "git diff && git log -1 --format=%s",
+          `'${bunHome}/bin/bun' -e 'require("node:fs").realpathSync(process.cwd())'`,
+          `'${bunHome}/bin/bun' --version`,
+          `'${bunHome}/bin/bun' test smoke.test.ts`,
+          `'${cargoHome}/bin/cargo' --version`,
+          `head -c 1 '${cargoHome}/registry/cache/package' >/dev/null`,
+        ]) {
+          const result = await runConfined({ command, cwd: gateWork, env: agentEnv() });
+          expect(result.exitCode, result.stderr).toBe(0);
+        }
+      },
+    );
   },
 );
 
@@ -211,6 +270,33 @@ test.skipIf(seatbeltSkip !== null)(
   },
 );
 
+test("specific database denies follow checkout and ancestor read grants", () => {
+  const scratch = join(root, "scratch");
+  mkdirSync(scratch);
+  const db = join(work, "private.db");
+  const parentDb = join(root, "package.json");
+  const stores = [new Store(db), new Store(parentDb)];
+  try {
+    readPolicyScope.run({ home: root, environment: {} }, () => {
+      const roots = writeRoots(work, scratch, true);
+      const profile = seatbeltProfile(roots);
+      const final = profile.split("\n").at(-1) ?? "";
+      expect(final).toStartWith("(deny file-read*");
+      for (const file of [db, `${db}-wal`, `${db}-shm`, parentDb])
+        expect(final).toContain(`(subpath "${file}")`);
+      expect(profile.lastIndexOf("(deny file-read*")).toBeGreaterThan(
+        profile.lastIndexOf("(allow file-read*"),
+      );
+      expect(ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []).literals).not.toContain(
+        parentDb,
+      );
+      expect(profile).not.toContain(`(literal "${parentDb}")`);
+    });
+  } finally {
+    for (const store of stores) store.close();
+  }
+});
+
 test.skipIf(seatbeltSkip !== null)(
   `private database reads are denied while checkout reads work ${seatbeltSkip ?? ""}`,
   async () => {
@@ -232,6 +318,63 @@ test.skipIf(seatbeltSkip !== null)(
     } finally {
       store.close();
     }
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `private database inside checkout stays unreadable beside a readable sibling ${seatbeltSkip ?? ""}`,
+  async () => {
+    const store = new Store(join(work, "private.db"));
+    try {
+      for (const file of ["private.db", "private.db-wal", "private.db-shm"]) {
+        expect(existsSync(join(work, file))).toBe(true);
+        const result = await runConfined({
+          command: `head -c 1 "${join(work, file)}" >/dev/null`,
+          cwd: work,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+      }
+      const allowed = await runConfined({ command: "cat a.ts", cwd: work, env: agentEnv() });
+      expect(allowed.exitCode).toBe(0);
+      expect(allowed.stdout).toContain("test('ok'");
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `relocated gh store stays denied outside home for gates and editors ${seatbeltSkip ?? ""}`,
+  async () => {
+    const scratch = join(root, "scratch");
+    const relocated = join(root, "relocated-gh");
+    mkdirSync(scratch);
+    mkdirSync(relocated);
+    const file = join(relocated, "hosts.yml");
+    writeFileSync(file, "stand-in");
+    await readPolicyScope.run({ home, environment: { GH_CONFIG_DIR: relocated } }, async () => {
+      for (const gate of [false, true]) {
+        const result = await runProcess({
+          cmd: [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            seatbeltProfile(writeRoots(work, scratch, gate)),
+            "/bin/sh",
+            "-c",
+            'head -c 1 "$1" >/dev/null',
+            "sh",
+            file,
+          ],
+          cwd: work,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+        expect(result.stdout).toBe("");
+      }
+    });
   },
 );
 
@@ -670,3 +813,25 @@ test("unavailable confinement errors keep their original reason without noisy wr
     expect(String(error)).not.toMatch(/preflight failed: Error:|also required/);
   }
 });
+
+test.skipIf(seatbeltSkip !== null)(
+  `failure-injection outcomes survive a gate checkout under home ${seatbeltSkip ?? ""}`,
+  async () => {
+    const repo = join(import.meta.dir, "..");
+    for (const name of ["src", "test", "scripts", "ui", "package.json", "bunfig.toml", "tsconfig.json"])
+      cpSync(join(repo, name), join(work, name), { recursive: true });
+    symlinkSync(join(repo, "node_modules"), join(work, "node_modules"));
+    await readPolicyScope.run({ home: root, environment: {} }, async () => {
+      const result = await runConfined({
+        command: `'${process.execPath}' test test/failure-injection.test.ts -t 'unavailable pinned implementer|unconfirmed holdout shutdown'`,
+        cwd: work,
+        env: agentEnv(),
+        timeoutMs: 60_000,
+      });
+      expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+      expect(result.stderr).toContain("4 pass");
+      expect(result.stderr).toContain("0 fail");
+    });
+  },
+  90_000,
+);

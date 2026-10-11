@@ -53,6 +53,7 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
+import { readPolicyScope } from "../harness/read-policy.ts";
 import { commandScope, confinementScope, seatbeltBackend } from "../harness/sandbox.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
@@ -156,7 +157,9 @@ export async function executeRun(
     { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
     () =>
       confinementScope.run(deps.confinement ?? seatbeltBackend, () =>
-        worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+        readPolicyScope.run(deps.cfg.readPolicy, () =>
+          worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+        ),
       ),
   );
 }

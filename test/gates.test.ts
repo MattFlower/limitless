@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +42,7 @@ import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
+import { test } from "./read-policy-support.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -1947,13 +1948,22 @@ test("private config excludes common git directories and all linked worktrees ca
 });
 
 test("waiting behind a lease does not spend the internal gate's execution timeout", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "gate-lease-")));
+  const cache = join(root, "cache");
+  const work = join(root, "work");
+  await sh(["git", "init", "-q", cache], { cwd: root });
+  writeFileSync(join(cache, "README"), "fixture");
+  await sh(["git", "add", "."], { cwd: cache });
+  await sh(["git", "commit", "-qm", "fixture"], { cwd: cache });
+  await sh(["git", "worktree", "add", "-q", "--detach", work], { cwd: cache });
+  await recordWorktree(work);
   const previous = gateSlots.limit;
   gateSlots.setLimit(1);
   const id = await gateSlots.lease("deploy");
   const queued = Promise.withResolvers<void>();
   try {
     const run = runGates(
-      process.cwd(),
+      work,
       {
         setup: [],
         checks: [{ name: "short", run: "true", timeoutSec: 0.1 }],
@@ -1972,6 +1982,7 @@ test("waiting behind a lease does not spend the internal gate's execution timeou
   } finally {
     gateSlots.heartbeat(id, true);
     gateSlots.setLimit(previous);
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

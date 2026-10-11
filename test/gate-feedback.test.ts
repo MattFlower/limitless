@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -16,6 +16,7 @@ import { fakeConfinement } from "./confinement.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
+import { test } from "./read-policy-support.ts";
 
 test.each([
   { kind: "JSON", secret: 'synthetic-gate-json-"quoted"-\\slash', padding: "" },

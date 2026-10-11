@@ -266,7 +266,7 @@ test("unconfirmed holdout shutdown preserves its snapshot and surfaces the termi
   try {
     const id = await run(f);
     await settled(f, id);
-    expect(f.store.getRun(id)?.status).toBe("needs_human");
+    expect(f.store.getRun(id)?.status, f.store.getRun(id)?.error ?? "").toBe("needs_human");
     expect(f.store.getRun(id)?.error).toContain("holdout process inspection unavailable");
     expect(f.store.getRunState<RunState>(id)?.needsHumanReason).toContain(
       "Invocation termination could not be confirmed",
@@ -307,7 +307,10 @@ test.each(["disabled", "quota", "rejected"])(
       profile: "standard",
       models: { implement: ["b"] },
     });
-    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    expect(
+      await executeRun(f.deps, run.id, new AbortController().signal),
+      f.store.getRun(run.id)?.error ?? "",
+    ).toBe("needs_human");
     expect(
       f.store
         .listInvocations(run.id)

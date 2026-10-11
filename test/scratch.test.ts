@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -15,6 +15,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { recordWorktree } from "../src/git/command.ts";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -44,6 +45,7 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -1493,29 +1495,47 @@ test("both editor profiles deny every credential store and configured path, pres
   });
 });
 
-test("factory sandbox configuration validates and applies optional denial and toolchain paths", () => {
+test("factory sandbox configuration validates and applies optional denial and toolchain paths", async () => {
   const { root, cwd, scratchDir, spec } = editFixture();
+  await recordWorktree(cwd);
   const secret = join(root, "extra-secret");
-  try {
-    loadConfig({
-      readOnly: true,
-      home: join(root, "data"),
-      configDir: join(root, "factory-config"),
-      raw: { sandbox: { deny_read: [secret], toolchain_paths: [join(root, "toolchain")] } },
-    });
+  const configA = loadConfig({
+    readOnly: true,
+    home: join(root, "data"),
+    configDir: join(root, "factory-config"),
+    raw: { sandbox: { deny_read: [secret], toolchain_paths: [join(root, "toolchain")] } },
+  });
+  loadConfig({
+    readOnly: true,
+    home: join(root, "other-data"),
+    configDir: join(root, "other-config"),
+    raw: {},
+  });
+  expect(Object.isFrozen(configA.readPolicy)).toBe(true);
+  expect(Object.isFrozen(configA.readPolicy.denyRead)).toBe(true);
+  expect(Object.isFrozen(configA.readPolicy.toolchains)).toBe(true);
+  readPolicyScope.run(configA.readPolicy, () => {
     expect(codexAccess(buildCodexArgs(spec), secret)).toBe("none");
+    for (const gate of [false, true]) {
+      const roots = writeRoots(cwd, scratchDir, gate);
+      expect(roots.denyRead).toContain(secret);
+      expect(roots.denyRead).toContain(configA.paths.configDir);
+    }
     expect(homeReadPolicy([cwd, scratchDir], true).allowRead).toContain(join(root, "toolchain"));
-    for (const raw of [
-      { deny_read: "bad" },
-      { toolchain_paths: [false] },
-      { deny_read: ["relative"] },
-      { typo: [] },
-      [],
-    ])
-      expect(() => configureReadPolicy(raw, root)).toThrow(ConfinementError);
-  } finally {
-    configureReadPolicy({}, join(homedir(), ".config/limitless"));
-  }
+  });
+  readPolicyScope.run(undefined, () => {
+    expect(() => writeRoots(cwd, scratchDir)).toThrow("Missing factory read policy");
+    expect(() => writeRoots(cwd, scratchDir, true)).toThrow(ConfinementError);
+    expect(() => buildCodexArgs(spec)).toThrow(ConfinementError);
+  });
+  for (const raw of [
+    { deny_read: "bad" },
+    { toolchain_paths: [false] },
+    { deny_read: ["relative"] },
+    { typo: [] },
+    [],
+  ])
+    expect(() => configureReadPolicy(raw, root)).toThrow(ConfinementError);
 });
 
 test("read policy resolves symlinks before parent components, including missing descendants and tilde paths", () => {
@@ -1604,6 +1624,7 @@ test.skipIf(seatbeltSkip !== null || codexSkip !== null)(
   async () => {
     const { cwd, scratchDir, spec, files, options } = credentialFixture();
     await readPolicyScope.run(options, async () => {
+      mkdirSync(join(scratchDir, "codex-home"));
       const profile = profileArgs(buildCodexArgs(spec)).flatMap((arg) => ["-c", arg]);
       for (const file of [...files, join(cwd, "canary"), join(scratchDir, "canary")]) {
         const result = await runProcess({
@@ -2026,3 +2047,105 @@ test.skipIf(process.platform !== "darwin")(
     expect(calls).toBe(1);
   },
 );
+
+test("relocated credential stores retain both spellings in gate and editor profiles", async () => {
+  const { root, cwd, scratchDir, spec } = editFixture();
+  await recordWorktree(cwd);
+  const home = join(root, "home");
+  const stores = join(root, "stores");
+  const alias = join(root, "alias-stores");
+  mkdirSync(home);
+  mkdirSync(stores);
+  symlinkSync(stores, alias);
+  const locations: Record<string, string> = {
+    CODEX_HOME: "codex",
+    GH_CONFIG_DIR: "gh",
+    XDG_CONFIG_HOME: "xdg",
+    LIMITLESS_CONFIG_DIR: "limitless",
+    AWS_SHARED_CREDENTIALS_FILE: "aws/credentials",
+    AWS_CONFIG_FILE: "aws/config",
+    DOCKER_CONFIG: "docker",
+    GNUPGHOME: "gnupg",
+    NETRC: "netrc",
+    NPM_CONFIG_USERCONFIG: "npmrc",
+    npm_config_userconfig: "lower-npmrc",
+    CARGO_HOME: "cargo",
+  };
+  const env = Object.fromEntries(Object.entries(locations).map(([key, path]) => [key, join(alias, path)]));
+  env.KUBECONFIG = `${alias}/kube-a:${alias}/kube-b`;
+  const targets = [
+    "codex/auth.json",
+    "gh/hosts.yml",
+    "xdg/gh/hosts.yml",
+    "xdg/limitless/secrets.env",
+    "limitless/secrets.env",
+    "aws/credentials",
+    "aws/config",
+    "docker/config.json",
+    "gnupg/key",
+    "kube-a",
+    "kube-b",
+    "netrc",
+    "npmrc",
+    "lower-npmrc",
+    "cargo/credentials",
+    "cargo/credentials.toml",
+  ];
+  for (const path of targets) {
+    mkdirSync(dirname(join(stores, path)), { recursive: true });
+    writeFileSync(join(stores, path), "stand-in");
+  }
+  const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, env);
+    const policy = configureReadPolicy(undefined, join(root, "factory-config"));
+    // Later changes to the daemon's environment don't replace this factory's policy either.
+    delete process.env.CODEX_HOME;
+    readPolicyScope.run({ ...policy, home }, () => {
+      const codex = buildCodexArgs(spec);
+      const claude = buildClaudeArgs(spec, "id");
+      for (const gate of [false, true]) {
+        const roots = writeRoots(cwd, scratchDir, gate);
+        const profile = seatbeltProfile(roots);
+        for (const path of [
+          "codex",
+          "gh",
+          "xdg/gh",
+          "xdg/limitless",
+          "limitless",
+          "aws/credentials",
+          "aws/config",
+          "docker",
+          "gnupg",
+          "kube-a",
+          "kube-b",
+          "netrc",
+          "npmrc",
+          "lower-npmrc",
+          "cargo/credentials",
+          "cargo/credentials.toml",
+        ])
+          for (const spelling of [join(alias, path), join(stores, path)]) {
+            expect(roots.denyRead).toContain(spelling);
+            expect(profile).toContain(`(subpath "${spelling}")`);
+          }
+      }
+      for (const file of targets) {
+        expect(codexAccess(codex, join(alias, file))).toBe("none");
+        expect(codexAccess(codex, join(stores, file))).toBe("none");
+        expect(claudeSandboxReads(claude, join(alias, file))).toBe(false);
+      }
+    });
+    process.env.CODEX_HOME = join(cwd, "login");
+    readPolicyScope.run({ ...configureReadPolicy(undefined, join(root, "factory-config")), home }, () => {
+      for (const gate of [false, true])
+        expect(() => writeRoots(cwd, scratchDir, gate)).toThrow(ConfinementError);
+      expect(() => buildCodexArgs(spec)).toThrow(ConfinementError);
+    });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});

@@ -9,9 +9,15 @@ import {
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
-import { ConfinementError, READ_PROBE, resolvedHome } from "./read-policy.ts";
+import {
+  ancestorReadPolicy,
+  ConfinementError,
+  READ_PROBE,
+  resolvedHome,
+  specificReadDenies,
+} from "./read-policy.ts";
 import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
@@ -29,16 +35,8 @@ export function seatbeltProfile(roots: WriteRoots): string {
         return `(${filter} "${path}")`;
       })
       .join(" ");
-  const ancestors = new Set<string>();
-  for (const allow of roots.allowRead ?? []) {
-    for (let parent = dirname(allow); ; parent = dirname(parent)) {
-      ancestors.add(parent);
-      if (parent === dirname(parent)) break;
-    }
-  }
-  const specificDenies = (roots.denyRead ?? []).filter((deny) =>
-    roots.allowRead?.some((allow) => deny === allow || deny.startsWith(`${allow}/`)),
-  );
+  const ancestors = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
+  const specificDenies = specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
   return [
     "(version 1)",
     "(allow default)",
@@ -50,7 +48,10 @@ export function seatbeltProfile(roots: WriteRoots): string {
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
     ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
     // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
-    ...(ancestors.size ? [`(allow file-read-metadata ${paths([...ancestors], "literal")})`] : []),
+    ...(ancestors.literals.length ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`] : []),
+    ...(ancestors.metadata.length
+      ? [`(allow file-read-metadata ${paths(ancestors.metadata, "literal")})`]
+      : []),
     // Specific denies (e.g. a registered database inside a checkout) still beat read allowances.
     ...(specificDenies.length ? [`(deny file-read* ${paths(specificDenies)})`] : []),
   ].join("\n");

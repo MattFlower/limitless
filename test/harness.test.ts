@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
@@ -22,6 +22,7 @@ import {
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
