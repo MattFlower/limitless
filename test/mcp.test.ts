@@ -1,8 +1,13 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
+import * as commands from "../src/git/command.ts";
+import { cachePath } from "../src/git/repos.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
-import { connect, fixture, resultValue } from "./mcp-support.ts";
+import { sh } from "../src/util/proc.ts";
+import { type ChangePage, changeFixture, connect, fixture, resultValue } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let connection: Awaited<ReturnType<typeof connect>>;
@@ -18,6 +23,176 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
   connection.client.callTool({ name: `limitless_${name}`, arguments: args });
 const create = async (args: Record<string, unknown> = {}) =>
   resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "Add a greeting", ...args }));
+
+test("change view pins and pages local code, metadata and reports", async () => {
+  const { run, baseSha, headSha, report } = await changeFixture(f);
+  const pin = { run: run.id, baseSha, headSha };
+  const read = async (args: Record<string, unknown> = {}) =>
+    resultValue<ChangePage>(await call("get_change", { ...pin, ...args }));
+  const first = await read();
+  expect(first).toMatchObject({
+    available: true,
+    headSha,
+    baseSha,
+    comparisonSha: baseSha,
+    baseBranch: "main",
+  });
+  expect(first.files).toHaveLength(50);
+  const rest = await read({ filesOffset: first.nextFilesOffset });
+  const files = [...first.files, ...rest.files];
+  expect(files.map((file) => file.path).sort()).toEqual(
+    ["hello.txt", "image.bin", "large.txt", ...Array.from({ length: 51 }, (_, i) => `extra-${i}.txt`)].sort(),
+  );
+  expect(files.find((file) => file.path === "hello.txt")).toMatchObject({ additions: 1, deletions: 0 });
+  const large = files.find((file) => file.path === "large.txt");
+  if (!large) throw new Error("Missing large file");
+  let diff = "",
+    offset = 0;
+  do {
+    const page = await read({ file: large.index, diffOffset: offset });
+    expect(page.diff.text.length).toBeLessThanOrEqual(16000);
+    expect(page.headSha).toBe(headSha);
+    diff += page.diff.text;
+    offset = page.diff.nextOffset ?? 0;
+  } while (offset);
+  const expected = await sh(
+    ["git", "diff", "--no-ext-diff", "--no-textconv", baseSha, headSha, "--", "large.txt"],
+    { cwd: f.repo },
+  );
+  expect(diff).toBe(expected.stdout);
+  let reportText = "",
+    reportOffset = 0;
+  do {
+    const page = await read({ reportOffset });
+    const saved = page.reports[0];
+    if (!saved) throw new Error("Missing report");
+    expect(saved.text.length).toBeLessThanOrEqual(4000);
+    reportText += saved.text;
+    reportOffset = saved.nextOffset ?? 0;
+  } while (reportOffset);
+  expect(reportText).toBe(report);
+  const binary = files.find((file) => file.binary);
+  expect(binary).toMatchObject({ path: "image.bin", additions: null, deletions: null });
+  expect((await read({ file: binary?.index })).diff).toMatchObject({ text: "", binary: true });
+  expect((await call("get_change", { run: run.id, diffOffset: 16000 })).isError).toBe(true);
+});
+
+test("change view refuses moved heads, missing comparisons and unavailable reports", async () => {
+  const c = await changeFixture(f, { "hello.txt": "changed\n" });
+  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+  c.observe(c.baseSha);
+  expect(resultValue(await call("get_change", pin))).toMatchObject({
+    available: false,
+    reason: expect.stringContaining("superseded"),
+  });
+  c.observe(c.headSha);
+  f.factory.store.updateRun(c.run.id, { baseSha: "f".repeat(40) });
+  expect(resultValue(await call("get_change", pin))).toMatchObject({
+    available: false,
+    reason: expect.stringContaining("unavailable"),
+  });
+  f.factory.store.updateRun(c.run.id, { baseSha: c.baseSha });
+  f.factory.store.db.query("DELETE FROM artifacts WHERE run_id = ? AND name = 'report.md'").run(c.run.id);
+  expect(resultValue<ChangePage>(await call("get_change", pin)).reports[0]).toMatchObject({
+    available: false,
+    reason: "Persisted report unavailable.",
+  });
+  c.observe("malformed");
+  expect(resultValue(await call("get_change", { run: c.run.id }))).toMatchObject({
+    available: false,
+    reason: "Observed PR head unavailable.",
+  });
+  c.observe(c.headSha);
+  rmSync(cachePath(f.factory.cfg.paths, c.repo), { recursive: true });
+  expect(resultValue(await call("get_change", pin))).toMatchObject({
+    available: false,
+    reason: expect.stringContaining("unavailable"),
+  });
+});
+
+test.each(["head moves", "push begins and ends"])(
+  "change view refuses when %s during Git inspection",
+  async (condition) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    const { store } = f.factory;
+    const original = commands.worktreeGit;
+    let inspected = () => {},
+      resume = () => {};
+    const ready = new Promise<void>((resolve) => {
+      inspected = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const git = spyOn(commands, "worktreeGit").mockImplementation(async (args, opts, retry) => {
+      const output = await original(args, opts, retry);
+      if (args.includes("--numstat")) {
+        inspected();
+        await released;
+      }
+      return output;
+    });
+    try {
+      const pending = call("get_change", { run: c.run.id });
+      await ready;
+      if (condition === "head moves") store.observePrHead(c.prUrl, c.baseSha);
+      else {
+        store.beginPrPush(c.prUrl, c.headSha, c.run.id);
+        store.endPrPush(c.prUrl, c.headSha);
+      }
+      resume();
+      expect(resultValue(await pending)).toMatchObject({
+        available: false,
+        reason: expect.stringContaining("superseded"),
+      });
+    } finally {
+      resume();
+      git.mockRestore();
+    }
+  },
+);
+
+test("status rechecks recorded heads after the asynchronous land read", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const backend = factoryBackend(f.factory);
+  const moved = await connect({
+    ...backend,
+    lands: async () => {
+      f.factory.store.observePrHead(c.prUrl, c.baseSha);
+      return [];
+    },
+  });
+  try {
+    const status = resultValue(
+      await moved.client.callTool({ name: "limitless_status", arguments: { run: c.run.id } }),
+    );
+    expect(status).toMatchObject({ state: "PR head superseded", headSha: null });
+    expect(JSON.stringify(status)).not.toContain("submit limitless_review");
+  } finally {
+    await moved.close();
+  }
+});
+
+test("change view includes committed gitlinks despite diff.ignoreSubmodules=all", async () => {
+  const oldLink = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
+  mkdirSync(join(f.repo, "module"));
+  await sh(["git", "update-index", "--add", "--cacheinfo", `160000,${oldLink},module`], { cwd: f.repo });
+  await sh(["git", "commit", "-qm", "gitlink base"], { cwd: f.repo });
+  const newLink = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
+  await sh(["git", "update-index", "--cacheinfo", `160000,${newLink},module`], { cwd: f.repo });
+  const c = await changeFixture(f, { "hello.txt": "hello\nnew greeting\n" });
+  await sh(["git", "config", "diff.ignoreSubmodules", "all"], {
+    cwd: cachePath(f.factory.cfg.paths, c.repo),
+  });
+  const first = resultValue<ChangePage>(await call("get_change", { run: c.run.id }));
+  const module = first.files.find((file) => file.path === "module");
+  expect(module).toMatchObject({ path: "module", additions: 1, deletions: 1 });
+  if (!module) throw new Error("Gitlink hidden from changed files");
+  const page = resultValue<ChangePage>(
+    await call("get_change", { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, file: module.index }),
+  );
+  expect(page.diff.text).toContain(`-Subproject commit ${oldLink}\n+Subproject commit ${newLink}\n`);
+});
 
 test("MCP consumer labels cannot impersonate Dependabot and still match own runs", async () => {
   const mine = await create({ consumer: " dependabot[bot] " });
@@ -133,7 +308,7 @@ test("model-written MCP prompts cannot opt in through Allow lines", async () => 
   expect((await call("create_run", { repo: f.repo, prompt, allow: ["anything"] })).isError).toBe(true);
 });
 
-test("twelve discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
+test("discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
   const { tools } = await connection.client.listTools();
   expect(tools.map((t) => t.name).sort()).toEqual(
     [
@@ -142,6 +317,7 @@ test("twelve discoverable tools, create defaults and overrides, get and queued c
       "create_run",
       "feed",
       "feed_ack",
+      "get_change",
       "get_run",
       "land",
       "list_runs",
@@ -173,6 +349,9 @@ test("twelve discoverable tools, create defaults and overrides, get and queued c
     properties: { run: { type: "string" }, sha: { type: "string" } },
   });
   expect(tools.find((t) => t.name === "limitless_status")?.inputSchema.required).toEqual(["run"]);
+  expect(tools.find((t) => t.name === "limitless_get_change")?.annotations).toMatchObject({
+    readOnlyHint: true,
+  });
   const run = await create();
   expect(run).toMatchObject({ profile: "auto", source: "mcp", status: "queued" });
   expect(f.factory.store.getRun(run.id)?.source).toBe("mcp");

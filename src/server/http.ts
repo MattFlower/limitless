@@ -11,6 +11,7 @@ import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { gateSlots } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
+import { getChange } from "../integrations/mcp-change.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
@@ -436,6 +437,14 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/runs/:id/cancel": {
       POST: handle((req) => json({ cancelled: factory.cancelRun(req.params.id as string, "ui") })),
     },
+    "/api/runs/:id/change": handle(async (req) => {
+      const params = new URL(req.url).searchParams;
+      const query = Object.fromEntries(params);
+      for (const key of ["filesOffset", "file", "diffOffset", "reportOffset"]) {
+        if (params.has(key)) Object.assign(query, { [key]: Number(params.get(key)) });
+      }
+      return json(await getChange(factory, { ...query, run: req.params.id }, req.signal));
+    }),
     "/api/runs/:id/retry": {
       POST: handle(async (req) => {
         const text = await req.text();
