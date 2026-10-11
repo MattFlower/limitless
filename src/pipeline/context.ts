@@ -29,6 +29,8 @@ import { discardChanges, headSha } from "../git/repos.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
+import { withSlottedCommands } from "../harness/slotted.ts";
+import type { SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { GhRunner } from "../integrations/github.ts";
@@ -74,6 +76,7 @@ export interface RunState {
   worktreePath?: string;
   gatesConfig?: GateConfig;
   previewConfig?: PreviewConfig | null;
+  slottedCommands?: SlottedCommands;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
@@ -784,7 +787,22 @@ export class RunContext {
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
           result = await withScratch(spec.cwd, (scratchDir) => {
             dispatch();
-            return harness({ ...spec, scratchDir });
+            return withSlottedCommands(
+              opts.confineReads ? [] : (this.state.slottedCommands ?? []),
+              spec.cwd,
+              scratchDir,
+              this.deps.cfg.port,
+              (data) =>
+                this.store.addEvent({
+                  runId: this.run.id,
+                  invocationId: invocation.id,
+                  type: "log",
+                  level: "info",
+                  message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
+                  data,
+                }),
+              (commandPath) => harness({ ...spec, scratchDir, ...(commandPath ? { commandPath } : {}) }),
+            );
           });
         } else {
           dispatch();

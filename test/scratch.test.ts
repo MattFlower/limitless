@@ -25,7 +25,9 @@ import {
 } from "../src/harness/codex.ts";
 import { ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
 import {
+  commandRoots,
   createScratch,
+  invocationCommands,
   privateReadRoots,
   readConfinement,
   removeScratch,
@@ -154,8 +156,14 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
     expect(codex).not.toContain("workspace-write");
     expect(codex).not.toContain("--add-dir");
     const policy = codex.find((arg) => arg.startsWith("permissions="));
+    // Other invocations' command capabilities are unreadable; this invocation's own stays readable.
+    const commands = invocationCommands(scratch);
+    const capabilities = [
+      ...commands.root.map((p) => `${JSON.stringify(p)}="none",`),
+      ...commands.own.map((p) => `${JSON.stringify(p)}="read",`),
+    ].join("");
     expect(policy).toBe(
-      `permissions={limitless-reader={filesystem={"/"="read",${JSON.stringify(realpathSync(scratch))}="write"},network={enabled=false}}}`,
+      `permissions={limitless-reader={filesystem={"/"="read",${capabilities}${JSON.stringify(realpathSync(scratch))}="write"},network={enabled=false}}}`,
     );
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
@@ -163,7 +171,7 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
       enabled: true,
       failIfUnavailable: true,
       allowUnsandboxedCommands: false,
-      filesystem: { allowWrite: [realpathSync(scratch)], denyWrite: [realpathSync(cwd)] },
+      filesystem: { allowWrite: [realpathSync(scratch)], denyWrite: [realpathSync(cwd), ...commandRoots()] },
     });
     expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
     // Claude derives its sandbox TMPDIR from the parent; another name would silently diverge.
@@ -195,7 +203,7 @@ test("denyRead keeps tool-enabled readers out of a parallel worktree", () => {
     expect(codexAccess(buildCodexArgs(spec), join(implementer, "marker.txt"))).toBe("none");
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
-    expect(settings.sandbox.filesystem.denyRead).toEqual([implementer]);
+    expect(settings.sandbox.filesystem.denyRead).toEqual([implementer, ...commandRoots()]);
     expect(claude.slice(claude.indexOf("--disallowedTools"))).toContain(`Read(/${implementer}/**)`);
     for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")]) {
       expect(() => build({ ...spec, denyRead: [root] })).toThrow("outside");
@@ -1336,10 +1344,12 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
         await withScratch(cwd, async (scratchDir) => {
           paths.push(scratchDir);
           const spec = specFor(cwd, scratchDir);
+          spec.commandPath = `${join(dirname(scratchDir), "commands")}:${process.env.PATH ?? ""}`;
           spec.target.backend = { baseUrl: "http://backend.invalid", authToken: "backend-only-token" };
           const runner = async (opts: ProcOptions): Promise<ProcResult> => {
             for (const key of ["TMPDIR", "TMP", "TEMP"]) expect(opts.env[key]).toBe(scratchDir);
             expect(opts.env.TMPPREFIX).toBe(join(scratchDir, "zsh"));
+            expect(opts.env.PATH).toBe(spec.commandPath);
             expect(opts.env.GH_TOKEN).toBe("limitless-agents-have-no-github-access");
             if (run === runClaude) {
               // The backend key reaches the CLI through its key helper, never the agent environment.
@@ -1482,6 +1492,8 @@ test("codex editors get an explicit write profile, fresh or resumed, and nothing
       [admin]: "read",
       [realpathSync(scratchDir)]: "write",
       [join(cwd, ".git")]: "read",
+      ...Object.fromEntries(commandRoots().map((p) => [p, "none"])),
+      ...Object.fromEntries(invocationCommands(scratchDir).own.map((p) => [p, "read"])),
     });
     expect(profileArgs(args).join("")).toContain("network={enabled=true}");
     for (const flag of ["--ignore-user-config", "--ignore-rules", "--strict-config"])
@@ -1525,7 +1537,7 @@ test("claude editors confine Bash and native edits to the same roots; project se
       failIfUnavailable: true,
       allowUnsandboxedCommands: true,
       excludedCommands: [],
-      filesystem: { denyWrite: [join(cwd, ".git"), admin], disabled: false },
+      filesystem: { denyWrite: [join(cwd, ".git"), admin, ...commandRoots()], disabled: false },
     });
     expect(sandbox.filesystem.allowWrite.sort()).toEqual([cwd, realpathSync(scratchDir)].sort());
     const allowed = args.slice(args.indexOf("--allowedTools") + 1, args.indexOf("--disallowedTools"));

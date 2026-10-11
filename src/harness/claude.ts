@@ -4,6 +4,7 @@ import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
+  invocationCommands,
   readConfinement,
   scratchEnv,
   scratchParent,
@@ -199,17 +200,22 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     if (spec.mode === "edit") {
       // The outer Seatbelt profile covers Bash and native tools. These permission rules also
       // refuse native edits outside the roots before they reach the filesystem.
-      const { write, protect, denyRead = [] } = writeRoots(spec.cwd, scratch);
-      denied.push(...denyRead.flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
+      const { write, protect, denyRead = [], commands } = writeRoots(spec.cwd, scratch);
+      // Bash reads its own wrappers through the outer profile; native tools need none of them.
+      denied.push(
+        ...[...denyRead, ...(commands?.root ?? [])].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]),
+      );
       editTools = write.map((p) => `Edit(/${p}/**)`);
-      denied.push(...protect.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
-      filesystem = { allowWrite: write, denyWrite: protect, disabled: false };
+      const denyWrite = [...protect, ...(commands?.root ?? [])];
+      denied.push(...denyWrite.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
+      filesystem = { allowWrite: write, denyWrite, disabled: false };
     } else {
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
-      const denyRead = confined?.deny ?? explicit;
+      const commands = invocationCommands(scratch, spec.cwd);
+      const denyRead = [...(confined?.deny ?? explicit), ...commands.root];
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
-      denied.push(...explicit.flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
+      denied.push(...[...explicit, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
       // reader is allowed Read (which also governs Grep and Glob) only there; a bare Grep or Glob
       // allow would search anywhere. dontAsk refuses every other path.
@@ -217,10 +223,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       if (confined) readTools = readable.map((p) => `Read(/${p}/**)`);
       filesystem = {
         allowWrite: [scratch],
-        denyWrite: [realpathSync(spec.cwd)],
+        denyWrite: [realpathSync(spec.cwd), ...commands.root],
         ...(denyRead.length ? { denyRead } : {}),
-        // Takes precedence over denyRead, so the private roots may contain cwd and scratch.
-        ...(confined ? { allowRead: readable } : {}),
+        // Takes precedence over denyRead, so the private roots may contain cwd and scratch. Only an
+        // unconfined reader receives command wrappers, so only it may read its own.
+        ...(confined ? { allowRead: readable } : commands.own.length ? { allowRead: commands.own } : {}),
         disabled: false,
       };
     }
@@ -358,6 +365,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     env: agentEnv({
       ...envExtra,
       ...scratchEnv(spec),
+      ...(spec.commandPath ? { PATH: spec.commandPath } : {}),
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
       // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
       // cwd record) must land in the scratch directly: its parent is outside the boundary.
