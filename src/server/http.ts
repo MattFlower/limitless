@@ -277,6 +277,15 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       POST: handle(async (req) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);
         const payload = await body<Record<string, unknown>>(req);
+        // A capability bearer speaks only for its own invocation: the body must name that same capability.
+        const authorization = req.headers.get("authorization");
+        const capability = /^Bearer (\S+)$/i.exec(authorization ?? "")?.[1];
+        if (
+          capability !== undefined &&
+          !matchesApiToken(authorization, extras.apiToken) &&
+          payload.token !== capability
+        )
+          return error("agent-test capability does not match the request", 401);
         if (payload.token !== undefined) {
           req.signal.throwIfAborted();
           const lease = await agentTestLease(payload);

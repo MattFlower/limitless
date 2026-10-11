@@ -227,7 +227,8 @@ test("token and loopback sessions authorize; bad credentials never fall back", a
 });
 
 test("the capability hook authorizes only gate-slot, preserving loopback restrictions", async () => {
-  const capability = { authorization: "Bearer invocation-capability" };
+  const session = new AgentTestSession(() => {});
+  const capability = { authorization: `Bearer ${session.token}` };
   const routes = createHttpRoutes(f.factory, {
     apiToken: token,
     gateSlotCapability: (req) => req.headers.get("authorization") === capability.authorization,
@@ -238,17 +239,21 @@ test("the capability hook authorizes only gate-slot, preserving loopback restric
       requestWithParams(`http://localhost${path}`, {
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
-        body: '{"id":"unknown"}',
+        body: JSON.stringify({ token: session.token, name: "probe", lane: "small" }),
       }),
       peer,
     );
   };
-  expect((await call("/api/admin/gate-slot", capability)).status).toBe(200);
-  for (const path of ["/api/land", "/api/runs/:id/review"])
-    expect((await call(path, capability)).status).toBe(401);
-  const remote = { requestIP: () => ({ address: "192.0.2.1" }) } as unknown as Server<undefined>;
-  for (const headers of [capability, credential()])
-    expect((await call("/api/admin/gate-slot", headers, remote)).status).toBe(403);
+  try {
+    expect((await call("/api/admin/gate-slot", capability)).status).toBe(200);
+    for (const path of ["/api/land", "/api/runs/:id/review"])
+      expect((await call(path, capability)).status).toBe(401);
+    const remote = { requestIP: () => ({ address: "192.0.2.1" }) } as unknown as Server<undefined>;
+    for (const headers of [capability, credential()])
+      expect((await call("/api/admin/gate-slot", headers, remote)).status).toBe(403);
+  } finally {
+    session.close();
+  }
 });
 
 test("a live agent-test capability is a bearer for gate-slot only, and ends with its invocation", async () => {
@@ -278,6 +283,44 @@ test("a live agent-test capability is a bearer for gate-slot only, and ends with
     session.close();
   }
   expect((await call("/api/admin/gate-slot", bearer)).status).toBe(401);
+});
+
+test("a capability bearer acts only for its own invocation's body", async () => {
+  const a = new AgentTestSession(() => {});
+  const b = new AgentTestSession(() => {});
+  const routes = createHttpRoutes(f.factory, {
+    apiToken: token,
+    gateSlotCapability: (req) => liveAgentTestCapability(req.headers.get("authorization")),
+  });
+  const post = (authorization: string, body: Record<string, unknown>) =>
+    (routes["/api/admin/gate-slot"] as { POST: Route }).POST(
+      requestWithParams("http://localhost/api/admin/gate-slot", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization },
+        body: JSON.stringify(body),
+      }),
+      localServer,
+    );
+  try {
+    const held = await post(`Bearer ${b.token}`, {
+      token: b.token,
+      name: "bun test b.test.ts",
+      lane: "small",
+    });
+    const lease = (await held.json()) as { id: string; acquired: boolean };
+    expect(lease.acquired).toBe(true);
+    // No body token would reach the legacy path, which admits running leases past the limit.
+    expect((await post(`Bearer ${a.token}`, { name: "uncapped agent", running: true })).status).toBe(401);
+    // Another invocation's token in the body never lets A act on B's lease.
+    expect((await post(`Bearer ${a.token}`, { token: b.token, id: lease.id, release: true })).status).toBe(
+      401,
+    );
+    const still = await post(`Bearer ${b.token}`, { token: b.token, id: lease.id });
+    expect(((await still.json()) as { acquired: boolean }).acquired).toBe(true);
+  } finally {
+    a.close();
+    b.close();
+  }
 });
 
 test("the lease client sends an agent's capability, never the API token, as its bearer", async () => {
