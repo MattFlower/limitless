@@ -64,7 +64,6 @@ export async function withSlottedCommands<T>(
       port,
       unix,
       token: session.token,
-      nested: crypto.randomUUID(),
     };
     const configPath = join(directory, "config.json"),
       entry = join(directory, "entry.js"),

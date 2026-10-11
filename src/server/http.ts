@@ -243,8 +243,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           return json(lease);
         }
         const { name, id, release, immediate, running, lane } = payload;
-        if (lane !== undefined && lane !== "gate" && lane !== "small") return error("invalid lane");
-        const slots = lane === "small" ? agentTestSlots : gateSlots;
+        if (lane !== undefined && lane !== "gate") return error("invalid lane");
+        const slots = gateSlots;
         if (id !== undefined) {
           if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
             return error("invalid lease");

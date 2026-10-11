@@ -2,11 +2,22 @@ import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { parseArgs } from "node:util";
 import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { bounded, DaemonTimeoutError, type DeployClock, deployClock, parseMaxWait } from "./deploy-wait.ts";
 
-type Reply = { id: string; acquired: boolean; expired?: boolean };
+type Reply = {
+  id: string;
+  acquired: boolean;
+  expired?: boolean;
+  busy?: boolean;
+  reused?: boolean;
+  capped?: boolean;
+  capMs?: number;
+  holder?: string;
+};
 export type LeaseClient = (body: Record<string, unknown>, signal: AbortSignal) => Promise<Reply>;
 export class LeaseRejected extends Error {}
+class LeaseWaitExhausted extends LeaseRejected {}
 export const localLeaseClient =
   (port = Number(process.env.LIMITLESS_PORT ?? 7400), unix?: string): LeaseClient =>
   async (body, signal) => {
@@ -18,16 +29,31 @@ export const localLeaseClient =
       ...(unix ? { unix } : {}),
     });
     if ([404, 405, 501].includes(response.status)) throw new Error("gate-slot endpoint unsupported");
-    if (!response.ok) throw new LeaseRejected(`gate-slot: HTTP ${response.status}`);
+    if (!response.ok) {
+      const detail: unknown =
+        body.token === undefined ? undefined : await response.json().catch(() => undefined);
+      const message =
+        detail && typeof detail === "object" && "error" in detail && typeof detail.error === "string"
+          ? `: ${redactCredentials(detail.error)}`
+          : "";
+      throw new LeaseRejected(`gate-slot: HTTP ${response.status}${message}`);
+    }
     const result: Reply = await response.json().catch(() => {
       throw new LeaseRejected("invalid gate-slot JSON");
     });
     if (
       typeof result?.id !== "string" ||
-      !result.id ||
+      (!result.id && result.busy !== true) ||
       typeof result.acquired !== "boolean" ||
       (result.expired !== undefined && typeof result.expired !== "boolean") ||
-      (result.expired && result.acquired)
+      (result.expired && result.acquired) ||
+      (result.busy !== undefined && typeof result.busy !== "boolean") ||
+      (result.busy && (result.acquired || result.id !== "")) ||
+      (result.reused !== undefined && typeof result.reused !== "boolean") ||
+      (result.capped !== undefined && typeof result.capped !== "boolean") ||
+      (result.capped && (!result.expired || result.acquired)) ||
+      (result.capMs !== undefined && (!Number.isFinite(result.capMs) || result.capMs <= 0)) ||
+      (result.holder !== undefined && typeof result.holder !== "string")
     )
       throw new LeaseRejected("invalid gate-slot response");
     return result;
@@ -39,6 +65,8 @@ export interface LeaseOptions {
   maxWaitMs?: number;
   signal?: AbortSignal;
   warn?: (s: string) => void;
+  /** Agent wrappers fail on queue exhaustion and prove nested reuse and running recovery. */
+  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void };
 }
 export async function withGateLease<T>(
   name: string,
@@ -48,7 +76,8 @@ export async function withGateLease<T>(
   const client = opts.client ?? localLeaseClient(),
     clock = opts.clock ?? deployClock;
   const maxWait = opts.maxWaitMs ?? 1_800_000,
-    deadline = clock.now() + maxWait;
+    started = clock.now(),
+    deadline = started + maxWait;
   if (!name.trim() || !Number.isSafeInteger(maxWait) || maxWait < 0)
     throw new Error("invalid gate-slot name or wait budget");
   const warn = (e: unknown) =>
@@ -63,8 +92,15 @@ export async function withGateLease<T>(
         const previous = id,
           result = await client(body, signal);
         // A late recovery still belongs to running work unless another reply recovered it first.
-        if (body.running && !stopped && id === previous) id = result.id;
-        else if (body.name && (signal.aborted || body.running) && (stopped || result.id !== id))
+        if (body.running && !stopped && id === previous && !result.busy) {
+          id = result.id;
+          opts.agentTest?.onLease(result.id);
+        } else if (
+          body.name &&
+          result.id &&
+          (signal.aborted || body.running) &&
+          (stopped || result.id !== id)
+        )
           void request({ id: result.id, release: true }).catch(warn);
         return result;
       },
@@ -76,10 +112,26 @@ export async function withGateLease<T>(
   try {
     try {
       opts.signal?.throwIfAborted();
-      let state: Reply | undefined,
-        lastReply = clock.now(),
-        first = true;
-      const pastDeadline = () => new Error("gate-slot wait passed the acquisition deadline");
+      let reused = false;
+      let state: Reply | undefined;
+      if (opts.agentTest?.parentId) {
+        const parent = await request({ reuse: opts.agentTest.parentId });
+        if (parent.reused === true && parent.acquired && parent.id === opts.agentTest.parentId) {
+          opts.agentTest.onLease(parent.id);
+          reused = true;
+          state = parent;
+        }
+      }
+      let lastReply = clock.now(),
+        first = true,
+        holder: string | undefined;
+      const pastDeadline = () =>
+        opts.agentTest
+          ? new LeaseWaitExhausted(
+              `agent-test: ${name} waited ${clock.now() - started}ms for the ${opts.agentTest.lane} lane` +
+                `${holder ? ` (holder: ${holder})` : ""}; try a targeted run: bun test <file>`,
+            )
+          : new Error("gate-slot wait passed the acquisition deadline");
       while (!state?.acquired) {
         opts.signal?.throwIfAborted();
         if (!first) {
@@ -92,7 +144,8 @@ export async function withGateLease<T>(
             id ? { id } : { name, immediate: maxWait === 0 },
             maxWait ? Math.max(1, Math.min(2000, deadline - clock.now())) : 2000,
           );
-          id = state.id;
+          id = state.busy ? undefined : state.id;
+          holder = state.holder ?? holder;
           lastReply = clock.now();
         } catch (e) {
           if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
@@ -101,26 +154,36 @@ export async function withGateLease<T>(
           if (clock.now() >= deadline) throw pastDeadline();
         }
         first = false;
-        if (state?.expired && maxWait) throw new Error("gate-slot lease expired");
+        if (state?.expired && maxWait) {
+          if (opts.agentTest) throw new LeaseRejected("agent-test lease expired while waiting");
+          throw new Error("gate-slot lease expired");
+        }
       }
-      if (maxWait && clock.now() >= deadline) throw pastDeadline();
+      if (!reused && maxWait && clock.now() >= deadline) throw pastDeadline();
+      if (id) opts.agentTest?.onLease(id);
       const beat = (ms = 10_000) => {
         cancel = clock.timeout(() => {
           const leaseId = id;
           void request({ id: leaseId })
             .then(async (r) => {
+              if (r.capped && opts.agentTest) {
+                (opts.warn ?? console.warn)(
+                  `warning: agent-test ${name} reached its ${r.capMs ?? "unknown"}ms duration cap (${opts.agentTest.lane} lane); letting the command finish`,
+                );
+                return;
+              }
               if (r.expired && !stopped && id === leaseId) {
-                await request({ name, running: true });
+                await request({ name, running: true, ...(opts.agentTest ? { recover: leaseId } : {}) });
               }
               if (!stopped) beat();
             })
             .catch((e) => {
               warn(e);
-              if (!stopped) beat(1000);
+              if (!stopped && !(opts.agentTest && e instanceof LeaseRejected)) beat(1000);
             });
         }, ms);
       };
-      beat();
+      if (!reused) beat();
     } catch (e) {
       await release();
       id = undefined;
@@ -187,6 +250,10 @@ export async function runLeasedCommand(
     return await (lease ? withGateLease(lease.name, work, { ...lease, signal: controller.signal }) : work());
   } catch (error) {
     if (signalExitCode && interrupted) return 128 + constants.signals[interrupted];
+    if (error instanceof LeaseWaitExhausted) {
+      (lease?.warn ?? console.warn)(error.message);
+      return 75;
+    }
     throw error;
   } finally {
     process.off("SIGINT", int);

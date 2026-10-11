@@ -7,8 +7,8 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
-import { AgentTestSession } from "../src/gates/agent-tests.ts";
-import { gateSlots, Semaphore } from "../src/gates/slots.ts";
+import { AgentTestSession, type TestWait } from "../src/gates/agent-tests.ts";
+import { agentTestSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -110,6 +110,11 @@ test("gate leases share health occupancy and admin mutation protections", async 
       });
     const peer = (address: string | null) =>
       ({ requestIP: () => (address ? { address } : null) }) as unknown as Server<undefined>;
+    for (const lane of ["small", "unknown", null]) {
+      expect((await route(request({ name: "agent test", lane }), localServer)).status).toBe(400);
+      expect(agentTestSlots.snapshot().occupied).toBe(0);
+      expect(gateSlots.snapshot().occupied).toBe(0);
+    }
     const create = await route(request({ name: "deploy" }), localServer);
     expect(create.status).toBe(200);
     const first = (await create.json()) as { id: string; acquired: boolean };
@@ -232,4 +237,58 @@ test("the gate-slot route counts running registrations above the cap and rejects
     await f.close();
   }
   expect(time.pending).toBe(0);
+});
+
+test("capability-bearing command names are redacted in events and HTTP errors", async () => {
+  const f = await fixture("agent-test-redaction");
+  const events: TestWait[] = [];
+  const session = new AgentTestSession((data) => {
+    events.push(data);
+  });
+  const release = await agentTestSlots.acquire(new AbortController().signal);
+  const release2 = await agentTestSlots.acquire(new AbortController().signal);
+  try {
+    const route = (createHttpRoutes(f.factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+    const request = (body: unknown) =>
+      route(
+        requestWithParams("http://localhost/api/admin/gate-slot", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        localServer,
+      );
+    const response = await request({
+      token: session.token,
+      name: `bun test ${session.token}`,
+      lane: "small",
+    });
+    expect(JSON.stringify(events)).not.toContain(session.token);
+    expect(JSON.stringify(events)).toContain("[redacted]");
+    expect(response.status).toBe(200);
+    expect(await response.text()).not.toContain(session.token);
+    const failed = spyOn(agentTestSlots, "lease").mockRejectedValue(
+      new Error(`lease failed ${session.token}`),
+    );
+    const other = new AgentTestSession(() => {});
+    try {
+      const response = await request({
+        token: other.token,
+        name: `bun test ${session.token}`,
+        lane: "small",
+      });
+      expect(response.status).toBe(400);
+      const text = await response.text();
+      expect(text).not.toContain(session.token);
+      expect(text).toContain("[redacted]");
+    } finally {
+      failed.mockRestore();
+      other.close();
+    }
+  } finally {
+    release();
+    release2();
+    session.close();
+    await f.close();
+  }
 });

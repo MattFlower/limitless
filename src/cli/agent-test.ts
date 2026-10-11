@@ -2,8 +2,15 @@ import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, resolve } from "node:path";
 import type { TestLane } from "../gates/agent-tests.ts";
 import type { SlottedCommands } from "../harness/slotted-config.ts";
-import { redactCredentials } from "../util/proc.ts";
-import { type LeaseClient, LeaseRejected, localLeaseClient, runLeasedCommand } from "./gate-slot.ts";
+import { redactCredentials, registerCredential } from "../util/proc.ts";
+import { bounded, type DeployClock, deployClock } from "./deploy-wait.ts";
+import {
+  type LeaseClient,
+  type LeaseOptions,
+  LeaseRejected,
+  localLeaseClient,
+  runLeasedCommand,
+} from "./gate-slot.ts";
 
 export interface WrapperConfig {
   commands: SlottedCommands;
@@ -11,47 +18,87 @@ export interface WrapperConfig {
   port: number;
   unix: string;
   token: string;
-  /** Marks a leased command's descendants; never the token, which the environment would expose. */
-  nested: string;
 }
 
-export function testLane(argv: string[], prefix: string[]): TestLane {
-  const extra = argv.slice(prefix.length);
-  // Only file/path arguments or an explicit name filter prove a targeted test run.
+const valuedTestOptions = new Set([
+  "--cwd",
+  "--preload",
+  "-r",
+  "--timeout",
+  "-t",
+  "--test-name-pattern",
+  "--reporter",
+  "--reporter-outfile",
+  "--max-concurrency",
+  "--retry",
+  "--rerun-each",
+  "--seed",
+  "--shard",
+  "--coverage-reporter",
+  "--coverage-dir",
+  "--path-ignore-patterns",
+  "--config",
+  "-c",
+  "--env-file",
+  "--tsconfig-override",
+  "--define",
+  "-d",
+  "--parallel",
+  "--parallel-delay",
+  "--timings",
+]);
+const booleanTestOptions = new Set([
+  "--only",
+  "--todo",
+  "--watch",
+  "--update-snapshots",
+  "-u",
+  "--coverage",
+  "--bail",
+  "--concurrent",
+  "--randomize",
+  "--pass-with-no-tests",
+  "--dots",
+  "--only-failures",
+  "--isolate",
+  "--no-isolate",
+  "--update-timings",
+  "--no-orphans",
+  "--no-env-file",
+]);
+
+export function testLane(argv: string[], prefix: string[], cwd = process.cwd()): TestLane {
+  const bunTest = argv[0] === "bun" && argv[1] === "test";
+  const extra = argv.slice(bunTest ? 2 : prefix.length);
+  let positional = false,
+    file = false;
   for (let i = 0; i < extra.length; i++) {
     const arg = extra[i] ?? "";
-    if (
-      arg === "-t" ||
-      arg === "--test-name-pattern" ||
-      arg.startsWith("--test-name-pattern=") ||
-      /^-t.+/.test(arg)
-    )
-      return "small";
-    if (arg === "--") return extra.slice(i + 1).some(Boolean) ? "small" : "gate";
-    if (
-      [
-        "--timeout",
-        "--preload",
-        "--reporter",
-        "--reporter-outfile",
-        "--max-concurrency",
-        "--retry",
-        "--rerun-each",
-        "--seed",
-        "--shard",
-        "--parallel",
-        "--parallel-delay",
-        "--timings",
-        "--path-ignore-patterns",
-        "--coverage-reporter",
-        "--coverage-dir",
-        "--bail",
-      ].includes(arg)
-    ) {
-      if (extra[i + 1] && !extra[i + 1]?.startsWith("-")) i++;
-    } else if (!arg.startsWith("-") && arg) return "small";
+    if (!positional && arg === "--") {
+      positional = true;
+      continue;
+    }
+    if (!positional && arg.startsWith("-")) {
+      const option = arg.split("=")[0] ?? arg;
+      if (!bunTest || option === "--cwd") return "gate";
+      if (valuedTestOptions.has(option)) {
+        if (!arg.includes("=")) {
+          if (!extra[i + 1] || extra[i + 1]?.startsWith("-")) return "gate";
+          i++;
+        }
+      } else if (booleanTestOptions.has(arg) || /^--bail=\d+$/.test(arg)) {
+        // Boolean options never consume a following file argument.
+      } else return "gate";
+    } else {
+      try {
+        if (!arg || !statSync(resolve(cwd, arg)).isFile()) return "gate";
+        file = true;
+      } catch {
+        return "gate";
+      }
+    }
   }
-  return "gate";
+  return file ? "small" : "gate";
 }
 
 export function realExecutable(name: string, path: string, wrapperDir: string): string | null {
@@ -72,19 +119,21 @@ export function realExecutable(name: string, path: string, wrapperDir: string): 
   return null;
 }
 
-export function wrapperLeaseClient(config: WrapperConfig): LeaseClient {
+export function wrapperLeaseClient(config: WrapperConfig, clock: DeployClock = deployClock): LeaseClient {
   const http = localLeaseClient(config.port),
     unix = localLeaseClient(config.port, config.unix);
   let socket = false;
   return async (body, signal) => {
-    if (socket) return unix(body, signal);
+    const first = socket ? unix : http,
+      second = socket ? http : unix;
     try {
-      return await http(body, signal);
+      return await bounded(clock, (attempt) => first(body, AbortSignal.any([signal, attempt])), 1000);
     } catch (error) {
       if (error instanceof LeaseRejected) throw error;
-      socket = true;
       signal.throwIfAborted();
-      return unix(body, signal);
+      const reply = await second(body, signal);
+      socket = !socket;
+      return reply;
     }
   };
 }
@@ -93,7 +142,9 @@ export async function agentTestCommand(
   config: WrapperConfig,
   argv: string[],
   client = wrapperLeaseClient(config),
+  options: Pick<LeaseOptions, "clock" | "maxWaitMs"> = {},
 ): Promise<number> {
+  registerCredential("LIMITLESS_AGENT_TEST_CAPABILITY", config.token);
   const name = argv[0];
   const executable = name && realExecutable(name, process.env.PATH ?? "", config.directory);
   if (!executable) {
@@ -103,19 +154,28 @@ export async function agentTestCommand(
   const prefix = config.commands
     .filter((p) => p.every((token, i) => argv[i] === token))
     .sort((a, b) => b.length - a.length)[0];
-  // Descendants share their parent's slot, including scripts that re-enter a slotted command.
-  if (!prefix || process.env.LIMITLESS_AGENT_TEST_SLOT === config.nested)
-    return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
+  if (!prefix) return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
   const lane = testLane(argv, prefix);
+  const env = { ...process.env };
+  const waiter = crypto.randomUUID();
   return runLeasedCommand(
     [executable, ...argv.slice(1)],
     {
+      ...options,
       name: redactCredentials(argv.join(" ")),
-      client: (body, signal) => client({ ...body, token: config.token, lane }, signal),
+      agentTest: {
+        lane,
+        parentId: process.env.LIMITLESS_AGENT_TEST_LEASE,
+        onLease: (id) => {
+          env.LIMITLESS_AGENT_TEST_LEASE = id;
+        },
+      },
+      client: (body, signal) =>
+        client({ ...body, token: config.token, lane, ...(body.name ? { waiter } : {}) }, signal),
       warn: (message) => console.warn(redactCredentials(message)),
     },
     true,
-    { ...process.env, LIMITLESS_AGENT_TEST_SLOT: config.nested },
+    env,
   );
 }
 

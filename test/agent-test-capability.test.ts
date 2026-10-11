@@ -211,7 +211,7 @@ test("a capability presented to another invocation's socket is refused, and dies
         body: JSON.stringify({ token, name: "bun test", lane: "small" }),
       });
     // The token never travels through the environment that `ps -E` exposes.
-    expect(own.nested).not.toBe(own.token);
+    expect(own).not.toHaveProperty("nested");
     expect((await request(own.unix, stolen?.token ?? "")).status).toBe(403);
     const lease = await (await request(own.unix, own.token)).json();
     expect(lease.acquired).toBe(true);
