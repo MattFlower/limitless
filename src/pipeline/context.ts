@@ -80,8 +80,7 @@ export interface RunState {
   reviewLenses?: RepoReviewLens[];
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
-  gateExecution?: { stage: StageName; round: number; purpose: string; handle: ExecutionHandle };
-  gateResults?: { stage: StageName; round: number; sha: string; values: Record<string, GateRun> };
+  gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
@@ -371,7 +370,7 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.store.setRunState(this.run.id, this.state);
+    this.store.setRunState(this.run.id, redactGateData(this.state));
   }
 
   async setPhase(phase: Phase): Promise<void> {

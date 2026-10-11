@@ -163,6 +163,28 @@ async function runAll(
   return { setupOk: true, setup, checks };
 }
 
+/** Standalone retries own scratch per check; an outer command scope still shares setup. */
+async function retryChecks(
+  cwd: string,
+  cfg: GateConfig,
+  signal: AbortSignal,
+  onWait: GateHooks["onWait"],
+  runner?: GateRunner,
+): Promise<GateRun> {
+  if (runner) return runner(cfg);
+  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
+  try {
+    const checks: GateResult[] = [];
+    for (const check of cfg.checks) {
+      if (signal.aborted) break;
+      checks.push(await withCommandScratch(cwd, () => runOne(check, cwd, signal)));
+    }
+    return { setupOk: true, setup: [], checks };
+  } finally {
+    release();
+  }
+}
+
 /**
  * Re-run once, inside a slot, each baseline check that failed without timing out. A check that
  * fails on base never blocks later, so a flaky baseline failure would hide a real regression.
@@ -174,7 +196,7 @@ export async function retryBaselineFailures(
   cfg: GateConfig,
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
-  runner: GateRunner = (gates) => runGates(cwd, gates, signal, { onWait }),
+  runner?: GateRunner,
 ): Promise<GateRun> {
   const retryable = (r: GateResult) =>
     !r.ok && !r.timedOut && !confinementFailed(r)
@@ -185,7 +207,7 @@ export async function retryBaselineFailures(
     const check = retryable(r);
     return check ? [check] : [];
   });
-  const retry = await runner({ ...cfg, setup: [], checks: selected });
+  const retry = await retryChecks(cwd, { ...cfg, setup: [], checks: selected }, signal, onWait, runner);
   let index = 0;
   return {
     ...run,
@@ -265,7 +287,7 @@ export async function retryRegressions(
   changed: string[],
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
-  runner: GateRunner = (gates) => runGates(cwd, gates, signal, { onWait }),
+  runner?: GateRunner,
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const retryable = (c: GateComparison) =>
@@ -277,7 +299,7 @@ export async function retryRegressions(
     const check = retryable(c);
     return check ? [check] : [];
   });
-  const retried = await runner({ ...cfg, setup: [], checks: selected });
+  const retried = await retryChecks(cwd, { ...cfg, setup: [], checks: selected }, signal, onWait, runner);
   let index = 0;
   return cmp.map((c) => {
     const retry = retryable(c) ? retried.checks[index++] : undefined;

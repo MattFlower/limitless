@@ -1,12 +1,11 @@
 import type { StageName } from "../core/types.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { executeGate } from "../gates/executor.ts";
-import { redactGateData } from "../gates/output.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
 import { headSha } from "../git/repos.ts";
 import type { RunContext } from "./context.ts";
 
-/** Keep preceding attempts until the stage consumes them, including across a restart in a retry. */
+/** Resume only a stage's first execution; later attempts depend on its setup. */
 export async function runGateExecution(
   ctx: RunContext,
   stage: StageName,
@@ -17,22 +16,28 @@ export async function runGateExecution(
 ): Promise<GateRun> {
   ctx.checkCancelled();
   const round = ctx.state.round;
-  if (ctx.state.gateResults?.stage !== stage || ctx.state.gateResults.round !== round)
-    ctx.state.gateResults = { stage, round, sha: await headSha(cwd), values: {} };
-  const results = ctx.state.gateResults.values;
-  if (results[purpose]) return results[purpose];
+  const sha = await headSha(cwd);
   const pending = ctx.state.gateExecution;
   const stored =
-    pending?.stage === stage && pending.round === round && pending.purpose === purpose
+    pending?.stage === stage &&
+    pending.round === round &&
+    pending.purpose === purpose &&
+    ["baseline", "initial", "rebase"].includes(purpose) &&
+    pending.sha === sha
       ? pending.handle
       : undefined;
+  if (pending && !stored) {
+    ctx.state.gateExecution = undefined;
+    await ctx.save();
+  }
+  let settled = false;
   try {
     const result = await executeGate(
       {
         repo: ctx.repo.slug,
         cwd,
         baseSha: ctx.run.baseSha ?? "",
-        headSha: await headSha(cwd),
+        headSha: sha,
         gates,
         checks: gates.checks.map((c) => c.name),
       },
@@ -40,19 +45,22 @@ export async function runGateExecution(
       hooks,
       ctx.deps.gateExecutor,
       stored,
-      async (handle) => {
-        ctx.state.gateExecution = { stage, round, purpose, handle: redactGateData(handle) };
+      async ({ kind, id, startedAt, url }) => {
+        ctx.state.gateExecution = { stage, round, purpose, sha, handle: { kind, id, startedAt, url } };
         if (purpose === "timeout") ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
         await ctx.save("gate-started");
       },
+      () => {
+        settled = true;
+      },
     );
     ctx.checkCancelled();
-    results[purpose] = redactGateData(result);
-    ctx.state.gateExecution = undefined;
-    await ctx.save("gate-result");
-    return results[purpose];
-  } catch (error) {
-    ctx.checkCancelled();
-    throw error;
+    return result;
+  } finally {
+    // A termination before attach leaves the durable identity available for resume.
+    if (settled) {
+      ctx.state.gateExecution = undefined;
+      await ctx.save("gate-result");
+    }
   }
 }

@@ -1,26 +1,27 @@
 import { randomUUID } from "node:crypto";
 import type { GateConfig } from "./detect.ts";
+import { redactGateData } from "./output.ts";
 import { type GateHooks, type GateResult, type GateRun, runLocalGates } from "./run.ts";
 
 export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
   start(req: Req, signal: AbortSignal): Promise<ExecutionHandle>;
-  attach(handle: ExecutionHandle, signal: AbortSignal): Execution<Res>;
+  attach(handle: ExecutionHandle, signal: AbortSignal, req?: Req, hooks?: GateHooks): Execution<Res>;
 }
 export interface ExecutionHandle {
   kind: Executor<unknown, unknown>["kind"];
   id: string;
   startedAt: number;
   url?: string;
-  /** Local work is replayed after restart, so its request travels with the handle. */
-  request?: GateRequest;
 }
 export interface Execution<Res> {
   events: AsyncIterable<ExecutionEvent>;
   result: Promise<Res>;
   cancel(): Promise<void>;
 }
-export type ExecutionEvent = { type: "status"; text: string } | { type: "check"; result: GateResult };
+export type ExecutionEvent =
+  | { type: "status"; text: string }
+  | { type: "check"; phase: "setup" | "check"; result: GateResult };
 export interface GateRequest {
   repo: string;
   cwd: string;
@@ -32,20 +33,27 @@ export interface GateRequest {
 export type GateExecutor = Executor<GateRequest, GateRun>;
 export type GateRunner = (gates: GateConfig) => Promise<GateRun>;
 
+export function gateExecutorFor(kind: "local"): GateExecutor {
+  switch (kind) {
+    case "local":
+      return localExecutor();
+  }
+}
+
 export function localExecutor(hooks: GateHooks = {}): GateExecutor {
   const executions = new Map<string, Execution<GateRun>>();
-  const starts = new Map<string, AbortSignal>();
+  const starts = new Map<string, { request: GateRequest; signal: AbortSignal }>();
   return {
     kind: "local",
     async start(request, signal) {
       signal.throwIfAborted();
       const id = randomUUID();
-      starts.set(id, signal);
-      return { kind: "local", id, startedAt: Date.now(), request };
+      starts.set(id, { request, signal });
+      return { kind: "local", id, startedAt: Date.now() };
     },
-    attach(handle, signal) {
+    attach(handle, signal, request, slotHooks = hooks) {
       const started = starts.get(handle.id);
-      if (started) signal = AbortSignal.any([started, signal]);
+      if (started) signal = AbortSignal.any([started.signal, signal]);
       const known = executions.get(handle.id);
       if (known) {
         if (signal.aborted) void known.cancel();
@@ -57,7 +65,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
         }
         return known;
       }
-      const req = handle.request;
+      const req = request ?? started?.request;
       if (!req) throw new Error("Local gate execution is missing its request");
       const controller = new AbortController();
       const cancel = async () => {
@@ -82,13 +90,11 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
         },
         controller.signal,
         {
-          ...hooks,
+          onWait: slotHooks.onWait,
+          holder: slotHooks.holder,
           onResult(r, phase) {
-            hooks.onResult?.(r, phase);
-            if (phase === "check") {
-              results.push({ type: "check", result: r });
-              notify();
-            }
+            results.push({ type: "check", phase, result: r });
+            notify();
           },
         },
       ).finally(() => {
@@ -128,6 +134,7 @@ export async function executeGate(
   injected?: GateExecutor,
   stored?: ExecutionHandle,
   persist: (handle: ExecutionHandle) => Promise<void> = async () => {},
+  onSettled: () => void = () => {},
 ): Promise<GateRun> {
   const executor =
     stored?.kind === "local" && injected?.kind !== "local"
@@ -136,7 +143,13 @@ export async function executeGate(
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
   const handle = stored ?? (await executor.start(req, signal));
   if (!stored) await persist(handle);
-  const execution = executor.attach(handle, signal);
+  let execution: Execution<GateRun>;
+  try {
+    execution = executor.attach(handle, signal, req, hooks);
+  } catch (error) {
+    onSettled();
+    throw error;
+  }
   let cancellation: Promise<void> | undefined;
   const abort = () => {
     cancellation ??= execution.cancel();
@@ -144,8 +157,14 @@ export async function executeGate(
   signal.addEventListener("abort", abort, { once: true });
   if (signal.aborted) abort();
   try {
-    return await execution.result;
+    const events = (async () => {
+      for await (const event of execution.events)
+        if (event.type === "check") hooks.onResult?.(redactGateData(event.result), event.phase);
+    })();
+    const [result] = await Promise.all([execution.result, events]);
+    return result;
   } finally {
+    onSettled();
     signal.removeEventListener("abort", abort);
     await cancellation;
   }

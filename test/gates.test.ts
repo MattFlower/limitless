@@ -1378,6 +1378,51 @@ const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal
   sandbox.confinementScope.run(fakeConfinement, () =>
     productionRetry(cmp, cwd, cfg, changed, signal, onWait),
   );
+
+test.each(["baseline", "regression"])("standalone %s retries own scratch per check", async (kind) => {
+  const cwd = tempDir({});
+  const signal = new AbortController().signal;
+  const cfg: GateConfig = {
+    setup: [],
+    source: "none",
+    protectedPaths: [],
+    checks: ["first", "second"].map((name) => ({
+      name,
+      run: 'if test -f "$HOME/marker"; then echo true; else echo false; fi; touch "$HOME/marker"',
+    })),
+  };
+  const failed: GateRun = {
+    setupOk: true,
+    setup: [],
+    checks: cfg.checks.map((c) => ({
+      name: c.name,
+      command: c.run,
+      ok: false,
+      exitCode: 1,
+      durationMs: 0,
+      output: "transient",
+    })),
+  };
+  try {
+    const checks =
+      kind === "baseline"
+        ? (await retryBaselineFailures(failed, cwd, cfg, signal)).checks
+        : (
+            await retryRegressions(
+              compareGates({ ...failed, checks: failed.checks.map((r) => ({ ...r, ok: true })) }, failed),
+              cwd,
+              cfg,
+              [],
+              signal,
+            )
+          ).map((c) => c.result);
+    expect(checks.map((r) => r.output)).toEqual(["false", "false"]);
+    expect(checks.every((r) => r.ok)).toBe(true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 describe("confined gates on the committed tree", () => {
   const git = (cwd: string, ...args: string[]) =>
     sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });

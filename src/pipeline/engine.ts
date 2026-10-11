@@ -12,7 +12,7 @@ import {
   singleFlight,
 } from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
@@ -502,9 +502,7 @@ async function prepare(ctx: RunContext): Promise<void> {
         const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
         const baseline = async (): Promise<GateRun> => {
           const cached =
-            bypass ||
-            ctx.state.gateResults?.stage === "prepare" ||
-            ctx.state.gateExecution?.stage === "prepare"
+            bypass || ctx.state.gateExecution?.stage === "prepare"
               ? null
               : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
           if (cached && cacheableBaseline(cached, gates)) {
@@ -515,7 +513,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           const fresh = await runBaseline();
           // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
           // and it contradicts any cached pass for this key, so that entry goes.
-          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, redactGateData(fresh), ctx.run.id);
           else store.deleteBaselineCache(key);
           return fresh;
         };
@@ -529,7 +527,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
     }
-    ctx.state.gateResults = undefined;
+    ctx.state.baseline = redactGateData(ctx.state.baseline);
     const baseline = ctx.state.baseline;
     if (baseline) {
       store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
@@ -1146,10 +1144,7 @@ async function oneRound(
     (stage) =>
       commandScope(cwd, async () => {
         const events = gateEvents(ctx);
-        const checkedSha =
-          ctx.state.gateResults?.stage === "gates" && ctx.state.gateResults.round === round
-            ? ctx.state.gateResults.sha
-            : await headSha(cwd);
+        const checkedSha = await headSha(cwd);
         let cmp: GateComparison[];
         let testScripts: Record<string, string> = {};
         let baseTimeout = false;
@@ -1165,9 +1160,14 @@ async function oneRound(
           const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
           if (timeoutOnly && !baseTimeout) {
             const first = after;
-            ctx.store.putArtifact(ctx.run.id, `gates-timeout-${round}.json`, "gates", JSON.stringify(first));
+            ctx.store.putArtifact(
+              ctx.run.id,
+              `gates-timeout-${round}.json`,
+              "gates",
+              JSON.stringify(redactGateData(first)),
+            );
             ctx.log(
-              `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + (ctx.state.gateExecution?.purpose === "timeout" || ctx.state.gateResults?.values.timeout ? 0 : 1)})`,
+              `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + 1})`,
               "warn",
             );
             // The re-run starts from the committed tree too, not from what the first attempt left behind.
@@ -1204,6 +1204,7 @@ async function oneRound(
             throw error;
           });
         }
+        cmp = redactGateData(cmp);
         for (const c of cmp.filter((c) => c.firstAttempt)) {
           ctx.store.addEvent({
             runId: ctx.run.id,
@@ -1213,7 +1214,6 @@ async function oneRound(
             data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
           });
         }
-        ctx.state.gateResults = undefined;
         ctx.state.lastGates = cmp;
         // A gate may have changed HEAD itself; those results cannot attest to the checked commit.
         ctx.state.gateEvidence =
@@ -2405,14 +2405,13 @@ async function mergeForDelivery(
             : (ctx.state.baseline ?? null),
           after,
         );
-        ctx.state.gateResults = undefined;
-        ctx.state.lastGates = comparison;
+        ctx.state.lastGates = redactGateData(comparison);
         await ctx.save();
         ctx.store.putArtifact(
           ctx.run.id,
           `gates-rebase-${ctx.state.round}.json`,
           "gates",
-          JSON.stringify(comparison, null, 2),
+          JSON.stringify(redactGateData(comparison), null, 2),
         );
         const regressed =
           !after.setupOk ||
