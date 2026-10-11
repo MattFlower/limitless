@@ -366,9 +366,10 @@ the daemon. Tunnel traffic remains webhook-only, and all webhook signature/sourc
 
 ### Signing in
 
-Requests through the proxy need a Limitless session; loopback requests (CLI, MCP, deploy,
-administration) never do. Without one, pages redirect to `/login` and API calls (SSE streams
-included) get 401. Set the password on the Mac:
+Requests through the proxy need a Limitless session when `auth = "required"` or
+`require_api_token = true`. With token enforcement enabled, loopback requests also need the
+API bearer token or a Limitless session; current CLI clients send the token automatically.
+Without one, pages redirect to `/login` and API calls (SSE streams included) get 401. Set the password on the Mac:
 
 ```bash
 limitless auth add-passkey                 # prints a one-time link to register a passkey
@@ -394,8 +395,9 @@ fill it. Signing in sets `__Host-limitless-session`, an opaque random cookie wit
 `HttpOnly; Secure; SameSite=Strict`; the database keeps only its SHA-256. A session ends after
 `idle_days` unused or `absolute_days` after sign-in, whichever comes first; open SSE streams
 end with it. Because the cookie
-is `Secure`, `public_origins` must be HTTPS unless `auth = "proxy"`. The UI's navigation bar
-offers **Sign out** and **Sign out everywhere**.
+is `Secure`, `public_origins` must be HTTPS when `auth = "required"` or
+`require_api_token = true`, including proxy authentication with enforcement enabled.
+The UI's navigation bar offers **Sign out** and **Sign out everywhere**.
 
 Failed password attempts are limited to 5 per 15 minutes per source address (429 with
 `Retry-After` after that). The daemon sees only the proxy's address, so all proxied clients
@@ -403,6 +405,8 @@ share that budget; the Access List keeps everyone else out. Passkey sign-ins are
 a signature cannot be guessed, so a burst of wrong passwords never locks out passkey sign-in. Setting a new password does not
 end existing sessions; revoke them if the old one may have leaked.
 
-`auth = "proxy"` keeps the earlier behaviour for setups that authenticate at the proxy: no
-built-in sign-in, so keep basic authentication on the Access List, with NPM's “Satisfy Any”
+`auth = "proxy"` with `require_api_token = false` keeps the earlier behaviour for setups
+that authenticate at the proxy: no Limitless sign-in is required. With enforcement enabled,
+proxied browsers also sign in to Limitless over an HTTPS public origin. Keep basic
+authentication on the Access List, with NPM's “Satisfy Any”
 disabled so both the source and the credentials are required.

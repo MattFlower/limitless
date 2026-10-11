@@ -72,7 +72,7 @@ export interface PolicyFilesystem {
 const policyFilesystem: PolicyFilesystem = { lstatSync, realpathSync };
 
 /** Resolve existing ancestors; retain denied or hidden optional descendants lexically for overlap checks. */
-function policyPath(path: string, denied: boolean, fs: PolicyFilesystem, optionalHome?: string) {
+function policyPath(path: string, denied: boolean, fs: PolicyFilesystem, optional = false) {
   let current = isAbsolute(path) ? sep : fs.realpathSync(process.cwd());
   let available = true;
   try {
@@ -81,18 +81,13 @@ function policyPath(path: string, denied: boolean, fs: PolicyFilesystem, optiona
     for (const [index, component] of components.entries()) {
       if (!component || component === ".") continue;
       const next = join(current, component);
-      let existing = false;
       try {
         const entry = fs.lstatSync(next, { throwIfNoEntry: false });
-        existing = !!entry;
         if (!entry) available = false;
         current = entry ? fs.realpathSync(next) : next;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (
-          (denied || (!existing && optionalHome && within(optionalHome, next))) &&
-          (code === "EPERM" || code === "EACCES")
-        )
+        if ((denied || optional) && (code === "EPERM" || code === "EACCES"))
           return {
             spellings: [...new Set([resolve(path), join(next, ...components.slice(index + 1))])],
             available: false,
@@ -190,7 +185,7 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
           ...(options.toolchains ?? []).map(expand),
         ]
       : []
-  ).map((p) => policyPath(p, false, fs, home));
+  ).map((p) => policyPath(p, false, fs, true));
   // Check even omitted candidates: an absent credential descendant must never be allowlisted.
   for (const allow of [...required, ...optional].flatMap((p) => p.spellings))
     for (const deny of credentials)

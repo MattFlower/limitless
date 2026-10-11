@@ -27,6 +27,11 @@ export { ConfinementError } from "./read-policy.ts";
 
 /** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
 export function seatbeltProfile(roots: WriteRoots): string {
+  if (
+    roots.daemonPort !== undefined &&
+    (!Number.isInteger(roots.daemonPort) || roots.daemonPort < 1 || roots.daemonPort > 65535)
+  )
+    throw new ConfinementError("Invalid daemon port for confinement");
   const paths = (list: string[], filter = "subpath") =>
     list
       .map((path) => {
@@ -40,11 +45,17 @@ export function seatbeltProfile(roots: WriteRoots): string {
   return [
     "(version 1)",
     "(allow default)",
+    // Seatbelt's localhost selector covers IPv4 and IPv6 loopback.
+    ...(roots.daemonPort ? [`(deny network-outbound (remote ip "localhost:${roots.daemonPort}"))`] : []),
     "(deny signal)",
     "(allow signal (target self) (target same-sandbox))",
     "(deny file-write*)",
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
+    ...(roots.commands ? [`(deny file-write* ${paths(roots.commands.root)})`] : []),
+    // Other invocations' lease capabilities: contents and listings, not the metadata path lookups need.
+    ...(roots.commands ? [`(deny file-read-data ${paths(roots.commands.root)})`] : []),
+    ...(roots.commands?.own.length ? [`(allow file-read-data ${paths(roots.commands.own)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
     ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
     // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
@@ -68,6 +79,15 @@ export const seatbeltBackend: ConfinementBackend = {
   verify: (roots, opts, run) => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal),
   wrap: (cmd, roots) => [SANDBOX_EXEC, "-p", seatbeltProfile(roots), ...cmd],
 };
+
+/** Carry the factory port through every editor, gate and land command in its backend scope. */
+export function seatbeltForPort(port: number): ConfinementBackend {
+  const rootsForPort = (roots: WriteRoots) => ({ ...roots, daemonPort: port || undefined });
+  return {
+    verify: (roots, opts, run) => seatbeltBackend.verify(rootsForPort(roots), opts, run),
+    wrap: (cmd, roots) => seatbeltBackend.wrap(cmd, rootsForPort(roots)),
+  };
+}
 
 /** Seatbelt verifies the effective profile every launch; Codex capability probes cache by CLI/version. */
 export async function verifySeatbelt(

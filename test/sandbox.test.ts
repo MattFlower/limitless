@@ -200,6 +200,40 @@ test.each([undefined, "EPERM", "EACCES"])(
   },
 );
 
+test.each(["EPERM", "EACCES"])(
+  "optional toolchains are omitted when existing home metadata resolves but realpath is denied: %s",
+  (code) => {
+    const scratch = join(root, "scratch");
+    mkdirSync(scratch);
+    const filesystem = (): PolicyFilesystem => {
+      let resolvedHome = false;
+      return {
+        lstatSync,
+        realpathSync(path) {
+          // The initial home lookup succeeds; component traversal hits Seatbelt's denied home.
+          if (path === home) {
+            if (resolvedHome) throw Object.assign(new Error("blocked home realpath"), { code });
+            resolvedHome = true;
+          }
+          return realpathSync(path);
+        },
+      };
+    };
+    readPolicyScope.run({ home, environment: {} }, () => {
+      const policy = homeReadPolicy([work, scratch], true, [], filesystem());
+      expect(policy.allowRead).toEqual([work, scratch]);
+      for (const path of [home, join(home, ".ssh"), join(home, ".cargo/credentials.toml")])
+        expect(policy.denyRead).toContain(path);
+      expect(() => homeReadPolicy([join(home, "checkout")], true, [], filesystem())).toThrow(
+        "Cannot resolve read policy path",
+      );
+    });
+    readPolicyScope.run({ home, environment: {}, toolchains: [join(home, ".ssh/absent")] }, () => {
+      expect(() => homeReadPolicy([work], true, [], filesystem())).toThrow("denied credential path");
+    });
+  },
+);
+
 test.each(["EPERM", "EACCES"])("read policy refusal for required roots hidden under home: %s", (code) => {
   readPolicyScope.run({ home, environment: {} }, () => {
     expect(() => homeReadPolicy([join(home, "checkout")], true, [], blockedHomeFilesystem(code))).toThrow(
@@ -219,7 +253,7 @@ test.each([undefined, "EPERM", "EACCES"])(
 );
 
 test.each(["EPERM", "EACCES", "EIO"])(
-  "read policy refusal for optional inspection failures outside denied home: %s",
+  "optional inspection outside denied home omits permission failures and refuses other errors: %s",
   (code) => {
     const candidate = join(root, "other-tools");
     const fs: PolicyFilesystem = {
@@ -230,9 +264,11 @@ test.each(["EPERM", "EACCES", "EIO"])(
       },
     };
     readPolicyScope.run({ home, environment: {}, toolchains: [candidate] }, () => {
-      expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
-        `Cannot resolve read policy path ${candidate}`,
-      );
+      if (code === "EIO")
+        expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+          `Cannot resolve read policy path ${candidate}`,
+        );
+      else expect(homeReadPolicy([work], true, [], fs).allowRead).toEqual([work]);
     });
   },
 );
@@ -255,9 +291,11 @@ test("read policy refusal for absent required roots and existing dangling toolch
           return realpathSync(path);
         },
       };
-      expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
-        `Cannot resolve read policy path ${candidate}`,
-      );
+      if (code === "EIO")
+        expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+          `Cannot resolve read policy path ${candidate}`,
+        );
+      else expect(homeReadPolicy([work], true, [], fs).allowRead).toEqual([work]);
     }
   });
 });

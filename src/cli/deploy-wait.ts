@@ -1,4 +1,5 @@
 import type { DrainState, HealthResponse, Run, RunDetail } from "../core/types.ts";
+import { apiTokenHeaders } from "./api-token.ts";
 
 export const DEFAULT_MAX_WAIT_MS = 45 * 60_000;
 const REQUEST_TIMEOUT_MS = 5000;
@@ -80,11 +81,14 @@ export function localDeployClient(port: number): DeployClient {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, {
       method,
       signal,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...apiTokenHeaders() },
     });
     if (response.status === 404 && path.startsWith("/api/admin/"))
       throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
-    if (!response.ok) throw new Error(`${method} ${path}: HTTP ${response.status}`);
+    if (!response.ok) {
+      const reply = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(`${method} ${path}: HTTP ${response.status}${reply?.error ? `: ${reply.error}` : ""}`);
+    }
     return response.json();
   }
   return {

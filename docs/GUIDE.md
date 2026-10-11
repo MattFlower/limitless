@@ -172,6 +172,7 @@ use the file first, then the environment.
 |---|---|---|
 | `[server] port` | `7400` | HTTP port. The `LIMITLESS_PORT` environment variable takes precedence. |
 | `[server] host` | `"127.0.0.1"` | Bind address. Keep it on loopback (see [remote UI](#remote-ui)). |
+| `[server] require_api_token` | `false` | Rollout: accept token or plain loopback in this release; the default becomes `true` in the next release. When enabled, all routes (including reads, streams, UI and HTTP `/mcp`) require the API token or UI sign-in session, except `GET /api/health`, sign-in/enrollment, `GET /api/auth/session`, caller-only logout and signature-verified webhooks. Loopback `trusted_proxies` then requires `server.auth = "required"`. All `public_origins` must use HTTPS when enabled, including `auth = "proxy"`, because browser sign-in uses a Secure session cookie. Anonymous `logout-all` is always refused, even with enforcement off. HTTP `/mcp` clients send `Authorization: Bearer $(cat ~/.limitless/api-token)`; the file follows `LIMITLESS_HOME`. Current CLI clients read it automatically. Older releases ignore this key, so rollback still starts. |
 | `[server] ui_url` | `http://localhost:<port>` | Base URL for run links in PR bodies and Discord. It is also an allowed browser origin. |
 | `[limits] max_concurrent_runs` | `3` | Runs executing at once. Others wait in `queued`. |
 | `[providers.<id>] max_concurrent` | Catalog limit | Concurrent requests for a catalog provider; positive safe integer. For example, `[providers.claude] max_concurrent = 5`. Unknown provider IDs are rejected. |
@@ -231,10 +232,33 @@ branch:
 setup = ["bun install --frozen-lockfile"]
 checks = [{ name = "test", run = "bun test", timeoutSec = 900 }]
 
+[limits]
+slotted_commands = ["bun test"]   # optional argv prefixes for agents' own test commands
+
 [policy]
 merge = "pr"                      # auto | pr | none
 protected_paths = ["migrations/**"]
 ```
+
+`[limits] slotted_commands` is opt-in and comes only from the run's trusted base commit;
+the value is saved for resume and review. Unset or `[]` leaves agent PATH unchanged.
+Invalid values warn and disable slotting: use nonempty command strings with executable
+names, without path separators. Prefixes match argv tokens, including calls inside shell
+commands and package scripts; absolute executable paths bypass PATH wrappers.
+
+Bare matched commands use the shared gate lane (`max_concurrent_gates`). File/path
+arguments or `-t`/`--test-name-pattern` use a separate small lane, fixed at two concurrent
+agent tests. Flags such as `--coverage` alone still count as full suites. Small commands
+never wait behind a full suite. Health reports this lane as `agentTestSlots` next to
+`gateSlots`; timeline events carry `kind: "agent-test"`, command, lane and queued wait ms.
+Gates, baselines, land checks and deploys keep their existing leases and PATH.
+
+Wrappers use loopback HTTP, with a scratch Unix socket fallback, without expanding
+sandbox permissions. Each invocation's wrappers and lease capability live in a private
+factory directory that every agent and gate sandbox denies reading, except to that invocation. If both transports are unavailable they warn and run the command,
+following gate-slot coordination semantics; a rejected lease or cancellation fails.
+Private holdout authors with read confinement do not receive wrappers, since they cannot
+read the factory-owned wrapper location. Run and stage concurrency limits stay unchanged.
 
 > [!IMPORTANT]
 > When `.limitless.toml` exists, gates come **only** from it. Automatic detection (package.json

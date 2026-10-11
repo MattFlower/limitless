@@ -7,18 +7,23 @@ import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
+import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
-import { gateSlots } from "../gates/slots.ts";
+import { agentTestSlots, gateSlots } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
+import { createApiToken, matchesApiToken } from "./api-token.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
 import { Passkeys } from "./passkeys.ts";
 
 export interface HttpExtras {
+  apiToken?: string;
+  /** An invocation capability is valid only for the gate-slot endpoint. */
+  gateSlotCapability?: (req: Request) => boolean;
   /** Extra routes contributed by integrations (webhooks, MCP). */
   routes?: Record<string, (req: Request, server: Server<undefined>) => Response | Promise<Response>>;
   /** Bundled SPA files, served through the same authorization as the API. */
@@ -130,6 +135,13 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   /** Reachable without a session: signing in, and enrolling with a one-time link. */
   const signInPath = (path: string) =>
     path === "/login" || path === "/enroll" || path.startsWith("/api/auth/passkey/");
+  const tokenExempt = (req: Request, path: string) =>
+    signInPath(path) ||
+    path.startsWith("/webhooks/") ||
+    (req.method === "GET" && (path === "/api/health" || path === "/api/auth/session")) ||
+    (req.method === "POST" && path === "/api/auth/logout");
+  const protectedRequest = (req: Request, path: string) =>
+    !tokenExempt(req, path) && (factory.cfg.requireApiToken || path === "/api/auth/logout-all");
   const handle =
     (
       fn: (
@@ -155,6 +167,36 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         (access === "proxy" && !publicHost(req.headers.get("host"), factory.cfg.publicOrigins))
       )
         return error("forbidden", 403);
+      if (!signInPath(path) && !path.startsWith("/webhooks/") && path !== "/api/auth/logout") {
+        const header = req.headers.get("authorization");
+        const hasBearer = /^Bearer(?:\s|$)/i.test(header ?? "");
+        const bearer = matchesApiToken(header, extras.apiToken);
+        const capability =
+          req.method === "POST" &&
+          path === "/api/admin/gate-slot" &&
+          extras.gateSlotCapability?.(req) === true;
+        const session = auth.session(req.headers);
+        if (
+          (hasBearer && !bearer && !capability) ||
+          (protectedRequest(req, path) && !bearer && !capability && !session)
+        ) {
+          if (
+            !hasBearer &&
+            !path.startsWith("/api/") &&
+            path !== "/mcp" &&
+            ["GET", "HEAD"].includes(req.method)
+          )
+            return new Response(null, {
+              status: 303,
+              headers: { location: `/login?next=${encodeURIComponent(path + url.search)}` },
+            });
+          return error(
+            "API token required: this daemon requires the local API token or a signed-in session; update the limitless CLI",
+            401,
+          );
+        }
+        if (session) signedIn.add(req);
+      }
       if (
         access === "proxy" &&
         factory.cfg.auth === "required" &&
@@ -234,20 +276,39 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/admin/gate-slot": {
       POST: handle(async (req) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);
-        const { name, id, release, immediate, running } = await body<Record<string, unknown>>(req);
+        const payload = await body<Record<string, unknown>>(req);
+        // A capability bearer speaks only for its own invocation: the body must name that same capability.
+        const authorization = req.headers.get("authorization");
+        const capability = /^Bearer (\S+)$/i.exec(authorization ?? "")?.[1];
+        if (
+          capability !== undefined &&
+          !matchesApiToken(authorization, extras.apiToken) &&
+          payload.token !== capability
+        )
+          return error("agent-test capability does not match the request", 401);
+        if (payload.token !== undefined) {
+          req.signal.throwIfAborted();
+          const lease = await agentTestLease(payload);
+          if (req.signal.aborted) await agentTestLease({ ...payload, id: lease.id, release: true });
+          req.signal.throwIfAborted();
+          return json(lease);
+        }
+        const { name, id, release, immediate, running, lane } = payload;
+        if (lane !== undefined && lane !== "gate") return error("invalid lane");
+        const slots = gateSlots;
         if (id !== undefined) {
           if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
             return error("invalid lease");
-          const acquired = gateSlots.heartbeat(id, release === true);
+          const acquired = slots.heartbeat(id, release === true);
           return json({ id, acquired: acquired ?? false, expired: acquired === undefined });
         }
         if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
         if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
         req.signal.throwIfAborted();
-        const lease = await gateSlots.lease(name, immediate === true, undefined, undefined, running === true);
-        if (req.signal.aborted) gateSlots.heartbeat(lease, true);
+        const lease = await slots.lease(name, immediate === true, undefined, undefined, running === true);
+        if (req.signal.aborted) slots.heartbeat(lease, true);
         req.signal.throwIfAborted();
-        return json({ id: lease, acquired: gateSlots.heartbeat(lease) ?? false });
+        return json({ id: lease, acquired: slots.heartbeat(lease) ?? false });
       }, true),
     },
     "/api/admin/drain": admin("drain"),
@@ -344,6 +405,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         uptimeMs: Date.now() - factory.startedAt,
         sha: factory.bootSha,
         gateSlots: gateSlots.snapshot(),
+        agentTestSlots: agentTestSlots.snapshot(),
         ...drainState(),
       } satisfies HealthResponse),
     ),
@@ -668,8 +730,18 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   return routes;
 }
 
-export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun.serve<undefined>) {
-  const routes = createHttpRoutes(factory, extras);
+export async function startHttp(
+  factory: Factory,
+  extras: HttpExtras = {},
+  serve = Bun.serve<undefined>,
+  suppliedCredential?: ReturnType<typeof createApiToken>,
+) {
+  // A supplied credential belongs to the daemon, which also waits for integration teardown.
+  const credential = suppliedCredential ?? createApiToken(factory.cfg.paths.home);
+  const release = () => {
+    if (!suppliedCredential) credential.release();
+  };
+  const routes = createHttpRoutes(factory, { ...extras, apiToken: credential.token });
   const bind = (hostname: string) =>
     serve({
       hostname,
@@ -678,19 +750,36 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun
       routes: routes as never,
       fetch: routes["/*"] as (req: Request, server: Server<undefined>) => Promise<Response>,
     });
-  const local = bind(factory.cfg.host);
+  let local: Server<undefined>;
+  try {
+    local = bind(factory.cfg.host);
+  } catch (error) {
+    release();
+    throw error;
+  }
   let lan: Server<undefined> | undefined;
   try {
     if (factory.cfg.listenLan) lan = bind(factory.cfg.listenLan);
+    credential.publish();
   } catch (error) {
-    void local.stop(true);
+    await Promise.allSettled([
+      Promise.resolve().then(() => local.stop(true)),
+      Promise.resolve().then(() => lan?.stop(true)),
+    ]);
+    release();
     throw error;
   }
   return {
     port: local.port,
     url: local.url,
     stop: async (force?: boolean) => {
-      await Promise.all([local.stop(force), lan?.stop(force)]);
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => local.stop(force)),
+        Promise.resolve().then(() => lan?.stop(force)),
+      ]);
+      release();
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     },
   };
 }
