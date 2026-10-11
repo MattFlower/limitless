@@ -112,7 +112,7 @@ test.each([
   },
 );
 
-test("legacy gate results are redacted on reopened state, checkpoints, HTTP and SSE reads", async () => {
+test("legacy gate results are redacted at checkpoints, HTTP and SSE reads without altering run state", async () => {
   const secret = "synthetic-legacy-gate-credential-421";
   registerCredential("LEGACY_GATE_TEST_TOKEN", secret);
   const terminalSecret = "synthetic-legacy-terminal-credential-421";
@@ -170,6 +170,7 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
     store = new Store(db);
     factory = new Factory(fixture.load(), { store });
     const context = new RunContext(factory.deps, run, repo, controller.signal);
+    expect(context.state).toEqual(state);
     const checkpoint = await context.stage("gates", async () => {
       throw new Error("completed gate checkpoint must be reused");
     });
@@ -225,7 +226,6 @@ test("legacy gate results are redacted on reopened state, checkpoints, HTTP and 
     };
     const messages = [
       ...runResponses,
-      JSON.stringify(context.state),
       JSON.stringify(checkpoint),
       artifact,
       JSON.stringify(events),
