@@ -1556,7 +1556,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** A round run, not yet finished, recorded as pushing to the PR (a crash can leave one behind). */
-  private pushingTo(prUrl: string): boolean {
+  pushingTo(prUrl: string): boolean {
     const sql = `SELECT 1 FROM pr_heads h JOIN runs ON runs.id = h.pushing
       WHERE h.pr_url = ? AND runs.status NOT IN (${TERMINAL_STATUSES.map(() => "?").join(", ")})`;
     return this.db.query(sql).get(prUrl, ...TERMINAL_STATUSES) !== null;
@@ -1848,6 +1848,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   getRunDetail(id: string): RunDetail | null {
     const run = this.getRun(id);
     if (!run) return null;
+    const head = run.prUrl ? this.prHead(run.prUrl) : null;
     const approval = run.prUrl && this.approvalFor(run.prUrl);
     const approvalTime =
       approval &&
@@ -1885,6 +1886,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
         ? review.blocking.flatMap((f) => (typeof f?.title === "string" ? [f.title] : []))
         : [],
       prSnapshot: parse<RunDetail["prSnapshot"]>(run.prUrl && this.githubPrData(run.prUrl), null),
+      prHead: head && run.prUrl ? { ...head, pushing: this.pushingTo(run.prUrl) } : null,
       run,
       stages: this.listStages(id),
       invocations: this.listInvocations(id),

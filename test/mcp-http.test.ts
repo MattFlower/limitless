@@ -5,7 +5,15 @@ import { httpBackend } from "../src/integrations/mcp.ts";
 import { mountMcp } from "../src/integrations/mcp-http.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
-import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
+import {
+  changeFixture,
+  connect,
+  fixture,
+  localServer,
+  type Route,
+  requestWithParams,
+  resultValue,
+} from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let mcp: ReturnType<typeof mountMcp>;
@@ -29,6 +37,30 @@ const rpc = (method: string, params: unknown = {}, id: number | undefined = 1) =
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
   });
+
+test("mounted MCP exposes only the protected change view", async () => {
+  const hidden = "mountedHiddenSentinel";
+  const c = await changeFixture(f, { "hello.txt": `hello\n${hidden}\n` });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [{ id: "H-1", description: hidden, steps: hidden, expected: hidden, edge_case: false }],
+    },
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", hidden);
+  const response = await route(
+    rpc("tools/call", { name: "limitless_get_change", arguments: { run: c.run.id } }),
+    localServer,
+  );
+  const message = await response.json();
+  expect(JSON.stringify(message)).not.toContain(hidden);
+  expect(resultValue(message.result)).toMatchObject({
+    available: true,
+    headSha: c.headSha,
+    baseSha: c.baseSha,
+    diff: { text: expect.stringContaining(" hello\n+[private detail]\n") },
+    reports: [{ text: "[private detail] [1 private details withheld]" }],
+  });
+});
 
 test("no HTTP MCP tool result or error includes owner diagnostics", async () => {
   const run = await f.factory.createRun({ repo: f.repo, prompt: "diagnostic transport" });
@@ -102,7 +134,7 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     ).status,
   ).toBe(202);
   const list = await route(rpc("tools/list"), localServer);
-  expect((await list.json()).result.tools).toHaveLength(12);
+  expect((await list.json()).result.tools).toHaveLength(13);
   const create = await route(
     rpc("tools/call", { name: "limitless_create_run", arguments: { repo: f.repo, prompt: "hello" } }),
     localServer,
