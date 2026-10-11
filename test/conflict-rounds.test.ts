@@ -21,13 +21,14 @@ import { observerRoots } from "../src/harness/sandbox.ts";
 import { startGitHubPoller } from "../src/integrations/github-poller.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
+import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { submitReview } from "../src/pipeline/review-round.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub } from "./github-poller-support.ts";
-import { approve, models, policy, providers, roleOf } from "./pipeline-support.ts";
+import { approve, holdout, models, pass, policy, providers, roleOf, spec } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -62,7 +63,7 @@ let clock: ReturnType<typeof waitClock>;
 let calls: string[][];
 let comments: { body: string }[];
 let implementations: number;
-let mode: "pass" | "gates" | "review" | "audit" | "empty" | "dropped";
+let mode: "pass" | "gates" | "review" | "audit" | "empty" | "dropped" | "blocked";
 let reviewPrompts: string[];
 let verifierCalls: number;
 let draft: boolean;
@@ -95,6 +96,17 @@ beforeEach(async () => {
     policy,
     harnesses: {
       fake: fakeHarness((s) => {
+        if (roleOf(s) === "verify")
+          return {
+            structured: {
+              ...pass,
+              criteria: pass.criteria.map((c) =>
+                c.id === "AC-1"
+                  ? { ...c, status: "blocked", evidence: "Real confinement probes require unconfined gates" }
+                  : c,
+              ),
+            },
+          };
         if (s.prompt.startsWith("You are a code-review verifier")) {
           verifierCalls++;
           return {
@@ -159,6 +171,10 @@ beforeEach(async () => {
   });
   factory.deps.gh = async (args, _signal, stdin) => {
     calls.push(args);
+    if (args[1] === "ready" && args.includes("--undo")) {
+      draft = true;
+      return "";
+    }
     if (args[1] === "merge" && args.includes("--disable-auto")) {
       autoMerge = false;
       return "";
@@ -337,6 +353,38 @@ test.each(["gates", "review", "audit"] as const)(
     expect(factory.store.getLandEntry(entry.id)?.reason).toBe("conflicts with main");
   },
 );
+
+test("an environment-blocked standard conflict round publishes its checked merge", async () => {
+  const old = await remoteHead();
+  await advanceBase();
+  const id = await trigger();
+  factory.deps.faults = { "stage:prepare:after": { action: "kill" } };
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+  // New conflict rounds default to quick; exercise a resumed round that requires verification.
+  factory.store.updateRun(id, { resolvedProfile: "standard" });
+  const state = factory.store.getRunState<RunState>(id);
+  if (!state) throw new Error("missing conflict round state");
+  factory.store.setRunState(id, { ...state, spec, holdout, holdoutStatus: "complete" });
+  factory.deps.faults = undefined;
+  mode = "blocked";
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  const head = await remoteHead();
+  expect(head).not.toBe(old);
+  expect(draft).toBe(true);
+  expect(comments).toHaveLength(1);
+  expect(comments[0]?.body).toContain(head);
+  expect(comments[0]?.body).toContain("🚧 blocked AC-1");
+  expect(comments[0]?.body).toContain("Real confinement probes require unconfined gates");
+  expect(factory.store.approvalFor(url)).toBeNull();
+  expect(factory.store.getRun(id)?.error).toContain("verification blocked by the environment");
+  expect(factory.store.getRunDetail(id)).toMatchObject({
+    run: { headSha: head },
+    review: { rounds: [{ deliveredSha: head }] },
+  });
+  expect(
+    factory.store.readFeed({ limit: 100 }).items.find((i) => i.kind === "conflict.round_delivered")?.data,
+  ).toMatchObject({ headSha: head });
+});
 
 test("a clean base merge is checked and delivered without running implementation", async () => {
   const head = await remoteHead();
