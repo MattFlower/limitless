@@ -15,13 +15,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { Store } from "../src/db/store.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import {
   ancestorReadPolicy,
   homeReadPolicy,
   type PolicyFilesystem,
+  policySpellings,
   readPolicyScope,
 } from "../src/harness/read-policy.ts";
 import {
@@ -201,15 +202,20 @@ test.each([undefined, "EPERM", "EACCES"])(
 );
 
 test.each(["EPERM", "EACCES"])(
-  "optional toolchains are omitted when existing home metadata resolves but realpath is denied: %s",
+  "read policy traverses denied home metadata but refuses absent roots and unresolved symlinks: %s",
   (code) => {
     const scratch = join(root, "scratch");
     mkdirSync(scratch);
+    const checkout = join(home, "checkout");
+    mkdirSync(join(checkout, "child"), { recursive: true });
+    const blockedLink = join(home, "blocked-link");
+    symlinkSync(checkout, blockedLink);
     const filesystem = (): PolicyFilesystem => {
       let resolvedHome = false;
       return {
         lstatSync,
         realpathSync(path) {
+          if (path === blockedLink) throw Object.assign(new Error("blocked symlink realpath"), { code });
           // The initial home lookup succeeds; component traversal hits Seatbelt's denied home.
           if (path === home) {
             if (resolvedHome) throw Object.assign(new Error("blocked home realpath"), { code });
@@ -220,11 +226,24 @@ test.each(["EPERM", "EACCES"])(
       };
     };
     readPolicyScope.run({ home, environment: {} }, () => {
-      const policy = homeReadPolicy([work, scratch], true, [], filesystem());
-      expect(policy.allowRead).toEqual([work, scratch]);
+      const fs = filesystem();
+      const policy = homeReadPolicy([work, scratch, checkout], true, [], fs);
+      expect(policy.allowRead).toEqual([work, scratch, checkout]);
+      expect(policySpellings([checkout], false, fs)).toEqual([checkout]);
+      const climbing = `${relative(process.cwd(), join(checkout, "child"))}/../../checkout`;
+      expect(policySpellings([climbing], false, fs)).toEqual([checkout]);
+      expect(() => homeReadPolicy([blockedLink], true, [], filesystem())).toThrow(
+        `Cannot resolve read policy path ${blockedLink}`,
+      );
+      expect(policySpellings([blockedLink], true, fs)).toEqual([blockedLink]);
+      expect(
+        readPolicyScope.run({ home, environment: {}, toolchains: [blockedLink] }, () =>
+          homeReadPolicy([checkout], true, [], filesystem()),
+        ).allowRead,
+      ).toEqual([checkout]);
       for (const path of [home, join(home, ".ssh"), join(home, ".cargo/credentials.toml")])
         expect(policy.denyRead).toContain(path);
-      expect(() => homeReadPolicy([join(home, "checkout")], true, [], filesystem())).toThrow(
+      expect(() => homeReadPolicy([join(home, "absent-checkout")], true, [], filesystem())).toThrow(
         "Cannot resolve read policy path",
       );
     });

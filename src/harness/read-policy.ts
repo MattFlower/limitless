@@ -84,7 +84,14 @@ function policyPath(path: string, denied: boolean, fs: PolicyFilesystem, optiona
       try {
         const entry = fs.lstatSync(next, { throwIfNoEntry: false });
         if (!entry) available = false;
-        current = entry ? fs.realpathSync(next) : next;
+        try {
+          current = entry ? fs.realpathSync(next) : next;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          // A non-symlink name below a canonical parent needs no further resolution.
+          if (entry && !entry.isSymbolicLink() && (code === "EPERM" || code === "EACCES")) current = next;
+          else throw error;
+        }
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if ((denied || optional) && (code === "EPERM" || code === "EACCES"))
