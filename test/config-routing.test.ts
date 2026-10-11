@@ -341,7 +341,9 @@ test("provider concurrency overrides reach the tracker without changing catalog 
     writeFileSync(join(configDir, "secrets.env"), "OMLX_API_KEY=file-key\n");
     expect(loadConfig({ home: join(root, "data"), configDir }).secrets.OMLX_API_KEY).toBe("file-key");
     const defaults = new Factory(loadConfig({ home: join(root, "defaults"), configDir }));
-    expect(defaults.deps.confinement).toBe(seatbeltBackend);
+    expect(defaults.deps.confinement?.wrap(["true"], { write: [root], protect: [] })).toEqual(
+      seatbeltBackend.wrap(["true"], { write: [root], protect: [], daemonPort: defaults.cfg.port }),
+    );
     expect(defaults.tracker.status("omlx")?.maxConcurrent).toBe(4);
     defaults.store.close();
     writeFileSync(

@@ -276,6 +276,7 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
 
 /** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
 function editorProfile(spec: AgentSpec): string[] {
+  // Codex exposes only a network on/off switch; the API token guards the daemon port.
   const { write, protect, denyRead = [] } = writeRoots(spec.cwd, validateScratch(spec));
   const entries = [
     ["/", "read"],
