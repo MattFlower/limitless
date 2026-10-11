@@ -899,8 +899,11 @@ test.each([
     expect(markerSeen).toBe(false);
     expect(existsSync(f.marker)).toBe(false);
     const stderr = warn.mock.calls.flat().join();
-    expect(stderr).toContain("HTTP:");
-    expect(stderr).toContain("Unix socket:");
+    // Truncated headers surface as a transport error on macOS and as a timeout on Linux; the injected
+    // clients above pin the exact HTTP and Unix socket details.
+    expect(stderr).toMatch(
+      /waited [\d.]+ms for the gate lane; try a targeted run: bun test <file>; last failure: /,
+    );
     expect(stderr).not.toContain("coordination unavailable");
   } finally {
     for (const socket of sockets) socket.destroy();
