@@ -199,8 +199,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         access === "proxy" &&
         factory.cfg.auth === "required" &&
         !signInPath(path) &&
-        !path.startsWith("/webhooks/") &&
-        !(factory.cfg.requireApiToken && tokenExempt(req, path))
+        !path.startsWith("/webhooks/")
       ) {
         if (auth.session(req.headers)) signedIn.add(req);
         else if (path.startsWith("/api/")) return error("sign-in required", 401);

@@ -236,6 +236,50 @@ test("enforcement refuses spoofed loopback proxy headers and accepts signed-in p
   }
 });
 
+test("token enforcement preserves required proxy sign-in on loopback-exempt routes", async () => {
+  const f = await fixture();
+  try {
+    Object.assign(f.factory.cfg, { auth: "required", trustedProxies: [proxy], publicOrigins: [origin] });
+    const auth = new Auth(f.factory.store, f.factory.cfg);
+    const routes = createHttpRoutes(f.factory, { apiToken: "testtoken" });
+    for (const enforcement of [false, true]) {
+      f.factory.cfg.requireApiToken = enforcement;
+      const cookie = auth.signIn("password", "owner").split(";")[0] ?? "";
+      for (const [path, method] of [
+        ["/api/health", "GET"],
+        ["/api/auth/session", "GET"],
+        ["/api/auth/logout", "POST"],
+      ] as const) {
+        const entry = routes[path];
+        const route =
+          typeof entry === "function" ? (entry as Route) : (entry as Record<string, Route>)[method];
+        if (!route) throw new Error(`missing ${method} ${path}`);
+        const call = (credentials: Record<string, string>) =>
+          route(
+            requestWithParams(`http://localhost:7400${path}`, {
+              method,
+              headers: {
+                host: new URL(origin).host,
+                origin,
+                "content-type": "application/json",
+                ...credentials,
+              },
+            }),
+            peer(proxy),
+          );
+        for (const credentials of [{}, { authorization: "Bearer testtoken" }] as Record<string, string>[]) {
+          const response = await call(credentials);
+          expect([enforcement, path, response.status]).toEqual([enforcement, path, 401]);
+          expect(await response.json()).toEqual({ error: "sign-in required" });
+        }
+        expect([enforcement, path, (await call({ cookie })).status]).toEqual([enforcement, path, 200]);
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 test("every SSE stream asks a reverse proxy not to buffer or transform it", async () => {
   const f = await fixture();
   try {
