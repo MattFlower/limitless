@@ -1,4 +1,5 @@
 import type { Factory } from "../app.ts";
+import { liveAgentTestCapability } from "../gates/agent-tests.ts";
 import { mountIntegrations } from "../integrations/index.ts";
 import { createApiToken } from "../server/api-token.ts";
 import { startHttp } from "../server/http.ts";
@@ -24,7 +25,16 @@ export async function startDaemon(
   };
   try {
     integrations = await mount(factory);
-    server = await startHttp(factory, { ui, routes: integrations.routes }, serve, credential);
+    server = await startHttp(
+      factory,
+      {
+        ui,
+        routes: integrations.routes,
+        gateSlotCapability: (req) => liveAgentTestCapability(req.headers.get("authorization")),
+      },
+      serve,
+      credential,
+    );
     factory.start();
     return { integrations, server: { ...server, stop } };
   } catch (error) {

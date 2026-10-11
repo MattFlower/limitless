@@ -7,8 +7,9 @@ import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
+import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
-import { gateSlots } from "../gates/slots.ts";
+import { agentTestSlots, gateSlots } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
@@ -275,20 +276,39 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/admin/gate-slot": {
       POST: handle(async (req) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);
-        const { name, id, release, immediate, running } = await body<Record<string, unknown>>(req);
+        const payload = await body<Record<string, unknown>>(req);
+        // A capability bearer speaks only for its own invocation: the body must name that same capability.
+        const authorization = req.headers.get("authorization");
+        const capability = /^Bearer (\S+)$/i.exec(authorization ?? "")?.[1];
+        if (
+          capability !== undefined &&
+          !matchesApiToken(authorization, extras.apiToken) &&
+          payload.token !== capability
+        )
+          return error("agent-test capability does not match the request", 401);
+        if (payload.token !== undefined) {
+          req.signal.throwIfAborted();
+          const lease = await agentTestLease(payload);
+          if (req.signal.aborted) await agentTestLease({ ...payload, id: lease.id, release: true });
+          req.signal.throwIfAborted();
+          return json(lease);
+        }
+        const { name, id, release, immediate, running, lane } = payload;
+        if (lane !== undefined && lane !== "gate") return error("invalid lane");
+        const slots = gateSlots;
         if (id !== undefined) {
           if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
             return error("invalid lease");
-          const acquired = gateSlots.heartbeat(id, release === true);
+          const acquired = slots.heartbeat(id, release === true);
           return json({ id, acquired: acquired ?? false, expired: acquired === undefined });
         }
         if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
         if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
         req.signal.throwIfAborted();
-        const lease = await gateSlots.lease(name, immediate === true, undefined, undefined, running === true);
-        if (req.signal.aborted) gateSlots.heartbeat(lease, true);
+        const lease = await slots.lease(name, immediate === true, undefined, undefined, running === true);
+        if (req.signal.aborted) slots.heartbeat(lease, true);
         req.signal.throwIfAborted();
-        return json({ id: lease, acquired: gateSlots.heartbeat(lease) ?? false });
+        return json({ id: lease, acquired: slots.heartbeat(lease) ?? false });
       }, true),
     },
     "/api/admin/drain": admin("drain"),
@@ -385,6 +405,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         uptimeMs: Date.now() - factory.startedAt,
         sha: factory.bootSha,
         gateSlots: gateSlots.snapshot(),
+        agentTestSlots: agentTestSlots.snapshot(),
         ...drainState(),
       } satisfies HealthResponse),
     ),

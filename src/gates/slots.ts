@@ -78,6 +78,7 @@ export class Semaphore {
     timer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
     clear = clearTimeout,
     running = false,
+    observe?: { onWait: () => void; onAcquired: () => void },
   ): Promise<string> {
     const id = crypto.randomUUID(),
       controller = new AbortController();
@@ -93,10 +94,11 @@ export class Semaphore {
     };
     this.leases.set(id, touch);
     touch(false);
-    void this.acquire(controller.signal, undefined, name, running).then(
+    void this.acquire(controller.signal, observe?.onWait, name, running).then(
       (free) => {
         release = free;
         if (controller.signal.aborted) touch(true);
+        else observe?.onAcquired();
       },
       () => touch(true),
     );
@@ -121,3 +123,6 @@ export class Semaphore {
 
 /** Shared by every gate run in the process: pipeline runs, baselines and eval trials. */
 export const gateSlots = new Semaphore(defaultGateSlots());
+
+/** Targeted agent tests never queue behind a full gate suite. */
+export const agentTestSlots = new Semaphore(2);
