@@ -33,7 +33,7 @@ import { seatbeltSkip } from "./confinement.ts";
 import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
-let server: ReturnType<typeof startHttp>;
+let server: Awaited<ReturnType<typeof startHttp>>;
 let token: string;
 let base: string;
 const daemonPort = () => {
@@ -46,7 +46,7 @@ beforeAll(async () => {
   f = await fixture();
   f.factory.cfg.port = 0;
   f.factory.cfg.requireApiToken = true;
-  server = startHttp(f.factory, {
+  server = await startHttp(f.factory, {
     routes: { "/mcp": () => new Response("ok") },
     ui: { "/index.html": new Blob(["owner UI"]) },
   });
@@ -306,7 +306,7 @@ test("startup rotates a private 0600 token protected in every sandbox spelling",
     rotated.release();
   }
   await server.stop(true);
-  server = startHttp(f.factory, { routes: { "/mcp": () => new Response("ok") } });
+  server = await startHttp(f.factory, { routes: { "/mcp": () => new Response("ok") } });
   base = `http://127.0.0.1:${server.port}`;
   const next = readFileSync(tokenPath(), "utf8");
   expect(next).not.toBe(token);
@@ -486,6 +486,79 @@ for (const failedStep of ["mount", "first bind", "second bind"] as const) {
   });
 }
 
+for (const owner of ["startHttp", "startDaemon"] as const) {
+  test(`${owner} waits for a delayed listener stop after second-bind failure`, async () => {
+    const startup = await fixture();
+    startup.factory.cfg.port = 0;
+    startup.factory.cfg.listenLan = "192.0.2.1";
+    const path = join(startup.factory.cfg.paths.home, "api-token");
+    const scratch = join(startup.home, "scratch", SCRATCH_NAME);
+    mkdirSync(scratch, { recursive: true });
+    const stopping = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const failure = new Error("injected second-bind failure");
+    const integrationStop = mock(async () => {});
+    const factoryStart = spyOn(startup.factory, "start").mockImplementation(() => {});
+    let listener: Server<undefined> | undefined;
+    let closeListener: (() => Promise<void>) | undefined;
+    const serve = ((options: Parameters<typeof Bun.serve<undefined>>[0]) => {
+      if (listener) throw failure;
+      listener = Bun.serve(options);
+      const stop = listener.stop.bind(listener);
+      closeListener = () => stop(true);
+      listener.stop = async (force) => {
+        stopping.resolve();
+        await finish.promise;
+        await stop(force);
+      };
+      return listener;
+    }) as typeof Bun.serve<undefined>;
+    let settled = false;
+    const result = (
+      owner === "startHttp"
+        ? startHttp(startup.factory, {}, serve)
+        : startDaemon(
+            startup.factory,
+            {},
+            async () => ({ routes: {}, notes: [], stop: integrationStop }),
+            serve,
+          )
+    ).then(
+      () => {
+        settled = true;
+        throw new Error("startup unexpectedly succeeded");
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+    try {
+      await stopping.promise;
+      if (!listener) throw new Error("first listener did not bind");
+      const url = new URL("/api/health", listener.url);
+      const health = await fetch(url);
+      expect(health.status).toBe(200);
+      await health.text();
+      expect(settled).toBe(false);
+      expect(privateReadPaths()).toContain(path);
+      expect(seatbeltProfile(writeRoots(startup.repo, scratch))).toContain(`(subpath "${path}")`);
+      finish.resolve();
+      expect(await result).toBe(failure);
+      await expect(fetch(url)).rejects.toThrow();
+      expect(privateReadPaths()).not.toContain(path);
+      expect(factoryStart).not.toHaveBeenCalled();
+      expect(integrationStop).toHaveBeenCalledTimes(owner === "startDaemon" ? 1 : 0);
+    } finally {
+      finish.resolve();
+      await result;
+      await closeListener?.();
+      factoryStart.mockRestore();
+      await startup.close();
+    }
+  });
+}
+
 test("failed binds never replace the running daemon's token or leak private path registrations", async () => {
   const before = readFileSync(tokenPath());
   const paths = privateReadPaths();
@@ -501,7 +574,7 @@ test("failed binds never replace the running daemon's token or leak private path
         if (++calls === failedBind) throw new Error("injected bind failure");
         return { stop };
       }) as unknown as typeof Bun.serve<undefined>;
-      expect(() => startHttp(f.factory, {}, bind)).toThrow("injected bind failure");
+      await expect(startHttp(f.factory, {}, bind)).rejects.toThrow("injected bind failure");
       expect(readFileSync(tokenPath())).toEqual(before);
       expect(privateReadPaths()).toEqual(paths);
       if (failedBind === 2) expect(stop).toHaveBeenCalledWith(true);
@@ -515,7 +588,7 @@ test("failed binds never replace the running daemon's token or leak private path
     await server.stop(true);
     expect(privateReadPaths()).not.toContain(tokenPath());
     f.factory.cfg.listenLan = lanBefore;
-    server = startHttp(f.factory);
+    server = await startHttp(f.factory);
     base = `http://127.0.0.1:${server.port}`;
     token = readFileSync(tokenPath(), "utf8");
   } finally {
@@ -581,7 +654,7 @@ test("local clients authenticate, pick up rotation, omit missing tokens and keep
       expect(JSON.stringify(agentEnv())).not.toContain(token);
       f.factory.cfg.port = daemonPort();
       await server.stop(true);
-      server = startHttp(f.factory);
+      server = await startHttp(f.factory);
       base = `http://127.0.0.1:${server.port}`;
       token = readFileSync(tokenPath(), "utf8");
       expect((await deploy.admin("drain", signal)).draining).toBe(true);

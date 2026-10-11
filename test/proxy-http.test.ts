@@ -128,7 +128,7 @@ test("config validates LAN settings; exact binds share routes, stop together and
       stops.push(stop);
       return { stop, port: opts.port, url: new URL("http://localhost:7400") };
     }) as unknown as typeof Bun.serve<undefined>;
-    await startHttp(f.factory, {}, serve).stop(true);
+    await (await startHttp(f.factory, {}, serve)).stop(true);
     expect(options.map((o) => [o.hostname, o.port])).toEqual([["127.0.0.1", 7400]]);
     Object.assign(
       f.factory.cfg,
@@ -136,7 +136,7 @@ test("config validates LAN settings; exact binds share routes, stop together and
         `listen_lan = "10.0.0.10"\nport = 7401\ntrusted_proxies = ["${proxy}"]\npublic_origins = ["HTTPS://LIMITLESS.EXAMPLE.TEST/"]`,
       ),
     );
-    const server = startHttp(f.factory, {}, serve);
+    const server = await startHttp(f.factory, {}, serve);
     expect(options.slice(1).map((o) => [o.hostname, o.port])).toEqual([
       ["127.0.0.1", 7401],
       ["10.0.0.10", 7401],
@@ -145,12 +145,12 @@ test("config validates LAN settings; exact binds share routes, stop together and
     await server.stop(true);
     for (const stop of stops) expect(stop).toHaveBeenCalledWith(true);
     let calls = 0;
-    expect(() =>
+    await expect(
       startHttp(f.factory, {}, ((opts: Parameters<typeof serve>[0]) => {
         if (++calls === 2) throw new Error("bind failed");
         return serve(opts);
       }) as typeof serve),
-    ).toThrow("bind failed");
+    ).rejects.toThrow("bind failed");
     expect(stops.at(-1)).toHaveBeenCalledWith(true);
   } finally {
     await f.close();
@@ -365,7 +365,7 @@ test("direct navigation to every UI route serves the SPA shell; unknown API path
   const f = await fixture();
   const ui = await buildUi();
   f.factory.cfg.port = 0;
-  const server = startHttp(f.factory, { ui });
+  const server = await startHttp(f.factory, { ui });
   try {
     const shell = await ui["/index.html"]?.text();
     if (!shell) throw new Error("missing bundled shell");

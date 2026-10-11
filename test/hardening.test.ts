@@ -1519,7 +1519,7 @@ describe("HTTP API", () => {
       confinement: fakeConfinement,
       harnesses: { fake: fakeHarness(() => ({})) },
     });
-    const server = startHttp(factory);
+    const server = await startHttp(factory);
     const base = `http://127.0.0.1:${server.port}`;
     try {
       const evil = await fetch(`${base}/api/runs`, {

@@ -12,7 +12,7 @@ export async function startDaemon(
 ) {
   const credential = createApiToken(factory.cfg.paths.home);
   let integrations: Awaited<ReturnType<typeof mount>> | undefined;
-  let server: ReturnType<typeof startHttp> | undefined;
+  let server: Awaited<ReturnType<typeof startHttp>> | undefined;
   const stop = async (force?: boolean) => {
     const results = await Promise.allSettled([
       Promise.resolve().then(() => integrations?.stop()),
@@ -24,7 +24,7 @@ export async function startDaemon(
   };
   try {
     integrations = await mount(factory);
-    server = startHttp(factory, { ui, routes: integrations.routes }, serve, credential);
+    server = await startHttp(factory, { ui, routes: integrations.routes }, serve, credential);
     factory.start();
     return { integrations, server: { ...server, stop } };
   } catch (error) {

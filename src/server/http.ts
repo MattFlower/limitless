@@ -700,7 +700,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   return routes;
 }
 
-export function startHttp(
+export async function startHttp(
   factory: Factory,
   extras: HttpExtras = {},
   serve = Bun.serve<undefined>,
@@ -732,8 +732,10 @@ export function startHttp(
     if (factory.cfg.listenLan) lan = bind(factory.cfg.listenLan);
     credential.publish();
   } catch (error) {
-    void local.stop(true);
-    void lan?.stop(true);
+    await Promise.allSettled([
+      Promise.resolve().then(() => local.stop(true)),
+      Promise.resolve().then(() => lan?.stop(true)),
+    ]);
     release();
     throw error;
   }
