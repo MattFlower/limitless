@@ -43,10 +43,12 @@ Use five verbs to manage work:
 
 Additional inspection and follow-up tools:
 
-- `limitless_get_run`: inspect id, status, nullable stage/prUrl, error, open questions and the latest
-  20 non-debug events. Check periodically or on request; avoid tight polling.
-- `limitless_list_runs`: find existing work, newest-first; optional status and limit (default 20,
-  range 1–100). Use this before resubmitting after an uncertain create response.
+- `limitless_get_run`: inspect a compact summary with state, stage, PR, head SHA, delivered round
+  count, land entry, error and open question count. Use `full:true` for all run fields, open questions
+  and the latest 20 non-debug events. Check periodically or on request; avoid tight polling.
+- `limitless_list_runs`: find existing work, newest-first; optional repo slug, status and limit
+  (default 5, range 1–100). Returns `{runs, hasMore}`; use `full:true` for all stored run fields.
+  Use this before resubmitting after an uncertain create response.
 - `limitless_answer_question`: supply id and an answer addressing every currently open question.
   Answer from known requirements; ask the user when their decision is needed. The response contains
   the answered questions. No open questions is an error.
@@ -56,10 +58,18 @@ Additional inspection and follow-up tools:
 - `limitless_providers`: inspect health, quota windows/reset times, spend/budget and concurrency
   to explain queue delays or assess capacity. Missing telemetry stays null or empty.
 - `limitless_create_run`: queue new authorized work; do not automatically retry a mutation after
-  a connection failure because it may already have taken effect.
+  a connection failure because it may already have taken effect. Supply your stable `consumer`
+  name to record provenance for `ownRuns` feed reads.
 - `limitless_feed`: catch up on everything to act on across runs (PRs opened, questions,
   needs_human, failures, merges, finished evals, daemon restarts) after your consumer's cursor;
   `wait` (up to 45 s, within MCP client timeouts) long-polls. Prefer it over polling runs one by one.
+  Pages are capped at 100 items and 16 KiB of UTF-8 serialized JSON. Follow `hasMore: true` with
+  `after: nextAfter`; oversized items retain id, kind and runId with `truncated: true`.
+  To start without history, use `from: "now"` without `after`, then continue with `after: nextAfter`.
+  This never acknowledges. Cursors past the end clamp to the newest issued id.
+  Filter by exact `repo` (the run's repoSlug), or `ownRuns: true` with the same `consumer` used on
+  MCP run creation. Combined filters both apply; other sources and older unowned runs are excluded.
+  Consumer names are labels, not access control, and acknowledgements apply across filters.
 - `limitless_feed_ack`: acknowledge through `nextAfter` for your consumer only after you have
   handled the items; reading never acknowledges.
 

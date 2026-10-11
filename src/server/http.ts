@@ -414,8 +414,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const status = url.searchParams.get("status")?.split(",").filter(Boolean) as RunStatus[] | undefined;
         const ids = url.searchParams.get("ids")?.split(",").filter(Boolean);
         const limit = Number(url.searchParams.get("limit") ?? 100);
+        const repoSlug = url.searchParams.get("repo") ?? undefined;
         return json(
-          store.listRuns({ ...(status ? { status } : {}), ...(ids?.length ? { ids } : {}), limit }),
+          store.listRuns({ ...(status ? { status } : {}), ...(ids?.length ? { ids } : {}), limit, repoSlug }),
         );
       }),
       POST: handle(async (req) => {

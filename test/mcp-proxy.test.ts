@@ -61,6 +61,7 @@ test("proxy maps all six tools to REST and matches Factory results, including fi
     })();
     for (const [name, args] of [
       ["get_run", { id: run.id }],
+      ["get_run", { id: run.id, full: true }],
       ["list_runs", { status: "queued", limit: 1 }],
     ] as const) {
       expect(await call(name, args)).toEqual(
@@ -68,7 +69,7 @@ test("proxy maps all six tools to REST and matches Factory results, including fi
       );
     }
     expect(requests.some((r) => r.url.endsWith("/events?tail=true&excludeDebug=true&limit=20"))).toBe(true);
-    expect(requests.some((r) => r.url.endsWith("/api/runs?limit=1&status=queued"))).toBe(true);
+    expect(requests.some((r) => r.url.endsWith("/api/runs?limit=2&status=queued"))).toBe(true);
     const legacy = await fetcher(`http://127.0.0.1:7400/api/runs/${run.id}/events?limit=6000`);
     const legacyEvents = await legacy.json();
     expect(legacyEvents).toHaveLength(5000);
@@ -85,9 +86,19 @@ test("proxy maps all six tools to REST and matches Factory results, including fi
       dependsOn: [run.id],
       status: "waiting",
     });
-    expect(resultValue<Run[]>(await call("list_runs", { status: "waiting" })).map((r) => r.id)).toEqual([
-      waiting.id,
-    ]);
+    expect(
+      resultValue<{ runs: Run[] }>(await call("list_runs", { status: "waiting" })).runs.map((r) => r.id),
+    ).toEqual([waiting.id]);
+    expect(
+      resultValue(await call("list_runs", { repo: run.repoSlug, status: "waiting", limit: 1 })),
+    ).toMatchObject({
+      runs: [{ id: waiting.id }],
+      hasMore: false,
+    });
+    expect(resultValue<unknown>(await call("list_runs", { repo: "missing/repo" }))).toEqual({
+      runs: [],
+      hasMore: false,
+    });
     expect((await call("create_run", { repo: f.repo, prompt: "bad", dependsOn: ["unknown"] })).isError).toBe(
       true,
     );
@@ -655,6 +666,7 @@ test.each(["direct", "proxy"] as const)(
     );
     try {
       for (const text of privacyTexts) {
+        const after = f.factory.store.readFeed({ from: "now" }).nextAfter;
         const run = await f.factory.createRun({ repo: f.repo, prompt: "work", title: `Title ${text}` });
         f.factory.store.updateRun(run.id, { status: "failed", error: `Failure ${text}` });
         f.factory.store.askQuestion(run.id, `Question ${text}`);
@@ -668,7 +680,7 @@ test.each(["direct", "proxy"] as const)(
         });
         f.factory.store.updateLandEntry(land.id, { state: "blocked", reason: `Reason ${text}` });
         const detail = resultValue<{ title: string; error: string; questions: { question: string }[] }>(
-          await conn.client.callTool({ name: "limitless_get_run", arguments: { id: run.id } }),
+          await conn.client.callTool({ name: "limitless_get_run", arguments: { id: run.id, full: true } }),
         );
         expect(detail).toMatchObject({
           title: "[withheld: private text]",
@@ -687,7 +699,7 @@ test.each(["direct", "proxy"] as const)(
           VALUES (1, 'review.round_delivered', ?, 'Safe round title', ?, ?, ?)`)
           .run(run.id, `Round ${text}`, JSON.stringify({ nested: [{ [text]: text }] }), run.id);
         const feed = resultValue<FeedPage>(
-          await conn.client.callTool({ name: "limitless_feed", arguments: { after: 0 } }),
+          await conn.client.callTool({ name: "limitless_feed", arguments: { after } }),
         );
         expect(feed.items.filter((item) => item.runId === run.id).map((item) => item.summary)).toEqual([
           "[withheld: private text]",
@@ -895,14 +907,18 @@ test("stdio MCP returns only public records across every tool and error", async 
     const reads = [
       [
         "limitless_get_run",
-        { id: run.id },
+        { id: run.id, full: true },
         {
           id: run.id,
           error: "public",
           events: expect.arrayContaining([expect.objectContaining({ message: "public event" })]),
         },
       ],
-      ["limitless_list_runs", { status: "failed", limit: 1 }, [{ id: run.id, error: "public" }]],
+      [
+        "limitless_list_runs",
+        { status: "failed", limit: 1 },
+        { runs: [{ id: run.id, error: "public" }], hasMore: false },
+      ],
       ["limitless_feed", { after: 0, wait: 0 }, { items: [{ runId: run.id }] }],
       ["limitless_status", { run: run.id }, { run: run.id, state: "Failed" }],
       ["limitless_providers", {}, [{ id: "fake" }]],

@@ -80,7 +80,7 @@ export function explainStatus(
   if (questions.some((q) => q.answer === null) || run.status === "waiting_input")
     return result(
       "Input needed",
-      "Read the open questions with limitless_get_run, then use limitless_answer_question.",
+      "Read the open questions with limitless_get_run (full:true), then use limitless_answer_question.",
     );
   if (run.status === "needs_human")
     return result(

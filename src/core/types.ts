@@ -522,9 +522,10 @@ export interface FeedItem {
   title: string;
   summary: string;
   data: Record<string, unknown>;
+  truncated?: boolean;
 }
 /** `nextAfter`: the last returned id, else the effective cursor. `pruned`: retention removed items after it. */
-export type FeedPage = { items: FeedItem[]; nextAfter: number; pruned: boolean };
+export type FeedPage = { items: FeedItem[]; nextAfter: number; pruned: boolean; hasMore?: boolean };
 export type FeedAck = { consumer: string; id: number };
 
 /** Process-local scheduler state; active includes executions waiting for input or capacity. */

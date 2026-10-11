@@ -1132,8 +1132,8 @@ HTTP paths below are relative to `http://127.0.0.1:7400`. POST JSON with
 
 | Verb | MCP tool and arguments | CLI | HTTP |
 |---|---|---|---|
-| Submit | `limitless_create_run` `{repo, prompt, title?, profile?, dependsOn?}` | `limitless run "<request>" --repo <owner>/<repo> --profile standard` | `POST /api/runs` `{repo, prompt, profile: "standard"}` |
-| Inbox | `limitless_feed` `{consumer, after?, wait?}` | `limitless feed --consumer <name> --wait 3600 --json` | `GET /api/feed?consumer=<name>&wait=60` |
+| Submit | `limitless_create_run` `{repo, prompt, consumer?, title?, profile?, dependsOn?}` | `limitless run "<request>" --repo <owner>/<repo> --profile standard` | `POST /api/runs` `{repo, prompt, profile: "standard"}` |
+| Inbox | `limitless_feed` `{consumer?, after?, from?: "now", repo?, ownRuns?, wait?}` | `limitless feed --consumer <name> --wait 3600 --json` | `GET /api/feed?consumer=<name>&wait=60` (also `after`, `from=now`, `repo`, `ownRuns=true`, `limit`) |
 | Acknowledge | `limitless_feed_ack` `{consumer, id}` | `limitless feed ack <id> --consumer <name>` | `POST /api/feed/ack` `{consumer, id}` |
 | Answer | `limitless_answer_question` `{id, answer}` | `limitless answer <run> "<answer>"` | `POST /api/runs/<id>/answer` `{answer}` |
 | Review | `limitless_review` `{run, verdict, reviewedSha, findings?}` | `limitless review <run> --changes <findings.json> --sha <head>` or `--approve --sha <head>` | `POST /api/runs/<id>/review` `{verdict, reviewedSha, findings?, reviewer?}` |
@@ -1149,10 +1149,34 @@ MCP. Digest is a read-only summary based on feed items and current run/land reco
 acknowledges, starts work, reviews or lands; use `limitless_feed` for omitted items and detail.
 
 Choose one **stable consumer name** per independent worker, and reuse it across sessions.
-The daemon stores its acknowledged cursor. Reading returns `{items, nextAfter, pruned}` in
+The daemon stores its acknowledged cursor. Reading returns `{items, nextAfter, pruned, hasMore}` in
 ascending ID order and never advances that cursor. `after` overrides it for an explicit read.
 Without either option, reading starts at zero. Ack is cumulative through `id`, never moves
 backwards, and affects subsequent reads for that consumer only. Sharing a name shares the inbox.
+
+Default HTTP and all MCP pages contain at most **100 items and 16 KiB of UTF-8 serialized JSON**,
+including the page fields. HTTP `limit` can request fewer items. For compatibility with older CLI
+digests, an explicit HTTP `limit` above 100 (up to 1000) returns up to that many items without a
+byte cap or item truncation: a short page is the final page. This exception lets an older CLI
+traverse the feed during a daemon upgrade. When `hasMore: true`, continue with `after: nextAfter`
+to read the next page without duplicates. In bounded pages, an individually oversized item keeps
+its `id`, `kind` and `runId`, drops its data and replaces its text, and carries `truncated: true`;
+inspect the referenced run for detail.
+Older daemons may omit `hasMore`.
+
+To skip existing history, read `{"consumer":"sandbox-agent","from":"now"}` through MCP, or
+`GET /api/feed?consumer=sandbox-agent&from=now`. This immediately returns no items and the highest
+issued feed ID as `nextAfter`, even if history was pruned. It does not acknowledge that ID.
+Continue with `after` set to the returned `nextAfter`; do not combine `from` and `after`.
+An `after` past the end clamps to the highest issued ID so the next read can receive new items.
+
+Use `repo` for an exact repository slug match (the run's `repoSlug`), and `ownRuns: true` with
+`consumer` to see only runs created through MCP with that same consumer name. Pass `consumer`
+on `limitless_create_run` as well as feed reads. Runs from other sources, older runs without
+recorded provenance, and items without a run are excluded. Combined filters must both match;
+pagination and `hasMore` count matching items only. Consumer names are caller-supplied labels,
+not access control. Acknowledgements remain cumulative across filters, so use separate consumer
+names for independently acknowledged inboxes.
 
 Ack `nextAfter` only after handling **every** item through it: answering a question, inspecting
 and recording a failure, reviewing a delivered PR, or recording the deliberate next action.
@@ -1174,12 +1198,12 @@ observed. No command here creates a real sandbox or enables auto-merge.
 1. Inspect `limitless_feed` with `{"consumer":"sandbox-agent"}` and handle its backlog. Submit:
 
    ```json
-   {"repo":"<owner>/limitless-sandbox","prompt":"Add a --json flag to export; preserve the default text output and test both modes.","profile":"standard"}
+   {"repo":"<owner>/limitless-sandbox","consumer":"sandbox-agent","prompt":"Add a --json flag to export; preserve the default text output and test both modes.","profile":"standard"}
    ```
 
    Pass this to `limitless_create_run`; save the returned `id` as `<run>`. CLI equivalent:
    `limitless run "Add a --json flag to export; preserve the default text output and test both modes." --repo <owner>/limitless-sandbox --profile standard`.
-2. On a question item, call `limitless_get_run` with `{"id":"<run>"}`. If it asks about the
+2. On a question item, call `limitless_get_run` with `{"id":"<run>","full":true}`. If it asks about the
    JSON shape, call `limitless_answer_question` with
    `{"id":"<run>","answer":"Use an object with a records array; retain record field names."}`.
    That answers all currently open questions. CLI: `limitless answer <run> "Use an object with a records array; retain record field names."`.
