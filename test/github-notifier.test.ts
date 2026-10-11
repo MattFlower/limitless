@@ -6,6 +6,7 @@ import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import {
   type GitHubPrClient,
+  type GitHubPrState,
   RECONCILE_REQUEST_CAP,
   reconcileMergedRuns,
   startGitHubNotifier,
@@ -410,12 +411,112 @@ for (const timing of ["already resolved", "lookup in flight"] as const) {
   });
 }
 
+test.each(["merged", "closed", "rejected"])(
+  "stop aborts and awaits a held %s lookup without writing",
+  async (outcome) => {
+    needsHuman(null);
+    const repo = store.getRepoBySlug("MattFlower/limitless");
+    if (!repo) throw new Error("missing repo");
+    const { id } = store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "verify PR",
+      source: "github",
+      sourceRef: { kind: "pull_request", repo: repo.slug, number: 39 },
+    });
+    store.updateRun(id, { status: "needs_human", prUrl });
+    const lookup = Promise.withResolvers<GitHubPrState>();
+    let signal: AbortSignal | undefined;
+    let calls = 0;
+    const stop = startGitHubNotifier(
+      store,
+      async () => {},
+      () => {},
+      observedPrs(store, async (_url, lookupSignal) => {
+        signal = lookupSignal;
+        calls++;
+        return lookup.promise;
+      }),
+    );
+    // Request another pass while the startup lookup is held open.
+    store.updateRun(id, { title: "pending check" });
+    const before = store.getRun(id);
+    const feed = store.readFeed();
+    let stopped = false;
+    const stopping = Promise.resolve(stop()).then(() => {
+      stopped = true;
+    });
+    try {
+      expect(signal?.aborted).toBe(true);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(stopped).toBe(false);
+      if (outcome === "rejected") lookup.reject(new Error("aborted"));
+      else
+        lookup.resolve({
+          url: prUrl,
+          state: outcome === "merged" ? "MERGED" : "CLOSED",
+          mergedAt: outcome === "merged" ? "2026-09-27T20:00:00Z" : null,
+          mergedBy: null,
+        });
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(calls).toBe(1);
+      expect(store.getRun(id)).toEqual(before);
+      expect(store.readFeed()).toEqual(feed);
+    } finally {
+      lookup.resolve({ url: prUrl, state: "OPEN", mergedAt: null, mergedBy: null });
+      await stopping;
+    }
+  },
+);
+
+test("stop aborts and awaits an in-flight gh comment", async () => {
+  needsHuman(null);
+  const repo = store.getRepoBySlug("MattFlower/limitless");
+  if (!repo) throw new Error("missing repo");
+  const comment = Promise.withResolvers<void>();
+  let signal: AbortSignal | undefined;
+  const stop = startGitHubNotifier(
+    store,
+    async (_args, commentSignal) => {
+      signal = commentSignal;
+      await comment.promise;
+    },
+    () => {},
+    async () => null,
+  );
+  store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "comment",
+    source: "github",
+    sourceRef: { kind: "issue", repo: "fake/repo", number: 1 },
+  });
+  let stopped = false;
+  const stopping = Promise.resolve(stop()).then(() => {
+    stopped = true;
+  });
+  try {
+    expect(signal?.aborted).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    comment.resolve();
+    await stopping;
+    expect(stopped).toBe(true);
+  } finally {
+    comment.resolve();
+    await stopping;
+  }
+});
+
 test("startup pass publishes a resolved run and stats count only open needs human", async () => {
   const id = needsHuman();
   needsHuman(null);
   const messages: string[] = [];
+  const resolved = Promise.withResolvers<void>();
   const unsubscribe = store.subscribe((msg) => {
-    if (msg.kind === "run") messages.push(msg.run.status);
+    if (msg.kind === "run") {
+      messages.push(msg.run.status);
+      if (msg.run.id === id && msg.run.status === "resolved") resolved.resolve();
+    }
   });
   const stop = startGitHubNotifier(
     store,
@@ -423,13 +524,13 @@ test("startup pass publishes a resolved run and stats count only open needs huma
     () => {},
     async () => ({ url: prUrl, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: null }),
   );
-  for (let i = 0; i < 20 && store.getRun(id)?.status !== "resolved"; i++) await Bun.sleep(5);
+  await resolved.promise;
+  await stop();
   expect(store.getRun(id)?.status).toBe("resolved");
   expect(messages).toContain("resolved");
   const totals = computeStats(store).totals;
   expect(totals.openNeedsHuman).toBe(1);
   expect(totals.openNeedsHumanRate).toBe(0.5);
-  stop();
   unsubscribe();
 });
 
@@ -1017,7 +1118,7 @@ test.each(["cancelled", "failed"] as const)(
       expect(client).not.toHaveBeenCalled();
       now++;
       await reconcile();
-      expect(client.mock.calls).toEqual([[prUrl]]);
+      expect(client.mock.calls.map((c) => c[0])).toEqual([prUrl]);
       expect(JSON.parse(h.store.githubPrData(prUrl) ?? "null")?.state).toBe("OPEN");
       expect(h.store.githubPrExpired(prUrl, now)).toBe(false);
       expect(h.store.getRun(run.id)).toMatchObject({ status, prClosedUnmerged: false });
@@ -1087,7 +1188,7 @@ test("polling probes a cancelled expired PR freshly within two capped passes und
       expect(new Set(calls).size).toBe(calls.length);
       if (i === 0) expect(calls).toContain(expired);
     }
-    expect(fresh.mock.calls).toEqual([[expired]]);
+    expect(fresh.mock.calls.map((c) => c[0])).toEqual([expired]);
     expect(h.store.githubPrExpired(expired, now)).toBe(false);
     expect(h.store.getRun(run.id)).toMatchObject({ status: "cancelled", prClosedUnmerged: false });
     expect(h.store.githubTracked(now).map((pr) => pr.url)).toContain(expired);

@@ -263,11 +263,11 @@ const backoff = (failures: number, base = 60_000) => Math.min(base * 2 ** failur
 /** Merge reconciliation's PR client while polling: the poller's observations for PRs it tracks, else `fallback`. */
 export function observedPrs(store: Store, fallback?: GitHubPrClient): GitHubPrClient {
   let tracked: Set<string> | undefined;
-  const client: GitHubPrClient = async (url) => {
+  const client: GitHubPrClient = async (url, signal) => {
     const pr = saved(store.githubPrData(url));
     tracked ??= new Set(store.githubTracked().map((p) => p.url));
     if (!fallback || pr?.state === "MERGED" || tracked.has(url)) return pr;
-    return fallback(url);
+    return fallback(url, signal);
   };
   client.beginPass = () => {
     tracked = undefined;
