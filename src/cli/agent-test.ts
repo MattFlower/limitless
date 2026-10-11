@@ -3,7 +3,7 @@ import { delimiter, dirname, resolve } from "node:path";
 import type { TestLane } from "../gates/agent-tests.ts";
 import type { SlottedCommands } from "../harness/slotted-config.ts";
 import { redactCredentials, registerCredential } from "../util/proc.ts";
-import { bounded, type DeployClock, deployClock } from "./deploy-wait.ts";
+import { bounded, DaemonTimeoutError, type DeployClock, deployClock } from "./deploy-wait.ts";
 import {
   type LeaseClient,
   type LeaseOptions,
@@ -119,21 +119,39 @@ export function realExecutable(name: string, path: string, wrapperDir: string): 
   return null;
 }
 
-export function wrapperLeaseClient(config: WrapperConfig, clock: DeployClock = deployClock): LeaseClient {
-  const http = localLeaseClient(config.port),
-    unix = localLeaseClient(config.port, config.unix);
+export function wrapperLeaseClient(
+  config: WrapperConfig,
+  clock: DeployClock = deployClock,
+  http = localLeaseClient(config.port),
+  unix = localLeaseClient(config.port, config.unix),
+): LeaseClient {
   let socket = false;
-  return async (body, signal) => {
+  return async (body, signal, onLateReply) => {
     const first = socket ? unix : http,
       second = socket ? http : unix;
+    let pending: ReturnType<LeaseClient> | undefined;
     try {
-      return await bounded(clock, (attempt) => first(body, AbortSignal.any([signal, attempt])), 1000);
+      return await bounded(
+        clock,
+        (attempt) => {
+          pending = first(body, AbortSignal.any([signal, attempt]));
+          return pending;
+        },
+        1000,
+      );
     } catch (error) {
       if (error instanceof LeaseRejected) throw error;
+      if (error instanceof DaemonTimeoutError) void pending?.then(onLateReply, () => {});
       signal.throwIfAborted();
-      const reply = await second(body, signal);
-      socket = !socket;
-      return reply;
+      try {
+        const reply = await second(body, signal);
+        socket = !socket;
+        return reply;
+      } catch (fallbackError) {
+        if (fallbackError instanceof LeaseRejected) throw fallbackError;
+        if (error instanceof DaemonTimeoutError) throw error;
+        throw fallbackError;
+      }
     }
   };
 }
@@ -170,8 +188,8 @@ export async function agentTestCommand(
           env.LIMITLESS_AGENT_TEST_LEASE = id;
         },
       },
-      client: (body, signal) =>
-        client({ ...body, token: config.token, lane, ...(body.name ? { waiter } : {}) }, signal),
+      client: (body, signal, onLateReply) =>
+        client({ ...body, token: config.token, lane, ...(body.name ? { waiter } : {}) }, signal, onLateReply),
       warn: (message) => console.warn(redactCredentials(message)),
     },
     true,

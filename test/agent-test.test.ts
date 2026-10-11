@@ -685,16 +685,18 @@ test("only failure of both transports permits the installed client's outage fall
   expect(existsSync(f.marker)).toBe(true);
 });
 
-test("a supported endpoint rejection never falls back, and socket failure rechecks HTTP", async () => {
+test("an answering endpoint rejection never falls back, and socket failure rechecks HTTP", async () => {
   const f = fixture();
   const fetcher = spyOn(globalThis, "fetch");
   cleanup.push(() => fetcher.mockRestore());
-  fetcher.mockResolvedValueOnce(new Response(null, { status: 403 }));
-  await expect(
-    wrapperLeaseClient(f.config)({ name: "bun test" }, new AbortController().signal),
-  ).rejects.toThrow("HTTP 403");
-  expect(fetcher).toHaveBeenCalledTimes(1);
-  fetcher.mockClear();
+  for (const status of [403, 404, 405, 501]) {
+    fetcher.mockResolvedValueOnce(new Response(null, { status }));
+    await expect(
+      wrapperLeaseClient(f.config)({ name: "bun test", token: f.config.token }, new AbortController().signal),
+    ).rejects.toThrow(`HTTP ${status}`);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    fetcher.mockClear();
+  }
   fetcher.mockRejectedValueOnce(new Error("HTTP offline"));
   fetcher.mockResolvedValueOnce(Response.json({ id: "socket", acquired: true }));
   fetcher.mockRejectedValueOnce(new Error("socket offline"));
@@ -726,3 +728,60 @@ test("an HTTP transport timeout still tries the reachable invocation socket", as
   ]);
   expect(time.pending).toBe(0);
 });
+
+test.each(["timeout", "late busy", "silent lease", "late lease", "offline"])(
+  "transport failures respect the agent wait budget (%s)",
+  async (scenario) => {
+    const f = fixture(),
+      { time, clock } = fakeClock();
+    clock.sleep = (ms) => new Promise((resolve) => clock.timeout(resolve, ms));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    cleanup.push(() => warn.mockRestore());
+    let requests = 0,
+      replies = 0;
+    const http: LeaseClient = async () => {
+      requests++;
+      if (scenario === "offline") throw new Error("ECONNREFUSED HTTP");
+      if (scenario === "timeout" || scenario === "silent lease") return new Promise(() => {});
+      return new Promise((resolve) => {
+        clock.timeout(() => {
+          replies++;
+          resolve({ id: "", acquired: false, busy: true });
+        }, 2500);
+      });
+    };
+    const unix: LeaseClient = async () => {
+      throw new Error("ECONNREFUSED socket");
+    };
+    const maxWaitMs = scenario === "timeout" || scenario === "offline" ? 5000 : 60_000;
+    const start = clock.now();
+    const work = agentTestCommand(
+      f.config,
+      ["bun", "test"],
+      scenario.endsWith("lease") ? http : wrapperLeaseClient(f.config, clock, http, unix),
+      { clock, maxWaitMs },
+    );
+    if (scenario === "offline") {
+      expect(await work).toBe(3);
+      expect(requests).toBe(1);
+      expect(clock.now()).toBe(start);
+      expect(readFileSync(f.marker, "utf8")).toBe("test\n");
+      expect(warn.mock.calls.flat().join()).toContain("unavailable");
+    } else {
+      await time.flush();
+      for (let elapsed = 0; elapsed < maxWaitMs; elapsed += 250) {
+        expect(existsSync(f.marker)).toBe(false);
+        await time.advance(250);
+      }
+      expect(await work).toBe(75);
+      expect(clock.now() - start).toBe(maxWaitMs);
+      expect(requests).toBeGreaterThan(1);
+      expect(existsSync(f.marker)).toBe(false);
+      expect(warn.mock.calls.flat().join()).toContain(`waited ${maxWaitMs}ms`);
+      expect(warn.mock.calls.flat().join()).not.toContain("unavailable");
+      if (scenario.startsWith("late")) expect(replies).toBeGreaterThan(1);
+      await time.advance(2500);
+    }
+    expect(time.pending).toBe(0);
+  },
+);

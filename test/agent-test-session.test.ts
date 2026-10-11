@@ -101,7 +101,7 @@ test("heartbeats cannot extend the total duration cap and capped leases cannot r
   expect(f.time.pending).toBe(0);
 });
 
-test("heartbeat recovery keeps the acquisition time, cannot repeat, and cannot change lanes", async () => {
+test("delayed recovery retries reuse the lease, keep its duration cap and cannot change lanes", async () => {
   const f = rig(),
     lease = await f.request(f.command);
   await f.time.advance(30_000);
@@ -109,13 +109,42 @@ test("heartbeat recovery keeps the acquisition time, cannot repeat, and cannot c
   await expect(
     f.request({ name: "bun test", lane: "gate", running: true, recover: lease.id }),
   ).rejects.toThrow();
-  const recovered = await f.request({ ...f.command, running: true, recover: lease.id });
+  const delayed = Promise.withResolvers<Awaited<ReturnType<typeof f.request>>>();
+  let recovered: Awaited<ReturnType<typeof f.request>> | undefined;
+  const first = f.request({ ...f.command, running: true, recover: lease.id }).then((reply) => {
+    recovered = reply;
+    return delayed.promise;
+  });
+  await f.time.flush();
+  // The client times out before receiving the first recovery response.
+  await f.time.advance(2000);
+  if (!recovered) throw new Error("missing recovery response");
   expect(recovered.acquired).toBe(true);
-  await expect(f.request({ ...f.command, running: true, recover: lease.id })).rejects.toThrow();
+  const retries = await Promise.all(
+    Array.from({ length: 10 }, () => f.request({ ...f.command, running: true, recover: lease.id })),
+  );
+  expect(retries.every((reply) => reply.id === recovered?.id && reply.acquired)).toBe(true);
+  delayed.resolve(recovered);
+  expect((await first).id).toBe(recovered.id);
+  expect(f.slots.small.snapshot().occupied).toBe(1);
+  const competitor = new AgentTestSession(() => {}, {
+    slots: f.slots,
+    now: f.time.now,
+    timer: f.time.timer.set,
+    clear: f.time.timer.clear,
+  });
+  cleanup.push(() => competitor.close());
+  expect(await competitor.request({ token: competitor.token, ...f.command, immediate: true })).toMatchObject({
+    acquired: false,
+  });
+  await expect(
+    f.request({ name: "bun test", lane: "gate", running: true, recover: lease.id }),
+  ).rejects.toThrow();
   await f.time.advance(20_000);
   await f.request({ id: recovered.id });
-  await f.time.advance(10_000);
+  await f.time.advance(8000);
   expect(await f.request({ id: recovered.id })).toMatchObject({ capped: true, acquired: false });
+  await expect(f.request({ ...f.command, running: true, recover: lease.id })).rejects.toThrow("cap");
   expect(f.slots.small.snapshot().occupied).toBe(0);
   expect(f.events.filter((event) => event.phase === "capped")).toHaveLength(1);
 });

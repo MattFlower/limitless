@@ -21,6 +21,7 @@ interface SessionOptions {
 }
 interface Lease {
   id?: string;
+  recoveredId?: Promise<string>;
   lane: TestLane;
   command: string;
   started?: number;
@@ -78,6 +79,25 @@ export class AgentTestSession {
       this.end(lease, "capped");
   }
 
+  private renew(id: string, release = false) {
+    const lease = this.leases.get(id);
+    if (!lease) throw new Error("lease does not belong to this invocation");
+    this.checkCap(lease);
+    if (release) this.end(lease, "released");
+    const acquired =
+      lease.status === "queued" || lease.status === "acquired"
+        ? this.slots[lease.lane].heartbeat(id)
+        : undefined;
+    return {
+      id,
+      acquired: acquired ?? false,
+      expired: acquired === undefined,
+      capped: lease.status === "capped",
+      capMs: this.caps[lease.lane],
+      holder: this.slots[lease.lane].snapshot().holders.join(", "),
+    };
+  }
+
   async request(body: Record<string, unknown>) {
     if (this.closed || body.token !== this.token) throw new Error("invalid agent-test capability");
     if (body.reuse !== undefined) {
@@ -95,22 +115,7 @@ export class AgentTestSession {
     if (body.id !== undefined) {
       if (typeof body.id !== "string" || (body.release !== undefined && typeof body.release !== "boolean"))
         throw new Error("invalid agent-test lease");
-      const lease = this.leases.get(body.id);
-      if (!lease) throw new Error("lease does not belong to this invocation");
-      this.checkCap(lease);
-      if (body.release === true) this.end(lease, "released");
-      const acquired =
-        lease.status === "queued" || lease.status === "acquired"
-          ? this.slots[lease.lane].heartbeat(body.id)
-          : undefined;
-      return {
-        id: body.id,
-        acquired: acquired ?? false,
-        expired: acquired === undefined,
-        capped: lease.status === "capped",
-        capMs: this.caps[lease.lane],
-        holder: this.slots[lease.lane].snapshot().holders.join(", "),
-      };
+      return this.renew(body.id, body.release === true);
     }
     if (
       typeof body.name !== "string" ||
@@ -132,13 +137,18 @@ export class AgentTestSession {
       if (
         !previous ||
         previous.lane !== lane ||
-        previous.status !== "heartbeat" ||
+        (previous.status !== "heartbeat" && previous.status !== "recovered") ||
         previous.started === undefined
       )
         throw new Error("running recovery requires an earlier heartbeat-expired lease of this invocation");
       if (this.now() - previous.started >= this.caps[lane]) {
         this.end(previous, "capped");
         throw new Error(`agent-test ${previous.command} reached its ${this.caps[lane]}ms duration cap`);
+      }
+      if (previous.recoveredId) {
+        const id = await previous.recoveredId;
+        if (this.closed) throw new Error("invalid agent-test capability");
+        return this.renew(id);
       }
     }
     const waiter = typeof body.waiter === "string" ? body.waiter : undefined;
@@ -164,7 +174,7 @@ export class AgentTestSession {
       if (previous.capTimer !== undefined) this.clear(previous.capTimer);
     }
     let waited = waiter ? this.waits.get(waiter) : undefined;
-    const id = await this.slots[lane].lease(
+    const registration = this.slots[lane].lease(
       command,
       body.immediate === true,
       (fn, ms) =>
@@ -193,6 +203,8 @@ export class AgentTestSession {
         },
       },
     );
+    if (previous) previous.recoveredId = registration;
+    const id = await registration;
     lease.id = id;
     this.leases.set(id, lease);
     if (this.closed || (lease.status !== "queued" && lease.status !== "acquired")) {

@@ -15,7 +15,12 @@ type Reply = {
   capMs?: number;
   holder?: string;
 };
-export type LeaseClient = (body: Record<string, unknown>, signal: AbortSignal) => Promise<Reply>;
+export type LeaseClient = (
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+  /** A timed-out transport can still return a lease that must be adopted or released. */
+  onLateReply?: (reply: Reply) => void,
+) => Promise<Reply>;
 export class LeaseRejected extends Error {}
 class LeaseWaitExhausted extends LeaseRejected {}
 export const localLeaseClient =
@@ -28,7 +33,8 @@ export const localLeaseClient =
       signal,
       ...(unix ? { unix } : {}),
     });
-    if ([404, 405, 501].includes(response.status)) throw new Error("gate-slot endpoint unsupported");
+    if ([404, 405, 501].includes(response.status) && body.token === undefined)
+      throw new Error("gate-slot endpoint unsupported");
     if (!response.ok) {
       const detail: unknown =
         body.token === undefined ? undefined : await response.json().catch(() => undefined);
@@ -84,24 +90,53 @@ export async function withGateLease<T>(
     (opts.warn ?? console.warn)(`warning: gate-slot coordination unavailable: ${e}`);
   let id: string | undefined,
     stopped = false,
-    cancel = () => {};
+    cancel = () => {},
+    lastReply = clock.now();
+  const beat = (ms = 10_000) => {
+    cancel();
+    cancel = clock.timeout(() => {
+      const leaseId = id;
+      void request({ id: leaseId })
+        .then(async (r) => {
+          if (r.capped && opts.agentTest) {
+            (opts.warn ?? console.warn)(
+              `warning: agent-test ${name} reached its ${r.capMs ?? "unknown"}ms duration cap (${opts.agentTest.lane} lane); letting the command finish`,
+            );
+            return;
+          }
+          if (r.expired && !stopped && id === leaseId) {
+            await request({ name, running: true, ...(opts.agentTest ? { recover: leaseId } : {}) });
+          }
+          if (!stopped) beat();
+        })
+        .catch((e) => {
+          warn(e);
+          if (!stopped && !(opts.agentTest && e instanceof LeaseRejected)) beat(1000);
+        });
+    }, ms);
+  };
   const request = (body: Record<string, unknown>, ms = 2000) =>
     bounded(
       clock,
       async (signal) => {
-        const previous = id,
-          result = await client(body, signal);
-        // A late recovery still belongs to running work unless another reply recovered it first.
-        if (body.running && !stopped && id === previous && !result.busy) {
-          id = result.id;
-          opts.agentTest?.onLease(result.id);
-        } else if (
-          body.name &&
-          result.id &&
-          (signal.aborted || body.running) &&
-          (stopped || result.id !== id)
-        )
-          void request({ id: result.id, release: true }).catch(warn);
+        const previous = id;
+        const observe = (result: Reply, late = false) => {
+          lastReply = clock.now();
+          // A late recovery still belongs to running work unless another reply recovered it first.
+          if (body.running && !stopped && id === previous && result.id && !result.busy && !result.capped) {
+            id = result.id;
+            opts.agentTest?.onLease(result.id);
+            beat();
+          } else if (
+            body.name &&
+            result.id &&
+            (late || signal.aborted || body.running) &&
+            (stopped || result.id !== id)
+          )
+            void request({ id: result.id, release: true }).catch(warn);
+        };
+        const result = await client(body, signal, (result) => observe(result, true));
+        observe(result);
         return result;
       },
       ms,
@@ -122,8 +157,7 @@ export async function withGateLease<T>(
           state = parent;
         }
       }
-      let lastReply = clock.now(),
-        first = true,
+      let first = true,
         holder: string | undefined;
       const pastDeadline = () =>
         opts.agentTest
@@ -146,10 +180,13 @@ export async function withGateLease<T>(
           );
           id = state.busy ? undefined : state.id;
           holder = state.holder ?? holder;
-          lastReply = clock.now();
         } catch (e) {
           if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
-          if ((first && !(e instanceof DaemonTimeoutError)) || clock.now() - lastReply > GATE_LEASE_EXPIRY_MS)
+          // Agent commands wait through stalls; silence alone cannot justify running unslotted.
+          if (
+            (first && !(e instanceof DaemonTimeoutError)) ||
+            (!opts.agentTest && clock.now() - lastReply > GATE_LEASE_EXPIRY_MS)
+          )
             throw new Error(`gate-slot daemon is unreachable: ${e}`);
           if (clock.now() >= deadline) throw pastDeadline();
         }
@@ -161,28 +198,6 @@ export async function withGateLease<T>(
       }
       if (!reused && maxWait && clock.now() >= deadline) throw pastDeadline();
       if (id) opts.agentTest?.onLease(id);
-      const beat = (ms = 10_000) => {
-        cancel = clock.timeout(() => {
-          const leaseId = id;
-          void request({ id: leaseId })
-            .then(async (r) => {
-              if (r.capped && opts.agentTest) {
-                (opts.warn ?? console.warn)(
-                  `warning: agent-test ${name} reached its ${r.capMs ?? "unknown"}ms duration cap (${opts.agentTest.lane} lane); letting the command finish`,
-                );
-                return;
-              }
-              if (r.expired && !stopped && id === leaseId) {
-                await request({ name, running: true, ...(opts.agentTest ? { recover: leaseId } : {}) });
-              }
-              if (!stopped) beat();
-            })
-            .catch((e) => {
-              warn(e);
-              if (!stopped && !(opts.agentTest && e instanceof LeaseRejected)) beat(1000);
-            });
-        }, ms);
-      };
       if (!reused) beat();
     } catch (e) {
       await release();
