@@ -966,6 +966,22 @@ test("clients omit another daemon's token and redact authentication errors and d
     );
     await expect(localDeployClient(port).admin("drain", signal)).rejects.toThrow(`HTTP 401: ${safeMessage}`);
     await expect(httpBackend(`http://127.0.0.1:${port}`).detail("test")).rejects.toThrow(safeMessage);
+    const escaped = JSON.stringify({ error: message }).replace(
+      /[0-9a-f]/g,
+      (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    const escapedError = await httpBackend(
+      `http://127.0.0.1:${port}`,
+      async () => new Response(escaped, { status: 401 }),
+    )
+      .detail("test")
+      .then(
+        () => "",
+        (e: Error) => e.message,
+      );
+    expect(escapedError).toContain(safeMessage);
+    expect(escapedError).not.toContain(token);
+    expect(escapedError).not.toContain(escaped.slice(escaped.indexOf(":") + 2, -2));
     const cli = await sh(
       [
         process.execPath,

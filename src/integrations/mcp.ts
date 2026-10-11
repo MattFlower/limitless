@@ -22,7 +22,7 @@ import {
 } from "../feed.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
-import { redactCredentials } from "../util/proc.ts";
+import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import { ChangeQuerySchema, getChange } from "./mcp-change.ts";
 import { explainStatus, statusDetailSchema, statusLandsSchema } from "./mcp-status.ts";
 
@@ -234,7 +234,16 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       );
     }
     const text = await response.text();
-    if (!response.ok) throw new Error(redactCredentials(`Daemon HTTP ${response.status}: ${text}`));
+    if (!response.ok) {
+      // Decode JSON before redacting so \u-escaped credentials cannot slip past literal matching.
+      let detail = redactCredentials(text);
+      try {
+        detail = JSON.stringify(redactCredentialData(JSON.parse(text)));
+      } catch {
+        // not json
+      }
+      throw new Error(`Daemon HTTP ${response.status}: ${detail}`);
+    }
     try {
       return JSON.parse(text);
     } catch {
