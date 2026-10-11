@@ -171,16 +171,19 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return error("forbidden", 403);
       if (!tokenExempt(path)) {
         const header = req.headers.get("authorization");
+        const hasBearer = /^Bearer(?:\s|$)/i.test(header ?? "");
         const bearer = matchesApiToken(header, extras.apiToken);
         const capability = path === "/api/admin/gate-slot" && extras.gateSlotCapability?.(req) === true;
         const session = auth.session(req.headers);
         if (
-          (header !== null && !bearer && !capability) ||
+          (hasBearer && !bearer && !capability) ||
           (protectedRequest(req, path) &&
             !bearer &&
             !capability &&
             !session &&
-            !(!factory.cfg.requireApiToken && access === "loopback" && header === null))
+            // Proxied UI requests retain their existing proxy/session checks below.
+            access !== "proxy" &&
+            !(!factory.cfg.requireApiToken && access === "loopback" && !hasBearer))
         )
           return error(
             "API token required: this daemon requires the local API token or a signed-in session; update the limitless CLI",

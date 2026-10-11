@@ -258,7 +258,6 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
     const routes = createHttpRoutes(f.factory, {
       ui,
       routes: { "/mcp": mcp, "/webhooks/github": githubWebhook(f.factory, async () => ["140.82.112.0/20"]) },
-      apiToken: "proxytesttoken",
     });
     const call = (
       path: string,
@@ -337,12 +336,7 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
             ).toBe(403);
     expect(f.factory.scheduler.draining).toBe(false);
     expect(mcp).not.toHaveBeenCalled();
-    const valid = {
-      host: "limitless.example.test",
-      origin,
-      "content-type": "application/json",
-      authorization: "Bearer proxytesttoken",
-    };
+    const valid = { host: "limitless.example.test", origin, "content-type": "application/json" };
     const before = f.factory.store.listRuns().length;
     for (const headers of [
       { ...valid, host: "foreign.example" },
@@ -353,11 +347,7 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
       { ...valid, origin: "" },
       { ...valid, origin: "https://evil.example" },
       { origin, "content-type": "application/json", "x-forwarded-host": "limitless.example.test" },
-      {
-        host: "limitless.example.test",
-        "content-type": "application/json",
-        authorization: valid.authorization,
-      },
+      { host: "limitless.example.test", "content-type": "application/json" },
     ] as Record<string, string>[])
       expect(
         (await call("/api/runs", proxy, headers, "POST", JSON.stringify({ repo: f.repo, prompt: "blocked" })))
@@ -371,6 +361,32 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
       (await call("/api/runs", proxy, valid, "POST", JSON.stringify({ repo: f.repo, prompt: "allowed" })))
         .status,
     ).toBe(201);
+    for (const enforcement of [false, true]) {
+      cfg.requireApiToken = enforcement;
+      for (const headers of [valid, { ...valid, authorization: "Basic dXNlcjpwYXNz" }]) {
+        expect((await call("/api/runs", proxy, headers)).status).toBe(200);
+        expect(
+          (await call("/api/runs", proxy, headers, "POST", JSON.stringify({ repo: f.repo, prompt: "proxy" })))
+            .status,
+        ).toBe(201);
+      }
+      for (const method of ["GET", "POST"])
+        expect(
+          (await call("/api/runs", proxy, { ...valid, authorization: "Bearer wrong" }, method)).status,
+        ).toBe(401);
+      cfg.auth = "required";
+      const unsigned = await call(
+        "/api/runs",
+        proxy,
+        { ...valid, authorization: "Basic dXNlcjpwYXNz" },
+        "POST",
+        "{}",
+      );
+      expect(unsigned.status).toBe(401);
+      expect(await unsigned.json()).toEqual({ error: "sign-in required" });
+      cfg.auth = "proxy";
+    }
+    cfg.requireApiToken = false;
     cfg.trustedProxies = [];
     cfg.publicOrigins = [];
     for (const headers of [

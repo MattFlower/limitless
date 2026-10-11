@@ -94,17 +94,18 @@ test("token and loopback sessions authorize; bad credentials never fall back", a
       f.factory.cfg.requireApiToken = enforcement;
       for (const headers of [credential(), { cookie }])
         expect((await post("/api/admin/drain", headers)).status).toBe(200);
-      for (const authorization of [
-        "Bearer wrong",
-        "Bearer",
-        "Bearer ",
-        "Basic abc",
-        `Bearer ${token} extra`,
-      ]) {
+      for (const authorization of ["Bearer wrong", "Bearer", "Bearer ", `Bearer ${token} extra`]) {
         expect((await post("/api/admin/drain", { authorization, cookie })).status).toBe(401);
         expect((await fetch(`${base}/api/health`, { headers: { authorization } })).status).toBe(401);
       }
       expect((await post("/api/admin/drain")).status).toBe(enforcement ? 401 : 200);
+      expect((await post("/api/admin/drain", { authorization: "Basic abc" })).status).toBe(
+        enforcement ? 401 : 200,
+      );
+      expect((await post("/api/admin/drain", { authorization: "Basic abc", cookie })).status).toBe(200);
+      expect((await fetch(`${base}/api/health`, { headers: { authorization: "Basic abc" } })).status).toBe(
+        200,
+      );
     }
     expect((await post("/api/admin/drain", { ...credential(), origin: "https://evil.example" })).status).toBe(
       403,
