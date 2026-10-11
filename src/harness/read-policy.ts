@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { redactCredentials } from "../util/proc.ts";
 
@@ -43,15 +43,29 @@ export function configureReadPolicy(raw: unknown, configDir: string): void {
 /** Resolve existing ancestors too: an absent child of a symlink still aliases the target. */
 export function policySpellings(paths: string[]): string[] {
   const canonical = (path: string): string => {
+    let current = isAbsolute(path) ? sep : realpathSync(process.cwd());
     try {
-      return realpathSync(path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || lstatSync(path, { throwIfNoEntry: false }))
-        throw new ConfinementError(`Cannot resolve read policy path ${path}`);
-      return join(canonical(dirname(path)), relative(dirname(path), path));
+      // Resolve each symlink before a later '..'; realpathSync normalizes its input in Bun.
+      for (const component of path.split(sep)) {
+        if (!component || component === ".") continue;
+        const next = join(current, component);
+        try {
+          current = realpathSync(next);
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code !== "ENOENT" ||
+            lstatSync(next, { throwIfNoEntry: false })
+          )
+            throw error;
+          current = next;
+        }
+      }
+      return current;
+    } catch {
+      throw new ConfinementError(`Cannot resolve read policy path ${path}`);
     }
   };
-  return [...new Set(paths.flatMap((p) => [resolve(p), canonical(resolve(p))]))];
+  return [...new Set(paths.flatMap((p) => [resolve(p), canonical(p)]))];
 }
 
 export function resolvedHome(): string {
@@ -69,7 +83,7 @@ export function resolvedHome(): string {
 export function homeReadPolicy(allowed: string[], gate = false, extra: string[] = []) {
   const options = readPolicyScope.getStore() ?? configured;
   const home = resolvedHome();
-  const expand = (p: string) => (p === "~" ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p);
+  const expand = (p: string) => (p === "~" ? home : p.startsWith("~/") ? `${home}/${p.slice(2)}` : p);
   const credentials = policySpellings([
     ...[
       ".ssh",

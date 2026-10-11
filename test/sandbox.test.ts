@@ -88,7 +88,14 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
 });
 
 test("gate refuses unresolved home and credential overlaps before executing or copying configuration", async () => {
-  for (const options of [{ home: join(root, "missing") }, { home: root, toolchains: [root] }]) {
+  mkdirSync(join(root, ".ssh/child"), { recursive: true });
+  symlinkSync(join(root, ".ssh/child"), join(root, "alias"));
+  for (const options of [
+    { home: join(root, "missing") },
+    { home: root, toolchains: [root] },
+    { home: root, toolchains: [`${root}/alias/..`] },
+    { home: root, toolchains: ["~/alias/../missing"] },
+  ]) {
     let started = false;
     await readPolicyScope.run(options, async () => {
       await expect(
@@ -104,7 +111,6 @@ test("gate refuses unresolved home and credential overlaps before executing or c
     });
     expect(started).toBe(false);
   }
-  mkdirSync(join(root, ".ssh"));
   symlinkSync(join(root, ".ssh"), join(root, "toolchain-link"));
   readPolicyScope.run({ home: root, toolchains: [join(root, "toolchain-link", "absent")] }, () => {
     expect(() => homeReadPolicy([work], true)).toThrow("denied credential path");

@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
@@ -24,7 +24,12 @@ import {
   type ReaderProbeOptions,
   runCodex,
 } from "../src/harness/codex.ts";
-import { configureReadPolicy, homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
+import {
+  configureReadPolicy,
+  homeReadPolicy,
+  policySpellings,
+  readPolicyScope,
+} from "../src/harness/read-policy.ts";
 import { ConfinementError, confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
 import {
   createScratch,
@@ -1513,12 +1518,43 @@ test("factory sandbox configuration validates and applies optional denial and to
   }
 });
 
+test("read policy resolves symlinks before parent components, including missing descendants and tilde paths", () => {
+  const { root, cwd, scratchDir, spec } = editFixture();
+  const home = join(root, "home");
+  mkdirSync(join(home, "a"), { recursive: true });
+  mkdirSync(join(home, "b/child"), { recursive: true });
+  symlinkSync(join(home, "b/child"), join(home, "a/link"));
+  writeFileSync(join(home, "b/secret"), "stand-in");
+  const spelling = `${home}/a/link/../secret`;
+  expect(readFileSync(spelling, "utf8")).toBe("stand-in");
+  for (const suffix of ["secret", "missing/secret"])
+    for (const path of [
+      `${home}/a/link/../${suffix}`,
+      `${relative(process.cwd(), home)}/a/link/../${suffix}`,
+    ])
+      expect(policySpellings([path])).toContain(join(home, "b", suffix));
+  readPolicyScope.run({ home, denyRead: ["~/a/link/../secret", "~/a/link/../missing/secret"] }, () => {
+    for (const file of [join(home, "b/secret"), join(home, "b/missing/secret")]) {
+      expect(homeReadPolicy([cwd, scratchDir]).denyRead).toContain(file);
+      expect(codexAccess(buildCodexArgs(spec), file)).toBe("none");
+      expect(seatbeltProfile(writeRoots(cwd, scratchDir))).toContain(`(subpath "${file}")`);
+    }
+  });
+});
+
 test("editors refuse unresolved homes and symlinked credential overlaps before CLI launch", async () => {
   const { root, spec, cwd } = editFixture();
   const home = join(root, "home");
   mkdirSync(home);
   symlinkSync(cwd, join(home, ".ssh"));
-  for (const options of [{ home: join(root, "absent") }, { home }]) {
+  mkdirSync(join(cwd, "child"));
+  symlinkSync(join(cwd, "child"), join(home, "alias"));
+  for (const options of [
+    { home: join(root, "absent") },
+    { home },
+    { home: root, denyRead: [`${home}/alias/..`] },
+    { home: root, denyRead: ["~/home/alias/.."] },
+  ]) {
     await readPolicyScope.run(options, async () => {
       for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")])
         expect(() => build(spec)).toThrow(ConfinementError);
