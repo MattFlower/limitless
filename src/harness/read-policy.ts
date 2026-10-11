@@ -109,7 +109,15 @@ function policyPath(path: string, denied: boolean, fs: PolicyFilesystem, optiona
 }
 
 export function policySpellings(paths: string[], denied = false, fs = policyFilesystem): string[] {
-  return [...new Set(paths.flatMap((p) => policyPath(p, denied, fs).spellings))];
+  const spellings = paths.flatMap((p) => policyPath(p, denied, fs).spellings);
+  // Seatbelt does not equate the APFS Data-volume firmlink spelling when resolution is blocked.
+  return [
+    ...new Set(
+      spellings.flatMap((p) =>
+        denied && p.startsWith("/System/Volumes/Data/") ? [p, p.slice("/System/Volumes/Data".length)] : [p],
+      ),
+    ),
+  ];
 }
 
 export function resolvedHome(fs = policyFilesystem): string {

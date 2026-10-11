@@ -177,6 +177,70 @@ function blockedHomeFilesystem(code: string): PolicyFilesystem {
   };
 }
 
+function blockedFirmlinkFilesystem(): PolicyFilesystem {
+  const data = "/System/Volumes/Data";
+  return {
+    lstatSync(path, options) {
+      return lstatSync(
+        path === data ? "/" : path.startsWith(`${data}/`) ? path.slice(data.length) : path,
+        options,
+      );
+    },
+    realpathSync(path) {
+      if (path === data || path.startsWith(`${data}/`) || path.startsWith(`${home}/`))
+        throw Object.assign(new Error("blocked realpath"), { code: "EPERM" });
+      return realpathSync(path);
+    },
+  };
+}
+
+test("Data-volume firmlink deny spellings reject a hidden optional credential allowance", () => {
+  const tools = join(home, "tools");
+  mkdirSync(tools);
+  const credential = join(tools, "credential-stand-in");
+  const alias = `/System/Volumes/Data${credential}`;
+  const fs = blockedFirmlinkFilesystem();
+  expect(policySpellings([alias], true, fs)).toEqual([alias, credential]);
+  expect(policySpellings([alias], false, fs)).toEqual([alias]);
+  readPolicyScope.run({ home, environment: { NETRC: alias }, toolchains: [tools] }, () => {
+    expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+      `Read allowance ${tools} overlaps denied credential path ${credential}`,
+    );
+  });
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `Data-volume firmlink credential published after profiling stays unreadable ${seatbeltSkip ?? ""}`,
+  async () => {
+    const tools = join(home, "tools");
+    mkdirSync(tools);
+    const credential = join(tools, "credential-stand-in");
+    const options = { home, environment: { NETRC: `/System/Volumes/Data${credential}` } };
+    const fs = blockedFirmlinkFilesystem();
+    let policy: ReturnType<typeof homeReadPolicy>;
+    try {
+      policy = readPolicyScope.run({ ...options, toolchains: [tools] }, () =>
+        homeReadPolicy([work], true, [], fs),
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfinementError);
+      expect(String(error)).toContain(
+        `Read allowance ${tools} overlaps denied credential path ${credential}`,
+      );
+      policy = readPolicyScope.run(options, () => homeReadPolicy([work], true, [], fs));
+    }
+    const profile = seatbeltProfile({ write: [work], protect: [], ...policy });
+    writeFileSync(credential, "stand-in");
+    const read = (file: string) =>
+      sh(["/usr/bin/sandbox-exec", "-p", profile, "/bin/cat", file], { cwd: work, allowFail: true });
+    const allowed = await read(join(work, "a.ts"));
+    expect(allowed.exitCode, allowed.stderr).toBe(0);
+    const denied = await read(credential);
+    expect(denied.exitCode, denied.stderr).toBe(1);
+    expect(denied.stderr).toMatch(/Operation not permitted|Permission denied/);
+  },
+);
+
 test.each([undefined, "EPERM", "EACCES"])(
   "optional toolchain candidates absent or hidden under denied home are omitted: %s",
   (code) => {
