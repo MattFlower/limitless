@@ -72,6 +72,42 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 const common = () => join(cache, ".git");
 const privateDir = () => join(common(), "worktrees", "work");
 
+function bunReadDenialFixture(denied: string[], reader = "node:fs") {
+  return `
+    import {test, expect} from "bun:test";
+    import {readFileSync} from ${JSON.stringify(reader)};
+    test("fixture works and credentials stay denied", () => {
+      expect(1 + 1).toBe(2);
+      for (const file of ${JSON.stringify(denied)})
+        expect(() => readFileSync(file)).toThrow(/Operation not permitted|Permission denied/i);
+    });
+  `;
+}
+
+test("Bun read-denial fixture accepts permission errors and rejects successful reads", async () => {
+  const file = join(home, "stand-in");
+  writeFileSync(file, "stand-in");
+  for (const message of [
+    "Operation not permitted",
+    "operation not permitted",
+    "Permission denied",
+    "permission denied",
+    undefined,
+  ]) {
+    writeFileSync(
+      join(work, "denied-reader.ts"),
+      `export function readFileSync() { throw new Error(${JSON.stringify(message)}); }`,
+    );
+    writeFileSync(
+      join(work, "smoke.test.ts"),
+      bunReadDenialFixture([file], message ? "./denied-reader.ts" : "node:fs"),
+    );
+    const result = await sh([process.execPath, "test", "smoke.test.ts"], { cwd: work, allowFail: true });
+    expect(result.exitCode, result.stderr).toBe(message ? 0 : 1);
+    expect(result.stderr).toContain(message ? "1 pass" : "1 fail");
+  }
+});
+
 test("gate profile denies home and allows only run, recorded Git and trusted toolchain paths", async () => {
   const scratch = join(root, "scratch");
   mkdirSync(scratch);
@@ -291,18 +327,7 @@ test.skipIf(seatbeltSkip !== null)(
       denied.push(file);
     }
     writeFileSync(join(gateWork, "package.json"), '{"type":"module"}');
-    writeFileSync(
-      join(gateWork, "smoke.test.ts"),
-      `
-      import {test, expect} from "bun:test";
-      import {readFileSync} from "node:fs";
-      test("fixture works and credentials stay denied", () => {
-        expect(1 + 1).toBe(2);
-        for (const file of ${JSON.stringify(denied.slice(0, 2))})
-          expect(() => readFileSync(file)).toThrow(/Operation not permitted|Permission denied/i);
-      });
-    `,
-    );
+    writeFileSync(join(gateWork, "smoke.test.ts"), bunReadDenialFixture(denied.slice(0, 2)));
     await readPolicyScope.run(
       { home: root, environment: { BUN_INSTALL: bunHome, CARGO_HOME: cargoHome } },
       async () => {
