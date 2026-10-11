@@ -194,6 +194,19 @@ function blockedFirmlinkFilesystem(): PolicyFilesystem {
   };
 }
 
+test("exact Data-volume root deny refuses every read allowance", () => {
+  const data = "/System/Volumes/Data";
+  const fs = blockedFirmlinkFilesystem();
+  readPolicyScope.run({ home, environment: {}, denyRead: [data] }, () => {
+    for (const allowance of [work, sibling, common(), privateDir()])
+      expect(() => homeReadPolicy([allowance], true, [], fs)).toThrow(
+        `Read allowance ${allowance} overlaps denied credential path /`,
+      );
+  });
+  expect(policySpellings([data], true, fs)).toEqual([data, "/"]);
+  expect(policySpellings([data], false, fs)).toEqual([data]);
+});
+
 test("Data-volume firmlink deny spellings reject a hidden optional credential allowance", () => {
   const tools = join(home, "tools");
   mkdirSync(tools);
@@ -299,7 +312,28 @@ test.each(["EPERM", "EACCES"])(
       expect(() => homeReadPolicy([blockedLink], true, [], filesystem())).toThrow(
         `Cannot resolve read policy path ${blockedLink}`,
       );
-      expect(policySpellings([blockedLink], true, fs)).toEqual([blockedLink]);
+      expect(() => policySpellings([blockedLink], true, fs)).toThrow(ConfinementError);
+      expect(() => policySpellings([blockedLink], true, fs)).toThrow(
+        `Cannot resolve read policy path ${blockedLink}`,
+      );
+      expect(
+        policySpellings([blockedLink], true, {
+          lstatSync(path, options) {
+            if (path === blockedLink) throw Object.assign(new Error("blocked lstat"), { code });
+            return lstatSync(path, options);
+          },
+          realpathSync: fs.realpathSync,
+        }),
+      ).toEqual([blockedLink]);
+      expect(
+        policySpellings([checkout], true, {
+          lstatSync,
+          realpathSync(path) {
+            if (path === checkout) throw Object.assign(new Error("blocked directory realpath"), { code });
+            return realpathSync(path);
+          },
+        }),
+      ).toEqual([checkout]);
       expect(
         readPolicyScope.run({ home, environment: {}, toolchains: [blockedLink] }, () =>
           homeReadPolicy([checkout], true, [], filesystem()),
@@ -314,6 +348,44 @@ test.each(["EPERM", "EACCES"])(
     readPolicyScope.run({ home, environment: {}, toolchains: [join(home, ".ssh/absent")] }, () => {
       expect(() => homeReadPolicy([work], true, [], filesystem())).toThrow("denied credential path");
     });
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `denied symlink refuses an unresolved target or keeps it unreadable ${seatbeltSkip ?? ""}`,
+  async () => {
+    const tools = join(root, "tools");
+    mkdirSync(tools);
+    const credential = join(tools, "credential-stand-in");
+    writeFileSync(credential, "stand-in");
+    const alias = join(home, ".netrc");
+    symlinkSync(credential, alias);
+    const fs: PolicyFilesystem = {
+      lstatSync,
+      realpathSync(path) {
+        if (path === alias) throw Object.assign(new Error("blocked symlink realpath"), { code: "EPERM" });
+        return realpathSync(path);
+      },
+    };
+    const options = { home, environment: {} };
+    let policy: ReturnType<typeof homeReadPolicy>;
+    try {
+      policy = readPolicyScope.run({ ...options, toolchains: [tools] }, () =>
+        homeReadPolicy([work], true, [], fs),
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfinementError);
+      expect(String(error)).toContain(`Cannot resolve read policy path ${alias}`);
+      policy = readPolicyScope.run(options, () => homeReadPolicy([work], true));
+    }
+    const profile = seatbeltProfile({ write: [work], protect: [], ...policy });
+    const read = (file: string) =>
+      sh(["/usr/bin/sandbox-exec", "-p", profile, "/bin/cat", file], { cwd: work, allowFail: true });
+    const allowed = await read(join(work, "a.ts"));
+    expect(allowed.exitCode, allowed.stderr).toBe(0);
+    const denied = await read(credential);
+    expect(denied.exitCode, denied.stderr).toBe(1);
+    expect(denied.stderr).toMatch(/Operation not permitted|Permission denied/);
   },
 );
 

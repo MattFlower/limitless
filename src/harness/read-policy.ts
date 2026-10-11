@@ -90,6 +90,8 @@ function policyPath(path: string, denied: boolean, fs: PolicyFilesystem, optiona
           const code = (error as NodeJS.ErrnoException).code;
           // A non-symlink name below a canonical parent needs no further resolution.
           if (entry && !entry.isSymbolicLink() && (code === "EPERM" || code === "EACCES")) current = next;
+          else if (denied && entry?.isSymbolicLink())
+            throw new ConfinementError(`Cannot resolve read policy path ${path}`);
           else throw error;
         }
       } catch (error) {
@@ -114,7 +116,9 @@ export function policySpellings(paths: string[], denied = false, fs = policyFile
   return [
     ...new Set(
       spellings.flatMap((p) =>
-        denied && p.startsWith("/System/Volumes/Data/") ? [p, p.slice("/System/Volumes/Data".length)] : [p],
+        denied && (p === "/System/Volumes/Data" || p.startsWith("/System/Volumes/Data/"))
+          ? [p, p.slice("/System/Volumes/Data".length) || "/"]
+          : [p],
       ),
     ),
   ];
