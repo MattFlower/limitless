@@ -372,10 +372,10 @@ test.each([
   expect(observable).not.toContain(JSON.stringify(literal).slice(1, -1));
 });
 
-test("saving and loading preserves specification, holdout, feedback and answers literally", async () => {
+test("saving preserves literal state while loading redacts credentials and terminal formatting", async () => {
   const literal = "synthetic-state-credential-486\x1b[31m";
   registerCredential("gate-state-test", "synthetic-state-credential-486");
-  const { ctx, restore } = await context();
+  const { f, ctx, restore } = await context();
   ctx.state.spec = { ...spec, summary: literal };
   ctx.state.holdout = {
     scenarios: [
@@ -391,12 +391,34 @@ test("saving and loading preserves specification, holdout, feedback and answers 
   };
   ctx.state.feedback = literal;
   ctx.state.answers = [literal];
+  ctx.state.gatesConfig = { ...gates, checks: [{ name: "check", run: literal }] };
+  ctx.state.baselineScripts = { check: literal };
   await ctx.save();
+  expect(f.store.getRunState<RunState>(ctx.run.id)).toMatchObject({
+    spec: { summary: literal },
+    holdout: { scenarios: [{ description: literal, steps: literal, expected: literal }] },
+    feedback: literal,
+    answers: [literal],
+    gatesConfig: { checks: [{ run: literal }] },
+    baselineScripts: { check: literal },
+  });
   const resumed = restore();
-  expect(resumed.state.spec).toEqual(ctx.state.spec);
-  expect(resumed.state.holdout).toEqual(ctx.state.holdout);
-  expect(resumed.state.feedback).toBe(literal);
-  expect(resumed.state.answers).toEqual([literal]);
+  expect(resumed.state.spec).toEqual({ ...spec, summary: "[redacted]" });
+  expect(resumed.state.holdout).toEqual({
+    scenarios: [
+      {
+        id: "H-1",
+        description: "[redacted]",
+        steps: "[redacted]",
+        expected: "[redacted]",
+        edge_case: false,
+      },
+    ],
+  });
+  expect(resumed.state.feedback).toBe("[redacted]");
+  expect(resumed.state.answers).toEqual(["[redacted]"]);
+  expect(resumed.state.gatesConfig?.checks[0]?.run).toBe("[redacted]");
+  expect(resumed.state.baselineScripts?.check).toBe("[redacted]");
 });
 
 test.each(["hook", "purpose", "sha"] as const)(

@@ -307,6 +307,7 @@ export class RunContext {
       feedback: null,
       toolCommands: [],
     };
+    this.state = redactGateData(this.state);
   }
 
   get store(): Store {
