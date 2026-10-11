@@ -44,12 +44,15 @@ export class LeaseTransportFailures extends Error {
 export const localLeaseClient =
   (port = Number(process.env.LIMITLESS_PORT ?? 7400), unix?: string): LeaseClient =>
   async (body, signal) => {
-    const response = await fetch(`http://127.0.0.1:${port}/api/admin/gate-slot`, {
+    const url = `http://127.0.0.1:${port}/api/admin/gate-slot`;
+    const response = await fetch(url, {
       method: "POST",
       // An agent's per-invocation capability is its only credential; the daemon accepts it for this route only.
       headers: {
         "content-type": "application/json",
-        ...(typeof body.token === "string" ? { authorization: `Bearer ${body.token}` } : apiTokenHeaders()),
+        ...(typeof body.token === "string"
+          ? { authorization: `Bearer ${body.token}` }
+          : apiTokenHeaders(url)),
       },
       body: JSON.stringify(body),
       signal,

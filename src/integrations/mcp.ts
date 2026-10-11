@@ -22,6 +22,7 @@ import {
 } from "../feed.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { ChangeQuerySchema, getChange } from "./mcp-change.ts";
 import { explainStatus, statusDetailSchema, statusLandsSchema } from "./mcp-status.ts";
 
@@ -214,8 +215,9 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
   const api = async (path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> => {
     let response: Response;
     try {
-      response = await fetcher(`${base.replace(/\/$/, "")}${path}`, {
-        headers: { "content-type": "application/json", ...apiTokenHeaders() },
+      const url = `${base.replace(/\/$/, "")}${path}`;
+      response = await fetcher(url, {
+        headers: { "content-type": "application/json", ...apiTokenHeaders(url) },
         ...(body === undefined
           ? {}
           : {
@@ -226,11 +228,13 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       });
     } catch (e) {
       throw new Error(
-        `Cannot reach the Limitless daemon at ${base}: ${String(e)}. Start limitless serve. Mutation outcomes may be unknown; inspect runs before retrying.`,
+        redactCredentials(
+          `Cannot reach the Limitless daemon at ${base}: ${String(e)}. Start limitless serve. Mutation outcomes may be unknown; inspect runs before retrying.`,
+        ),
       );
     }
     const text = await response.text();
-    if (!response.ok) throw new Error(`Daemon HTTP ${response.status}: ${text}`);
+    if (!response.ok) throw new Error(redactCredentials(`Daemon HTTP ${response.status}: ${text}`));
     try {
       return JSON.parse(text);
     } catch {

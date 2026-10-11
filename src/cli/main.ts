@@ -6,6 +6,7 @@ import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
@@ -85,13 +86,18 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   let text: string;
   try {
-    res = await fetch(`${BASE}${path}`, {
+    const url = `${BASE}${path}`;
+    const headers = new Headers({ "content-type": "application/json", ...apiTokenHeaders(url) });
+    for (const [key, value] of new Headers(init?.headers)) headers.set(key, value);
+    res = await fetch(url, {
       ...init,
-      headers: { "content-type": "application/json", ...apiTokenHeaders(), ...(init?.headers ?? {}) },
+      headers,
     });
     text = await res.text();
   } catch {
-    throw new ApiError(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`);
+    throw new ApiError(
+      redactCredentials(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`),
+    );
   }
   if (!res.ok) {
     let msg = text;
@@ -100,7 +106,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // not json
     }
-    throw new ApiError(`${res.status}: ${msg}`, res.status);
+    throw new ApiError(redactCredentials(`${res.status}: ${msg}`), res.status);
   }
   return JSON.parse(text) as T;
 }
@@ -136,10 +142,11 @@ function formatEvent(e: RunEvent): string {
 }
 
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
-  const res = await fetch(`${BASE}/api/runs/${runId}/stream?after=${after}`, { headers: apiTokenHeaders() });
+  const url = `${BASE}/api/runs/${runId}/stream?after=${after}`;
+  const res = await fetch(url, { headers: apiTokenHeaders(url) });
   if (!res.ok) {
     const reply = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new ApiError(`${res.status}: ${reply?.error ?? res.statusText}`, res.status);
+    throw new ApiError(redactCredentials(`${res.status}: ${reply?.error ?? res.statusText}`), res.status);
   }
   if (!res.body) return;
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -669,6 +676,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error(color.red((e as Error).message));
+  console.error(color.red(redactCredentials((e as Error).message)));
   process.exit(1);
 });

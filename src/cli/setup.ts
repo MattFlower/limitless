@@ -6,7 +6,7 @@ import type { GitHubAccessProblem } from "../core/types.ts";
 import { githubDoctor } from "../integrations/github-poller.ts";
 import { installIntegrations, repositoryRoot, sessionStartInstructions } from "../integrations/install.ts";
 import { resolveCatalog } from "../router/config-catalog.ts";
-import { sh } from "../util/proc.ts";
+import { redactCredentials, sh } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 import { patchSetupConfig } from "./setup-config.ts";
 export type Check = { id: string; status: "ok" | "warn" | "fail"; message: string; fix?: string };
@@ -20,7 +20,7 @@ async function get(d: SetupDeps, url: string, token?: string, local = false) {
     const headers: HeadersInit = token
       ? { authorization: `Bearer ${token}` }
       : local
-        ? apiTokenHeaders(d.config.paths.home)
+        ? apiTokenHeaders(url, d.config.paths.home)
         : {};
     return await d.fetch(url, { method: "GET", signal: AbortSignal.timeout(2000), headers });
   } catch {
@@ -54,7 +54,7 @@ function safe(d: SetupDeps, text: string): string {
       );
     text = text.replace(new RegExp(pattern, "g"), "[redacted]");
   }
-  return text;
+  return redactCredentials(text);
 }
 function encoded(d: SetupDeps, value: unknown): string {
   const redact = (_: string, v: unknown) => (typeof v === "string" ? safe(d, v) : v);

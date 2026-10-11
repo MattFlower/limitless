@@ -1,4 +1,5 @@
 import type { DrainState, HealthResponse, Run, RunDetail } from "../core/types.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 
 export const DEFAULT_MAX_WAIT_MS = 45 * 60_000;
@@ -78,16 +79,21 @@ export function validateHealth(value: unknown): HealthResponse {
 
 export function localDeployClient(port: number): DeployClient {
   async function request(path: string, signal: AbortSignal, method = "GET"): Promise<unknown> {
-    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+    const url = `http://127.0.0.1:${port}${path}`;
+    const response = await fetch(url, {
       method,
       signal,
-      headers: { "content-type": "application/json", ...apiTokenHeaders() },
+      headers: { "content-type": "application/json", ...apiTokenHeaders(url) },
     });
     if (response.status === 404 && path.startsWith("/api/admin/"))
       throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
     if (!response.ok) {
       const reply = (await response.json().catch(() => null)) as { error?: string } | null;
-      throw new Error(`${method} ${path}: HTTP ${response.status}${reply?.error ? `: ${reply.error}` : ""}`);
+      throw new Error(
+        redactCredentials(
+          `${method} ${path}: HTTP ${response.status}${reply?.error ? `: ${reply.error}` : ""}`,
+        ),
+      );
     }
     return response.json();
   }
