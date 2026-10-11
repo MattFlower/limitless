@@ -91,7 +91,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     for (const [key, value] of new Headers(init?.headers)) headers.set(key, value);
     res = await fetch(url, {
       ...init,
-      headers,
+      headers: Object.fromEntries(headers),
     });
     text = await res.text();
   } catch {
