@@ -117,6 +117,8 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
   readPolicyScope.run({ home: root, toolchains: [toolchain], environment: {} }, () => {
     const roots = writeRoots(work, scratch, true);
     const profile = seatbeltProfile(roots);
+    expect(profile).toContain('(deny mach-lookup (global-name "com.limitless.read-allowlist.denied"))');
+    expect(profile).toContain('(allow mach-lookup (global-name "com.limitless.read-allowlist.allowed"))');
     expect(profile).toContain(`(deny file-read* (subpath "${root}")`);
     for (const path of [work, scratch, `${work}.git-paths`, common(), privateDir(), toolchain])
       expect(roots.allowRead).toContain(path);
@@ -655,6 +657,7 @@ test("specific database denies follow checkout and ancestor read grants", () => 
       const roots = writeRoots(work, scratch, true);
       const profile = seatbeltProfile(roots);
       const final = profile.split("\n").at(-1) ?? "";
+      expect(profile).not.toContain("com.limitless.read-allowlist.");
       expect(final).toStartWith("(deny file-read*");
       for (const file of [db, `${db}-wal`, `${db}-shm`, parentDb])
         expect(final).toContain(`(subpath "${file}")`);
@@ -669,6 +672,20 @@ test("specific database denies follow checkout and ancestor read grants", () => 
   } finally {
     for (const store of stores) store.close();
   }
+});
+
+test("a command read deny inside an allowance withholds the process inspection marker", () => {
+  const roots = {
+    write: [work],
+    protect: [],
+    denyRead: [root],
+    allowRead: [work],
+    commands: { root: [join(work, "commands")], own: [] },
+  };
+  expect(seatbeltProfile(roots)).not.toContain("com.limitless.read-allowlist.");
+  expect(seatbeltProfile({ ...roots, commands: { root: [join(root, "commands")], own: [] } })).toContain(
+    "com.limitless.read-allowlist.",
+  );
 });
 
 test.skipIf(seatbeltSkip !== null)(

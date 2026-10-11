@@ -9,7 +9,7 @@ import {
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import {
   ancestorReadPolicy,
@@ -42,6 +42,12 @@ export function seatbeltProfile(roots: WriteRoots): string {
       .join(" ");
   const ancestors = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
   const specificDenies = specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
+  const readHoles = [...specificDenies, ...(roots.commands?.root ?? [])].filter((deny) =>
+    (roots.allowRead ?? []).some((allow) => {
+      const rel = relative(allow, deny);
+      return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    }),
+  );
   return [
     "(version 1)",
     "(allow default)",
@@ -58,8 +64,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
     ...(roots.commands?.own.length ? [`(allow file-read-data ${paths(roots.commands.own)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
     ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
-    // Kernel-queryable identity for process inspection; these names have no services.
-    ...(roots.denyRead?.length && roots.allowRead?.length
+    // A denied cwd proves non-membership only when no read allowance contains unreadable subtrees.
+    // Private denies and command roots outside the allowances do not invalidate that proof.
+    ...(roots.denyRead?.length && roots.allowRead?.length && readHoles.length === 0
       ? [
           '(deny mach-lookup (global-name "com.limitless.read-allowlist.denied"))',
           '(allow mach-lookup (global-name "com.limitless.read-allowlist.allowed"))',

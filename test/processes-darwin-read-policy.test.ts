@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
 import { SANDBOX_EXEC, seatbeltProfile } from "../src/harness/sandbox.ts";
+import { writeRoots } from "../src/harness/scratch.ts";
+import { protectPrivateFile } from "../src/util/private-reads.ts";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 
@@ -37,6 +39,109 @@ async function startOrphan(cwd: string, pidFile: string): Promise<number> {
 }
 
 const nativeModule = JSON.stringify(join(import.meta.dir, "../src/util/processes-darwin.ts"));
+
+test.skipIf(seatbeltSkip !== null)(
+  `cleanup refuses an orphan inside a read-denied checkout subtree (${seatbeltSkip ?? "available"})`,
+  async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-cwd-private-")));
+    const work = join(dir, "checkout");
+    const scratch = join(dir, "scratch");
+    for (const path of [work, scratch]) mkdirSync(path);
+    const privateFile = join(work, "private.db");
+    const pidFile = join(work, "descendant.pid");
+    writeFileSync(privateFile, "registered private database");
+    const release = protectPrivateFile(privateFile);
+    try {
+      // Native syscalls can replace a writable, read-denied file and enter the resulting directory.
+      // The pipe closes on exec; the launcher waits until the SIP platform binary is orphaned.
+      const source = join(work, "orphan.c");
+      const binary = join(work, "orphan");
+      writeFileSync(
+        source,
+        `#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc != 3) return 2;
+  if (unlink(argv[1]) || mkdir(argv[1], 0700) || chdir(argv[1])) return 3;
+  int ready[2];
+  if (pipe(ready) || fcntl(ready[1], F_SETFD, FD_CLOEXEC) == -1) return 4;
+  pid_t child = fork();
+  if (child < 0) return 5;
+  if (child == 0) {
+    close(ready[0]);
+    if (setsid() == -1) _exit(6);
+    pid_t orphan = fork();
+    if (orphan < 0) _exit(7);
+    if (orphan > 0) _exit(0);
+    int attempts = 0;
+    while (getppid() != 1 && ++attempts < 3000) usleep(1000);
+    if (getppid() != 1) _exit(8);
+    FILE *file = fopen(argv[2], "w");
+    if (!file) _exit(9);
+    fprintf(file, "%d", getpid());
+    fclose(file);
+    int nullfd = open("/dev/null", O_RDWR);
+    if (nullfd == -1) _exit(10);
+    for (int fd = 0; fd < 3; fd++) if (dup2(nullfd, fd) == -1) _exit(10);
+    close(nullfd);
+    execl("/bin/sleep", "sleep", "30", NULL);
+    write(ready[1], "x", 1);
+    _exit(10);
+  }
+  close(ready[1]);
+  int status;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 11;
+  char failed;
+  return read(ready[0], &failed, 1) == 0 ? 0 : 12;
+}
+`,
+      );
+      const build = await runProcess({
+        cmd: ["/usr/bin/cc", source, "-o", binary],
+        cwd: work,
+        env: agentEnv(),
+        timeoutMs: 10_000,
+      });
+      expect(build.exitCode, build.stderr).toBe(0);
+      const profile = readPolicyScope.run({ home: dir, environment: {} }, () =>
+        seatbeltProfile(writeRoots(work, scratch, true)),
+      );
+      const script = `
+        import {runProcess} from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
+        try {
+          const result = await runProcess({cmd:${JSON.stringify([binary, privateFile, pidFile])},
+            cwd:process.cwd(),env:{...process.env},timeoutMs:5000});
+          console.log(JSON.stringify({result:result.exitCode}));
+        } catch (error) { console.log(JSON.stringify({error:error.message})); }
+      `;
+      const result = await runProcess({
+        cmd: [SANDBOX_EXEC, "-p", profile, process.execPath, "-e", script],
+        cwd: work,
+        env: agentEnv(),
+        timeoutMs: 10_000,
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(pid).toBeGreaterThan(1);
+      expect(JSON.parse(result.stdout)).toEqual({
+        error: `Invocation termination could not be confirmed: Process cwd inspection failed for ${pid} (errno 1)`,
+      });
+    } finally {
+      // The PID file is written by our own double-forked fixture, never obtained by a host scan.
+      try {
+        const pid = Number(readFileSync(pidFile, "utf8").trim());
+        if (pid > 1) process.kill(pid, "SIGKILL");
+      } catch {}
+      release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
 
 test.skipIf(seatbeltSkip !== null)(
   `injected cwd permission errors stay closed outside the gate read allowlist (${seatbeltSkip ?? "available"})`,
