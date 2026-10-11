@@ -4,6 +4,7 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,7 +18,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Store } from "../src/db/store.ts";
 import { recordWorktree } from "../src/git/command.ts";
-import { ancestorReadPolicy, homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
+import {
+  ancestorReadPolicy,
+  homeReadPolicy,
+  type PolicyFilesystem,
+  readPolicyScope,
+} from "../src/harness/read-policy.ts";
 import {
   ConfinementError,
   confinementScope,
@@ -70,6 +76,7 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
   const scratch = join(root, "scratch");
   mkdirSync(scratch);
   const toolchain = join(root, "tools", "custom-toolchain");
+  mkdirSync(toolchain, { recursive: true });
   readPolicyScope.run({ home: root, toolchains: [toolchain], environment: {} }, () => {
     const roots = writeRoots(work, scratch, true);
     const profile = seatbeltProfile(roots);
@@ -109,7 +116,7 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
       ".rustup/settings.toml",
       ".rustup/update-hashes",
     ])
-      expect(roots.allowRead).toContain(join(root, path));
+      expect(roots.allowRead).not.toContain(join(root, path));
     for (const name of ["credentials", "credentials.toml"])
       expect(roots.denyRead).toContain(join(root, ".cargo", name));
   });
@@ -117,7 +124,109 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
   expect(() => writeRoots(work, scratch, true)).toThrow("trusted Git paths");
 });
 
-test("gate refuses unresolved home and credential overlaps before executing or copying configuration", async () => {
+function blockedHomeFilesystem(code: string): PolicyFilesystem {
+  const inspect = (path: string) => {
+    if (path.startsWith(`${home}/`)) throw Object.assign(new Error("blocked home"), { code });
+  };
+  return {
+    lstatSync(path, options) {
+      inspect(path);
+      return lstatSync(path, options);
+    },
+    realpathSync(path) {
+      inspect(path);
+      return realpathSync(path);
+    },
+  };
+}
+
+test.each([undefined, "EPERM", "EACCES"])(
+  "optional toolchain candidates absent or hidden under denied home are omitted: %s",
+  (code) => {
+    const scratch = join(root, "scratch");
+    mkdirSync(scratch);
+    const realpaths: string[] = [];
+    const filesystem = code ? blockedHomeFilesystem(code) : { lstatSync, realpathSync };
+    const fs: PolicyFilesystem = {
+      lstatSync: filesystem.lstatSync,
+      realpathSync(path) {
+        realpaths.push(path);
+        return filesystem.realpathSync(path);
+      },
+    };
+    readPolicyScope.run({ home, environment: {}, toolchains: [join(home, "custom-tools")] }, () => {
+      const policy = homeReadPolicy([work, scratch, common(), privateDir()], true, [], fs);
+      expect(policy.allowRead).toEqual([work, scratch, common(), privateDir()]);
+      expect(policy.denyRead).toContain(home);
+      expect(policy.denyRead).toContain(join(home, ".ssh"));
+      expect(realpaths.filter((p) => p.startsWith(`${home}/`))).toEqual([]);
+    });
+  },
+);
+
+test.each(["EPERM", "EACCES"])("read policy refusal for required roots hidden under home: %s", (code) => {
+  readPolicyScope.run({ home, environment: {} }, () => {
+    expect(() => homeReadPolicy([join(home, "checkout")], true, [], blockedHomeFilesystem(code))).toThrow(
+      "Cannot resolve read policy path",
+    );
+  });
+});
+
+test.each([undefined, "EPERM", "EACCES"])(
+  "read policy refusal for absent or hidden credential descendants: %s",
+  (code) => {
+    readPolicyScope.run({ home, environment: {}, toolchains: [join(home, ".ssh", "absent")] }, () => {
+      const fs = code ? blockedHomeFilesystem(code) : { lstatSync, realpathSync };
+      expect(() => homeReadPolicy([work], true, [], fs)).toThrow("denied credential path");
+    });
+  },
+);
+
+test.each(["EPERM", "EACCES", "EIO"])(
+  "read policy refusal for optional inspection failures outside denied home: %s",
+  (code) => {
+    const candidate = join(root, "other-tools");
+    const fs: PolicyFilesystem = {
+      realpathSync,
+      lstatSync(path, options) {
+        if (path === candidate) throw Object.assign(new Error("inspection failed"), { code });
+        return lstatSync(path, options);
+      },
+    };
+    readPolicyScope.run({ home, environment: {}, toolchains: [candidate] }, () => {
+      expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+        `Cannot resolve read policy path ${candidate}`,
+      );
+    });
+  },
+);
+
+test("read policy refusal for absent required roots and existing dangling toolchain symlinks", () => {
+  const candidate = join(home, "dangling-toolchain");
+  symlinkSync(join(home, "absent-target"), candidate);
+  readPolicyScope.run({ home, environment: {} }, () => {
+    expect(() => homeReadPolicy([join(root, "absent-checkout")], true)).toThrow(
+      "Cannot resolve read policy path",
+    );
+  });
+  readPolicyScope.run({ home, environment: {}, toolchains: [candidate] }, () => {
+    expect(() => homeReadPolicy([work], true)).toThrow(`Cannot resolve read policy path ${candidate}`);
+    for (const code of ["EPERM", "EACCES", "EIO"]) {
+      const fs: PolicyFilesystem = {
+        lstatSync,
+        realpathSync(path) {
+          if (path === candidate) throw Object.assign(new Error("unresolved entry"), { code });
+          return realpathSync(path);
+        },
+      };
+      expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+        `Cannot resolve read policy path ${candidate}`,
+      );
+    }
+  });
+});
+
+test("read policy refusal for unresolved home and credential overlaps before executing or copying configuration", async () => {
   mkdirSync(join(root, ".ssh/child"), { recursive: true });
   symlinkSync(join(root, ".ssh/child"), join(root, "alias"));
   for (const options of [
@@ -190,7 +299,7 @@ test.skipIf(seatbeltSkip !== null)(
       test("fixture works and credentials stay denied", () => {
         expect(1 + 1).toBe(2);
         for (const file of ${JSON.stringify(denied.slice(0, 2))})
-          expect(() => readFileSync(file)).toThrow(/Operation not permitted|Permission denied/);
+          expect(() => readFileSync(file)).toThrow(/Operation not permitted|Permission denied/i);
       });
     `,
     );

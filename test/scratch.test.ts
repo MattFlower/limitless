@@ -1499,6 +1499,7 @@ test("factory sandbox configuration validates and applies optional denial and to
   const { root, cwd, scratchDir, spec } = editFixture();
   await recordWorktree(cwd);
   const secret = join(root, "extra-secret");
+  mkdirSync(join(root, "toolchain"));
   const configA = loadConfig({
     readOnly: true,
     home: join(root, "data"),
