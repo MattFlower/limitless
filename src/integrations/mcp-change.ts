@@ -208,9 +208,16 @@ function buildCatalogue(store: Factory["store"], ids: string[]): HoldoutRedactor
         expected: /[\r\n\t]/u.test(scenario.expected) ? "" : scenario.expected,
       })),
     };
-    const independent = privateHoldoutDetails(standalone, publicSources);
-    // Multiline prose is matched as a phrase. Only independently distinctive literals
-    // survive on their own; short code fragments inferred from multiline text do not.
+    // The observed-text path extracts only literals. Keep those from every field, even
+    // when multiline prose cannot safely contribute standalone sentence fragments.
+    const independent = privateHoldoutDetails(
+      standalone,
+      publicSources,
+      holdout.scenarios
+        .flatMap((scenario) => [scenario.description, scenario.steps, scenario.expected])
+        .join("\n"),
+    );
+    // Multiline prose is matched as a phrase; syntax-shaped literals also match alone.
     for (const detail of privateHoldoutDetails(holdout, publicSources))
       if (independent.has(detail) || /[\r\n\t]/u.test(detail) || detail.length >= DISTINCTIVE_LENGTH)
         details.add(detail);

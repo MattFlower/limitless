@@ -185,6 +185,44 @@ test("holdout literals inside code are redacted at word boundaries, not by withh
   }
 });
 
+test("short literals in multiline holdout fields stay private in patches and reports", async () => {
+  const content = 'const label = "xq-77";\nrun --dry a/b\nexit 3\nconst val9 = true;\nreadable ending\n';
+  const c = await changeFixture(f, { "hello.txt": content });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: 'Inspect output.\nIt contains "xq-77".',
+          steps: "Run check.\nUse --dry on a/b before checking.",
+          expected: "Check completes.\nExit 3 with val9 set.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", content);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      expect(page.available).toBe(true);
+      for (const text of [page.diff.text, page.reports[0]?.text]) {
+        expect(text).toContain('const label = "[private detail]";');
+        expect(text).toContain("run [private detail] [private detail]");
+        expect(text).toContain("exit [private detail]");
+        expect(text).toContain("const [private detail] = true;");
+        expect(text).toContain("readable ending");
+        expect(text).not.toMatch(/xq-77|--dry|a\/b|exit 3|val9/);
+      }
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
 test.each(["maxWords", "cafe\u0301"])(
   "short holdout literal %s is withheld when percent- or Unicode-encoded in paths, patches and reports",
   async (literal) => {
@@ -374,7 +412,16 @@ test("multiline hunk matching hides complete phrases and preserves unrelated gen
     "hello.txt": `}\n  return true;\n  expect(x).toBe(1)\n${"unrelated readable line\n".repeat(800)}}\nreturn true;\nindependent assertion\nexpect(x).toBe(1)`,
     "renamed.txt": "}\nreturn true;\nexpect(x).toBe(1)",
   });
+  // The assertion's syntax-shaped literals are public; the complete multiline phrase is private.
   f.factory.store.setRunState(c.run.id, {
+    spec: {
+      summary: "Review this change with expect(x).toBe(1) assertions.",
+      assumptions: [],
+      requirements: [],
+      acceptance_criteria: [],
+      out_of_scope: [],
+      blocking_questions: [],
+    },
     holdout: {
       scenarios: [
         {
