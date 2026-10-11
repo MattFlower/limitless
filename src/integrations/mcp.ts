@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
+import { apiTokenHeaders } from "../cli/api-token.ts";
 import {
   type CreateRunRequest,
   type FeedAck,
@@ -211,11 +212,11 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
     let response: Response;
     try {
       response = await fetcher(`${base.replace(/\/$/, "")}${path}`, {
+        headers: { "content-type": "application/json", ...apiTokenHeaders() },
         ...(body === undefined
           ? {}
           : {
               method: "POST",
-              headers: { "content-type": "application/json" },
               body: JSON.stringify(body),
             }),
         signal: signal ?? AbortSignal.timeout(30_000),

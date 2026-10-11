@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { parseArgs } from "node:util";
 import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
+import { apiTokenHeaders } from "./api-token.ts";
 import { bounded, DaemonTimeoutError, type DeployClock, deployClock, parseMaxWait } from "./deploy-wait.ts";
 
 type Reply = { id: string; acquired: boolean; expired?: boolean };
@@ -12,7 +13,7 @@ export const localLeaseClient =
   async (body, signal) => {
     const response = await fetch(`http://127.0.0.1:${port}/api/admin/gate-slot`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...apiTokenHeaders() },
       body: JSON.stringify(body),
       signal,
     });

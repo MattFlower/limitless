@@ -361,6 +361,32 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
       (await call("/api/runs", proxy, valid, "POST", JSON.stringify({ repo: f.repo, prompt: "allowed" })))
         .status,
     ).toBe(201);
+    for (const enforcement of [false, true]) {
+      cfg.requireApiToken = enforcement;
+      for (const headers of [valid, { ...valid, authorization: "Basic dXNlcjpwYXNz" }]) {
+        expect((await call("/api/runs", proxy, headers)).status).toBe(200);
+        expect(
+          (await call("/api/runs", proxy, headers, "POST", JSON.stringify({ repo: f.repo, prompt: "proxy" })))
+            .status,
+        ).toBe(201);
+      }
+      for (const method of ["GET", "POST"])
+        expect(
+          (await call("/api/runs", proxy, { ...valid, authorization: "Bearer wrong" }, method)).status,
+        ).toBe(401);
+      cfg.auth = "required";
+      const unsigned = await call(
+        "/api/runs",
+        proxy,
+        { ...valid, authorization: "Basic dXNlcjpwYXNz" },
+        "POST",
+        "{}",
+      );
+      expect(unsigned.status).toBe(401);
+      expect(await unsigned.json()).toEqual({ error: "sign-in required" });
+      cfg.auth = "proxy";
+    }
+    cfg.requireApiToken = false;
     cfg.trustedProxies = [];
     cfg.publicOrigins = [];
     for (const headers of [

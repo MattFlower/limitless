@@ -6,6 +6,7 @@ import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { apiTokenHeaders } from "./api-token.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
 import { localOwnerDiagnostics, printOwnerDiagnostics } from "./owner-diagnostics.ts";
@@ -86,7 +87,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${BASE}${path}`, {
       ...init,
-      headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+      headers: { "content-type": "application/json", ...apiTokenHeaders(), ...(init?.headers ?? {}) },
     });
     text = await res.text();
   } catch {
@@ -135,7 +136,7 @@ function formatEvent(e: RunEvent): string {
 }
 
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
-  const res = await fetch(`${BASE}/api/runs/${runId}/stream?after=${after}`);
+  const res = await fetch(`${BASE}/api/runs/${runId}/stream?after=${after}`, { headers: apiTokenHeaders() });
   if (!res.body) return;
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";

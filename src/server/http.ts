@@ -14,10 +14,14 @@ import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
+import { createApiToken, matchesApiToken } from "./api-token.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
 import { Passkeys } from "./passkeys.ts";
 
 export interface HttpExtras {
+  apiToken?: string;
+  /** An invocation capability is valid only for the gate-slot endpoint. */
+  gateSlotCapability?: (req: Request) => boolean;
   /** Extra routes contributed by integrations (webhooks, MCP). */
   routes?: Record<string, (req: Request, server: Server<undefined>) => Response | Promise<Response>>;
   /** Bundled SPA files, served through the same authorization as the API. */
@@ -129,6 +133,17 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   /** Reachable without a session: signing in, and enrolling with a one-time link. */
   const signInPath = (path: string) =>
     path === "/login" || path === "/enroll" || path.startsWith("/api/auth/passkey/");
+  const tokenExempt = (path: string) =>
+    signInPath(path) ||
+    path.startsWith("/webhooks/") ||
+    path === "/api/auth/logout" ||
+    path === "/api/auth/logout-all";
+  const protectedRequest = (req: Request, path: string) =>
+    !tokenExempt(path) &&
+    (!["GET", "HEAD", "OPTIONS"].includes(req.method) ||
+      path === "/api/admin" ||
+      path.startsWith("/api/admin/") ||
+      path === "/mcp");
   const handle =
     (
       fn: (
@@ -154,6 +169,28 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         (access === "proxy" && !publicHost(req.headers.get("host"), factory.cfg.publicOrigins))
       )
         return error("forbidden", 403);
+      if (!tokenExempt(path)) {
+        const header = req.headers.get("authorization");
+        const hasBearer = /^Bearer(?:\s|$)/i.test(header ?? "");
+        const bearer = matchesApiToken(header, extras.apiToken);
+        const capability = path === "/api/admin/gate-slot" && extras.gateSlotCapability?.(req) === true;
+        const session = auth.session(req.headers);
+        if (
+          (hasBearer && !bearer && !capability) ||
+          (protectedRequest(req, path) &&
+            !bearer &&
+            !capability &&
+            !session &&
+            // Proxied UI requests retain their existing proxy/session checks below.
+            access !== "proxy" &&
+            !(!factory.cfg.requireApiToken && access === "loopback" && !hasBearer))
+        )
+          return error(
+            "API token required: this daemon requires the local API token or a signed-in session; update the limitless CLI",
+            401,
+          );
+        if (session) signedIn.add(req);
+      }
       if (
         access === "proxy" &&
         factory.cfg.auth === "required" &&
@@ -660,7 +697,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
 }
 
 export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun.serve<undefined>) {
-  const routes = createHttpRoutes(factory, extras);
+  const credential = createApiToken(factory.cfg.paths.home);
+  const routes = createHttpRoutes(factory, { ...extras, apiToken: credential.token });
   const bind = (hostname: string) =>
     serve({
       hostname,
@@ -669,12 +707,19 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun
       routes: routes as never,
       fetch: routes["/*"] as (req: Request, server: Server<undefined>) => Promise<Response>,
     });
-  const local = bind(factory.cfg.host);
+  let local: Server<undefined>;
+  try {
+    local = bind(factory.cfg.host);
+  } catch (error) {
+    credential.release();
+    throw error;
+  }
   let lan: Server<undefined> | undefined;
   try {
     if (factory.cfg.listenLan) lan = bind(factory.cfg.listenLan);
   } catch (error) {
     void local.stop(true);
+    credential.release();
     throw error;
   }
   return {
@@ -682,6 +727,7 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun
     url: local.url,
     stop: async (force?: boolean) => {
       await Promise.all([local.stop(force), lan?.stop(force)]);
+      credential.release();
     },
   };
 }

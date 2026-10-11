@@ -172,6 +172,7 @@ use the file first, then the environment.
 |---|---|---|
 | `[server] port` | `7400` | HTTP port. The `LIMITLESS_PORT` environment variable takes precedence. |
 | `[server] host` | `"127.0.0.1"` | Bind address. Keep it on loopback (see [remote UI](#remote-ui)). |
+| `[server] require_api_token` | `false` | Rollout: accept token or plain loopback in this release; the default becomes `true` in the next release. When enabled, local mutations, admin routes and HTTP `/mcp` require the API token or existing UI sign-in session (including the loopback UI). HTTP `/mcp` clients send `Authorization: Bearer $(cat ~/.limitless/api-token)`; the file follows `LIMITLESS_HOME`. Current CLI clients read it automatically. Older releases ignore this key, so rollback still starts. |
 | `[server] ui_url` | `http://localhost:<port>` | Base URL for run links in PR bodies and Discord. It is also an allowed browser origin. |
 | `[limits] max_concurrent_runs` | `3` | Runs executing at once. Others wait in `queued`. |
 | `[providers.<id>] max_concurrent` | Catalog limit | Concurrent requests for a catalog provider; positive safe integer. For example, `[providers.claude] max_concurrent = 5`. Unknown provider IDs are rejected. |
