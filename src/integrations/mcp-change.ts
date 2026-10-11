@@ -6,7 +6,7 @@ import { normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
 import { holdoutBoundaryPattern, privateHoldoutDetails } from "../pipeline/prompts.ts";
-import { HoldoutSchema, renderSpec, rowKind, SpecSchema } from "../pipeline/schemas.ts";
+import { HoldoutSchema, renderSpec, rowKind, SpecSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { commitSha, reviewableHead } from "./mcp-head.ts";
 
@@ -172,16 +172,28 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     );
     for (const diagnostic of ownerDiagnostics(store.db, id)) {
       if (diagnostic.kind !== "run-error" && !verifiers.has(diagnostic.invocationId ?? -1)) continue;
-      // Result/error copies are the exact text redacted by the invocation boundary,
-      // including quoted JSON literals that lose their quotes when parsed.
-      if (diagnostic.kind !== "event") collect(diagnostic.text);
       let output: unknown = diagnostic.text;
       try {
         output = JSON.parse(diagnostic.text);
       } catch {
         /* Plain verifier diagnostics are also private. */
       }
-      collectOutput(output);
+      const verify = VerifySchema.safeParse(output);
+      const fields = verificationText.safeParse(output);
+      if (verify.success) {
+        collectVerification(verify.data);
+        // Factory gate citations are not part of the model's Verify schema.
+        if (fields.success)
+          for (const criterion of fields.data.criteria ?? []) collectOutput(criterion.gateEvidence);
+      } else if (fields.success && fields.data.criteria) {
+        // Incomplete verifier JSON still distinguishes public rows from private observations.
+        collectVerification(fields.data);
+      } else {
+        // Only unstructured diagnostics need whole-text harvesting, including quoted JSON
+        // literals that lose their quotes when parsed.
+        if (diagnostic.kind !== "event") collect(diagnostic.text);
+        collectOutput(output);
+      }
     }
   }
   const pattern = details.size

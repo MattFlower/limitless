@@ -412,6 +412,93 @@ test("change pages protect persisted verifier literals and never return owner-on
   }
 });
 
+test.each([true, false])(
+  "raw verifier diagnostics preserve public evidence while withholding private observations (complete: %s)",
+  async (complete) => {
+    const c = await changeFixture(f, {
+      "src/count.ts": "export const publicCounterName = 123;\nexport const limit = 7;\nruntimeProbeSecret\n",
+    });
+    const { store } = f.factory;
+    store.setRunState(c.run.id, {
+      spec: {
+        summary: "Count words.",
+        assumptions: [],
+        requirements: ["Export a count."],
+        acceptance_criteria: [{ id: "AC-1", criterion: "Count words.", how_to_verify: "bun test" }],
+        out_of_scope: [],
+        blocking_questions: [],
+      },
+      holdout: {
+        scenarios: [
+          {
+            id: "H-1",
+            description: "Exercise private behavior.",
+            steps: "Run the check.",
+            expected: "It completes.",
+            edge_case: false,
+          },
+        ],
+      },
+    });
+    const invocation = store.createInvocation({
+      runId: c.run.id,
+      stageId: null,
+      role: "verify",
+      harness: "fake",
+      provider: "fake",
+      model: "test",
+      modelId: "fake/m",
+    });
+    store.recordOwnerDiagnostic(
+      {
+        runId: c.run.id,
+        invocationId: invocation.id,
+        kind: "result",
+        text: JSON.stringify({
+          criteria: [
+            {
+              id: "AC-1",
+              status: "met",
+              evidence: "src/count.ts:7 exports 'publicCounterName' with value 123.",
+              publicSummary: "src/count.ts returns 123.",
+            },
+            {
+              id: "H-1",
+              status: "met",
+              evidence: "Observed 'runtimeProbeSecret' during verification.",
+              publicSummary: "Behavior confirmed.",
+            },
+          ],
+          notes: "",
+          ...(complete ? { overall: "pass" } : {}),
+        }),
+      },
+      "Private verifier output withheld.",
+    );
+    store.putArtifact(c.run.id, "report.md", "report", "src/count.ts:7 returns 123; runtimeProbeSecret");
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        expect(page.files).toMatchObject([{ path: "src/count.ts", additions: 3, deletions: 0 }]);
+        expect(page.diff.text).toContain(
+          "+export const publicCounterName = 123;\n+export const limit = 7;\n",
+        );
+        expect(page.diff.text).toContain("+[private detail]");
+        expect(page.reports[0]?.text).toContain("src/count.ts:7 returns 123; [private detail]");
+        expect(JSON.stringify(page)).not.toMatch(
+          /runtimeProbeSecret|Observed '|invocationId|owner_diagnostics/,
+        );
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
 test("a rendered report never exposes a clipped holdout scenario description", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
   const description = `Callers who pass an unusually long sentence ${"through the private pipeline ".repeat(12)}see one tidy summary.`;
