@@ -266,6 +266,8 @@ export interface ArtifactMeta {
 }
 
 export interface RunDetail {
+  /** Recorded PR observation/push epoch; a poll snapshot alone may be superseded. */
+  prHead?: { sha: string; version: number; pushing: boolean } | null;
   stoppingStage?: StageName | null;
   blockingFindings?: string[];
   prSnapshot?: {

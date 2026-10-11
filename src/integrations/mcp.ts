@@ -338,8 +338,11 @@ export function createMcpServer(backend: McpBackend): Server {
       "Explain a run's state and concrete next action using saved PR observations, review state and the land queue. Supply run. Reports unknown PR observations without claiming readiness; use get_run for evidence. Unknown run IDs are errors, and this read never changes a run or its feed cursor.",
       z.object({ run: nonblank }).strict(),
       async ({ run }, _signal, privacy) => {
-        const detail = statusDetailSchema.parse(await backend.detail(run));
-        return explainStatus(detail, statusLandsSchema.parse(await backend.lands(detail.run.id)), privacy);
+        const initial = statusDetailSchema.parse(await backend.detail(run));
+        const lands = statusLandsSchema.parse(await backend.lands(initial.run.id));
+        // The head may move while the land query is in flight.
+        const detail = statusDetailSchema.parse(await backend.detail(initial.run.id));
+        return explainStatus(detail, lands, privacy);
       },
     ),
     tool(

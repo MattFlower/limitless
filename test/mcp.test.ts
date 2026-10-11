@@ -1,6 +1,8 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
+import * as commands from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
@@ -106,6 +108,90 @@ test("change view refuses moved heads, missing comparisons and unavailable repor
     available: false,
     reason: expect.stringContaining("unavailable"),
   });
+});
+
+test.each(["head moves", "push begins and ends"])(
+  "change view refuses when %s during Git inspection",
+  async (condition) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    const { store } = f.factory;
+    const original = commands.worktreeGit;
+    let inspected = () => {},
+      resume = () => {};
+    const ready = new Promise<void>((resolve) => {
+      inspected = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const git = spyOn(commands, "worktreeGit").mockImplementation(async (args, opts, retry) => {
+      const output = await original(args, opts, retry);
+      if (args.includes("--numstat")) {
+        inspected();
+        await released;
+      }
+      return output;
+    });
+    try {
+      const pending = call("get_change", { run: c.run.id });
+      await ready;
+      if (condition === "head moves") store.observePrHead(c.prUrl, c.baseSha);
+      else {
+        store.beginPrPush(c.prUrl, c.headSha, c.run.id);
+        store.endPrPush(c.prUrl, c.headSha);
+      }
+      resume();
+      expect(resultValue(await pending)).toMatchObject({
+        available: false,
+        reason: expect.stringContaining("superseded"),
+      });
+    } finally {
+      resume();
+      git.mockRestore();
+    }
+  },
+);
+
+test("status rechecks recorded heads after the asynchronous land read", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const backend = factoryBackend(f.factory);
+  const moved = await connect({
+    ...backend,
+    lands: async () => {
+      f.factory.store.observePrHead(c.prUrl, c.baseSha);
+      return [];
+    },
+  });
+  try {
+    const status = resultValue(
+      await moved.client.callTool({ name: "limitless_status", arguments: { run: c.run.id } }),
+    );
+    expect(status).toMatchObject({ state: "PR head superseded", headSha: null });
+    expect(JSON.stringify(status)).not.toContain("submit limitless_review");
+  } finally {
+    await moved.close();
+  }
+});
+
+test("change view includes committed gitlinks despite diff.ignoreSubmodules=all", async () => {
+  const oldLink = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
+  mkdirSync(join(f.repo, "module"));
+  await sh(["git", "update-index", "--add", "--cacheinfo", `160000,${oldLink},module`], { cwd: f.repo });
+  await sh(["git", "commit", "-qm", "gitlink base"], { cwd: f.repo });
+  const newLink = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim();
+  await sh(["git", "update-index", "--cacheinfo", `160000,${newLink},module`], { cwd: f.repo });
+  const c = await changeFixture(f, { "hello.txt": "hello\nnew greeting\n" });
+  await sh(["git", "config", "diff.ignoreSubmodules", "all"], {
+    cwd: cachePath(f.factory.cfg.paths, c.repo),
+  });
+  const first = resultValue<ChangePage>(await call("get_change", { run: c.run.id }));
+  const module = first.files.find((file) => file.path === "module");
+  expect(module).toMatchObject({ path: "module", additions: 1, deletions: 1 });
+  if (!module) throw new Error("Gitlink hidden from changed files");
+  const page = resultValue<ChangePage>(
+    await call("get_change", { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, file: module.index }),
+  );
+  expect(page.diff.text).toContain(`-Subproject commit ${oldLink}\n+Subproject commit ${newLink}\n`);
 });
 
 test("MCP consumer labels cannot impersonate Dependabot and still match own runs", async () => {

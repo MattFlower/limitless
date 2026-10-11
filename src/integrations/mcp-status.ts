@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
-import { commitSha } from "./mcp-change.ts";
+import { recordedHeadSchema, reviewableHead } from "./mcp-head.ts";
 
 export const statusDetailSchema = z.object({
+  prHead: recordedHeadSchema,
   run: z.object({
     id: z.string(),
     status: z.string(),
@@ -53,8 +54,7 @@ export function explainStatus(
   const latestRound = review?.rounds
     .toSorted((a, b) => (a.round ?? a.createdAt ?? 0) - (b.round ?? b.createdAt ?? 0))
     .at(-1);
-  const observedHead = commitSha.safeParse(pr?.headRefOid);
-  const headSha = observedHead.success ? observedHead.data : null;
+  const { headSha, problem } = reviewableHead(pr?.headRefOid, detail.prHead);
   const land = lands
     .filter((entry) => entry.runId === run.id || (run.prUrl && entry.prUrl === run.prUrl))
     .sort((a, b) => b.id - a.id)[0];
@@ -148,6 +148,11 @@ export function explainStatus(
     return result(
       "Draft PR needs attention",
       "Inspect the draft and its delivery evidence before reviewing.",
+    );
+  if (problem === "superseded")
+    return result(
+      "PR head superseded",
+      "Wait for the push and a matching saved PR observation; check limitless_status again.",
     );
   if (!headSha)
     return result("PR head unknown", "Inspect the current PR head before requesting limitless_land.");

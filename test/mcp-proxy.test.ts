@@ -10,7 +10,7 @@ import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { registerCredential } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import {
   type ChangePage,
   changeFixture,
@@ -92,7 +92,7 @@ test("HTTP-backed change pages match direct MCP for the pinned code and report",
 test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and report intact", async () => {
   const c = await changeFixture(f, {
     "hello.txt": "hello\nnew greeting\n",
-    "src/count.ts": "export const limit = 3;\n",
+    "src/count.ts": "export const publicCounterName = 3;\n",
   });
   const report = "AC-1 met: src/count.ts sets the limit to 3 (verified at 100%).";
   f.factory.store.setRunState(c.run.id, {
@@ -103,6 +103,16 @@ test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and rep
       acceptance_criteria: [{ id: "AC-1", criterion: "The limit is 3.", how_to_verify: "bun test" }],
       out_of_scope: [],
       blocking_questions: [],
+    },
+    lastVerify: {
+      criteria: [
+        {
+          id: "AC-1",
+          evidence: "Observed 'publicCounterName' in the public criterion.",
+          publicSummary: "",
+          status: "met",
+        },
+      ],
     },
     holdout: {
       scenarios: [
@@ -134,7 +144,7 @@ test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and rep
       ]);
       // "2" is a private holdout literal, yet Git's hunk range and the code stay readable.
       expect(first.diff.text).toContain("@@ -1 +1,2 @@\n hello\n+new greeting\n");
-      expect((await read(1)).diff.text).toContain("+export const limit = 3;\n");
+      expect((await read(1)).diff.text).toContain("+export const publicCounterName = 3;\n");
       expect(first.reports[0]?.text).toBe(report);
       for (const text of [first.diff.text, (await read(1)).diff.text, first.reports[0]?.text])
         expect(text).not.toMatch(/private detail|withheld/);
@@ -231,6 +241,176 @@ test.each(["maxWords", "cafe\u0301"])(
     }
   },
 );
+
+test.each([2, 3])(
+  "change pages protect %i-line holdout prose in descriptions, steps and expectations",
+  async (length) => {
+    const prose = [
+      "Walk along the shoreline",
+      "until the lantern turns violet",
+      "and listen for the distant bell",
+    ].slice(0, length);
+    // The first line is context; the rest are added lines beyond the first page.
+    writeFileSync(join(f.repo, "hello.txt"), `${prose[0]}\n`);
+    await sh(["git", "commit", "-am", "public context"], { cwd: f.repo });
+    const c = await changeFixture(f, {
+      "hello.txt": `${"unrelated readable line\n".repeat(800)}${prose.join("\n")}\nmore readable code\n`,
+    });
+    const connections = await changeConnections();
+    try {
+      for (const field of ["description", "steps", "expected"] as const) {
+        f.factory.store.setRunState(c.run.id, {
+          holdout: {
+            scenarios: [
+              {
+                id: "H-1",
+                description: "Private check.",
+                steps: "Perform check.",
+                expected: "Check completes.",
+                edge_case: false,
+                [field]: prose.join("\n"),
+              },
+            ],
+          },
+        });
+        for (const conn of [connections.direct, connections.proxy]) {
+          let text = "",
+            offset = 0;
+          do {
+            const page = resultValue<ChangePage>(
+              await conn.client.callTool({
+                name: "limitless_get_change",
+                arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, diffOffset: offset },
+              }),
+            );
+            expect(page.available).toBe(true);
+            text += page.diff.text;
+            offset = page.diff.nextOffset ?? 0;
+          } while (offset);
+          for (const line of prose) expect(text).not.toContain(line);
+          expect(text).toContain("unrelated readable line");
+          expect(text).toContain("more readable code");
+          expect(text).toContain("[private detail]");
+        }
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test("change pages protect persisted verifier literals and never return owner-only rows", async () => {
+  const hidden = "runtimeProbeSecret",
+    diagnosticOnly = "ownerOnlyProbeSecret",
+    plainObserved = "violettide";
+  const c = await changeFixture(f, {
+    "hello.txt": `${"readable line\n".repeat(1500)}${hidden}\n${diagnosticOnly}\n${plainObserved}\n`,
+    [`${hidden}.txt`]: "private filename\n",
+  });
+  const { store } = f.factory;
+  const holdout = {
+    scenarios: [
+      {
+        id: "H-1",
+        description: "Exercise private behavior.",
+        steps: "Run the check.",
+        expected: "It completes.",
+        edge_case: false,
+      },
+    ],
+  };
+  const verify = {
+    criteria: [
+      {
+        id: "H-1",
+        status: "met",
+        evidence: `Observed '${hidden}' during verification.`,
+        publicSummary: "Behavior confirmed.",
+      },
+    ],
+    notes: "",
+    overall: "pass",
+  };
+  store.setRunState(c.run.id, {
+    holdout,
+    lastVerify: verify,
+    verifyResults: [{ ...verify, modelOutput: verify }],
+  });
+  const invocation = store.createInvocation({
+    runId: c.run.id,
+    stageId: null,
+    role: "verify",
+    harness: "fake",
+    provider: "fake",
+    model: "test",
+    modelId: "fake/m",
+  });
+  store.recordOwnerDiagnostic(
+    {
+      runId: c.run.id,
+      invocationId: invocation.id,
+      kind: "result",
+      text: `Observed '${diagnosticOnly}' during verification.`,
+    },
+    "Observed '[private detail]' during verification.",
+  );
+  store.recordOwnerDiagnostic(
+    { runId: c.run.id, invocationId: invocation.id, kind: "result", text: JSON.stringify(plainObserved) },
+    '"[private detail]"',
+  );
+  store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    `${"readable report\n".repeat(600)}${hidden}\n${diagnosticOnly}\n${plainObserved}`,
+  );
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const streams: string[] = [];
+      for (const stream of ["diff", "report"] as const) {
+        let text = "",
+          offset = 0;
+        do {
+          const response = await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: {
+              run: c.run.id,
+              headSha: c.headSha,
+              baseSha: c.baseSha,
+              [stream === "diff" ? "diffOffset" : "reportOffset"]: offset,
+            },
+          });
+          const output = JSON.stringify(response);
+          for (const privateText of [
+            hidden,
+            diagnosticOnly,
+            plainObserved,
+            "owner_diagnostics",
+            "invocationId",
+            "Observed '",
+          ])
+            expect(output).not.toContain(privateText);
+          const page = resultValue<ChangePage>(response);
+          expect(page.files[1]?.path).toContain("private detail");
+          const content = stream === "diff" ? page.diff : page.reports[0];
+          if (!content) throw new Error("Missing report");
+          text += content.text;
+          offset = content.nextOffset ?? 0;
+        } while (offset);
+        streams.push(text);
+      }
+      const [patch = "", report = ""] = streams;
+      expect(patch).toContain("readable line");
+      expect(patch).toContain("[private detail]");
+      expect(report).toContain("readable report");
+      expect(report).toContain("[private detail]");
+    }
+    expect(ownerDiagnostics(store.db, c.run.id)[0]?.text).toContain(diagnosticOnly);
+  } finally {
+    await connections.close();
+  }
+});
 
 test("a rendered report never exposes a clipped holdout scenario description", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
@@ -389,8 +569,47 @@ test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [in
   },
 );
 
+test.each(["newer recorded head", "push in progress", "missing recorded head"])(
+  "status and change view refuse a stale snapshot with %s on both backends",
+  async (condition) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" }, true);
+    const { store } = f.factory;
+    if (condition === "newer recorded head") store.observePrHead(c.prUrl, c.baseSha);
+    else if (condition === "push in progress") {
+      const pushing = store.createRun(c.repo, { repo: c.repo.slug, prompt: "Push review changes" });
+      store.beginPrPush(c.prUrl, c.headSha, pushing.id);
+    } else store.db.query("DELETE FROM pr_heads WHERE pr_url = ?").run(c.prUrl);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const status = resultValue<{ state: string; nextAction: string; headSha: string | null }>(
+          await conn.client.callTool({ name: "limitless_status", arguments: { run: c.run.id } }),
+        );
+        expect(status.headSha).toBeNull();
+        expect(status.state).toBe(
+          condition === "missing recorded head" ? "PR head unknown" : "PR head superseded",
+        );
+        expect(status.nextAction).not.toContain(c.headSha);
+        expect(status.nextAction).not.toContain("submit limitless_review");
+        expect(
+          resultValue(
+            await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+          ),
+        ).toMatchObject({
+          available: false,
+          reason: expect.stringContaining(
+            condition === "missing recorded head" ? "unavailable" : "superseded",
+          ),
+        });
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
 test("original-run status follows in-flight, failed and delivered rounds and reviews the observed head", async () => {
-  const c = await changeFixture(f, { "hello.txt": "new greeting\n" }, true);
+  const c = await changeFixture(f, { "hello.txt": "new greeting\nroundRuntimeSecret\n" }, true);
   const { store } = f.factory;
   c.observe(c.baseSha);
   const created = store.createReviewRound(
@@ -413,7 +632,21 @@ test("original-run status follows in-flight, failed and delivered rounds and rev
       if (status === "succeeded") {
         store.markRoundDelivered(created.run.id, c.headSha);
         c.observe(c.headSha);
-        store.putArtifact(created.run.id, "report.md", "report", "Round report");
+        store.setRunState(created.run.id, {
+          holdout: {
+            scenarios: [
+              {
+                id: "H-1",
+                description: "Exercise round behavior.",
+                steps: "Run the round check.",
+                expected: "Check completes.",
+                edge_case: false,
+              },
+            ],
+          },
+          lastVerify: { criteria: [{ id: "H-1", evidence: "Observed 'roundRuntimeSecret'." }] },
+        });
+        store.putArtifact(created.run.id, "report.md", "report", "Round report\nroundRuntimeSecret");
       }
       for (const conn of [connections.direct, connections.proxy]) {
         const value = resultValue<{ state: string; nextAction: string }>(
@@ -449,7 +682,10 @@ test("original-run status follows in-flight, failed and delivered rounds and rev
       [c.run.id, true],
       [created.run.id, true],
     ]);
-    expect(view.reports[1]?.text).toBe("Round report");
+    expect(view.headSha).toBe(c.headSha);
+    expect(view.diff.text).toContain("new greeting");
+    expect(view.diff.text).not.toContain("roundRuntimeSecret");
+    expect(view.reports[1]?.text).toBe("Round report\n[private detail] [1 private details withheld]");
   } finally {
     await connections.close();
   }
@@ -756,6 +992,7 @@ test("status explains review, input, land and terminal states using saved observ
     ...f.factory.store.getRunDetail(run.id),
     run: { ...run, status: "succeeded", prUrl },
     prSnapshot: { state: "OPEN", headRefOid: sha },
+    prHead: { sha, version: 1, pushing: false },
     review: { approval: null, rounds: [] },
   };
   const entry = { id: 1, runId: run.id, prUrl, state: "queued", reason: null };
@@ -795,6 +1032,7 @@ test("status explains review, input, land and terminal states using saved observ
       [
         {
           prSnapshot: { state: "OPEN", headRefOid: "b".repeat(40) },
+          prHead: { sha: "b".repeat(40), version: 2, pushing: false },
           review: { approval: { sha, stale: false }, rounds: [] },
         },
         [],
@@ -923,6 +1161,7 @@ test.each(["failed", "cancelled"] as const)(
     if (!("run" in round)) throw new Error("Expected a review round");
     store.updateRun(round.run.id, { status });
     store.db.query("UPDATE review_rounds SET created_at = ? WHERE run_id = ?").run(10, round.run.id);
+    store.observePrHead(prUrl, sha);
     store.recordApproval(run.id, prUrl, sha, "reviewer");
     store.db.query("UPDATE review_approvals SET created_at = ? WHERE pr_url = ?").run(20, prUrl);
     const routes = createHttpRoutes(f.factory);

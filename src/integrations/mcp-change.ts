@@ -1,14 +1,15 @@
 import { constants } from "node:os";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
+import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
 import { normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
 import { holdoutBoundaryPattern, privateHoldoutDetails } from "../pipeline/prompts.ts";
-import { HoldoutSchema, renderSpec, SpecSchema } from "../pipeline/schemas.ts";
+import { HoldoutSchema, renderSpec, rowKind, SpecSchema } from "../pipeline/schemas.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
+import { commitSha, reviewableHead } from "./mcp-head.ts";
 
-export const commitSha = z.string().regex(/^[a-fA-F0-9]{40}$/);
 export const ChangeQuerySchema = z
   .object({
     run: z.string().trim().min(1),
@@ -33,6 +34,21 @@ const FILES_CAP = 50;
 const DISTINCTIVE_LENGTH = 12;
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
+// Only the verifier text fields: routing and checkpoint metadata are public structure.
+const verificationText = z.object({
+  notes: z.string().optional(),
+  criteria: z
+    .array(
+      z.object({
+        id: z.string(),
+        evidence: z.string().optional(),
+        publicSummary: z.string().optional(),
+        requirementCitation: z.string().nullish(),
+        gateEvidence: z.object({ check: z.string(), command: z.string() }).optional(),
+      }),
+    )
+    .optional(),
+});
 
 /**
  * Header lines (whose only free text is the already-vetted path) and hunk ranges are Git's
@@ -80,7 +96,14 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     .object({ headRefOid: commitSha, baseRefName: z.string().optional(), baseRefOid: commitSha.optional() })
     .safeParse(observed);
   if (!snapshot.success) return { available: false, reason: "Observed PR head unavailable." };
-  const headSha = snapshot.data.headRefOid;
+  const recorded = owner.prUrl ? store.prHead(owner.prUrl) : null;
+  const head = reviewableHead(
+    snapshot.data.headRefOid,
+    recorded && { ...recorded, pushing: store.pushingTo(owner.prUrl ?? "") },
+  );
+  if (head.problem)
+    return { available: false, reason: `PR head ${head.problem}; restart limitless_get_change.` };
+  const headSha = head.headSha;
   if (q.headSha && q.headSha !== headSha)
     return { available: false, reason: "PR head superseded; restart limitless_get_change." };
   const baseBranch = snapshot.data.baseRefName ?? owner.baseBranch;
@@ -95,16 +118,71 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const details = new Set<string>();
   for (const id of [owner.id, ...rounds.map((round) => round.runId)]) {
     const state = z
-      .object({ holdout: HoldoutSchema.optional(), spec: SpecSchema.nullish().catch(null) })
+      .object({
+        holdout: HoldoutSchema.optional(),
+        spec: SpecSchema.nullish().catch(null),
+        lastVerify: verificationText.nullish(),
+        verifyResults: z
+          .array(verificationText.extend({ modelOutput: verificationText.optional() }))
+          .optional(),
+      })
       .safeParse(store.getRunState(id) ?? {});
     if (!state.success) return { available: false, reason: "Holdout policy unavailable; content withheld." };
     const { holdout, spec } = state.data;
-    if (!holdout) continue;
+    if (!holdout?.scenarios.length) continue;
     // Same exemption as verifier feedback: what the run's request and spec already state is public.
     const publicSources = [store.getRun(id)?.prompt ?? "", spec ? renderSpec(spec) : "", ...errnoNames].join(
       "\n",
     );
-    for (const detail of privateHoldoutDetails(holdout, publicSources)) details.add(detail);
+    const collect = (observed?: string) => {
+      for (const detail of privateHoldoutDetails(holdout, publicSources, observed)) {
+        details.add(detail);
+        // Patch prefixes interrupt whole multiline phrases. Protect each constituent line
+        // before paging, including prose without syntax-shaped literals.
+        if (/[\r\n]/u.test(detail))
+          for (const line of detail.split(/\r?\n/u)) if (line.trim()) details.add(line.trim());
+      }
+    };
+    const collectOutput = (value: unknown) => {
+      if (typeof value === "string") collect(value);
+      else if (value && typeof value === "object")
+        for (const field of Object.values(value)) collectOutput(field);
+    };
+    collect();
+    const collectVerification = (verify: z.output<typeof verificationText> | null | undefined) => {
+      collect(verify?.notes);
+      for (const criterion of verify?.criteria ?? []) {
+        // Public acceptance evidence/summaries stay public, as in preDeliveryVerifyArtifact.
+        if (rowKind(criterion.id, spec ?? null, holdout) !== "public")
+          collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation]);
+        collectOutput(criterion.gateEvidence);
+      }
+    };
+    collectVerification(state.data.lastVerify);
+    for (const verify of state.data.verifyResults ?? []) {
+      collectVerification(verify);
+      collectVerification(verify.modelOutput);
+    }
+    // These raw copies are internal catalogue inputs only, never response fields.
+    const verifiers = new Set(
+      store
+        .listInvocations(id)
+        .filter((v) => v.role === "verify")
+        .map((v) => v.id),
+    );
+    for (const diagnostic of ownerDiagnostics(store.db, id)) {
+      if (diagnostic.kind !== "run-error" && !verifiers.has(diagnostic.invocationId ?? -1)) continue;
+      // Result/error copies are the exact text redacted by the invocation boundary,
+      // including quoted JSON literals that lose their quotes when parsed.
+      if (diagnostic.kind !== "event") collect(diagnostic.text);
+      let output: unknown = diagnostic.text;
+      try {
+        output = JSON.parse(diagnostic.text);
+      } catch {
+        /* Plain verifier diagnostics are also private. */
+      }
+      collectOutput(output);
+    }
   }
   const pattern = details.size
     ? new RegExp(
@@ -165,7 +243,16 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     const baseSha = (await git(["merge-base", comparison, headSha])).trim();
     if (q.baseSha && q.baseSha !== baseSha)
       return { available: false, reason: "Comparison superseded; restart limitless_get_change." };
-    const counts = await git(["diff", "--no-renames", "--numstat", "-z", baseSha, headSha, "--"]);
+    const counts = await git([
+      "diff",
+      "--no-renames",
+      "--ignore-submodules=none",
+      "--numstat",
+      "-z",
+      baseSha,
+      headSha,
+      "--",
+    ]);
     const files = counts
       .split("\0")
       .filter(Boolean)
@@ -188,6 +275,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
             await git([
               "diff",
               "--no-renames",
+              "--ignore-submodules=none",
               "--unified=3",
               "--diff-algorithm=myers",
               "--no-indent-heuristic",
@@ -227,7 +315,14 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     }
     // Awaited Git reads must not return a head that advanced while the view was assembled.
     const current = owner.prUrl && store.githubPrData(owner.prUrl);
-    if (!current || JSON.parse(current).headRefOid !== headSha)
+    const now = owner.prUrl ? store.prHead(owner.prUrl) : null;
+    if (
+      !current ||
+      !now ||
+      now.version !== recorded?.version ||
+      reviewableHead(JSON.parse(current).headRefOid, { ...now, pushing: store.pushingTo(owner.prUrl ?? "") })
+        .headSha !== headSha
+    )
       return { available: false, reason: "PR head superseded; restart limitless_get_change." };
     return privateOutputData(
       {

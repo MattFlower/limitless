@@ -152,8 +152,9 @@ export async function changeFixture(
     baseBranch: "main",
     branch: "limitless/feature",
   });
-  const observe = (head: string) =>
-    f.factory.store.saveGithubPr({
+  const observe = (head: string) => {
+    if (/^[a-fA-F0-9]{40}$/.test(head)) f.factory.store.observePrHead(prUrl, head);
+    return f.factory.store.saveGithubPr({
       url: prUrl,
       repo: repo.slug,
       runId: run.id,
@@ -161,6 +162,7 @@ export async function changeFixture(
       nodeId: "PR_fixture",
       data: JSON.stringify({ state: "OPEN", headRefOid: head, baseRefName: "main" }),
     });
+  };
   observe(headSha);
   const report = `Factory report\n${"Reviewed locally.\n".repeat(400)}`;
   f.factory.store.putArtifact(run.id, "report.md", "report", report);
