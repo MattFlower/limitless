@@ -118,8 +118,9 @@ test("gate profile denies home and allows only run, recorded Git and trusted too
     const roots = writeRoots(work, scratch, true);
     const profile = seatbeltProfile(roots);
     expect(profile).toContain(`(deny file-read* (subpath "${root}")`);
-    for (const path of [work, scratch, common(), privateDir(), toolchain])
+    for (const path of [work, scratch, `${work}.git-paths`, common(), privateDir(), toolchain])
       expect(roots.allowRead).toContain(path);
+    expect(roots.protect).toContain(`${work}.git-paths`);
     expect(roots.allowRead).not.toContain(sibling);
     expect(roots.allowRead).not.toContain(root);
     expect(profile.indexOf("(allow file-read*")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
@@ -563,6 +564,52 @@ test.skipIf(seatbeltSkip !== null)(
         }
       },
     );
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `nested gate command reads its protected sidecar under denied home ${seatbeltSkip ?? ""}`,
+  async () => {
+    const gateWork = join(root, ".limitless/work/current");
+    mkdirSync(dirname(gateWork), { recursive: true });
+    await sh(["git", "-C", cache, "worktree", "add", "-q", "--detach", gateWork], { cwd: root });
+    await recordWorktree(gateWork);
+    const record = `${gateWork}.git-paths`;
+    const original = readFileSync(record, "utf8");
+    const module = (path: string) => JSON.stringify(join(import.meta.dir, "..", path));
+    writeFileSync(
+      join(gateWork, "nested.ts"),
+      `
+        import { strict as assert } from "node:assert";
+        import { readdirSync, writeFileSync } from "node:fs";
+        import { readPolicyScope } from ${module("src/harness/read-policy.ts")};
+        import { confinementScope, runConfined } from ${module("src/harness/sandbox.ts")};
+        import { agentEnv } from ${module("src/util/proc.ts")};
+        const denied = (action) => assert.throws(action, (error) =>
+          error.code === "EPERM" || error.code === "EACCES");
+        denied(() => writeFileSync(${JSON.stringify(record)}, "tampered"));
+        denied(() => readdirSync(${JSON.stringify(dirname(record))}));
+        // The outer gate enforces the policy; macOS cannot apply a second Seatbelt profile.
+        const backend = { verify: async () => {}, wrap: (cmd) => cmd };
+        const result = await readPolicyScope.run({ home: process.env.HOME, environment: {} },
+          () => confinementScope.run(backend, () => runConfined({
+            command: "printf nested-ok", cwd: process.cwd(), env: agentEnv(),
+          })));
+        assert.equal(result.exitCode, 0, result.stderr);
+        assert.equal(result.stdout, "nested-ok");
+        console.log("nested-ok");
+      `,
+    );
+    await readPolicyScope.run({ home: root, environment: {} }, async () => {
+      const result = await runConfined({
+        command: `'${process.execPath}' nested.ts`,
+        cwd: gateWork,
+        env: agentEnv(),
+      });
+      expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+      expect(result.stdout).toBe("nested-ok\n");
+    });
+    expect(readFileSync(record, "utf8")).toBe(original);
   },
 );
 

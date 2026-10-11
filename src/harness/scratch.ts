@@ -106,7 +106,7 @@ export interface WriteRoots {
   commands?: InvocationCommands;
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
-  /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
+  /** Read-only Git administration and the factory-recorded sidecar, even if a write root overlaps. */
   protect: string[];
 }
 
@@ -159,7 +159,8 @@ export function writeRoots(
           realpathSync(resolve(paths[1], readFileSync(join(paths[1], "commondir"), "utf8").trim()))
       )
         throw new Error();
-      readable.push(...paths.slice(1));
+      readable.push(record, ...paths.slice(1));
+      protectedPaths.push(record);
     } catch {
       throw new ConfinementError(`Missing or invalid trusted Git paths: ${record}`);
     }
