@@ -414,7 +414,8 @@ test.each(["blocked", "unmet"] as const)(
     }
     const head = await remoteHead();
     expect(head).not.toBe(old);
-    expect(draft).toBe(true);
+    expect(draft).toBe(false);
+    expect(calls.filter((args) => args[1] === "ready")).toEqual([]);
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain(head);
     expect(comments[0]?.body).toContain("🚧 blocked AC-1");

@@ -441,16 +441,17 @@ test("a changes verdict runs one round that pushes onto the PR branch with the f
   expect(kinds()).toEqual(expect.arrayContaining(["review.round_started", "review.round_delivered"]));
 });
 
-test.each(["none", "round-delivered", "delivery-complete"])(
+test.each(["none", "round-delivered", "delivery-complete", "draft"])(
   "an environment-blocked review round publishes its checked head, restarting at %s",
   async (checkpoint) => {
     const original = await delivered("standard");
     const old = await remoteHead();
     const id = (await changes(original.id)).body.round?.id as string;
+    pr.draft = checkpoint === "draft";
     verifyStatus = "blocked";
     const push = spyOn(repos, "pushExistingBranch");
     const commands = spyOn(proc, "sh");
-    if (checkpoint !== "none") {
+    if (checkpoint !== "none" && checkpoint !== "draft") {
       factory.deps.faults = {
         "store:save": { action: "kill", when: (c) => c.checkpoint === checkpoint },
       };
@@ -470,8 +471,8 @@ test.each(["none", "round-delivered", "delivery-complete"])(
       ]),
     );
     expect(verifyCalls).toBe(2);
-    expect(pr.draft).toBe(true);
-    expect(pr.calls.filter((args) => args[1] === "ready")).toEqual([["pr", "ready", PR_URL, "--undo"]]);
+    expect(pr.draft).toBe(checkpoint === "draft");
+    expect(pr.calls.filter((args) => args[1] === "ready")).toEqual([]);
     expect(pr.comments).toHaveLength(1);
     expect(pr.comments[0]?.body).toContain(head);
     expect(pr.comments[0]?.body).toContain("🚧 blocked AC-1");
@@ -493,6 +494,67 @@ test.each(["none", "round-delivered", "delivery-complete"])(
     });
   },
 );
+
+test.each(["terminal reason", "missing terminal reason", "verify SHA", "verify round"])(
+  "a resumed environment block with a stale %s never publishes",
+  async (stale) => {
+    const original = await delivered("standard");
+    const old = await remoteHead();
+    const id = (await changes(original.id)).body.round?.id as string;
+    verifyStatus = "blocked";
+    factory.deps.faults = { "stage:deliver:before": { action: "kill" } };
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+    const state = factory.store.getRunState<RunState>(id);
+    const latest = state?.verifyResults?.at(-1);
+    if (!state?.needsHumanReason || !latest) throw new Error("missing environment stop");
+    if (stale === "terminal reason") state.terminalReason = "rounds exhausted";
+    else if (stale === "missing terminal reason") delete state.terminalReason;
+    else if (stale === "verify SHA") latest.sha = old;
+    else latest.round = state.round - 1;
+    factory.store.setRunState(id, state);
+    await restart();
+    const push = spyOn(repos, "pushExistingBranch");
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+    expect(push).not.toHaveBeenCalled();
+    expect(await remoteHead()).toBe(old);
+    expect(pr.comments).toHaveLength(0);
+    expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
+    if (stale === "terminal reason") {
+      expect(factory.store.getRun(id)?.error).toBe("rounds exhausted");
+      expect(factory.store.getRunState<RunState>(id)?.needsHumanReason).toBe("rounds exhausted");
+    }
+  },
+);
+
+test("an oversized blocked-round report posts bounded evidence and a full-report reference", async () => {
+  const original = await delivered("standard");
+  const largeFindings = Array.from({ length: 20 }, (_, i) => ({
+    ...findings[0],
+    title: `Finding ${i}`,
+    detail: "quoted detail ".repeat(1420),
+  }));
+  const created = await review(original.id, {
+    verdict: "changes",
+    reviewedSha: await remoteHead(),
+    findings: largeFindings,
+  });
+  expect(created.status).toBe(201);
+  const id = created.body.round?.id as string;
+  verifyStatus = "blocked";
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  expect(pr.comments).toHaveLength(1);
+  const comment = pr.comments[0]?.body ?? "";
+  expect(comment.length).toBeLessThanOrEqual(60_000);
+  expect(comment).toContain(`<!-- limitless-review-round:${id} -->`);
+  expect(comment).toContain(await remoteHead());
+  expect(comment).toContain("🚧 blocked AC-1");
+  expect(comment).toContain("🚧 blocked H-1");
+  expect(comment).toContain("Real confinement probes require unconfined gates");
+  expect(comment).toContain(`Full report: ${factory.cfg.uiUrl}/runs/${id}`);
+  const report = factory.store.getArtifact(id, "report.md") ?? "";
+  expect(report.length).toBeGreaterThan(65_536);
+  expect(report).toContain(largeFindings[0]?.detail ?? "missing finding");
+});
 
 test.each(["unmet", "unclear"] as const)(
   "a required %s criterion alongside a block never publishes",

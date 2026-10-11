@@ -179,7 +179,14 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
-    if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
+    if (ctx.state.needsHumanReason)
+      throw new NeedsHumanError(
+        ctx.state.needsHumanReason.startsWith(ENVIRONMENT_BLOCKED) &&
+          ctx.state.terminalReason &&
+          !ctx.state.terminalReason.startsWith(ENVIRONMENT_BLOCKED)
+          ? ctx.state.terminalReason
+          : ctx.state.needsHumanReason,
+      );
     ctx.state.flow ??= "build";
     await ctx.save();
     if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
@@ -341,6 +348,16 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         if (err instanceof NeedsHumanError) message = err.message;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
+    }
+    if (
+      !message.startsWith(ENVIRONMENT_BLOCKED) &&
+      (ctx.state.needsHumanReason?.startsWith(ENVIRONMENT_BLOCKED) ||
+        ctx.state.terminalReason?.startsWith(ENVIRONMENT_BLOCKED)) &&
+      (ctx.state.needsHumanReason !== message || ctx.state.terminalReason !== message)
+    ) {
+      ctx.state.needsHumanReason = redactCredentials(message);
+      ctx.state.terminalReason = ctx.state.needsHumanReason;
+      deps.store.setRunState(runId, ctx.state);
     }
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
     deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
@@ -1129,6 +1146,7 @@ async function oneRound(
       const owner = reviewRound(ctx)?.owner;
       const base = (owner ? owner.baseBranch : ctx.run.baseBranch) ?? ctx.repo.defaultBranch;
       ctx.state.terminalReason = `the resolution leaves no change against ${base}`;
+      ctx.state.needsHumanReason = undefined;
       await ctx.save();
       throw new NeedsHumanError(ctx.state.terminalReason);
     }
@@ -1782,7 +1800,8 @@ function environmentBlockedRound(ctx: RunContext): boolean {
   const verify = ctx.state.verifyResults?.at(-1);
   return (
     !!reviewRound(ctx) &&
-    !!ctx.state.needsHumanReason?.startsWith(ENVIRONMENT_BLOCKED) &&
+    !!ctx.state.terminalReason?.startsWith(ENVIRONMENT_BLOCKED) &&
+    ctx.state.terminalReason === ctx.state.needsHumanReason &&
     !!ctx.state.lastVerify &&
     blockedOnly(ctx.state.lastVerify) &&
     verify?.round === ctx.state.round &&
@@ -2012,21 +2031,36 @@ async function deliverReviewRound(
     }
     const blocked = environmentBlockedRound(ctx);
     if (blocked || review.kind === "conflict" || review.kind === "ci") {
-      if (blocked && !pr.isDraft) await gh(["pr", "ready", prUrl, "--undo"], ctx.signal);
       const marker = `<!-- limitless-${review.kind}-round:${ctx.run.id} -->`;
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
         .comments as { body?: string }[] | undefined;
       if (!comments?.some((comment) => comment.body?.includes(marker))) {
         const failure = ctx.store.ciFixFailure(ctx.run.id);
         if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
-        const text = redactCredentials(
-          (review.kind === "ci"
+        let text = redactCredentials(
+          review.kind === "ci"
             ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${JSON.stringify(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
             : review.kind === "conflict"
               ? `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`
-              : `${marker}\nRound ${review.round} published at ${head}.`) +
-            (blocked ? `\n\n${buildReport(ctx, false)}` : ""),
+              : `${marker}\nRound ${review.round} published at ${head}.`,
         );
+        if (blocked) {
+          const publicSources = await ctx.publicHoldoutSources();
+          const rows = (ctx.state.lastVerify?.criteria ?? [])
+            .filter((c) => c.status === "blocked")
+            .map((c, index) => {
+              if (rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown")
+                return `🚧 blocked unknown-${index + 1}: private evidence withheld`;
+              const evidence = redactCredentials(
+                redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources),
+              ).slice(0, 300);
+              return `🚧 blocked ${c.id}: ${evidence}`;
+            });
+          // Keep checked-head evidence ahead of quoted requests; the full report is a run artifact.
+          text = redactCredentials(
+            `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+          ).slice(0, 60_000);
+        }
         await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
         await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);
       }
@@ -2166,6 +2200,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               }
               if (reason) {
                 ctx.state.terminalReason = reason;
+                ctx.state.needsHumanReason = undefined;
                 ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
@@ -2182,6 +2217,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             if (!confirmingHead) throw error;
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
+            ctx.state.needsHumanReason = undefined;
             ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
