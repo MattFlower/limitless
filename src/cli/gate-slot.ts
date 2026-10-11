@@ -3,6 +3,7 @@ import { constants } from "node:os";
 import { parseArgs } from "node:util";
 import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
 import { redactCredentials } from "../util/proc.ts";
+import { apiTokenHeaders } from "./api-token.ts";
 import { bounded, DaemonTimeoutError, type DeployClock, deployClock, parseMaxWait } from "./deploy-wait.ts";
 
 type Reply = {
@@ -45,7 +46,11 @@ export const localLeaseClient =
   async (body, signal) => {
     const response = await fetch(`http://127.0.0.1:${port}/api/admin/gate-slot`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      // An agent's per-invocation capability is its only credential; the daemon accepts it for this route only.
+      headers: {
+        "content-type": "application/json",
+        ...(typeof body.token === "string" ? { authorization: `Bearer ${body.token}` } : apiTokenHeaders()),
+      },
       body: JSON.stringify(body),
       signal,
       ...(unix ? { unix } : {}),
@@ -53,8 +58,8 @@ export const localLeaseClient =
     if ([404, 405, 501].includes(response.status) && body.token === undefined)
       throw new Error("gate-slot endpoint unsupported");
     if (!response.ok) {
-      const detail: unknown =
-        body.token === undefined ? undefined : await response.json().catch(() => undefined);
+      // Keep the daemon's reason (an authentication error names the fix); it is redacted before display.
+      const detail: unknown = await response.json().catch(() => undefined);
       const message =
         detail && typeof detail === "object" && "error" in detail && typeof detail.error === "string"
           ? `: ${redactCredentials(detail.error)}`

@@ -228,6 +228,12 @@ export class AgentTestSession {
   }
 }
 
+/** Whether a request carries a live invocation capability; the daemon accepts it for the gate-slot route only. */
+export function liveAgentTestCapability(authorization: string | null): boolean {
+  const token = /^Bearer ([0-9a-f-]{36})$/i.exec(authorization ?? "")?.[1];
+  return token !== undefined && sessions.has(token);
+}
+
 export async function agentTestLease(body: Record<string, unknown>) {
   const session = typeof body.token === "string" ? sessions.get(body.token) : undefined;
   if (!session) throw new Error("invalid agent-test capability");

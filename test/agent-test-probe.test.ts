@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { buildClaudeArgs } from "../src/harness/claude.ts";
 import { editorProfile } from "../src/harness/codex.ts";
-import { seatbeltBackend } from "../src/harness/sandbox.ts";
+import { seatbeltForPort } from "../src/harness/sandbox.ts";
 import {
   commandDir,
   createCommandRoot,
@@ -74,7 +74,9 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
           mkdirSync(home);
           extra = { CODEX_HOME: home };
           cmd = [codex, "sandbox", ...editorProfile(spec), "--", ...command];
-        } else if (sandbox === "claude-editor") cmd = seatbeltBackend.wrap(command, writeRoots(cwd, scratch));
+          // As in production: Claude editors' outer profile denies the daemon's own port (#484).
+        } else if (sandbox === "claude-editor")
+          cmd = seatbeltForPort(Number(http.port)).wrap(command, writeRoots(cwd, scratch));
         else {
           const args = buildClaudeArgs(spec, "probe");
           const settings = JSON.parse(args[args.indexOf("--settings") + 1] ?? "{}");
@@ -107,7 +109,14 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
         console.info(
           `${sandbox}: HTTP, Unix, own capability, other capability = ${JSON.stringify(observed)}`,
         );
-        const transports = sandbox === "claude-reader" ? [false, false] : [true, true];
+        // Claude editors reach the lease service only through their invocation socket; Codex editors keep
+        // loopback HTTP, where the capability is their credential.
+        const transports =
+          sandbox === "claude-reader"
+            ? [false, false]
+            : sandbox === "claude-editor"
+              ? [false, true]
+              : [true, true];
         expect(observed).toEqual([...transports, true, false]);
       } finally {
         if (sandbox === "claude-reader") await SandboxManager.reset();

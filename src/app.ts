@@ -14,7 +14,7 @@ import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
-import { seatbeltBackend } from "./harness/sandbox.ts";
+import { seatbeltForPort } from "./harness/sandbox.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
@@ -161,7 +161,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
-      confinement: opts.confinement ?? seatbeltBackend,
+      confinement: opts.confinement ?? seatbeltForPort(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
       store: this.store,

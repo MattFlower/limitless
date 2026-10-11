@@ -15,7 +15,7 @@ if (import.meta.main) {
       : { structured: { action: { type: "propose_run", ...proposalFields } }, delayMs: 500 };
   });
   const ui = await (await import("../src/server/ui.ts")).buildUi();
-  const server = startHttp(fixture.factory, { ui });
+  const server = await startHttp(fixture.factory, { ui });
   console.log(`Fake-only chat UI: ${server.url}chat`);
   const stop = () => {
     server.stop(true);

@@ -229,7 +229,7 @@ test("daemon API and CLI dry run leave Git, files and DB unchanged", async () =>
   store.updateRun(r.id, { finishedAt: Date.now() - 31 * DAY });
   store.db.query("UPDATE events SET ts = ? WHERE id = ?").run(Date.now() - 15 * DAY, event.id);
   const factory = new Factory(cfg, { store, providers: [] });
-  const server = startHttp(factory);
+  const server = await startHttp(factory);
   try {
     const before = await listed();
     const url = `http://127.0.0.1:${server.port}`;
@@ -271,7 +271,7 @@ test("gates clear-cache drops cached baselines for one repo or all of them", asy
   store.putBaselineCache({ ...key, repoId: other.id }, pass, "r");
   const count = () => store.db.query("SELECT repo_id FROM passing_baselines ORDER BY repo_id").all();
   const factory = new Factory(cfg, { store, providers: [] });
-  const server = startHttp(factory);
+  const server = await startHttp(factory);
   const url = `http://127.0.0.1:${server.port}`;
   const cli = (...args: string[]) =>
     sh(["bun", "src/cli/main.ts", "gates", "clear-cache", ...args], {

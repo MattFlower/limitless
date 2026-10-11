@@ -1,8 +1,32 @@
 import { expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { runInNewContext } from "node:vm";
 import { authCommand, readSecret } from "../src/cli/auth.ts";
 import { Store } from "../src/db/store.ts";
-import { Auth, LoginLimiter, localPath, SESSION_COOKIE } from "../src/server/auth.ts";
+import { Auth, LoginLimiter, localPath, loginPage, SESSION_COOKIE } from "../src/server/auth.ts";
+
+test("the rendered login page redirects only for a successful non-null session reply", async () => {
+  const html = await loginPage("/runs/test").text();
+  const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+  if (!script) throw new Error("login script missing");
+  for (const [ok, session, redirects] of [
+    [true, null, 0],
+    [false, { id: "owner" }, 0],
+    [true, { id: "owner" }, 1],
+  ] as const) {
+    const replaced: string[] = [];
+    runInNewContext(script, {
+      fetch: async () => ({ ok, json: async () => ({ session }) }),
+      location: { replace: (path: string) => replaced.push(path) },
+      document: {
+        forms: [{ next: { value: "/runs/test" } }],
+        getElementById: () => ({ addEventListener: () => {} }),
+      },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(replaced).toEqual(redirects ? ["/runs/test"] : []);
+  }
+});
 
 const DAY = 86_400_000;
 const cookieOf = (setCookie: string) => new Headers({ cookie: `theme=dark; ${setCookie.split(";")[0]}` });

@@ -98,6 +98,7 @@ export function validateScratch(spec: AgentSpec): string {
 }
 
 export interface WriteRoots {
+  daemonPort?: number;
   denyRead?: string[];
   /** Every invocation's command capabilities are unreadable, except this invocation's own. */
   commands?: InvocationCommands;
