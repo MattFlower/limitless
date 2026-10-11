@@ -304,6 +304,10 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   if (!Array.isArray(origins)) throw new Error("server.public_origins must be an array of HTTP(S) origins");
   if (server.auth !== undefined && server.auth !== "required" && server.auth !== "proxy")
     throw new Error('server.auth must be "required" or "proxy"');
+  if (server.require_api_token === true && trustedProxies.some(isLoopback) && server.auth === "proxy")
+    throw new Error(
+      'server.require_api_token with loopback server.trusted_proxies requires server.auth = "required"',
+    );
   if (server.auth !== "proxy" && origins.some((o) => publicOrigin(o).startsWith("http:")))
     throw new Error('server.auth = "required" needs https public_origins (the session cookie is Secure)');
   const auth = (raw.auth ?? {}) as Record<string, unknown>;

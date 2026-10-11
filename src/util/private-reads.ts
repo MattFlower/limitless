@@ -1,13 +1,15 @@
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 const privatePaths = new Map<string, number>();
 
 /** Protect a private file in both its configured and canonical spellings. */
 export function protectPrivateFile(path: string, sidecars = false): () => void {
-  const paths = [...new Set([resolve(path), realpathSync(path)])].flatMap((p) =>
-    sidecars ? [p, `${p}-wal`, `${p}-shm`] : [p],
-  );
+  // Token protection is registered before its file is published.
+  const canonical = join(realpathSync(dirname(path)), basename(path));
+  const paths = [
+    ...new Set([resolve(path), canonical, ...(existsSync(path) ? [realpathSync(path)] : [])]),
+  ].flatMap((p) => (sidecars ? [p, `${p}-wal`, `${p}-shm`] : [p]));
   for (const p of paths) privatePaths.set(p, (privatePaths.get(p) ?? 0) + 1);
   let released = false;
   return () => {

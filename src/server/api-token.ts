@@ -4,19 +4,24 @@ import { join } from "node:path";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { registerCredential } from "../util/proc.ts";
 
-/** Rotate before listening; atomic replacement keeps clients from reading a partial token. */
+/** Protect before launching work; publish only after all listeners bind successfully. */
 export function createApiToken(home: string) {
   const token = randomBytes(32).toString("hex");
   registerCredential("LIMITLESS_API_TOKEN", token);
   const path = join(home, "api-token");
-  const temp = `${path}.${crypto.randomUUID()}`;
-  try {
-    writeFileSync(temp, token, { flag: "wx", mode: 0o600 });
-    renameSync(temp, path);
-  } finally {
-    rmSync(temp, { force: true });
-  }
-  return { token, release: protectPrivateFile(path) };
+  return {
+    token,
+    release: protectPrivateFile(path),
+    publish() {
+      const temp = `${path}.${crypto.randomUUID()}`;
+      try {
+        writeFileSync(temp, token, { flag: "wx", mode: 0o600 });
+        renameSync(temp, path);
+      } finally {
+        rmSync(temp, { force: true });
+      }
+    },
+  };
 }
 
 export function matchesApiToken(header: string | null, token?: string): boolean {

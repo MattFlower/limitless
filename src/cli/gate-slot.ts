@@ -18,7 +18,10 @@ export const localLeaseClient =
       signal,
     });
     if ([404, 405, 501].includes(response.status)) throw new Error("gate-slot endpoint unsupported");
-    if (!response.ok) throw new LeaseRejected(`gate-slot: HTTP ${response.status}`);
+    if (!response.ok) {
+      const reply = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new LeaseRejected(`gate-slot: HTTP ${response.status}${reply?.error ? `: ${reply.error}` : ""}`);
+    }
     const result: Reply = await response.json().catch(() => {
       throw new LeaseRejected("invalid gate-slot JSON");
     });

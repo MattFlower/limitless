@@ -7,6 +7,7 @@ import { githubDoctor } from "../integrations/github-poller.ts";
 import { installIntegrations, repositoryRoot, sessionStartInstructions } from "../integrations/install.ts";
 import { resolveCatalog } from "../router/config-catalog.ts";
 import { sh } from "../util/proc.ts";
+import { apiTokenHeaders } from "./api-token.ts";
 import { patchSetupConfig } from "./setup-config.ts";
 export type Check = { id: string; status: "ok" | "warn" | "fail"; message: string; fix?: string };
 type CommandResult = { exitCode: number | null; stdout: string; stderr: string };
@@ -14,9 +15,13 @@ type SmokeRow = { name: string; status: "pass" | "fail" | "skip"; reason?: strin
 type Health = { ok: boolean; sha: string };
 type ModelList = { data?: { id: string; type?: string }[] };
 export type SetupDeps = ReturnType<typeof setupDeps>;
-async function get(d: SetupDeps, url: string, token?: string) {
+async function get(d: SetupDeps, url: string, token?: string, local = false) {
   try {
-    const headers: HeadersInit = token ? { authorization: `Bearer ${token}` } : {};
+    const headers: HeadersInit = token
+      ? { authorization: `Bearer ${token}` }
+      : local
+        ? apiTokenHeaders(d.config.paths.home)
+        : {};
     return await d.fetch(url, { method: "GET", signal: AbortSignal.timeout(2000), headers });
   } catch {
     return null;
@@ -146,7 +151,7 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
   const smokeMessage = smokeOk ? "last smoke passed" : `missing or failed smoke: ${failed.join(", ")}`;
   add("smoke", smokeOk ? "ok" : "warn", smokeMessage);
   try {
-    const response = health?.ok ? await get(d, `${d.url}/api/github/access`) : null;
+    const response = health?.ok ? await get(d, `${d.url}/api/github/access`, undefined, true) : null;
     const problems = response?.ok ? ((await response.json()) as GitHubAccessProblem[]) : null;
     if (problems && !Array.isArray(problems)) throw new Error("invalid access feed");
     const lines = problems ? githubDoctor(problems) : [];

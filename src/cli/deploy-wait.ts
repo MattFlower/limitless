@@ -85,7 +85,10 @@ export function localDeployClient(port: number): DeployClient {
     });
     if (response.status === 404 && path.startsWith("/api/admin/"))
       throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
-    if (!response.ok) throw new Error(`${method} ${path}: HTTP ${response.status}`);
+    if (!response.ok) {
+      const reply = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(`${method} ${path}: HTTP ${response.status}${reply?.error ? `: ${reply.error}` : ""}`);
+    }
     return response.json();
   }
   return {

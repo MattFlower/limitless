@@ -137,6 +137,10 @@ function formatEvent(e: RunEvent): string {
 
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
   const res = await fetch(`${BASE}/api/runs/${runId}/stream?after=${after}`, { headers: apiTokenHeaders() });
+  if (!res.ok) {
+    const reply = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(`${res.status}: ${reply?.error ?? res.statusText}`, res.status);
+  }
   if (!res.body) return;
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";
@@ -186,8 +190,7 @@ async function serve(): Promise<void> {
   const { resolveBootSha } = await import("./boot-sha.ts");
   const { loadConfig } = await import("../config.ts");
   const { Factory } = await import("../app.ts");
-  const { startHttp } = await import("../server/http.ts");
-  const { mountIntegrations } = await import("../integrations/index.ts");
+  const { startDaemon } = await import("./daemon.ts");
   const { sweepOrphanedSnapshots } = await import("../pipeline/snapshots.ts");
   const { sweepClassificationScratch } = await import("../git/repos.ts");
   const cfg = loadConfig();
@@ -200,9 +203,7 @@ async function serve(): Promise<void> {
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
   });
   const ui = await (await import("../server/ui.ts")).buildUi();
-  const integrations = await mountIntegrations(factory);
-  const server = startHttp(factory, { ui, routes: integrations.routes });
-  factory.start();
+  const { integrations, server } = await startDaemon(factory, ui);
   console.log(`Limitless listening on http://${cfg.host}:${server.port}  (data: ${cfg.paths.home})`);
   if (cfg.listenLan) console.log(`LAN proxy listener: http://${cfg.listenLan}:${cfg.port}`);
   for (const line of integrations.notes) console.log(`  ${line}`);
