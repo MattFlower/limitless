@@ -7,6 +7,7 @@ import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontext
 import type { FeedPage, Question, Run } from "../src/core/types.ts";
 import * as diagnosticCatalogue from "../src/db/owner-diagnostics.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
+import { getChange } from "../src/integrations/mcp-change.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -186,16 +187,17 @@ test("holdout literals inside code are redacted at word boundaries, not by withh
 });
 
 test("short literals in multiline holdout fields stay private in patches and reports", async () => {
-  const content = 'const label = "xq-77";\nrun --dry a/b\nexit 3\nconst val9 = true;\nreadable ending\n';
+  const content =
+    'const label = "xq-77";\nconst shortLabel = "qv";\nrun --dry a/b\nexit 3\nconst val9 = true;\nreadable ending\n';
   const c = await changeFixture(f, { "hello.txt": content });
   f.factory.store.setRunState(c.run.id, {
     holdout: {
       scenarios: [
         {
           id: "H-1",
-          description: 'Inspect output.\nIt contains "xq-77".',
+          description: 'Inspect output.\nIt contains "xq-77" and "qv".',
           steps: "Run check.\nUse --dry on a/b before checking.",
-          expected: "Check completes.\nExit 3 with val9 set.",
+          expected: "Exit 3 with val9 set.",
           edge_case: false,
         },
       ],
@@ -211,6 +213,7 @@ test("short literals in multiline holdout fields stay private in patches and rep
       expect(page.available).toBe(true);
       for (const text of [page.diff.text, page.reports[0]?.text]) {
         expect(text).toContain('const label = "[private detail]";');
+        expect(text).toContain('const shortLabel = "[private detail]";');
         expect(text).toContain("run [private detail] [private detail]");
         expect(text).toContain("exit [private detail]");
         expect(text).toContain("const [private detail] = true;");
@@ -409,13 +412,13 @@ test("multiline hunk matching hides complete phrases and preserves unrelated gen
   writeFileSync(join(f.repo, "hello.txt"), "}\nold behavior\n");
   await sh(["git", "commit", "-am", "public context"], { cwd: f.repo });
   const c = await changeFixture(f, {
-    "hello.txt": `}\n  return true;\n  expect(x).toBe(1)\n${"unrelated readable line\n".repeat(800)}}\nreturn true;\nindependent assertion\nexpect(x).toBe(1)`,
+    "hello.txt": `}\n  return true;\n  expect(x).toBe(1)\n${"unrelated readable line\n".repeat(800)}}\nreturn true;\nindependent assertion\nexpect(x).toBe(1)\nconst counter = 1;\nexpect(counter).toBe(2);`,
     "renamed.txt": "}\nreturn true;\nexpect(x).toBe(1)",
   });
-  // The assertion's syntax-shaped literals are public; the complete multiline phrase is private.
+  // Generic assertion tokens are not public exemptions; only the complete phrase is private.
   f.factory.store.setRunState(c.run.id, {
     spec: {
-      summary: "Review this change with expect(x).toBe(1) assertions.",
+      summary: "Review this change.",
       assumptions: [],
       requirements: [],
       acceptance_criteria: [],
@@ -457,6 +460,8 @@ test("multiline hunk matching hides complete phrases and preserves unrelated gen
         expect(text).toContain(" [private detail]\n-old behavior\n+[private detail]\n+[private detail]");
         expect(text).toContain("+}\n+return true;\n+independent assertion\n+expect(x).toBe(1)");
         expect(text).toContain("unrelated readable line");
+        expect(text).toContain("+const counter = 1;");
+        expect(text).toContain("+expect(counter).toBe(2);");
       } else {
         expect(text).not.toMatch(/return true;|expect\(x\)/);
         expect(text).toContain("\\ No newline at end of file");
@@ -466,6 +471,41 @@ test("multiline hunk matching hides complete phrases and preserves unrelated gen
     await conn.close();
   }
 });
+
+test("multiline whitespace matching stays bounded and hides positive matches before paging", async () => {
+  const whitespace = " ".repeat(128 * 1024);
+  const content = `${whitespace}X\n"\tZ"\nreadable ending\n`;
+  const c = await changeFixture(f, { "hello.txt": content });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: 'Inspect "\tZ".\nKeep it private.',
+          steps: "Run check.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", content);
+  const started = performance.now();
+  const page = (await getChange(f.factory, {
+    run: c.run.id,
+    headSha: c.headSha,
+    baseSha: c.baseSha,
+    diffOffset: whitespace.length,
+    reportOffset: whitespace.length,
+  })) as ChangePage;
+  expect(performance.now() - started).toBeLessThan(1500);
+  expect(page.available).toBe(true);
+  for (const text of [page.diff.text, page.reports[0]?.text]) {
+    expect(text).toContain("[private detail]");
+    expect(text).toContain("readable ending");
+    expect(text).not.toContain("Z");
+  }
+}, 3000);
 
 test("escaped multiline prose in hunk annotations is hidden while Git ranges stay readable", async () => {
   const annotation = 'const label = "Amber sky\\nViolet sea";';
@@ -600,6 +640,30 @@ test("change pages reuse the catalogue and refresh diagnostics, holdouts and pri
     writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "");
     registerCredential("CHANGE_TEST_CREDENTIAL", "credentialSecret");
     expect((await read(0)).diff.text).toBe("[withheld: private text]");
+    writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "");
+    // The documented per-store limit is 2,048 details; this adds 2,049 unique literals.
+    store.recordOwnerDiagnostic(
+      {
+        runId: c.run.id,
+        invocationId: invocation.id,
+        kind: "result",
+        text: Array.from({ length: 2049 }, (_, i) => `'oversizedSecret${i}'`).join(" "),
+      },
+      "Private observation.",
+    );
+    const beforeOversized = reads.mock.calls.length;
+    expect((await read()).available).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(beforeOversized + 2);
+    expect((await read()).available).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(beforeOversized + 4);
+    store.recordOwnerDiagnostic(
+      { runId: c.run.id, invocationId: invocation.id, kind: "result", text: "Observed 'readable line'." },
+      "Private observation.",
+    );
+    const updated = await read();
+    expect(updated.available).toBe(true);
+    expect(updated.diff.text).not.toContain("readable line");
+    expect(reads).toHaveBeenCalledTimes(beforeOversized + 6);
     rmSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
     // Missing optional private strings means an empty list; an unreadable policy fails closed.
     mkdirSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));

@@ -152,6 +152,77 @@ test.each(["head moves", "push begins and ends"])(
   },
 );
 
+test("change view refuses a diagnostic race when the catalogue key cannot be computed", async () => {
+  const c = await changeFixture(f, { "hello.txt": "fallbackRaceSecret\n" });
+  const { store } = f.factory;
+  store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "Private check.",
+          steps: "Run check.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+  });
+  store.putArtifact(c.run.id, "report.md", "report", "Observed fallbackRaceSecret.");
+  const invocation = store.createInvocation({
+    runId: c.run.id,
+    stageId: null,
+    role: "verify",
+    harness: "fake",
+    provider: "fake",
+    model: "test",
+    modelId: "fake/m",
+  });
+  const originalQuery = store.db.query.bind(store.db);
+  const key = spyOn(store.db, "query").mockImplementation((sql, ...args) => {
+    if (sql === "PRAGMA data_version") throw new Error("Key unavailable");
+    return originalQuery(sql, ...args);
+  });
+  const originalGit = commands.worktreeGit;
+  let inspected = () => {},
+    resume = () => {};
+  const ready = new Promise<void>((resolve) => {
+    inspected = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const git = spyOn(commands, "worktreeGit").mockImplementation(async (args, opts, retry) => {
+    const output = await originalGit(args, opts, retry);
+    if (args.includes("--numstat")) {
+      inspected();
+      await released;
+    }
+    return output;
+  });
+  try {
+    const pending = call("get_change", { run: c.run.id });
+    await ready;
+    store.recordOwnerDiagnostic(
+      {
+        runId: c.run.id,
+        invocationId: invocation.id,
+        kind: "result",
+        text: "Observed 'fallbackRaceSecret'.",
+      },
+      "Private observation.",
+    );
+    resume();
+    const response = resultValue(await pending);
+    expect(response).toMatchObject({ available: false, reason: expect.stringContaining("restart") });
+    expect(JSON.stringify(response)).not.toContain("fallbackRaceSecret");
+  } finally {
+    resume();
+    git.mockRestore();
+    key.mockRestore();
+  }
+});
+
 test("status rechecks recorded heads after the asynchronous land read", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
   const backend = factoryBackend(f.factory);

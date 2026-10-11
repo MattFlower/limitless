@@ -37,9 +37,12 @@ const DISTINCTIVE_LENGTH = 12;
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
 type HoldoutRedactor = (value: string, keep?: (line: string) => number) => string;
-// One catalogue per store bounds retained private data. Privacy filters are loaded separately
-// on every read; this cache contains only holdout-derived patterns, never sanitized output.
-const catalogues = new WeakMap<Factory["store"], { key: string; redact: HoldoutRedactor }>();
+// Retain at most 2,048 details totaling 256K UTF-16 characters per store. Larger catalogues
+// still redact each read, but their patterns are not retained. Privacy filters load each read.
+const CATALOGUE_DETAILS_CAP = 2_048;
+const CATALOGUE_CHARACTERS_CAP = 256_000;
+type Catalogue = { redact: HoldoutRedactor; cacheable: boolean };
+const catalogues = new WeakMap<Factory["store"], { key: string; catalogue: Catalogue }>();
 
 function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): string | null {
   try {
@@ -139,13 +142,29 @@ function redactMultiline(value: string, pattern: RegExp, keep?: (line: string) =
           /\\+[nrt]/gu,
           (sequence) => ({ n: "\n", r: "\r", t: "\t" })[sequence.at(-1) ?? ""] ?? sequence,
         );
-        ranges.push({ index: line.index, start: text.length, end: text.length + decoded.length });
-        text += `${decoded}\n`;
+        // Collapse each whitespace run once, merging runs across physical line boundaries.
+        // A shared space belongs to both lines so a match hides every contributing line.
+        let normalized = `${decoded}\n`.replace(/\s+/gu, " ");
+        const shared = text.length > 0 && normalized.startsWith(" ");
+        if (shared) normalized = normalized.slice(1);
+        ranges.push({
+          index: line.index,
+          start: text.length - Number(shared),
+          // The appended line separator has no original character to withhold.
+          end: text.length + normalized.length - Number(!/\s$/u.test(decoded)),
+        });
+        text += normalized;
       }
       pattern.lastIndex = 0;
+      let cursor = 0;
       for (const found of text.matchAll(pattern)) {
         const end = found.index + found[0].length;
-        for (const range of ranges) if (range.start < end && range.end > found.index) hidden.add(range.index);
+        while (ranges[cursor] && (ranges[cursor]?.end ?? 0) <= found.index) cursor++;
+        for (let i = cursor; i < ranges.length; i++) {
+          const range = ranges[i];
+          if (!range || range.start >= end) break;
+          if (range.end > found.index) hidden.add(range.index);
+        }
       }
     }
     return true;
@@ -179,7 +198,7 @@ function redactMultiline(value: string, pattern: RegExp, keep?: (line: string) =
     .join("\n");
 }
 
-function buildCatalogue(store: Factory["store"], ids: string[]): HoldoutRedactor | null {
+function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | null {
   // Holdouts from earlier rounds remain private even after a later round delivers.
   const details = new Set<string>();
   for (const id of ids) {
@@ -208,18 +227,25 @@ function buildCatalogue(store: Factory["store"], ids: string[]): HoldoutRedactor
         expected: /[\r\n\t]/u.test(scenario.expected) ? "" : scenario.expected,
       })),
     };
-    // The observed-text path extracts only literals. Keep those from every field, even
-    // when multiline prose cannot safely contribute standalone sentence fragments.
-    const independent = privateHoldoutDetails(
-      standalone,
-      publicSources,
-      holdout.scenarios
-        .flatMap((scenario) => [scenario.description, scenario.steps, scenario.expected])
-        .join("\n"),
+    const independent = privateHoldoutDetails(standalone, publicSources);
+    const quoted = new Set(
+      holdout.scenarios.flatMap((scenario) =>
+        [scenario.description, scenario.steps, scenario.expected].flatMap((source) =>
+          [...source.matchAll(/(["'`])(?:(?!\1)[^\n])*?\1/gu)].map((match) => match[0].slice(1, -1)),
+        ),
+      ),
     );
-    // Multiline prose is matched as a phrase; syntax-shaped literals also match alone.
+    // Multiline phrases protect generic syntax in context. Quoted values, paths, flags and
+    // distinctive identifiers also match independently; bare numbers and assertion methods do not.
     for (const detail of privateHoldoutDetails(holdout, publicSources))
-      if (independent.has(detail) || /[\r\n\t]/u.test(detail) || detail.length >= DISTINCTIVE_LENGTH)
+      if (
+        independent.has(detail) ||
+        /[\r\n\t]/u.test(detail) ||
+        (!/^(?:\d+(?:\.\d+)?|to(?:Be|Have|Equal|Contain|Match|Throw|Start|End)\w*)$/u.test(detail) &&
+          (quoted.has(detail) ||
+            detail.length >= DISTINCTIVE_LENGTH ||
+            /[/_-]|[\p{L}$].*\d|\d.*[\p{L}$]/u.test(detail)))
+      )
         details.add(detail);
     const collect = (observed?: string) => {
       if (observed !== undefined)
@@ -307,11 +333,9 @@ function buildCatalogue(store: Factory["store"], ids: string[]): HoldoutRedactor
     ? new RegExp(
         multilineDetails
           .map((detail) => {
-            const normalized = detail.normalize("NFKC").toLowerCase();
+            const normalized = detail.normalize("NFKC").toLowerCase().replace(/\s+/gu, " ");
             const literal = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            return (
-              detail.length >= DISTINCTIVE_LENGTH ? literal : holdoutBoundaryPattern(normalized)
-            ).replace(/\s+/gu, "\\s+");
+            return detail.length >= DISTINCTIVE_LENGTH ? literal : holdoutBoundaryPattern(normalized);
           })
           .join("|"),
         "giu",
@@ -346,7 +370,12 @@ function buildCatalogue(store: Factory["store"], ids: string[]): HoldoutRedactor
     if (hidden || privateMatches(safe, distinctive).length) return "[withheld: holdout text]";
     return removed ? `${safe}${keep ? "\n" : " "}[${removed} private details withheld]` : safe;
   };
-  return holdoutRedact;
+  return {
+    redact: holdoutRedact,
+    cacheable:
+      details.size <= CATALOGUE_DETAILS_CAP &&
+      [...details].reduce((size, detail) => size + detail.length, 0) <= CATALOGUE_CHARACTERS_CAP,
+  };
 }
 
 /** Saved observations only: no fetch, working-tree bytes, arbitrary paths, or artifact reads. */
@@ -390,9 +419,11 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const ids = [...new Set([owner.id, ...rounds.map((round) => round.runId)])];
   const key = catalogueKey(store, ids, rounds);
   const cached = catalogues.get(store);
-  const holdoutRedact = key && cached?.key === key ? cached.redact : buildCatalogue(store, ids);
-  if (!holdoutRedact) return { available: false, reason: "Holdout policy unavailable; content withheld." };
-  if (key) catalogues.set(store, { key, redact: holdoutRedact });
+  const catalogue = key && cached?.key === key ? cached.catalogue : buildCatalogue(store, ids);
+  if (!catalogue) return { available: false, reason: "Holdout policy unavailable; content withheld." };
+  if (key && catalogue.cacheable) catalogues.set(store, { key, catalogue });
+  else catalogues.delete(store);
+  const holdoutRedact = catalogue.redact;
   const protect = (value: string, keep?: (line: string) => number) => privacy(holdoutRedact(value, keep));
   const safe = (value: string) => protect(value) === value;
   const cwd = cachePath(factory.cfg.paths, repo);
@@ -485,7 +516,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         .headSha !== headSha
     )
       return { available: false, reason: "PR head superseded; restart limitless_get_change." };
-    if (key && catalogueKey(store, ids, owner.prUrl ? store.reviewRounds(owner.prUrl) : []) !== key)
+    if (!key || catalogueKey(store, ids, owner.prUrl ? store.reviewRounds(owner.prUrl) : []) !== key)
       return { available: false, reason: "Holdout policy changed; restart limitless_get_change." };
     return privateOutputData(
       {
