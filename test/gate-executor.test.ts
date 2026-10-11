@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest } from "../src/gates/executor.ts";
-import { gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
+import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
 import { type GateRun, retryBaselineFailures } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -11,7 +11,7 @@ import { LandQueue } from "../src/land/queue.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
-import { fakeConfinement } from "./confinement.ts";
+import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, type Handler, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
 
@@ -464,6 +464,36 @@ test("local attachment replays an unknown handle, reuses known work and emits ch
     const events = [];
     for await (const event of execution.events) events.push(event);
     expect(events).toMatchObject([{ type: "check", result: { name: "check", ok: true } }]);
+  });
+});
+
+test.each([false, true])("shared local executor releases settled work (rejected=%s)", async (rejected) => {
+  const executor = gateExecutorFor("local");
+  const signal = new AbortController().signal;
+  const req = request(fixture.repoDir);
+  const recording = recordingConfinement();
+  const backend = {
+    ...recording.backend,
+    async verify(...args: Parameters<typeof recording.backend.verify>) {
+      await recording.backend.verify(...args);
+      if (rejected && recording.calls.length === 1) throw new Error("execution failed");
+    },
+  };
+  let handle: ExecutionHandle | undefined;
+  await confinementScope.run(backend, async () => {
+    const first = executeGate(req, signal, {}, executor, undefined, async (started) => {
+      handle = started;
+    });
+    if (rejected) await expect(first).rejects.toThrow("execution failed");
+    else expect((await first).checks[0]?.ok).toBe(true);
+    if (!handle) throw new Error("missing handle");
+    const settledHandle = handle;
+    // Neither the cached execution nor its original request survives settlement.
+    expect(() => executor.attach(settledHandle, signal)).toThrow("missing its request");
+    const replay = await executeGate(req, signal, {}, executor, settledHandle);
+    expect(replay.checks[0]?.ok).toBe(true);
+    expect(recording.calls).toHaveLength(2);
+    expect(() => executor.attach(settledHandle, signal)).toThrow("missing its request");
   });
 });
 

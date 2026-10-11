@@ -98,6 +98,8 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
           },
         },
       ).finally(() => {
+        executions.delete(handle.id);
+        starts.delete(handle.id);
         done = true;
         notify();
         signal.removeEventListener("abort", abort);
