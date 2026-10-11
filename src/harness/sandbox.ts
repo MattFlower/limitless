@@ -58,6 +58,13 @@ export function seatbeltProfile(roots: WriteRoots): string {
     ...(roots.commands?.own.length ? [`(allow file-read-data ${paths(roots.commands.own)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
     ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
+    // Kernel-queryable identity for process inspection; these names have no services.
+    ...(roots.denyRead?.length && roots.allowRead?.length
+      ? [
+          '(deny mach-lookup (global-name "com.limitless.read-allowlist.denied"))',
+          '(allow mach-lookup (global-name "com.limitless.read-allowlist.allowed"))',
+        ]
+      : []),
     // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
     ...(ancestors.literals.length ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`] : []),
     ...(ancestors.metadata.length

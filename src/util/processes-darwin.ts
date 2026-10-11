@@ -16,7 +16,37 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
     args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64],
     returns: FFIType.i32,
   },
+  sandbox_check: {
+    // Darwin arm64 passes variadic arguments on the stack, after the eight register slots.
+    args: [
+      FFIType.i32,
+      FFIType.ptr,
+      FFIType.i32,
+      ...(process.arch === "arm64" ? Array<FFIType>(5).fill(FFIType.u64) : []),
+      FFIType.ptr,
+    ],
+    returns: FFIType.i32,
+  },
 });
+
+function readAllowlistConfined(directories: readonly string[]): boolean {
+  const check = (operation: string, filter: number, value: string) =>
+    symbols.sandbox_check(
+      process.pid,
+      ptr(Buffer.from(`${operation}\0`)),
+      filter | 0x40000000 /* NO_REPORT */,
+      ...(process.arch === "arm64" ? [0, 0, 0, 0, 0] : []),
+      ptr(Buffer.from(`${value}\0`)),
+    );
+  // This permission pair exists only in the factory's home read-allowlist profile.
+  // Neither an environment marker nor being inside some other sandbox is sufficient.
+  return (
+    check("mach-lookup", 2 /* GLOBAL_NAME */, "com.limitless.read-allowlist.denied") === 1 &&
+    check("mach-lookup", 2, "com.limitless.read-allowlist.allowed") === 0 &&
+    directories.length > 0 &&
+    directories.every((path) => check("file-read-data", 1 /* PATH */, path) === 0)
+  );
+}
 
 function darwinDescendant(
   pid: number,
@@ -60,6 +90,9 @@ export function hiddenDarwinProcessMember(
   const cwd = readCwd();
   if ("errno" in cwd) {
     if (cwd.errno === 3 /* ESRCH */) return false;
+    // Under this profile a denied cwd cannot be in the invocation's readable roots.
+    if ((cwd.errno === 1 /* EPERM */ || cwd.errno === 13) /* EACCES */ && readAllowlistConfined(directories))
+      return false;
     throw new Error(`Process cwd inspection failed for ${pid} (errno ${cwd.errno})`);
   }
   // The kernel reports a symlink-free path; canonicalizing only resolves aliases. Any orphan
