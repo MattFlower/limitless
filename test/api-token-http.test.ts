@@ -501,6 +501,7 @@ for (const owner of ["startHttp", "startDaemon"] as const) {
     const factoryStart = spyOn(startup.factory, "start").mockImplementation(() => {});
     let listener: Server<undefined> | undefined;
     let closeListener: (() => Promise<void>) | undefined;
+    let protectedAtClose = false;
     const serve = ((options: Parameters<typeof Bun.serve<undefined>>[0]) => {
       if (listener) throw failure;
       listener = Bun.serve(options);
@@ -510,6 +511,7 @@ for (const owner of ["startHttp", "startDaemon"] as const) {
         stopping.resolve();
         await finish.promise;
         await stop(force);
+        protectedAtClose = privateReadPaths().includes(path);
       };
       return listener;
     }) as typeof Bun.serve<undefined>;
@@ -545,6 +547,7 @@ for (const owner of ["startHttp", "startDaemon"] as const) {
       expect(seatbeltProfile(writeRoots(startup.repo, scratch))).toContain(`(subpath "${path}")`);
       finish.resolve();
       expect(await result).toBe(failure);
+      expect(protectedAtClose).toBe(true);
       await expect(fetch(url)).rejects.toThrow();
       expect(privateReadPaths()).not.toContain(path);
       expect(factoryStart).not.toHaveBeenCalled();
