@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { once } from "node:events";
 import {
   existsSync,
   mkdirSync,
@@ -9,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
@@ -64,6 +66,23 @@ function fixture() {
   return { root, directory, real, marker, config, fake };
 }
 
+function transportFailure(code: string, detail = code) {
+  return Object.assign(new Error(detail), { code });
+}
+
+function offlineClient(config: WrapperConfig, detail = "offline") {
+  return wrapperLeaseClient(
+    config,
+    undefined,
+    async () => {
+      throw transportFailure("ECONNREFUSED", `HTTP ${detail}`);
+    },
+    async () => {
+      throw transportFailure("ENOENT", `socket ${detail}`);
+    },
+  );
+}
+
 test("matched command waits, passes exit code and releases its lease", async () => {
   const f = fixture(),
     queued = Promise.withResolvers<void>(),
@@ -115,11 +134,7 @@ test("coordination outage runs with a warning, but rejected leases never run the
     ).rejects.toThrow("rejected");
     expect(existsSync(f.marker)).toBe(false);
     expect(warning).not.toHaveBeenCalled();
-    expect(
-      await agentTestCommand(f.config, ["bun", "test"], async () => {
-        throw new Error("offline");
-      }),
-    ).toBe(3);
+    expect(await agentTestCommand(f.config, ["bun", "test"], offlineClient(f.config))).toBe(3);
     expect(warning.mock.calls.flat().join()).toContain("coordination unavailable");
     expect(readFileSync(f.marker, "utf8")).toBe("test\n");
   } finally {
@@ -648,11 +663,7 @@ test("wrapper registers the capability before warnings and rejected-client stder
   f.config.token = crypto.randomUUID();
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   cleanup.push(() => warn.mockRestore());
-  expect(
-    await agentTestCommand(f.config, ["bun", "test"], async () => {
-      throw new Error(`offline ${f.config.token}`);
-    }),
-  ).toBe(3);
+  expect(await agentTestCommand(f.config, ["bun", "test"], offlineClient(f.config, f.config.token))).toBe(3);
   expect(warn.mock.calls.flat().join()).not.toContain(f.config.token);
   expect(warn.mock.calls.flat().join()).toContain("[redacted]");
   const file = join(f.root, "config.json");
@@ -668,20 +679,47 @@ test("wrapper registers the capability before warnings and rejected-client stder
   expect(error.mock.calls.flat().join()).toContain("[redacted]");
 });
 
-test("only failure of both transports permits the installed client's outage fallback", async () => {
+test.each([
+  ["ECONNREFUSED", "ECONNREFUSED"],
+  ["ConnectionRefused", "ConnectionRefused"],
+  ["FailedToOpenSocket", "FailedToOpenSocket"],
+  ["ECONNREFUSED", "ENOENT"],
+  ["ECONNREFUSED", "ENOTDIR"],
+  ["cause", "cause"],
+])("confirmed preconnection failures run unslotted (HTTP %s, Unix %s)", async (httpCode, unixCode) => {
   const f = fixture();
-  const fetcher = spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+  f.config.token = crypto.randomUUID();
+  const { clock } = fakeClock();
+  const start = clock.now();
+  const error = (code: string, transport: string) => {
+    const failure = transportFailure(
+      code === "cause" ? "ECONNREFUSED" : code,
+      `${transport} ${f.config.token}`,
+    );
+    return code === "cause" ? new TypeError("fetch failed", { cause: failure }) : failure;
+  };
+  const fetcher = spyOn(globalThis, "fetch")
+    .mockRejectedValueOnce(error(httpCode, "HTTP refused"))
+    .mockRejectedValueOnce(error(unixCode, "socket unavailable"));
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   cleanup.push(() => {
     fetcher.mockRestore();
     warn.mockRestore();
   });
-  expect(await agentTestCommand(f.config, ["bun", "test"], wrapperLeaseClient(f.config))).toBe(3);
+  expect(
+    await agentTestCommand(f.config, ["bun", "test"], wrapperLeaseClient(f.config, clock), { clock }),
+  ).toBe(3);
+  expect(clock.now()).toBe(start);
   expect(fetcher.mock.calls.map(([_url, init]) => (init && "unix" in init ? "unix" : "http"))).toEqual([
     "http",
     "unix",
   ]);
   expect(warn.mock.calls.flat().join()).toContain("unavailable");
+  const stderr = warn.mock.calls.flat().join();
+  expect(stderr).toContain("HTTP refused");
+  expect(stderr).toContain("socket unavailable");
+  expect(stderr).not.toContain(f.config.token);
+  expect(stderr).toContain("[redacted]");
   expect(existsSync(f.marker)).toBe(true);
 });
 
@@ -710,6 +748,164 @@ test("an answering endpoint rejection never falls back, and socket failure reche
     "unix",
     "http",
   ]);
+});
+
+test.each([false, true])(
+  "rejected or malformed leases never start the binary (fallback=%s)",
+  async (fallback) => {
+    const f = fixture();
+    const fetcher = spyOn(globalThis, "fetch");
+    cleanup.push(() => fetcher.mockRestore());
+    for (const response of [
+      new Response(null, { status: 403 }),
+      new Response("truncated JSON"),
+      Response.json({ id: "", acquired: true }),
+    ]) {
+      fetcher.mockReset();
+      if (fallback) fetcher.mockRejectedValueOnce(transportFailure("ECONNREFUSED"));
+      fetcher.mockResolvedValueOnce(response);
+      await expect(agentTestCommand(f.config, ["bun", "test"])).rejects.toBeInstanceOf(LeaseRejected);
+      expect(existsSync(f.marker)).toBe(false);
+      expect(fetcher).toHaveBeenCalledTimes(fallback ? 2 : 1);
+    }
+  },
+);
+
+test.each([
+  ["ECONNRESET", false],
+  ["ConnectionClosed", false],
+  ["ECONNRESET", true],
+  ["ConnectionClosed", true],
+  ["unknown", false],
+  ["message only", false],
+  ["ENOENT", false],
+  ["timeout", true],
+  ["nested reset", false],
+] as const)("potentially live transport waits through the budget (%s, Unix=%s)", async (code, socket) => {
+  const f = fixture(),
+    { clock, time } = fakeClock();
+  f.config.token = crypto.randomUUID();
+  clock.sleep = (ms) => new Promise((resolve) => clock.timeout(resolve, ms));
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanup.push(() => warn.mockRestore());
+  let requests = 0;
+  const transport =
+    (unix: boolean): LeaseClient =>
+    async () => {
+      requests++;
+      if (unix !== socket) throw transportFailure("ECONNREFUSED", `other transport ${f.config.token}`);
+      if (code === "timeout") return new Promise(() => {});
+      if (code === "message only") throw new Error("ECONNREFUSED is only message text");
+      if (code === "nested reset")
+        throw new TypeError("fetch failed", { cause: transportFailure("ECONNRESET") });
+      throw transportFailure(code, `live transport ${f.config.token}`);
+    };
+  const maxWaitMs = 5000,
+    start = clock.now();
+  const work = agentTestCommand(
+    f.config,
+    ["bun", "test"],
+    wrapperLeaseClient(f.config, clock, transport(false), transport(true)),
+    {
+      clock,
+      maxWaitMs,
+    },
+  );
+  await time.flush();
+  for (let elapsed = 0; elapsed < maxWaitMs; elapsed += 250) {
+    expect(existsSync(f.marker)).toBe(false);
+    await time.advance(250);
+  }
+  expect(await work).toBe(75);
+  expect(existsSync(f.marker)).toBe(false);
+  expect(clock.now() - start).toBe(maxWaitMs);
+  expect(requests).toBeGreaterThan(2);
+  const stderr = warn.mock.calls.flat().join();
+  expect(stderr).toContain("HTTP:");
+  expect(stderr).toContain("Unix socket:");
+  expect(stderr).toContain("other transport");
+  expect(stderr).not.toContain(f.config.token);
+  expect(stderr).not.toContain("coordination unavailable");
+  if (code === "timeout") expect(stderr).toContain("timed out");
+  expect(time.pending).toBe(0);
+});
+
+test("nested lease reuse also waits through a reset without running unslotted", async () => {
+  const f = fixture(),
+    { clock } = fakeClock();
+  const parent = process.env.LIMITLESS_AGENT_TEST_LEASE;
+  process.env.LIMITLESS_AGENT_TEST_LEASE = "parent";
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanup.push(() => {
+    warn.mockRestore();
+    if (parent === undefined) delete process.env.LIMITLESS_AGENT_TEST_LEASE;
+    else process.env.LIMITLESS_AGENT_TEST_LEASE = parent;
+  });
+  const requests: Record<string, unknown>[] = [];
+  const client = wrapperLeaseClient(
+    f.config,
+    clock,
+    async (body) => {
+      requests.push(body);
+      throw transportFailure("ECONNRESET");
+    },
+    async () => {
+      throw transportFailure("ENOENT");
+    },
+  );
+  expect(await agentTestCommand(f.config, ["bun", "test"], client, { clock, maxWaitMs: 500 })).toBe(75);
+  expect(existsSync(f.marker)).toBe(false);
+  expect(requests).toEqual([
+    { token: f.config.token, lane: "gate", reuse: "parent" },
+    { token: f.config.token, lane: "gate", reuse: "parent" },
+  ]);
+});
+
+test.each([
+  ["reset", false],
+  ["truncated headers", false],
+  ["reset", true],
+  ["truncated headers", true],
+] as const)("local lease service %s never runs unslotted (Unix=%s)", async (mode, unix) => {
+  const f = fixture();
+  const sockets = new Set<Socket>();
+  let requests = 0,
+    markerSeen = false;
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.once("data", () => {
+      requests++;
+      markerSeen ||= existsSync(f.marker);
+      if (mode === "reset") {
+        if (unix) socket.destroy();
+        else socket.resetAndDestroy();
+      } else socket.end("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Len");
+    });
+  });
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanup.push(() => warn.mockRestore());
+  try {
+    if (unix) server.listen(f.config.unix);
+    else server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!unix && address && typeof address !== "string") f.config.port = address.port;
+    const start = performance.now(),
+      maxWaitMs = 500;
+    expect(await agentTestCommand(f.config, ["bun", "test"], undefined, { maxWaitMs })).toBe(75);
+    expect(performance.now() - start).toBeGreaterThanOrEqual(maxWaitMs);
+    expect(requests).toBeGreaterThan(0);
+    expect(markerSeen).toBe(false);
+    expect(existsSync(f.marker)).toBe(false);
+    const stderr = warn.mock.calls.flat().join();
+    expect(stderr).toContain("HTTP:");
+    expect(stderr).toContain("Unix socket:");
+    expect(stderr).not.toContain("coordination unavailable");
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("an HTTP transport timeout still tries the reachable invocation socket", async () => {
@@ -741,7 +937,7 @@ test.each(["timeout", "late busy", "silent lease", "late lease", "offline"])(
       replies = 0;
     const http: LeaseClient = async () => {
       requests++;
-      if (scenario === "offline") throw new Error("ECONNREFUSED HTTP");
+      if (scenario === "offline") throw transportFailure("ECONNREFUSED", "HTTP refused");
       if (scenario === "timeout" || scenario === "silent lease") return new Promise(() => {});
       return new Promise((resolve) => {
         clock.timeout(() => {
@@ -751,7 +947,7 @@ test.each(["timeout", "late busy", "silent lease", "late lease", "offline"])(
       });
     };
     const unix: LeaseClient = async () => {
-      throw new Error("ECONNREFUSED socket");
+      throw transportFailure("ECONNREFUSED", "socket refused");
     };
     const maxWaitMs = scenario === "timeout" || scenario === "offline" ? 5000 : 60_000;
     const start = clock.now();

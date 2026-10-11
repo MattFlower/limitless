@@ -20,9 +20,26 @@ export type LeaseClient = (
   signal: AbortSignal,
   /** A timed-out transport can still return a lease that must be adopted or released. */
   onLateReply?: (reply: Reply) => void,
+  /** Retain transport diagnostics even when the enclosing request budget expires. */
+  onFailure?: (error: unknown) => void,
 ) => Promise<Reply>;
 export class LeaseRejected extends Error {}
 class LeaseWaitExhausted extends LeaseRejected {}
+function transportDetail(error: unknown): string {
+  if (!error || typeof error !== "object") return String(error);
+  const code = "code" in error && typeof error.code === "string" ? ` (${error.code})` : "";
+  const cause = "cause" in error && error.cause !== error ? `; cause: ${String(error.cause)}` : "";
+  return `${error}${code}${cause}`;
+}
+export class LeaseTransportFailures extends Error {
+  constructor(
+    readonly http: unknown,
+    readonly unix: unknown,
+    readonly preconnection: boolean,
+  ) {
+    super(redactCredentials(`HTTP: ${transportDetail(http)}; Unix socket: ${transportDetail(unix)}`));
+  }
+}
 export const localLeaseClient =
   (port = Number(process.env.LIMITLESS_PORT ?? 7400), unix?: string): LeaseClient =>
   async (body, signal) => {
@@ -87,7 +104,7 @@ export async function withGateLease<T>(
   if (!name.trim() || !Number.isSafeInteger(maxWait) || maxWait < 0)
     throw new Error("invalid gate-slot name or wait budget");
   const warn = (e: unknown) =>
-    (opts.warn ?? console.warn)(`warning: gate-slot coordination unavailable: ${e}`);
+    (opts.warn ?? console.warn)(redactCredentials(`warning: gate-slot coordination unavailable: ${e}`));
   let id: string | undefined,
     stopped = false,
     cancel = () => {},
@@ -115,32 +132,45 @@ export async function withGateLease<T>(
         });
     }, ms);
   };
-  const request = (body: Record<string, unknown>, ms = 2000) =>
-    bounded(
-      clock,
-      async (signal) => {
-        const previous = id;
-        const observe = (result: Reply, late = false) => {
-          lastReply = clock.now();
-          // A late recovery still belongs to running work unless another reply recovered it first.
-          if (body.running && !stopped && id === previous && result.id && !result.busy && !result.capped) {
-            id = result.id;
-            opts.agentTest?.onLease(result.id);
-            beat();
-          } else if (
-            body.name &&
-            result.id &&
-            (late || signal.aborted || body.running) &&
-            (stopped || result.id !== id)
-          )
-            void request({ id: result.id, release: true }).catch(warn);
-        };
-        const result = await client(body, signal, (result) => observe(result, true));
-        observe(result);
-        return result;
-      },
-      ms,
-    );
+  const request = async (body: Record<string, unknown>, ms = 2000) => {
+    let failure: unknown;
+    try {
+      return await bounded(
+        clock,
+        async (signal) => {
+          const previous = id;
+          const observe = (result: Reply, late = false) => {
+            lastReply = clock.now();
+            // A late recovery still belongs to running work unless another reply recovered it first.
+            if (body.running && !stopped && id === previous && result.id && !result.busy && !result.capped) {
+              id = result.id;
+              opts.agentTest?.onLease(result.id);
+              beat();
+            } else if (
+              body.name &&
+              result.id &&
+              (late || signal.aborted || body.running) &&
+              (stopped || result.id !== id)
+            )
+              void request({ id: result.id, release: true }).catch(warn);
+          };
+          const result = await client(
+            body,
+            signal,
+            (result) => observe(result, true),
+            (error) => {
+              failure = error;
+            },
+          );
+          observe(result);
+          return result;
+        },
+        ms,
+      );
+    } catch (error) {
+      throw error instanceof DaemonTimeoutError && failure ? failure : error;
+    }
+  };
   const release = async () => {
     if (id) await request({ id, release: true }).catch(warn);
   };
@@ -149,21 +179,18 @@ export async function withGateLease<T>(
       opts.signal?.throwIfAborted();
       let reused = false;
       let state: Reply | undefined;
-      if (opts.agentTest?.parentId) {
-        const parent = await request({ reuse: opts.agentTest.parentId });
-        if (parent.reused === true && parent.acquired && parent.id === opts.agentTest.parentId) {
-          opts.agentTest.onLease(parent.id);
-          reused = true;
-          state = parent;
-        }
-      }
       let first = true,
-        holder: string | undefined;
+        holder: string | undefined,
+        failure: unknown,
+        parentChecked = false;
       const pastDeadline = () =>
         opts.agentTest
           ? new LeaseWaitExhausted(
-              `agent-test: ${name} waited ${clock.now() - started}ms for the ${opts.agentTest.lane} lane` +
-                `${holder ? ` (holder: ${holder})` : ""}; try a targeted run: bun test <file>`,
+              redactCredentials(
+                `agent-test: ${name} waited ${clock.now() - started}ms for the ${opts.agentTest.lane} lane` +
+                  `${holder ? ` (holder: ${holder})` : ""}; try a targeted run: bun test <file>` +
+                  `${failure ? `; last failure: ${failure}` : ""}`,
+              ),
             )
           : new Error("gate-slot wait passed the acquisition deadline");
       while (!state?.acquired) {
@@ -174,6 +201,20 @@ export async function withGateLease<T>(
           if (clock.now() >= deadline) throw pastDeadline();
         }
         try {
+          if (opts.agentTest?.parentId && !parentChecked) {
+            const parent = await request(
+              { reuse: opts.agentTest.parentId },
+              maxWait ? Math.max(1, Math.min(2000, deadline - clock.now())) : 2000,
+            );
+            parentChecked = true;
+            if (parent.reused === true && parent.acquired && parent.id === opts.agentTest.parentId) {
+              opts.agentTest.onLease(parent.id);
+              reused = true;
+              state = parent;
+              break;
+            }
+            if (maxWait && clock.now() >= deadline) throw pastDeadline();
+          }
           state = await request(
             id ? { id } : { name, immediate: maxWait === 0 },
             maxWait ? Math.max(1, Math.min(2000, deadline - clock.now())) : 2000,
@@ -182,12 +223,15 @@ export async function withGateLease<T>(
           holder = state.holder ?? holder;
         } catch (e) {
           if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
+          failure = e;
           // Agent commands wait through stalls; silence alone cannot justify running unslotted.
           if (
-            (first && !(e instanceof DaemonTimeoutError)) ||
-            (!opts.agentTest && clock.now() - lastReply > GATE_LEASE_EXPIRY_MS)
+            opts.agentTest
+              ? first && e instanceof LeaseTransportFailures && e.preconnection
+              : (first && !(e instanceof DaemonTimeoutError)) ||
+                clock.now() - lastReply > GATE_LEASE_EXPIRY_MS
           )
-            throw new Error(`gate-slot daemon is unreachable: ${e}`);
+            throw opts.agentTest ? e : new Error(`gate-slot daemon is unreachable: ${e}`);
           if (clock.now() >= deadline) throw pastDeadline();
         }
         first = false;
@@ -203,6 +247,7 @@ export async function withGateLease<T>(
       await release();
       id = undefined;
       if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
+      if (opts.agentTest && !(e instanceof LeaseTransportFailures && e.preconnection)) throw e;
       warn(e);
     }
     opts.signal?.throwIfAborted();

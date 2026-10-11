@@ -8,6 +8,7 @@ import {
   type LeaseClient,
   type LeaseOptions,
   LeaseRejected,
+  LeaseTransportFailures,
   localLeaseClient,
   runLeasedCommand,
 } from "./gate-slot.ts";
@@ -119,6 +120,20 @@ export function realExecutable(name: string, path: string, wrapperDir: string): 
   return null;
 }
 
+const PRECONNECTION_SOCKET_CODES = new Set(["ECONNREFUSED", "ConnectionRefused", "FailedToOpenSocket"]);
+const UNIX_PATH_MISSING_CODES = new Set(["ENOENT", "ENOTDIR"]);
+
+function preconnectionFailure(error: unknown, socket: boolean): boolean {
+  if (!error || typeof error !== "object") return false;
+  // Node fetch wraps its socket error in cause; Bun exposes the code directly.
+  const failure = "code" in error ? error : "cause" in error ? error.cause : undefined;
+  if (!failure || typeof failure !== "object" || !("code" in failure)) return false;
+  return (
+    typeof failure.code === "string" &&
+    (PRECONNECTION_SOCKET_CODES.has(failure.code) || (socket && UNIX_PATH_MISSING_CODES.has(failure.code)))
+  );
+}
+
 export function wrapperLeaseClient(
   config: WrapperConfig,
   clock: DeployClock = deployClock,
@@ -126,9 +141,10 @@ export function wrapperLeaseClient(
   unix = localLeaseClient(config.port, config.unix),
 ): LeaseClient {
   let socket = false;
-  return async (body, signal, onLateReply) => {
-    const first = socket ? unix : http,
-      second = socket ? http : unix;
+  return async (body, signal, onLateReply, onFailure) => {
+    const usingSocket = socket,
+      first = usingSocket ? unix : http,
+      second = usingSocket ? http : unix;
     let pending: ReturnType<LeaseClient> | undefined;
     try {
       return await bounded(
@@ -143,14 +159,23 @@ export function wrapperLeaseClient(
       if (error instanceof LeaseRejected) throw error;
       if (error instanceof DaemonTimeoutError) void pending?.then(onLateReply, () => {});
       signal.throwIfAborted();
+      const failures = (fallbackError: unknown) =>
+        new LeaseTransportFailures(
+          usingSocket ? fallbackError : error,
+          usingSocket ? error : fallbackError,
+          preconnectionFailure(error, usingSocket) && preconnectionFailure(fallbackError, !usingSocket),
+        );
+      const aborted = () => onFailure?.(failures(new DaemonTimeoutError()));
+      signal.addEventListener("abort", aborted, { once: true });
       try {
         const reply = await second(body, signal);
-        socket = !socket;
+        socket = !usingSocket;
         return reply;
       } catch (fallbackError) {
         if (fallbackError instanceof LeaseRejected) throw fallbackError;
-        if (error instanceof DaemonTimeoutError) throw error;
-        throw fallbackError;
+        throw failures(fallbackError);
+      } finally {
+        signal.removeEventListener("abort", aborted);
       }
     }
   };
@@ -188,8 +213,13 @@ export async function agentTestCommand(
           env.LIMITLESS_AGENT_TEST_LEASE = id;
         },
       },
-      client: (body, signal, onLateReply) =>
-        client({ ...body, token: config.token, lane, ...(body.name ? { waiter } : {}) }, signal, onLateReply),
+      client: (body, signal, onLateReply, onFailure) =>
+        client(
+          { ...body, token: config.token, lane, ...(body.name ? { waiter } : {}) },
+          signal,
+          onLateReply,
+          onFailure,
+        ),
       warn: (message) => console.warn(redactCredentials(message)),
     },
     true,
