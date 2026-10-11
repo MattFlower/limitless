@@ -6,6 +6,7 @@ import type { Server } from "bun";
 import { loadConfig } from "../src/config.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { classifyRequest, publicHost } from "../src/server/access.ts";
+import { Auth } from "../src/server/auth.ts";
 import { createHttpRoutes, startHttp } from "../src/server/http.ts";
 import { buildUi } from "../src/server/ui.ts";
 import { fixture, type Route, requestWithParams } from "./mcp-support.ts";
@@ -59,6 +60,33 @@ test("config validates LAN settings; exact binds share routes, stop together and
     expect(config('auth = "proxy"\npublic_origins = ["http://limitless.example.test"]')).toMatchObject({
       auth: "proxy",
     });
+    for (const ip of ["127.0.0.1", "127.2.3.4", "::1", "0:0:0:0:0:0:0:1", "::ffff:127.0.0.1"]) {
+      const settings = `require_api_token = true\ntrusted_proxies = ["${ip}"]`;
+      expect(() => config(`${settings}\nauth = "proxy"`)).toThrow(
+        'server.require_api_token with loopback server.trusted_proxies requires server.auth = "required"',
+      );
+      expect(config(`${settings}\nauth = "required"`).trustedProxies).toEqual([ip]);
+      expect(config(`require_api_token = false\ntrusted_proxies = ["${ip}"]\nauth = "proxy"`).auth).toBe(
+        "proxy",
+      );
+    }
+    expect(config(`require_api_token = true\ntrusted_proxies = ["${proxy}"]\nauth = "proxy"`).auth).toBe(
+      "proxy",
+    );
+    const proxySettings = `trusted_proxies = ["${proxy}"]\nauth = "proxy"`;
+    const httpOrigins =
+      'public_origins = ["https://limitless.example.test", "http://limitless.example.test"]';
+    expect(() => config(`require_api_token = true\n${proxySettings}\n${httpOrigins}`)).toThrow(
+      "server.require_api_token needs https public_origins (the session cookie is Secure)",
+    );
+    expect(config(`require_api_token = false\n${proxySettings}\n${httpOrigins}`).auth).toBe("proxy");
+    expect(
+      config(`require_api_token = true\n${proxySettings}\npublic_origins = ["${origin}"]`),
+    ).toMatchObject({
+      auth: "proxy",
+      requireApiToken: true,
+      publicOrigins: [origin],
+    });
     expect(config("[auth]\nidle_days = 7\nabsolute_days = 90.5")).toMatchObject({
       sessionIdleDays: 7,
       sessionAbsoluteDays: 90.5,
@@ -100,7 +128,7 @@ test("config validates LAN settings; exact binds share routes, stop together and
       stops.push(stop);
       return { stop, port: opts.port, url: new URL("http://localhost:7400") };
     }) as unknown as typeof Bun.serve<undefined>;
-    await startHttp(f.factory, {}, serve).stop(true);
+    await (await startHttp(f.factory, {}, serve)).stop(true);
     expect(options.map((o) => [o.hostname, o.port])).toEqual([["127.0.0.1", 7400]]);
     Object.assign(
       f.factory.cfg,
@@ -108,7 +136,7 @@ test("config validates LAN settings; exact binds share routes, stop together and
         `listen_lan = "10.0.0.10"\nport = 7401\ntrusted_proxies = ["${proxy}"]\npublic_origins = ["HTTPS://LIMITLESS.EXAMPLE.TEST/"]`,
       ),
     );
-    const server = startHttp(f.factory, {}, serve);
+    const server = await startHttp(f.factory, {}, serve);
     expect(options.slice(1).map((o) => [o.hostname, o.port])).toEqual([
       ["127.0.0.1", 7401],
       ["10.0.0.10", 7401],
@@ -117,12 +145,12 @@ test("config validates LAN settings; exact binds share routes, stop together and
     await server.stop(true);
     for (const stop of stops) expect(stop).toHaveBeenCalledWith(true);
     let calls = 0;
-    expect(() =>
+    await expect(
       startHttp(f.factory, {}, ((opts: Parameters<typeof serve>[0]) => {
         if (++calls === 2) throw new Error("bind failed");
         return serve(opts);
       }) as typeof serve),
-    ).toThrow("bind failed");
+    ).rejects.toThrow("bind failed");
     expect(stops.at(-1)).toHaveBeenCalledWith(true);
   } finally {
     await f.close();
@@ -181,6 +209,126 @@ test("resolve is loopback-only even through a trusted proxy with valid Host and 
   }
 });
 
+test("enforcement refuses spoofed loopback proxy headers and accepts signed-in proxies", async () => {
+  const f = await fixture();
+  try {
+    Object.assign(f.factory.cfg, {
+      requireApiToken: true,
+      auth: "proxy",
+      trustedProxies: ["127.0.0.1", proxy],
+      publicOrigins: [origin],
+    });
+    const routes = createHttpRoutes(f.factory, { apiToken: "testtoken" });
+    const create = (routes["/api/runs"] as { POST: Route }).POST;
+    const headers = {
+      "x-forwarded-for": "192.0.2.1",
+      host: new URL(origin).host,
+      origin,
+      "content-type": "application/json",
+    };
+    const call = (address: string, extra: Record<string, string> = {}) =>
+      create(
+        requestWithParams("http://localhost:7400/api/runs", {
+          method: "POST",
+          headers: { ...headers, ...extra },
+          body: JSON.stringify({ repo: f.repo, prompt: "proxy run" }),
+        }),
+        peer(address),
+      );
+    const before = f.factory.store.listRuns().length;
+    expect((await call("127.0.0.1")).status).toBe(401);
+    expect(f.factory.store.listRuns()).toHaveLength(before);
+    expect((await call(proxy, { authorization: "Bearer testtoken" })).status).toBe(201);
+    f.factory.cfg.trustedProxies = [proxy];
+    const auth = new Auth(f.factory.store, f.factory.cfg);
+    const password = "correct horse battery";
+    await auth.setPassword(password);
+    const login = (routes["/login"] as { POST: Route }).POST;
+    const signedIn = await login(
+      requestWithParams(`${origin}/login`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: "limitless", password, next: "/" }).toString(),
+      }),
+      peer(proxy),
+    );
+    expect(signedIn.status).toBe(303);
+    const session = signedIn.headers.get("set-cookie") ?? "";
+    expect(session).toContain("Secure");
+    const proxyCookie = session.split(";")[0] ?? "";
+    const list = (routes["/api/runs"] as { GET: Route }).GET;
+    for (const [extra, status] of [
+      [{}, 401],
+      [{ cookie: proxyCookie }, 200],
+    ] as const) {
+      expect(
+        (
+          await list(
+            requestWithParams(`${origin}/api/runs`, {
+              headers: { ...headers, ...extra },
+            }),
+            peer(proxy),
+          )
+        ).status,
+      ).toBe(status);
+    }
+    expect((await call(proxy, { cookie: proxyCookie })).status).toBe(201);
+    f.factory.cfg.auth = "required";
+    f.factory.cfg.trustedProxies = ["127.0.0.1", proxy];
+    const cookie = new Auth(f.factory.store, f.factory.cfg).signIn("password", "proxy").split(";")[0] ?? "";
+    for (const address of ["127.0.0.1", proxy]) {
+      expect((await call(address)).status).toBe(401);
+      expect((await call(address, { cookie })).status).toBe(201);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("token enforcement preserves required proxy sign-in on loopback-exempt routes", async () => {
+  const f = await fixture();
+  try {
+    Object.assign(f.factory.cfg, { auth: "required", trustedProxies: [proxy], publicOrigins: [origin] });
+    const auth = new Auth(f.factory.store, f.factory.cfg);
+    const routes = createHttpRoutes(f.factory, { apiToken: "testtoken" });
+    for (const enforcement of [false, true]) {
+      f.factory.cfg.requireApiToken = enforcement;
+      const cookie = auth.signIn("password", "owner").split(";")[0] ?? "";
+      for (const [path, method] of [
+        ["/api/health", "GET"],
+        ["/api/auth/session", "GET"],
+        ["/api/auth/logout", "POST"],
+      ] as const) {
+        const entry = routes[path];
+        const route =
+          typeof entry === "function" ? (entry as Route) : (entry as Record<string, Route>)[method];
+        if (!route) throw new Error(`missing ${method} ${path}`);
+        const call = (credentials: Record<string, string>) =>
+          route(
+            requestWithParams(`http://localhost:7400${path}`, {
+              method,
+              headers: {
+                host: new URL(origin).host,
+                origin,
+                "content-type": "application/json",
+                ...credentials,
+              },
+            }),
+            peer(proxy),
+          );
+        for (const credentials of [{}, { authorization: "Bearer testtoken" }] as Record<string, string>[]) {
+          const response = await call(credentials);
+          expect([enforcement, path, response.status]).toEqual([enforcement, path, 401]);
+          expect(await response.json()).toEqual({ error: "sign-in required" });
+        }
+        expect([enforcement, path, (await call({ cookie })).status]).toEqual([enforcement, path, 200]);
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 test("every SSE stream asks a reverse proxy not to buffer or transform it", async () => {
   const f = await fixture();
   try {
@@ -217,7 +365,7 @@ test("direct navigation to every UI route serves the SPA shell; unknown API path
   const f = await fixture();
   const ui = await buildUi();
   f.factory.cfg.port = 0;
-  const server = startHttp(f.factory, { ui });
+  const server = await startHttp(f.factory, { ui });
   try {
     const shell = await ui["/index.html"]?.text();
     if (!shell) throw new Error("missing bundled shell");
@@ -361,6 +509,34 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
       (await call("/api/runs", proxy, valid, "POST", JSON.stringify({ repo: f.repo, prompt: "allowed" })))
         .status,
     ).toBe(201);
+    for (const enforcement of [false, true]) {
+      cfg.requireApiToken = enforcement;
+      for (const headers of [valid, { ...valid, authorization: "Basic dXNlcjpwYXNz" }]) {
+        expect((await call("/api/runs", proxy, headers)).status).toBe(enforcement ? 401 : 200);
+        expect(
+          (await call("/api/runs", proxy, headers, "POST", JSON.stringify({ repo: f.repo, prompt: "proxy" })))
+            .status,
+        ).toBe(enforcement ? 401 : 201);
+      }
+      for (const method of ["GET", "POST"])
+        expect(
+          (await call("/api/runs", proxy, { ...valid, authorization: "Bearer wrong" }, method)).status,
+        ).toBe(401);
+      cfg.auth = "required";
+      const unsigned = await call(
+        "/api/runs",
+        proxy,
+        { ...valid, authorization: "Basic dXNlcjpwYXNz" },
+        "POST",
+        "{}",
+      );
+      expect(unsigned.status).toBe(401);
+      expect((await unsigned.json()).error).toContain(
+        enforcement ? "API token required" : "sign-in required",
+      );
+      cfg.auth = "proxy";
+    }
+    cfg.requireApiToken = false;
     cfg.trustedProxies = [];
     cfg.publicOrigins = [];
     for (const headers of [
