@@ -48,10 +48,10 @@ test.each([
     const factory = new Factory(fixture.load());
     try {
       const diagnostic = kind === "JSON" ? JSON.stringify({ credential: secret }) : secret;
-      writeFileSync(join(fixture.root, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
+      writeFileSync(join(fixture.work, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
       const gates = await confinementScope.run(fakeConfinement, () =>
         runGates(
-          fixture.root,
+          fixture.work,
           {
             setup: [],
             checks: [

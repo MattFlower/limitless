@@ -8,26 +8,30 @@ import {
   realpathSync,
   rmSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
+import { ConfinementError, READ_PROBE, resolvedHome } from "./read-policy.ts";
 import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 
 /** A command could not run confined: an operational failure, never a gate or grading result. */
-export class ConfinementError extends Error {}
+export { ConfinementError } from "./read-policy.ts";
 
-/** Seatbelt: everything as usual except writes, which only the roots minus `protect` take; the last match wins. */
+/** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
 export function seatbeltProfile(roots: WriteRoots): string {
   const paths = (list: string[]) =>
     list
       .map((path) => {
         if (/["\\]/.test(path) || [...path].some((c) => c < " "))
-          throw new ConfinementError("Cannot confine writes to an unusual path");
+          throw new ConfinementError(`Cannot confine an unusual policy path: ${path}`);
         return `(subpath "${path}")`;
       })
       .join(" ");
+  const specificDenies = (roots.denyRead ?? []).filter((deny) =>
+    roots.allowRead?.some((allow) => deny === allow || deny.startsWith(`${allow}/`)),
+  );
   return [
     "(version 1)",
     "(allow default)",
@@ -37,6 +41,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
+    ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
+    // Specific denies (e.g. a registered database inside a checkout) still beat read allowances.
+    ...(specificDenies.length ? [`(deny file-read* ${paths(specificDenies)})`] : []),
   ].join("\n");
 }
 
@@ -131,7 +138,7 @@ async function probeSeatbelt(
     for (const file of roots?.denyRead ?? []) {
       if (!existsSync(file)) continue;
       const read = await run({
-        cmd: [executable, "-p", profile, "/bin/sh", "-c", 'cat "$1" >/dev/null', "sh", file],
+        cmd: [executable, "-p", profile, "/bin/sh", "-c", READ_PROBE, "sh", file],
         cwd: root,
         env: agentEnv(),
         timeoutMs: 30_000,
@@ -143,7 +150,7 @@ async function probeSeatbelt(
         read.timedOut ||
         !/Operation not permitted|Permission denied/.test(read.stderr)
       )
-        throw new ConfinementError("Private database read confinement not verified");
+        throw new ConfinementError(`Private read confinement not verified: ${file}`);
     }
     const cmd = ["/bin/sh", "-c", SIGNAL_PROBE, "sh", executable, profile, join(allowed, "ready")];
     const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 30_000, signal });
@@ -224,7 +231,8 @@ export async function runConfined(
     const scope = commandScratch.getStore();
     if (!scope) throw new ConfinementError("Missing command scratch");
     const scratch = scope.dir;
-    const home = opts.env.HOME ?? homedir();
+    const home = resolvedHome();
+    const roots = observed(writeRoots(opts.cwd, scratch, true));
     const cargo = join(scratch, "cargo");
     if (!scope.initialized) {
       mkdirSync(cargo);
@@ -252,7 +260,7 @@ export async function runConfined(
           GOPATH: join(scratch, "go"),
         },
       },
-      observed(writeRoots(opts.cwd, scratch)),
+      roots,
       run,
       verify,
     );

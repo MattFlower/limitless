@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,14 +14,18 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/db/store.ts";
+import { recordWorktree } from "../src/git/command.ts";
+import { homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
 import {
   ConfinementError,
   confinementScope,
   runConfined,
   runSandboxed,
+  seatbeltProfile,
   verifySeatbelt,
   withCommandScratch,
 } from "../src/harness/sandbox.ts";
+import { writeRoots } from "../src/harness/scratch.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
 
@@ -50,12 +55,133 @@ beforeEach(async () => {
   await git("-C", cache, "commit", "-qm", "base");
   await git("-C", cache, "worktree", "add", "-q", "--detach", work);
   await git("-C", cache, "worktree", "add", "-q", "--detach", sibling);
+  await recordWorktree(work);
   writeFileSync(join(sibling, "canary"), "sibling");
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const common = () => join(cache, ".git");
 const privateDir = () => join(common(), "worktrees", "work");
+
+test("gate profile denies home and allows only run, recorded Git and trusted toolchain paths", async () => {
+  const scratch = join(root, "scratch");
+  mkdirSync(scratch);
+  readPolicyScope.run({ home: root, toolchains: [join(root, "custom-toolchain")] }, () => {
+    const roots = writeRoots(work, scratch, true);
+    const profile = seatbeltProfile(roots);
+    expect(profile).toContain(`(deny file-read* (subpath "${root}")`);
+    for (const path of [work, scratch, common(), privateDir(), join(root, "custom-toolchain")])
+      expect(roots.allowRead).toContain(path);
+    expect(roots.allowRead).not.toContain(sibling);
+    expect(roots.allowRead).not.toContain(root);
+    expect(profile.indexOf("(allow file-read*")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
+  });
+  rmSync(`${work}.git-paths`);
+  expect(() => writeRoots(work, scratch, true)).toThrow("trusted Git paths");
+});
+
+test("gate refuses unresolved home and credential overlaps before executing or copying configuration", async () => {
+  for (const options of [{ home: join(root, "missing") }, { home: root, toolchains: [root] }]) {
+    let started = false;
+    await readPolicyScope.run(options, async () => {
+      await expect(
+        runConfined(
+          { command: "unused", cwd: work, env: agentEnv() },
+          async () => {},
+          async () => {
+            started = true;
+            return proc();
+          },
+        ),
+      ).rejects.toThrow(ConfinementError);
+    });
+    expect(started).toBe(false);
+  }
+  mkdirSync(join(root, ".ssh"));
+  symlinkSync(join(root, ".ssh"), join(root, "toolchain-link"));
+  readPolicyScope.run({ home: root, toolchains: [join(root, "toolchain-link", "absent")] }, () => {
+    expect(() => homeReadPolicy([work], true)).toThrow("denied credential path");
+  });
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `gate home read boundary preserves Git and Bun ${seatbeltSkip ?? ""}`,
+  async () => {
+    const denied = [
+      join(root, ".ssh/key"),
+      join(root, ".config/limitless/secrets.env"),
+      join(root, "personal"),
+      join(sibling, "canary"),
+      join(root, ".limitless/runs/other/data"),
+    ];
+    for (const file of denied) {
+      mkdirSync(join(file, ".."), { recursive: true });
+      writeFileSync(file, "stand-in");
+    }
+    const bunHome = join(root, ".bun");
+    mkdirSync(join(bunHome, "bin"), { recursive: true });
+    copyFileSync(process.execPath, join(bunHome, "bin/bun"));
+    const bare = join(root, "bare.git");
+    const gateWork = join(root, "bare-work");
+    await sh(["git", "clone", "-q", "--bare", cache, bare], { cwd: root });
+    await sh(["git", "--git-dir", bare, "worktree", "add", "-q", "--detach", gateWork], { cwd: root });
+    await recordWorktree(gateWork);
+    await readPolicyScope.run({ home: root, toolchains: [bunHome] }, async () => {
+      for (const file of denied) {
+        const result = await runConfined({
+          command: `head -c 1 '${file}' >/dev/null`,
+          cwd: gateWork,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+        expect(result.stdout).toBe("");
+      }
+      for (const command of [
+        "head -c 1 a.ts >/dev/null",
+        'printf x > "$TMPDIR/canary" && head -c 1 "$TMPDIR/canary" >/dev/null',
+        `head -c 1 '${bare}/HEAD' >/dev/null`,
+        `head -c 1 '${bare}/worktrees/bare-work/commondir' >/dev/null`,
+        "git status --porcelain",
+        `'${bunHome}/bin/bun' --version`,
+      ]) {
+        const result = await runConfined({ command, cwd: gateWork, env: agentEnv() });
+        expect(result.exitCode, result.stderr).toBe(0);
+      }
+    });
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `SSH identity reads fail at the filesystem without an external host ${seatbeltSkip ?? ""}`,
+  async () => {
+    const key = join(root, ".ssh/stand-in");
+    mkdirSync(join(root, ".ssh"));
+    await sh(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], { cwd: work });
+    // This exercises OpenSSH's private-key loader independently of connection failures.
+    const normal = await runProcess({ cmd: ["ssh-keygen", "-y", "-f", key], cwd: work, env: agentEnv() });
+    expect(normal.exitCode).toBe(0);
+    await readPolicyScope.run({ home: root }, async () => {
+      const result = await runConfined({
+        command: `ssh-keygen -y -f '${key}' >/dev/null`,
+        cwd: work,
+        env: agentEnv(),
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(key);
+      expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+      const ssh = await runConfined({
+        command: `ssh -F /dev/null -o BatchMode=yes -o 'ProxyCommand=exit 0' -i '${key}' example.invalid true`,
+        cwd: work,
+        env: agentEnv(),
+      });
+      expect(ssh.exitCode).not.toBe(0);
+      expect(ssh.stderr).toMatch(
+        /Identity file .* not accessible: (Operation not permitted|Permission denied)/,
+      );
+    });
+  },
+);
 
 test.skipIf(seatbeltSkip !== null)(
   `private database reads are denied while checkout reads work ${seatbeltSkip ?? ""}`,
@@ -289,37 +415,38 @@ test("the effective profile is probed before the native-tool process and failed 
   }
 });
 
-test("command scratch persists across setup, checks and retry scopes, with readable toolchains", async () => {
-  let scratch = "";
-  // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
-  const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
-  const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
-  mkdirSync(join(home, ".cargo"));
-  writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
-  const run = async (opts: ProcOptions) => {
-    expect(opts.env.HOME).toBe(opts.env.TMPDIR);
-    expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
-    const current = opts.env.TMPDIR ?? "";
-    expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
-    expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
-    if (scratch) {
-      expect(current).toBe(scratch);
-      expect(readFileSync(join(current, "setup"), "utf8")).toBe("ready");
-    } else {
-      scratch = current;
-      writeFileSync(join(current, "setup"), "ready");
-    }
-    opts.onStdoutLine?.(opts.cmd[7] ?? "");
-    return proc();
-  };
-  await withCommandScratch(work, async () => {
-    await runConfined(opts, async () => {}, run);
-    await withCommandScratch(work, () => runConfined(opts, async () => {}, run));
-    await runConfined(opts, async () => {}, run);
-    expect(existsSync(scratch)).toBe(true);
-  });
-  expect(existsSync(scratch)).toBe(false);
-});
+test("command scratch persists across setup, checks and retry scopes, with readable toolchains", async () =>
+  readPolicyScope.run({ home }, async () => {
+    let scratch = "";
+    // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
+    const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
+    const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
+    mkdirSync(join(home, ".cargo"));
+    writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
+    const run = async (opts: ProcOptions) => {
+      expect(opts.env.HOME).toBe(opts.env.TMPDIR);
+      expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
+      const current = opts.env.TMPDIR ?? "";
+      expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
+      expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
+      if (scratch) {
+        expect(current).toBe(scratch);
+        expect(readFileSync(join(current, "setup"), "utf8")).toBe("ready");
+      } else {
+        scratch = current;
+        writeFileSync(join(current, "setup"), "ready");
+      }
+      opts.onStdoutLine?.(opts.cmd[7] ?? "");
+      return proc();
+    };
+    await withCommandScratch(work, async () => {
+      await runConfined(opts, async () => {}, run);
+      await withCommandScratch(work, () => runConfined(opts, async () => {}, run));
+      await runConfined(opts, async () => {}, run);
+      expect(existsSync(scratch)).toBe(true);
+    });
+    expect(existsSync(scratch)).toBe(false);
+  }));
 
 test.skipIf(seatbeltSkip !== null)(
   `installed rustup discovery survives command confinement ${seatbeltSkip ?? ""}`,
@@ -333,30 +460,31 @@ test.skipIf(seatbeltSkip !== null)(
   },
 );
 
-test("later commands never copy trusted config through setup-created scratch symlinks", async () => {
-  mkdirSync(join(home, ".cargo"));
-  writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
-  const protectedDir = join(home, "protected");
-  mkdirSync(protectedDir);
-  const opts = { command: "unused", cwd: work, env: agentEnv({ HOME: home }) };
-  let calls = 0;
-  await withCommandScratch(work, async () => {
-    const runner = async (opts: ProcOptions) => {
-      calls++;
-      const cargo = opts.env.CARGO_HOME ?? "";
-      if (calls === 1) {
-        rmSync(cargo, { recursive: true });
-        symlinkSync(protectedDir, cargo);
-      }
-      opts.onStdoutLine?.(opts.cmd[7] ?? "");
-      return proc();
-    };
-    await runConfined(opts, async () => {}, runner);
-    await runConfined(opts, async () => {}, runner);
-  });
-  expect(calls).toBe(2);
-  expect(existsSync(join(protectedDir, "config.toml"))).toBe(false);
-});
+test("later commands never copy trusted config through setup-created scratch symlinks", async () =>
+  readPolicyScope.run({ home }, async () => {
+    mkdirSync(join(home, ".cargo"));
+    writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
+    const protectedDir = join(home, "protected");
+    mkdirSync(protectedDir);
+    const opts = { command: "unused", cwd: work, env: agentEnv({ HOME: home }) };
+    let calls = 0;
+    await withCommandScratch(work, async () => {
+      const runner = async (opts: ProcOptions) => {
+        calls++;
+        const cargo = opts.env.CARGO_HOME ?? "";
+        if (calls === 1) {
+          rmSync(cargo, { recursive: true });
+          symlinkSync(protectedDir, cargo);
+        }
+        opts.onStdoutLine?.(opts.cmd[7] ?? "");
+        return proc();
+      };
+      await runConfined(opts, async () => {}, runner);
+      await runConfined(opts, async () => {}, runner);
+    });
+    expect(calls).toBe(2);
+    expect(existsSync(join(protectedDir, "config.toml"))).toBe(false);
+  }));
 
 test("confined environment retains installed cargo discovery without a live sandbox backend", async () => {
   const normal = await runProcess({ cmd: ["cargo", "--version"], cwd: work, env: agentEnv() });

@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
@@ -23,7 +24,8 @@ import {
   type ReaderProbeOptions,
   runCodex,
 } from "../src/harness/codex.ts";
-import { ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
+import { configureReadPolicy, homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
+import { ConfinementError, confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
@@ -35,7 +37,7 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
-import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
+import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
@@ -1438,6 +1440,159 @@ function editFixture() {
   };
 }
 
+const credentialStores = [
+  ".ssh",
+  ".config/limitless",
+  ".config/gh",
+  ".codex",
+  ".aws",
+  ".netrc",
+  ".npmrc",
+  ".docker",
+  ".gnupg",
+  ".kube",
+];
+function credentialFixture() {
+  const fixture = editFixture();
+  const home = join(fixture.root, "home");
+  mkdirSync(home);
+  const files = [...credentialStores, "custom-login"].map((store) => {
+    const file = join(home, store, ...([".netrc", ".npmrc"].includes(store) ? [] : ["stand-in"]));
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, "stand-in");
+    return file;
+  });
+  for (const dir of [fixture.cwd, fixture.scratchDir]) writeFileSync(join(dir, "canary"), "stand-in");
+  return { ...fixture, files, options: { home, denyRead: [join(home, "custom-login")] } };
+}
+
+test("both editor profiles deny every credential store and configured path, preserving run reads", () => {
+  const { cwd, scratchDir, spec, files, options } = credentialFixture();
+  readPolicyScope.run(options, () => {
+    const codex = buildCodexArgs(spec);
+    const claude = buildClaudeArgs(spec, "session");
+    const outer = seatbeltProfile(writeRoots(cwd, scratchDir));
+    for (const file of files) {
+      expect(codexAccess(codex, file)).toBe("none");
+      expect(claudeSandboxReads(claude, file)).toBe(false);
+      expect(outer).toContain(
+        `(subpath "${[".netrc", ".npmrc"].includes(basename(file)) ? file : dirname(file)}")`,
+      );
+    }
+    for (const dir of [cwd, scratchDir]) {
+      expect(codexAccess(codex, join(dir, "canary"))).toBe("write");
+      expect(claudeSandboxReads(claude, join(dir, "canary"))).toBe(true);
+    }
+    expect(codexAccess(codex, join(options.home, ".claude/login"))).toBe("read");
+    expect(outer).not.toContain(`(subpath "${options.home}")`);
+  });
+});
+
+test("factory sandbox configuration validates and applies optional denial and toolchain paths", () => {
+  const { root, cwd, scratchDir, spec } = editFixture();
+  const secret = join(root, "extra-secret");
+  try {
+    loadConfig({
+      readOnly: true,
+      home: join(root, "data"),
+      configDir: join(root, "factory-config"),
+      raw: { sandbox: { deny_read: [secret], toolchain_paths: [join(root, "toolchain")] } },
+    });
+    expect(codexAccess(buildCodexArgs(spec), secret)).toBe("none");
+    expect(homeReadPolicy([cwd, scratchDir], true).allowRead).toContain(join(root, "toolchain"));
+    for (const raw of [
+      { deny_read: "bad" },
+      { toolchain_paths: [false] },
+      { deny_read: ["relative"] },
+      { typo: [] },
+      [],
+    ])
+      expect(() => configureReadPolicy(raw, root)).toThrow(ConfinementError);
+  } finally {
+    configureReadPolicy({}, join(homedir(), ".config/limitless"));
+  }
+});
+
+test("editors refuse unresolved homes and symlinked credential overlaps before CLI launch", async () => {
+  const { root, spec, cwd } = editFixture();
+  const home = join(root, "home");
+  mkdirSync(home);
+  symlinkSync(cwd, join(home, ".ssh"));
+  for (const options of [{ home: join(root, "absent") }, { home }]) {
+    await readPolicyScope.run(options, async () => {
+      for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")])
+        expect(() => build(spec)).toThrow(ConfinementError);
+      let calls = 0;
+      const run = async () => {
+        calls++;
+        return procResult;
+      };
+      await expect(runCodex(spec, run)).rejects.toThrow(ConfinementError);
+      await expect(runClaude(spec, run)).rejects.toThrow(ConfinementError);
+      expect(calls).toBe(0);
+    });
+  }
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `Claude outer editor denies credential reads ${seatbeltSkip ?? ""}`,
+  async () => {
+    const { cwd, scratchDir, files, options } = credentialFixture();
+    await readPolicyScope.run(options, async () => {
+      const profile = seatbeltProfile(writeRoots(cwd, scratchDir));
+      for (const file of [...files, join(cwd, "canary"), join(scratchDir, "canary")]) {
+        const result = await runProcess({
+          cmd: [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            profile,
+            "/bin/sh",
+            "-c",
+            'head -c 1 "$1" >/dev/null',
+            "sh",
+            file,
+          ],
+          cwd,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(files.includes(file) ? 1 : 0);
+        if (files.includes(file)) expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+        expect(result.stdout).toBe("");
+      }
+    });
+  },
+);
+
+test.skipIf(seatbeltSkip !== null || codexSkip !== null)(
+  `Codex editor denies credential reads ${codexSkip ?? seatbeltSkip ?? ""}`,
+  async () => {
+    const { cwd, scratchDir, spec, files, options } = credentialFixture();
+    await readPolicyScope.run(options, async () => {
+      const profile = profileArgs(buildCodexArgs(spec)).flatMap((arg) => ["-c", arg]);
+      for (const file of [...files, join(cwd, "canary"), join(scratchDir, "canary")]) {
+        const result = await runProcess({
+          cmd: [
+            "codex",
+            "sandbox",
+            ...profile,
+            "--",
+            "/bin/sh",
+            "-c",
+            'head -c 1 "$1" >/dev/null',
+            "sh",
+            file,
+          ],
+          cwd,
+          env: agentEnv({ CODEX_HOME: join(scratchDir, "codex-home") }),
+        });
+        expect(result.exitCode).toBe(files.includes(file) ? 1 : 0);
+        if (files.includes(file)) expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+        expect(result.stdout).toBe("");
+      }
+    });
+  },
+);
+
 test("write roots are the worktree and scratch; admin and common stay read-only", () => {
   const { root, cwd, scratchDir, common, admin } = editFixture();
   const roots = writeRoots(cwd, scratchDir);
@@ -1482,6 +1637,7 @@ test("codex editors get an explicit write profile, fresh or resumed, and nothing
       [admin]: "read",
       [realpathSync(scratchDir)]: "write",
       [join(cwd, ".git")]: "read",
+      ...Object.fromEntries((writeRoots(cwd, scratchDir).denyRead ?? []).map((p) => [p, "none"])),
     });
     expect(profileArgs(args).join("")).toContain("network={enabled=true}");
     for (const flag of ["--ignore-user-config", "--ignore-rules", "--strict-config"])
@@ -1564,6 +1720,13 @@ function editCodex(
     expect(readFileSync(join(admin, "gitdir"), "utf8")).toBe(join(opts.cwd, ".git"));
     expect(dirname(dirname(admin))).toBe(common);
     const [token = "", file = ""] = opts.cmd.slice(-2);
+    if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"'))) {
+      return {
+        ...procResult,
+        exitCode: behaviour === "leaky" ? 0 : 1,
+        stderr: `head: ${file}: Operation not permitted`,
+      };
+    }
     const entries = Object.entries(codexFilesystem(opts.cmd)).filter(
       ([path]) => file === path || file.startsWith(`${path === "/" ? "" : path}/`),
     );
@@ -1592,18 +1755,19 @@ test("codex editors run only after a probe writes cwd and scratch and is denied 
   expect(result.status).toBe("ok");
   expect(result.confinement).toMatchObject({ ok: true, version: "codex-cli 0.160.0" });
   // Negative canary, the probe's own .git, then cwd and scratch writes.
-  expect(fake.sandboxes()).toHaveLength(6);
+  expect(fake.sandboxes().filter((cmd) => cmd.includes('printf %s "$1" > "$2"'))).toHaveLength(6);
+  const attempts = fake.sandboxes().length;
   expect(fake.execs()).toHaveLength(1);
   expect(readdirSync(fake.root)).toEqual([]);
   // Cached for this CLI and version; a new version is probed again.
   await runCodex(spec, fake.runner, fake.probe);
-  expect(fake.sandboxes()).toHaveLength(6);
+  expect(fake.sandboxes()).toHaveLength(attempts);
   fake.cli.version = "codex-cli 0.161.0";
   await runCodex(spec, fake.runner, fake.probe);
-  expect(fake.sandboxes()).toHaveLength(12);
+  expect(fake.sandboxes()).toHaveLength(attempts * 2);
   fake.cli.path = `${CODEX}-alternate`;
   await runCodex(spec, fake.runner, fake.probe);
-  expect(fake.sandboxes()).toHaveLength(18);
+  expect(fake.sandboxes()).toHaveLength(attempts * 3);
 });
 
 test("CLI sandboxes run directly when outer confinement refuses; Claude editors fail closed", async () => {
@@ -1742,6 +1906,8 @@ test.skipIf(process.platform !== "darwin")(
         expect(profile).not.toContain(`(subpath "${common}")`);
         expect(profile).toContain(`(deny file-write* (subpath "${cwd}/.git") (subpath "${admin}"))`);
         if (!opts.cmd.includes("claude")) {
+          if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"')))
+            return { ...procResult, exitCode: 1, stderr: "head: Operation not permitted" };
           probes++;
           writeFileSync(opts.cmd.at(-2) ?? "", "ok");
           return { ...procResult, stdout: "verified" };
@@ -1783,6 +1949,8 @@ test.skipIf(process.platform !== "darwin")(
         const result = await runClaude(spec, async (opts) => {
           if (opts.cmd[0] === "/bin/sh") return { ...procResult, stdout: "signals-verified" };
           if (!opts.cmd.includes("claude")) {
+            if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"')))
+              return { ...procResult, exitCode: 1, stderr: "head: Operation not permitted" };
             writeFileSync(opts.cmd.at(-2) ?? "", "ok");
             return { ...procResult, stdout: "verified" };
           }

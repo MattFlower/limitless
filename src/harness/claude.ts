@@ -199,11 +199,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     if (spec.mode === "edit") {
       // The outer Seatbelt profile covers Bash and native tools. These permission rules also
       // refuse native edits outside the roots before they reach the filesystem.
-      const { write, protect, denyRead = [] } = writeRoots(spec.cwd, scratch);
+      const { write, protect, denyRead = [] } = writeRoots(spec.cwd, scratch, false, spec.denyRead);
       denied.push(...denyRead.flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       editTools = write.map((p) => `Edit(/${p}/**)`);
       denied.push(...protect.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
-      filesystem = { allowWrite: write, denyWrite: protect, disabled: false };
+      filesystem = { allowWrite: write, denyWrite: protect, denyRead, disabled: false };
     } else {
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
@@ -295,7 +295,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const keyFile = t.backend && `${tmpdir()}/limitless-${sessionId}.key`;
   const args = buildClaudeArgs(spec, sessionId, keyFile);
   const editing = spec.mode === "edit" && !spec.noTools;
-  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec)) : null;
+  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead) : null;
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
   const runner: typeof runProcess = (opts) =>

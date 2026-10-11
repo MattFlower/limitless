@@ -1503,6 +1503,18 @@ test.skipIf(process.platform !== "darwin")(
     let probes = 0;
     let launches = 0;
     const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"')))
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "head: Operation not permitted",
+          signal: null,
+          cancelled: false,
+          timedOut: false,
+          idleTimedOut: false,
+          truncated: false,
+          durationMs: 1,
+        };
       const signalProbe = opts.cmd[0] === "/bin/sh";
       const probing = signalProbe || opts.cmd.at(-1)?.endsWith("/denied");
       if (probing) {
@@ -1552,6 +1564,18 @@ test.skipIf(process.platform !== "darwin")(
     const cwd = tempDir({});
     let scratch = "";
     const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"')))
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "head: Operation not permitted",
+          signal: null,
+          cancelled: false,
+          timedOut: false,
+          idleTimedOut: false,
+          truncated: false,
+          durationMs: 1,
+        };
       if (opts.cmd.at(-1)?.endsWith("/denied")) {
         writeFileSync(opts.cmd.at(-2) ?? "", "ok");
       } else if (opts.cmd[0] !== "/bin/sh") {
@@ -1959,7 +1983,7 @@ test("gate subprocess excludes an arbitrary unselected provider credential", asy
     process.env.MAC_MLX_KEY = "FAKE_GATE_CREDENTIAL_733";
     fixture.load();
     const gate = await runGates(
-      fixture.root,
+      fixture.work,
       {
         setup: [],
         checks: [{ name: "env", run: 'test -z "$MAC_MLX_KEY" && printf "credential=absent CI=%s" "$CI"' }],
