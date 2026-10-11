@@ -33,6 +33,17 @@ export interface GateRequest {
 export type GateExecutor = Executor<GateRequest, GateRun>;
 export type GateRunner = (gates: GateConfig) => Promise<GateRun>;
 
+const liveExecutions = new WeakMap<GateExecutor, Map<string, Execution<GateRun>>>();
+
+/** Discard only work still owned by this process; never replay an old handle to cancel it. */
+export async function cancelGateExecution(handle: ExecutionHandle, executor?: GateExecutor): Promise<void> {
+  const execution = executor?.kind === handle.kind ? liveExecutions.get(executor)?.get(handle.id) : undefined;
+  if (execution) {
+    await execution.cancel();
+    await execution.result.catch(() => {});
+  }
+}
+
 export function gateExecutorFor(kind: "local"): GateExecutor {
   switch (kind) {
     case "local":
@@ -43,7 +54,7 @@ export function gateExecutorFor(kind: "local"): GateExecutor {
 export function localExecutor(hooks: GateHooks = {}): GateExecutor {
   const executions = new Map<string, Execution<GateRun>>();
   const starts = new Map<string, { request: GateRequest; signal: AbortSignal }>();
-  return {
+  const executor: GateExecutor = {
     kind: "local",
     async start(request, signal) {
       signal.throwIfAborted();
@@ -126,6 +137,8 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
       return execution;
     },
   };
+  liveExecutions.set(executor, executions);
+  return executor;
 }
 
 /** Start, checkpoint, attach and cancel through the same path for all daemon gates. */
@@ -152,6 +165,12 @@ export async function executeGate(
     onSettled();
     throw error;
   }
+  let live = liveExecutions.get(executor);
+  if (!live) {
+    live = new Map();
+    liveExecutions.set(executor, live);
+  }
+  live.set(handle.id, execution);
   let cancellation: Promise<void> | undefined;
   const abort = () => {
     cancellation ??= execution.cancel();
@@ -165,9 +184,14 @@ export async function executeGate(
     })();
     const [result] = await Promise.all([execution.result, events]);
     return result;
+  } catch (error) {
+    abort();
+    throw error;
   } finally {
-    onSettled();
     signal.removeEventListener("abort", abort);
     await cancellation;
+    await execution.result.catch(() => {});
+    live.delete(handle.id);
+    onSettled();
   }
 }

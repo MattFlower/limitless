@@ -465,7 +465,9 @@ async function prepare(ctx: RunContext): Promise<void> {
         ? trusted.scripts
         : pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
       ctx.log(
-        `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
+        redactGateOutput(
+          `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
+        ),
       );
       await ctx.save();
       const { onWait } = gateEvents(ctx);
@@ -513,7 +515,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           const fresh = await runBaseline();
           // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
           // and it contradicts any cached pass for this key, so that entry goes.
-          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, redactGateData(fresh), ctx.run.id);
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
           else store.deleteBaselineCache(key);
           return fresh;
         };

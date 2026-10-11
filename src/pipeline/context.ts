@@ -307,7 +307,6 @@ export class RunContext {
       feedback: null,
       toolCommands: [],
     };
-    this.state = redactGateData(this.state);
   }
 
   get store(): Store {
@@ -370,7 +369,7 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.store.setRunState(this.run.id, redactGateData(this.state));
+    this.store.setRunState(this.run.id, this.state);
   }
 
   async setPhase(phase: Phase): Promise<void> {

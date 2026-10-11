@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { cacheableBaseline } from "../src/gates/cache.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
 import { type GateRun, retryBaselineFailures } from "../src/gates/run.ts";
@@ -13,7 +14,16 @@ import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
-import { approve, type Handler, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import {
+  approve,
+  type Handler,
+  holdout,
+  pipelineSetup,
+  roleOf,
+  spec,
+  triage,
+  waitFor,
+} from "./pipeline-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
   home: "",
@@ -285,7 +295,8 @@ test("credential-bearing commands retry and replay from an identity without exec
     expect(saved?.gateExecution).toBeDefined();
     expect(saved?.gateExecution?.handle).not.toHaveProperty("request");
     expect(saved?.gateExecution).not.toHaveProperty("gates");
-    expect(JSON.stringify(saved)).not.toContain(secret);
+    expect(JSON.stringify(saved?.gateExecution)).not.toContain(secret);
+    expect(saved?.gatesConfig).toEqual(cfg);
     f.deps.faults = undefined;
     f.deps.gateExecutor = localExecutor();
     expect(
@@ -293,6 +304,163 @@ test("credential-bearing commands retry and replay from an identity without exec
     ).toBe(true);
   });
 });
+
+test.each([
+  ["credential", false],
+  ["credential", true],
+  ["escape", false],
+  ["escape", true],
+] as const)("gate inputs survive gate-started restart (%s, restart=%s)", async (kind, restart) => {
+  const literal = kind === "credential" ? "synthetic-resume-credential-486" : "\x1b[31moriginal";
+  if (kind === "credential") registerCredential("gate-resume-test", literal);
+  const script = `test "$(cat expected.txt)" = '${literal}'`;
+  const command = `bun run check && ${script}`;
+  writeFileSync(join(fixture.repoDir, "expected.txt"), literal);
+  writeFileSync(join(fixture.repoDir, "package.json"), JSON.stringify({ scripts: { check: script } }));
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = "check", run = ${JSON.stringify(command)} }]\n`,
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "literal gate inputs"], { cwd: fixture.repoDir });
+  const interrupted = deferred<void>();
+  const f = start(
+    handler,
+    false,
+    false,
+    restart
+      ? {
+          faults: {
+            "store:save": {
+              action: "kill",
+              when: (c) => c.stage === "gates" && c.checkpoint === "gate-started",
+              onHit: () => interrupted.resolve(),
+            },
+          },
+        }
+      : {},
+  );
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+  let finished = f;
+  if (restart) {
+    await interrupted.promise;
+    await f.stop();
+    const saved = f.store.getRunState<RunState>(run.id);
+    expect(saved?.gatesConfig?.checks[0]?.run).toBe(command);
+    expect(saved?.baselineScripts?.check).toBe(script);
+    f.store.close();
+    finished = start(handler);
+  }
+  expect(await waitFor(finished, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const state = finished.store.getRunState<RunState>(run.id);
+  expect(state?.gatesConfig?.checks[0]?.run).toBe(command);
+  expect(state?.baselineScripts?.check).toBe(script);
+  expect(state?.lastGates?.[0]).toMatchObject({ verdict: "pass", blocking: false });
+  expect(state?.lastAudit?.some((f) => f.rule === "gate-script-changed")).toBe(false);
+  const row = finished.store.db.query("SELECT gate_run FROM passing_baselines").get() as {
+    gate_run: string;
+  } | null;
+  if (!row) throw new Error("missing baseline cache");
+  expect(
+    cacheableBaseline(JSON.parse(row.gate_run), { ...gates, checks: [{ name: "check", run: command }] }),
+  ).toBe(true);
+  const observable = JSON.stringify([
+    state?.lastGates,
+    finished.store.listEvents(run.id),
+    finished.store.getArtifact(run.id, "baseline-gates.json"),
+  ]);
+  expect(observable).not.toContain(JSON.stringify(literal).slice(1, -1));
+});
+
+test("saving and loading preserves specification, holdout, feedback and answers literally", async () => {
+  const literal = "synthetic-state-credential-486\x1b[31m";
+  registerCredential("gate-state-test", "synthetic-state-credential-486");
+  const { ctx, restore } = await context();
+  ctx.state.spec = { ...spec, summary: literal };
+  ctx.state.holdout = {
+    scenarios: [
+      {
+        ...holdout.scenarios[0],
+        id: "H-1",
+        description: literal,
+        steps: literal,
+        expected: literal,
+        edge_case: false,
+      },
+    ],
+  };
+  ctx.state.feedback = literal;
+  ctx.state.answers = [literal];
+  await ctx.save();
+  const resumed = restore();
+  expect(resumed.state.spec).toEqual(ctx.state.spec);
+  expect(resumed.state.holdout).toEqual(ctx.state.holdout);
+  expect(resumed.state.feedback).toBe(literal);
+  expect(resumed.state.answers).toEqual([literal]);
+});
+
+test.each(["hook", "purpose", "sha"] as const)(
+  "forgotten local execution stops before replacement (%s)",
+  async (reason) => {
+    const executor = localExecutor();
+    const { ctx, f } = await context(executor);
+    const pidFile = join(fixture.home, "gate-child.pid");
+    const req = request(fixture.repoDir);
+    req.gates = {
+      ...gates,
+      checks: [
+        { name: "first", run: "true" },
+        { name: "pending", run: `echo $$ > '${pidFile}'; exec sleep 900` },
+      ],
+    };
+    const handle = await executor.start(req, ctx.signal);
+    await confinementScope.run(fakeConfinement, async () => {
+      const execution = executor.attach(handle, ctx.signal);
+      const settled = execution.result.catch(() => undefined);
+      try {
+        const deadline = Date.now() + 5_000;
+        while (!existsSync(pidFile)) {
+          if (Date.now() > deadline) throw new Error("gate child did not start");
+          await Bun.sleep(10);
+        }
+        const pid = Number(readFileSync(pidFile, "utf8").trim());
+        process.kill(pid, 0);
+        expect(gateSlots.snapshot().occupied).toBe(1);
+        const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd: fixture.repoDir })).stdout.trim();
+        ctx.state.gateExecution = {
+          stage: "gates",
+          round: 0,
+          purpose: reason === "purpose" ? "rebase" : "initial",
+          sha: reason === "sha" ? "stale" : sha,
+          handle,
+        };
+        await ctx.save();
+        const start = executor.start.bind(executor);
+        executor.start = (...args) => {
+          expect(() => process.kill(pid, 0)).toThrow();
+          expect(gateSlots.snapshot().occupied).toBe(0);
+          return start(...args);
+        };
+        const failure = new Error("log write failed");
+        const hooks = {
+          onResult() {
+            if (reason === "hook") throw failure;
+            expect(() => process.kill(pid, 0)).toThrow();
+          },
+        };
+        const attempt = runGateExecution(ctx, "gates", "initial", fixture.repoDir, gates, hooks);
+        if (reason === "hook") await expect(attempt).rejects.toBe(failure);
+        else expect((await attempt).checks[0]?.ok).toBe(true);
+        expect(() => process.kill(pid, 0)).toThrow();
+        expect(gateSlots.snapshot().occupied).toBe(0);
+        expect(f.store.getRunState<RunState>(ctx.run.id)?.gateExecution).toBeUndefined();
+      } finally {
+        await execution.cancel();
+        await settled;
+      }
+    });
+  },
+);
 
 test.each([true, false])("executor results decide gate verdicts (pass=%s)", async (passing) => {
   const scripted = fake(async (h, req) => result(req, h.id === "1" || passing));

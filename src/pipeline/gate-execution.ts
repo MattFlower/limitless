@@ -1,6 +1,6 @@
 import type { StageName } from "../core/types.ts";
 import type { GateConfig } from "../gates/detect.ts";
-import { executeGate } from "../gates/executor.ts";
+import { cancelGateExecution, executeGate } from "../gates/executor.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
 import { headSha } from "../git/repos.ts";
 import type { RunContext } from "./context.ts";
@@ -27,6 +27,7 @@ export async function runGateExecution(
       ? pending.handle
       : undefined;
   if (pending && !stored) {
+    await cancelGateExecution(pending.handle, ctx.deps.gateExecutor);
     ctx.state.gateExecution = undefined;
     await ctx.save();
   }
