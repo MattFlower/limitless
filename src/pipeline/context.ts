@@ -297,7 +297,8 @@ export class RunContext {
     this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
-    this.state = deps.store.getRunState<RunState>(run.id) ?? {
+    const stored = deps.store.getRunState<RunState>(run.id);
+    this.state = stored ?? {
       flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
       phase: "prepare",
       answers: [],
@@ -308,6 +309,9 @@ export class RunContext {
       toolCommands: [],
     };
     this.state = redactGateData(this.state);
+    // Executable inputs must survive reload literally; diagnostics still need legacy redaction.
+    if (stored?.gatesConfig) this.state.gatesConfig = stored.gatesConfig;
+    if (stored?.baselineScripts) this.state.baselineScripts = stored.baselineScripts;
   }
 
   get store(): Store {

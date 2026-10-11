@@ -417,8 +417,8 @@ test("saving preserves literal state while loading redacts credentials and termi
   });
   expect(resumed.state.feedback).toBe("[redacted]");
   expect(resumed.state.answers).toEqual(["[redacted]"]);
-  expect(resumed.state.gatesConfig?.checks[0]?.run).toBe("[redacted]");
-  expect(resumed.state.baselineScripts?.check).toBe("[redacted]");
+  expect(resumed.state.gatesConfig?.checks[0]?.run).toBe(literal);
+  expect(resumed.state.baselineScripts?.check).toBe(literal);
 });
 
 test.each(["hook", "purpose", "sha"] as const)(
