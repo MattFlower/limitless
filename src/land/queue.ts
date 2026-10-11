@@ -8,9 +8,9 @@ import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
+import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
-import { runGates } from "../gates/run.ts";
 import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
@@ -20,6 +20,7 @@ import {
   ensureCache,
   exportCommit,
   fetchBase,
+  headSha,
   isAncestor,
   mergePullRequest,
   pushExistingBranch,
@@ -70,6 +71,7 @@ export interface LandClock {
 }
 
 export interface LandDeps {
+  gateExecutor?: GateExecutor;
   store: Store;
   paths: Paths;
   /** GitHub polling is on: read the poller's saved observations instead of calling `gh` every cycle. */
@@ -381,12 +383,22 @@ export class LandQueue {
       mkdirSync(dirname(log), { recursive: true });
       writeFileSync(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
       await exportCommit(cwd, baseSha, base, signal);
-      // The gate slot comes from runGates itself: one lease, never a second one on top.
-      const run = await runGates(cwd, detectGates(base), signal, {
-        holder: "land",
-        onResult: (r) =>
-          appendFileSync(log, `\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
-      });
+      const run = await executeGate(
+        {
+          repo: entry.repo,
+          cwd,
+          baseSha,
+          headSha: await headSha(cwd),
+          gates: detectGates(base),
+        },
+        signal,
+        {
+          holder: "land",
+          onResult: (r) =>
+            appendFileSync(log, `\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
+        },
+        this.deps.gateExecutor,
+      );
       this.store.updateLandEntry(entry.id, { logPath: log });
       const failed = run.setupOk ? run.checks.filter((c) => !c.ok) : run.setup.filter((c) => !c.ok);
       if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);

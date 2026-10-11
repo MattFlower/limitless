@@ -33,6 +33,7 @@ import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  gateExecutor?: EngineDeps["gateExecutor"];
   confinement?: EngineDeps["confinement"];
   faults?: EngineDeps["faults"];
   bootSha?: string;
@@ -161,6 +162,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
+      gateExecutor: opts.gateExecutor,
       confinement: opts.confinement ?? seatbeltBackend,
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
@@ -196,6 +198,7 @@ export class Factory {
       ciReruns: cfg.githubCiReruns,
       client: getGitHubPr,
       confinement: this.deps.confinement,
+      gateExecutor: this.deps.gateExecutor,
       ...opts.land,
     });
     this.concierge = new Concierge(this);

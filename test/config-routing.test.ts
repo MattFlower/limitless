@@ -1023,3 +1023,14 @@ test("native aliases inherit both reserve windows, retain identity and honor exp
     fixture.close();
   }
 });
+
+test.each([undefined, '"local"', '"lan"', "3"])("gate executor config: %s", (value) => {
+  const fixture = providerFixture();
+  try {
+    writeFileSync(fixture.file, value === undefined ? "" : `[gates]\nexecutor = ${value}\n`);
+    if (value === undefined || value === '"local"') expect(fixture.load().gateExecutor).toBe("local");
+    else expect(() => fixture.load()).toThrow(/gates\.executor.*local/);
+  } finally {
+    fixture.close();
+  }
+});

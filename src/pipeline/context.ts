@@ -22,6 +22,7 @@ import type {
 import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
+import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
@@ -44,6 +45,7 @@ import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schem
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  gateExecutor?: GateExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
   faults?: FaultPlan;
   gh?: GhRunner;
@@ -78,6 +80,8 @@ export interface RunState {
   reviewLenses?: RepoReviewLens[];
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
+  gateExecution?: { stage: StageName; round: number; purpose: string; handle: ExecutionHandle };
+  gateResults?: { stage: StageName; round: number; sha: string; values: Record<string, GateRun> };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
