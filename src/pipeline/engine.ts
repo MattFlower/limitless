@@ -319,8 +319,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       ctx.state.worktreePath &&
-      ctx.state.conflictRound === undefined &&
-      !ctx.state.pendingRebaseSha &&
+      ((ctx.state.conflictRound === undefined && !ctx.state.pendingRebaseSha) ||
+        environmentBlockedRound(ctx)) &&
       !(reviewRound(ctx)?.kind === "ci" && ctx.run.headSha === reviewRound(ctx)?.reviewedSha)
     ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
@@ -1777,6 +1777,21 @@ async function oneRound(
 
 class DeliveryHeadError extends NeedsHumanError {}
 
+/** Only the current checked round's environment-blocked verdict permits unverified publication. */
+function environmentBlockedRound(ctx: RunContext): boolean {
+  const verify = ctx.state.verifyResults?.at(-1);
+  return (
+    !!reviewRound(ctx) &&
+    !!ctx.state.needsHumanReason?.startsWith(ENVIRONMENT_BLOCKED) &&
+    !!ctx.state.lastVerify &&
+    blockedOnly(ctx.state.lastVerify) &&
+    verify?.round === ctx.state.round &&
+    !!verify.sha &&
+    verify.sha === ctx.state.reviewedSha &&
+    blockedOnly(verify)
+  );
+}
+
 /** Only round evidence, or a factory merge already validated and gated, authorizes delivery. */
 async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> {
   const expected = ctx.state.reviewedSha;
@@ -1790,7 +1805,9 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
     stage.name !== "gates" ||
     stage.round !== ctx.state.round ||
     stage.status !== "succeeded" ||
-    (ctx.state.flow !== "verify-change" && ctx.state.lastVerifiedSha !== expected) ||
+    (ctx.state.flow !== "verify-change" &&
+      ctx.state.lastVerifiedSha !== expected &&
+      !environmentBlockedRound(ctx)) ||
     gates.checks.some((c) => c.blocking) ||
     ctx.state.lastReview?.verdict !== "approve" ||
     !ctx.state.lastAudit ||
@@ -1798,6 +1815,7 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
   )
     throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
   if (head === expected) return;
+  if (environmentBlockedRound(ctx)) throw new DeliveryHeadError(reason);
   // A completed clean merge records both run SHAs only after validation and post-merge gates.
   const base = ctx.state.pendingRebaseSha ?? (head === ctx.run.headSha ? ctx.run.baseSha : null);
   if (base && (!ctx.state.pendingRebaseSha || ctx.state.preRebaseHead === expected)) {
@@ -1990,18 +2008,24 @@ async function deliverReviewRound(
       }
       stored();
       ctx.store.markRoundDelivered(ctx.run.id, head);
+      await ctx.save("round-delivered");
     }
-    if (review.kind === "conflict" || review.kind === "ci") {
-      const marker = `<!-- limitless-${review.kind === "ci" ? "ci" : "conflict"}-round:${ctx.run.id} -->`;
+    const blocked = environmentBlockedRound(ctx);
+    if (blocked || review.kind === "conflict" || review.kind === "ci") {
+      if (blocked && !pr.isDraft) await gh(["pr", "ready", prUrl, "--undo"], ctx.signal);
+      const marker = `<!-- limitless-${review.kind}-round:${ctx.run.id} -->`;
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
         .comments as { body?: string }[] | undefined;
       if (!comments?.some((comment) => comment.body?.includes(marker))) {
         const failure = ctx.store.ciFixFailure(ctx.run.id);
         if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
         const text = redactCredentials(
-          review.kind === "ci"
+          (review.kind === "ci"
             ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${JSON.stringify(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
-            : `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
+            : review.kind === "conflict"
+              ? `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`
+              : `${marker}\nRound ${review.round} published at ${head}.`) +
+            (blocked ? `\n\n${buildReport(ctx, false)}` : ""),
         );
         await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
         await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);
@@ -2019,6 +2043,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   if (ctx.state.deliveryComplete) return;
   // Before any delivery path is chosen: a review round only ever takes its own.
   const review = reviewRound(ctx);
+  const blocked = !success && environmentBlockedRound(ctx);
   assertExistingBranchDelivery(ctx.repo, ctx.run, review?.grant);
   if (ctx.run.deliveryBranch && !review && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
@@ -2179,7 +2204,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         ? null
         : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     let head = sha ?? (await headSha(cwd));
-    if (success || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
+    if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {
       const baseBranch = ctx.run.baseBranch as string;
@@ -2211,7 +2236,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     await checkPublication(ctx, report, { sha: await headSha(cwd), title });
     head = await headSha(cwd);
-    if (success || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
+    if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
@@ -2242,7 +2267,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     if (review || ctx.run.deliveryBranch) {
       publish();
-      if (!success) return { summary: "PR update needs human review; no push", value: undefined };
+      if (!success && !blocked) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
       if (review) await deliverReviewRound(ctx, review, cwd, head, gh, budget);
       else if (ctx.run.deliveryBranch) {

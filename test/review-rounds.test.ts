@@ -1,17 +1,20 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { ReviewFinding, Run, RunDetail } from "../src/core/types.ts";
+import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -98,11 +101,15 @@ let factory: Factory;
 let implementPrompts: string[];
 let onImplement: () => Promise<Record<string, string>>;
 let rejectNextReview = false;
+let verifyStatus: "met" | "blocked" | "unmet" | "unclear";
+let verifyCalls: number;
 /** The fake PR: `view` overrides fields of `gh pr view`; `fail` breaks it; `hold` delays one lookup. */
 let pr: {
   state: string;
   body: string;
   autoMerge: boolean;
+  draft: boolean;
+  comments: { body: string }[];
   calls: string[][];
   view: Record<string, unknown>;
   fail: boolean;
@@ -148,7 +155,21 @@ function answer(s: AgentSpec): FakeReply | Promise<FakeReply> {
       },
     };
   }
-  if (s.prompt.startsWith("You are the acceptance")) return { structured: verify };
+  if (s.prompt.startsWith("You are the acceptance")) {
+    verifyCalls++;
+    return {
+      structured: {
+        ...verify,
+        criteria: verify.criteria.map((c, i) =>
+          i === 0
+            ? { ...c, status: verifyStatus, evidence: "Real confinement probes require unconfined gates" }
+            : i === 1 && verifyStatus !== "met"
+              ? { ...c, status: "blocked", evidence: "Environment unavailable" }
+              : c,
+        ),
+      },
+    };
+  }
   implementPrompts.push(s.prompt);
   return onImplement().then((files) => ({ files, text: "done" }));
 }
@@ -189,6 +210,8 @@ function makeFactory(faults?: FaultPlan): Factory {
         headRepository: { name: "repo" },
         headRepositoryOwner: { login: "test" },
         body: pr.body,
+        isDraft: pr.draft,
+        comments: pr.comments,
         autoMergeRequest: pr.autoMerge ? { enabledAt: "2026-10-04T00:00:00Z" } : null,
         ...pr.view,
       });
@@ -199,6 +222,14 @@ function makeFactory(faults?: FaultPlan): Factory {
     }
     if (args[0] === "pr" && args[1] === "edit" && args[2] === PR_URL) {
       pr.body = stdin ?? "";
+      return "";
+    }
+    if (args[1] === "ready" && args.includes("--undo")) {
+      pr.draft = true;
+      return "";
+    }
+    if (args[1] === "comment") {
+      pr.comments.push({ body: stdin ?? "" });
       return "";
     }
     throw new Error(`unexpected gh ${args.join(" ")}`);
@@ -222,10 +253,14 @@ beforeEach(async () => {
   implementPrompts = [];
   onImplement = async () => ({ "fix.txt": "fixed\n" });
   rejectNextReview = false;
+  verifyStatus = "met";
+  verifyCalls = 0;
   pr = {
     state: "OPEN",
     body: "Factory report",
     autoMerge: false,
+    draft: false,
+    comments: [],
     calls: [],
     view: {},
     fail: false,
@@ -235,6 +270,7 @@ beforeEach(async () => {
   factory = makeFactory();
 });
 afterEach(async () => {
+  mock.restore();
   await factory.stop();
   factory.store.close();
   observerRoots.clear();
@@ -404,6 +440,75 @@ test("a changes verdict runs one round that pushes onto the PR branch with the f
   ]);
   expect(kinds()).toEqual(expect.arrayContaining(["review.round_started", "review.round_delivered"]));
 });
+
+test.each(["none", "round-delivered", "delivery-complete"])(
+  "an environment-blocked review round publishes its checked head, restarting at %s",
+  async (checkpoint) => {
+    const original = await delivered("standard");
+    const old = await remoteHead();
+    const id = (await changes(original.id)).body.round?.id as string;
+    verifyStatus = "blocked";
+    const push = spyOn(repos, "pushExistingBranch");
+    const commands = spyOn(proc, "sh");
+    if (checkpoint !== "none") {
+      factory.deps.faults = {
+        "store:save": { action: "kill", when: (c) => c.checkpoint === checkpoint },
+      };
+      expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+      expect(factory.store.reviewRound(id)?.deliveredSha).toBe(await remoteHead());
+      await restart();
+    }
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+    const head = await remoteHead();
+    expect(head).not.toBe(old);
+    expect(head).toHaveLength(40);
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(commands.mock.calls.map(([args]) => args)).toContainEqual(
+      expect.arrayContaining([
+        `${head}:refs/heads/${BRANCH}`,
+        `--force-with-lease=refs/heads/${BRANCH}:${old}`,
+      ]),
+    );
+    expect(verifyCalls).toBe(2);
+    expect(pr.draft).toBe(true);
+    expect(pr.calls.filter((args) => args[1] === "ready")).toEqual([["pr", "ready", PR_URL, "--undo"]]);
+    expect(pr.comments).toHaveLength(1);
+    expect(pr.comments[0]?.body).toContain(head);
+    expect(pr.comments[0]?.body).toContain("🚧 blocked AC-1");
+    expect(pr.comments[0]?.body).toContain("Real confinement probes require unconfined gates");
+    expect(factory.store.approvalFor(PR_URL)).toBeNull();
+    expect(factory.store.getRun(id)).toMatchObject({
+      status: "needs_human",
+      error: expect.stringContaining("verification blocked by the environment"),
+      headSha: head,
+    });
+    const feed = factory.store
+      .readFeed({ limit: 100 })
+      .items.filter((i) => i.kind === "review.round_delivered");
+    expect(feed).toHaveLength(1);
+    expect(feed[0]?.data).toMatchObject({ headSha: head });
+    expect(factory.store.getRunDetail(id)).toMatchObject({
+      run: { headSha: head },
+      review: { rounds: [{ deliveredSha: head }] },
+    });
+  },
+);
+
+test.each(["unmet", "unclear"] as const)(
+  "a required %s criterion alongside a block never publishes",
+  async (status) => {
+    const original = await delivered("standard");
+    const old = await remoteHead();
+    const id = (await changes(original.id)).body.round?.id as string;
+    verifyStatus = status;
+    factory.cfg.maxRounds = 1;
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+    expect(await remoteHead()).toBe(old);
+    expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
+    expect(pr.comments).toHaveLength(0);
+    expect(kinds()).not.toContain("review.round_delivered");
+  },
+);
 
 test.each(["amended round", "unchanged round", "amended existing branch"])(
   "delivery restart checks the reviewed HEAD: %s",

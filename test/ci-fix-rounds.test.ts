@@ -16,7 +16,17 @@ import { executeRun } from "../src/pipeline/engine.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, prNode, respond } from "./github-poller-support.ts";
-import { approve, models, policy, providers, roleOf, triage } from "./pipeline-support.ts";
+import {
+  approve,
+  holdout,
+  models,
+  pass,
+  policy,
+  providers,
+  roleOf,
+  spec,
+  triage,
+} from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -52,7 +62,7 @@ let calls: string[][];
 let comments: { body: string }[];
 let draft: boolean;
 let autoMerge: boolean;
-let mode: "pass" | "gates" | "review" | "audit" | "stop";
+let mode: "pass" | "gates" | "review" | "audit" | "stop" | "blocked" | "unmet";
 let implementCalls: number;
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
@@ -77,6 +87,33 @@ beforeEach(async () => {
     harnesses: {
       fake: fakeHarness((s) => {
         if (roleOf(s) === "triage") return { structured: triage({ task_class: "bugfix" }) };
+        if (roleOf(s) === "spec")
+          return {
+            structured: {
+              ...spec,
+              summary: "Preserve greeting",
+              requirements: ["Preserve greeting"],
+              acceptance_criteria: [
+                { id: "AC-1", criterion: "Greeting is preserved", how_to_verify: "inspect greeting.txt" },
+              ],
+            },
+          };
+        if (roleOf(s) === "holdout") return { structured: holdout };
+        if (roleOf(s) === "verify")
+          return {
+            structured: {
+              ...pass,
+              criteria: pass.criteria.map((c) =>
+                c.id === "AC-1"
+                  ? {
+                      ...c,
+                      status: mode === "blocked" ? "blocked" : "unmet",
+                      evidence: "Real confinement probes require unconfined gates",
+                    }
+                  : c,
+              ),
+            },
+          };
         if (roleOf(s) === "review")
           return {
             structured:
@@ -115,6 +152,10 @@ beforeEach(async () => {
   });
   factory.deps.gh = async (args, _signal, stdin) => {
     calls.push(args);
+    if (args[1] === "ready" && args.includes("--undo")) {
+      draft = true;
+      return "";
+    }
     if (args[1] === "merge" && args.includes("--disable-auto")) {
       autoMerge = false;
       return "";
@@ -356,6 +397,39 @@ test.each(["gates", "review", "audit"] as const)("a failed %s never pushes or co
   expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
   expect(comments).toHaveLength(0);
 });
+
+test.each(["blocked", "unmet"] as const)(
+  "a CI fix with %s verification publishes only environment blocks",
+  async (status) => {
+    factory.store.db.query("UPDATE runs SET profile = 'standard' WHERE id = ?").run(owner.id);
+    const old = await remoteHead();
+    mode = status;
+    const id = await start();
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+    if (status === "unmet") {
+      expect(await remoteHead()).toBe(old);
+      expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
+      expect(comments).toHaveLength(0);
+      return;
+    }
+    const head = await remoteHead();
+    expect(head).not.toBe(old);
+    expect(draft).toBe(true);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain(head);
+    expect(comments[0]?.body).toContain("🚧 blocked AC-1");
+    expect(comments[0]?.body).toContain("Real confinement probes require unconfined gates");
+    expect(factory.store.getRun(id)?.error).toContain("verification blocked by the environment");
+    expect(factory.store.approvalFor(url)).toBeNull();
+    expect(factory.store.getRunDetail(id)).toMatchObject({
+      run: { headSha: head },
+      review: { rounds: [{ deliveredSha: head }] },
+    });
+    expect(
+      factory.store.readFeed({ limit: 100 }).items.find((i) => i.kind === "ci.round_delivered")?.data,
+    ).toMatchObject({ headSha: head });
+  },
+);
 
 test.each(["approval", "conflict"] as const)(
   "cap dedupes its feed episode and resets after %s",
