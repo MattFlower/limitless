@@ -49,4 +49,14 @@ export function feedStore() {
   return ctx;
 }
 
-export const allItems = (store: Store) => store.readFeed({ after: 0, limit: 1000 }).items;
+export function allItems(store: Store): FeedItem[] {
+  const items: FeedItem[] = [];
+  let after = 0;
+  for (;;) {
+    const page = store.readFeed({ after });
+    items.push(...page.items);
+    if (!page.hasMore) return items;
+    if (page.nextAfter <= after) throw new Error("Feed cursor did not advance");
+    after = page.nextAfter;
+  }
+}

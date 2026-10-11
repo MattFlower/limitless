@@ -6,11 +6,19 @@ import type { Factory } from "../app.ts";
 import {
   type CreateRunRequest,
   type FeedAck,
+  type FeedPage,
   type ResolutionKind,
   RUN_ROLES,
   type RunStatus,
 } from "../core/types.ts";
-import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
+import {
+  FeedAckSchema,
+  FeedQuerySchema,
+  limitFeedPage,
+  mcpRequestedBy,
+  validateFeedQuery,
+  waitForFeed,
+} from "../feed.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { ChangeQuerySchema, getChange } from "./mcp-change.ts";
@@ -47,6 +55,10 @@ const runSchema = z
     profile,
     stage: z.string().nullable(),
     prUrl: z.string().nullable(),
+    headSha: z.string().nullable().optional(),
+    merged: z.boolean().optional(),
+    mergedAt: z.number().nullable().optional(),
+    mergedBy: z.string().nullable().optional(),
     costUsd: z.number(),
     costEquivUsd: z.number(),
     error: z.string().nullable(),
@@ -75,11 +87,45 @@ const feedPageSchema = z.object({
   items: z.array(z.object({ id: z.number().int(), kind: z.string(), title: z.string() }).passthrough()),
   nextAfter: z.number().int(),
   pruned: z.boolean(),
+  hasMore: z.boolean().optional(),
 });
 const feedArgsSchema = FeedQuerySchema.omit({ limit: true }).extend({
   wait: z.number().min(0).max(45).default(0),
 });
-const detailSchema = z.object({ run: runSchema, questions: z.array(questionSchema) });
+const detailSchema = z.object({ run: runSchema, questions: z.array(questionSchema) }).passthrough();
+const roundsSchema = z.object({
+  rounds: z.array(z.object({ deliveredSha: z.string().nullable().optional() })),
+});
+
+function mergeFields(run: z.output<typeof runSchema>) {
+  const { mergedAt, mergedBy, ...rest } = run;
+  return {
+    ...rest,
+    ...(run.merged && mergedAt != null ? { mergedAt } : {}),
+    ...(run.merged && mergedBy != null ? { mergedBy } : {}),
+  };
+}
+
+function compactRun(run: z.output<typeof runSchema>, privacy: OutputPrivacy | null) {
+  // Check complete strings before clipping, so a truncated secret cannot escape redaction.
+  const safe = privacy ? privateOutputData(mergeFields(run), privacy) : mergeFields(run);
+  return {
+    id: safe.id,
+    repository: safe.repoSlug,
+    title: safe.title.slice(0, 200),
+    status: safe.status,
+    dependsOn: safe.dependsOn,
+    stage: safe.stage,
+    prUrl: safe.prUrl,
+    headSha: safe.headSha ?? null,
+    merged: safe.merged ?? false,
+    ...(safe.mergedAt !== undefined ? { mergedAt: safe.mergedAt } : {}),
+    ...(safe.mergedBy !== undefined ? { mergedBy: safe.mergedBy } : {}),
+    costUsd: safe.costUsd,
+    costEquivUsd: safe.costEquivUsd,
+    error: safe.error?.slice(0, 500) ?? null,
+  };
+}
 const providersSchema = z.array(
   z.object({
     id: nonblank,
@@ -110,7 +156,7 @@ export interface McpBackend {
   create(input: CreateRunRequest): Promise<unknown>;
   detail(id: string): Promise<unknown>;
   events(id: string): Promise<unknown>;
-  list(status: RunStatus | undefined, limit: number): Promise<unknown>;
+  list(status: RunStatus | undefined, limit: number, repo?: string): Promise<unknown>;
   cancel(id: string): Promise<unknown>;
   answer(id: string, answer: string): Promise<unknown>;
   resolve(id: string, input: z.output<typeof ResolveRunSchema>): Promise<unknown>;
@@ -133,7 +179,8 @@ export function factoryBackend(factory: Factory): McpBackend {
     create: async (input) => factory.createRun({ ...input, source: "mcp" }),
     detail: async (id) => requireRun(id),
     events: async (id) => factory.store.listEvents(id, { tail: true, excludeDebug: true, limit: 20 }),
-    list: async (status, limit) => factory.store.listRuns({ status: status ? [status] : undefined, limit }),
+    list: async (status, limit, repo) =>
+      factory.store.listRuns({ status: status ? [status] : undefined, limit, repoSlug: repo }),
     cancel: async (id) => {
       requireRun(id);
       return { cancelled: factory.cancelRun(id, "mcp") };
@@ -201,8 +248,10 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
     detail: (id) => api(path(id)),
     events: (id) =>
       api(`${path(id)}/events?${new URLSearchParams({ tail: "true", excludeDebug: "true", limit: "20" })}`),
-    list: (status, limit) =>
-      api(`/api/runs?${new URLSearchParams({ limit: String(limit), ...(status ? { status } : {}) })}`),
+    list: (status, limit, repo) =>
+      api(
+        `/api/runs?${new URLSearchParams({ limit: String(limit), ...(status ? { status } : {}), ...(repo ? { repo } : {}) })}`,
+      ),
     cancel: async (id) => {
       // The existing cancel endpoint returns false for unknown ids. Preserve MCP's not-found semantics.
       detailSchema.parse(await api(path(id)));
@@ -295,48 +344,86 @@ export function createMcpServer(backend: McpBackend): Server {
     ),
     tool(
       "limitless_create_run",
-      "Delegate asynchronous repository work to the factory. Use for long-running or background tasks. Supply repo (owner/name or absolute path on the daemon machine), a self-contained prompt, optional title and profile (auto by default), and dependsOn run IDs to wait for their PRs to merge. Returns the created run with id and current status immediately; completion and a PR are not guaranteed. Repository delivery policy applies.",
+      "Delegate asynchronous repository work to the factory. Use for long-running or background tasks. Supply repo (owner/name or absolute path on the daemon machine), a self-contained prompt, optional title and profile (auto by default), and dependsOn run IDs to wait for their PRs to merge. Supply consumer (your stable name, shared with limitless_feed) to record provenance for ownRuns filtering. Returns the created run with id and current status immediately; completion and a PR are not guaranteed. Repository delivery policy applies.",
       z
         .object({
           repo: nonblank,
           prompt: nonblank,
           title: nonblank.optional(),
+          consumer: FeedQuerySchema.shape.consumer,
           allow: z.array(z.enum(["submodules", "gitattributes", "binary"])).optional(),
           models: z.partialRecord(z.enum(RUN_ROLES), z.array(z.string()).min(1)).optional(),
           dependsOn: z.array(nonblank).optional(),
           profile: profile.default("auto"),
         })
         .strict(),
-      async (input) => runSchema.parse(await backend.create({ ...input, source: "mcp" })),
+      async ({ consumer, ...input }) =>
+        runSchema.parse(
+          await backend.create({
+            ...input,
+            requestedBy: consumer === undefined ? undefined : mcpRequestedBy(consumer),
+            source: "mcp",
+          }),
+        ),
     ),
     tool(
       "limitless_get_run",
-      "Inspect progress or follow up on a delegated run by id. Returns id, repository, title, status, nullable stage and prUrl, separate actual costUsd and subscription-equivalent costEquivUsd, error, open questions, and the latest 20 non-debug events in ascending event-id order. Unknown ids are errors.",
-      idSchema,
-      async ({ id }) => {
-        const { run, questions } = detailSchema.parse(await backend.detail(id));
-        const events = z.array(eventSchema).parse(await backend.events(id));
+      "Inspect a delegated run by id. Defaults to a compact summary: status/state, stage, PR, current head SHA, delivered round count, latest land entry, open question count and last error. Title/error may be clipped. Set full:true for all run fields, detail, open questions and the latest 20 non-debug events in ascending event-id order. Unknown ids are errors; merge metadata is omitted until known.",
+      idSchema.extend({ full: z.boolean().default(false) }),
+      async ({ id, full }, _signal, privacy) => {
+        const detail = detailSchema.parse(await backend.detail(id));
+        const { run, questions, worktreePath: _worktreePath, ...rest } = detail;
+        const statusDetail = statusDetailSchema.parse(detail);
+        const lands = statusLandsSchema.parse(await backend.lands(id));
+        const explained = explainStatus(statusDetail, lands, privacy);
+        const summary = {
+          ...compactRun(run, privacy),
+          state: "state" in explained ? explained.state : undefined,
+          headSha: statusDetail.prSnapshot?.headRefOid ?? run.headSha ?? null,
+          deliveredRounds: detail.review
+            ? roundsSchema.parse(detail.review).rounds.filter((r) => r.deliveredSha).length
+            : 0,
+          land: explained.land
+            ? {
+                ...explained.land,
+                ...("reason" in explained.land
+                  ? { reason: explained.land.reason?.slice(0, 500) ?? null }
+                  : {}),
+              }
+            : null,
+          openQuestions: questions.filter((q) => q.answer === null).length,
+        };
+        if (!full) return summary;
         return {
-          id: run.id,
-          repository: run.repoSlug,
+          ...rest,
+          ...mergeFields(run),
+          ...summary,
           title: run.title,
-          status: run.status,
-          dependsOn: run.dependsOn,
-          stage: run.stage,
-          prUrl: run.prUrl,
-          costUsd: run.costUsd,
-          costEquivUsd: run.costEquivUsd,
           error: run.error,
+          repository: run.repoSlug,
           questions: questions.filter((q) => q.answer === null),
-          events,
+          events: z.array(eventSchema).parse(await backend.events(id)),
         };
       },
     ),
     tool(
       "limitless_list_runs",
-      "Find delegated work or check the queue before creating duplicate work. Accepts optional status (one run status) and integer limit (default 20, range 1–100). Returns runs newest-first, with ids, status and cost fields; without status returns all statuses.",
-      z.object({ status: status.optional(), limit: z.number().int().min(1).max(100).default(20) }).strict(),
-      async ({ status, limit }) => z.array(runSchema).parse(await backend.list(status, limit)),
+      "Find delegated work before creating duplicates. Accepts optional repo (exact repository slug), status and limit (default 5, range 1–100). Returns {runs, hasMore} newest-first; hasMore means more matching runs remain. Runs are compact by default, with title/error clipped; full:true includes all stored run fields. Merge metadata is omitted until known.",
+      z
+        .object({
+          repo: nonblank.optional(),
+          status: status.optional(),
+          limit: z.number().int().min(1).max(100).default(5),
+          full: z.boolean().default(false),
+        })
+        .strict(),
+      async ({ repo, status, limit, full }, _signal, privacy) => {
+        const runs = z.array(runSchema).parse(await backend.list(status, limit + 1, repo));
+        return {
+          runs: runs.slice(0, limit).map((run) => (full ? mergeFields(run) : compactRun(run, privacy))),
+          hasMore: runs.length > limit,
+        };
+      },
     ),
     tool(
       "limitless_cancel_run",
@@ -368,9 +455,12 @@ export function createMcpServer(backend: McpBackend): Server {
     ),
     tool(
       "limitless_feed",
-      "Catch up on what needs action (PRs opened, questions, failures, needs_human, merges, finished evals, daemon restarts) across all runs. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; wait (0–45 seconds, within client timeouts) long-polls until a new item arrives. Returns {items, nextAfter, pruned} in ascending id order; pruned means retention removed items you never acknowledged. Reading never acknowledges: call limitless_feed_ack with nextAfter only after you have handled the items.",
+      'Catch up on PRs, questions, failures, merges, evals and daemon restarts. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; new consumers start at zero. Pages contain at most 100 items and 16 KiB of UTF-8 serialized JSON, in ascending id order. Returns {items, nextAfter, pruned, hasMore}; when hasMore is true, continue with after: nextAfter. An oversized item retains id, kind and runId with truncated: true; inspect its run for details. Use from: "now" without after to return no history and snapshot the newest issued id; continue with after: nextAfter. An after past the end clamps to the newest id. Filter by exact repo, or ownRuns: true with consumer to match only MCP runs created with that name; combined filters both apply. Consumer names are not access control. wait (0–45 seconds, within client timeouts) long-polls for a matching item, except from: "now" returns immediately. pruned means retention removed unseen items. Reading never acknowledges: call limitless_feed_ack only after handling the items. Acknowledgements apply across filters.',
       feedArgsSchema,
-      async (input, signal) => feedPageSchema.parse(await backend.feed(input, signal)),
+      async (input, signal) => {
+        validateFeedQuery(input);
+        return feedPageSchema.parse(await backend.feed(input, signal));
+      },
     ),
     tool(
       "limitless_feed_ack",
@@ -406,7 +496,10 @@ export function createMcpServer(backend: McpBackend): Server {
         : params.name === "limitless_status"
           ? result
           : { message: "Tool output withheld; privacy policy unavailable." };
-      return { content: [{ type: "text", text: JSON.stringify(output) }] };
+      // Apply the page budget after privacy substitutions, which can expand small strings.
+      const bounded =
+        params.name === "limitless_feed" && privacy ? limitFeedPage(output as FeedPage) : output;
+      return { content: [{ type: "text", text: JSON.stringify(bounded) }] };
     } catch (e) {
       const message =
         params.name === "limitless_get_change"

@@ -50,6 +50,7 @@ import {
   MAX_RUN_IDS,
   TERMINAL_STATUSES,
 } from "../core/types.ts";
+import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
@@ -685,11 +686,41 @@ export class Store {
     this.publishFeed();
   }
 
-  readFeed(opts: { consumer?: string; after?: number; limit?: number } = {}): FeedPage {
-    const after = opts.after ?? (opts.consumer === undefined ? 0 : this.feedCursor(opts.consumer));
-    const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT ?`);
-    const items = (query.all(after, opts.limit ?? 100) as Row[]).map(toFeedItem);
-    return { items, nextAfter: items.at(-1)?.id ?? after, pruned: this.getSetting(FEED_PRUNED, 0) > after };
+  readFeed(opts: Partial<FeedQuery> = {}): FeedPage {
+    validateFeedQuery(opts);
+    const newest = this.feedIssued();
+    if (opts.from === "now") return { items: [], nextAfter: newest, pruned: false, hasMore: false };
+    const after = Math.min(
+      opts.after ?? (opts.consumer === undefined ? 0 : this.feedCursor(opts.consumer)),
+      newest,
+    );
+    const limit = Math.min(opts.limit ?? MAX_FEED_ITEMS, 1000);
+    const query = this.db.query(`${FEED_SELECT} WHERE id > ?
+      AND (? IS NULL OR repo = ?)
+      AND (? = 0 OR EXISTS (SELECT 1 FROM runs WHERE runs.id = feed.run_id
+        AND source = 'mcp' AND requested_by = ?)) ORDER BY id LIMIT ?`);
+    const items = (
+      query.all(
+        after,
+        opts.repo ?? null,
+        opts.repo ?? null,
+        opts.ownRuns ? 1 : 0,
+        opts.consumer === undefined ? null : mcpRequestedBy(opts.consumer),
+        limit + 1,
+      ) as Row[]
+    ).map(toFeedItem);
+    const page = { items, nextAfter: after, pruned: this.getSetting(FEED_PRUNED, 0) > after };
+    // Older HTTP digests stop on a short page, so large explicit limits must bypass the byte cap too.
+    if (limit > MAX_FEED_ITEMS) {
+      const selected = items.slice(0, limit);
+      return {
+        ...page,
+        items: selected,
+        nextAfter: selected.at(-1)?.id ?? after,
+        hasMore: items.length > limit,
+      };
+    }
+    return limitFeedPage(page, limit);
   }
 
   feedCursor(consumer: string): number {
@@ -1647,7 +1678,9 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     return row ? toRun(row) : null;
   }
 
-  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string; ids?: string[] } = {}): Run[] {
+  listRuns(
+    opts: { status?: RunStatus[]; limit?: number; repoId?: string; repoSlug?: string; ids?: string[] } = {},
+  ): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (opts.ids) {
@@ -1663,6 +1696,10 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     if (opts.repoId) {
       where.push("runs.repo_id = ?");
       params.push(opts.repoId);
+    }
+    if (opts.repoSlug) {
+      where.push("repos.slug = ?");
+      params.push(opts.repoSlug);
     }
     const sql = `${RUN_SELECT} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY runs.created_at DESC LIMIT ?`;
     params.push(opts.limit ?? 100);

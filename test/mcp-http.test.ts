@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import type { FeedPage, Run } from "../src/core/types.ts";
 import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
+import { httpBackend } from "../src/integrations/mcp.ts";
 import { mountMcp } from "../src/integrations/mcp-http.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import {
   changeFixture,
+  connect,
   fixture,
   localServer,
   type Route,
@@ -68,14 +72,18 @@ test("no HTTP MCP tool result or error includes owner diagnostics", async () => 
   const reads = [
     [
       "limitless_get_run",
-      { id: run.id },
+      { id: run.id, full: true },
       {
         id: run.id,
         error: "public",
         events: expect.arrayContaining([expect.objectContaining({ message: "public event" })]),
       },
     ],
-    ["limitless_list_runs", { status: "failed", limit: 1 }, [{ id: run.id, error: "public" }]],
+    [
+      "limitless_list_runs",
+      { status: "failed", limit: 1 },
+      { runs: [{ id: run.id, error: "public" }], hasMore: false },
+    ],
     ["limitless_feed", { after: 0, wait: 0 }, { items: [{ runId: run.id }] }],
     ["limitless_status", { run: run.id }, { run: run.id, state: "Failed" }],
     ["limitless_providers", {}, [{ id: "fake" }]],
@@ -295,6 +303,99 @@ test("the mounted endpoint serves the feed tools", async () => {
     id: page.nextAfter,
   });
   expect(f.factory.store.feedCursor("codex")).toBe(page.nextAfter);
+});
+
+test("HTTP-backed MCP records consumers and filters only their MCP-created runs", async () => {
+  const routes = createHttpRoutes(f.factory);
+  const proxy = await connect(
+    httpBackend("http://localhost:7400", async (url, init) => {
+      const entry = routes[new URL(url).pathname];
+      const handler = (entry as Record<string, Route>)[init?.method ?? "GET"] as Route;
+      return handler(requestWithParams(url, init), localServer);
+    }),
+  );
+  const call = (name: string, args: Record<string, unknown>) =>
+    proxy.client.callTool({ name: `limitless_${name}`, arguments: args });
+  try {
+    const mine = resultValue<Run>(
+      await call("create_run", { repo: f.repo, prompt: "mine", consumer: " worker " }),
+    );
+    const other = resultValue<Run>(
+      await call("create_run", { repo: f.repo, prompt: "other", consumer: "other" }),
+    );
+    const legacy = resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "legacy" }));
+    const ui = await f.factory.createRun({ repo: f.repo, prompt: "ui", source: "ui", requestedBy: "worker" });
+    const store = f.factory.store;
+    expect(store.getRun(mine.id)).toMatchObject({ source: "mcp", requestedBy: "mcp:worker" });
+    const repo = store.upsertRepo({
+      slug: "owner/other",
+      kind: "github",
+      url: "https://example.test/other",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const elsewhere = store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "elsewhere",
+      source: "mcp",
+      requestedBy: "mcp:worker",
+    });
+    for (const run of [mine, other, legacy, ui, elsewhere]) store.updateRun(run.id, { status: "failed" });
+    store.daemonStarted("boot", "test", "sha");
+    const own = resultValue<FeedPage>(await call("feed", { consumer: "worker", ownRuns: true }));
+    expect(own.items.map((i) => i.runId)).toEqual([mine.id, elsewhere.id]);
+    expect(own.hasMore).toBe(false);
+    const combined = resultValue<FeedPage>(
+      await call("feed", { consumer: "worker", ownRuns: true, repo: mine.repoSlug }),
+    );
+    expect(combined.items.map((i) => i.runId)).toEqual([mine.id]);
+    expect(
+      resultValue<FeedPage>(await call("feed", { consumer: "other", ownRuns: true })).items.map(
+        (i) => i.runId,
+      ),
+    ).toEqual([other.id]);
+    expect((await call("feed", { ownRuns: true })).isError).toBe(true);
+    expect((await call("feed", { from: "now", after: 0 })).isError).toBe(true);
+    const snapshot = resultValue<FeedPage>(
+      await call("feed", { consumer: "worker", from: "now", ownRuns: true }),
+    );
+    expect(snapshot).toMatchObject({ items: [], nextAfter: 6, hasMore: false });
+    expect(store.feedCursor("worker")).toBe(0);
+    store.askQuestion(mine.id, "Next action?");
+    expect(
+      resultValue<FeedPage>(
+        await call("feed", { consumer: "worker", ownRuns: true, after: snapshot.nextAfter }),
+      ).items,
+    ).toMatchObject([{ runId: mine.id, kind: "run.question" }]);
+    // The MCP response preserves the HTTP page's byte bound and truncation marker.
+    store.updateRun(mine.id, { status: "needs_human", error: "🙂".repeat(10000) });
+    const oversized = resultValue<FeedPage>(await call("feed", { after: 7 }));
+    expect(Buffer.byteLength(JSON.stringify(oversized))).toBeLessThanOrEqual(16 * 1024);
+    expect(oversized.items).toMatchObject([{ runId: mine.id, truncated: true }]);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("MCP's byte budget includes privacy substitutions that expand the page", async () => {
+  registerCredential("FEED_TEST_CREDENTIAL", "short-feed-key");
+  const data = JSON.stringify({ messages: Array(900).fill("short-feed-key") });
+  f.factory.store.db
+    .query(`INSERT INTO feed (ts, kind, title, summary, data, dedupe_key)
+    VALUES (1, 'daemon.started', 't', 's', ?, 'privacy-budget')`)
+    .run(data);
+  const original = f.factory.store.readFeed({});
+  expect(original.items[0]?.truncated).toBeUndefined();
+  const response = await route(rpc("tools/call", { name: "limitless_feed", arguments: {} }), localServer);
+  const result = (await response.json()).result;
+  const page = resultValue<FeedPage>(result);
+  expect(Buffer.byteLength(result.content[0].text)).toBeLessThanOrEqual(16 * 1024);
+  expect(page).toMatchObject({
+    items: [{ id: 1, kind: "daemon.started", truncated: true }],
+    nextAfter: 1,
+    hasMore: false,
+  });
 });
 
 test("an HTTP client disconnecting from a feed long poll releases its listener", async () => {

@@ -73,7 +73,7 @@ async function printDigest(
         );
         if (group.kinds.includes(item.kind)) group.items.set(key, item);
       }
-    if (page.items.length < 1000) break;
+    if (!(page.hasMore ?? page.items.length === 1000)) break;
     if (after !== undefined && page.nextAfter <= after) throw new Error("Feed cursor did not advance");
     after = page.nextAfter;
   }

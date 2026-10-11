@@ -48,8 +48,42 @@ async function item(title = "work"): Promise<number> {
 }
 const listeners = () => (store as unknown as { listeners: Set<unknown> }).listeners.size;
 
+test.each([101, 1000])(
+  "legacy HTTP limit=%s digests traverse full pages without a byte cap",
+  async (limit) => {
+    const data = { message: "🙂".repeat(80) };
+    const count = 1001;
+    const insert = store.db.query(
+      "INSERT INTO feed (ts, kind, title, summary, data, dedupe_key) VALUES (1, 'daemon.started', 't', 's', ?, ?)",
+    );
+    store.db.transaction(() => {
+      for (let i = 0; i < count; i++) insert.run(JSON.stringify(data), `item-${i}`);
+    })();
+    const bounded = await page("?consumer=fresh");
+    expect(bounded.items.length).toBeLessThanOrEqual(100);
+    expect(Buffer.byteLength(JSON.stringify(bounded))).toBeLessThanOrEqual(16 * 1024);
+    expect(bounded.hasMore).toBe(true);
+    const ids: number[] = [];
+    let after = 0;
+    for (let reads = 0; reads < count; reads++) {
+      const legacy = await page(`?limit=${limit}&after=${after}`);
+      ids.push(...legacy.items.map((item) => item.id));
+      expect(legacy.nextAfter).toBe(legacy.items.at(-1)?.id ?? -1);
+      expect(legacy.hasMore).toBe(ids.length < count);
+      expect(legacy.items.every((item) => item.truncated === undefined)).toBe(true);
+      if (legacy.items.length < limit) {
+        expect(ids).toHaveLength(count);
+        break;
+      }
+      expect(Buffer.byteLength(JSON.stringify(legacy))).toBeGreaterThan(16 * 1024);
+      after = legacy.nextAfter;
+    }
+    expect(ids).toEqual(Array.from({ length: count }, (_, i) => i + 1));
+  },
+);
+
 test("reads honor cursors and explicit after; acknowledgements are durable, monotonic and per consumer", async () => {
-  expect(await page("?consumer=new")).toEqual({ items: [], nextAfter: 0, pruned: false });
+  expect(await page("?consumer=new")).toEqual({ items: [], nextAfter: 0, pruned: false, hasMore: false });
   const ids = [await item("a"), await item("b"), await item("c")];
   expect((await page("?consumer=orchestrator")).items.map((i) => i.id)).toEqual(ids);
   expect(store.feedCursor("orchestrator")).toBe(0);
@@ -69,6 +103,7 @@ test("reads honor cursors and explicit after; acknowledgements are durable, mono
     items: [],
     nextAfter: ids[2],
     pruned: false,
+    hasMore: false,
   });
 });
 
@@ -88,6 +123,11 @@ test("malformed parameters and acknowledgements are rejected", async () => {
     "?wait=-1",
     "?wait=Infinity",
     "?wait=soon",
+    "?from=now&after=0",
+    "?from=yesterday",
+    "?ownRuns=true",
+    "?consumer=a&ownRuns=maybe",
+    "?repo=",
   ])
     expect([query, (await read(query)).status]).toEqual([query, 400]);
   for (const body of [
@@ -160,9 +200,94 @@ test("long poll returns backlog at once, wakes on a new item, ignores unrelated 
   expect(woke.items.map((i) => i.id)).toEqual([second]);
 
   started = Date.now();
-  expect(await page(`?after=${second}&wait=0.05`)).toEqual({ items: [], nextAfter: second, pruned: false });
+  expect(await page(`?after=${second}&wait=0.05`)).toEqual({
+    items: [],
+    nextAfter: second,
+    pruned: false,
+    hasMore: false,
+  });
   expect(Date.now() - started).toBeGreaterThanOrEqual(40);
   expect(listeners()).toBe(0);
+});
+
+test("starting from now snapshots issued history without acknowledging or waiting", async () => {
+  expect(await page("?consumer=fresh&from=now")).toEqual({
+    items: [],
+    nextAfter: 0,
+    pruned: false,
+    hasMore: false,
+  });
+  const first = await item("first");
+  store.ackFeed("worker", first);
+  const newest = await item("second");
+  store.pruneFeed(Date.now() + 1);
+  const snapshot = await page("?consumer=worker&from=now&wait=60");
+  expect(snapshot).toEqual({ items: [], nextAfter: newest, pruned: false, hasMore: false });
+  expect(store.feedCursor("worker")).toBe(first);
+  const later = await item("later");
+  expect((await page(`?consumer=worker&after=${snapshot.nextAfter}`)).items.map((i) => i.id)).toEqual([
+    later,
+  ]);
+  expect((await read("?from=now&after=0")).status).toBe(400);
+});
+
+test("repository filtering precedes pagination and hasMore, and uses an exact match", async () => {
+  const ids: number[] = [];
+  for (const repo of ["owner/one", "owner/one-extra", "owner/two", "owner/one", "owner/two"]) {
+    ids.push(await item(repo));
+    store.db.query("UPDATE feed SET repo = ? WHERE id = ?").run(repo, ids.at(-1) ?? -1);
+  }
+  const first = await page("?repo=owner%2Fone&limit=1");
+  expect(first).toMatchObject({
+    items: [{ id: ids[0], repo: "owner/one" }],
+    nextAfter: ids[0],
+    hasMore: true,
+  });
+  const second = await page(`?repo=owner%2Fone&limit=1&after=${first.nextAfter}`);
+  expect(second).toMatchObject({
+    items: [{ id: ids[3], repo: "owner/one" }],
+    nextAfter: ids[3],
+    hasMore: false,
+  });
+  expect((await page(`?repo=owner%2Fone&after=${second.nextAfter}`)).items).toEqual([]);
+  expect((await page("?repo=owner%2Fmissing")).hasMore).toBe(false);
+});
+
+test("a clamped long poll preserves filters and ignores unrelated feed items", async () => {
+  const repo = store.upsertRepo({
+    slug: "owner/one",
+    kind: "github",
+    url: "https://example.test/one",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const other = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "other",
+    source: "mcp",
+    requestedBy: "mcp:other",
+  });
+  const mine = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "mine",
+    source: "mcp",
+    requestedBy: "mcp:worker",
+  });
+  const pending = read("?after=100000&consumer=worker&ownRuns=true&repo=owner%2Fone&wait=30");
+  let settled = false;
+  void pending.then(() => {
+    settled = true;
+  });
+  await item("unrelated repo");
+  store.updateRun(other.id, { status: "failed" });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  store.updateRun(mine.id, { status: "failed" });
+  const result = (await (await pending).json()) as FeedPage;
+  expect(result.items).toMatchObject([{ runId: mine.id, repo: "owner/one" }]);
+  expect(result.items).toHaveLength(1);
+  expect(store.feedCursor("worker")).toBe(0);
 });
 
 test("an item committed while the wait is being set up still wakes it", async () => {
