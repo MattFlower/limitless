@@ -704,8 +704,13 @@ export function startHttp(
   factory: Factory,
   extras: HttpExtras = {},
   serve = Bun.serve<undefined>,
-  credential = createApiToken(factory.cfg.paths.home),
+  suppliedCredential?: ReturnType<typeof createApiToken>,
 ) {
+  // A supplied credential belongs to the daemon, which also waits for integration teardown.
+  const credential = suppliedCredential ?? createApiToken(factory.cfg.paths.home);
+  const release = () => {
+    if (!suppliedCredential) credential.release();
+  };
   const routes = createHttpRoutes(factory, { ...extras, apiToken: credential.token });
   const bind = (hostname: string) =>
     serve({
@@ -719,7 +724,7 @@ export function startHttp(
   try {
     local = bind(factory.cfg.host);
   } catch (error) {
-    credential.release();
+    release();
     throw error;
   }
   let lan: Server<undefined> | undefined;
@@ -729,15 +734,20 @@ export function startHttp(
   } catch (error) {
     void local.stop(true);
     void lan?.stop(true);
-    credential.release();
+    release();
     throw error;
   }
   return {
     port: local.port,
     url: local.url,
     stop: async (force?: boolean) => {
-      await Promise.all([local.stop(force), lan?.stop(force)]);
-      credential.release();
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => local.stop(force)),
+        Promise.resolve().then(() => lan?.stop(force)),
+      ]);
+      release();
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     },
   };
 }

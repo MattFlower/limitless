@@ -73,6 +73,20 @@ test("config validates LAN settings; exact binds share routes, stop together and
     expect(config(`require_api_token = true\ntrusted_proxies = ["${proxy}"]\nauth = "proxy"`).auth).toBe(
       "proxy",
     );
+    const proxySettings = `trusted_proxies = ["${proxy}"]\nauth = "proxy"`;
+    const httpOrigins =
+      'public_origins = ["https://limitless.example.test", "http://limitless.example.test"]';
+    expect(() => config(`require_api_token = true\n${proxySettings}\n${httpOrigins}`)).toThrow(
+      "server.require_api_token needs https public_origins (the session cookie is Secure)",
+    );
+    expect(config(`require_api_token = false\n${proxySettings}\n${httpOrigins}`).auth).toBe("proxy");
+    expect(
+      config(`require_api_token = true\n${proxySettings}\npublic_origins = ["${origin}"]`),
+    ).toMatchObject({
+      auth: "proxy",
+      requireApiToken: true,
+      publicOrigins: [origin],
+    });
     expect(config("[auth]\nidle_days = 7\nabsolute_days = 90.5")).toMatchObject({
       sessionIdleDays: 7,
       sessionAbsoluteDays: 90.5,
@@ -225,7 +239,42 @@ test("enforcement refuses spoofed loopback proxy headers and accepts signed-in p
     expect((await call("127.0.0.1")).status).toBe(401);
     expect(f.factory.store.listRuns()).toHaveLength(before);
     expect((await call(proxy, { authorization: "Bearer testtoken" })).status).toBe(201);
+    f.factory.cfg.trustedProxies = [proxy];
+    const auth = new Auth(f.factory.store, f.factory.cfg);
+    const password = "correct horse battery";
+    await auth.setPassword(password);
+    const login = (routes["/login"] as { POST: Route }).POST;
+    const signedIn = await login(
+      requestWithParams(`${origin}/login`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: "limitless", password, next: "/" }).toString(),
+      }),
+      peer(proxy),
+    );
+    expect(signedIn.status).toBe(303);
+    const session = signedIn.headers.get("set-cookie") ?? "";
+    expect(session).toContain("Secure");
+    const proxyCookie = session.split(";")[0] ?? "";
+    const list = (routes["/api/runs"] as { GET: Route }).GET;
+    for (const [extra, status] of [
+      [{}, 401],
+      [{ cookie: proxyCookie }, 200],
+    ] as const) {
+      expect(
+        (
+          await list(
+            requestWithParams(`${origin}/api/runs`, {
+              headers: { ...headers, ...extra },
+            }),
+            peer(proxy),
+          )
+        ).status,
+      ).toBe(status);
+    }
+    expect((await call(proxy, { cookie: proxyCookie })).status).toBe(201);
     f.factory.cfg.auth = "required";
+    f.factory.cfg.trustedProxies = ["127.0.0.1", proxy];
     const cookie = new Auth(f.factory.store, f.factory.cfg).signIn("password", "proxy").split(";")[0] ?? "";
     for (const address of ["127.0.0.1", proxy]) {
       expect((await call(address)).status).toBe(401);

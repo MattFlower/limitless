@@ -1,5 +1,14 @@
-import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
-import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
+import {
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { apiTokenHeaders, readApiToken } from "../src/cli/api-token.ts";
@@ -352,6 +361,130 @@ test("startup protects a not-yet-published token before resuming queued land che
   }
   expect(privateReadPaths()).not.toContain(path);
 });
+
+for (const failedStep of ["mount", "first bind", "second bind"] as const) {
+  test(`failed ${failedStep} waits for all integration cleanup before releasing token protection`, async () => {
+    const startup = await fixture();
+    startup.factory.cfg.port = 0;
+    startup.factory.cfg.githubPoll = true;
+    startup.factory.cfg.listenLan = failedStep === "second bind" ? "192.0.2.1" : null;
+    const path = join(startup.factory.cfg.paths.home, "api-token");
+    writeFileSync(path, "prior token", { mode: 0o600 });
+    const scratch = join(startup.home, "scratch", SCRATCH_NAME);
+    mkdirSync(scratch, { recursive: true });
+    const repo = startup.factory.store.upsertRepo({
+      slug: "test/repo",
+      kind: "github",
+      url: "unused",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = startup.factory.store.createRun(repo, { repo: repo.slug, prompt: "tracked PR" });
+    startup.factory.store.updateRun(run.id, {
+      status: "succeeded",
+      prUrl: "https://github.com/test/repo/pull/1",
+    });
+    const intervals = spyOn(globalThis, "setInterval");
+    const clearIntervals = spyOn(globalThis, "clearInterval");
+    const timers = spyOn(globalThis, "setTimeout");
+    const clearTimers = spyOn(globalThis, "clearTimeout");
+    const unsubscriptions: ReturnType<typeof mock>[] = [];
+    const subscribe = startup.factory.store.subscribe.bind(startup.factory.store);
+    const subscriptions = spyOn(startup.factory.store, "subscribe").mockImplementation((listener) => {
+      const unsubscribe = mock(subscribe(listener));
+      unsubscriptions.push(unsubscribe);
+      return unsubscribe;
+    });
+    const landStart = spyOn(startup.factory.land, "start");
+    const landStop = startup.factory.land.stop.bind(startup.factory.land);
+    const stopping = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const stopped = spyOn(startup.factory.land, "stop").mockImplementation(async () => {
+      await landStop();
+      stopping.resolve();
+      await finish.promise;
+      // A failed cleanup must not replace the startup error or skip the other cleanups.
+      throw new Error("injected cleanup failure");
+    });
+    const factoryStart = spyOn(startup.factory, "start");
+    const listenerStop = mock(() => Promise.resolve());
+    const failure = new Error(`injected ${failedStep} failure`);
+    let binds = 0;
+    const serve = (() => {
+      if (++binds === (failedStep === "second bind" ? 2 : 1)) throw failure;
+      return { stop: listenerStop };
+    }) as unknown as typeof Bun.serve<undefined>;
+    let integrations: Awaited<ReturnType<typeof mountIntegrations>> | undefined;
+    const result = startDaemon(
+      startup.factory,
+      {},
+      async (factory) => {
+        integrations = await mountIntegrations(factory, {
+          toolVersions: async () => {
+            expect(landStart).toHaveBeenCalledTimes(1);
+            if (failedStep === "mount") throw failure;
+            return [];
+          },
+          gh: async () => {},
+          prClient: async () => null,
+          github: async () => ({ status: 200, headers: new Headers(), body: {} }),
+        });
+        return integrations;
+      },
+      serve,
+    ).catch((error: unknown) => error);
+    try {
+      await Promise.race([
+        stopping.promise,
+        result.then(() => {
+          throw new Error("startup finished without waiting for integration cleanup");
+        }),
+      ]);
+      expect(privateReadPaths()).toContain(path);
+      expect(seatbeltProfile(writeRoots(startup.repo, scratch))).toContain(`(subpath "${path}")`);
+      expect(readFileSync(path, "utf8")).toBe("prior token");
+      expect(intervals).toHaveBeenCalledTimes(1);
+      expect(timers).toHaveBeenCalled();
+      for (const interval of intervals.mock.results)
+        expect(clearIntervals).toHaveBeenCalledWith(interval.value);
+      for (const timer of timers.mock.results) expect(clearTimers).toHaveBeenCalledWith(timer.value);
+      expect(unsubscriptions).toHaveLength(2);
+      for (const unsubscribe of unsubscriptions) expect(unsubscribe).toHaveBeenCalledTimes(1);
+      finish.resolve();
+      expect(await result).toBe(failure);
+      expect(stopped).toHaveBeenCalledTimes(1);
+      expect(factoryStart).not.toHaveBeenCalled();
+      expect(privateReadPaths()).not.toContain(path);
+      expect(readFileSync(path, "utf8")).toBe("prior token");
+      if (failedStep === "second bind") expect(listenerStop).toHaveBeenCalledWith(true);
+      if (integrations) {
+        const mcp = integrations.routes["/mcp"];
+        if (!mcp) throw new Error("missing MCP route");
+        expect((await mcp(new Request("http://127.0.0.1/mcp", { method: "POST" }), localServer)).status).toBe(
+          503,
+        );
+      }
+    } finally {
+      finish.resolve();
+      await result;
+      // Also release test-owned resources if a regression interrupts startup before cleanup.
+      for (const interval of intervals.mock.results)
+        clearInterval(interval.value as ReturnType<typeof setInterval>);
+      for (const timer of timers.mock.results) clearTimeout(timer.value as ReturnType<typeof setTimeout>);
+      for (const unsubscribe of unsubscriptions) unsubscribe();
+      intervals.mockRestore();
+      clearIntervals.mockRestore();
+      timers.mockRestore();
+      clearTimers.mockRestore();
+      subscriptions.mockRestore();
+      landStart.mockRestore();
+      stopped.mockRestore();
+      factoryStart.mockRestore();
+      await startup.close();
+    }
+  });
+}
 
 test("failed binds never replace the running daemon's token or leak private path registrations", async () => {
   const before = readFileSync(tokenPath());
