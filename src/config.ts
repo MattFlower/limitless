@@ -42,6 +42,7 @@ export interface Config {
   publicOrigins: string[];
   /** `[server] auth`: "required" makes non-loopback UI/API access sign in; "proxy" leaves it to the proxy. */
   auth: "required" | "proxy";
+  requireApiToken: boolean;
   /** `[auth]` `idle_days` / `absolute_days`: when a sign-in session expires unused, and at the latest. */
   sessionIdleDays: number;
   sessionAbsoluteDays: number;
@@ -183,6 +184,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   }
 
   const server = (raw.server ?? {}) as Record<string, unknown>;
+  if (server.require_api_token !== undefined && typeof server.require_api_token !== "boolean")
+    throw new Error("server.require_api_token must be a boolean");
   const limits = (raw.limits ?? {}) as Record<string, unknown>;
   const reserves = (raw.reserves ?? {}) as Record<string, unknown>;
   const owners = (raw.owners ?? {}) as Record<string, unknown>;
@@ -317,6 +320,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     trustedProxies,
     publicOrigins: origins.map(publicOrigin),
     auth: server.auth === "proxy" ? "proxy" : "required",
+    requireApiToken: server.require_api_token === true,
     sessionIdleDays: lifetime("idle_days", 30),
     sessionAbsoluteDays: lifetime("absolute_days", 180),
     retention: {

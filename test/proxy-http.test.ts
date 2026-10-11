@@ -258,6 +258,7 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
     const routes = createHttpRoutes(f.factory, {
       ui,
       routes: { "/mcp": mcp, "/webhooks/github": githubWebhook(f.factory, async () => ["140.82.112.0/20"]) },
+      apiToken: "proxytesttoken",
     });
     const call = (
       path: string,
@@ -336,7 +337,12 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
             ).toBe(403);
     expect(f.factory.scheduler.draining).toBe(false);
     expect(mcp).not.toHaveBeenCalled();
-    const valid = { host: "limitless.example.test", origin, "content-type": "application/json" };
+    const valid = {
+      host: "limitless.example.test",
+      origin,
+      "content-type": "application/json",
+      authorization: "Bearer proxytesttoken",
+    };
     const before = f.factory.store.listRuns().length;
     for (const headers of [
       { ...valid, host: "foreign.example" },
@@ -347,7 +353,11 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
       { ...valid, origin: "" },
       { ...valid, origin: "https://evil.example" },
       { origin, "content-type": "application/json", "x-forwarded-host": "limitless.example.test" },
-      { host: "limitless.example.test", "content-type": "application/json" },
+      {
+        host: "limitless.example.test",
+        "content-type": "application/json",
+        authorization: valid.authorization,
+      },
     ] as Record<string, string>[])
       expect(
         (await call("/api/runs", proxy, headers, "POST", JSON.stringify({ repo: f.repo, prompt: "blocked" })))

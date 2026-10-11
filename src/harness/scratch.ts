@@ -98,6 +98,7 @@ export function validateScratch(spec: AgentSpec): string {
 }
 
 export interface WriteRoots {
+  daemonPort?: number;
   denyRead?: string[];
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];

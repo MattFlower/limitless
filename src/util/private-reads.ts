@@ -1,24 +1,28 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 
-const databases = new Map<string, number>();
+const privatePaths = new Map<string, number>();
 
-/** Protect SQLite and its sidecars for every factory, including non-default data directories. */
-export function protectDatabase(path: string): () => void {
-  if (path === ":memory:") return () => {};
-  const paths = [...new Set([resolve(path), realpathSync(path)])];
-  for (const p of paths) databases.set(p, (databases.get(p) ?? 0) + 1);
+/** Protect a private file in both its configured and canonical spellings. */
+export function protectPrivateFile(path: string, sidecars = false): () => void {
+  const paths = [...new Set([resolve(path), realpathSync(path)])].flatMap((p) =>
+    sidecars ? [p, `${p}-wal`, `${p}-shm`] : [p],
+  );
+  for (const p of paths) privatePaths.set(p, (privatePaths.get(p) ?? 0) + 1);
   let released = false;
   return () => {
     if (released) return;
     released = true;
     for (const p of paths) {
-      const count = (databases.get(p) ?? 1) - 1;
-      if (count) databases.set(p, count);
-      else databases.delete(p);
+      const count = (privatePaths.get(p) ?? 1) - 1;
+      if (count) privatePaths.set(p, count);
+      else privatePaths.delete(p);
     }
   };
 }
 
-export const privateReadPaths = (): string[] =>
-  [...databases.keys()].flatMap((p) => [p, `${p}-wal`, `${p}-shm`]);
+/** Protect SQLite and its sidecars, including non-default data directories. */
+export const protectDatabase = (path: string): (() => void) =>
+  path === ":memory:" ? () => {} : protectPrivateFile(path, true);
+
+export const privateReadPaths = (): string[] => [...privatePaths.keys()];
