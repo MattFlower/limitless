@@ -821,11 +821,17 @@ test.skipIf(seatbeltSkip !== null)(
     for (const name of ["src", "test", "scripts", "ui", "package.json", "bunfig.toml", "tsconfig.json"])
       cpSync(join(repo, name), join(work, name), { recursive: true });
     symlinkSync(join(repo, "node_modules"), join(work, "node_modules"));
-    await readPolicyScope.run({ home: root, environment: {} }, async () => {
+    // The inner fake factories inherit this path. policySpellings must stat its ancestors,
+    // including the denied home, before they can reach the allowed toolchain subpaths.
+    const rustup = join(root, ".rustup");
+    mkdirSync(join(rustup, "toolchains"), { recursive: true });
+    mkdirSync(join(rustup, "update-hashes"));
+    writeFileSync(join(rustup, "settings.toml"), "");
+    await readPolicyScope.run({ home: root, environment: { RUSTUP_HOME: rustup } }, async () => {
       const result = await runConfined({
         command: `'${process.execPath}' test test/failure-injection.test.ts -t 'unavailable pinned implementer|unconfirmed holdout shutdown'`,
         cwd: work,
-        env: agentEnv(),
+        env: agentEnv({ RUSTUP_HOME: rustup }),
         timeoutMs: 60_000,
       });
       expect(result.exitCode, result.stdout + result.stderr).toBe(0);
