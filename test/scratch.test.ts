@@ -1562,6 +1562,19 @@ test("read policy resolves symlinks before parent components, including missing 
   });
 });
 
+test("denied paths under an unreadable directory keep their lexical spelling; allowances still refuse", () => {
+  const { root } = editFixture();
+  const locked = join(realpathSync(root), "locked");
+  mkdirSync(join(locked, "gh"), { recursive: true });
+  chmodSync(locked, 0o000);
+  try {
+    expect(policySpellings([join(locked, "gh/hosts.yml")], true)).toEqual([join(locked, "gh/hosts.yml")]);
+    expect(() => policySpellings([join(locked, "gh/hosts.yml")])).toThrow(ConfinementError);
+  } finally {
+    chmodSync(locked, 0o755);
+  }
+});
+
 test("editors refuse unresolved homes and symlinked credential overlaps before CLI launch", async () => {
   const { root, spec, cwd } = editFixture();
   const home = join(root, "home");

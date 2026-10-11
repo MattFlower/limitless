@@ -65,23 +65,27 @@ export function configureReadPolicy(raw: unknown, configDir: string): ReadPolicy
   });
 }
 
-/** Resolve existing ancestors too: an absent child of a symlink still aliases the target. */
-export function policySpellings(paths: string[]): string[] {
+/**
+ * Resolve existing ancestors too: an absent child of a symlink still aliases the target.
+ * A denied path may sit under a directory this process can't read (a gate's denied home):
+ * keep its rest lexically, since the outer profile already denies what lies there.
+ */
+export function policySpellings(paths: string[], denied = false): string[] {
   const canonical = (path: string): string => {
     let current = isAbsolute(path) ? sep : realpathSync(process.cwd());
     try {
       // Resolve each symlink before a later '..'; realpathSync normalizes its input in Bun.
-      for (const component of path.split(sep)) {
+      const components = path.split(sep);
+      for (const [index, component] of components.entries()) {
         if (!component || component === ".") continue;
         const next = join(current, component);
         try {
           current = realpathSync(next);
         } catch (error) {
-          if (
-            (error as NodeJS.ErrnoException).code !== "ENOENT" ||
-            lstatSync(next, { throwIfNoEntry: false })
-          )
-            throw error;
+          const code = (error as NodeJS.ErrnoException).code;
+          if (denied && (code === "EPERM" || code === "EACCES"))
+            return join(next, ...components.slice(index + 1));
+          if (code !== "ENOENT" || lstatSync(next, { throwIfNoEntry: false })) throw error;
           current = next;
         }
       }
@@ -112,42 +116,48 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
   const home = resolvedHome();
   const expand = (p: string) => (p === "~" ? home : p.startsWith("~/") ? `${home}/${p.slice(2)}` : p);
   const cargo = expand(env.CARGO_HOME ?? join(home, ".cargo"));
-  const credentials = policySpellings([
-    ...[
-      ".ssh",
-      ".config/limitless",
-      ".config/gh",
-      ".codex",
-      ".aws",
-      ".netrc",
-      ".npmrc",
-      ".docker",
-      ".gnupg",
-      ".kube",
-    ].map((p) => join(home, p)),
-    ...[
-      env.CODEX_HOME,
-      env.GH_CONFIG_DIR,
-      ...(env.XDG_CONFIG_HOME
-        ? [join(env.XDG_CONFIG_HOME, "gh"), join(env.XDG_CONFIG_HOME, "limitless")]
-        : []),
-      env.LIMITLESS_CONFIG_DIR,
-      env.AWS_SHARED_CREDENTIALS_FILE,
-      env.AWS_CONFIG_FILE,
-      env.DOCKER_CONFIG,
-      env.GNUPGHOME,
-      ...(env.KUBECONFIG?.split(sep === "/" ? ":" : ";") ?? []),
-      env.NETRC,
-      env.NPM_CONFIG_USERCONFIG,
-      env.npm_config_userconfig,
-      ...[join(home, ".cargo"), cargo].flatMap((p) => [join(p, "credentials"), join(p, "credentials.toml")]),
-    ]
-      .filter((p): p is string => !!p)
-      .map(expand),
-    ...(options.denyRead ?? []).map(expand),
-    ...extra.filter((p) => !privateReadPaths().includes(p)),
-  ]);
-  const denyRead = policySpellings([...credentials, ...privateReadPaths()]);
+  const credentials = policySpellings(
+    [
+      ...[
+        ".ssh",
+        ".config/limitless",
+        ".config/gh",
+        ".codex",
+        ".aws",
+        ".netrc",
+        ".npmrc",
+        ".docker",
+        ".gnupg",
+        ".kube",
+      ].map((p) => join(home, p)),
+      ...[
+        env.CODEX_HOME,
+        env.GH_CONFIG_DIR,
+        ...(env.XDG_CONFIG_HOME
+          ? [join(env.XDG_CONFIG_HOME, "gh"), join(env.XDG_CONFIG_HOME, "limitless")]
+          : []),
+        env.LIMITLESS_CONFIG_DIR,
+        env.AWS_SHARED_CREDENTIALS_FILE,
+        env.AWS_CONFIG_FILE,
+        env.DOCKER_CONFIG,
+        env.GNUPGHOME,
+        ...(env.KUBECONFIG?.split(sep === "/" ? ":" : ";") ?? []),
+        env.NETRC,
+        env.NPM_CONFIG_USERCONFIG,
+        env.npm_config_userconfig,
+        ...[join(home, ".cargo"), cargo].flatMap((p) => [
+          join(p, "credentials"),
+          join(p, "credentials.toml"),
+        ]),
+      ]
+        .filter((p): p is string => !!p)
+        .map(expand),
+      ...(options.denyRead ?? []).map(expand),
+      ...extra.filter((p) => !privateReadPaths().includes(p)),
+    ],
+    true,
+  );
+  const denyRead = policySpellings([...credentials, ...privateReadPaths()], true);
   const allowRead = policySpellings([
     ...allowed,
     ...(gate
@@ -166,7 +176,7 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
       if (within(allow, deny) || within(deny, allow))
         throw new ConfinementError(`Read allowance ${allow} overlaps denied credential path ${deny}`);
   return {
-    denyRead: gate ? [...policySpellings([options.home ?? homedir()]), ...denyRead] : denyRead,
+    denyRead: gate ? [...policySpellings([options.home ?? homedir()], true), ...denyRead] : denyRead,
     ...(gate ? { allowRead } : {}),
   };
 }
