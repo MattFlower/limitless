@@ -9,7 +9,7 @@ import {
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import { ConfinementError, READ_PROBE, resolvedHome } from "./read-policy.ts";
 import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
@@ -21,14 +21,21 @@ export { ConfinementError } from "./read-policy.ts";
 
 /** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
 export function seatbeltProfile(roots: WriteRoots): string {
-  const paths = (list: string[]) =>
+  const paths = (list: string[], filter = "subpath") =>
     list
       .map((path) => {
         if (/["\\]/.test(path) || [...path].some((c) => c < " "))
           throw new ConfinementError(`Cannot confine an unusual policy path: ${path}`);
-        return `(subpath "${path}")`;
+        return `(${filter} "${path}")`;
       })
       .join(" ");
+  const ancestors = new Set<string>();
+  for (const allow of roots.allowRead ?? []) {
+    for (let parent = dirname(allow); ; parent = dirname(parent)) {
+      ancestors.add(parent);
+      if (parent === dirname(parent)) break;
+    }
+  }
   const specificDenies = (roots.denyRead ?? []).filter((deny) =>
     roots.allowRead?.some((allow) => deny === allow || deny.startsWith(`${allow}/`)),
   );
@@ -42,6 +49,8 @@ export function seatbeltProfile(roots: WriteRoots): string {
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
     ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
+    // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
+    ...(ancestors.size ? [`(allow file-read-metadata ${paths([...ancestors], "literal")})`] : []),
     // Specific denies (e.g. a registered database inside a checkout) still beat read allowances.
     ...(specificDenies.length ? [`(deny file-read* ${paths(specificDenies)})`] : []),
   ].join("\n");

@@ -66,15 +66,22 @@ const privateDir = () => join(common(), "worktrees", "work");
 test("gate profile denies home and allows only run, recorded Git and trusted toolchain paths", async () => {
   const scratch = join(root, "scratch");
   mkdirSync(scratch);
-  readPolicyScope.run({ home: root, toolchains: [join(root, "custom-toolchain")] }, () => {
+  const toolchain = join(root, "tools", "custom-toolchain");
+  readPolicyScope.run({ home: root, toolchains: [toolchain] }, () => {
     const roots = writeRoots(work, scratch, true);
     const profile = seatbeltProfile(roots);
     expect(profile).toContain(`(deny file-read* (subpath "${root}")`);
-    for (const path of [work, scratch, common(), privateDir(), join(root, "custom-toolchain")])
+    for (const path of [work, scratch, common(), privateDir(), toolchain])
       expect(roots.allowRead).toContain(path);
     expect(roots.allowRead).not.toContain(sibling);
     expect(roots.allowRead).not.toContain(root);
     expect(profile.indexOf("(allow file-read*")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
+    const metadata = profile.split("\n").find((rule) => rule.startsWith("(allow file-read-metadata"));
+    for (const ancestor of [root, cache, join(common(), "worktrees"), join(root, "tools")])
+      expect(metadata).toContain(`(literal "${ancestor}")`);
+    expect(metadata).not.toContain("(subpath");
+    expect(metadata).not.toContain(`(literal "${sibling}")`);
+    expect(profile.indexOf("(allow file-read-metadata")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
   });
   rmSync(`${work}.git-paths`);
   expect(() => writeRoots(work, scratch, true)).toThrow("trusted Git paths");
@@ -121,8 +128,10 @@ test.skipIf(seatbeltSkip !== null)(
     const bunHome = join(root, ".bun");
     mkdirSync(join(bunHome, "bin"), { recursive: true });
     copyFileSync(process.execPath, join(bunHome, "bin/bun"));
-    const bare = join(root, "bare.git");
-    const gateWork = join(root, "bare-work");
+    const bare = join(root, ".limitless/repos/repo.git");
+    const gateWork = join(root, ".limitless/work/current");
+    mkdirSync(join(bare, ".."), { recursive: true });
+    mkdirSync(join(gateWork, ".."), { recursive: true });
     await sh(["git", "clone", "-q", "--bare", cache, bare], { cwd: root });
     await sh(["git", "--git-dir", bare, "worktree", "add", "-q", "--detach", gateWork], { cwd: root });
     await recordWorktree(gateWork);
@@ -137,12 +146,25 @@ test.skipIf(seatbeltSkip !== null)(
         expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
         expect(result.stdout).toBe("");
       }
+      // Traversal metadata must not grant directory listings of home or intermediate factory data.
+      for (const dir of [root, join(root, ".limitless"), join(root, ".limitless/work")]) {
+        const result = await runConfined({
+          command: `ls -A '${dir}' >/dev/null`,
+          cwd: gateWork,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+        expect(result.stdout).toBe("");
+      }
       for (const command of [
         "head -c 1 a.ts >/dev/null",
         'printf x > "$TMPDIR/canary" && head -c 1 "$TMPDIR/canary" >/dev/null',
         `head -c 1 '${bare}/HEAD' >/dev/null`,
-        `head -c 1 '${bare}/worktrees/bare-work/commondir' >/dev/null`,
+        `head -c 1 '${bare}/worktrees/current/commondir' >/dev/null`,
         "git status --porcelain",
+        "git diff && git log -1 --format=%s",
+        `'${bunHome}/bin/bun' -e 'require("node:fs").realpathSync(process.cwd())'`,
         `'${bunHome}/bin/bun' --version`,
       ]) {
         const result = await runConfined({ command, cwd: gateWork, env: agentEnv() });
