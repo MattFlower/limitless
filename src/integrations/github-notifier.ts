@@ -100,6 +100,7 @@ export async function reconcileMergedRuns(
   client: GitHubPrClient,
   log: (message: string) => void = console.warn,
   now: () => number = Date.now,
+  signal?: AbortSignal,
 ): Promise<void> {
   let pass = passes.get(store);
   if (!pass) {
@@ -153,6 +154,7 @@ export async function reconcileMergedRuns(
   const results = new Map<string, GitHubPrState | null>();
   const failed = new Set<string>();
   for (const run of ordered) {
+    if (signal?.aborted) return;
     if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
     if (failed.has(run.prUrl)) continue;
     if (expired.has(run.prUrl) && !results.has(run.prUrl)) {
@@ -171,7 +173,11 @@ export async function reconcileMergedRuns(
         if (expired.has(run.prUrl)) pass.attempted.set(run.prUrl, now());
         if (!expired.has(run.prUrl)) pass.cursor = run.id;
         if (!expired.has(run.prUrl)) pass.checked.set(run.prUrl, now());
-        results.set(run.prUrl, await (expired.has(run.prUrl) ? (client.fresh ?? client) : client)(run.prUrl));
+        results.set(
+          run.prUrl,
+          await (expired.has(run.prUrl) ? (client.fresh ?? client) : client)(run.prUrl, signal),
+        );
+        if (signal?.aborted) return;
       }
       const pr = results.get(run.prUrl);
       if (!pr || pr.url !== run.prUrl) {
@@ -194,6 +200,7 @@ export async function reconcileMergedRuns(
         } else if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {
+      if (signal?.aborted) return;
       failed.add(run.prUrl);
       const failures = (pass.retries.get(run.prUrl)?.failures ?? 0) + 1;
       pass.retries.set(run.prUrl, {
@@ -203,7 +210,7 @@ export async function reconcileMergedRuns(
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
     }
   }
-  store.reconcileWaitingRuns();
+  if (!signal?.aborted) store.reconcileWaitingRuns();
 }
 
 /** Factory-side comments for GitHub-originated runs. */
@@ -214,8 +221,18 @@ export function startGitHubNotifier(
   client: GitHubPrClient = getGitHubPr,
   configDir?: string,
   roots: string[] = [],
-): () => void {
+): () => Promise<void> {
   const seen = new Set<string>();
+  const abort = new AbortController();
+  const work = new Set<Promise<unknown>>();
+  const track = async (task: Promise<unknown>) => {
+    work.add(task);
+    try {
+      await task;
+    } finally {
+      work.delete(task);
+    }
+  };
   let stopped = false;
   let checking = false;
   let pending = false;
@@ -227,7 +244,7 @@ export function startGitHubNotifier(
     }
     checking = true;
     try {
-      await reconcileMergedRuns(store, client, log);
+      await track(reconcileMergedRuns(store, client, log, Date.now, abort.signal));
     } finally {
       checking = false;
       if (pending) {
@@ -278,7 +295,7 @@ export function startGitHubNotifier(
     } catch {
       return log("Factory comment blocked by private-string policy");
     }
-    void gh([
+    const args = [
       ref.kind === "issue" ? "issue" : "pr",
       "comment",
       String(ref.number),
@@ -286,11 +303,18 @@ export function startGitHubNotifier(
       ref.repo,
       "--body",
       body,
-    ]).catch((error: unknown) => log(`GitHub comment failed for ${run.id}: ${String(error)}`));
+    ];
+    void track(
+      gh(args, abort.signal).catch((error: unknown) => {
+        if (!abort.signal.aborted) log(`GitHub comment failed for ${run.id}: ${String(error)}`);
+      }),
+    );
   });
-  return () => {
+  return async () => {
     stopped = true;
     clearInterval(timer);
     unsubscribe();
+    abort.abort();
+    await Promise.allSettled(work);
   };
 }
