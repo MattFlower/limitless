@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, expect, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -37,6 +37,7 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { agentEnv, redactCredentials, runProcess, sh } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
+import { test } from "./read-policy-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let server: Awaited<ReturnType<typeof startHttp>>;

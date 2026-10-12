@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
@@ -22,6 +22,7 @@ import {
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -1142,7 +1143,7 @@ test("configured backend auth reaches the CLI only through a key helper, never t
           "-e",
           'console.log(JSON.stringify({auth: process.env.AUTH ?? "absent", kept: process.env.KEPT}))',
         ],
-        cwd: fixture.root,
+        cwd: fixture.work,
         env: agentEnv({ KEPT: "ordinary", ...extra }),
       });
       childEnvs.push(JSON.parse(child.stdout));
@@ -1152,10 +1153,10 @@ test("configured backend auth reaches the CLI only through a key helper, never t
     const events: AgentEvent[] = [];
     const logPath = join(fixture.root, "backend.log");
     let keyFile = "";
-    const result = await confinedEdit(fixture.root, (scratchDir) =>
+    const result = await confinedEdit(fixture.work, (scratchDir) =>
       runClaude(
         {
-          cwd: fixture.root,
+          cwd: fixture.work,
           scratchDir,
           prompt: "test",
           mode: "edit",
@@ -1177,7 +1178,7 @@ test("configured backend auth reaches the CLI only through a key helper, never t
           expect(options.env?.ANTHROPIC_BASE_URL).toBe("https://example.invalid");
           const helper = await runProcess({
             cmd: ["sh", "-c", settings.apiKeyHelper],
-            cwd: fixture.root,
+            cwd: fixture.work,
             env: {},
           });
           expect(helper.stdout).toBe(token);
@@ -1257,10 +1258,10 @@ test("configured credentials never reach native children or their events, logs a
         child,
         `console.log("child credential=" + (process.env.MAC_MLX_KEY ?? "absent")); console.log(${JSON.stringify(JSON.stringify(event))}); console.log(${JSON.stringify(JSON.stringify(textEvent))}); console.error(${JSON.stringify(`ordinary diagnostic ${fileSecret} ${envSecret}`)}); console.error(${JSON.stringify(`token=${fileSecret}; token=${fileSecret};`)}); process.exit(1);`,
       );
-      const result = await confinedEdit(fixture.root, (scratchDir) =>
+      const result = await confinedEdit(fixture.work, (scratchDir) =>
         (harness === "claude" ? runClaude : verifiedCodex)(
           {
-            cwd: fixture.root,
+            cwd: fixture.work,
             scratchDir,
             prompt: "test",
             mode: "edit",
@@ -1368,10 +1369,10 @@ test("a credential inside the model name never reaches the log header", async ()
     writeFileSync(child, "process.exit(1);");
     for (const harness of ["claude", "codex"] as const) {
       const logPath = join(fixture.root, `${harness}.log`);
-      await confinedEdit(fixture.root, (scratchDir) =>
+      await confinedEdit(fixture.work, (scratchDir) =>
         (harness === "claude" ? runClaude : verifiedCodex)(
           {
-            cwd: fixture.root,
+            cwd: fixture.work,
             scratchDir,
             prompt: "test",
             mode: "edit",

@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +42,7 @@ import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
+import { test } from "./read-policy-support.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -1503,6 +1504,18 @@ test.skipIf(process.platform !== "darwin")(
     let probes = 0;
     let launches = 0;
     const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"')))
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "head: Operation not permitted",
+          signal: null,
+          cancelled: false,
+          timedOut: false,
+          idleTimedOut: false,
+          truncated: false,
+          durationMs: 1,
+        };
       const signalProbe = opts.cmd[0] === "/bin/sh";
       const probing = signalProbe || opts.cmd.at(-1)?.endsWith("/denied");
       if (probing) {
@@ -1552,6 +1565,18 @@ test.skipIf(process.platform !== "darwin")(
     const cwd = tempDir({});
     let scratch = "";
     const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.some((arg) => arg.includes('head -c 1 "$1"')))
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "head: Operation not permitted",
+          signal: null,
+          cancelled: false,
+          timedOut: false,
+          idleTimedOut: false,
+          truncated: false,
+          durationMs: 1,
+        };
       if (opts.cmd.at(-1)?.endsWith("/denied")) {
         writeFileSync(opts.cmd.at(-2) ?? "", "ok");
       } else if (opts.cmd[0] !== "/bin/sh") {
@@ -1923,13 +1948,22 @@ test("private config excludes common git directories and all linked worktrees ca
 });
 
 test("waiting behind a lease does not spend the internal gate's execution timeout", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "gate-lease-")));
+  const cache = join(root, "cache");
+  const work = join(root, "work");
+  await sh(["git", "init", "-q", cache], { cwd: root });
+  writeFileSync(join(cache, "README"), "fixture");
+  await sh(["git", "add", "."], { cwd: cache });
+  await sh(["git", "commit", "-qm", "fixture"], { cwd: cache });
+  await sh(["git", "worktree", "add", "-q", "--detach", work], { cwd: cache });
+  await recordWorktree(work);
   const previous = gateSlots.limit;
   gateSlots.setLimit(1);
   const id = await gateSlots.lease("deploy");
   const queued = Promise.withResolvers<void>();
   try {
     const run = runGates(
-      process.cwd(),
+      work,
       {
         setup: [],
         checks: [{ name: "short", run: "true", timeoutSec: 0.1 }],
@@ -1948,6 +1982,7 @@ test("waiting behind a lease does not spend the internal gate's execution timeou
   } finally {
     gateSlots.heartbeat(id, true);
     gateSlots.setLimit(previous);
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -1959,7 +1994,7 @@ test("gate subprocess excludes an arbitrary unselected provider credential", asy
     process.env.MAC_MLX_KEY = "FAKE_GATE_CREDENTIAL_733";
     fixture.load();
     const gate = await runGates(
-      fixture.root,
+      fixture.work,
       {
         setup: [],
         checks: [{ name: "env", run: 'test -z "$MAC_MLX_KEY" && printf "credential=absent CI=%s" "$CI"' }],

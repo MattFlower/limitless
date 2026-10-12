@@ -1,11 +1,13 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { compareGates, runGates } from "../src/gates/run.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
+import { withScratch } from "../src/harness/scratch.ts";
 import { type ProcOptions, registerCredential, runProcess, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 type Chunk = { stream: "stdout" | "stderr"; text: string | Buffer };
 
@@ -227,54 +229,55 @@ test.each(["literal", "JSON"])(
   },
 );
 
-test("raw confinement marker split at every offset remains authoritative before runner redaction", async () => {
-  const marker = "sandbox_apply: Operation not permitted";
-  const secret = `${marker} synthetic-marker-secret`;
-  registerCredential("SPLIT_MARKER_TEST_TOKEN", secret);
-  for (const stream of ["stdout", "stderr"] as const) {
-    for (let offset = 1; offset < marker.length; offset++) {
-      const result = await withChunks(
-        [
-          { stream, text: secret.slice(0, offset) },
-          { stream, text: secret.slice(offset) },
-        ],
-        () =>
-          confinementScope.run(fakeConfinement, () =>
-            runGates(
-              process.cwd(),
-              {
-                setup: [],
-                checks: [{ name: "marker", run: "fixture" }],
-                source: "detected",
-                protectedPaths: [],
-              },
-              new AbortController().signal,
+test("raw confinement marker split at every offset remains authoritative before runner redaction", () =>
+  withScratch(process.cwd(), async (cwd) => {
+    const marker = "sandbox_apply: Operation not permitted";
+    const secret = `${marker} synthetic-marker-secret`;
+    registerCredential("SPLIT_MARKER_TEST_TOKEN", secret);
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 1; offset < marker.length; offset++) {
+        const result = await withChunks(
+          [
+            { stream, text: secret.slice(0, offset) },
+            { stream, text: secret.slice(offset) },
+          ],
+          () =>
+            confinementScope.run(fakeConfinement, () =>
+              runGates(
+                cwd,
+                {
+                  setup: [],
+                  checks: [{ name: "marker", run: "fixture" }],
+                  source: "detected",
+                  protectedPaths: [],
+                },
+                new AbortController().signal,
+              ),
             ),
-          ),
-      );
-      expect(result.checks[0]).toMatchObject({ output: "[redacted]", confinementError: true, ok: false });
-      expect(compareGates(null, result)[0]?.verdict).toBe("confinement_error");
+        );
+        expect(result.checks[0]).toMatchObject({ output: "[redacted]", confinementError: true, ok: false });
+        expect(compareGates(null, result)[0]?.verdict).toBe("confinement_error");
+      }
     }
-  }
-  const interrupted = marker.replace("Operation", "Oper\u001b[0mation");
-  const result = await withChunks(
-    Array.from(interrupted, (text) => ({ stream: "stdout", text })),
-    () =>
-      confinementScope.run(fakeConfinement, () =>
-        runGates(
-          process.cwd(),
-          {
-            setup: [],
-            checks: [{ name: "marker", run: "fixture" }],
-            source: "detected",
-            protectedPaths: [],
-          },
-          new AbortController().signal,
+    const interrupted = marker.replace("Operation", "Oper\u001b[0mation");
+    const result = await withChunks(
+      Array.from(interrupted, (text) => ({ stream: "stdout", text })),
+      () =>
+        confinementScope.run(fakeConfinement, () =>
+          runGates(
+            cwd,
+            {
+              setup: [],
+              checks: [{ name: "marker", run: "fixture" }],
+              source: "detected",
+              protectedPaths: [],
+            },
+            new AbortController().signal,
+          ),
         ),
-      ),
-  );
-  expect(result.checks[0]).toMatchObject({ output: marker, confinementError: false, ok: true });
-});
+    );
+    expect(result.checks[0]).toMatchObject({ output: marker, confinementError: false, ok: true });
+  }));
 
 test("sh forwards opt-in redaction to the runner", async () => {
   const secret = "synthetic-sh-stream-credential";

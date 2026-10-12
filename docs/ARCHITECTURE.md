@@ -145,8 +145,8 @@ concrete checks (commands to run, inputs/outputs, and edge cases only where the 
 them) into the database, and the verifier executes them against the finished worktree. The
 implementer can't special-case tests it has never seen.
 
-Residual risk: the implementer's harness has no read sandbox, and the holdout runs in parallel as
-the same user. While it runs, its scratch and CLI log are in the shared temporary directory. The
+Residual risk: the implementer's harness can read other invocations' scratch, and the holdout runs
+in parallel as the same user. While it runs, its scratch and CLI log are in the shared temporary directory. The
 log keeps only JSON structure (every string is withheld), CLI sessions aren't persisted, and the
 prompt tells the author to return scenario text only in its answer, but a scratch file the author
 writes anyway is readable until the invocation ends.
@@ -283,6 +283,9 @@ detection, per-invocation budget, process-group kill on cancel.
   to `still_failing` or `flaky`, even when baseline and candidate fail identically. Comparison also
   inspects output and retained first attempts, so restored results without a diagnostic flag still block.
 - Gate setup, checks and pipeline retries share private scratch until completion or cancellation.
+  Their home reads are denied except for the run's checkout, scratch, recorded Git directories and
+  trusted toolchain homes. Editors deny credential stores through the same read-policy module;
+  Claude's own CLI login remains readable (#369), and Keychain access is a separate gap.
   HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
   and a private copy of Cargo configuration preserve installed toolchain discovery and read
   access; writes to real HOME remain denied.

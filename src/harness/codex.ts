@@ -10,6 +10,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -17,6 +18,7 @@ import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
+import { READ_PROBE } from "./read-policy.ts";
 import {
   createScratch,
   type InvocationCommands,
@@ -289,7 +291,12 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
 /** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
 export function editorProfile(spec: AgentSpec): string[] {
   // Codex exposes only a network on/off switch; the API token guards the daemon port.
-  const { write, protect, denyRead = [], commands } = writeRoots(spec.cwd, validateScratch(spec));
+  const {
+    write,
+    protect,
+    denyRead = [],
+    commands,
+  } = writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead);
   const entries = [
     ["/", "read"],
     ...write.map((p) => [p, "write"]),
@@ -350,7 +357,15 @@ export function canaryRoots(
   for (const root of [classes.tmp, classes.tmpdir].map((path) => realpathSync(path)))
     required.set(root, [root]);
   required.set(home, [join(home, ".limitless"), home]);
-  const roots = [...new Set(deny.filter((path) => existsSync(path)).map((path) => realpathSync(path)))];
+  // Canaries go inside each root, so only directories qualify: denied files such as credential stores
+  // (#492) can't hold one, and the editor probe checks their reads directly.
+  const roots = [
+    ...new Set(
+      deny
+        .filter((path) => existsSync(path) && statSync(path).isDirectory())
+        .map((path) => realpathSync(path)),
+    ),
+  ];
   for (const root of required.keys())
     if (!roots.includes(root)) throw new Error("mandatory private root not denied");
   return roots.flatMap((root) => {
@@ -380,7 +395,7 @@ function deniedRead(stderr: string, file: string): boolean {
     const field = line
       .slice(0, error.index)
       .trim()
-      .replace(/^\S*cat:\s*/, "")
+      .replace(/^\S*(?:cat|head|ls):\s*/, "")
       .replace(/^(['"])(.*)\1$/, "$2");
     return field === file;
   });
@@ -465,7 +480,9 @@ export class CodexReaderProbe {
   async verify(
     spec: AgentSpec,
     run: typeof runProcess,
-    deny: string[] = spellings(spec.denyRead ?? []),
+    deny: string[] = spec.mode === "edit"
+      ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
+      : spellings(spec.denyRead ?? []),
   ): Promise<ConfinementProbe> {
     const path = this.which("codex");
     if (!path) return { ok: false, path: null, version: null, reason: START_FAILED, exitCode: null };
@@ -602,7 +619,7 @@ async function sandboxProbe(
     const scratchDir = createScratch(probeCwd);
     owned.push(scratchParent(scratchDir));
     spec = editing
-      ? { ...template, cwd: probeCwd, scratchDir, denyRead: [], confineReads: false }
+      ? { ...template, cwd: probeCwd, scratchDir, confineReads: false }
       : { ...template, cwd: probeCwd, scratchDir, confineReads: true };
     const scratch = validateScratch(spec);
     // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
@@ -649,19 +666,28 @@ async function sandboxProbe(
       signal,
     });
   let last: number | null = null;
-  for (const file of privateReadPaths().filter(existsSync)) {
-    const proc = await run({
-      cmd: [path, "sandbox", ...profile, "--", "/bin/sh", "-c", 'cat "$1" >/dev/null', "sh", file],
-      cwd: spec.cwd,
-      env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
-      timeoutMs: 60_000,
-      signal,
-    });
-    if (signal.aborted || proc.cancelled || proc.signal || proc.exitCode === null)
-      return result(INCONCLUSIVE, proc.exitCode);
-    if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
-    if (proc.exitCode === 0) return result(NOT_ENFORCED, proc.exitCode);
-    if (proc.exitCode !== 1 || !deniedRead(proc.stderr, file)) return result(INCONCLUSIVE, proc.exitCode);
+  const probeReads = async () => {
+    const deniedFiles = editing
+      ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
+      : privateReadPaths();
+    for (const file of deniedFiles.filter(existsSync)) {
+      const proc = await run({
+        cmd: [path, "sandbox", ...profile, "--", "/bin/sh", "-c", READ_PROBE, "sh", file],
+        cwd: spec.cwd,
+        env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
+        timeoutMs: 60_000,
+        signal,
+      });
+      if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
+      if (signal.aborted || proc.cancelled || proc.signal || proc.exitCode === null)
+        return result(INCONCLUSIVE, proc.exitCode);
+      if (proc.exitCode === 0) return result(editing ? WRITE_NOT_ENFORCED : NOT_ENFORCED, proc.exitCode);
+      if (proc.exitCode !== 1 || !deniedRead(proc.stderr, file)) return result(INCONCLUSIVE, proc.exitCode);
+    }
+  };
+  if (!editing) {
+    const failed = await probeReads();
+    if (failed !== undefined) return failed;
   }
   for (const file of [...negatives, ...positives]) {
     let proc: ProcResult;
@@ -692,6 +718,10 @@ async function sandboxProbe(
     if (proc.stdout.includes(file.token)) return result(NOT_ENFORCED, proc.exitCode);
     if (proc.exitCode === 0 || !deniedRead(proc.stderr, file.path))
       return result(INCONCLUSIVE, proc.exitCode);
+  }
+  if (editing) {
+    const failed = await probeReads();
+    if (failed !== undefined) return failed;
   }
   return editing ? result(null, last) : result(INCONCLUSIVE, null);
 }
@@ -784,7 +814,11 @@ export async function runCodex(
   const confined = editing || (spec.confineReads && spec.mode === "readonly" && !spec.noTools);
   // One snapshot of the denied paths keys the verdict, drives the probe and builds the exec
   // profile; resolving it again is a no-op unless a symlink was retargeted meanwhile.
-  const deny = confined && !editing ? spellings(spec.denyRead ?? []) : [];
+  const deny = editing
+    ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
+    : confined
+      ? spellings(spec.denyRead ?? [])
+      : [];
   const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec);
   let confinement: ConfinementProbe | undefined;
   if (confined) {

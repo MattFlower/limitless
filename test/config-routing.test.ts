@@ -13,6 +13,7 @@ import { exportProviders, resolveCatalog, tomlValue } from "../src/router/config
 import { validatePolicy, validateRunModels } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import { privateReadPaths } from "../src/util/private-reads.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
 
@@ -486,7 +487,15 @@ test("roster targets are checked against the catalog at startup; single mode onl
   const start = (roster: string, mode = "panel") => {
     const toml = `[review]\nmode = "${mode}"\n[review.rosters]\nstandard = [${roster}]\n`;
     writeFileSync(join(configDir, "config.toml"), toml);
-    new Factory(loadConfig({ home: join(root, "data"), configDir })).store.close();
+    const cfg = loadConfig({ home: join(root, "data"), configDir });
+    const privatePaths = privateReadPaths();
+    const store = new Store(cfg.paths.db);
+    try {
+      new Factory(cfg, { store });
+    } finally {
+      store.close();
+      expect(privateReadPaths()).toEqual(privatePaths);
+    }
   };
   try {
     start(
@@ -520,9 +529,15 @@ test("a stale pinned shadow roster target turns the shadow off with a warning; s
   const start = (roster: string, mode = "single") => {
     const toml = `[review]\nmode = "${mode}"\n${mode === "single" ? 'shadow = "panel"\n' : ""}[review.rosters]\nstandard = [${roster}]\n`;
     writeFileSync(join(configDir, "config.toml"), toml);
-    const factory = new Factory(loadConfig({ home: join(root, "data"), configDir }));
-    factory.store.close();
-    return factory;
+    const cfg = loadConfig({ home: join(root, "data"), configDir });
+    const privatePaths = privateReadPaths();
+    const store = new Store(cfg.paths.db);
+    try {
+      return new Factory(cfg, { store });
+    } finally {
+      store.close();
+      expect(privateReadPaths()).toEqual(privatePaths);
+    }
   };
   try {
     const stale = start('{ prompt = "adversarial", target = "claude/opsu" }');

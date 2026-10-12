@@ -192,6 +192,7 @@ export class Factory {
     this.land = new LandQueue({
       store: this.store,
       paths: cfg.paths,
+      readPolicy: cfg.readPolicy,
       polling: cfg.githubPoll,
       ciReruns: cfg.githubCiReruns,
       client: getGitHubPr,

@@ -2,9 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGates } from "../src/gates/run.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { testReadPolicy } from "./read-policy-support.ts";
 
 export const gateCredential = "synthetic-gate-output-credential-409";
 
@@ -17,15 +19,17 @@ export async function credentialGate() {
       `error: credential ${gateCredential}\n(fail) assertion\n${"summary\n".repeat(1_000)}${gateCredential}\n`,
     );
     return await confinementScope.run(fakeConfinement, () =>
-      runGates(
-        dir,
-        {
-          setup: [],
-          checks: [{ name: "test", run: "cat output.txt; exit 1" }],
-          source: "detected",
-          protectedPaths: [],
-        },
-        new AbortController().signal,
+      readPolicyScope.run(testReadPolicy, () =>
+        runGates(
+          dir,
+          {
+            setup: [],
+            checks: [{ name: "test", run: "cat output.txt; exit 1" }],
+            source: "detected",
+            protectedPaths: [],
+          },
+          new AbortController().signal,
+        ),
       ),
     );
   } finally {
