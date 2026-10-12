@@ -1,7 +1,7 @@
 import { expect } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runClaude } from "../src/harness/claude.ts";
@@ -19,6 +19,12 @@ import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
 const payload = join(import.meta.dir, "fixtures/signal-payload.ts");
+/** Gates read only their checkout and scratch under a denied home (#492), so run a copy from the checkout. */
+function gatePayload(cwd: string): string {
+  const copy = join(cwd, "signal-payload.ts");
+  copyFileSync(payload, copy);
+  return copy;
+}
 const alive = (child: ChildProcess) => child.exitCode === null && child.signalCode === null;
 async function stop(child: ChildProcess) {
   if (!alive(child)) return;
@@ -112,7 +118,7 @@ test("offline adapters and gates protect outside/sibling markers or explicitly r
           runConfined({
             cwd,
             env: agentEnv({ ...env, SIGNAL_STARTED: gateStarted }),
-            command: `"${process.execPath}" "${payload}"`,
+            command: `"${process.execPath}" "${gatePayload(cwd)}"`,
             timeoutMs: 5000,
           }),
       ]);
@@ -180,7 +186,7 @@ kill -TERM "$child"
 wait "$child"; status=$?
 [ "$status" -gt 128 ] || exit 1
 printf 'owned-terminated\\n'
-exec "${process.execPath}" "${payload}"`,
+exec "${process.execPath}" "${gatePayload(cwd)}"`,
         env: agentEnv({
           SIGNAL_WAIT: "1",
           SIGNAL_MARKER: `inside-${crypto.randomUUID()}`,
