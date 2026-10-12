@@ -157,6 +157,68 @@ test("readiness timeout reports the configured endpoint and cleans scratch", asy
   await expectCleaned(dir);
 });
 
+test.each(["ready", "timeout"])(
+  "large unterminated serve output preserves health, cleanup and bounded diagnostics (%s)",
+  async (state) => {
+    const dir = fixture();
+    writeFileSync(
+      join(dir, "serve.ts"),
+      `
+await Bun.write("server-pid", String(process.pid));
+await Bun.write("scratch", process.env.HOME ?? "");
+async function flood() {
+  const chunk = "x".repeat(65_536);
+  for (let i = 0; i < 64; i++) {
+    for (const stream of [process.stdout, process.stderr]) {
+      await new Promise((resolve, reject) => stream.write(chunk, error => error ? reject(error) : resolve()));
+    }
+  }
+  await Bun.write("emitted", "done");
+}
+Bun.serve({hostname: "127.0.0.1", port: Number(process.env.LIMITLESS_PORT), fetch(req) {
+  const path = new URL(req.url).pathname;
+  if (path === "/flood") { void flood(); return new Response("emitting"); }
+  return new Response("ok", {status: path === "/health" ? 200 : 404});
+}});
+await Bun.write("port", process.env.LIMITLESS_PORT ?? "");
+`,
+    );
+    const controller = new AbortController();
+    const starting = startPreview(
+      dir,
+      { ...config, ready: state === "ready" ? "/health" : "/never" },
+      controller.signal,
+      3_000,
+    ).then(
+      (server) => ({ server, error: null }),
+      (error: unknown) => ({ server: null, error }),
+    );
+    try {
+      // Begin the flood after readiness in the healthy case, while polling in the timeout case.
+      if (state === "ready") expect((await starting).error).toBeNull();
+      await until(() => existsSync(join(dir, "port")));
+      const url = `http://127.0.0.1:${readFileSync(join(dir, "port"), "utf8")}`;
+      expect(await (await fetch(`${url}/flood`)).text()).toBe("emitting");
+      await until(() => existsSync(join(dir, "emitted")));
+      expect(await (await fetch(`${url}/health`)).text()).toBe("ok");
+      if (state === "timeout") {
+        const { error } = await starting;
+        expect(error).toBeInstanceOf(Error);
+        const message = String(error);
+        expect(message).toContain("Preview readiness timed out");
+        expect(message).toContain("[truncated]");
+        expect(message.length).toBeLessThan(4_200);
+      }
+    } finally {
+      controller.abort();
+      const { server } = await starting;
+      await server?.stop();
+    }
+    await expectCleaned(dir);
+  },
+  10_000,
+);
+
 async function until(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate() && Date.now() < deadline) await Bun.sleep(10);
@@ -353,7 +415,7 @@ const denied = [];
 for (const target of ${JSON.stringify(targets)}) {
   try { await Bun.write(target, "tampered"); throw new Error("write unexpectedly allowed: " + target); }
   catch (error) {
-    if (!/Operation not permitted|Permission denied/.test(String(error))) throw error;
+    if (error?.code !== "EPERM" && error?.code !== "EACCES") throw error;
     denied.push(target);
   }
 }
@@ -383,7 +445,7 @@ const original = Bun.write;
 Bun.write = async (path, ...args) => {
   const target = typeof path === "string" ? realpathSync(resolve(path)) : "";
   if (!roots.write.some(root => within(root, target)) || roots.protect.some(root => within(root, target)))
-    throw new Error("Operation not permitted");
+    throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
   return original(path, ...args);
 };
 `,

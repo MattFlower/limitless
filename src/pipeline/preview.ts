@@ -185,6 +185,7 @@ export async function startPreview(
           env,
           signal: commandSignal,
           tailLimit: 4_000,
+          maxLineLength: 4_000,
           onStarted: () => {
             started = true;
           },
