@@ -335,6 +335,10 @@ test.each(["unreadable", "invalid TOML", "invalid port", "unrelated setting", "e
           id: "lease",
           acquired: true,
         });
+        // `limitless deploy` builds its lease client from the routing port.
+        await expect(
+          localLeaseClient(resolveClientPort())({ name: "deploy" }, new AbortController().signal),
+        ).resolves.toEqual({ id: "lease", acquired: true });
         await expect(
           localDeployClient(resolveClientPort()).health(new AbortController().signal),
         ).resolves.toMatchObject({ ok: true });
@@ -342,8 +346,13 @@ test.each(["unreadable", "invalid TOML", "invalid port", "unrelated setting", "e
         forward.mockRestore();
       }
       const routedBase = `http://127.0.0.1:${authorized ? stub.port : 7400}`;
-      expect(requestUrls).toEqual([`${routedBase}/api/admin/gate-slot`, `${routedBase}/api/health`]);
+      expect(requestUrls).toEqual([
+        `${routedBase}/api/admin/gate-slot`,
+        `${routedBase}/api/admin/gate-slot`,
+        `${routedBase}/api/health`,
+      ]);
       expect(seen).toEqual([
+        authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,

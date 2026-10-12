@@ -53,7 +53,7 @@ export const localLeaseClient =
         "content-type": "application/json",
         ...(typeof body.token === "string"
           ? { authorization: `Bearer ${body.token}` }
-          : apiTokenHeaders(url, undefined, port)),
+          : apiTokenHeaders(url)),
       },
       body: JSON.stringify(body),
       signal,
