@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { loadConfig } from "../config.ts";
 import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
@@ -80,14 +81,19 @@ Usage:
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
 
-const BASE = process.env.LIMITLESS_URL ?? `http://127.0.0.1:${process.env.LIMITLESS_PORT ?? 7400}`;
+const daemonUrl = (port: number) => process.env.LIMITLESS_URL ?? `http://127.0.0.1:${port}`;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const port = loadConfig({ readOnly: true }).port;
+  const base = daemonUrl(port);
   let res: Response;
   let text: string;
   try {
-    const url = `${BASE}${path}`;
-    const headers = new Headers({ "content-type": "application/json", ...apiTokenHeaders(url) });
+    const url = `${base}${path}`;
+    const headers = new Headers({
+      "content-type": "application/json",
+      ...apiTokenHeaders(url, undefined, port),
+    });
     for (const [key, value] of new Headers(init?.headers)) headers.set(key, value);
     res = await fetch(url, {
       ...init,
@@ -96,7 +102,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     text = await res.text();
   } catch {
     throw new ApiError(
-      redactCredentials(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`),
+      redactCredentials(`Cannot reach the Limitless daemon at ${base}. Start it with \`limitless serve\`.`),
     );
   }
   if (!res.ok) {
@@ -142,8 +148,9 @@ function formatEvent(e: RunEvent): string {
 }
 
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
-  const url = `${BASE}/api/runs/${runId}/stream?after=${after}`;
-  const res = await fetch(url, { headers: apiTokenHeaders(url) });
+  const port = loadConfig({ readOnly: true }).port;
+  const url = `${daemonUrl(port)}/api/runs/${runId}/stream?after=${after}`;
+  const res = await fetch(url, { headers: apiTokenHeaders(url, undefined, port) });
   if (!res.ok) {
     const reply = (await res.json().catch(() => null)) as { error?: string } | null;
     throw new ApiError(redactCredentials(`${res.status}: ${reply?.error ?? res.statusText}`), res.status);
@@ -330,7 +337,7 @@ async function main(): Promise<void> {
       return serve();
     case "mcp": {
       const { startStdio } = await import("../integrations/mcp.ts");
-      return startStdio(BASE);
+      return startStdio(daemonUrl(loadConfig({ readOnly: true }).port));
     }
     case "integrations": {
       if (rest[0] !== "install") throw new Error("usage: limitless integrations install [--write]");
@@ -511,10 +518,9 @@ async function main(): Promise<void> {
     }
     case "service": {
       const svc = await import("./service.ts");
-      const port = Number(process.env.LIMITLESS_PORT ?? 7400);
+      const port = loadConfig({ readOnly: true }).port;
       if (rest[0] === "install") {
         const tunnel = values.tunnel === true;
-        // Only the tunnel needs the public host; plain installs never read config here.
         const publicUrl = tunnel ? (await import("../config.ts")).loadConfig().publicUrl : null;
         return svc.install(port, { tunnel, mtplx: values.mtplx === true, publicUrl });
       }
@@ -526,7 +532,7 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       if (rest.length > 1)
         throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
-      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true, {
+      return svc.deploy(loadConfig({ readOnly: true }).port, rest[0], values.smoke === true, {
         maxWaitMs,
         now: values.now === true,
       });

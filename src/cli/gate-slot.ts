@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { parseArgs } from "node:util";
+import { loadConfig } from "../config.ts";
 import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
@@ -42,7 +43,7 @@ export class LeaseTransportFailures extends Error {
   }
 }
 export const localLeaseClient =
-  (port = Number(process.env.LIMITLESS_PORT ?? 7400), unix?: string): LeaseClient =>
+  (port = loadConfig({ readOnly: true }).port, unix?: string): LeaseClient =>
   async (body, signal) => {
     const url = `http://127.0.0.1:${port}/api/admin/gate-slot`;
     const response = await fetch(url, {
@@ -52,7 +53,7 @@ export const localLeaseClient =
         "content-type": "application/json",
         ...(typeof body.token === "string"
           ? { authorization: `Bearer ${body.token}` }
-          : apiTokenHeaders(url)),
+          : apiTokenHeaders(url, undefined, port)),
       },
       body: JSON.stringify(body),
       signal,

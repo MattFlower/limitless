@@ -20,7 +20,7 @@ async function get(d: SetupDeps, url: string, token?: string, local = false) {
     const headers: HeadersInit = token
       ? { authorization: `Bearer ${token}` }
       : local
-        ? apiTokenHeaders(url, d.config.paths.home)
+        ? apiTokenHeaders(url, d.config.paths.home, d.config.port)
         : {};
     return await d.fetch(url, { method: "GET", signal: AbortSignal.timeout(2000), headers });
   } catch {

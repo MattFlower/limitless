@@ -77,11 +77,13 @@ const exempt = (path: string) =>
   path.startsWith("/api/auth/passkey/") ||
   path === "/api/auth/logout";
 
-test("token headers match normalized origins and fail closed for invalid or stale bindings", () => {
+test("token headers match normalized origins, fall back for stale bindings and reject invalid records", () => {
   const home = mkdtempSync(join(tmpdir(), "limitless-token-origin-"));
   const previousHome = process.env.LIMITLESS_HOME;
   const previousPort = process.env.LIMITLESS_PORT;
+  const previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
   process.env.LIMITLESS_HOME = home;
+  process.env.LIMITLESS_CONFIG_DIR = home;
   delete process.env.LIMITLESS_PORT;
   const secret = "a".repeat(64);
   const path = join(home, "api-token.origin");
@@ -96,9 +98,16 @@ test("token headers match normalized origins and fail closed for invalid or stal
     expect(apiTokenHeaders("http://127.0.0.1:7400/api/runs")).toEqual(expected);
     for (const url of ["http://127.0.0.1:7401", "http://localhost:7400", "https://127.0.0.1:7400"])
       expect(apiTokenHeaders(url)).toEqual({});
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
+    expect(apiTokenHeaders("http://127.0.0.1:7412/api/runs")).toEqual(expected);
+    for (const url of ["http://127.0.0.1:7400", "http://localhost:7412", "https://127.0.0.1:7412"])
+      expect(apiTokenHeaders(url)).toEqual({});
     process.env.LIMITLESS_PORT = "7401";
     expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual(expected);
     expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+    expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+    expect(apiTokenHeaders("http://127.0.0.1:7413", home, 7413)).toEqual(expected);
+    expect(apiTokenHeaders("http://127.0.0.1:7401", home, 7413)).toEqual({});
     process.env.LIMITLESS_PORT = "7400@evil.example";
     expect(apiTokenHeaders("http://evil.example")).toEqual({});
     process.env.LIMITLESS_PORT = "7401";
@@ -115,20 +124,24 @@ test("token headers match normalized origins and fail closed for invalid or stal
       "invalid",
     ])
       expect(apiTokenHeaders(url)).toEqual({});
-    for (const record of [
-      "{",
-      "null",
-      "{}",
-      JSON.stringify({ origin: "http://127.0.0.1", tokenHash: "stale" }),
-    ]) {
+    for (const record of ["{", "null", "{}", JSON.stringify({ origin: "http://127.0.0.1" })]) {
       writeFileSync(path, record);
       expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
     }
+    delete process.env.LIMITLESS_PORT;
     bind("http://127.0.0.1:7401", "b".repeat(64));
+    expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual(expected);
     expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+    for (const url of ["http://127.0.0.1:7400", "http://localhost:7412", "https://127.0.0.1:7412"])
+      expect(apiTokenHeaders(url)).toEqual({});
+    process.env.LIMITLESS_PORT = "7401";
+    expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual(expected);
+    expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
     for (const origin of ["garbage", "file:///", "http://127.0.0.1:7401/path"]) {
-      bind(origin);
-      expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+      for (const value of [secret, "b".repeat(64)]) {
+        bind(origin, value);
+        expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+      }
     }
     rmSync(path);
     mkdirSync(path);
@@ -140,6 +153,55 @@ test("token headers match normalized origins and fail closed for invalid or stal
     else process.env.LIMITLESS_HOME = previousHome;
     if (previousPort === undefined) delete process.env.LIMITLESS_PORT;
     else process.env.LIMITLESS_PORT = previousPort;
+    if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
+  }
+});
+
+test("CLI uses the configured port and its environment override for an older daemon", async () => {
+  const home = mkdtempSync(join(tmpdir(), "limitless-token-config-"));
+  const secret = "c".repeat(64);
+  const seen: (string | null)[] = [];
+  const stub = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      seen.push(req.headers.get("authorization"));
+      return Response.json([]);
+    },
+  });
+  try {
+    writeFileSync(join(home, "api-token"), secret);
+    writeFileSync(join(home, "config.toml"), `[server]\nport = ${stub.port}\n`);
+    const env: Record<string, string> = { ...process.env, LIMITLESS_HOME: home, LIMITLESS_CONFIG_DIR: home };
+    delete env.LIMITLESS_URL;
+    delete env.LIMITLESS_PORT;
+    for (const stale of [false, true]) {
+      if (stale)
+        writeFileSync(
+          join(home, "api-token.origin"),
+          JSON.stringify({ origin: "https://example.com", tokenHash: "stale" }),
+        );
+      const result = await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
+        cwd: home,
+        env,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+    }
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7400\n");
+    expect(
+      (
+        await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
+          cwd: home,
+          env: { ...env, LIMITLESS_PORT: String(stub.port) },
+        })
+      ).exitCode,
+    ).toBe(0);
+    expect(seen).toEqual(Array(3).fill(`Bearer ${secret}`));
+  } finally {
+    await stub.stop(true);
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
