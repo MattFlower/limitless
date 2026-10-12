@@ -6,11 +6,11 @@ import type { GateCommand, GateConfig } from "./detect.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
 import {
+  findGateCounterpart,
   launchFailure,
   launchFailureScan,
   redactGateOutput,
   redactGateStreams,
-  sameGateName,
 } from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
@@ -204,10 +204,11 @@ export async function retryBaselineFailures(
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
 ): Promise<GateRun> {
-  const retryable = (r: GateResult) =>
-    !r.ok && !r.timedOut && !confinementFailed(r)
-      ? cfg.checks.find((k) => sameGateName(k.name, r.name) && k.run === r.command)
-      : undefined;
+  const retryable = (r: GateResult) => {
+    if (r.ok || r.timedOut || confinementFailed(r)) return undefined;
+    const check = findGateCounterpart(r, run.checks, cfg.checks);
+    return check?.run === r.command ? check : undefined;
+  };
   if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
   const selected = run.checks.flatMap((r) => {
     const check = retryable(r);
@@ -252,7 +253,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     return out;
   }
   for (const r of after.checks) {
-    const before = baseline?.checks.find((b) => sameGateName(b.name, r.name));
+    const before = findGateCounterpart(r, after.checks, baseline?.checks ?? []);
     let verdict: GateVerdict;
     if (confinementFailed(r) || confinementFailed(before)) verdict = "confinement_error";
     else if (!before) verdict = r.ok ? "new_pass" : "new_failure";
@@ -296,10 +297,12 @@ export async function retryRegressions(
   runner?: GateRunner,
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
-  const retryable = (c: GateComparison) =>
-    c.verdict === "regressed" && !c.result.timedOut && !pointsAt(c.result.output, changed)
-      ? cfg.checks.find((k) => sameGateName(k.name, c.name) && k.run === c.result.command)
-      : undefined;
+  const retryable = (c: GateComparison) => {
+    if (c.verdict !== "regressed" || c.result.timedOut || pointsAt(c.result.output, changed))
+      return undefined;
+    const check = findGateCounterpart(c, cmp, cfg.checks);
+    return check?.run === c.result.command ? check : undefined;
+  };
   if (!cmp.some(retryable)) return cmp;
   const selected = cmp.flatMap((c) => {
     const check = retryable(c);

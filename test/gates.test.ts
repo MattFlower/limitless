@@ -543,6 +543,31 @@ describe("runGates / compareGates", () => {
     ]);
   });
 
+  test("gate counterparts prefer exact names and reject sanitized ambiguity on either side", () => {
+    const base = (checks: GateRun["checks"]): GateRun => ({ setupOk: true, setup: [], checks });
+    const red = "check\x1b[31m";
+    const blue = "check\x1b[34m";
+    // Exact identities win even when sanitized names collide.
+    expect(
+      compareGates(base([r("check", false), r(red, true)]), base([r("check", false), r(red, false)])).map(
+        (c) => [c.verdict, c.blocking],
+      ),
+    ).toEqual([
+      ["still_failing", false],
+      ["regressed", true],
+    ]);
+    // A unique counterpart on one side is insufficient when the other side collides.
+    const cases: [GateRun["checks"], GateRun["checks"]][] = [
+      [[r("check", false)], [r(red, false), r(blue, false)]],
+      [[r(red, false), r(blue, false)], [r("check", false)]],
+    ];
+    for (const [before, after] of cases) {
+      expect(compareGates(base(before), base(after)).map((c) => [c.verdict, c.blocking])).toEqual(
+        after.map(() => ["new_failure", true]),
+      );
+    }
+  });
+
   test("setup failure after change is blocking", () => {
     const after: GateRun = { setupOk: false, setup: [r("setup", false)], checks: [] };
     expect(compareGates({ setupOk: true, setup: [r("setup", true)], checks: [] }, after)[0]?.blocking).toBe(

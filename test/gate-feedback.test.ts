@@ -4,7 +4,14 @@ import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
 import { extractFailures } from "../src/gates/failures.ts";
-import { compareGates, type GateComparison, runGates } from "../src/gates/run.ts";
+import {
+  compareGates,
+  type GateComparison,
+  type GateRun,
+  retryBaselineFailures,
+  retryRegressions,
+  runGates,
+} from "../src/gates/run.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { formatGateFeedback, implementPrompt, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
@@ -316,6 +323,43 @@ test("gate feedback and review receive redacted early diagnostics and tails", as
     expect(message).toContain("(fail) assertion");
     expect(message).not.toContain(gateCredential);
   }
+});
+
+test("ambiguous sanitized gate names cannot select retry commands or timeout limits", async () => {
+  const cfg = {
+    setup: [],
+    checks: [
+      { name: "check\x1b[31m", run: "false", timeoutSec: 37 },
+      { name: "check\x1b[34m", run: "false", timeoutSec: 42 },
+    ],
+    source: "none" as const,
+    protectedPaths: [],
+  };
+  const run: GateRun = {
+    setupOk: true,
+    setup: [],
+    checks: [{ name: "check", command: "false", ok: false, exitCode: 1, durationMs: 1, output: "failed" }],
+  };
+  const cmp = compareGates({ ...run, checks: run.checks.map((c) => ({ ...c, ok: true })) }, run);
+  const retry = async () => {
+    throw new Error("ambiguous gate must not be retried");
+  };
+  const signal = new AbortController().signal;
+  expect(await retryBaselineFailures(run, ".", cfg, signal, undefined, retry)).toBe(run);
+  expect(await retryRegressions(cmp, ".", cfg, [], signal, undefined, retry)).toBe(cmp);
+  expect(
+    formatGateFeedback(
+      cmp.map((c) => ({ ...c, result: { ...c.result, timedOut: true } })),
+      cfg,
+    ),
+  ).toContain("timed out after 900 s");
+  // Lookup uses literal names before feedback redaction, preserving the exact second timeout.
+  const literal = cmp.map((c) => ({
+    ...c,
+    name: cfg.checks[1]?.name ?? "",
+    result: { ...c.result, timedOut: true },
+  }));
+  expect(formatGateFeedback(literal, cfg)).toContain("timed out after 42 s");
 });
 
 function comparison(output: string, failures?: string, timedOut = true): GateComparison[] {

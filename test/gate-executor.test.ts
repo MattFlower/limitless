@@ -6,7 +6,13 @@ import { auditDiff } from "../src/gates/audit.ts";
 import { cacheableBaseline } from "../src/gates/cache.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
-import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
+import {
+  compareGates,
+  type GateComparison,
+  type GateRun,
+  retryBaselineFailures,
+  retryRegressions,
+} from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
@@ -453,6 +459,82 @@ test("changed baseline script diagnostics stay redacted after gate-started resta
     "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]'",
   ]);
 });
+
+test.each(["formatting", "credential"])(
+  "gate name collision blocks factory comparison (%s)",
+  async (kind) => {
+    const secret = "synthetic-gate-name-collision-486";
+    if (kind === "credential") registerCredential("gate-name-collision", secret);
+    const names =
+      kind === "formatting" ? ["check", "check\x1b[31m"] : ["check [redacted]", `check ${secret}`];
+    writeFileSync(
+      join(fixture.repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "false" }`).join(", ")}]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: fixture.repoDir });
+    await sh(["git", "commit", "-qm", "colliding gate identities"], { cwd: fixture.repoDir });
+    const scripted = fake(async (h, req) => {
+      const run = result(req, false);
+      // The second baseline gate passes; the first fails again on its baseline retry.
+      if (h.id === "1" && run.checks[1]) Object.assign(run.checks[1], { ok: true, exitCode: 0 });
+      return run;
+    });
+    const f = start(handler, false, false, { gateExecutor: scripted.executor });
+    f.deps.cfg.maxRounds = 1;
+    const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+    const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+    const checks = f.store.getRunState<RunState>(run.id)?.lastGates;
+    expect(checks?.[0]).toMatchObject({ verdict: "still_failing", blocking: false });
+    expect(checks?.[1]).toMatchObject({ verdict: "new_failure", blocking: true });
+    expect(status).toBe("needs_human");
+  },
+);
+
+test.each(["formatting", "credential"])(
+  "gate name collision blocks post-merge delivery (%s)",
+  async (kind) => {
+    const secret = "synthetic-merge-gate-name-collision-486";
+    if (kind === "credential") registerCredential("merge-gate-name-collision", secret);
+    const names =
+      kind === "formatting" ? ["check", "check\x1b[31m"] : ["check [redacted]", `check ${secret}`];
+    writeFileSync(
+      join(fixture.repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "false" }`).join(", ")}]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: fixture.repoDir });
+    await sh(["git", "commit", "-qm", "colliding merge gate identities"], { cwd: fixture.repoDir });
+    const bare = await githubFixture();
+    let merged = false;
+    const scripted = fake(async (_h, req) => {
+      const run = result(req, false);
+      // Before merge only the second gate passes; after merge only the first does.
+      const passing = run.checks[merged ? 0 : 1];
+      if (passing) Object.assign(passing, { ok: true, exitCode: 0 });
+      return run;
+    });
+    const f = start(
+      async (s) => {
+        if (roleOf(s) === "review") {
+          await advanceBase(bare, "base.txt", "base advanced\n");
+          merged = true;
+        }
+        return handler(s);
+      },
+      false,
+      false,
+      { gateExecutor: scripted.executor },
+    );
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+    const checks = JSON.parse(f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "null") as
+      | GateComparison[]
+      | null;
+    expect(checks?.[1]).toMatchObject({ verdict: "new_failure", blocking: true });
+    expect(status).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.error).toContain("post-merge gates regressed");
+  },
+);
 
 test("formatted gate identities keep baseline verdicts after gate-started restart", async () => {
   const name = "colored\x1b[31m";

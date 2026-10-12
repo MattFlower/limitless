@@ -3,7 +3,7 @@ import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { redactGateData, sameGateName } from "../gates/output.ts";
+import { findGateCounterpart, redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
   citationInSource,
@@ -171,13 +171,14 @@ Reply with a concise report: files changed, how you verified (commands and resul
 }
 
 export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): string {
-  cmp = redactGateData(cmp);
   const bad = cmp.filter((c) => c.blocking);
   if (!bad.length) return "";
   return bad
     .map((c) => {
+      const check = findGateCounterpart(c, cmp, cfg?.checks ?? []);
+      c = redactGateData(c);
       if (c.result.timedOut) {
-        const limit = cfg?.checks.find((k) => sameGateName(k.name, c.name))?.timeoutSec ?? 900;
+        const limit = check?.timeoutSec ?? 900;
         const output = stripVTControlCharacters(c.result.output);
         const last = [
           ...output.matchAll(

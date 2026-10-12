@@ -12,7 +12,7 @@ import {
   singleFlight,
 } from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
-import { redactGateData, redactGateOutput, sameGateName } from "../gates/output.ts";
+import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
@@ -1175,8 +1175,7 @@ async function oneRound(
           ctx.checkCancelled();
           baseTimeout = after.checks.some(
             (r) =>
-              r.timedOut &&
-              ctx.state.baseline?.checks.some((b) => sameGateName(b.name, r.name) && b.timedOut),
+              r.timedOut && findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
           );
           const failed = after.checks.filter((r) => !r.ok);
           const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
@@ -1200,7 +1199,7 @@ async function oneRound(
               ...after,
               checks: after.checks.map((r) => ({
                 ...r,
-                firstAttempt: first.checks.find((c) => sameGateName(c.name, r.name)),
+                firstAttempt: findGateCounterpart(r, after.checks, first.checks),
               })),
             };
           }
@@ -1217,8 +1216,7 @@ async function oneRound(
           ctx.checkCancelled();
           baseTimeout ||= after.checks.some(
             (r) =>
-              r.timedOut &&
-              ctx.state.baseline?.checks.some((b) => sameGateName(b.name, r.name) && b.timedOut),
+              r.timedOut && findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
           );
         } finally {
           // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
@@ -2483,7 +2481,7 @@ async function mergeForDelivery(
         const regressed =
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
-          previous.some((c) => c.result.ok && !after.checks.find((r) => sameGateName(r.name, c.name))?.ok);
+          previous.some((c) => c.result.ok && !findGateCounterpart(c, previous, after.checks)?.ok);
         if (regressed) throw new MergeRegressedError("post-merge gates regressed");
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       },
