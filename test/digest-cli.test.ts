@@ -238,40 +238,47 @@ test("digest groups review rounds and landing retries by PR across different run
   expect(lines[1]).toBe("Needs you: 0; PRs awaiting review: 0; Blocked lands: 0");
 });
 
-test("digest counts beyond one feed page, drops handled items, and validates before reading", async () => {
-  const pages: FeedPage[] = [
-    {
-      items: Array.from({ length: 1000 }, (_, i) => item(i + 1, "run.question")),
-      nextAfter: 1000,
-      pruned: false,
-    },
-    {
-      items: [item(1001, "run.resolved", { runId: "r1" }), item(1002, "run.pr_opened")],
-      nextAfter: 1002,
-      pruned: false,
-    },
-  ];
-  const paths: string[] = [],
-    lines: string[] = [];
-  const api = fixtureApi(
-    pages.flatMap((page) => page.items),
-    async <T>(path: string): Promise<T> => {
-      paths.push(path);
-      return pages.shift() as T;
-    },
-  );
-  await digestCommand([], {}, { api, print: (line) => lines.push(line) });
-  expect(lines[1]).toBe("Needs you: 999; PRs awaiting review: 1; Blocked lands: 0");
-  expect(new URL(paths[1] ?? "", "http://x").searchParams.get("after")).toBe("1000");
-  expect(paths).toHaveLength(2);
-  for (const [rest, consumer] of [
-    [["ack"], undefined],
-    [[], " "],
-    [[], "x".repeat(201)],
-  ] as const)
-    await expect(digestCommand([...rest], { consumer }, { api, print: () => {} })).rejects.toThrow();
-  expect(paths).toHaveLength(2);
-});
+test.each([
+  { count: 1000, hasMore: undefined },
+  { count: 2, hasMore: true },
+])(
+  "digest counts beyond one feed page ($count items), drops handled items, and validates before reading",
+  async ({ count, hasMore }) => {
+    const pages: FeedPage[] = [
+      {
+        items: Array.from({ length: count }, (_, i) => item(i + 1, "run.question")),
+        nextAfter: count,
+        pruned: false,
+        ...(hasMore === undefined ? {} : { hasMore }),
+      },
+      {
+        items: [item(count + 1, "run.resolved", { runId: "r1" }), item(count + 2, "run.pr_opened")],
+        nextAfter: count + 2,
+        pruned: false,
+      },
+    ];
+    const paths: string[] = [],
+      lines: string[] = [];
+    const api = fixtureApi(
+      pages.flatMap((page) => page.items),
+      async <T>(path: string): Promise<T> => {
+        paths.push(path);
+        return pages.shift() as T;
+      },
+    );
+    await digestCommand([], {}, { api, print: (line) => lines.push(line) });
+    expect(lines[1]).toBe(`Needs you: ${count - 1}; PRs awaiting review: 1; Blocked lands: 0`);
+    expect(new URL(paths[1] ?? "", "http://x").searchParams.get("after")).toBe(String(count));
+    expect(paths).toHaveLength(2);
+    for (const [rest, consumer] of [
+      [["ack"], undefined],
+      [[], " "],
+      [[], "x".repeat(201)],
+    ] as const)
+      await expect(digestCommand([...rest], { consumer }, { api, print: () => {} })).rejects.toThrow();
+    expect(paths).toHaveLength(2);
+  },
+);
 
 function storeApi(f: ReturnType<typeof feedStore>, requests: string[]) {
   return async <T>(path: string, init?: RequestInit): Promise<T> => {

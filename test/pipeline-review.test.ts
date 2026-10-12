@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderToString } from "solid-js/web";
 import type { Factory } from "../src/app.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { factoryBackend } from "../src/integrations/mcp.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { sh } from "../src/util/proc.ts";
+import { connect, resultValue } from "./mcp-support.ts";
 import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
@@ -36,6 +38,53 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("an MCP consumer named Dependabot keeps policy routing and ordinary review input", async () => {
+    const reviews: string[] = [];
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          reviews.push(s.prompt);
+          return { structured: approve };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "");
+    process.env.LIMITLESS_CONFIG_DIR = f.cfg.paths.configDir;
+    const connection = await connect(factoryBackend(f));
+    try {
+      const created = resultValue<{ id: string }>(
+        await connection.client.callTool({
+          name: "limitless_create_run",
+          arguments: { repo: repoDir, prompt: "Add farewell", profile: "quick", consumer: "dependabot[bot]" },
+        }),
+      );
+      expect(await waitFor(f, created.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const run = f.store.getRun(created.id);
+      const repo = run && f.store.getRepo(run.repoId);
+      if (!run || !repo) throw new Error("missing run or repo");
+      expect(run.taskClass).toBe("feature");
+      expect(new RunContext(f.deps, run, repo, new AbortController().signal).freeFirstRouting).toBe(false);
+      expect(f.store.listInvocations(run.id).map((i) => [i.role, i.provider])).toEqual([
+        ["triage", "alpha"],
+        ["implement", "alpha"],
+        ["review", "beta"],
+      ]);
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0]).not.toContain("Dependency update: check breaking changes");
+    } finally {
+      await connection.close();
+      if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+      else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
   test("verify-change panel R2 gets only the fix diff's stat and patch", async () => {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });

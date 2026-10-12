@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pi
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
 import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 const sha = "a".repeat(40);
 const spec: Spec = {

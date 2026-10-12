@@ -901,10 +901,34 @@ describe("process handling", () => {
     },
   );
 
+  test("cwd permission errors are ignored only under the read allowlist", async () => {
+    const native = await loadNativeInspection(dir);
+    const decide = (errno: number) =>
+      native.hiddenDarwinProcessMember(
+        42,
+        new Map([[42, 1]]),
+        new Set(),
+        100,
+        [realpathSync(dir)],
+        () => 101,
+        () => ({ errno }),
+      );
+    for (const confined of [false, true]) {
+      native.setReadAllowlist(confined);
+      for (const errno of [1, 13]) {
+        if (confined) expect(decide(errno)).toBe(false);
+        else expect(() => decide(errno)).toThrow("Process cwd inspection failed for 42");
+      }
+      expect(decide(3)).toBe(false);
+      for (const errno of [5, 22])
+        expect(() => decide(errno)).toThrow("Process cwd inspection failed for 42");
+    }
+  });
+
   test.skipIf(process.platform !== "darwin")(
     "hidden cwd membership uses canonical roots and fails closed",
     async () => {
-      const { hiddenDarwinProcessMember } = await import("../src/util/processes-darwin.ts");
+      const { hiddenDarwinProcessMember } = await loadNativeInspection(dir);
       const nested = join(dir, "nested");
       mkdirSync(nested);
       const alias = join(dir, "alias");
@@ -1519,7 +1543,7 @@ describe("HTTP API", () => {
       confinement: fakeConfinement,
       harnesses: { fake: fakeHarness(() => ({})) },
     });
-    const server = startHttp(factory);
+    const server = await startHttp(factory);
     const base = `http://127.0.0.1:${server.port}`;
     try {
       const evil = await fetch(`${base}/api/runs`, {

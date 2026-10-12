@@ -53,7 +53,9 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
-import { commandScope, confinementScope, seatbeltBackend } from "../harness/sandbox.ts";
+import { readPolicyScope } from "../harness/read-policy.ts";
+import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -155,8 +157,10 @@ export async function executeRun(
   return processScope.run(
     { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
     () =>
-      confinementScope.run(deps.confinement ?? seatbeltBackend, () =>
-        worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+      confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
+        readPolicyScope.run(deps.cfg.readPolicy, () =>
+          worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+        ),
       ),
   );
 }
@@ -179,7 +183,14 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
-    if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
+    if (ctx.state.needsHumanReason)
+      throw new NeedsHumanError(
+        ctx.state.needsHumanReason.startsWith(ENVIRONMENT_BLOCKED) &&
+          ctx.state.terminalReason &&
+          !ctx.state.terminalReason.startsWith(ENVIRONMENT_BLOCKED)
+          ? ctx.state.terminalReason
+          : ctx.state.needsHumanReason,
+      );
     ctx.state.flow ??= "build";
     await ctx.save();
     if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
@@ -194,6 +205,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           ctx.state.verification?.baseSha ?? ctx.run.baseSha,
           ".limitless.toml",
         ),
+      );
+      await ctx.save();
+    }
+    if (ctx.state.phase !== "prepare" && ctx.state.slottedCommands === undefined) {
+      const trustedSha =
+        reviewRound(ctx)?.owner.baseSha ?? ctx.state.verification?.baseSha ?? ctx.run.baseSha;
+      if (!trustedSha || !ctx.state.worktreePath)
+        throw new Error("Cannot restore base slotted commands: missing base SHA or worktree");
+      ctx.state.slottedCommands = readSlottedCommands(
+        await readFileAt(ctx.state.worktreePath, trustedSha, ".limitless.toml"),
+        (message) => ctx.log(message, "warn"),
       );
       await ctx.save();
     }
@@ -319,8 +341,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       ctx.state.worktreePath &&
-      ctx.state.conflictRound === undefined &&
-      !ctx.state.pendingRebaseSha &&
+      ((ctx.state.conflictRound === undefined && !ctx.state.pendingRebaseSha) ||
+        environmentBlockedRound(ctx)) &&
       !(reviewRound(ctx)?.kind === "ci" && ctx.run.headSha === reviewRound(ctx)?.reviewedSha)
     ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
@@ -341,6 +363,16 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         if (err instanceof NeedsHumanError) message = err.message;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
+    }
+    if (
+      !message.startsWith(ENVIRONMENT_BLOCKED) &&
+      (ctx.state.needsHumanReason?.startsWith(ENVIRONMENT_BLOCKED) ||
+        ctx.state.terminalReason?.startsWith(ENVIRONMENT_BLOCKED)) &&
+      (ctx.state.needsHumanReason !== message || ctx.state.terminalReason !== message)
+    ) {
+      ctx.state.needsHumanReason = redactCredentials(message);
+      ctx.state.terminalReason = ctx.state.needsHumanReason;
+      deps.store.setRunState(runId, ctx.state);
     }
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
     deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
@@ -449,6 +481,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     try {
       const repoConfig = await readFileAt(wt.path, trustedSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
+      ctx.state.slottedCommands = readSlottedCommands(repoConfig, (message) => ctx.log(message, "warn"));
       // Review lenses come from the base commit, never from the change under review.
       if (ctx.deps.cfg.reviewMode === "panel")
         ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
@@ -1129,6 +1162,7 @@ async function oneRound(
       const owner = reviewRound(ctx)?.owner;
       const base = (owner ? owner.baseBranch : ctx.run.baseBranch) ?? ctx.repo.defaultBranch;
       ctx.state.terminalReason = `the resolution leaves no change against ${base}`;
+      ctx.state.needsHumanReason = undefined;
       await ctx.save();
       throw new NeedsHumanError(ctx.state.terminalReason);
     }
@@ -1777,6 +1811,22 @@ async function oneRound(
 
 class DeliveryHeadError extends NeedsHumanError {}
 
+/** Only the current checked round's environment-blocked verdict permits unverified publication. */
+function environmentBlockedRound(ctx: RunContext): boolean {
+  const verify = ctx.state.verifyResults?.at(-1);
+  return (
+    !!reviewRound(ctx) &&
+    !!ctx.state.terminalReason?.startsWith(ENVIRONMENT_BLOCKED) &&
+    ctx.state.terminalReason === ctx.state.needsHumanReason &&
+    !!ctx.state.lastVerify &&
+    blockedOnly(ctx.state.lastVerify) &&
+    verify?.round === ctx.state.round &&
+    !!verify.sha &&
+    verify.sha === ctx.state.reviewedSha &&
+    blockedOnly(verify)
+  );
+}
+
 /** Only round evidence, or a factory merge already validated and gated, authorizes delivery. */
 async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> {
   const expected = ctx.state.reviewedSha;
@@ -1790,7 +1840,9 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
     stage.name !== "gates" ||
     stage.round !== ctx.state.round ||
     stage.status !== "succeeded" ||
-    (ctx.state.flow !== "verify-change" && ctx.state.lastVerifiedSha !== expected) ||
+    (ctx.state.flow !== "verify-change" &&
+      ctx.state.lastVerifiedSha !== expected &&
+      !environmentBlockedRound(ctx)) ||
     gates.checks.some((c) => c.blocking) ||
     ctx.state.lastReview?.verdict !== "approve" ||
     !ctx.state.lastAudit ||
@@ -1798,6 +1850,7 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
   )
     throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
   if (head === expected) return;
+  if (environmentBlockedRound(ctx)) throw new DeliveryHeadError(reason);
   // A completed clean merge records both run SHAs only after validation and post-merge gates.
   const base = ctx.state.pendingRebaseSha ?? (head === ctx.run.headSha ? ctx.run.baseSha : null);
   if (base && (!ctx.state.pendingRebaseSha || ctx.state.preRebaseHead === expected)) {
@@ -1990,19 +2043,40 @@ async function deliverReviewRound(
       }
       stored();
       ctx.store.markRoundDelivered(ctx.run.id, head);
+      await ctx.save("round-delivered");
     }
-    if (review.kind === "conflict" || review.kind === "ci") {
-      const marker = `<!-- limitless-${review.kind === "ci" ? "ci" : "conflict"}-round:${ctx.run.id} -->`;
+    const blocked = environmentBlockedRound(ctx);
+    if (blocked || review.kind === "conflict" || review.kind === "ci") {
+      const marker = `<!-- limitless-${review.kind}-round:${ctx.run.id} -->`;
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
         .comments as { body?: string }[] | undefined;
       if (!comments?.some((comment) => comment.body?.includes(marker))) {
         const failure = ctx.store.ciFixFailure(ctx.run.id);
         if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
-        const text = redactCredentials(
+        let text = redactCredentials(
           review.kind === "ci"
             ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${JSON.stringify(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
-            : `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`,
+            : review.kind === "conflict"
+              ? `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`
+              : `${marker}\nRound ${review.round} published at ${head}.`,
         );
+        if (blocked) {
+          const publicSources = await ctx.publicHoldoutSources();
+          const rows = (ctx.state.lastVerify?.criteria ?? [])
+            .filter((c) => c.status === "blocked")
+            .map((c, index) => {
+              if (rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown")
+                return `🚧 blocked unknown-${index + 1}: private evidence withheld`;
+              const evidence = redactCredentials(
+                redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources),
+              ).slice(0, 300);
+              return `🚧 blocked ${c.id}: ${evidence}`;
+            });
+          // Keep checked-head evidence ahead of quoted requests; the full report is a run artifact.
+          text = redactCredentials(
+            `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+          ).slice(0, 60_000);
+        }
         await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
         await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);
       }
@@ -2019,6 +2093,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   if (ctx.state.deliveryComplete) return;
   // Before any delivery path is chosen: a review round only ever takes its own.
   const review = reviewRound(ctx);
+  const blocked = !success && environmentBlockedRound(ctx);
   assertExistingBranchDelivery(ctx.repo, ctx.run, review?.grant);
   if (ctx.run.deliveryBranch && !review && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
@@ -2141,6 +2216,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               }
               if (reason) {
                 ctx.state.terminalReason = reason;
+                ctx.state.needsHumanReason = undefined;
                 ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
@@ -2157,6 +2233,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             if (!confirmingHead) throw error;
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
+            ctx.state.needsHumanReason = undefined;
             ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
@@ -2179,7 +2256,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         ? null
         : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     let head = sha ?? (await headSha(cwd));
-    if (success || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
+    if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {
       const baseBranch = ctx.run.baseBranch as string;
@@ -2211,7 +2288,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     await checkPublication(ctx, report, { sha: await headSha(cwd), title });
     head = await headSha(cwd);
-    if (success || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
+    if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
@@ -2242,7 +2319,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     if (review || ctx.run.deliveryBranch) {
       publish();
-      if (!success) return { summary: "PR update needs human review; no push", value: undefined };
+      if (!success && !blocked) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
       if (review) await deliverReviewRound(ctx, review, cwd, head, gh, budget);
       else if (ctx.run.deliveryBranch) {

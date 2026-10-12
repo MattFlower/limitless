@@ -8,35 +8,77 @@ import {
   realpathSync,
   rmSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
+import {
+  ancestorReadPolicy,
+  ConfinementError,
+  READ_PROBE,
+  resolvedHome,
+  specificReadDenies,
+} from "./read-policy.ts";
 import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 
 /** A command could not run confined: an operational failure, never a gate or grading result. */
-export class ConfinementError extends Error {}
+export { ConfinementError } from "./read-policy.ts";
 
-/** Seatbelt: everything as usual except writes, which only the roots minus `protect` take; the last match wins. */
+/** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
 export function seatbeltProfile(roots: WriteRoots): string {
-  const paths = (list: string[]) =>
+  if (
+    roots.daemonPort !== undefined &&
+    (!Number.isInteger(roots.daemonPort) || roots.daemonPort < 1 || roots.daemonPort > 65535)
+  )
+    throw new ConfinementError("Invalid daemon port for confinement");
+  const paths = (list: string[], filter = "subpath") =>
     list
       .map((path) => {
         if (/["\\]/.test(path) || [...path].some((c) => c < " "))
-          throw new ConfinementError("Cannot confine writes to an unusual path");
-        return `(subpath "${path}")`;
+          throw new ConfinementError(`Cannot confine an unusual policy path: ${path}`);
+        return `(${filter} "${path}")`;
       })
       .join(" ");
+  const ancestors = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
+  const specificDenies = specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
+  const readHoles = [...specificDenies, ...(roots.commands?.root ?? [])].filter((deny) =>
+    (roots.allowRead ?? []).some((allow) => {
+      const rel = relative(allow, deny);
+      return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    }),
+  );
   return [
     "(version 1)",
     "(allow default)",
+    // Seatbelt's localhost selector covers IPv4 and IPv6 loopback.
+    ...(roots.daemonPort ? [`(deny network-outbound (remote ip "localhost:${roots.daemonPort}"))`] : []),
     "(deny signal)",
     "(allow signal (target self) (target same-sandbox))",
     "(deny file-write*)",
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
+    ...(roots.commands ? [`(deny file-write* ${paths(roots.commands.root)})`] : []),
+    // Other invocations' lease capabilities: contents and listings, not the metadata path lookups need.
+    ...(roots.commands ? [`(deny file-read-data ${paths(roots.commands.root)})`] : []),
+    ...(roots.commands?.own.length ? [`(allow file-read-data ${paths(roots.commands.own)})`] : []),
     ...(roots.denyRead?.length ? [`(deny file-read* ${paths(roots.denyRead)})`] : []),
+    ...(roots.allowRead?.length ? [`(allow file-read* ${paths(roots.allowRead)})`] : []),
+    // A denied cwd proves non-membership only when no read allowance contains unreadable subtrees.
+    // Private denies and command roots outside the allowances do not invalidate that proof.
+    ...(roots.denyRead?.length && roots.allowRead?.length && readHoles.length === 0
+      ? [
+          '(deny mach-lookup (global-name "com.limitless.read-allowlist.denied"))',
+          '(allow mach-lookup (global-name "com.limitless.read-allowlist.allowed"))',
+        ]
+      : []),
+    // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
+    ...(ancestors.literals.length ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`] : []),
+    ...(ancestors.metadata.length
+      ? [`(allow file-read-metadata ${paths(ancestors.metadata, "literal")})`]
+      : []),
+    // Specific denies (e.g. a registered database inside a checkout) still beat read allowances.
+    ...(specificDenies.length ? [`(deny file-read* ${paths(specificDenies)})`] : []),
   ].join("\n");
 }
 
@@ -51,6 +93,15 @@ export const seatbeltBackend: ConfinementBackend = {
   verify: (roots, opts, run) => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal),
   wrap: (cmd, roots) => [SANDBOX_EXEC, "-p", seatbeltProfile(roots), ...cmd],
 };
+
+/** Carry the factory port through every editor, gate and land command in its backend scope. */
+export function seatbeltForPort(port: number): ConfinementBackend {
+  const rootsForPort = (roots: WriteRoots) => ({ ...roots, daemonPort: port || undefined });
+  return {
+    verify: (roots, opts, run) => seatbeltBackend.verify(rootsForPort(roots), opts, run),
+    wrap: (cmd, roots) => seatbeltBackend.wrap(cmd, rootsForPort(roots)),
+  };
+}
 
 /** Seatbelt verifies the effective profile every launch; Codex capability probes cache by CLI/version. */
 export async function verifySeatbelt(
@@ -131,7 +182,7 @@ async function probeSeatbelt(
     for (const file of roots?.denyRead ?? []) {
       if (!existsSync(file)) continue;
       const read = await run({
-        cmd: [executable, "-p", profile, "/bin/sh", "-c", 'cat "$1" >/dev/null', "sh", file],
+        cmd: [executable, "-p", profile, "/bin/sh", "-c", READ_PROBE, "sh", file],
         cwd: root,
         env: agentEnv(),
         timeoutMs: 30_000,
@@ -143,7 +194,7 @@ async function probeSeatbelt(
         read.timedOut ||
         !/Operation not permitted|Permission denied/.test(read.stderr)
       )
-        throw new ConfinementError("Private database read confinement not verified");
+        throw new ConfinementError(`Private read confinement not verified: ${file}`);
     }
     const cmd = ["/bin/sh", "-c", SIGNAL_PROBE, "sh", executable, profile, join(allowed, "ready")];
     const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 30_000, signal });
@@ -224,7 +275,8 @@ export async function runConfined(
     const scope = commandScratch.getStore();
     if (!scope) throw new ConfinementError("Missing command scratch");
     const scratch = scope.dir;
-    const home = opts.env.HOME ?? homedir();
+    const home = resolvedHome();
+    const roots = observed(writeRoots(opts.cwd, scratch, true));
     const cargo = join(scratch, "cargo");
     if (!scope.initialized) {
       mkdirSync(cargo);
@@ -252,7 +304,7 @@ export async function runConfined(
           GOPATH: join(scratch, "go"),
         },
       },
-      observed(writeRoots(opts.cwd, scratch)),
+      roots,
       run,
       verify,
     );

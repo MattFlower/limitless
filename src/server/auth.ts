@@ -86,7 +86,7 @@ export function loginPage(next: string, message = "", status = 200, headers: Rec
 <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
 <p role="alert">${escapeHtml(message)}</p><button>Sign in with password</button></form><script>${WEBAUTHN_JS}
 const back = () => location.replace(document.forms[0].next.value);
-fetch("/api/auth/session").then((r) => r.ok && back());
+fetch("/api/auth/session").then(async (r) => { if (r.ok && (await r.json()).session) back(); });
 run("passkey", async () => {
   const o = await post("/api/auth/passkey/login/options", {});
   const c = await navigator.credentials.get({ publicKey: { ...o, challenge: bin(o.challenge), allowCredentials: ids(o.allowCredentials) } });

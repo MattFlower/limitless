@@ -13,6 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
+import { ConfinementError, homeReadPolicy, policySpellings } from "./read-policy.ts";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -98,10 +99,14 @@ export function validateScratch(spec: AgentSpec): string {
 }
 
 export interface WriteRoots {
+  daemonPort?: number;
   denyRead?: string[];
+  allowRead?: string[];
+  /** Every invocation's command capabilities are unreadable, except this invocation's own. */
+  commands?: InvocationCommands;
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
-  /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
+  /** Read-only Git administration and the factory-recorded sidecar, even if a write root overlaps. */
   protect: string[];
 }
 
@@ -109,7 +114,12 @@ export interface WriteRoots {
  * Where an edit agent, gate or hidden command may write. The shared common directory (config,
  * info/, hooks, objects, other worktrees) and the private admin directory stay read-only.
  */
-export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
+export function writeRoots(
+  cwd: string,
+  scratchDir: string,
+  gate = false,
+  denyRead: string[] = [],
+): WriteRoots {
   const root = realpathSync(cwd);
   const scratch = realpathSync(scratchDir);
   if (within(root, scratch) || within(scratch, root))
@@ -133,12 +143,101 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
       throw new Error("Worktree .git does not name its own linked worktree directory");
     protectedPaths.push(gitDir);
   } else if (stat && !stat.isDirectory()) throw new Error("Worktree .git must be a file or directory");
-  return { write: spellings(granted), protect: spellings(protectedPaths), denyRead: privateReadPaths() };
+  const readable = [...granted];
+  if (gate && stat?.isFile()) {
+    // The protected sidecar was recorded by the factory before candidate execution.
+    const record = `${resolve(cwd)}.git-paths`;
+    try {
+      const paths: unknown = JSON.parse(readFileSync(record, "utf8"));
+      if (
+        !Array.isArray(paths) ||
+        paths.length !== 3 ||
+        !paths.every((p) => typeof p === "string" && isAbsolute(p)) ||
+        realpathSync(paths[0]) !== root ||
+        realpathSync(paths[1]) !== protectedPaths.at(-1) ||
+        realpathSync(paths[2]) !==
+          realpathSync(resolve(paths[1], readFileSync(join(paths[1], "commondir"), "utf8").trim()))
+      )
+        throw new Error();
+      readable.push(record, ...paths.slice(1));
+      protectedPaths.push(record);
+    } catch {
+      throw new ConfinementError(`Missing or invalid trusted Git paths: ${record}`);
+    }
+  }
+  return {
+    write: spellings(granted),
+    protect: spellings(protectedPaths),
+    ...homeReadPolicy(readable, gate, denyRead),
+    commands: invocationCommands(scratchDir, cwd),
+  };
+}
+
+const COMMAND_ROOT = `limitless-commands-${process.getuid?.() ?? 0}`;
+let sharedCommandRoot: string | undefined;
+
+/** Both spellings of the factory-owned root that holds each invocation's wrappers and lease capability. */
+export function commandRoots(cwd = process.cwd(), scratchDir?: string): string[] {
+  const writable = spellings([cwd, ...(scratchDir ? [scratchDir] : [])]);
+  const overlaps = (root: string) => writable.some((path) => within(path, root) || within(root, path));
+  if (!sharedCommandRoot) {
+    // Scratch's parent is outside the checkout even when the daemon inherits an in-checkout TMPDIR.
+    const candidates = [
+      tmpdir(),
+      ...(scratchDir && basename(scratchDir) === SCRATCH_NAME ? [dirname(scratchParent(scratchDir))] : []),
+    ];
+    for (const base of candidates) {
+      const root = join(realpathSync(base), COMMAND_ROOT);
+      if (!spellings([root]).some(overlaps)) {
+        sharedCommandRoot = root;
+        break;
+      }
+    }
+  }
+  if (!sharedCommandRoot || spellings([sharedCommandRoot]).some(overlaps))
+    throw new Error("Command wrapper root must be outside the checkout and scratch");
+  // Keep one root across invocations; changing TMPDIR must not expose an earlier capability.
+  return spellings([sharedCommandRoot]);
+}
+
+/** One invocation's wrapper directory, named for its scratch so every profile can grant it alone. */
+export function commandDir(scratchDir: string, cwd = process.cwd()): string {
+  const parent = realpathSync(scratchParent(scratchDir));
+  const name = new Bun.CryptoHasher("sha256").update(parent).digest("hex").slice(0, 32);
+  const root = commandRoots(cwd, scratchDir)[0];
+  if (!root) throw new Error("Missing command wrapper root");
+  return join(root, name);
+}
+
+/** Creates the root for this user only; a pre-existing root someone else controls is refused. */
+export function createCommandRoot(cwd = process.cwd(), scratchDir?: string): string {
+  const root = commandRoots(cwd, scratchDir)[0];
+  if (!root) throw new Error("Missing command wrapper root");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(root);
+  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
+    throw new Error(`Command wrapper root ${root} is not private to this user`);
+  return root;
+}
+
+export interface InvocationCommands {
+  /** The shared root, both spellings: other invocations' capabilities live here. */
+  root: string[];
+  /** This invocation's own directory, both spellings; empty when it has no wrappers. */
+  own: string[];
+}
+
+export function invocationCommands(scratchDir: string, cwd = process.cwd()): InvocationCommands {
+  const root = commandRoots(cwd, scratchDir);
+  if (basename(scratchDir) !== SCRATCH_NAME) return { root, own: [] };
+  const own = commandDir(scratchDir, cwd);
+  // Only an invocation given wrappers has a directory to read; nothing else is granted.
+  return { root, own: existsSync(own) ? root.map((r) => join(r, basename(own))) : [] };
 }
 
 /** Each path as given and, when it exists, canonical: what a confined profile actually denies. */
 export function spellings(paths: string[]): string[] {
-  return [...new Set(paths.flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]))];
+  return policySpellings(paths);
 }
 
 /** `denyRead` as given and canonical (either spelling reaches it); cwd and scratch must stay readable. */

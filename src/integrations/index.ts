@@ -22,54 +22,68 @@ export interface IntegrationDeps {
 
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
 export async function mountIntegrations(factory: Factory, deps: IntegrationDeps = {}): Promise<Integrations> {
-  const mcp = mountMcp(factory);
-  const discord = mountDiscord(factory);
-  const prClient = deps.prClient ?? getGitHubPr;
-  const stopNotifier = startGitHubNotifier(
-    factory.store,
-    deps.gh ?? runGh,
-    console.warn,
-    // While polling, merge reconciliation reads the poller's observations for the PRs it tracks.
-    factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
-    factory.cfg.paths.configDir,
-    [factory.cfg.paths.repos, factory.cfg.paths.work],
-  );
-  const seconds = factory.cfg.githubPollSeconds;
-  const stopPoller = factory.cfg.githubPoll
-    ? startGitHubPoller(factory.store, {
-        client: deps.github,
-        gh: deps.gh,
-        seconds,
-        ciReruns: factory.cfg.githubCiReruns,
-      })
-    : () => {};
-  // The land queue resumes whatever the last daemon left in flight, and waits for new requests.
-  factory.land.start();
-  const queued = factory.land.list().filter((entry) => entry.state !== "landed");
-  return {
-    routes: {
-      "/mcp": (req, server) => {
-        server.timeout(req, 90);
-        return mcp.handle(req, server.requestIP(req)?.address ?? null);
+  const cleanups: (() => void | Promise<void>)[] = [];
+  let stopping: Promise<void> | undefined;
+  const stop = () =>
+    (stopping ??= (async () => {
+      const results = await Promise.allSettled(cleanups.map((cleanup) => Promise.resolve().then(cleanup)));
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    })());
+  try {
+    const mcp = mountMcp(factory);
+    cleanups.push(() => mcp.stop());
+    const discord = mountDiscord(factory);
+    cleanups.push(() => discord.stop());
+    const prClient = deps.prClient ?? getGitHubPr;
+    const stopNotifier = startGitHubNotifier(
+      factory.store,
+      deps.gh ?? runGh,
+      console.warn,
+      // While polling, merge reconciliation reads the poller's observations for the PRs it tracks.
+      factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
+      factory.cfg.paths.configDir,
+      [factory.cfg.paths.repos, factory.cfg.paths.work],
+    );
+    cleanups.push(stopNotifier);
+    const seconds = factory.cfg.githubPollSeconds;
+    const stopPoller = factory.cfg.githubPoll
+      ? startGitHubPoller(factory.store, {
+          client: deps.github,
+          gh: deps.gh,
+          seconds,
+          ciReruns: factory.cfg.githubCiReruns,
+        })
+      : () => {};
+    cleanups.push(stopPoller);
+    cleanups.push(() => factory.land.stop());
+    // The land queue resumes whatever the last daemon left in flight, and waits for new requests.
+    factory.land.start();
+    const queued = factory.land.list().filter((entry) => entry.state !== "landed");
+    return {
+      routes: {
+        "/mcp": (req, server) => {
+          server.timeout(req, 90);
+          return mcp.handle(req, server.requestIP(req)?.address ?? null);
+        },
+        "/webhooks/github": githubWebhook(factory),
       },
-      "/webhooks/github": githubWebhook(factory),
-    },
-    notes: [
-      ...(await (deps.toolVersions ?? toolVersions)()),
-      "MCP: /mcp (loopback only)",
-      discord.note,
-      factory.cfg.secrets.GITHUB_WEBHOOK_SECRET
-        ? "GitHub webhooks enabled"
-        : "GitHub webhooks disabled (GITHUB_WEBHOOK_SECRET is not configured)",
-      factory.cfg.githubPoll ? `GitHub PR polling every ${seconds}s` : "GitHub PR polling disabled",
-      `Land queue: ${queued.length ? `${queued.length} pending` : "idle"}`,
-    ],
-    stop: async () => {
-      stopNotifier();
-      stopPoller();
-      await Promise.all([factory.land.stop(), mcp.stop(), discord.stop()]);
-    },
-  };
+      notes: [
+        ...(await (deps.toolVersions ?? toolVersions)()),
+        "MCP: /mcp (loopback only)",
+        discord.note,
+        factory.cfg.secrets.GITHUB_WEBHOOK_SECRET
+          ? "GitHub webhooks enabled"
+          : "GitHub webhooks disabled (GITHUB_WEBHOOK_SECRET is not configured)",
+        factory.cfg.githubPoll ? `GitHub PR polling every ${seconds}s` : "GitHub PR polling disabled",
+        `Land queue: ${queued.length ? `${queued.length} pending` : "idle"}`,
+      ],
+      stop,
+    };
+  } catch (error) {
+    await stop().catch(() => {});
+    throw error;
+  }
 }
 
 /** Which agent CLIs the daemon will actually run (PATH mix-ups have bitten us before). */

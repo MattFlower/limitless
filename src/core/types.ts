@@ -266,6 +266,8 @@ export interface ArtifactMeta {
 }
 
 export interface RunDetail {
+  /** Recorded PR observation/push epoch; a poll snapshot alone may be superseded. */
+  prHead?: { sha: string; version: number; pushing: boolean } | null;
   stoppingStage?: StageName | null;
   blockingFindings?: string[];
   prSnapshot?: {
@@ -522,9 +524,10 @@ export interface FeedItem {
   title: string;
   summary: string;
   data: Record<string, unknown>;
+  truncated?: boolean;
 }
 /** `nextAfter`: the last returned id, else the effective cursor. `pruned`: retention removed items after it. */
-export type FeedPage = { items: FeedItem[]; nextAfter: number; pruned: boolean };
+export type FeedPage = { items: FeedItem[]; nextAfter: number; pruned: boolean; hasMore?: boolean };
 export type FeedAck = { consumer: string; id: number };
 
 /** Process-local scheduler state; active includes executions waiting for input or capacity. */
@@ -536,6 +539,7 @@ export interface DrainState {
 
 export interface HealthResponse extends DrainState {
   gateSlots?: { occupied: number; limit: number; holders: string[] };
+  agentTestSlots?: { occupied: number; limit: number; holders: string[] };
   ok: boolean;
   uptimeMs: number;
   sha: string;

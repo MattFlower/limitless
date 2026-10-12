@@ -2,8 +2,16 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { wrapperLeaseClient } from "../src/cli/agent-test.ts";
 import { DaemonTimeoutError, type DeployClock } from "../src/cli/deploy-wait.ts";
-import { gateSlotCommand, type LeaseClient, localLeaseClient, withGateLease } from "../src/cli/gate-slot.ts";
+import {
+  gateSlotCommand,
+  type LeaseClient,
+  LeaseRejected,
+  localLeaseClient,
+  withGateLease,
+} from "../src/cli/gate-slot.ts";
+import { AgentTestSession } from "../src/gates/agent-tests.ts";
 import { GATE_LEASE_EXPIRY_MS, Semaphore } from "../src/gates/slots.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -439,6 +447,114 @@ test("recovery responses arriving after work exits or times out retire the new l
   }
 });
 
+test.each(["retry reply", "late reply", "after exit", "transport late reply", "transport after exit"])(
+  "agent recovery keeps heartbeats and retires delayed replies (%s)",
+  async (mode) => {
+    const f = rig();
+    const options = {
+      slots: { gate: f.slots, small: new Semaphore(1) },
+      now: f.time.now,
+      timer: f.time.timer.set,
+      clear: f.time.timer.clear,
+      caps: { gate: 180_000, small: 180_000 },
+    };
+    const session = new AgentTestSession(() => {}, options),
+      competitor = new AgentTestSession(() => {}, options);
+    const done = Promise.withResolvers<void>(),
+      started = Promise.withResolvers<void>(),
+      delayed = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>();
+    let firstBeat = true,
+      recoveries = 0,
+      recovered: Awaited<ReturnType<LeaseClient>> | undefined;
+    const adopted: string[] = [];
+    const warnings: string[] = [];
+    const client: LeaseClient = async (body) => {
+      const result = await session.request({ ...body, token: session.token, lane: "gate" });
+      if (body.running && ++recoveries === 1) {
+        recovered = result;
+        return delayed.promise;
+      }
+      if (body.running && mode !== "retry reply") throw new LeaseRejected("recovery reply rejected");
+      return result;
+    };
+    const work = withGateLease(
+      "survivor",
+      () => {
+        started.resolve();
+        return done.promise;
+      },
+      {
+        clock: {
+          ...f.clock,
+          timeout: (fn, ms) => {
+            // Delay the first heartbeat past expiry, as on a stalled machine.
+            if (firstBeat && ms === 10_000) {
+              firstBeat = false;
+              return f.clock.timeout(fn, 31_000);
+            }
+            return f.clock.timeout(fn, ms);
+          },
+        },
+        agentTest: { lane: "gate", onLease: (id) => adopted.push(id) },
+        warn: (message) => warnings.push(message),
+        client: mode.startsWith("transport")
+          ? wrapperLeaseClient(
+              { commands: [], directory: "", port: 0, unix: "unused", token: session.token },
+              f.clock,
+              client,
+              async () => {
+                throw new Error("ECONNREFUSED socket");
+              },
+            )
+          : client,
+      },
+    );
+    try {
+      await started.promise;
+      await f.time.advance(30_000);
+      expect(f.slots.snapshot().occupied).toBe(0);
+      await f.time.advance(1000);
+      expect(f.slots.snapshot().holders).toEqual(["survivor"]);
+      await f.time.advance(2000);
+      expect(warnings.join()).toContain("timed out");
+      await f.time.advance(1000);
+      expect(recoveries).toBe(2);
+      if (!recovered) throw new Error("missing recovery response");
+      if (mode.endsWith("after exit")) {
+        done.resolve();
+        await work;
+      }
+      delayed.resolve(recovered);
+      await f.time.flush();
+      if (!mode.endsWith("after exit")) {
+        expect(adopted.at(-1)).toBe(recovered.id);
+        for (let i = 0; i < 4; i++) {
+          await f.time.advance(10_000);
+          expect(f.slots.snapshot().holders).toEqual(["survivor"]);
+          expect(
+            await competitor.request({
+              token: competitor.token,
+              name: "second",
+              lane: "gate",
+              immediate: true,
+            }),
+          ).toMatchObject({ acquired: false });
+        }
+      }
+      done.resolve();
+      await work;
+      expect(f.slots.snapshot().occupied).toBe(0);
+    } finally {
+      done.resolve();
+      if (recovered) delayed.resolve(recovered);
+      await work;
+      session.close();
+      competitor.close();
+    }
+    expect(f.time.pending).toBe(0);
+  },
+);
+
 test("an abandoned queued lease admitted at 29 seconds still expires by 30 seconds", async () => {
   const f = rig();
   const release = await f.slots.acquire(signal, undefined, "first");
@@ -779,7 +895,7 @@ test("interruption forwards only to the wrapper's child and releases the lease",
       started.resolve();
     } catch {}
   }, 10);
-  const before = process.listenerCount("SIGTERM");
+  const before = new Set(process.listeners("SIGTERM"));
   try {
     const work = gateSlotCommand(
       [
@@ -797,11 +913,13 @@ test("interruption forwards only to the wrapper's child and releases the lease",
       f.client,
     );
     await started.promise;
+    const listener = process.listeners("SIGTERM").find((entry) => !before.has(entry));
+    expect(listener).toBeDefined();
     process.emit("SIGTERM");
     expect(await work).toBe(143);
     expect(readFileSync(file, "utf8")).toBe("terminated");
     expect(f.slots.snapshot().occupied).toBe(0);
-    expect(process.listenerCount("SIGTERM")).toBe(before);
+    expect(process.listeners("SIGTERM")).not.toContain(listener);
   } finally {
     clearInterval(poll);
     rmSync(dirname(file), { recursive: true, force: true });
