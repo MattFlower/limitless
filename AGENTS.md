@@ -124,6 +124,16 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   `sandbox_apply: Operation not permitted` counts as a confinement failure, not a test result, so
   keep that literal out of test titles and printed strings (a `test.each` title containing it once
   blocked a round as a confinement error).
+- **The home is read-denied for gates.** A gate reads only its checkout, scratch, trusted Git paths
+  and toolchains (#492). Inside one, `realpath` on the home fails although `lstat` reports it.
+  - A test that runs a confined command must keep everything that command reads inside the
+    command's own checkout or scratch. A test that passes from a checkout in `/tmp` can still fail
+    from one under the home, which is where the deploy's release checkout lives (#500).
+  - Deny lists hold files (credential stores) as well as directories. Code that walks them must
+    not assume a directory (#501: the Codex probe made canaries inside `~/.npmrc`).
+  - Before landing a confinement change, run the full suite unconfined from a checkout under the
+    real home, as the deploy does. Gates, land checks and CI skip the real-Seatbelt tests, and a
+    `/tmp` checkout hides home-deny failures.
 - **Subprocesses** go through `sh`/`runProcess` (`src/util/proc.ts`): abort signals, timeouts, the
   per-run process scope and descendant cleanup depend on it. The few direct spawns (preview servers,
   the SSH tunnel, `gate-slot`) manage their own lifecycle; don't add more without a reason. Agent
