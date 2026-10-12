@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { loadConfig } from "../config.ts";
 import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
@@ -9,6 +8,7 @@ import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
+import { resolveClientPort } from "./client-port.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
 import { localOwnerDiagnostics, printOwnerDiagnostics } from "./owner-diagnostics.ts";
@@ -84,7 +84,7 @@ Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
 const daemonUrl = (port: number) => process.env.LIMITLESS_URL ?? `http://127.0.0.1:${port}`;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const port = loadConfig({ readOnly: true }).port;
+  const port = resolveClientPort();
   const base = daemonUrl(port);
   let res: Response;
   let text: string;
@@ -148,7 +148,7 @@ function formatEvent(e: RunEvent): string {
 }
 
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
-  const port = loadConfig({ readOnly: true }).port;
+  const port = resolveClientPort();
   const url = `${daemonUrl(port)}/api/runs/${runId}/stream?after=${after}`;
   const res = await fetch(url, { headers: apiTokenHeaders(url, undefined, port) });
   if (!res.ok) {
@@ -337,7 +337,7 @@ async function main(): Promise<void> {
       return serve();
     case "mcp": {
       const { startStdio } = await import("../integrations/mcp.ts");
-      return startStdio(daemonUrl(loadConfig({ readOnly: true }).port));
+      return startStdio(daemonUrl(resolveClientPort()));
     }
     case "integrations": {
       if (rest[0] !== "install") throw new Error("usage: limitless integrations install [--write]");
@@ -518,7 +518,7 @@ async function main(): Promise<void> {
     }
     case "service": {
       const svc = await import("./service.ts");
-      const port = loadConfig({ readOnly: true }).port;
+      const port = resolveClientPort();
       if (rest[0] === "install") {
         const tunnel = values.tunnel === true;
         const publicUrl = tunnel ? (await import("../config.ts")).loadConfig().publicUrl : null;
@@ -532,7 +532,7 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       if (rest.length > 1)
         throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
-      return svc.deploy(loadConfig({ readOnly: true }).port, rest[0], values.smoke === true, {
+      return svc.deploy(resolveClientPort(), rest[0], values.smoke === true, {
         maxWaitMs,
         now: values.now === true,
       });

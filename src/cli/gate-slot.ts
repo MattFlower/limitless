@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { parseArgs } from "node:util";
-import { loadConfig } from "../config.ts";
 import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
+import { resolveClientPort } from "./client-port.ts";
 import { bounded, DaemonTimeoutError, type DeployClock, deployClock, parseMaxWait } from "./deploy-wait.ts";
 
 type Reply = {
@@ -43,7 +43,7 @@ export class LeaseTransportFailures extends Error {
   }
 }
 export const localLeaseClient =
-  (port = loadConfig({ readOnly: true }).port, unix?: string): LeaseClient =>
+  (port = resolveClientPort(), unix?: string): LeaseClient =>
   async (body, signal) => {
     const url = `http://127.0.0.1:${port}/api/admin/gate-slot`;
     const response = await fetch(url, {

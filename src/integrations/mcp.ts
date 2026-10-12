@@ -4,7 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { apiTokenHeaders } from "../cli/api-token.ts";
-import { loadConfig } from "../config.ts";
+import { resolveClientPort } from "../cli/client-port.ts";
 import {
   type CreateRunRequest,
   type FeedAck,
@@ -213,7 +213,7 @@ export const resolveConflict = (status: RunStatus) =>
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
-  const port = loadConfig({ readOnly: true }).port;
+  const port = resolveClientPort();
   const api = async (path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> => {
     let response: Response;
     try {

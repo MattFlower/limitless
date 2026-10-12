@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -110,6 +111,20 @@ test("token headers match normalized origins, fall back for stale bindings and r
     expect(apiTokenHeaders("http://127.0.0.1:7401", home, 7413)).toEqual({});
     process.env.LIMITLESS_PORT = "7400@evil.example";
     expect(apiTokenHeaders("http://evil.example")).toEqual({});
+    for (const invalid of ["", "0", "-1", "65536", "7412.5", "1e3", "0x1cf4", "7400@evil.example"]) {
+      process.env.LIMITLESS_PORT = invalid;
+      expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual(expected);
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+    }
+    delete process.env.LIMITLESS_PORT;
+    for (const invalid of ["0", "-1", "65536", "7412.5", '"7412"', "true", '"7400@evil.example"']) {
+      writeFileSync(join(home, "config.toml"), `[server]\nport = ${invalid}\n`);
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual(expected);
+      expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+    }
+    for (const invalid of [0, -1, 65536, 7412.5, Number.NaN, Number.POSITIVE_INFINITY])
+      expect(apiTokenHeaders("http://127.0.0.1:7400", home, invalid)).toEqual({});
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
     process.env.LIMITLESS_PORT = "7401";
     bind("http://127.0.0.1");
     expect(apiTokenHeaders("HTTP://127.0.0.1:80/a?b=1#c")).toEqual(expected);
@@ -204,6 +219,94 @@ test("CLI uses the configured port and its environment override for an older dae
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test.each(["unreadable", "invalid TOML", "unrelated setting", "environment override"])(
+  "CLI, lease and MCP requests tolerate %s configuration",
+  async (kind) => {
+    const home = mkdtempSync(join(tmpdir(), "limitless-client-config-"));
+    const config = join(home, "config.toml");
+    const secret = "d".repeat(64);
+    const keys = ["LIMITLESS_HOME", "LIMITLESS_CONFIG_DIR", "LIMITLESS_PORT", "LIMITLESS_URL"];
+    const previous = keys.map((key) => process.env[key]);
+    const seen: (string | null)[] = [];
+    const stub = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seen.push(req.headers.get("authorization"));
+        return Response.json(
+          new URL(req.url).pathname === "/api/admin/gate-slot" ? { id: "lease", acquired: true } : [],
+        );
+      },
+    });
+    const base = `http://127.0.0.1:${stub.port}`;
+    try {
+      process.env.LIMITLESS_HOME = home;
+      process.env.LIMITLESS_CONFIG_DIR = home;
+      process.env.LIMITLESS_URL = base;
+      delete process.env.LIMITLESS_PORT;
+      writeFileSync(join(home, "api-token"), secret);
+      writeFileSync(
+        config,
+        kind === "invalid TOML"
+          ? `credential = "${secret}"\n[server\n`
+          : `[server]\nport = ${stub.port}\n[review]\nmode = "invalid"\n`,
+      );
+      if (kind === "unreadable" || kind === "environment override") chmodSync(config, 0);
+      if (kind === "environment override") process.env.LIMITLESS_PORT = String(stub.port);
+      const authorized = kind === "unrelated setting" || kind === "environment override";
+      expect(apiTokenHeaders(base)).toEqual(authorized ? { authorization: `Bearer ${secret}` } : {});
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual(
+        authorized ? {} : { authorization: `Bearer ${secret}` },
+      );
+      const result = await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
+        cwd: home,
+        env: { ...process.env, LIMITLESS_URL: base },
+        allowFail: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+      await expect(httpBackend(base).list(undefined, 20)).resolves.toEqual([]);
+      const lease = localLeaseClient();
+      const originalFetch = globalThis.fetch;
+      const leaseUrls: string[] = [];
+      // Forward the default-port request to our port-0 server without occupying a shared port.
+      const forward = spyOn(globalThis, "fetch").mockImplementation(
+        Object.assign(
+          (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            leaseUrls.push(String(url));
+            return originalFetch(`${base}${new URL(String(url)).pathname}`, init);
+          },
+          { preconnect: fetch.preconnect },
+        ),
+      );
+      try {
+        await expect(lease({ name: "test" }, new AbortController().signal)).resolves.toEqual({
+          id: "lease",
+          acquired: true,
+        });
+      } finally {
+        forward.mockRestore();
+      }
+      expect(leaseUrls).toEqual([`http://127.0.0.1:${authorized ? stub.port : 7400}/api/admin/gate-slot`]);
+      expect(seen).toEqual([
+        authorized ? `Bearer ${secret}` : null,
+        authorized ? `Bearer ${secret}` : null,
+        // Missing origin records permit the resolved loopback port, including the default.
+        `Bearer ${secret}`,
+      ]);
+    } finally {
+      keys.forEach((key, i) => {
+        const value = previous[i];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      });
+      await stub.stop(true);
+      chmodSync(config, 0o600);
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test("all registered mutations, admin routes and MCP require credentials", async () => {
   const routes = createHttpRoutes(f.factory, { routes: { "/mcp": () => new Response("ok") } });

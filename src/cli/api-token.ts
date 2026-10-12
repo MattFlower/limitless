@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../config.ts";
 import { registerCredential } from "../util/proc.ts";
+import { isClientPort, resolveClientPort } from "./client-port.ts";
 
 /** Re-read per request: deploy and lease clients can outlive a daemon restart. */
 export function readApiToken(
@@ -30,7 +30,9 @@ export function apiTokenHeaders(
     const target = new URL(url);
     if (target.protocol !== "http:" && target.protocol !== "https:") return {};
     const fallback = (): Record<string, string> => {
-      const origin = new URL(`http://127.0.0.1:${port ?? loadConfig({ readOnly: true }).port}`).origin;
+      const selected = port ?? resolveClientPort();
+      if (!isClientPort(selected)) return {};
+      const origin = new URL(`http://127.0.0.1:${selected}`).origin;
       return target.origin === origin ? { authorization: `Bearer ${token}` } : {};
     };
     let record: string;
