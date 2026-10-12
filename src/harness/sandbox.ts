@@ -249,8 +249,13 @@ export async function runSandboxed(
   opts.signal?.throwIfAborted();
   const token = `limitless-started-${crypto.randomUUID()}`;
   let started = false;
+  const lineLimit = opts.maxLineLength ?? Infinity;
+  const forwardLine = (line: string, onLine?: (line: string) => void) =>
+    onLine?.(line.length > lineLimit ? `${line.slice(0, lineLimit)} [truncated]` : line);
   const payload: ProcOptions = {
     ...opts,
+    // The startup token must fit even when candidate output has a smaller cap.
+    maxLineLength: Math.max(lineLimit, token.length),
     cmd: [
       // Confirm sandbox startup separately from the candidate's exit status.
       "/bin/sh",
@@ -264,8 +269,9 @@ export async function runSandboxed(
       if (line === token) {
         started = true;
         opts.onStarted?.();
-      } else opts.onStdoutLine?.(line);
+      } else forwardLine(line, opts.onStdoutLine);
     },
+    onStderrLine: (line) => forwardLine(line, opts.onStderrLine),
   };
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
   if (!started)

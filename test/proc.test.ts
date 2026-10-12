@@ -101,21 +101,78 @@ test("bounded framing releases oversized lines on both streams and preserves sep
   expect(observed[1]).toBe(1);
 });
 
-test("bounded framing never recognizes a startup token at the end of an oversized line", async () => {
-  await expect(
-    withChunks(
-      (token) => [{ stream: "stdout", text: `${"x".repeat(256_000)}${token}\n` }],
+test.each([53, 16])("sandbox startup ignores the caller's %i-character line cap", async (maxLineLength) => {
+  const markerLength = "limitless-started-".length + 36;
+  for (let offset = 0; offset <= markerLength; offset++) {
+    const lines: string[] = [];
+    const result = await withChunks(
+      (token) => [
+        { stream: "stdout", text: token?.slice(0, offset) ?? "" },
+        {
+          stream: "stdout",
+          text: `${token?.slice(offset)}\n${"x".repeat(maxLineLength + 1)}\n${"x".repeat(256)}\nafter-out`,
+        },
+        { stream: "stderr", text: `${"y".repeat(maxLineLength + 1)}\n${"y".repeat(256)}\nafter-error` },
+      ],
       () =>
         runSandboxed(
-          { ...options(), maxLineLength: 128 },
+          {
+            ...options(),
+            maxLineLength,
+            onStarted: () => lines.push("started"),
+            onStdoutLine: (line) => lines.push(line),
+            onStderrLine: (line) => lines.push(line),
+          },
           { write: [], protect: [] },
           runProcess,
           async () => {},
           fakeConfinement,
         ),
-    ),
-  ).rejects.toThrow("payload did not start");
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("limitless-started-");
+    expect(lines).toEqual([
+      "started",
+      `${"x".repeat(maxLineLength)} [truncated]`,
+      `${"x".repeat(maxLineLength)} [truncated]`,
+      `${"y".repeat(maxLineLength)} [truncated]`,
+      `${"y".repeat(maxLineLength)} [truncated]`,
+      "after-out",
+      "after-error",
+    ]);
+  }
 });
+
+test.each(["missing", "incomplete", "oversized prefix", "oversized suffix"])(
+  "sandbox startup fails closed with %s marker",
+  async (form) => {
+    await expect(
+      withChunks(
+        (token) => [
+          {
+            stream: "stdout",
+            text:
+              form === "missing"
+                ? "candidate output\n"
+                : form === "incomplete"
+                  ? `${token?.slice(0, -1)}\n`
+                  : form === "oversized prefix"
+                    ? `${"x".repeat(256_000)}${token}\n`
+                    : `${token}${"x".repeat(256_000)}\n`,
+          },
+        ],
+        () =>
+          runSandboxed(
+            { ...options(), maxLineLength: 16 },
+            { write: [], protect: [] },
+            runProcess,
+            async () => {},
+            fakeConfinement,
+          ),
+      ),
+    ).rejects.toThrow("payload did not start");
+  },
+);
 
 test("runner keeps overlapping credentials raw in one chunk and at every split offset", async () => {
   const short = 'synthetic-overlap-"key"-\\prefix';
