@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { apiTokenHeaders, readApiToken } from "../src/cli/api-token.ts";
+import { resolveClientPort } from "../src/cli/client-port.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { localDeployClient } from "../src/cli/deploy-wait.ts";
 import { localLeaseClient } from "../src/cli/gate-slot.ts";
@@ -109,19 +110,68 @@ test("token headers match normalized origins, fall back for stale bindings and r
     expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
     expect(apiTokenHeaders("http://127.0.0.1:7413", home, 7413)).toEqual(expected);
     expect(apiTokenHeaders("http://127.0.0.1:7401", home, 7413)).toEqual({});
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 49752\n");
+    for (const [env, selected] of [
+      ["+49751", 49751],
+      ["7413.0", 7413],
+      ["1e3", 1000],
+      ["0x1cf4", 7412],
+    ] as const) {
+      process.env.LIMITLESS_PORT = env;
+      expect(loadConfig({ readOnly: true }).port).toBe(selected);
+      expect(resolveClientPort()).toBe(selected);
+      for (const stale of [false, true]) {
+        if (stale) bind("http://127.0.0.1:49752", "b".repeat(64));
+        expect(apiTokenHeaders(`http://127.0.0.1:${selected}`)).toEqual(expected);
+        for (const url of [
+          "http://127.0.0.1:49752",
+          `http://localhost:${selected}`,
+          `https://127.0.0.1:${selected}`,
+        ])
+          expect(apiTokenHeaders(url)).toEqual({});
+      }
+      rmSync(path);
+    }
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
     process.env.LIMITLESS_PORT = "7400@evil.example";
     expect(apiTokenHeaders("http://evil.example")).toEqual({});
-    for (const invalid of ["", "0", "-1", "65536", "7412.5", "1e3", "0x1cf4", "7400@evil.example"]) {
+    for (const invalid of ["", "0", "NaN", "7400@evil.example"]) {
       process.env.LIMITLESS_PORT = invalid;
       expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual(expected);
       expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
     }
+    for (const [invalid, selected] of [
+      ["-1", -1],
+      ["65536", 65536],
+      ["7412.5", 7412.5],
+      ["Infinity", 7400],
+    ] as const) {
+      process.env.LIMITLESS_PORT = invalid;
+      expect(loadConfig({ readOnly: true }).port).toBe(selected);
+      expect(resolveClientPort()).toBe(selected);
+      expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+    }
     delete process.env.LIMITLESS_PORT;
-    for (const invalid of ["0", "-1", "65536", "7412.5", '"7412"', "true", '"7400@evil.example"']) {
+    for (const [invalid, selected] of [
+      ["0", 0],
+      ["-1", -1],
+      ["65536", 65536],
+      ["7412.5", 7412.5],
+      ['"7412"', 7400],
+      ["true", 7400],
+      ['"7400@evil.example"', 7400],
+      ["inf", 7400],
+      ["nan", 7400],
+    ] as const) {
       writeFileSync(join(home, "config.toml"), `[server]\nport = ${invalid}\n`);
-      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual(expected);
+      expect(loadConfig({ readOnly: true }).port).toBe(selected);
+      expect(resolveClientPort()).toBe(selected);
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
       expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
     }
+    writeFileSync(join(home, "config.toml"), "[server]\n");
+    expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual(expected);
     for (const invalid of [0, -1, 65536, 7412.5, Number.NaN, Number.POSITIVE_INFINITY])
       expect(apiTokenHeaders("http://127.0.0.1:7400", home, invalid)).toEqual({});
     writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
@@ -209,7 +259,7 @@ test("CLI uses the configured port and its environment override for an older dae
       (
         await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
           cwd: home,
-          env: { ...env, LIMITLESS_PORT: String(stub.port) },
+          env: { ...env, LIMITLESS_PORT: `+${stub.port}` },
         })
       ).exitCode,
     ).toBe(0);
@@ -253,12 +303,10 @@ test.each(["unreadable", "invalid TOML", "unrelated setting", "environment overr
           : `[server]\nport = ${stub.port}\n[review]\nmode = "invalid"\n`,
       );
       if (kind === "unreadable" || kind === "environment override") chmodSync(config, 0);
-      if (kind === "environment override") process.env.LIMITLESS_PORT = String(stub.port);
+      if (kind === "environment override") process.env.LIMITLESS_PORT = `+${stub.port}`;
       const authorized = kind === "unrelated setting" || kind === "environment override";
       expect(apiTokenHeaders(base)).toEqual(authorized ? { authorization: `Bearer ${secret}` } : {});
-      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual(
-        authorized ? {} : { authorization: `Bearer ${secret}` },
-      );
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
       const result = await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
         cwd: home,
         env: { ...process.env, LIMITLESS_URL: base },
@@ -292,8 +340,7 @@ test.each(["unreadable", "invalid TOML", "unrelated setting", "environment overr
       expect(seen).toEqual([
         authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,
-        // Missing origin records permit the resolved loopback port, including the default.
-        `Bearer ${secret}`,
+        authorized ? `Bearer ${secret}` : null,
       ]);
     } finally {
       keys.forEach((key, i) => {

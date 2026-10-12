@@ -129,6 +129,19 @@ function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
+/** Clients can withhold credentials by supplying NaN for an explicitly invalid port. */
+export function resolveServerPort(env: string | undefined, server: unknown, invalid = 7400): number {
+  const table = server ?? {};
+  const configured =
+    typeof table === "object" && !Array.isArray(table)
+      ? "port" in table
+        ? table.port
+        : undefined
+      : Number.NaN;
+  const selected = Number(env) || configured;
+  return selected === undefined ? 7400 : num(selected, invalid);
+}
+
 function days(v: unknown, fallback: number): number {
   const value = num(v, fallback);
   return value >= 0 ? value : fallback;
@@ -284,7 +297,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   const baselineEnv = gates.baseline_env ?? [];
   if (!Array.isArray(baselineEnv) || !baselineEnv.every((v) => typeof v === "string"))
     throw new Error("gates.baseline_env must be an array of environment variable names");
-  const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
+  const port = overrides.port ?? resolveServerPort(process.env.LIMITLESS_PORT, server);
   const host = str(server.host, "127.0.0.1") as string;
 
   const listenLan = server.listen_lan ?? null;

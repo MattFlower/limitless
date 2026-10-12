@@ -79,7 +79,8 @@ Usage:
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
-Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
+Environment: LIMITLESS_URL, else http://127.0.0.1:<port>
+             Port: LIMITLESS_PORT, else [server] port, else 7400`;
 
 const daemonUrl = (port: number) => process.env.LIMITLESS_URL ?? `http://127.0.0.1:${port}`;
 
@@ -92,7 +93,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     const url = `${base}${path}`;
     const headers = new Headers({
       "content-type": "application/json",
-      ...apiTokenHeaders(url, undefined, port),
+      ...apiTokenHeaders(url),
     });
     for (const [key, value] of new Headers(init?.headers)) headers.set(key, value);
     res = await fetch(url, {
@@ -150,7 +151,7 @@ function formatEvent(e: RunEvent): string {
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
   const port = resolveClientPort();
   const url = `${daemonUrl(port)}/api/runs/${runId}/stream?after=${after}`;
-  const res = await fetch(url, { headers: apiTokenHeaders(url, undefined, port) });
+  const res = await fetch(url, { headers: apiTokenHeaders(url) });
   if (!res.ok) {
     const reply = (await res.json().catch(() => null)) as { error?: string } | null;
     throw new ApiError(redactCredentials(`${res.status}: ${reply?.error ?? res.statusText}`), res.status);

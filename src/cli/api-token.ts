@@ -30,7 +30,7 @@ export function apiTokenHeaders(
     const target = new URL(url);
     if (target.protocol !== "http:" && target.protocol !== "https:") return {};
     const fallback = (): Record<string, string> => {
-      const selected = port ?? resolveClientPort();
+      const selected = port ?? resolveClientPort(true);
       if (!isClientPort(selected)) return {};
       const origin = new URL(`http://127.0.0.1:${selected}`).origin;
       return target.origin === origin ? { authorization: `Bearer ${token}` } : {};
