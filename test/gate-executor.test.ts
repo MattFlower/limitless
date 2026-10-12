@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { cacheableBaseline } from "../src/gates/cache.ts";
+import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
 import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
@@ -487,6 +488,136 @@ test.each([
   expect(JSON.stringify([f.store.getRun(run.id)?.error, events])).not.toContain(secret);
   expect(scripted.starts).toHaveLength(0);
   if (bare) await assertUnpublished(bare);
+});
+
+test.each([
+  ["implement", "formatting"],
+  ["comparison", "formatting"],
+  ["comparison", "late credential"],
+  ["comparison", "literal duplicate"],
+  ["post-merge", "literal duplicate"],
+  ["comparison", "distinct"],
+  ["comparison", "single ESC"],
+] as const)("stored gate names on %s resume: %s", async (boundary, kind) => {
+  const secret = `synthetic-stored-gate-${boundary}-${kind}-486`;
+  const collision = kind !== "distinct" && kind !== "single ESC";
+  if (kind !== "late credential") registerCredential("stored-gate-resume-test", secret);
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    '[gates]\nchecks = [{ name = "first", run = "true" }, { name = "second", run = "true" }]\n',
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "distinct gate identities"], { cwd: fixture.repoDir });
+  const bare = await githubFixture();
+  const interrupted = deferred<void>();
+  const scripted = fake(async (_h, req) => result(req));
+  const f = start(handler, false, false, {
+    gateExecutor: scripted.executor,
+    faults: {
+      [boundary === "implement"
+        ? "stage:implement:before"
+        : boundary === "post-merge"
+          ? "stage:deliver:before"
+          : "stage:gates:before"]: {
+        action: "kill",
+        onHit: () => interrupted.resolve(),
+      },
+    },
+  });
+  registerGithub(f, bare);
+  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+  await interrupted.promise;
+  await f.stop();
+  await assertUnpublished(bare);
+  const saved = f.store.getRunState<RunState>(run.id);
+  if (!saved?.gatesConfig) throw new Error("missing stored gate configuration");
+  expect(saved.phase).toBe(boundary === "post-merge" ? "deliver" : "loop");
+  expect(saved.implementedRound).toBe(boundary === "implement" ? undefined : 0);
+  if (boundary === "post-merge") {
+    const head = f.store.getRun(run.id)?.headSha;
+    if (!head) throw new Error("missing approved head");
+    expect(saved.lastVerifiedSha).toBe(head);
+  }
+  const sanitized = "check [redacted]";
+  const names =
+    kind === "single ESC"
+      ? ["check\x1b[31m"]
+      : kind === "distinct"
+        ? ["check\x1b[31m", `other ${secret}`]
+        : kind === "formatting"
+          ? [`check ${secret}`, `check\x1b[31m ${secret}`]
+          : kind === "late credential"
+            ? [sanitized, `check ${secret}`]
+            : [`check ${secret}`, `check ${secret}`];
+  if (kind === "late credential") {
+    // Detection succeeded before this credential was known; resuming must validate it again.
+    writeFileSync(
+      join(fixture.repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "true" }`).join(", ")}]\n`,
+    );
+    saved.gatesConfig = detectGates(fixture.repoDir);
+    expect(saved.gatesConfig.checks.map((check) => check.name)).toEqual(names);
+    registerCredential("stored-gate-late-registration-test", secret);
+  } else {
+    // Legacy persisted configurations can predate detection-time validation entirely.
+    saved.gatesConfig.checks = names.map((name) => ({ name, run: "true" }));
+  }
+  // Legacy evidence was produced by these same names; only its observable copy is sanitized.
+  saved.baseline = result({ ...request(saved.worktreePath ?? fixture.repoDir), gates: saved.gatesConfig });
+  if (saved.lastGates) saved.lastGates = compareGates(saved.baseline, saved.baseline);
+  f.store.setRunState(run.id, saved);
+  const eventsBefore = f.store.listEvents(run.id).length;
+  const recordedBase = f.store.getRun(run.id)?.baseSha;
+  if (!recordedBase) throw new Error("missing recorded base");
+  let base = recordedBase;
+  if (boundary === "post-merge") base = await advanceBase(bare, "base.txt", "base advanced\n");
+  f.store.close();
+  const fresh = fake(async (_h, req) => result(req));
+  let invocations = 0;
+  const resumed = start(
+    (s) => {
+      invocations++;
+      return handler(s);
+    },
+    false,
+    false,
+    { gateExecutor: fresh.executor },
+  );
+  const status = await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"]);
+  const finished = resumed.store.getRun(run.id);
+  const events = resumed.store.listEvents(run.id);
+  if (collision) {
+    expect(status).toBe(boundary === "post-merge" ? "needs_human" : "failed");
+    const error = `.limitless.toml gate names must stay distinct once sanitized: "${sanitized}"`;
+    expect(finished?.error).toBe(error);
+    expect(events.some((event) => event.message?.includes(error))).toBe(true);
+    expect(JSON.stringify([finished?.error, events])).not.toContain(secret);
+    expect(JSON.stringify([finished?.error, events])).not.toContain("\\u001b");
+    expect(fresh.starts).toHaveLength(0);
+    expect(fresh.attaches).toHaveLength(0);
+    expect(invocations).toBe(0);
+    expect(events.slice(eventsBefore).some((event) => event.type === "gate")).toBe(false);
+    expect(finished?.prUrl).toBeNull();
+    expect(finished?.merged).toBe(false);
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+    const ghCalls = existsSync(join(fixture.home, "gh-calls"))
+      ? readFileSync(join(fixture.home, "gh-calls"), "utf8")
+      : "";
+    expect(ghCalls).not.toMatch(/pr (create|merge|comment)/);
+    expect((await sh(["git", "rev-parse", "main"], { cwd: bare })).stdout.trim()).toBe(base);
+  } else {
+    expect(status).toBe("succeeded");
+    expect(fresh.starts).toHaveLength(1);
+    expect(resumed.store.getRunState<RunState>(run.id)?.lastGates).toHaveLength(names.length);
+    expect(
+      resumed.store
+        .getRunState<RunState>(run.id)
+        ?.lastGates?.every((check) => check.verdict === "pass" && !check.blocking),
+    ).toBe(true);
+  }
 });
 
 test("formatted gate identities keep baseline verdicts after gate-started restart", async () => {

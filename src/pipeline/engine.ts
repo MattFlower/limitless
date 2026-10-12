@@ -11,7 +11,14 @@ import {
   lockfileHash,
   singleFlight,
 } from "../gates/cache.ts";
-import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
+import {
+  assertDistinctGateNames,
+  detectGates,
+  type GateConfig,
+  GateNameCollisionError,
+  gateScriptNames,
+  pickScripts,
+} from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
@@ -295,6 +302,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (
       verifiedFailure &&
       !(e instanceof DeliveryHeadError) &&
+      !(e instanceof GateNameCollisionError) &&
       !terminationBlocked &&
       !ctx.state.terminalReason?.startsWith("the resolution leaves no change against ")
     ) {
@@ -962,7 +970,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
 
 async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
-  const gates = ctx.state.gatesConfig as GateConfig;
+  const gates = assertDistinctGateNames(ctx.state.gatesConfig as GateConfig);
   const baseSha = ctx.run.baseSha as string;
   const merge = ctx.state.conflictRound === round;
   const previousHead = ctx.state.preRebaseHead;
@@ -1104,7 +1112,7 @@ async function oneRound(
   holdout: Promise<Error | null> | null,
 ): Promise<boolean> {
   const cwd = ctx.state.worktreePath as string;
-  const gates = ctx.state.gatesConfig as GateConfig;
+  const gates = assertDistinctGateNames(ctx.state.gatesConfig as GateConfig);
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
   const privateStrings = () => privateEntries(ctx, cwd);
   const changeDiff = () =>
@@ -2456,7 +2464,7 @@ async function mergeForDelivery(
           "gates",
           "rebase",
           cwd,
-          ctx.state.gatesConfig as GateConfig,
+          assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
           gateEvents(ctx),
         );
         ctx.checkCancelled();
