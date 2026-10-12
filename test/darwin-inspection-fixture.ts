@@ -14,6 +14,11 @@ let unreadable: {
   inGroup?: boolean;
 } | null = null;
 let errno = 3;
+let readAllowlist = false;
+
+export function setReadAllowlist(value: boolean): void {
+  readAllowlist = value;
+}
 
 export function setLeaderBirth(value: bigint | null): void {
   birth = value;
@@ -37,6 +42,11 @@ export const toArrayBuffer = () => new Int32Array([errno]).buffer;
 export const dlopen = () => ({
   symbols: {
     __error: () => 1,
+    sandbox_check: (_pid: number, _operation: Uint8Array, _filter: number, ...args: unknown[]) => {
+      const value = args.at(-1);
+      if (!(value instanceof Uint8Array)) throw new Error("Missing sandbox query value");
+      return readAllowlist && Buffer.from(value).toString().includes("read-allowlist.denied") ? 1 : 0;
+    },
     proc_listpids: (_kind: number, _uid: number, buffer: Int32Array | null) => {
       const pids = [
         process.pid,

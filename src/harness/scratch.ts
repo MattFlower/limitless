@@ -13,6 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
+import { ConfinementError, homeReadPolicy, policySpellings } from "./read-policy.ts";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -100,11 +101,12 @@ export function validateScratch(spec: AgentSpec): string {
 export interface WriteRoots {
   daemonPort?: number;
   denyRead?: string[];
+  allowRead?: string[];
   /** Every invocation's command capabilities are unreadable, except this invocation's own. */
   commands?: InvocationCommands;
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
-  /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
+  /** Read-only Git administration and the factory-recorded sidecar, even if a write root overlaps. */
   protect: string[];
 }
 
@@ -112,7 +114,12 @@ export interface WriteRoots {
  * Where an edit agent, gate or hidden command may write. The shared common directory (config,
  * info/, hooks, objects, other worktrees) and the private admin directory stay read-only.
  */
-export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
+export function writeRoots(
+  cwd: string,
+  scratchDir: string,
+  gate = false,
+  denyRead: string[] = [],
+): WriteRoots {
   const root = realpathSync(cwd);
   const scratch = realpathSync(scratchDir);
   if (within(root, scratch) || within(scratch, root))
@@ -136,10 +143,32 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
       throw new Error("Worktree .git does not name its own linked worktree directory");
     protectedPaths.push(gitDir);
   } else if (stat && !stat.isDirectory()) throw new Error("Worktree .git must be a file or directory");
+  const readable = [...granted];
+  if (gate && stat?.isFile()) {
+    // The protected sidecar was recorded by the factory before candidate execution.
+    const record = `${resolve(cwd)}.git-paths`;
+    try {
+      const paths: unknown = JSON.parse(readFileSync(record, "utf8"));
+      if (
+        !Array.isArray(paths) ||
+        paths.length !== 3 ||
+        !paths.every((p) => typeof p === "string" && isAbsolute(p)) ||
+        realpathSync(paths[0]) !== root ||
+        realpathSync(paths[1]) !== protectedPaths.at(-1) ||
+        realpathSync(paths[2]) !==
+          realpathSync(resolve(paths[1], readFileSync(join(paths[1], "commondir"), "utf8").trim()))
+      )
+        throw new Error();
+      readable.push(record, ...paths.slice(1));
+      protectedPaths.push(record);
+    } catch {
+      throw new ConfinementError(`Missing or invalid trusted Git paths: ${record}`);
+    }
+  }
   return {
     write: spellings(granted),
     protect: spellings(protectedPaths),
-    denyRead: privateReadPaths(),
+    ...homeReadPolicy(readable, gate, denyRead),
     commands: invocationCommands(scratchDir, cwd),
   };
 }
@@ -208,7 +237,7 @@ export function invocationCommands(scratchDir: string, cwd = process.cwd()): Inv
 
 /** Each path as given and, when it exists, canonical: what a confined profile actually denies. */
 export function spellings(paths: string[]): string[] {
-  return [...new Set(paths.flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]))];
+  return policySpellings(paths);
 }
 
 /** `denyRead` as given and canonical (either spelling reaches it); cwd and scratch must stay readable. */

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ import {
 import type { AgentSpec } from "../src/harness/types.ts";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 // No model calls: launch commands directly through each harness's production sandbox policy.
 for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as const) {

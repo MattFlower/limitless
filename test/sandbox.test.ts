@@ -1,6 +1,10 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout } from "bun:test";
 import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,18 +15,29 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { Store } from "../src/db/store.ts";
+import { recordWorktree } from "../src/git/command.ts";
+import {
+  ancestorReadPolicy,
+  homeReadPolicy,
+  type PolicyFilesystem,
+  policySpellings,
+  readPolicyScope,
+} from "../src/harness/read-policy.ts";
 import {
   ConfinementError,
   confinementScope,
   runConfined,
   runSandboxed,
+  seatbeltProfile,
   verifySeatbelt,
   withCommandScratch,
 } from "../src/harness/sandbox.ts";
+import { writeRoots } from "../src/harness/scratch.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 // Real git and sandboxed subprocesses.
 setDefaultTimeout(30_000);
@@ -50,12 +65,628 @@ beforeEach(async () => {
   await git("-C", cache, "commit", "-qm", "base");
   await git("-C", cache, "worktree", "add", "-q", "--detach", work);
   await git("-C", cache, "worktree", "add", "-q", "--detach", sibling);
+  await recordWorktree(work);
   writeFileSync(join(sibling, "canary"), "sibling");
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const common = () => join(cache, ".git");
 const privateDir = () => join(common(), "worktrees", "work");
+
+function bunReadDenialFixture(denied: string[], reader = "node:fs") {
+  return `
+    import {test, expect} from "bun:test";
+    import {readFileSync} from ${JSON.stringify(reader)};
+    test("fixture works and credentials stay denied", () => {
+      expect(1 + 1).toBe(2);
+      for (const file of ${JSON.stringify(denied)})
+        expect(() => readFileSync(file)).toThrow(/Operation not permitted|Permission denied/i);
+    });
+  `;
+}
+
+test("Bun read-denial fixture accepts permission errors and rejects successful reads", async () => {
+  const file = join(home, "stand-in");
+  writeFileSync(file, "stand-in");
+  for (const message of [
+    "Operation not permitted",
+    "operation not permitted",
+    "Permission denied",
+    "permission denied",
+    undefined,
+  ]) {
+    writeFileSync(
+      join(work, "denied-reader.ts"),
+      `export function readFileSync() { throw new Error(${JSON.stringify(message)}); }`,
+    );
+    writeFileSync(
+      join(work, "smoke.test.ts"),
+      bunReadDenialFixture([file], message ? "./denied-reader.ts" : "node:fs"),
+    );
+    const result = await sh([process.execPath, "test", "smoke.test.ts"], { cwd: work, allowFail: true });
+    expect(result.exitCode, result.stderr).toBe(message ? 0 : 1);
+    expect(result.stderr).toContain(message ? "1 pass" : "1 fail");
+  }
+});
+
+test("gate profile denies home and allows only run, recorded Git and trusted toolchain paths", async () => {
+  const scratch = join(root, "scratch");
+  mkdirSync(scratch);
+  const toolchain = join(root, "tools", "custom-toolchain");
+  mkdirSync(toolchain, { recursive: true });
+  readPolicyScope.run({ home: root, toolchains: [toolchain], environment: {} }, () => {
+    const roots = writeRoots(work, scratch, true);
+    const profile = seatbeltProfile(roots);
+    expect(profile).toContain('(deny mach-lookup (global-name "com.limitless.read-allowlist.denied"))');
+    expect(profile).toContain('(allow mach-lookup (global-name "com.limitless.read-allowlist.allowed"))');
+    expect(profile).toContain(`(deny file-read* (subpath "${root}")`);
+    for (const path of [work, scratch, `${work}.git-paths`, common(), privateDir(), toolchain])
+      expect(roots.allowRead).toContain(path);
+    expect(roots.protect).toContain(`${work}.git-paths`);
+    expect(roots.allowRead).not.toContain(sibling);
+    expect(roots.allowRead).not.toContain(root);
+    expect(profile.indexOf("(allow file-read*")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
+    const metadata = profile.split("\n").find((rule) => rule.startsWith("(allow file-read-metadata"));
+    for (const ancestor of [root, cache, join(common(), "worktrees"), join(root, "tools")])
+      expect(metadata).toContain(`(literal "${ancestor}")`);
+    expect(metadata).not.toContain("(subpath");
+    expect(metadata).not.toContain(`(literal "${sibling}")`);
+    expect(profile.indexOf("(allow file-read-metadata")).toBeGreaterThan(profile.indexOf("(deny file-read*"));
+    const probes = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
+    for (const allow of roots.allowRead ?? [])
+      for (let parent = dirname(allow); ; parent = dirname(parent)) {
+        for (const name of ["package.json", "bunfig.toml", "tsconfig.json", "jsconfig.json"]) {
+          expect(probes.literals).toContain(join(parent, name));
+          expect(profile).toContain(`(literal "${join(parent, name)}")`);
+          expect(profile).not.toContain(`(subpath "${join(parent, name)}")`);
+        }
+        expect(metadata).toContain(`(literal "${join(parent, "node_modules")}")`);
+        if (parent === dirname(parent)) break;
+      }
+    for (const path of [".bun", ".cargo", ".rustup"]) expect(roots.allowRead).not.toContain(join(root, path));
+    for (const path of [
+      ".bun/bin",
+      ".bun/install/cache",
+      ".cargo/bin",
+      ".cargo/registry",
+      ".cargo/git",
+      ".cargo/config",
+      ".cargo/config.toml",
+      ".rustup/toolchains",
+      ".rustup/settings.toml",
+      ".rustup/update-hashes",
+    ])
+      expect(roots.allowRead).not.toContain(join(root, path));
+    for (const name of ["credentials", "credentials.toml"])
+      expect(roots.denyRead).toContain(join(root, ".cargo", name));
+  });
+  rmSync(`${work}.git-paths`);
+  expect(() => writeRoots(work, scratch, true)).toThrow("trusted Git paths");
+});
+
+function blockedHomeFilesystem(code: string): PolicyFilesystem {
+  const inspect = (path: string) => {
+    if (path.startsWith(`${home}/`)) throw Object.assign(new Error("blocked home"), { code });
+  };
+  return {
+    lstatSync(path, options) {
+      inspect(path);
+      return lstatSync(path, options);
+    },
+    realpathSync(path) {
+      inspect(path);
+      return realpathSync(path);
+    },
+  };
+}
+
+function blockedFirmlinkFilesystem(): PolicyFilesystem {
+  const data = "/System/Volumes/Data";
+  return {
+    lstatSync(path, options) {
+      return lstatSync(
+        path === data ? "/" : path.startsWith(`${data}/`) ? path.slice(data.length) : path,
+        options,
+      );
+    },
+    realpathSync(path) {
+      if (path === data || path.startsWith(`${data}/`) || path.startsWith(`${home}/`))
+        throw Object.assign(new Error("blocked realpath"), { code: "EPERM" });
+      return realpathSync(path);
+    },
+  };
+}
+
+test("exact Data-volume root deny refuses every read allowance", () => {
+  const data = "/System/Volumes/Data";
+  const fs = blockedFirmlinkFilesystem();
+  readPolicyScope.run({ home, environment: {}, denyRead: [data] }, () => {
+    for (const allowance of [work, sibling, common(), privateDir()])
+      expect(() => homeReadPolicy([allowance], true, [], fs)).toThrow(
+        `Read allowance ${allowance} overlaps denied credential path /`,
+      );
+  });
+  expect(policySpellings([data], true, fs)).toEqual([data, "/"]);
+  expect(policySpellings([data], false, fs)).toEqual([data]);
+});
+
+test("Data-volume firmlink deny spellings reject a hidden optional credential allowance", () => {
+  const tools = join(home, "tools");
+  mkdirSync(tools);
+  const credential = join(tools, "credential-stand-in");
+  const alias = `/System/Volumes/Data${credential}`;
+  const fs = blockedFirmlinkFilesystem();
+  expect(policySpellings([alias], true, fs)).toEqual([alias, credential]);
+  expect(policySpellings([alias], false, fs)).toEqual([alias]);
+  readPolicyScope.run({ home, environment: { NETRC: alias }, toolchains: [tools] }, () => {
+    expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+      `Read allowance ${tools} overlaps denied credential path ${credential}`,
+    );
+  });
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `Data-volume firmlink credential published after profiling stays unreadable ${seatbeltSkip ?? ""}`,
+  async () => {
+    const tools = join(home, "tools");
+    mkdirSync(tools);
+    const credential = join(tools, "credential-stand-in");
+    const options = { home, environment: { NETRC: `/System/Volumes/Data${credential}` } };
+    const fs = blockedFirmlinkFilesystem();
+    let policy: ReturnType<typeof homeReadPolicy>;
+    try {
+      policy = readPolicyScope.run({ ...options, toolchains: [tools] }, () =>
+        homeReadPolicy([work], true, [], fs),
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfinementError);
+      expect(String(error)).toContain(
+        `Read allowance ${tools} overlaps denied credential path ${credential}`,
+      );
+      policy = readPolicyScope.run(options, () => homeReadPolicy([work], true, [], fs));
+    }
+    const profile = seatbeltProfile({ write: [work], protect: [], ...policy });
+    writeFileSync(credential, "stand-in");
+    const read = (file: string) =>
+      sh(["/usr/bin/sandbox-exec", "-p", profile, "/bin/cat", file], { cwd: work, allowFail: true });
+    const allowed = await read(join(work, "a.ts"));
+    expect(allowed.exitCode, allowed.stderr).toBe(0);
+    const denied = await read(credential);
+    expect(denied.exitCode, denied.stderr).toBe(1);
+    expect(denied.stderr).toMatch(/Operation not permitted|Permission denied/);
+  },
+);
+
+test.each([undefined, "EPERM", "EACCES"])(
+  "optional toolchain candidates absent or hidden under denied home are omitted: %s",
+  (code) => {
+    const scratch = join(root, "scratch");
+    mkdirSync(scratch);
+    const realpaths: string[] = [];
+    const filesystem = code ? blockedHomeFilesystem(code) : { lstatSync, realpathSync };
+    const fs: PolicyFilesystem = {
+      lstatSync: filesystem.lstatSync,
+      realpathSync(path) {
+        realpaths.push(path);
+        return filesystem.realpathSync(path);
+      },
+    };
+    readPolicyScope.run({ home, environment: {}, toolchains: [join(home, "custom-tools")] }, () => {
+      const policy = homeReadPolicy([work, scratch, common(), privateDir()], true, [], fs);
+      expect(policy.allowRead).toEqual([work, scratch, common(), privateDir()]);
+      expect(policy.denyRead).toContain(home);
+      expect(policy.denyRead).toContain(join(home, ".ssh"));
+      expect(realpaths.filter((p) => p.startsWith(`${home}/`))).toEqual([]);
+    });
+  },
+);
+
+test.each(["EPERM", "EACCES"])(
+  "read policy traverses denied home metadata but refuses absent roots and unresolved symlinks: %s",
+  (code) => {
+    const scratch = join(root, "scratch");
+    mkdirSync(scratch);
+    const checkout = join(home, "checkout");
+    mkdirSync(join(checkout, "child"), { recursive: true });
+    const blockedLink = join(home, "blocked-link");
+    symlinkSync(checkout, blockedLink);
+    const filesystem = (): PolicyFilesystem => {
+      let resolvedHome = false;
+      return {
+        lstatSync,
+        realpathSync(path) {
+          if (path === blockedLink) throw Object.assign(new Error("blocked symlink realpath"), { code });
+          // The initial home lookup succeeds; component traversal hits Seatbelt's denied home.
+          if (path === home) {
+            if (resolvedHome) throw Object.assign(new Error("blocked home realpath"), { code });
+            resolvedHome = true;
+          }
+          return realpathSync(path);
+        },
+      };
+    };
+    readPolicyScope.run({ home, environment: {} }, () => {
+      const fs = filesystem();
+      const policy = homeReadPolicy([work, scratch, checkout], true, [], fs);
+      expect(policy.allowRead).toEqual([work, scratch, checkout]);
+      expect(policySpellings([checkout], false, fs)).toEqual([checkout]);
+      const climbing = `${relative(process.cwd(), join(checkout, "child"))}/../../checkout`;
+      expect(policySpellings([climbing], false, fs)).toEqual([checkout]);
+      expect(() => homeReadPolicy([blockedLink], true, [], filesystem())).toThrow(
+        `Cannot resolve read policy path ${blockedLink}`,
+      );
+      expect(() => policySpellings([blockedLink], true, fs)).toThrow(ConfinementError);
+      expect(() => policySpellings([blockedLink], true, fs)).toThrow(
+        `Cannot resolve read policy path ${blockedLink}`,
+      );
+      expect(
+        policySpellings([blockedLink], true, {
+          lstatSync(path, options) {
+            if (path === blockedLink) throw Object.assign(new Error("blocked lstat"), { code });
+            return lstatSync(path, options);
+          },
+          realpathSync: fs.realpathSync,
+        }),
+      ).toEqual([blockedLink]);
+      expect(
+        policySpellings([checkout], true, {
+          lstatSync,
+          realpathSync(path) {
+            if (path === checkout) throw Object.assign(new Error("blocked directory realpath"), { code });
+            return realpathSync(path);
+          },
+        }),
+      ).toEqual([checkout]);
+      expect(
+        readPolicyScope.run({ home, environment: {}, toolchains: [blockedLink] }, () =>
+          homeReadPolicy([checkout], true, [], filesystem()),
+        ).allowRead,
+      ).toEqual([checkout]);
+      for (const path of [home, join(home, ".ssh"), join(home, ".cargo/credentials.toml")])
+        expect(policy.denyRead).toContain(path);
+      expect(() => homeReadPolicy([join(home, "absent-checkout")], true, [], filesystem())).toThrow(
+        "Cannot resolve read policy path",
+      );
+    });
+    readPolicyScope.run({ home, environment: {}, toolchains: [join(home, ".ssh/absent")] }, () => {
+      expect(() => homeReadPolicy([work], true, [], filesystem())).toThrow("denied credential path");
+    });
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `denied symlink refuses an unresolved target or keeps it unreadable ${seatbeltSkip ?? ""}`,
+  async () => {
+    const tools = join(root, "tools");
+    mkdirSync(tools);
+    const credential = join(tools, "credential-stand-in");
+    writeFileSync(credential, "stand-in");
+    const alias = join(home, ".netrc");
+    symlinkSync(credential, alias);
+    const fs: PolicyFilesystem = {
+      lstatSync,
+      realpathSync(path) {
+        if (path === alias) throw Object.assign(new Error("blocked symlink realpath"), { code: "EPERM" });
+        return realpathSync(path);
+      },
+    };
+    const options = { home, environment: {} };
+    let policy: ReturnType<typeof homeReadPolicy>;
+    try {
+      policy = readPolicyScope.run({ ...options, toolchains: [tools] }, () =>
+        homeReadPolicy([work], true, [], fs),
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfinementError);
+      expect(String(error)).toContain(`Cannot resolve read policy path ${alias}`);
+      policy = readPolicyScope.run(options, () => homeReadPolicy([work], true));
+    }
+    const profile = seatbeltProfile({ write: [work], protect: [], ...policy });
+    const read = (file: string) =>
+      sh(["/usr/bin/sandbox-exec", "-p", profile, "/bin/cat", file], { cwd: work, allowFail: true });
+    const allowed = await read(join(work, "a.ts"));
+    expect(allowed.exitCode, allowed.stderr).toBe(0);
+    const denied = await read(credential);
+    expect(denied.exitCode, denied.stderr).toBe(1);
+    expect(denied.stderr).toMatch(/Operation not permitted|Permission denied/);
+  },
+);
+
+test.each(["EPERM", "EACCES"])("read policy refusal for required roots hidden under home: %s", (code) => {
+  readPolicyScope.run({ home, environment: {} }, () => {
+    expect(() => homeReadPolicy([join(home, "checkout")], true, [], blockedHomeFilesystem(code))).toThrow(
+      "Cannot resolve read policy path",
+    );
+  });
+});
+
+test.each([undefined, "EPERM", "EACCES"])(
+  "read policy refusal for absent or hidden credential descendants: %s",
+  (code) => {
+    readPolicyScope.run({ home, environment: {}, toolchains: [join(home, ".ssh", "absent")] }, () => {
+      const fs = code ? blockedHomeFilesystem(code) : { lstatSync, realpathSync };
+      expect(() => homeReadPolicy([work], true, [], fs)).toThrow("denied credential path");
+    });
+  },
+);
+
+test.each(["EPERM", "EACCES", "EIO"])(
+  "optional inspection outside denied home omits permission failures and refuses other errors: %s",
+  (code) => {
+    const candidate = join(root, "other-tools");
+    const fs: PolicyFilesystem = {
+      realpathSync,
+      lstatSync(path, options) {
+        if (path === candidate) throw Object.assign(new Error("inspection failed"), { code });
+        return lstatSync(path, options);
+      },
+    };
+    readPolicyScope.run({ home, environment: {}, toolchains: [candidate] }, () => {
+      if (code === "EIO")
+        expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+          `Cannot resolve read policy path ${candidate}`,
+        );
+      else expect(homeReadPolicy([work], true, [], fs).allowRead).toEqual([work]);
+    });
+  },
+);
+
+test("read policy refusal for absent required roots and existing dangling toolchain symlinks", () => {
+  const candidate = join(home, "dangling-toolchain");
+  symlinkSync(join(home, "absent-target"), candidate);
+  readPolicyScope.run({ home, environment: {} }, () => {
+    expect(() => homeReadPolicy([join(root, "absent-checkout")], true)).toThrow(
+      "Cannot resolve read policy path",
+    );
+  });
+  readPolicyScope.run({ home, environment: {}, toolchains: [candidate] }, () => {
+    expect(() => homeReadPolicy([work], true)).toThrow(`Cannot resolve read policy path ${candidate}`);
+    for (const code of ["EPERM", "EACCES", "EIO"]) {
+      const fs: PolicyFilesystem = {
+        lstatSync,
+        realpathSync(path) {
+          if (path === candidate) throw Object.assign(new Error("unresolved entry"), { code });
+          return realpathSync(path);
+        },
+      };
+      if (code === "EIO")
+        expect(() => homeReadPolicy([work], true, [], fs)).toThrow(
+          `Cannot resolve read policy path ${candidate}`,
+        );
+      else expect(homeReadPolicy([work], true, [], fs).allowRead).toEqual([work]);
+    }
+  });
+});
+
+test("read policy refusal for unresolved home and credential overlaps before executing or copying configuration", async () => {
+  mkdirSync(join(root, ".ssh/child"), { recursive: true });
+  symlinkSync(join(root, ".ssh/child"), join(root, "alias"));
+  for (const options of [
+    { home: join(root, "missing") },
+    { home: root, toolchains: [root] },
+    { home: root, toolchains: [`${root}/alias/..`] },
+    { home: root, toolchains: ["~/alias/../missing"] },
+  ]) {
+    let started = false;
+    await readPolicyScope.run(options, async () => {
+      await expect(
+        runConfined(
+          { command: "unused", cwd: work, env: agentEnv() },
+          async () => {},
+          async () => {
+            started = true;
+            return proc();
+          },
+        ),
+      ).rejects.toThrow(ConfinementError);
+    });
+    expect(started).toBe(false);
+  }
+  symlinkSync(join(root, ".ssh"), join(root, "toolchain-link"));
+  readPolicyScope.run({ home: root, toolchains: [join(root, "toolchain-link", "absent")] }, () => {
+    expect(() => homeReadPolicy([work], true)).toThrow("denied credential path");
+  });
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `gate home read boundary preserves Git and Bun ${seatbeltSkip ?? ""}`,
+  async () => {
+    const denied = [
+      join(root, ".ssh/key"),
+      join(root, ".config/limitless/secrets.env"),
+      join(root, "personal"),
+      join(sibling, "canary"),
+      join(root, ".limitless/runs/other/data"),
+    ];
+    for (const file of denied) {
+      mkdirSync(join(file, ".."), { recursive: true });
+      writeFileSync(file, "stand-in");
+    }
+    const bunHome = join(root, ".bun");
+    mkdirSync(join(bunHome, "bin"), { recursive: true });
+    copyFileSync(process.execPath, join(bunHome, "bin/bun"));
+    const bare = join(root, ".limitless/repos/repo.git");
+    const gateWork = join(root, ".limitless/work/current");
+    mkdirSync(join(bare, ".."), { recursive: true });
+    mkdirSync(join(gateWork, ".."), { recursive: true });
+    await sh(["git", "clone", "-q", "--bare", cache, bare], { cwd: root });
+    await sh(["git", "--git-dir", bare, "worktree", "add", "-q", "--detach", gateWork], { cwd: root });
+    await recordWorktree(gateWork);
+    const cargoHome = join(root, ".cargo");
+    for (const path of ["bin", "registry/cache"]) mkdirSync(join(cargoHome, path), { recursive: true });
+    writeFileSync(join(cargoHome, "bin/cargo"), '#!/bin/sh\nprintf "cargo stand-in\\n"\n');
+    chmodSync(join(cargoHome, "bin/cargo"), 0o700);
+    writeFileSync(join(cargoHome, "registry/cache/package"), "cached");
+    for (const name of ["credentials", "credentials.toml"]) {
+      const file = join(cargoHome, name);
+      writeFileSync(file, "stand-in");
+      denied.push(file);
+    }
+    writeFileSync(join(gateWork, "package.json"), '{"type":"module"}');
+    writeFileSync(join(gateWork, "smoke.test.ts"), bunReadDenialFixture(denied.slice(0, 2)));
+    await readPolicyScope.run(
+      { home: root, environment: { BUN_INSTALL: bunHome, CARGO_HOME: cargoHome } },
+      async () => {
+        for (const file of denied) {
+          const result = await runConfined({
+            command: `head -c 1 '${file}' >/dev/null`,
+            cwd: gateWork,
+            env: agentEnv(),
+          });
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+          expect(result.stdout).toBe("");
+        }
+        // Traversal metadata must not grant directory listings of home or intermediate factory data.
+        for (const dir of [root, join(root, ".limitless"), join(root, ".limitless/work")]) {
+          const result = await runConfined({
+            command: `ls -A '${dir}' >/dev/null`,
+            cwd: gateWork,
+            env: agentEnv(),
+          });
+          expect(result.exitCode).not.toBe(0);
+          expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+          expect(result.stdout).toBe("");
+        }
+        for (const command of [
+          "head -c 1 a.ts >/dev/null",
+          'printf x > "$TMPDIR/canary" && head -c 1 "$TMPDIR/canary" >/dev/null',
+          `head -c 1 '${bare}/HEAD' >/dev/null`,
+          `head -c 1 '${bare}/worktrees/current/commondir' >/dev/null`,
+          "git status --porcelain",
+          "git diff && git log -1 --format=%s",
+          `'${bunHome}/bin/bun' -e 'require("node:fs").realpathSync(process.cwd())'`,
+          `'${bunHome}/bin/bun' --version`,
+          `'${bunHome}/bin/bun' test smoke.test.ts`,
+          `'${cargoHome}/bin/cargo' --version`,
+          `head -c 1 '${cargoHome}/registry/cache/package' >/dev/null`,
+        ]) {
+          const result = await runConfined({ command, cwd: gateWork, env: agentEnv() });
+          expect(result.exitCode, result.stderr).toBe(0);
+        }
+      },
+    );
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `nested gate command reads its protected sidecar under denied home ${seatbeltSkip ?? ""}`,
+  async () => {
+    const gateWork = join(root, ".limitless/work/current");
+    mkdirSync(dirname(gateWork), { recursive: true });
+    await sh(["git", "-C", cache, "worktree", "add", "-q", "--detach", gateWork], { cwd: root });
+    await recordWorktree(gateWork);
+    const record = `${gateWork}.git-paths`;
+    const original = readFileSync(record, "utf8");
+    const module = (path: string) => JSON.stringify(join(import.meta.dir, "..", path));
+    writeFileSync(
+      join(gateWork, "nested.ts"),
+      `
+        import { strict as assert } from "node:assert";
+        import { readdirSync, writeFileSync } from "node:fs";
+        import { readPolicyScope } from ${module("src/harness/read-policy.ts")};
+        import { confinementScope, runConfined } from ${module("src/harness/sandbox.ts")};
+        import { agentEnv } from ${module("src/util/proc.ts")};
+        const denied = (action) => assert.throws(action, (error) =>
+          error.code === "EPERM" || error.code === "EACCES");
+        denied(() => writeFileSync(${JSON.stringify(record)}, "tampered"));
+        denied(() => readdirSync(${JSON.stringify(dirname(record))}));
+        // The outer gate enforces the policy; macOS cannot apply a second Seatbelt profile.
+        const backend = { verify: async () => {}, wrap: (cmd) => cmd };
+        const result = await readPolicyScope.run({ home: process.env.HOME, environment: {} },
+          () => confinementScope.run(backend, () => runConfined({
+            command: "printf nested-ok", cwd: process.cwd(), env: agentEnv(),
+          })));
+        assert.equal(result.exitCode, 0, result.stderr);
+        assert.equal(result.stdout, "nested-ok");
+        console.log("nested-ok");
+      `,
+    );
+    await readPolicyScope.run({ home: root, environment: {} }, async () => {
+      const result = await runConfined({
+        command: `'${process.execPath}' nested.ts`,
+        cwd: gateWork,
+        env: agentEnv(),
+      });
+      expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+      expect(result.stdout).toBe("nested-ok\n");
+    });
+    expect(readFileSync(record, "utf8")).toBe(original);
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `SSH identity reads fail at the filesystem without an external host ${seatbeltSkip ?? ""}`,
+  async () => {
+    const key = join(root, ".ssh/stand-in");
+    mkdirSync(join(root, ".ssh"));
+    await sh(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], { cwd: work });
+    // This exercises OpenSSH's private-key loader independently of connection failures.
+    const normal = await runProcess({ cmd: ["ssh-keygen", "-y", "-f", key], cwd: work, env: agentEnv() });
+    expect(normal.exitCode).toBe(0);
+    await readPolicyScope.run({ home: root }, async () => {
+      const result = await runConfined({
+        command: `ssh-keygen -y -f '${key}' >/dev/null`,
+        cwd: work,
+        env: agentEnv(),
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(key);
+      expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+      const ssh = await runConfined({
+        command: `ssh -F /dev/null -o BatchMode=yes -o 'ProxyCommand=exit 0' -i '${key}' example.invalid true`,
+        cwd: work,
+        env: agentEnv(),
+      });
+      expect(ssh.exitCode).not.toBe(0);
+      expect(ssh.stderr).toMatch(
+        /Identity file .* not accessible: (Operation not permitted|Permission denied)/,
+      );
+    });
+  },
+);
+
+test("specific database denies follow checkout and ancestor read grants", () => {
+  const scratch = join(root, "scratch");
+  mkdirSync(scratch);
+  const db = join(work, "private.db");
+  const parentDb = join(root, "package.json");
+  const stores = [new Store(db), new Store(parentDb)];
+  try {
+    readPolicyScope.run({ home: root, environment: {} }, () => {
+      const roots = writeRoots(work, scratch, true);
+      const profile = seatbeltProfile(roots);
+      const final = profile.split("\n").at(-1) ?? "";
+      expect(profile).not.toContain("com.limitless.read-allowlist.");
+      expect(final).toStartWith("(deny file-read*");
+      for (const file of [db, `${db}-wal`, `${db}-shm`, parentDb])
+        expect(final).toContain(`(subpath "${file}")`);
+      expect(profile.lastIndexOf("(deny file-read*")).toBeGreaterThan(
+        profile.lastIndexOf("(allow file-read*"),
+      );
+      expect(ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []).literals).not.toContain(
+        parentDb,
+      );
+      expect(profile).not.toContain(`(literal "${parentDb}")`);
+    });
+  } finally {
+    for (const store of stores) store.close();
+  }
+});
+
+test("a command read deny inside an allowance withholds the process inspection marker", () => {
+  const roots = {
+    write: [work],
+    protect: [],
+    denyRead: [root],
+    allowRead: [work],
+    commands: { root: [join(work, "commands")], own: [] },
+  };
+  expect(seatbeltProfile(roots)).not.toContain("com.limitless.read-allowlist.");
+  expect(seatbeltProfile({ ...roots, commands: { root: [join(root, "commands")], own: [] } })).toContain(
+    "com.limitless.read-allowlist.",
+  );
+});
 
 test.skipIf(seatbeltSkip !== null)(
   `private database reads are denied while checkout reads work ${seatbeltSkip ?? ""}`,
@@ -78,6 +709,63 @@ test.skipIf(seatbeltSkip !== null)(
     } finally {
       store.close();
     }
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `private database inside checkout stays unreadable beside a readable sibling ${seatbeltSkip ?? ""}`,
+  async () => {
+    const store = new Store(join(work, "private.db"));
+    try {
+      for (const file of ["private.db", "private.db-wal", "private.db-shm"]) {
+        expect(existsSync(join(work, file))).toBe(true);
+        const result = await runConfined({
+          command: `head -c 1 "${join(work, file)}" >/dev/null`,
+          cwd: work,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+      }
+      const allowed = await runConfined({ command: "cat a.ts", cwd: work, env: agentEnv() });
+      expect(allowed.exitCode).toBe(0);
+      expect(allowed.stdout).toContain("test('ok'");
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.skipIf(seatbeltSkip !== null)(
+  `relocated gh store stays denied outside home for gates and editors ${seatbeltSkip ?? ""}`,
+  async () => {
+    const scratch = join(root, "scratch");
+    const relocated = join(root, "relocated-gh");
+    mkdirSync(scratch);
+    mkdirSync(relocated);
+    const file = join(relocated, "hosts.yml");
+    writeFileSync(file, "stand-in");
+    await readPolicyScope.run({ home, environment: { GH_CONFIG_DIR: relocated } }, async () => {
+      for (const gate of [false, true]) {
+        const result = await runProcess({
+          cmd: [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            seatbeltProfile(writeRoots(work, scratch, gate)),
+            "/bin/sh",
+            "-c",
+            'head -c 1 "$1" >/dev/null',
+            "sh",
+            file,
+          ],
+          cwd: work,
+          env: agentEnv(),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Operation not permitted|Permission denied/);
+        expect(result.stdout).toBe("");
+      }
+    });
   },
 );
 
@@ -289,37 +977,38 @@ test("the effective profile is probed before the native-tool process and failed 
   }
 });
 
-test("command scratch persists across setup, checks and retry scopes, with readable toolchains", async () => {
-  let scratch = "";
-  // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
-  const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
-  const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
-  mkdirSync(join(home, ".cargo"));
-  writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
-  const run = async (opts: ProcOptions) => {
-    expect(opts.env.HOME).toBe(opts.env.TMPDIR);
-    expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
-    const current = opts.env.TMPDIR ?? "";
-    expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
-    expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
-    if (scratch) {
-      expect(current).toBe(scratch);
-      expect(readFileSync(join(current, "setup"), "utf8")).toBe("ready");
-    } else {
-      scratch = current;
-      writeFileSync(join(current, "setup"), "ready");
-    }
-    opts.onStdoutLine?.(opts.cmd[7] ?? "");
-    return proc();
-  };
-  await withCommandScratch(work, async () => {
-    await runConfined(opts, async () => {}, run);
-    await withCommandScratch(work, () => runConfined(opts, async () => {}, run));
-    await runConfined(opts, async () => {}, run);
-    expect(existsSync(scratch)).toBe(true);
-  });
-  expect(existsSync(scratch)).toBe(false);
-});
+test("command scratch persists across setup, checks and retry scopes, with readable toolchains", async () =>
+  readPolicyScope.run({ home }, async () => {
+    let scratch = "";
+    // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
+    const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
+    const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
+    mkdirSync(join(home, ".cargo"));
+    writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
+    const run = async (opts: ProcOptions) => {
+      expect(opts.env.HOME).toBe(opts.env.TMPDIR);
+      expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
+      const current = opts.env.TMPDIR ?? "";
+      expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
+      expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
+      if (scratch) {
+        expect(current).toBe(scratch);
+        expect(readFileSync(join(current, "setup"), "utf8")).toBe("ready");
+      } else {
+        scratch = current;
+        writeFileSync(join(current, "setup"), "ready");
+      }
+      opts.onStdoutLine?.(opts.cmd[7] ?? "");
+      return proc();
+    };
+    await withCommandScratch(work, async () => {
+      await runConfined(opts, async () => {}, run);
+      await withCommandScratch(work, () => runConfined(opts, async () => {}, run));
+      await runConfined(opts, async () => {}, run);
+      expect(existsSync(scratch)).toBe(true);
+    });
+    expect(existsSync(scratch)).toBe(false);
+  }));
 
 test.skipIf(seatbeltSkip !== null)(
   `installed rustup discovery survives command confinement ${seatbeltSkip ?? ""}`,
@@ -333,30 +1022,31 @@ test.skipIf(seatbeltSkip !== null)(
   },
 );
 
-test("later commands never copy trusted config through setup-created scratch symlinks", async () => {
-  mkdirSync(join(home, ".cargo"));
-  writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
-  const protectedDir = join(home, "protected");
-  mkdirSync(protectedDir);
-  const opts = { command: "unused", cwd: work, env: agentEnv({ HOME: home }) };
-  let calls = 0;
-  await withCommandScratch(work, async () => {
-    const runner = async (opts: ProcOptions) => {
-      calls++;
-      const cargo = opts.env.CARGO_HOME ?? "";
-      if (calls === 1) {
-        rmSync(cargo, { recursive: true });
-        symlinkSync(protectedDir, cargo);
-      }
-      opts.onStdoutLine?.(opts.cmd[7] ?? "");
-      return proc();
-    };
-    await runConfined(opts, async () => {}, runner);
-    await runConfined(opts, async () => {}, runner);
-  });
-  expect(calls).toBe(2);
-  expect(existsSync(join(protectedDir, "config.toml"))).toBe(false);
-});
+test("later commands never copy trusted config through setup-created scratch symlinks", async () =>
+  readPolicyScope.run({ home }, async () => {
+    mkdirSync(join(home, ".cargo"));
+    writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
+    const protectedDir = join(home, "protected");
+    mkdirSync(protectedDir);
+    const opts = { command: "unused", cwd: work, env: agentEnv({ HOME: home }) };
+    let calls = 0;
+    await withCommandScratch(work, async () => {
+      const runner = async (opts: ProcOptions) => {
+        calls++;
+        const cargo = opts.env.CARGO_HOME ?? "";
+        if (calls === 1) {
+          rmSync(cargo, { recursive: true });
+          symlinkSync(protectedDir, cargo);
+        }
+        opts.onStdoutLine?.(opts.cmd[7] ?? "");
+        return proc();
+      };
+      await runConfined(opts, async () => {}, runner);
+      await runConfined(opts, async () => {}, runner);
+    });
+    expect(calls).toBe(2);
+    expect(existsSync(join(protectedDir, "config.toml"))).toBe(false);
+  }));
 
 test("confined environment retains installed cargo discovery without a live sandbox backend", async () => {
   const normal = await runProcess({ cmd: ["cargo", "--version"], cwd: work, env: agentEnv() });
@@ -514,3 +1204,29 @@ test("unavailable confinement errors keep their original reason without noisy wr
     expect(String(error)).not.toMatch(/preflight failed: Error:|also required/);
   }
 });
+
+test.skipIf(seatbeltSkip !== null)(
+  `failure-injection outcomes survive a gate checkout under home ${seatbeltSkip ?? ""}`,
+  async () => {
+    const repo = join(import.meta.dir, "..");
+    for (const name of ["src", "test", "scripts", "ui", "package.json", "bunfig.toml", "tsconfig.json"])
+      cpSync(join(repo, name), join(work, name), { recursive: true });
+    symlinkSync(join(repo, "node_modules"), join(work, "node_modules"));
+    // The inner factories inherit relocated credential stores under the denied home, as an
+    // owner's XDG_CONFIG_HOME or CODEX_HOME would be: their deny spellings can't stat there.
+    const relocated = { XDG_CONFIG_HOME: join(root, ".config"), CODEX_HOME: join(root, ".codex-custom") };
+    for (const path of Object.values(relocated)) mkdirSync(join(path, "gh"), { recursive: true });
+    await readPolicyScope.run({ home: root, environment: {} }, async () => {
+      const result = await runConfined({
+        command: `'${process.execPath}' test test/failure-injection.test.ts -t 'unavailable pinned implementer|unconfirmed holdout shutdown'`,
+        cwd: work,
+        env: agentEnv(relocated),
+        timeoutMs: 60_000,
+      });
+      expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+      expect(result.stderr).toContain("4 pass");
+      expect(result.stderr).toContain("0 fail");
+    });
+  },
+  90_000,
+);

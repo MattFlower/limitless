@@ -29,6 +29,8 @@ export const customProvider = {
 };
 export function providerFixture(providers: unknown = [customProvider], secrets = "") {
   const root = mkdtempSync(join(tmpdir(), "limitless-provider-config-"));
+  const work = join(root, "work");
+  mkdirSync(work);
   const configDir = join(root, "config");
   mkdirSync(configDir);
   const file = join(configDir, "config.toml");
@@ -36,6 +38,7 @@ export function providerFixture(providers: unknown = [customProvider], secrets =
   writeFileSync(join(configDir, "secrets.env"), secrets);
   return {
     root,
+    work,
     configDir,
     file,
     load: () => loadConfig({ home: join(root, "data"), configDir }),

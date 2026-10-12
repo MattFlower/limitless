@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -16,6 +16,7 @@ import { fakeConfinement } from "./confinement.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
+import { test } from "./read-policy-support.ts";
 
 test.each([
   { kind: "JSON", secret: 'synthetic-gate-json-"quoted"-\\slash', padding: "" },
@@ -48,10 +49,10 @@ test.each([
     const factory = new Factory(fixture.load());
     try {
       const diagnostic = kind === "JSON" ? JSON.stringify({ credential: secret }) : secret;
-      writeFileSync(join(fixture.root, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
+      writeFileSync(join(fixture.work, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
       const gates = await confinementScope.run(fakeConfinement, () =>
         runGates(
-          fixture.root,
+          fixture.work,
           {
             setup: [],
             checks: [

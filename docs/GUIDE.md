@@ -201,6 +201,8 @@ use the file first, then the environment.
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
+| `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
+| `[sandbox] toolchain_paths` | `[]` | Additional gate-readable toolchain roots, from this factory configuration only. Only build subpaths of the Bun, Cargo and Rustup homes are included by default (using the factory's `BUN_INSTALL`, `CARGO_HOME` and `RUSTUP_HOME` when set); Cargo registry credentials stay denied. A root overlapping a denied credential path prevents launch. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
 | `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
@@ -209,6 +211,18 @@ use the file first, then the environment.
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Runtime routing, eval policy generation and the Evals matrix exclude models whose origin or baseOrigin is listed (exact, case-sensitive matching). Any configured list, even `[]`, also excludes unknown baseOrigin. There is no excluded-model fallback; explicit run/retry pins, routing saves and eval targets are refused. Omit for no origin filter. Edit config.toml and restart to change this read-only safety constraint. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] remote_model_path`, `remote_host`, `remote_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
+
+Gates deny home reads except their checkout, scratch, recorded Git directories and approved
+toolchains; system paths remain readable. Exact ancestor manifest names and `node_modules`
+metadata remain readable for toolchain discovery, without directory listing access. Each factory
+retains its frozen configuration and credential-location environment snapshot. Editors and gates
+also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`,
+`LIMITLESS_CONFIG_DIR`, the AWS credential/config variables, `DOCKER_CONFIG`, `GNUPGHOME`,
+`KUBECONFIG`, `NETRC`, npm userconfig variables and Cargo's credential files. Editors deny the
+credential stores above, but Claude's
+own CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
+macOS Keychain access through `security`, network egress and the loopback API (#484) remain separate
+gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default
 branch:

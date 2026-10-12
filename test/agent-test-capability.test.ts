@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -12,6 +12,7 @@ import { withSlottedCommands } from "../src/harness/slotted.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -132,15 +133,17 @@ async function inCheckoutTmpdir(probe: boolean) {
     import {dirname, join} from 'node:path';
     import {mkdirSync, readFileSync, existsSync} from 'node:fs';
     import {createCommandRoot, commandDir, commandRoots, writeRoots} from ${JSON.stringify(join(import.meta.dir, "../src/harness/scratch.ts"))};
+    import {configureReadPolicy, readPolicyScope} from ${JSON.stringify(join(import.meta.dir, "../src/harness/read-policy.ts"))};
     import {seatbeltProfile, SANDBOX_EXEC} from ${JSON.stringify(join(import.meta.dir, "../src/harness/sandbox.ts"))};
     import {runProcess, agentEnv} from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
     const cwd=${JSON.stringify(cwd)}, scratch=${JSON.stringify(scratch)};
     const root=createCommandRoot(cwd,scratch), own=commandDir(scratch,cwd), other=join(root,'other');
     mkdirSync(own); mkdirSync(other);
     await Bun.write(join(own,'config.json'),'own'); await Bun.write(join(other,'config.json'),'other');
-    const profile=seatbeltProfile(writeRoots(cwd,scratch));
+    const policy=configureReadPolicy(undefined,join(dirname(cwd),'factory-config'));
+    const profile=readPolicyScope.run(policy,()=>seatbeltProfile(writeRoots(cwd,scratch)));
     let overlapping=false;
-    try {writeRoots(dirname(root),scratch)} catch {overlapping=true}
+    try {readPolicyScope.run(policy,()=>writeRoots(dirname(root),scratch))} catch {overlapping=true}
     // A later environment change must not switch which capabilities the profiles protect.
     process.env.TMPDIR=scratch;
     const stable=commandRoots(cwd,scratch).includes(root);
