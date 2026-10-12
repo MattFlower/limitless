@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
+import { agentEnv, invocationScratch, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import {
   ancestorReadPolicy,
   ConfinementError,
@@ -217,12 +217,20 @@ async function probeSeatbelt(
 /** Extra roots confined commands may write: only test fixtures that observe gate runs add any. */
 export const observerRoots = new Set<string>();
 
-/** One owned scratch for dependent setup/check commands; inner scopes reuse it. */
+/** Inner scopes reuse scratch; a caller supplying ownedScratch must stop commands before removing it. */
 const commandScratch = new AsyncLocalStorage<{ dir: string; initialized: boolean }>();
-export const withCommandScratch = <T>(cwd: string, fn: () => Promise<T>): Promise<T> =>
-  commandScratch.getStore()
-    ? fn()
-    : withScratch(cwd, (dir) => commandScratch.run({ dir, initialized: false }, fn));
+export const withCommandScratch = <T>(
+  cwd: string,
+  fn: () => Promise<T>,
+  ownedScratch?: string,
+): Promise<T> =>
+  ownedScratch
+    ? invocationScratch.run(ownedScratch, () =>
+        commandScratch.run({ dir: ownedScratch, initialized: false }, fn),
+      )
+    : commandScratch.getStore()
+      ? fn()
+      : withScratch(cwd, (dir) => commandScratch.run({ dir, initialized: false }, fn));
 
 export const commandScope =
   <T>(cwd: string, fn: () => Promise<T>) =>
@@ -231,7 +239,7 @@ export const commandScope =
 
 /** Confine the entire process, including native tools, before any CLI code runs. */
 export async function runSandboxed(
-  opts: ProcOptions,
+  opts: ProcOptions & { onStarted?: () => void },
   roots: WriteRoots,
   run = runProcess,
   verify?: () => Promise<void>,
@@ -253,8 +261,10 @@ export async function runSandboxed(
       ...opts.cmd,
     ],
     onStdoutLine: (line) => {
-      if (line === token) started = true;
-      else opts.onStdoutLine?.(line);
+      if (line === token) {
+        started = true;
+        opts.onStarted?.();
+      } else opts.onStdoutLine?.(line);
     },
   };
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
@@ -267,7 +277,7 @@ export async function runSandboxed(
 
 /** Keep installed toolchains readable; writable package caches belong to the suite scratch. */
 export async function runConfined(
-  opts: Omit<ProcOptions, "cmd"> & { command: string },
+  opts: Omit<ProcOptions, "cmd"> & { command: string; onStarted?: () => void },
   verify?: () => Promise<void>,
   run = runProcess,
 ): Promise<ProcResult> {

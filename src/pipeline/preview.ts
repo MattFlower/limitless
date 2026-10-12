@@ -1,8 +1,8 @@
-import { type ChildProcess, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import type { DiffInfo } from "../git/repos.ts";
+import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
-import { agentEnv, runProcess } from "../util/proc.ts";
+import { agentEnv, ProcessTerminationError, type ProcResult } from "../util/proc.ts";
 
 export interface PreviewConfig {
   paths: string[];
@@ -90,37 +90,6 @@ async function availablePort(): Promise<number> {
   });
 }
 
-function stopTree(child: ChildProcess): Promise<void> {
-  return new Promise((resolve) => {
-    const exited = child.exitCode !== null || child.signalCode !== null;
-    const kill = (signal: NodeJS.Signals) => {
-      if (child.pid === undefined) return;
-      try {
-        process.kill(-child.pid, signal);
-      } catch {
-        child.kill(signal);
-      }
-    };
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const finish = () => {
-      clearTimeout(timer);
-      kill("SIGKILL");
-      // A detached grandchild may retain the pipes after the direct child exits.
-      child.stdin?.destroy();
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-      resolve();
-    };
-    if (exited || child.pid === undefined) {
-      finish();
-      return;
-    }
-    timer = setTimeout(() => kill("SIGKILL"), 2_000);
-    child.once("exit", finish);
-    kill("SIGTERM");
-  });
-}
-
 export interface Preview {
   url: string;
   scratch: string;
@@ -135,12 +104,17 @@ export async function startPreview(
   commandTimeoutMs = 120_000,
 ): Promise<Preview> {
   const scratch = createScratch(cwd);
-  let child: ChildProcess | undefined;
+  const controller = new AbortController();
+  const commandSignal = AbortSignal.any([signal, controller.signal]);
+  let serving: Promise<ProcResult> | undefined;
   let stopping: Promise<void> | undefined;
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       signal.removeEventListener("abort", onAbort);
-      if (child) await stopTree(child);
+      controller.abort();
+      await serving?.catch((error: unknown) => {
+        if (error instanceof ProcessTerminationError) throw error;
+      });
       removeScratch(scratch);
     })();
     return stopping;
@@ -148,98 +122,113 @@ export async function startPreview(
   const onAbort = () => {
     void stop();
   };
-  try {
-    if (signal.aborted) throw new Error("Preview cancelled");
-    const port = await availablePort();
-    const url = `http://127.0.0.1:${port}`;
-    const readyUrl = readinessUrl(config.ready, url);
-    if (Object.values(config.env).some((value) => value.includes("..")))
-      throw new Error('Invalid [preview].env: values must not contain ".."');
-    const expanded = Object.fromEntries(
-      Object.entries(config.env).map(([key, value]) => [
-        key,
-        value.replaceAll("{scratch}", scratch).replaceAll("{port}", String(port)),
-      ]),
-    );
-    const reserved = agentEnv();
-    const env = { ...reserved, ...expanded };
-    for (const key of Object.keys(env)) {
-      if (key === "GH_TOKEN" || key.startsWith("GIT_")) {
-        delete env[key];
-        if (reserved[key] !== undefined) env[key] = reserved[key];
-      }
-    }
-    Object.assign(env, {
-      HOME: scratch,
-      TMPDIR: scratch,
-      TMP: scratch,
-      TEMP: scratch,
-      LIMITLESS_NO_SCHEDULER: "1",
-    });
-    for (const [step, commandText] of [
-      ["build", config.build],
-      ["seed", config.seed],
-    ] as const) {
-      if (!commandText) continue;
-      const result = await runProcess({
-        cmd: ["/bin/sh", "-c", commandText],
-        cwd,
-        env,
-        signal,
-        timeoutMs: commandTimeoutMs,
-        tailLimit: 4_000,
-      });
-      if (signal.aborted) throw new Error("Preview cancelled");
-      if (result.exitCode !== 0 || result.timedOut)
-        throw new Error(
-          `Preview ${step} ${result.timedOut ? "timed out" : "failed"}: ${(result.stderr || result.stdout).trim().slice(-4_000)}`,
-        );
-    }
-    if (signal.aborted) throw new Error("Preview cancelled");
-    child = spawn("/bin/sh", ["-c", config.serve], {
-      cwd,
-      env,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    const collect = (chunk: Buffer) => {
-      output = (output + chunk.toString()).slice(-4_000);
-    };
-    child.stdout?.on("data", collect);
-    child.stderr?.on("data", collect);
-    let exit: string | null = null;
-    child.on("error", (error) => {
-      exit = error.message;
-    });
-    child.on("exit", (code, sig) => {
-      exit = `exit ${code ?? sig}`;
-    });
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (signal.aborted) throw new Error("Preview cancelled");
-    const deadline = Date.now() + readinessMs;
-    while (Date.now() < deadline) {
-      if (signal.aborted) throw new Error("Preview cancelled");
-      if (exit) throw new Error(`Preview serve exited early (${exit}): ${output.trim()}`);
+  return withCommandScratch(
+    cwd,
+    async () => {
       try {
-        const response = await fetch(readyUrl, {
-          signal: AbortSignal.any([
-            signal,
-            AbortSignal.timeout(Math.max(1, Math.min(1_000, deadline - Date.now()))),
-          ]),
-          redirect: "error",
-        });
-        await response.body?.cancel();
         if (signal.aborted) throw new Error("Preview cancelled");
-        if (response.ok) return { url, scratch, stop };
-      } catch {
-        /* Retry until the bounded readiness deadline. */
+        const port = await availablePort();
+        const url = `http://127.0.0.1:${port}`;
+        const readyUrl = readinessUrl(config.ready, url);
+        if (Object.values(config.env).some((value) => value.includes("..")))
+          throw new Error('Invalid [preview].env: values must not contain ".."');
+        const expanded = Object.fromEntries(
+          Object.entries(config.env).map(([key, value]) => [
+            key,
+            value.replaceAll("{scratch}", scratch).replaceAll("{port}", String(port)),
+          ]),
+        );
+        const reserved = agentEnv();
+        const env = { ...reserved, ...expanded };
+        for (const key of Object.keys(env)) {
+          if (key === "GH_TOKEN" || key.startsWith("GIT_")) {
+            delete env[key];
+            if (reserved[key] !== undefined) env[key] = reserved[key];
+          }
+        }
+        Object.assign(env, {
+          HOME: scratch,
+          TMPDIR: scratch,
+          TMP: scratch,
+          TEMP: scratch,
+          LIMITLESS_NO_SCHEDULER: "1",
+        });
+        for (const [step, commandText] of [
+          ["build", config.build],
+          ["seed", config.seed],
+        ] as const) {
+          if (!commandText) continue;
+          const result = await runConfined({
+            command: commandText,
+            cwd,
+            env,
+            signal: commandSignal,
+            timeoutMs: commandTimeoutMs,
+            tailLimit: 4_000,
+          });
+          if (signal.aborted) throw new Error("Preview cancelled");
+          if (result.exitCode !== 0 || result.timedOut)
+            throw new Error(
+              `Preview ${step} ${result.timedOut ? "timed out" : "failed"}: ${(result.stderr || result.stdout).trim().slice(-4_000)}`,
+            );
+        }
+        if (signal.aborted) throw new Error("Preview cancelled");
+        let output = "";
+        let started = false;
+        let exit: Error | null = null;
+        const collect = (line: string) => {
+          output = `${output}${line}\n`.slice(-4_000);
+        };
+        serving = runConfined({
+          command: config.serve,
+          cwd,
+          env,
+          signal: commandSignal,
+          tailLimit: 4_000,
+          onStarted: () => {
+            started = true;
+          },
+          onStdoutLine: collect,
+          onStderrLine: collect,
+        });
+        void serving.then(
+          (result) => {
+            exit = new Error(
+              `Preview serve exited early (exit ${result.exitCode ?? result.signal}): ${(result.stderr || result.stdout).trim()}`,
+            );
+          },
+          (error: unknown) => {
+            exit = error instanceof Error ? error : new Error(String(error));
+          },
+        );
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) throw new Error("Preview cancelled");
+        const deadline = Date.now() + readinessMs;
+        while (Date.now() < deadline) {
+          if (signal.aborted) throw new Error("Preview cancelled");
+          if (exit) throw exit;
+          try {
+            const response = await fetch(readyUrl, {
+              signal: AbortSignal.any([
+                signal,
+                AbortSignal.timeout(Math.max(1, Math.min(1_000, deadline - Date.now()))),
+              ]),
+              redirect: "error",
+            });
+            await response.body?.cancel();
+            if (signal.aborted) throw new Error("Preview cancelled");
+            if (response.ok && started && !exit) return { url, scratch, stop };
+          } catch {
+            /* Retry until the bounded readiness deadline. */
+          }
+          await Bun.sleep(100);
+        }
+        throw new Error(`Preview readiness timed out at ${url}${config.ready}: ${output.trim()}`);
+      } catch (error) {
+        await stop();
+        throw error;
       }
-      await Bun.sleep(100);
-    }
-    throw new Error(`Preview readiness timed out at ${url}${config.ready}: ${output.trim()}`);
-  } catch (error) {
-    await stop();
-    throw error;
-  }
+    },
+    scratch,
+  );
 }
