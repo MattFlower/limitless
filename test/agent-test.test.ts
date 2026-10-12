@@ -22,7 +22,13 @@ import {
   wrapperLeaseClient,
   wrapperMain,
 } from "../src/cli/agent-test.ts";
-import { type LeaseClient, LeaseRejected, withGateLease } from "../src/cli/gate-slot.ts";
+import {
+  gateSlotCommand,
+  type LeaseClient,
+  LeaseRejected,
+  localLeaseClient,
+  withGateLease,
+} from "../src/cli/gate-slot.ts";
 import { AgentTestSession, agentTestLease, type TestWait } from "../src/gates/agent-tests.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { SCRATCH_NAME } from "../src/harness/scratch.ts";
@@ -862,12 +868,23 @@ test("nested lease reuse also waits through a reset without running unslotted", 
 });
 
 test.each([
-  ["reset", false],
-  ["truncated headers", false],
-  ["reset", true],
-  ["truncated headers", true],
-] as const)("local lease service %s never runs unslotted (Unix=%s)", async (mode, unix) => {
+  ["reset", false, false],
+  ["truncated headers", false, false],
+  ["reset", true, false],
+  ["truncated headers", true, false],
+  ["truncated body", false, false],
+  ["truncated body", true, false],
+  ["truncated body", false, true],
+  ["truncated body", true, true],
+] as const)("local lease service %s waits (Unix=%s, parent=%s)", async (mode, unix, parent) => {
   const f = fixture();
+  const previousParent = process.env.LIMITLESS_AGENT_TEST_LEASE;
+  if (parent) process.env.LIMITLESS_AGENT_TEST_LEASE = "parent";
+  else delete process.env.LIMITLESS_AGENT_TEST_LEASE;
+  cleanup.push(() => {
+    if (previousParent === undefined) delete process.env.LIMITLESS_AGENT_TEST_LEASE;
+    else process.env.LIMITLESS_AGENT_TEST_LEASE = previousParent;
+  });
   const sockets = new Set<Socket>();
   let requests = 0,
     markerSeen = false;
@@ -880,7 +897,9 @@ test.each([
       if (mode === "reset") {
         if (unix) socket.destroy();
         else socket.resetAndDestroy();
-      } else socket.end("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Len");
+      } else if (mode === "truncated body")
+        socket.end('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"id":');
+      else socket.end("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Len");
     });
   });
   const warn = spyOn(console, "warn").mockImplementation(() => {});
@@ -905,11 +924,69 @@ test.each([
       /waited [\d.]+ms for the gate lane; try a targeted run: bun test <file>; last failure: /,
     );
     expect(stderr).not.toContain("coordination unavailable");
+    if (mode === "truncated body") expect(stderr).toContain("ECONNRESET");
   } finally {
     for (const socket of sockets) socket.destroy();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test.each(["truncated body", "malformed JSON", "invalid schema"])(
+  "local lease service %s stays rejected for the CLI and deploy; complete invalid agent replies reject",
+  async (mode) => {
+    const f = fixture(),
+      sockets = new Set<Socket>();
+    let requests = 0;
+    const payload = mode === "invalid schema" ? '{"id":"","acquired":true}' : '{"id":';
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      socket.once("data", () => {
+        requests++;
+        socket.end(
+          `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${mode === "truncated body" ? 100 : Buffer.byteLength(payload)}\r\n\r\n${payload}`,
+        );
+      });
+    });
+    try {
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("missing server port");
+      f.config.port = address.port;
+      const client = localLeaseClient(address.port);
+      await expect(gateSlotCommand(["--max-wait", "1", "--", f.fake, "test"], client)).rejects.toBeInstanceOf(
+        LeaseRejected,
+      );
+      expect(requests).toBe(1);
+      let deployed = false;
+      await expect(
+        withGateLease(
+          "deploy",
+          async () => {
+            deployed = true;
+          },
+          { client },
+        ),
+      ).rejects.toBeInstanceOf(LeaseRejected);
+      expect(deployed).toBe(false);
+      expect(requests).toBe(2);
+      if (mode !== "truncated body") {
+        const configFile = join(f.root, "config.json");
+        writeFileSync(configFile, JSON.stringify(f.config));
+        const error = spyOn(console, "error").mockImplementation(() => {});
+        cleanup.push(() => error.mockRestore());
+        expect(await wrapperMain([configFile, "bun", "test"])).toBe(1);
+        expect(error.mock.calls.flat().join()).toContain("invalid gate-slot");
+        expect(requests).toBe(3);
+      }
+      expect(existsSync(f.marker)).toBe(false);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
 
 test("an HTTP transport timeout still tries the reachable invocation socket", async () => {
   const f = fixture(),
