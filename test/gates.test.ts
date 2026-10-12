@@ -83,6 +83,37 @@ describe("detectGates", () => {
     expect(g.protectedPaths).toEqual(["migrations/**"]);
   });
 
+  test.each(["formatting", "credential"])("refuses sanitized gate name collisions (%s)", (kind) => {
+    const secret = "synthetic-detect-gate-name-credential-486";
+    proc.registerCredential("detect-gate-name-test", secret);
+    const sanitized = kind === "formatting" ? "check" : "check [redacted]";
+    const names = [sanitized, kind === "formatting" ? "check\x1b[31m" : `check ${secret}`];
+    const dir = tempDir({
+      ".limitless.toml": `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "true" }`).join(", ")}]\n`,
+    });
+    try {
+      expect(() => detectGates(dir)).toThrow(
+        `.limitless.toml gate names must stay distinct once sanitized: "${sanitized}"`,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps literal gate names when sanitized names are distinct", () => {
+    const secret = "synthetic-detect-control-credential-486";
+    proc.registerCredential("detect-gate-name-control", secret);
+    const names = ["check\x1b[31m", `other ${secret}`];
+    const dir = tempDir({
+      ".limitless.toml": `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "true" }`).join(", ")}]\n`,
+    });
+    try {
+      expect(detectGates(dir).checks).toEqual(names.map((name) => ({ name, run: "true" })));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("go and rust", () => {
     expect(detectGates(tempDir({ "go.mod": "module x" })).checks.map((c) => c.name)).toEqual(["vet", "test"]);
     expect(detectGates(tempDir({ "Cargo.toml": "[package]" })).checks.map((c) => c.name)).toEqual([

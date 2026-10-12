@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { redactGateOutput } from "./output.ts";
 
 export interface GateCommand {
   name: string;
@@ -40,6 +41,15 @@ export function detectGates(cwd: string): GateConfig {
       protectedPaths: Array.isArray(policy.protected_paths) ? (policy.protected_paths as string[]) : [],
     };
     if (policy.merge === "auto" || policy.merge === "pr" || policy.merge === "none") cfg.merge = policy.merge;
+    // Stored gate results are sanitized on reload, so names that only differ by terminal formatting or a
+    // registered credential could not be told apart afterwards; refuse them instead of guessing.
+    const names = new Set<string>();
+    for (const { name } of cfg.checks) {
+      const key = redactGateOutput(name);
+      if (names.has(key))
+        throw new Error(`.limitless.toml gate names must stay distinct once sanitized: "${key}"`);
+      names.add(key);
+    }
     return cfg;
   }
 
