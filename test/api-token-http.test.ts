@@ -270,8 +270,8 @@ test("CLI uses the configured port and its environment override for an older dae
   }
 });
 
-test.each(["unreadable", "invalid TOML", "unrelated setting", "environment override"])(
-  "CLI, lease and MCP requests tolerate %s configuration",
+test.each(["unreadable", "invalid TOML", "invalid port", "unrelated setting", "environment override"])(
+  "CLI, lease, deploy and MCP requests tolerate %s configuration",
   async (kind) => {
     const home = mkdtempSync(join(tmpdir(), "limitless-client-config-"));
     const config = join(home, "config.toml");
@@ -284,6 +284,8 @@ test.each(["unreadable", "invalid TOML", "unrelated setting", "environment overr
       port: 0,
       fetch(req) {
         seen.push(req.headers.get("authorization"));
+        if (new URL(req.url).pathname === "/api/health")
+          return Response.json({ ok: true, uptimeMs: 0, draining: false, active: [] });
         return Response.json(
           new URL(req.url).pathname === "/api/admin/gate-slot" ? { id: "lease", acquired: true } : [],
         );
@@ -300,7 +302,7 @@ test.each(["unreadable", "invalid TOML", "unrelated setting", "environment overr
         config,
         kind === "invalid TOML"
           ? `credential = "${secret}"\n[server\n`
-          : `[server]\nport = ${stub.port}\n[review]\nmode = "invalid"\n`,
+          : `[server]\nport = ${kind === "invalid port" ? '"7400"' : stub.port}\n[review]\nmode = "invalid"\n`,
       );
       if (kind === "unreadable" || kind === "environment override") chmodSync(config, 0);
       if (kind === "environment override") process.env.LIMITLESS_PORT = `+${stub.port}`;
@@ -317,12 +319,12 @@ test.each(["unreadable", "invalid TOML", "unrelated setting", "environment overr
       await expect(httpBackend(base).list(undefined, 20)).resolves.toEqual([]);
       const lease = localLeaseClient();
       const originalFetch = globalThis.fetch;
-      const leaseUrls: string[] = [];
+      const requestUrls: string[] = [];
       // Forward the default-port request to our port-0 server without occupying a shared port.
       const forward = spyOn(globalThis, "fetch").mockImplementation(
         Object.assign(
           (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
-            leaseUrls.push(String(url));
+            requestUrls.push(String(url));
             return originalFetch(`${base}${new URL(String(url)).pathname}`, init);
           },
           { preconnect: fetch.preconnect },
@@ -333,11 +335,16 @@ test.each(["unreadable", "invalid TOML", "unrelated setting", "environment overr
           id: "lease",
           acquired: true,
         });
+        await expect(
+          localDeployClient(resolveClientPort()).health(new AbortController().signal),
+        ).resolves.toMatchObject({ ok: true });
       } finally {
         forward.mockRestore();
       }
-      expect(leaseUrls).toEqual([`http://127.0.0.1:${authorized ? stub.port : 7400}/api/admin/gate-slot`]);
+      const routedBase = `http://127.0.0.1:${authorized ? stub.port : 7400}`;
+      expect(requestUrls).toEqual([`${routedBase}/api/admin/gate-slot`, `${routedBase}/api/health`]);
       expect(seen).toEqual([
+        authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,
         authorized ? `Bearer ${secret}` : null,

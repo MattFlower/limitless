@@ -83,7 +83,7 @@ export function localDeployClient(port: number): DeployClient {
     const response = await fetch(url, {
       method,
       signal,
-      headers: { "content-type": "application/json", ...apiTokenHeaders(url, undefined, port) },
+      headers: { "content-type": "application/json", ...apiTokenHeaders(url) },
     });
     if (response.status === 404 && path.startsWith("/api/admin/"))
       throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
