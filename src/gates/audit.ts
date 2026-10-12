@@ -1,5 +1,6 @@
 import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
+import { redactGateOutput } from "./output.ts";
 import { loadPrivateStrings, privateMatches, privateReason, redactPrivate } from "./private.ts";
 
 export interface AuditFinding {
@@ -386,8 +387,8 @@ export function auditDiff(
         file: "package.json",
         detail:
           after === undefined
-            ? `Removed the "${name}" script that a factory check runs.`
-            : `Changed the "${name}" script that a factory check runs ("${before}" → "${after}").`,
+            ? `Removed the "${redactGateOutput(name)}" script that a factory check runs.`
+            : `Changed the "${redactGateOutput(name)}" script that a factory check runs ("${redactGateOutput(before)}" → "${redactGateOutput(after)}").`,
       });
     }
   }
@@ -396,7 +397,7 @@ export function auditDiff(
       findings.push({
         rule: "no-verify",
         severity: "warn",
-        detail: `Agent ran a command with --no-verify: ${cmd}`,
+        detail: `Agent ran a command with --no-verify: ${redactGateOutput(cmd)}`,
       });
     }
   }

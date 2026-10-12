@@ -2,15 +2,18 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { auditDiff } from "../src/gates/audit.ts";
 import { cacheableBaseline } from "../src/gates/cache.ts";
-import type { ExecutionHandle, GateExecutor, GateRequest } from "../src/gates/executor.ts";
+import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
-import { type GateRun, retryBaselineFailures } from "../src/gates/run.ts";
+import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
+import { formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { renderReport } from "../src/pipeline/report.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
@@ -144,6 +147,12 @@ test.each([
   ["rebase", "pending"],
   ["rebase", "after-result"],
 ] as const)("restart runs a moved %s head afresh (%s)", async (purpose, checkpoint) => {
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = ${JSON.stringify("colored\x1b[31m")}, run = "true" }]\n`,
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "formatted gate identity"], { cwd: fixture.repoDir });
   const interrupted = deferred<void>();
   const scripted = fake(async (_h, req) => ({
     ...result(req),
@@ -370,6 +379,140 @@ test.each([
     finished.store.getArtifact(run.id, "baseline-gates.json"),
   ]);
   expect(observable).not.toContain(JSON.stringify(literal).slice(1, -1));
+});
+
+test("changed baseline script diagnostics stay redacted after gate-started restart", async () => {
+  const secret = "synthetic-baseline-script-credential-486";
+  registerCredential("baseline-script-test", secret);
+  const script = `true # ${secret}`;
+  const candidate = JSON.stringify({ scripts: { check: "true" } });
+  writeFileSync(join(fixture.repoDir, "package.json"), JSON.stringify({ scripts: { check: script } }));
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    '[gates]\nchecks = [{ name = "check", run = "bun run check" }]\n',
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "baseline script credential"], { cwd: fixture.repoDir });
+  const changeScript: Handler = (s) =>
+    roleOf(s) === "implement" ? { files: { "package.json": candidate } } : handler(s);
+  const interrupted = deferred<void>();
+  const f = start(changeScript, false, false, {
+    faults: {
+      "store:save": {
+        action: "kill",
+        when: (c) => c.stage === "gates" && c.checkpoint === "gate-started",
+        onHit: () => interrupted.resolve(),
+      },
+    },
+  });
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Change check", profile: "quick" });
+  await interrupted.promise;
+  await f.stop();
+  expect(f.store.getRunState<RunState>(run.id)?.baselineScripts).toEqual({ check: script });
+  f.store.close();
+  const resumed = start(changeScript);
+  resumed.deps.cfg.maxRounds = 1;
+  expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  const state = resumed.store.getRunState<RunState>(run.id);
+  expect(state?.baselineScripts).toEqual({ check: script });
+  expect(state?.lastAudit?.find((finding) => finding.rule === "gate-script-changed")).toMatchObject({
+    severity: "block",
+    detail: 'Changed the "check" script that a factory check runs ("true # [redacted]" → "true").',
+  });
+  const events = resumed.store.listEvents(run.id).filter((event) => event.type === "audit");
+  expect(events.length).toBeGreaterThan(0);
+  expect(state?.feedback).toContain("true # [redacted]");
+  expect(resumed.store.getRun(run.id)?.error).toContain("Last feedback:");
+  expect(JSON.stringify([events, state?.feedback, resumed.store.getRun(run.id)?.error])).not.toContain(
+    secret,
+  );
+  if (!state) throw new Error("missing resumed state");
+  const report = renderReport({
+    success: false,
+    runId: run.id,
+    prompt: run.prompt,
+    state,
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "https://example.com/run",
+  });
+  expect(report).toContain("true # [redacted]");
+  expect(report).not.toContain(secret);
+  const colored = `${secret.slice(0, 12)}\x1b[31m${secret.slice(12)}\x1b[0m`;
+  const fresh = auditDiff(
+    { patch: "", files: [], stat: "", added: 0, removed: 0 },
+    {
+      taskClass: "question",
+      protectedPaths: [],
+      gateScripts: { before: { check: script }, after: { check: `true # ${colored} changed` } },
+      toolCommands: [`git commit --no-verify -m '${colored}'`],
+    },
+  );
+  expect(fresh.map((finding) => finding.detail)).toEqual([
+    'Changed the "check" script that a factory check runs ("true # [redacted]" → "true # [redacted] changed").',
+    "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]'",
+  ]);
+});
+
+test("formatted gate identities keep baseline verdicts after gate-started restart", async () => {
+  const name = "colored\x1b[31m";
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = ${JSON.stringify(name)}, run = "false" }]\n`,
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "formatted gate identity"], { cwd: fixture.repoDir });
+  const interrupted = deferred<void>();
+  const f = start(handler, false, false, {
+    faults: {
+      "store:save": {
+        action: "kill",
+        when: (c) => c.stage === "gates" && c.checkpoint === "gate-started",
+        onHit: () => interrupted.resolve(),
+      },
+    },
+  });
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+  await interrupted.promise;
+  await f.stop();
+  expect(f.store.getRunState<RunState>(run.id)?.baseline?.checks[0]).toMatchObject({
+    name: "colored",
+    ok: false,
+  });
+  f.store.close();
+  const resumed = start(handler);
+  resumed.deps.cfg.maxRounds = 1;
+  await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"]);
+  const state = resumed.store.getRunState<RunState>(run.id);
+  expect(state?.gatesConfig?.checks[0]?.name).toBe(name);
+  expect(state?.lastGates?.[0]).toMatchObject({
+    name: "colored",
+    verdict: "still_failing",
+    blocking: false,
+  });
+  expect(resumed.store.getRun(run.id)?.status).toBe("succeeded");
+  const cfg = { ...gates, checks: [{ name, run: "false", timeoutSec: 37 }] };
+  const baseline = state?.baseline;
+  if (!baseline) throw new Error("missing baseline");
+  const retry: GateRunner = async (selected) => {
+    expect(selected.checks).toEqual(cfg.checks);
+    return result({ ...request(fixture.repoDir), gates: selected });
+  };
+  const signal = new AbortController().signal;
+  const retried = await retryBaselineFailures(baseline, fixture.repoDir, cfg, signal, undefined, retry);
+  expect(retried.checks[0]).toMatchObject({ ok: true, firstAttempt: { ok: false } });
+  const regression = compareGates(
+    { ...baseline, checks: baseline.checks.map((check) => ({ ...check, ok: true })) },
+    baseline,
+  );
+  const flaky = await retryRegressions(regression, fixture.repoDir, cfg, [], signal, undefined, retry);
+  expect(flaky[0]).toMatchObject({ verdict: "flaky", blocking: false, firstAttempt: { ok: false } });
+  expect(
+    formatGateFeedback(
+      regression.map((check) => ({ ...check, result: { ...check.result, timedOut: true } })),
+      cfg,
+    ),
+  ).toContain("timed out after 37 s");
 });
 
 test("saving preserves literal state while loading redacts credentials and terminal formatting", async () => {

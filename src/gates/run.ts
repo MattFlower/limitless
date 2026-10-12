@@ -5,7 +5,13 @@ import { resolveTestWorkers } from "../util/test-workers.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
-import { launchFailure, launchFailureScan, redactGateOutput, redactGateStreams } from "./output.ts";
+import {
+  launchFailure,
+  launchFailureScan,
+  redactGateOutput,
+  redactGateStreams,
+  sameGateName,
+} from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -200,7 +206,7 @@ export async function retryBaselineFailures(
 ): Promise<GateRun> {
   const retryable = (r: GateResult) =>
     !r.ok && !r.timedOut && !confinementFailed(r)
-      ? cfg.checks.find((k) => k.name === r.name && k.run === r.command)
+      ? cfg.checks.find((k) => sameGateName(k.name, r.name) && k.run === r.command)
       : undefined;
   if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
   const selected = run.checks.flatMap((r) => {
@@ -246,7 +252,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     return out;
   }
   for (const r of after.checks) {
-    const before = baseline?.checks.find((b) => b.name === r.name);
+    const before = baseline?.checks.find((b) => sameGateName(b.name, r.name));
     let verdict: GateVerdict;
     if (confinementFailed(r) || confinementFailed(before)) verdict = "confinement_error";
     else if (!before) verdict = r.ok ? "new_pass" : "new_failure";
@@ -292,7 +298,7 @@ export async function retryRegressions(
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const retryable = (c: GateComparison) =>
     c.verdict === "regressed" && !c.result.timedOut && !pointsAt(c.result.output, changed)
-      ? cfg.checks.find((k) => k.name === c.name && k.run === c.result.command)
+      ? cfg.checks.find((k) => sameGateName(k.name, c.name) && k.run === c.result.command)
       : undefined;
   if (!cmp.some(retryable)) return cmp;
   const selected = cmp.flatMap((c) => {

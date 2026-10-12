@@ -22,6 +22,10 @@ export function launchFailureScan() {
 export const redactGateOutput = (output: string): string =>
   redactCredentials(stripVTControlCharacters(output));
 
+/** Stored diagnostics have sanitized names; fresh executable inputs retain literal names. */
+export const sameGateName = (left: string, right: string): boolean =>
+  redactGateOutput(left) === redactGateOutput(right);
+
 /** Sanitize decoded historical data without changing rows; preserve the raw confinement verdict. */
 export const redactGateData = <T>(value: T): T =>
   value === undefined

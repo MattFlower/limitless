@@ -3,7 +3,7 @@ import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { redactGateData } from "../gates/output.ts";
+import { redactGateData, sameGateName } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
   citationInSource,
@@ -177,7 +177,7 @@ export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): str
   return bad
     .map((c) => {
       if (c.result.timedOut) {
-        const limit = cfg?.checks.find((k) => k.name === c.name)?.timeoutSec ?? 900;
+        const limit = cfg?.checks.find((k) => sameGateName(k.name, c.name))?.timeoutSec ?? 900;
         const output = stripVTControlCharacters(c.result.output);
         const last = [
           ...output.matchAll(
