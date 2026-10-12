@@ -909,8 +909,10 @@ test("canaries cover each distinct writable private root the production profile 
     mkdirSync(join(parent, dir), { recursive: true });
   symlinkSync(join(parent, "outer/inner"), join(parent, "alias"));
   chmodSync(join(parent, "locked"), 0o555);
+  writeFileSync(join(parent, "credential"), "denied file");
   const at = (...dirs: string[]) => dirs.map((d) => join(parent, d));
-  const deny = at("outer", "outer/inner", "alias", "locked", "missing", "other", "home");
+  // A denied file (a credential store) is never a canary location: the editor probe reads it directly.
+  const deny = at("outer", "outer/inner", "alias", "locked", "missing", "other", "home", "credential");
   const classes = { tmp: join(parent, "outer"), tmpdir: join(parent, "alias"), home: join(parent, "home") };
   // Aliases merge; a root nested in another is a distinct class and keeps its own canary; an optional
   // root we cannot write to is skipped, and home's canary goes in the factory directory.

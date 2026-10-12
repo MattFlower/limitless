@@ -10,6 +10,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -356,7 +357,15 @@ export function canaryRoots(
   for (const root of [classes.tmp, classes.tmpdir].map((path) => realpathSync(path)))
     required.set(root, [root]);
   required.set(home, [join(home, ".limitless"), home]);
-  const roots = [...new Set(deny.filter((path) => existsSync(path)).map((path) => realpathSync(path)))];
+  // Canaries go inside each root, so only directories qualify: denied files such as credential stores
+  // (#492) can't hold one, and the editor probe checks their reads directly.
+  const roots = [
+    ...new Set(
+      deny
+        .filter((path) => existsSync(path) && statSync(path).isDirectory())
+        .map((path) => realpathSync(path)),
+    ),
+  ];
   for (const root of required.keys())
     if (!roots.includes(root)) throw new Error("mandatory private root not denied");
   return roots.flatMap((root) => {
