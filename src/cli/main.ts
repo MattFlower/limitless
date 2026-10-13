@@ -6,7 +6,9 @@ import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
+import { resolveClientPort } from "./client-port.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
 import { localOwnerDiagnostics, printOwnerDiagnostics } from "./owner-diagnostics.ts";
@@ -77,21 +79,32 @@ Usage:
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
-Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
+Environment: LIMITLESS_URL, else http://127.0.0.1:<port>
+             Port: LIMITLESS_PORT, else [server] port, else 7400`;
 
-const BASE = process.env.LIMITLESS_URL ?? `http://127.0.0.1:${process.env.LIMITLESS_PORT ?? 7400}`;
+const daemonUrl = (port: number) => process.env.LIMITLESS_URL ?? `http://127.0.0.1:${port}`;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const port = resolveClientPort();
+  const base = daemonUrl(port);
   let res: Response;
   let text: string;
   try {
-    res = await fetch(`${BASE}${path}`, {
+    const url = `${base}${path}`;
+    const headers = new Headers({
+      "content-type": "application/json",
+      ...apiTokenHeaders(url),
+    });
+    for (const [key, value] of new Headers(init?.headers)) headers.set(key, value);
+    res = await fetch(url, {
       ...init,
-      headers: { "content-type": "application/json", ...apiTokenHeaders(), ...(init?.headers ?? {}) },
+      headers: Object.fromEntries(headers),
     });
     text = await res.text();
   } catch {
-    throw new ApiError(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`);
+    throw new ApiError(
+      redactCredentials(`Cannot reach the Limitless daemon at ${base}. Start it with \`limitless serve\`.`),
+    );
   }
   if (!res.ok) {
     let msg = text;
@@ -100,7 +113,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // not json
     }
-    throw new ApiError(`${res.status}: ${msg}`, res.status);
+    throw new ApiError(redactCredentials(`${res.status}: ${msg}`), res.status);
   }
   return JSON.parse(text) as T;
 }
@@ -136,10 +149,12 @@ function formatEvent(e: RunEvent): string {
 }
 
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
-  const res = await fetch(`${BASE}/api/runs/${runId}/stream?after=${after}`, { headers: apiTokenHeaders() });
+  const port = resolveClientPort();
+  const url = `${daemonUrl(port)}/api/runs/${runId}/stream?after=${after}`;
+  const res = await fetch(url, { headers: apiTokenHeaders(url) });
   if (!res.ok) {
     const reply = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new ApiError(`${res.status}: ${reply?.error ?? res.statusText}`, res.status);
+    throw new ApiError(redactCredentials(`${res.status}: ${reply?.error ?? res.statusText}`), res.status);
   }
   if (!res.body) return;
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -323,7 +338,7 @@ async function main(): Promise<void> {
       return serve();
     case "mcp": {
       const { startStdio } = await import("../integrations/mcp.ts");
-      return startStdio(BASE);
+      return startStdio(daemonUrl(resolveClientPort()));
     }
     case "integrations": {
       if (rest[0] !== "install") throw new Error("usage: limitless integrations install [--write]");
@@ -504,10 +519,9 @@ async function main(): Promise<void> {
     }
     case "service": {
       const svc = await import("./service.ts");
-      const port = Number(process.env.LIMITLESS_PORT ?? 7400);
+      const port = resolveClientPort();
       if (rest[0] === "install") {
         const tunnel = values.tunnel === true;
-        // Only the tunnel needs the public host; plain installs never read config here.
         const publicUrl = tunnel ? (await import("../config.ts")).loadConfig().publicUrl : null;
         return svc.install(port, { tunnel, mtplx: values.mtplx === true, publicUrl });
       }
@@ -519,7 +533,7 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       if (rest.length > 1)
         throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
-      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true, {
+      return svc.deploy(resolveClientPort(), rest[0], values.smoke === true, {
         maxWaitMs,
         now: values.now === true,
       });
@@ -669,6 +683,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error(color.red((e as Error).message));
+  console.error(color.red(redactCredentials((e as Error).message)));
   process.exit(1);
 });
