@@ -82,6 +82,15 @@ and extend the closest case when it already exercises that behavior.
 - **External clients are injected.** `gh`, GitHub and model clients come in through parameters or
   factory dependencies, and some default to the real one (for example the `client` parameter of
   `startGitHubNotifier`). Pass a fake every time.
+- **Gates need the factory read policy.** A test that runs gate commands (`runLocalGates`,
+  `executeGate`, a `LandQueue` check) imports `test` from `./read-policy-support.ts`, which binds the
+  test policy to each callback, and gives a `LandQueue` `readPolicy: testReadPolicy`. Without it the
+  gate fails closed with "Missing factory read policy" (#486's new gate tests failed this way once
+  the policy reached main).
+- **A synthetic resumed run records what a resume restores.** A test that writes a `RunState` past
+  `prepare` and resumes it sets each field the engine would otherwise restore from the base commit
+  (`previewConfig: null`, `slottedCommands: []`) unless that restore is under test, or the resume
+  fails with "Cannot restore base ... missing base SHA or worktree".
 - **"Flaky" needs evidence.** Before calling a failure flaky, rerun it alone and read its raw
   output. Deterministic bugs (a matcher that missed a changed CLI path, a test race exposed by a
   faster code path) have been dismissed as flakes and cost hours.
