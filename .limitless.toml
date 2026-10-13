@@ -10,6 +10,11 @@ checks = [
   { name = "test", run = "bun test --parallel=$(bun scripts/test-workers.ts)", timeoutSec = 1800 },
 ]
 
+[limits]
+# Agents' own `bun test` runs wait for a gate slot instead of running beside land checks: unslotted full
+# suites from an implementer blocked #492's land three times with load timeouts (2026-10-12).
+slotted_commands = ["bun test"]
+
 [policy]
 # Changes to the factory itself are reviewed by the orchestrator before merging.
 merge = "pr"
