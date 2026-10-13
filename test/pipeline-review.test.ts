@@ -777,6 +777,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       phase: "loop",
       round: 5,
       previewConfig: null,
+      slottedCommands: [],
       holdoutStatus: "complete",
       feedback: `Gate failed with credential ${secret}`,
     } satisfies RunState);

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
@@ -28,6 +28,7 @@ import {
   triage,
   waitFor,
 } from "./pipeline-support.ts";
+import { test, testReadPolicy } from "./read-policy-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
   home: "",
@@ -1063,6 +1064,7 @@ test.each(["injected", "local"])("landing checks log setup and check events once
     store: f.store,
     paths: f.deps.cfg.paths,
     confinement: fakeConfinement,
+    readPolicy: testReadPolicy,
     gateExecutor: kind === "local" ? localExecutor() : scripted.executor,
     client: async () => ({
       url: prUrl,
