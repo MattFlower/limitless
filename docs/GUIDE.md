@@ -1500,6 +1500,15 @@ fields such as `apiKey` are rejected. During this migration only, the deprecated
 mtplx provider retains its internal static-token fallback under its original ID; export omits
 that token. An explicit `api_key_env` replaces the fallback.
 
+**An agent can read its backend's token.** When an agent works through an
+`anthropic-compatible` provider, the factory writes the provider's key to a mode-0600 file in
+its own temporary directory for that invocation, and the Claude CLI reads it from there. The
+key stays out of the agent's environment, but the agent's tools run as the same user and are
+not denied reads of that file while the invocation runs, so an agent can print the token.
+Give each such provider a token scoped to that backend alone, with no other privileges and a
+spending limit where the backend offers one, and rotate it if a run may have exposed it. Local
+servers that need no key carry no such risk (#335).
+
 Part 1 keeps built-ins alongside configured providers: a matching ID takes precedence;
 omission does not remove a provider. Startup notes identify implicit deprecated machine
 providers until they have explicit definitions. Legacy `[providers.omlx]` tables with
