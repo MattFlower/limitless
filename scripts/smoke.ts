@@ -9,6 +9,7 @@ import { Store } from "../src/db/store.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
@@ -1057,7 +1058,9 @@ export async function main(print = console.log, options: RunOptions = {}): Promi
   if (index >= 0) {
     const references = process.argv[index + 1];
     if (!references) throw new Error("--models requires model@effort references");
-    return reportChecks(explicitModelChecks(references, catalog, excludeOrigins), print, options);
+    return readPolicyScope.run(cfg.readPolicy, () =>
+      reportChecks(explicitModelChecks(references, catalog, excludeOrigins), print, options),
+    );
   }
   const store = new Store(cfg.paths.db);
   const runtime = store.runtimeModels();
@@ -1078,7 +1081,7 @@ export async function main(print = console.log, options: RunOptions = {}): Promi
     ),
   );
   checks.push(...catalogChecks(enabled, [...catalog.models, ...runtime], secrets));
-  return reportChecks(checks, print, options);
+  return readPolicyScope.run(cfg.readPolicy, () => reportChecks(checks, print, options));
 }
 
 if (import.meta.main) process.exitCode = await main();

@@ -27,6 +27,7 @@ import {
   remoteBranchSha,
   removeWorktree,
 } from "../git/repos.ts";
+import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
@@ -74,6 +75,7 @@ export interface LandDeps {
   gateExecutor?: GateExecutor;
   store: Store;
   paths: Paths;
+  readPolicy?: ReadPolicyOptions;
   /** GitHub polling is on: read the poller's saved observations instead of calling `gh` every cycle. */
   polling?: boolean;
   client?: LandPrClient;
@@ -295,7 +297,10 @@ export class LandQueue {
     };
     let heartbeat = set(beat, CLAIM_STALE_MS / 3);
     // `checking` re-runs the checks from the start, like a `queued` entry.
-    const work = () => worktreeGitScope.run(true, () => this.land(entry, signal));
+    const work = () =>
+      readPolicyScope.run(this.deps.readPolicy, () =>
+        worktreeGitScope.run(true, () => this.land(entry, signal)),
+      );
     try {
       await (this.deps.confinement ? confinementScope.run(this.deps.confinement, work) : work());
     } catch (error) {

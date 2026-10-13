@@ -59,7 +59,9 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
+import { readPolicyScope } from "../harness/read-policy.ts";
 import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -163,7 +165,9 @@ export async function executeRun(
     { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
     () =>
       confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
-        worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+        readPolicyScope.run(deps.cfg.readPolicy, () =>
+          worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+        ),
       ),
   );
 }
@@ -208,6 +212,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           ctx.state.verification?.baseSha ?? ctx.run.baseSha,
           ".limitless.toml",
         ),
+      );
+      await ctx.save();
+    }
+    if (ctx.state.phase !== "prepare" && ctx.state.slottedCommands === undefined) {
+      const trustedSha =
+        reviewRound(ctx)?.owner.baseSha ?? ctx.state.verification?.baseSha ?? ctx.run.baseSha;
+      if (!trustedSha || !ctx.state.worktreePath)
+        throw new Error("Cannot restore base slotted commands: missing base SHA or worktree");
+      ctx.state.slottedCommands = readSlottedCommands(
+        await readFileAt(ctx.state.worktreePath, trustedSha, ".limitless.toml"),
+        (message) => ctx.log(message, "warn"),
       );
       await ctx.save();
     }
@@ -474,6 +489,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     try {
       const repoConfig = await readFileAt(wt.path, trustedSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
+      ctx.state.slottedCommands = readSlottedCommands(repoConfig, (message) => ctx.log(message, "warn"));
       // Review lenses come from the base commit, never from the change under review.
       if (ctx.deps.cfg.reviewMode === "panel")
         ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));

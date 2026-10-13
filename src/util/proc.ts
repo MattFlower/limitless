@@ -295,6 +295,8 @@ export interface ProcOptions {
   onRawChunk?: (chunk: string, stream: "stdout" | "stderr") => void;
   onStdoutLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
+  /** Emit an oversized line's bounded prefix with a truncation suffix, then discard until newline. */
+  maxLineLength?: number;
   /** Keep at most this many characters of stdout/stderr (the tail). Default 64k. */
   tailLimit?: number;
 }
@@ -321,23 +323,36 @@ const INCOMPLETE_VT = new RegExp(
   String.raw`(?:${VT_ESCAPE}(?:\][^${"\u0007\u001b\u009c"}]*(?:${VT_ESCAPE})?|\[[0-?]*[ -/]*|[ -/]*)|${"\u009b"}[0-?]*[ -/]*)$`,
 );
 
-function lineSplitter(onLine?: (line: string) => void) {
+function lineSplitter(onLine?: (line: string) => void, limit = Infinity) {
   let pending = "";
+  let discarding = false;
   return {
     push(chunk: string) {
       if (!onLine) return;
-      pending += chunk;
-      let idx = pending.indexOf("\n");
-      while (idx >= 0) {
-        const line = pending.slice(0, idx);
-        pending = pending.slice(idx + 1);
-        if (line.length) onLine(line);
-        idx = pending.indexOf("\n");
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf("\n", start);
+        const end = newline < 0 ? chunk.length : newline;
+        if (!discarding) {
+          const remaining = limit - pending.length;
+          if (end - start > remaining) {
+            // Never present a truncated suffix as a complete line (notably the startup marker).
+            onLine(`${pending}${chunk.slice(start, start + remaining)} [truncated]`);
+            pending = "";
+            discarding = true;
+          } else pending += chunk.slice(start, end);
+        }
+        if (newline < 0) break;
+        if (pending.length) onLine(pending);
+        pending = "";
+        discarding = false;
+        start = newline + 1;
       }
     },
     flush() {
       if (onLine && pending.length) onLine(pending);
       pending = "";
+      discarding = false;
     },
   };
 }
@@ -403,8 +418,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     let idleTimedOut = false;
     let settled = false;
     let lastActivity = Date.now();
-    const out = lineSplitter(opts.onStdoutLine);
-    const err = lineSplitter(opts.onStderrLine);
+    const out = lineSplitter(opts.onStdoutLine, opts.maxLineLength);
+    const err = lineSplitter(opts.onStderrLine, opts.maxLineLength);
 
     let shutdown: Promise<void> | undefined;
     let terminationError: ProcessTerminationError | undefined;

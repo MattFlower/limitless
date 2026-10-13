@@ -26,6 +26,7 @@ import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { testReadPolicy } from "./read-policy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 // These tests drive real git and confined gate commands; under CPU load they outlast Bun's 5 s default.
@@ -273,6 +274,7 @@ function queue(
   const q = new LandQueue({
     store,
     paths,
+    readPolicy: testReadPolicy,
     github: github.client,
     confinement: fakeConfinement,
     clock: {

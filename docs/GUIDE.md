@@ -202,6 +202,8 @@ use the file first, then the environment.
 | `[gates] executor` | `"local"` | Gate execution backend; `local` is the only supported value for now. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
+| `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
+| `[sandbox] toolchain_paths` | `[]` | Additional gate-readable toolchain roots, from this factory configuration only. Only build subpaths of the Bun, Cargo and Rustup homes are included by default (using the factory's `BUN_INSTALL`, `CARGO_HOME` and `RUSTUP_HOME` when set); Cargo registry credentials stay denied. A root overlapping a denied credential path prevents launch. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
 | `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
@@ -211,6 +213,18 @@ use the file first, then the environment.
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] remote_model_path`, `remote_host`, `remote_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
 
+Gates deny home reads except their checkout, scratch, recorded Git directories and approved
+toolchains; system paths remain readable. Exact ancestor manifest names and `node_modules`
+metadata remain readable for toolchain discovery, without directory listing access. Each factory
+retains its frozen configuration and credential-location environment snapshot. Editors and gates
+also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`,
+`LIMITLESS_CONFIG_DIR`, the AWS credential/config variables, `DOCKER_CONFIG`, `GNUPGHOME`,
+`KUBECONFIG`, `NETRC`, npm userconfig variables and Cargo's credential files. Editors deny the
+credential stores above, but Claude's
+own CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
+macOS Keychain access through `security`, network egress and the loopback API (#484) remain separate
+gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
+
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default
 branch:
 
@@ -219,10 +233,33 @@ branch:
 setup = ["bun install --frozen-lockfile"]
 checks = [{ name = "test", run = "bun test", timeoutSec = 900 }]
 
+[limits]
+slotted_commands = ["bun test"]   # optional argv prefixes for agents' own test commands
+
 [policy]
 merge = "pr"                      # auto | pr | none
 protected_paths = ["migrations/**"]
 ```
+
+`[limits] slotted_commands` is opt-in and comes only from the run's trusted base commit;
+the value is saved for resume and review. Unset or `[]` leaves agent PATH unchanged.
+Invalid values warn and disable slotting: use nonempty command strings with executable
+names, without path separators. Prefixes match argv tokens, including calls inside shell
+commands and package scripts; absolute executable paths bypass PATH wrappers.
+
+Bare matched commands use the shared gate lane (`max_concurrent_gates`). File/path
+arguments or `-t`/`--test-name-pattern` use a separate small lane, fixed at two concurrent
+agent tests. Flags such as `--coverage` alone still count as full suites. Small commands
+never wait behind a full suite. Health reports this lane as `agentTestSlots` next to
+`gateSlots`; timeline events carry `kind: "agent-test"`, command, lane and queued wait ms.
+Gates, baselines, land checks and deploys keep their existing leases and PATH.
+
+Wrappers use loopback HTTP, with a scratch Unix socket fallback, without expanding
+sandbox permissions. Each invocation's wrappers and lease capability live in a private
+factory directory that every agent and gate sandbox denies reading, except to that invocation. If both transports are unavailable they warn and run the command,
+following gate-slot coordination semantics; a rejected lease or cancellation fails.
+Private holdout authors with read confinement do not receive wrappers, since they cannot
+read the factory-owned wrapper location. Run and stage concurrency limits stay unchanged.
 
 > [!IMPORTANT]
 > When `.limitless.toml` exists, gates come **only** from it. Automatic detection (package.json

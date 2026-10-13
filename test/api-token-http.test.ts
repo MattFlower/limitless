@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, expect, mock, spyOn } from "bun:test";
 import {
   mkdirSync,
   readFileSync,
@@ -17,6 +17,7 @@ import { localDeployClient } from "../src/cli/deploy-wait.ts";
 import { localLeaseClient } from "../src/cli/gate-slot.ts";
 import { doctor, setupDeps } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
+import { AgentTestSession, liveAgentTestCapability } from "../src/gates/agent-tests.ts";
 import { buildClaudeArgs } from "../src/harness/claude.ts";
 import { buildCodexArgs } from "../src/harness/codex.ts";
 import { seatbeltBackend, seatbeltForPort, seatbeltProfile } from "../src/harness/sandbox.ts";
@@ -31,6 +32,7 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { agentEnv, redactCredentials, runProcess, sh } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
+import { test } from "./read-policy-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let server: Awaited<ReturnType<typeof startHttp>>;
@@ -226,7 +228,8 @@ test("token and loopback sessions authorize; bad credentials never fall back", a
 });
 
 test("the capability hook authorizes only gate-slot, preserving loopback restrictions", async () => {
-  const capability = { authorization: "Bearer invocation-capability" };
+  const session = new AgentTestSession(() => {});
+  const capability = { authorization: `Bearer ${session.token}` };
   const routes = createHttpRoutes(f.factory, {
     apiToken: token,
     gateSlotCapability: (req) => req.headers.get("authorization") === capability.authorization,
@@ -237,17 +240,106 @@ test("the capability hook authorizes only gate-slot, preserving loopback restric
       requestWithParams(`http://localhost${path}`, {
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
-        body: '{"id":"unknown"}',
+        body: JSON.stringify({ token: session.token, name: "probe", lane: "small" }),
       }),
       peer,
     );
   };
-  expect((await call("/api/admin/gate-slot", capability)).status).toBe(200);
-  for (const path of ["/api/land", "/api/runs/:id/review"])
-    expect((await call(path, capability)).status).toBe(401);
-  const remote = { requestIP: () => ({ address: "192.0.2.1" }) } as unknown as Server<undefined>;
-  for (const headers of [capability, credential()])
-    expect((await call("/api/admin/gate-slot", headers, remote)).status).toBe(403);
+  try {
+    expect((await call("/api/admin/gate-slot", capability)).status).toBe(200);
+    for (const path of ["/api/land", "/api/runs/:id/review"])
+      expect((await call(path, capability)).status).toBe(401);
+    const remote = { requestIP: () => ({ address: "192.0.2.1" }) } as unknown as Server<undefined>;
+    for (const headers of [capability, credential()])
+      expect((await call("/api/admin/gate-slot", headers, remote)).status).toBe(403);
+  } finally {
+    session.close();
+  }
+});
+
+test("a live agent-test capability is a bearer for gate-slot only, and ends with its invocation", async () => {
+  const session = new AgentTestSession(() => {});
+  const routes = createHttpRoutes(f.factory, {
+    apiToken: token,
+    gateSlotCapability: (req) => liveAgentTestCapability(req.headers.get("authorization")),
+  });
+  const call = (path: string, authorization: string) =>
+    (routes[path] as { POST: Route }).POST(
+      requestWithParams(`http://localhost${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization },
+        body: JSON.stringify({ token: session.token, name: "bun test a.test.ts", lane: "small" }),
+      }),
+      localServer,
+    );
+  const bearer = `Bearer ${session.token}`;
+  try {
+    expect((await call("/api/admin/gate-slot", bearer)).status).toBe(200);
+    for (const path of ["/api/land", "/api/runs/:id/review"])
+      expect((await call(path, bearer)).status).toBe(401);
+    expect((await call("/api/admin/gate-slot", "Bearer 00000000-0000-4000-8000-000000000000")).status).toBe(
+      401,
+    );
+  } finally {
+    session.close();
+  }
+  expect((await call("/api/admin/gate-slot", bearer)).status).toBe(401);
+});
+
+test("a capability bearer acts only for its own invocation's body", async () => {
+  const a = new AgentTestSession(() => {});
+  const b = new AgentTestSession(() => {});
+  const routes = createHttpRoutes(f.factory, {
+    apiToken: token,
+    gateSlotCapability: (req) => liveAgentTestCapability(req.headers.get("authorization")),
+  });
+  const post = (authorization: string, body: Record<string, unknown>) =>
+    (routes["/api/admin/gate-slot"] as { POST: Route }).POST(
+      requestWithParams("http://localhost/api/admin/gate-slot", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization },
+        body: JSON.stringify(body),
+      }),
+      localServer,
+    );
+  try {
+    const held = await post(`Bearer ${b.token}`, {
+      token: b.token,
+      name: "bun test b.test.ts",
+      lane: "small",
+    });
+    const lease = (await held.json()) as { id: string; acquired: boolean };
+    expect(lease.acquired).toBe(true);
+    // No body token would reach the legacy path, which admits running leases past the limit.
+    expect((await post(`Bearer ${a.token}`, { name: "uncapped agent", running: true })).status).toBe(401);
+    // Another invocation's token in the body never lets A act on B's lease.
+    expect((await post(`Bearer ${a.token}`, { token: b.token, id: lease.id, release: true })).status).toBe(
+      401,
+    );
+    const still = await post(`Bearer ${b.token}`, { token: b.token, id: lease.id });
+    expect(((await still.json()) as { acquired: boolean }).acquired).toBe(true);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+test("the lease client sends an agent's capability, never the API token, as its bearer", async () => {
+  const previous = process.env.LIMITLESS_HOME;
+  process.env.LIMITLESS_HOME = f.factory.cfg.paths.home;
+  const fetcher = spyOn(globalThis, "fetch").mockImplementation((async () =>
+    Response.json({ id: "x", acquired: true })) as unknown as typeof fetch);
+  const capability = "11111111-1111-4111-8111-111111111111";
+  try {
+    await localLeaseClient(1)({ token: capability, name: "bun test" }, new AbortController().signal);
+    await localLeaseClient(1)({ name: "deploy" }, new AbortController().signal);
+    const sent = fetcher.mock.calls.map(([, init]) => new Headers(init?.headers).get("authorization"));
+    expect(sent).toEqual([`Bearer ${capability}`, `Bearer ${token}`]);
+  } finally {
+    fetcher.mockRestore();
+    if (previous === undefined) delete process.env.LIMITLESS_HOME;
+    else process.env.LIMITLESS_HOME = previous;
+  }
 });
 
 function editorSpec(): AgentSpec {
@@ -360,6 +452,45 @@ test("startup protects a not-yet-published token before resuming queued land che
     await startup.close();
   }
   expect(privateReadPaths()).not.toContain(path);
+});
+
+test("with enforcement on, the daemon accepts a live agent-test capability for gate-slot only", async () => {
+  const startup = await fixture();
+  startup.factory.cfg.port = 0;
+  startup.factory.cfg.listenLan = null;
+  startup.factory.cfg.requireApiToken = true;
+  const land = spyOn(startup.factory.land, "start").mockImplementation(() => {});
+  const start = spyOn(startup.factory, "start").mockImplementation(() => {});
+  const session = new AgentTestSession(() => {});
+  let running: Awaited<ReturnType<typeof startDaemon>> | undefined;
+  try {
+    running = await startDaemon(startup.factory, {}, (factory) =>
+      mountIntegrations(factory, {
+        toolVersions: async () => [],
+        gh: async () => {},
+        prClient: async () => null,
+      }),
+    );
+    const port = running.server.port;
+    const reply = await localLeaseClient(port)(
+      { token: session.token, name: "bun test a.test.ts", lane: "small" },
+      new AbortController().signal,
+    );
+    expect(reply.acquired).toBe(true);
+    const elsewhere = await fetch(`http://127.0.0.1:${port}/api/land`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${session.token}`, "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(elsewhere.status).toBe(401);
+  } finally {
+    session.close();
+    await running?.integrations.stop();
+    await running?.server.stop(true);
+    land.mockRestore();
+    start.mockRestore();
+    await startup.close();
+  }
 });
 
 for (const failedStep of ["mount", "first bind", "second bind"] as const) {

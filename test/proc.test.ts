@@ -1,16 +1,21 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { compareGates, runGates } from "../src/gates/run.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
+import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
+import { withScratch } from "../src/harness/scratch.ts";
 import { type ProcOptions, registerCredential, runProcess, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { test } from "./read-policy-support.ts";
 
 type Chunk = { stream: "stdout" | "stderr"; text: string | Buffer };
 
 /** Control pipe chunk boundaries without subprocess scheduling or timing margins. */
-async function withChunks<T>(chunks: Chunk[], run: () => Promise<T>): Promise<T> {
+async function withChunks<T>(
+  chunks: Chunk[] | ((token: string | undefined) => Chunk[]),
+  run: () => Promise<T>,
+): Promise<T> {
   const spawnFixture = (_bin: string, args?: readonly string[]) => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
@@ -24,8 +29,10 @@ async function withChunks<T>(chunks: Chunk[], run: () => Promise<T>): Promise<T>
     setImmediate(() => {
       // The real sandbox wrapper prints this trusted startup token before its payload.
       const token = args?.[3];
-      if (typeof token === "string" && token.startsWith("limitless-started-")) stdout.write(`${token}\n`);
-      for (const chunk of chunks) ({ stdout, stderr })[chunk.stream].write(chunk.text);
+      if (Array.isArray(chunks) && typeof token === "string" && token.startsWith("limitless-started-"))
+        stdout.write(`${token}\n`);
+      for (const chunk of typeof chunks === "function" ? chunks(token) : chunks)
+        ({ stdout, stderr })[chunk.stream].write(chunk.text);
       stdout.end();
       stderr.end();
       setImmediate(() => child.emit("close", 0, null));
@@ -41,6 +48,131 @@ async function withChunks<T>(chunks: Chunk[], run: () => Promise<T>): Promise<T>
 }
 
 const options = (): ProcOptions => ({ cmd: ["fixture"], cwd: process.cwd(), env: {} });
+
+test("bounded framing releases oversized lines on both streams and preserves separate startup lines", async () => {
+  const lines: string[] = [];
+  const observed: number[] = [];
+  const body = "x".repeat(256_000);
+  await withChunks(
+    (token) => [
+      // An oversized line containing the token must not count as a startup handshake.
+      { stream: "stdout", text: `${body}${token}\n` },
+      { stream: "stdout", text: token?.slice(0, 20) ?? "" },
+      { stream: "stdout", text: `${token?.slice(20)}\nshort-out\n${body}` },
+      { stream: "stderr", text: `short-error\n${body}` },
+      ...Array.from({ length: 16 }, () => [
+        { stream: "stdout" as const, text: body },
+        { stream: "stderr" as const, text: body },
+      ]).flat(),
+      { stream: "stdout", text: "\nafter-out\nlast-out" },
+      { stream: "stderr", text: "\nafter-error\nlast-error" },
+    ],
+    () =>
+      runSandboxed(
+        {
+          ...options(),
+          maxLineLength: 128,
+          tailLimit: 128,
+          onRawChunk: () => observed.push(lines.length),
+          onStarted: () => lines.push("started"),
+          onStdoutLine: (line) => lines.push(line),
+          onStderrLine: (line) => lines.push(line),
+        },
+        { write: [], protect: [] },
+        runProcess,
+        async () => {},
+        fakeConfinement,
+      ),
+  );
+  const truncated = `${"x".repeat(128)} [truncated]`;
+  expect(lines).toEqual([
+    truncated,
+    "started",
+    "short-out",
+    truncated,
+    "short-error",
+    truncated,
+    "after-out",
+    "after-error",
+    "last-out",
+    "last-error",
+  ]);
+  // Overflow is released before another chunk arrives, rather than retained until EOF.
+  expect(observed[1]).toBe(1);
+});
+
+test.each([53, 16])("sandbox startup ignores the caller's %i-character line cap", async (maxLineLength) => {
+  const markerLength = "limitless-started-".length + 36;
+  for (let offset = 0; offset <= markerLength; offset++) {
+    const lines: string[] = [];
+    const result = await withChunks(
+      (token) => [
+        { stream: "stdout", text: token?.slice(0, offset) ?? "" },
+        {
+          stream: "stdout",
+          text: `${token?.slice(offset)}\n${"x".repeat(maxLineLength + 1)}\n${"x".repeat(256)}\nafter-out`,
+        },
+        { stream: "stderr", text: `${"y".repeat(maxLineLength + 1)}\n${"y".repeat(256)}\nafter-error` },
+      ],
+      () =>
+        runSandboxed(
+          {
+            ...options(),
+            maxLineLength,
+            onStarted: () => lines.push("started"),
+            onStdoutLine: (line) => lines.push(line),
+            onStderrLine: (line) => lines.push(line),
+          },
+          { write: [], protect: [] },
+          runProcess,
+          async () => {},
+          fakeConfinement,
+        ),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("limitless-started-");
+    expect(lines).toEqual([
+      "started",
+      `${"x".repeat(maxLineLength)} [truncated]`,
+      `${"x".repeat(maxLineLength)} [truncated]`,
+      `${"y".repeat(maxLineLength)} [truncated]`,
+      `${"y".repeat(maxLineLength)} [truncated]`,
+      "after-out",
+      "after-error",
+    ]);
+  }
+});
+
+test.each(["missing", "incomplete", "oversized prefix", "oversized suffix"])(
+  "sandbox startup fails closed with %s marker",
+  async (form) => {
+    await expect(
+      withChunks(
+        (token) => [
+          {
+            stream: "stdout",
+            text:
+              form === "missing"
+                ? "candidate output\n"
+                : form === "incomplete"
+                  ? `${token?.slice(0, -1)}\n`
+                  : form === "oversized prefix"
+                    ? `${"x".repeat(256_000)}${token}\n`
+                    : `${token}${"x".repeat(256_000)}\n`,
+          },
+        ],
+        () =>
+          runSandboxed(
+            { ...options(), maxLineLength: 16 },
+            { write: [], protect: [] },
+            runProcess,
+            async () => {},
+            fakeConfinement,
+          ),
+      ),
+    ).rejects.toThrow("payload did not start");
+  },
+);
 
 test("runner keeps overlapping credentials raw in one chunk and at every split offset", async () => {
   const short = 'synthetic-overlap-"key"-\\prefix';
@@ -227,54 +359,55 @@ test.each(["literal", "JSON"])(
   },
 );
 
-test("raw confinement marker split at every offset remains authoritative before runner redaction", async () => {
-  const marker = "sandbox_apply: Operation not permitted";
-  const secret = `${marker} synthetic-marker-secret`;
-  registerCredential("SPLIT_MARKER_TEST_TOKEN", secret);
-  for (const stream of ["stdout", "stderr"] as const) {
-    for (let offset = 1; offset < marker.length; offset++) {
-      const result = await withChunks(
-        [
-          { stream, text: secret.slice(0, offset) },
-          { stream, text: secret.slice(offset) },
-        ],
-        () =>
-          confinementScope.run(fakeConfinement, () =>
-            runGates(
-              process.cwd(),
-              {
-                setup: [],
-                checks: [{ name: "marker", run: "fixture" }],
-                source: "detected",
-                protectedPaths: [],
-              },
-              new AbortController().signal,
+test("raw confinement marker split at every offset remains authoritative before runner redaction", () =>
+  withScratch(process.cwd(), async (cwd) => {
+    const marker = "sandbox_apply: Operation not permitted";
+    const secret = `${marker} synthetic-marker-secret`;
+    registerCredential("SPLIT_MARKER_TEST_TOKEN", secret);
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 1; offset < marker.length; offset++) {
+        const result = await withChunks(
+          [
+            { stream, text: secret.slice(0, offset) },
+            { stream, text: secret.slice(offset) },
+          ],
+          () =>
+            confinementScope.run(fakeConfinement, () =>
+              runGates(
+                cwd,
+                {
+                  setup: [],
+                  checks: [{ name: "marker", run: "fixture" }],
+                  source: "detected",
+                  protectedPaths: [],
+                },
+                new AbortController().signal,
+              ),
             ),
-          ),
-      );
-      expect(result.checks[0]).toMatchObject({ output: "[redacted]", confinementError: true, ok: false });
-      expect(compareGates(null, result)[0]?.verdict).toBe("confinement_error");
+        );
+        expect(result.checks[0]).toMatchObject({ output: "[redacted]", confinementError: true, ok: false });
+        expect(compareGates(null, result)[0]?.verdict).toBe("confinement_error");
+      }
     }
-  }
-  const interrupted = marker.replace("Operation", "Oper\u001b[0mation");
-  const result = await withChunks(
-    Array.from(interrupted, (text) => ({ stream: "stdout", text })),
-    () =>
-      confinementScope.run(fakeConfinement, () =>
-        runGates(
-          process.cwd(),
-          {
-            setup: [],
-            checks: [{ name: "marker", run: "fixture" }],
-            source: "detected",
-            protectedPaths: [],
-          },
-          new AbortController().signal,
+    const interrupted = marker.replace("Operation", "Oper\u001b[0mation");
+    const result = await withChunks(
+      Array.from(interrupted, (text) => ({ stream: "stdout", text })),
+      () =>
+        confinementScope.run(fakeConfinement, () =>
+          runGates(
+            cwd,
+            {
+              setup: [],
+              checks: [{ name: "marker", run: "fixture" }],
+              source: "detected",
+              protectedPaths: [],
+            },
+            new AbortController().signal,
+          ),
         ),
-      ),
-  );
-  expect(result.checks[0]).toMatchObject({ output: marker, confinementError: false, ok: true });
-});
+    );
+    expect(result.checks[0]).toMatchObject({ output: marker, confinementError: false, ok: true });
+  }));
 
 test("sh forwards opt-in redaction to the runner", async () => {
   const secret = "synthetic-sh-stream-credential";
