@@ -746,8 +746,8 @@ test.each(["hook", "purpose", "sha"] as const)(
         { name: "pending", run: `echo $$ > '${pidFile}'; exec sleep 900` },
       ],
     };
-    const handle = await executor.start(req, ctx.signal);
     await confinementScope.run(fakeConfinement, async () => {
+      const handle = await executor.start(req, ctx.signal);
       const execution = executor.attach(handle, ctx.signal);
       const settled = execution.result.catch(() => undefined);
       try {
