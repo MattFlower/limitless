@@ -70,9 +70,17 @@ export const localLeaseClient =
           : "";
       throw new LeaseRejected(`gate-slot: HTTP ${response.status}${message}`);
     }
-    const result: Reply = await response.json().catch(() => {
+    const text = await response.text().catch((error: unknown) => {
+      // Capability-bearing agent requests wait through body transport failures too.
+      if (typeof body.token === "string") throw error;
       throw new LeaseRejected("invalid gate-slot JSON");
     });
+    let result: Reply;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      throw new LeaseRejected("invalid gate-slot JSON");
+    }
     if (
       typeof result?.id !== "string" ||
       (!result.id && result.busy !== true) ||

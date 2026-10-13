@@ -64,7 +64,12 @@ must:
   `INSERT … VALUES` (for example `eval_runs` and `eval_trials` in `src/db/store.ts`), so adding a
   column to one breaks the previous release's inserts after a rollback. Put new fields for those
   tables in a new table keyed by the row id, or switch the inserts to explicit column lists in a
-  release that ships first.
+  release that ships first. Prefer `ALTER TABLE … ADD COLUMN` to a table rebuild.
+  - SQLite's `ALTER TABLE … RENAME` re-validates every trigger and view, so a rebuild fails
+    wherever some trigger names a table the database lacks, such as a test's partial schema.
+  - macOS's system SQLite accepted a rebuild that Linux CI's bundled SQLite rejected (#458).
+    To check a migration locally, run it against Homebrew's SQLite with
+    `Database.setCustomSQLite`.
 - **HTTP JSON** changes are additive: new fields optional, old fields kept. Readers tolerate
   missing and unknown fields.
 - **Run state:** a deploy restarts the daemon mid-run, and runs resume from persisted phases and
@@ -119,6 +124,16 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   `sandbox_apply: Operation not permitted` counts as a confinement failure, not a test result, so
   keep that literal out of test titles and printed strings (a `test.each` title containing it once
   blocked a round as a confinement error).
+- **The home is read-denied for gates.** A gate reads only its checkout, scratch, trusted Git paths
+  and toolchains (#492). Inside one, `realpath` on the home fails although `lstat` reports it.
+  - A test that runs a confined command must keep everything that command reads inside the
+    command's own checkout or scratch. A test that passes from a checkout in `/tmp` can still fail
+    from one under the home, which is where the deploy's release checkout lives (#500).
+  - Deny lists hold files (credential stores) as well as directories. Code that walks them must
+    not assume a directory (#501: the Codex probe made canaries inside `~/.npmrc`).
+  - Before landing a confinement change, run the full suite unconfined from a checkout under the
+    real home, as the deploy does. Gates, land checks and CI skip the real-Seatbelt tests, and a
+    `/tmp` checkout hides home-deny failures.
 - **Subprocesses** go through `sh`/`runProcess` (`src/util/proc.ts`): abort signals, timeouts, the
   per-run process scope and descendant cleanup depend on it. The few direct spawns (preview servers,
   the SSH tunnel, `gate-slot`) manage their own lifecycle; don't add more without a reason. Agent
@@ -139,6 +154,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
 - Everything that comes from the change under test is untrusted data: its `.limitless.toml`,
   scripts, test output, reports, and the text a model writes. What steers the factory (gate
   commands, review lenses, policy) is read from the base commit, never from the PR branch.
+- A name a client chooses (an MCP consumer, a label) never lands in a field the factory branches
+  on. `requestedBy === "dependabot[bot]"` changes routing and review, so an MCP consumer is stored
+  as `mcp:<name>` (#479).
 - A model's claim is not evidence. "Tests pass" or "verified by gate run 12" counts only after the
   engine has checked it against its own records for the same commit.
 - Issue, PR and comment text from GitHub is quoted as data, never followed as instructions.
