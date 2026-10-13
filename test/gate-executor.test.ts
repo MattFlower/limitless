@@ -9,6 +9,7 @@ import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
 import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -967,6 +968,25 @@ test("local attachment replays an unknown handle, reuses known work and emits ch
   });
 });
 
+test("local attachment preserves start-time read policy and confinement", async () => {
+  const executor = localExecutor();
+  const signal = new AbortController().signal;
+  const recording = recordingConfinement();
+  const handle = await readPolicyScope.run(testReadPolicy, () =>
+    confinementScope.run(recording.backend, () => executor.start(request(fixture.repoDir), signal)),
+  );
+  const execution = readPolicyScope.run(undefined, () =>
+    confinementScope.exit(() => {
+      expect(readPolicyScope.getStore()).toBeUndefined();
+      expect(confinementScope.getStore()).toBeUndefined();
+      return executor.attach(handle, signal);
+    }),
+  );
+  expect((await execution.result).checks[0]?.ok).toBe(true);
+  expect(recording.calls).toHaveLength(1);
+  expect(recording.calls[0]?.opts.cmd).toContain("true");
+});
+
 test.each([false, true])("shared local executor releases settled work (rejected=%s)", async (rejected) => {
   const executor = gateExecutorFor("local");
   const signal = new AbortController().signal;
@@ -1115,8 +1135,8 @@ test("local check events stream before completion and the start signal cancels r
       { name: "pending", run: "sleep 900" },
     ],
   };
-  const handle = await executor.start(req, controller.signal);
   await confinementScope.run(fakeConfinement, async () => {
+    const handle = await executor.start(req, controller.signal);
     const execution = executor.attach(handle, new AbortController().signal);
     try {
       const event = await execution.events[Symbol.asyncIterator]().next();

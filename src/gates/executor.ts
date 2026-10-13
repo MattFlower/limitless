@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { GateConfig } from "./detect.ts";
 import { redactGateData } from "./output.ts";
@@ -53,13 +54,16 @@ export function gateExecutorFor(kind: "local"): GateExecutor {
 
 export function localExecutor(hooks: GateHooks = {}): GateExecutor {
   const executions = new Map<string, Execution<GateRun>>();
-  const starts = new Map<string, { request: GateRequest; signal: AbortSignal }>();
+  const starts = new Map<
+    string,
+    { request: GateRequest; signal: AbortSignal; context: ReturnType<typeof AsyncLocalStorage.snapshot> }
+  >();
   const executor: GateExecutor = {
     kind: "local",
     async start(request, signal) {
       signal.throwIfAborted();
       const id = randomUUID();
-      starts.set(id, { request, signal });
+      starts.set(id, { request, signal, context: AsyncLocalStorage.snapshot() });
       return { kind: "local", id, startedAt: Date.now() };
     },
     attach(handle, signal, request, slotHooks = hooks) {
@@ -93,7 +97,9 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
         changed = Promise.withResolvers<void>();
         previous.resolve();
       };
-      const result = runLocalGates(
+      const run = (...args: Parameters<typeof runLocalGates>) =>
+        started ? started.context(runLocalGates, ...args) : runLocalGates(...args);
+      const result = run(
         req.cwd,
         {
           ...req.gates,
