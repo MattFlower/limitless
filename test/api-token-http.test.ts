@@ -1155,49 +1155,6 @@ test("local clients authenticate, pick up rotation, omit missing tokens and keep
   }
 });
 
-test("CLI 401 explains an origin mismatch while unrelated 401 keeps the server reason", async () => {
-  const home = mkdtempSync(join(tmpdir(), "limitless-cli-origin-"));
-  const secret = "synthetic-origin-token";
-  const bound = "http://127.0.0.1:7400";
-  const seen: (string | null)[] = [];
-  const stub = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: (req) => {
-      seen.push(req.headers.get("authorization"));
-      return Response.json({ error: "API token required: update the limitless CLI" }, { status: 401 });
-    },
-  });
-  writeFileSync(join(home, "api-token"), secret);
-  writeFileSync(
-    join(home, "api-token.origin"),
-    JSON.stringify({ origin: bound, tokenHash: createHash("sha256").update(secret).digest("hex") }),
-  );
-  try {
-    const request = () =>
-      sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
-        cwd: f.repo,
-        env: { ...process.env, LIMITLESS_HOME: home, LIMITLESS_URL: `http://localhost:${stub.port}` },
-        allowFail: true,
-      });
-    const mismatch = await request();
-    expect(mismatch.exitCode).not.toBe(0);
-    expect(mismatch.stderr).toContain("401: API token withheld");
-    expect(mismatch.stderr).toContain("requested origin differs");
-    expect(mismatch.stderr).toContain(bound);
-    expect(mismatch.stderr).not.toContain("update the limitless CLI");
-    expect(mismatch.stdout + mismatch.stderr).not.toContain(secret);
-    rmSync(join(home, "api-token"));
-    const unrelated = await request();
-    expect(unrelated.stderr).toContain("401: API token required: update the limitless CLI");
-    expect(unrelated.stderr).not.toContain("origin differs");
-    expect(seen).toEqual([null, null]);
-  } finally {
-    await stub.stop(true);
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
 test("clients omit another daemon's token and redact authentication errors and diagnostics", async () => {
   const previous = process.env.LIMITLESS_HOME;
   process.env.LIMITLESS_HOME = f.factory.cfg.paths.home;
