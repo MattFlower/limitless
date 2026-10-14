@@ -320,6 +320,7 @@ export function createMcpServer(backend: McpBackend): Server {
       verdict: ReviewVerdictSchema.shape.verdict,
       reviewedSha: ReviewVerdictSchema.shape.reviewedSha,
       findings: ReviewVerdictSchema.shape.findings,
+      consumer: FeedQuerySchema.shape.consumer,
     })
     .strict()
     .superRefine(({ run: _run, ...input }, ctx) => {
@@ -337,9 +338,13 @@ export function createMcpServer(backend: McpBackend): Server {
     ),
     tool(
       "limitless_review",
-      "Review a run's current PR head. Supply run, verdict (changes or approve), reviewedSha (full commit SHA), and findings (severity, title, detail; optional file and line). Changes requires findings; approve accepts omitted findings or an empty array. Returns the approval or new review round. Inspect status after an uncertain response before retrying.",
+      "Review a run's current PR head. Supply run, verdict (changes or approve), reviewedSha (full commit SHA), and findings (severity, title, detail; optional file and line). Optional consumer records approval provenance as mcp:<consumer>. Changes requires findings; approve accepts omitted findings or an empty array. Returns the approval or new review round. Inspect status after an uncertain response before retrying.",
       reviewSchema,
-      async ({ run, ...input }) => backend.review(run, ReviewVerdictSchema.parse(input)),
+      async ({ run, ...input }) =>
+        backend.review(run, {
+          ...ReviewVerdictSchema.parse(input),
+          reviewer: "mcp",
+        }),
     ),
     tool(
       "limitless_land",
@@ -520,7 +525,9 @@ export function createMcpServer(backend: McpBackend): Server {
     } catch (e) {
       const message =
         params.name === "limitless_get_change"
-          ? "Change view request failed; check arguments and local availability."
+          ? e instanceof z.ZodError && e.issues.some((issue) => issue.code === "custom")
+            ? "Further reads require headSha and baseSha from the first page."
+            : "Invalid change-view request or backend unavailable."
           : e instanceof Error
             ? e.message
             : String(e);

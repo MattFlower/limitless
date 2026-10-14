@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { cpSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import type { StreamMessage } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { Store } from "../src/db/store.ts";
 import { allItems, feedRound, feedStore } from "./feed-support.ts";
@@ -183,6 +184,45 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
       pruned: false,
       hasMore: false,
     });
+  } finally {
+    f.close();
+  }
+});
+
+test("buffered store transactions discard run and feed messages on rollback and drain after commit", () => {
+  const f = feedStore();
+  try {
+    const run = f.run();
+    const messages: StreamMessage[] = [];
+    const transactions: boolean[] = [];
+    f.store.subscribe((msg) => {
+      messages.push(msg);
+      transactions.push(f.store.db.inTransaction);
+    });
+    const write = () =>
+      f.store.transaction(() => {
+        f.store.updateRun(run.id, { status: "needs_human" });
+        f.store.resolveRun(run.id, { kind: "done_elsewhere", by: "human" });
+      });
+    expect(() =>
+      f.store.transaction(() => {
+        write();
+        expect(messages).toEqual([]);
+        expect(allItems(f.store)).toHaveLength(2);
+        throw new Error("rollback");
+      }),
+    ).toThrow("rollback");
+    expect(messages).toEqual([]);
+    expect(allItems(f.store)).toEqual([]);
+    expect(f.store.getRun(run.id)?.status).toBe("queued");
+    f.store.transaction(() => {
+      write();
+      expect(messages).toEqual([]);
+    });
+    expect(messages.filter((msg) => msg.kind === "run")).toHaveLength(2);
+    expect(messages.flatMap((msg) => (msg.kind === "feed" ? [msg.item] : []))).toEqual(allItems(f.store));
+    expect(allItems(f.store).map((item) => item.kind)).toEqual(["run.needs_human", "run.resolved"]);
+    expect(transactions).toEqual(messages.map(() => false));
   } finally {
     f.close();
   }

@@ -4,7 +4,7 @@ import type { Store } from "../db/store.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { sh } from "../util/proc.ts";
 import { type GhRunner, runGh } from "./github.ts";
-import { type Context, rollup } from "./github-poller.ts";
+import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
 
 export interface GitHubPrState {
   url: string;
@@ -155,7 +155,23 @@ export async function reconcileMergedRuns(
   const failed = new Set<string>();
   for (const run of ordered) {
     if (signal?.aborted) return;
-    if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
+    if (!run.prUrl) continue;
+    if (run.merged && run.status !== "needs_human") {
+      // Fill from observations we already have; missing metadata must never trigger another fetch.
+      if (run.mergedBy === null || run.mergedAt === null) {
+        const pr = savedSnapshot(store.githubPrData(run.prUrl));
+        if (pr?.url === run.prUrl && pr.state === "MERGED") {
+          const at = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
+          store.resolveMergedPr(
+            run.repoId,
+            pr.url,
+            pr.mergedBy?.login ?? null,
+            Number.isFinite(at) ? at : null,
+          );
+        }
+      }
+      continue;
+    }
     if (failed.has(run.prUrl)) continue;
     if (expired.has(run.prUrl) && !results.has(run.prUrl)) {
       if (!pass.checked.has(run.prUrl)) pass.checked.set(run.prUrl, now());
@@ -190,7 +206,7 @@ export async function reconcileMergedRuns(
       if (store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
       if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
-        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
+        store.resolveMergedPr(run.repoId, pr.url, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
         store.observeGithubPrState(pr.url, pr.state, now());

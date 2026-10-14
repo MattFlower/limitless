@@ -23,17 +23,23 @@ export function apiTokenHeaders(
   url: string | URL,
   home = process.env.LIMITLESS_HOME ?? join(homedir(), ".limitless"),
   port?: number,
+  withheld?: (origin: string) => void,
 ): Record<string, string> {
   const token = readApiToken(home);
   if (!token) return {};
   try {
     const target = new URL(url);
     if (target.protocol !== "http:" && target.protocol !== "https:") return {};
+    const forOrigin = (origin: string): Record<string, string> => {
+      if (target.origin === origin) return { authorization: `Bearer ${token}` };
+      withheld?.(origin);
+      return {};
+    };
     const fallback = (): Record<string, string> => {
       const selected = port ?? resolveClientPort(true);
       if (!isClientPort(selected)) return {};
       const origin = new URL(`http://127.0.0.1:${selected}`).origin;
-      return target.origin === origin ? { authorization: `Bearer ${token}` } : {};
+      return forOrigin(origin);
     };
     let record: string;
     try {
@@ -47,7 +53,7 @@ export function apiTokenHeaders(
     const origin = new URL(pair.origin).origin;
     if (origin !== pair.origin || !/^https?:\/\//.test(origin)) return {};
     if (pair.tokenHash !== createHash("sha256").update(token).digest("hex")) return fallback();
-    return target.origin === origin ? { authorization: `Bearer ${token}` } : {};
+    return forOrigin(origin);
   } catch {
     return {};
   }
