@@ -3,6 +3,7 @@ import type { Server } from "bun";
 import type { FeedPage, StreamMessage } from "../src/core/types.ts";
 import type { Store } from "../src/db/store.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { feedRound } from "./feed-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -253,42 +254,88 @@ test("repository filtering precedes pagination and hasMore, and uses an exact ma
   expect((await page("?repo=owner%2Fmissing")).hasMore).toBe(false);
 });
 
-test("a clamped long poll preserves filters and ignores unrelated feed items", async () => {
-  const repo = store.upsertRepo({
-    slug: "owner/one",
-    kind: "github",
-    url: "https://example.test/one",
-    localPath: null,
-    defaultBranch: "main",
-    mergePolicy: "none",
-  });
-  const other = store.createRun(repo, {
-    repo: repo.slug,
-    prompt: "other",
-    source: "mcp",
-    requestedBy: "mcp:other",
-  });
-  const mine = store.createRun(repo, {
-    repo: repo.slug,
-    prompt: "mine",
-    source: "mcp",
-    requestedBy: "mcp:worker",
-  });
-  const pending = read("?after=100000&consumer=worker&ownRuns=true&repo=owner%2Fone&wait=30");
-  let settled = false;
-  void pending.then(() => {
-    settled = true;
-  });
-  await item("unrelated repo");
-  store.updateRun(other.id, { status: "failed" });
-  await Promise.resolve();
-  expect(settled).toBe(false);
-  store.updateRun(mine.id, { status: "failed" });
-  const result = (await (await pending).json()) as FeedPage;
-  expect(result.items).toMatchObject([{ runId: mine.id, repo: "owner/one" }]);
-  expect(result.items).toHaveLength(1);
-  expect(store.feedCursor("worker")).toBe(0);
-});
+test.each(["review", "conflict", "ci"] as const)(
+  "a clamped ownRuns long poll wakes for a matching parent's %s round only",
+  async (kind) => {
+    const repo = store.upsertRepo({
+      slug: "owner/one",
+      kind: "github",
+      url: "https://example.test/one",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const other = store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "other",
+      source: "mcp",
+      requestedBy: "mcp:other",
+    });
+    const mine = store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "mine",
+      source: "mcp",
+      requestedBy: "mcp:worker",
+    });
+    const extraRepo = store.upsertRepo({ ...repo, id: undefined, slug: "owner/one-extra" });
+    const extraParent = store.createRun(extraRepo, {
+      repo: extraRepo.slug,
+      prompt: "mine in another repo",
+      source: "mcp",
+      requestedBy: "mcp:worker",
+    });
+    const otherRound = feedRound(store, repo, other, kind);
+    const mineRound = feedRound(store, repo, mine, kind);
+    const extraRound = feedRound(store, extraRepo, extraParent, kind);
+    const controller = new AbortController();
+    const pending = read("?after=100000&consumer=worker&ownRuns=true&repo=owner%2Fone&wait=30", {
+      signal: controller.signal,
+    });
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    try {
+      await item("unrelated repo");
+      store.updateRun(other.id, { status: "failed" });
+      store.markRoundDelivered(otherRound.id, "b".repeat(40));
+      store.markRoundDelivered(extraRound.id, "b".repeat(40));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      store.markRoundDelivered(mineRound.id, "b".repeat(40));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(true);
+      const result = (await (await pending).json()) as FeedPage;
+      expect(result.items).toMatchObject([
+        {
+          kind: `${kind}.round_delivered`,
+          runId: mineRound.id,
+          repo: "owner/one",
+          data: { sourceRunId: mine.id },
+        },
+      ]);
+      expect(result.items).toHaveLength(1);
+      expect(store.feedCursor("worker")).toBe(0);
+      const direct = read(
+        `?after=${result.nextAfter}&consumer=worker&ownRuns=true&repo=owner%2Fone&wait=30`,
+        { signal: controller.signal },
+      );
+      settled = false;
+      void direct.then(() => {
+        settled = true;
+      });
+      store.updateRun(mine.id, { status: "failed" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(true);
+      expect(((await (await direct).json()) as FeedPage).items).toMatchObject([
+        { runId: mine.id, repo: "owner/one" },
+      ]);
+    } finally {
+      controller.abort();
+      await pending;
+    }
+  },
+);
 
 test("an item committed while the wait is being set up still wakes it", async () => {
   const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });

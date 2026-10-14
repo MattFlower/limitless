@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FeedItem, StreamMessage } from "../src/core/types.ts";
+import type { FeedItem, Repo, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 
 /** A real SQLite store in a temporary directory, with one local repository. */
@@ -59,4 +59,26 @@ export function allItems(store: Store): FeedItem[] {
     if (page.nextAfter <= after) throw new Error("Feed cursor did not advance");
     after = page.nextAfter;
   }
+}
+
+/** Persist the same linkage used by server-created rounds, without running the pipeline. */
+export function feedRound(
+  store: Store,
+  repo: Repo,
+  owner: Run,
+  kind: "review" | "conflict" | "ci",
+  round = 1,
+) {
+  const run = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "Round work",
+    source: "ui",
+    requestedBy: "mcp:other",
+  });
+  store.db
+    .query(`INSERT INTO review_rounds
+      (run_id, source_run_id, pr_url, round, kind, reviewed_sha, findings, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, '[]', 1)`)
+    .run(run.id, owner.id, `https://example.test/pr/${owner.id}`, round, kind, "a".repeat(40));
+  return run;
 }
