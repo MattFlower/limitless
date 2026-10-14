@@ -211,6 +211,48 @@ test("committed nested repositories and changed gitlink commits block, but reque
   ).toBe(false);
 });
 
+test.each(["commitAll", "discardChanges", "diff"])(
+  "%s does not run a nested repository's clean filter",
+  async (operation) => {
+    const nested = join(work, "nested");
+    const file = join(nested, "file");
+    const marker = join(dir, "nested-filter-ran");
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(file, "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    writeFileSync(join(work, ".gitmodules"), '[submodule "nested"]\n\tpath = nested\n\tignore = none\n');
+    if (operation !== "commitAll") await commitAll(work, "gitlink");
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    const dirtyMtime = (mtime = 1000) => utimesSync(file, mtime, mtime);
+    dirtyMtime();
+    if (operation === "commitAll") {
+      expect(await commitAll(work, "added gitlink")).not.toBeNull();
+      expect(existsSync(marker)).toBe(false);
+      expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
+        `160000 commit ${await headSha(nested)}\tnested`,
+      );
+      await git(nested, "-c", "filter.attack.clean=", "commit", "--allow-empty", "-qm", "advance nested");
+      dirtyMtime(2000);
+      expect(await commitAll(work, "changed gitlink")).not.toBeNull();
+      expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
+        `160000 commit ${await headSha(nested)}\tnested`,
+      );
+    } else if (operation === "discardChanges") {
+      expect(await discardChanges(work)).toBe(false);
+      writeFileSync(join(work, "sample.test.ts"), edited);
+      dirtyMtime();
+      expect(await discardChanges(work)).toBe(true);
+      expect(readFileSync(join(work, "sample.test.ts"), "utf8")).toBe(original);
+    } else {
+      expect((await factory("diff", "--name-only")).stdout).toBe("");
+    }
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
 test("committed .gitmodules ignore=all cannot hide added or changed gitlinks", async () => {
   const nested = join(work, "nested");
   mkdirSync(nested);

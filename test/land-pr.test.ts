@@ -293,6 +293,7 @@ test.each([
   "state:CHERRY_PICK_HEAD",
   "state:REVERT_HEAD",
   "checks:clean-filter",
+  "checks:nested-filter",
   "pre-push:clean-filter",
   "checks:external-diff",
   "checks:signing",
@@ -356,7 +357,12 @@ test.each([
       writeFileSync(join(source, ".git/info/exclude"), "local-build/\n");
     if (scenario.endsWith(":clean-filter"))
       writeFileSync(join(work, ".gitattributes"), "file filter=attack\n");
+    if (scenario === "checks:nested-filter") {
+      writeFileSync(join(work, ".gitmodules"), '[submodule "nested"]\n\tpath = nested\n\tignore = none\n');
+    }
     await git("-C", work, "add", ".");
+    if (scenario === "checks:nested-filter")
+      await git("-C", work, "update-index", "--add", "--cacheinfo", `160000,${value.base},nested`);
     await git("-C", work, "commit", "-qm", "safe change");
     const landingSha = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
     if (scenario !== "no-private-strings") writeFileSync(join(config, "private-strings.txt"), entry);
@@ -383,6 +389,7 @@ test.each([
     const [plantAt, plantKey] = scenario.split(":");
     const postCheckConfig: Record<string, string[][]> = {
       "clean-filter": [["filter.attack.clean", `${command}; cat`]],
+      "nested-filter": [["filter.attack.clean", `${command}; cat`]],
       "external-diff": [
         ["diff.external", command],
         ["diff.trustExitCode", "true"],
@@ -521,6 +528,13 @@ if (args[0] === "run") {
   }
   if (${JSON.stringify(scenario)}.startsWith("state:")) writeFileSync(${JSON.stringify(paths[1])} + "/" + ${JSON.stringify(plantKey)}, ${JSON.stringify(landingSha)} + "\\n");
   if (${JSON.stringify(plantKey)} === "clean-filter") writeFileSync(${JSON.stringify(join(work, "file"))}, "safe change\\n");
+  if (${JSON.stringify(scenario)} === "checks:nested-filter") {
+    // Only factory inspection runs after this pointer is planted: never recurse into the parent.
+    mkdirSync(${JSON.stringify(join(work, "nested"))});
+    writeFileSync(${JSON.stringify(join(work, "nested/.git"))}, "gitdir: " + ${JSON.stringify(paths[2])} + "\\n");
+    writeFileSync(${JSON.stringify(join(work, "nested/file"))}, "base\\n");
+    writeFileSync(${JSON.stringify(join(paths[2] ?? "", "info/attributes"))}, "* filter=attack\\n");
+  }
   writeFileSync(${JSON.stringify(checked)}, "ready");
 }
 if (args[0].endsWith(".ts")) {

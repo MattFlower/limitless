@@ -18,6 +18,8 @@ const HARDENING = [
   "-c",
   "core.fsmonitor=false",
   "-c",
+  "submodule.recurse=false",
+  "-c",
   "diff.external=",
   "-c",
   "core.attributesFile=/dev/null",
@@ -135,6 +137,9 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   const indicators = ["new=+", "old=-", "context= "].map((value) => `--output-indicator-${value}`);
   const format = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", ...indicators];
   const flags = inspection ? ["--no-ext-diff", "--no-textconv", ...format] : [];
+  // Nested repositories have their own filters, which parent config discovery cannot suppress.
+  // Explicit commit-range --ignore-submodules=none flags below still expose gitlinks to the audit.
+  if (["status", "diff"].includes(cmd[command] ?? "")) flags.push("--ignore-submodules=dirty");
   return run([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
     ...opts,
     env,
