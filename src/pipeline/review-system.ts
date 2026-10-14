@@ -52,7 +52,7 @@ const VerifierSchema = z
   .refine((v) => v.target === undefined || v.targets === undefined, {
     message: 'a verifier takes "target" or "targets", not both',
   });
-export const ReviewSystemSchema = z
+const ReviewSystemBaseSchema = z
   .strictObject({
     name: z.string().trim().min(1, "system name must not be empty"),
     mode: z.enum(["single", "panel"], { error: 'unsupported review system mode; use "single" or "panel"' }),
@@ -66,14 +66,11 @@ export const ReviewSystemSchema = z
   .superRefine((system, ctx) => {
     if (system.mode === "single" && system.finders.length !== 1)
       ctx.addIssue({ code: "custom", path: ["finders"], message: 'mode "single" takes exactly one finder' });
-    if (
-      system.mode === "single" &&
-      system.finders.some((f) => f.prompt !== "standard" || f.lens || f.family || f.local)
-    )
+    if (system.mode === "single" && system.finders.some((f) => f.lens || f.family || f.local))
       ctx.addIssue({
         code: "custom",
         path: ["finders"],
-        message: 'mode "single" uses the "standard" prompt, with no lens, family or local finder',
+        message: 'mode "single" takes no lens, family or local finder',
       });
     if (system.mode === "single" && system.verifier)
       ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "single" takes no verifier' });
@@ -94,6 +91,11 @@ export const ReviewSystemSchema = z
       ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "panel" needs a verifier' });
   }) satisfies z.ZodType<ReviewSystem>;
 
+export const ReviewSystemSchema = ReviewSystemBaseSchema.refine(
+  (system) => system.mode !== "single" || system.finders.every((f) => f.prompt === "standard"),
+  { path: ["finders"], message: 'mode "single" uses the "standard" prompt' },
+);
+
 /**
  * An eval candidate built from the daemon's configured roster for a profile: `targets` pins each of
  * its finders in order, then one per inline repo lens.
@@ -112,7 +114,12 @@ const RosterReferenceSchema = z.strictObject({
 });
 export type RosterReference = z.infer<typeof RosterReferenceSchema>;
 export type EvalReviewSystem = ReviewSystem | RosterReference;
-const EvalSystemSchema = ReviewSystemSchema.safeExtend({ replayFrom: z.string().trim().min(1).optional() });
+const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
+  replayFrom: z.string().trim().min(1).optional(),
+}).refine((system) => system.mode !== "single" || system.finders.every((f) => f.local === undefined), {
+  path: ["finders"],
+  message: 'mode "single" takes no local finder option',
+});
 
 /** Eval candidates: uniquely named, and every finder pinned so results never depend on live routing. */
 export const EvalReviewSystemsSchema = z

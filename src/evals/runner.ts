@@ -23,6 +23,7 @@ import {
   panelIdentity,
   pickVerifier,
   type ReviewRequest,
+  reviewRequest,
   runReview,
   type VerifierRequest,
 } from "../pipeline/review.ts";
@@ -676,6 +677,11 @@ export class EvalRunner {
         "review" in prepared && prepared.review
           ? { ...prepared.review, ...(system ? { system } : {}) }
           : undefined;
+      const finder = system?.mode === "single" ? system.finders[0]?.prompt : undefined;
+      if (reviewInput && finder && finder !== "standard") {
+        reviewInput.prompt = { ...reviewInput.prompt, finder };
+        prompt = reviewRequest(reviewInput).prompt;
+      }
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
       // Panel targets beyond the trial's own (its first finder) are pinned in the system. A bare
       // target is an unset effort, which today's model default must not restore (as for the trial).

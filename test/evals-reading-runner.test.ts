@@ -12,6 +12,7 @@ import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import * as review from "../src/pipeline/review.ts";
+import { parseEvalReviewSystems } from "../src/pipeline/review-system.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
 import { MODELS, type ModelDef, type ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -196,6 +197,111 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
       expect(omitted).toContain(kept);
     expect(omitted).toContain("# Automated check results");
     expect(omitted).toContain("- test `test`: FAIL, regressed (BLOCKING)");
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["adversarial", "careful"] as const)(
+  "single %s eval uses the panel finder framing and production grading",
+  async (prompt) => {
+    const f = await fixture();
+    try {
+      const systems = parseEvalReviewSystems(
+        JSON.stringify({
+          systems: [
+            {
+              name: "variant",
+              mode: "single",
+              finders: [{ target: "candidate-a", prompt }],
+              implementerReport: "include",
+            },
+          ],
+        }),
+        "systems.json",
+      );
+      const output = { ...reviewOutput(), verdict: "approve" as const };
+      // Confidence does not change the single review's severity-based blocking rule.
+      output.findings = output.findings.map((finding) => ({ ...finding, confidence: 0.1 }));
+      output.findings.push(...reviewOutput(30, "minor", "other.ts").findings);
+      f.respond(async (s) => {
+        expect(s.target.modelId).toBe("candidate-a");
+        expect(s.mode).toBe("readonly");
+        expect(s.schema).toBe(ReviewSchema);
+        expect(s.jsonSchema).toEqual(toStrictJsonSchema(ReviewSchema));
+        expect(s.systemAppend).toBe(FACTORY_PREAMBLE);
+        const diff = await diffSince(s.cwd, f.sha);
+        expect(s.prompt).toBe(
+          reviewPrompt({
+            ...f.item.input,
+            baseSha: f.sha,
+            stat: diff.stat,
+            audit: [],
+            implementerReportMode: "include",
+            finder: prompt,
+          }),
+        );
+        return { structured: output };
+      });
+      const report = await f.run({ models: undefined, systems });
+      expect(f.calls).toHaveLength(1);
+      const persisted = f.factory.evals.report(report.run.id);
+      expect(persisted?.run.systems?.[0]?.finders[0]?.prompt).toBe(prompt);
+      expect(persisted?.trials[0]).toMatchObject({
+        status: "ok",
+        pass: true,
+        score: 1,
+        details: {
+          system: "variant",
+          grade: {
+            review: {
+              blockingFindings: 1,
+              requiredMatched: 1,
+              requestChanges: true,
+              verdictMatch: true,
+            },
+          },
+        },
+      });
+      expect(review.blockingReviewFindings(output)).toHaveLength(1);
+      expect(review.reviewVerdict(output)).toBe("request_changes");
+      await f.clean();
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test.each([
+  ["standard", "adversarial"],
+  ["adversarial", "standard"],
+] as const)("single prompt caches are isolated in %s then %s order", async (first, second) => {
+  const f = await fixture();
+  try {
+    f.respond(() => ({ structured: reviewOutput() }));
+    const run = (prompt: string) =>
+      f.run({
+        models: undefined,
+        systems: [
+          {
+            name: "candidate",
+            mode: "single",
+            finders: [{ target: "candidate-a", prompt }],
+            implementerReport: "include",
+          },
+        ],
+      });
+    const a = await run(first);
+    const b = await run(second);
+    expect(a.trials[0]?.status).toBe("ok");
+    expect(b.trials[0]?.status).toBe("ok");
+    expect(a.trials[0]?.cacheKey).not.toBe(b.trials[0]?.cacheKey);
+    expect(a.summaries[0]?.cached).toBe(0);
+    expect(b.summaries[0]?.cached).toBe(0);
+    expect(f.calls).toHaveLength(2);
+    for (const prompt of [first, second]) expect((await run(prompt)).summaries[0]?.cached).toBe(1);
+    expect(f.calls).toHaveLength(2);
     await f.clean();
   } finally {
     await f.close();
