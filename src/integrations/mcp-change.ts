@@ -45,6 +45,64 @@ const CATALOGUE_CHARACTERS_CAP = 256_000;
 type Catalogue = { redact: HoldoutRedactor; cacheable: boolean };
 const catalogues = new WeakMap<Factory["store"], { key: string; catalogue: Catalogue }>();
 
+/** Map literal matches in each file side back to their physical patch lines. */
+function privatePatchLines(patch: string, values: readonly string[]): Set<number> {
+  const hidden = new Set<number>();
+  const literals = values.map((value) => value.normalize("NFKC").toLowerCase());
+  type Line = { index: number; prefix: string; text: string };
+  let hunk: Line[] = [];
+  let inHunk = false;
+  const scan = (side: Line[]) => {
+    const layers = side.map((line) => {
+      const forms = normalizedLayers(line.text);
+      // Withhold unsafe decoding at its source, retaining raw text for literal spans.
+      if (!forms) hidden.add(line.index);
+      return forms ?? [line.text.normalize("NFKC").toLowerCase()];
+    });
+    const depth = layers.reduce((max, forms) => Math.max(max, forms?.length ?? 0), 0);
+    for (let layer = 0; layer < depth; layer++) {
+      let text = "";
+      const ranges = side.map((line, i) => {
+        const forms = layers[i];
+        const start = text.length;
+        text += forms?.[Math.min(layer, forms.length - 1)] ?? "";
+        return { index: line.index, start, end: text.length };
+      });
+      for (const literal of literals) {
+        if (!literal) continue;
+        let start = text.indexOf(literal);
+        while (start >= 0) {
+          const end = start + literal.length;
+          for (const range of ranges) if (range.start < end && range.end > start) hidden.add(range.index);
+          // Overlapping occurrences can involve additional patch lines.
+          start = text.indexOf(literal, start + 1);
+        }
+      }
+    }
+  };
+  const flush = () => {
+    scan(hunk.filter((line) => line.prefix !== "+"));
+    scan(hunk.filter((line) => line.prefix !== "-"));
+    hunk = [];
+  };
+  for (const [index, line] of patch.split("\n").entries()) {
+    if (line.startsWith("@@ ")) {
+      flush();
+      inHunk = true;
+    } else if (inHunk && /^[-+ ]/u.test(line)) {
+      hunk.push({ index, prefix: line[0] ?? "", text: `${line.slice(1)}\n` });
+    } else if (inHunk && line.startsWith("\\")) {
+      const previous = hunk.at(-1);
+      if (previous) previous.text = previous.text.slice(0, -1);
+    } else {
+      flush();
+      inHunk = false;
+    }
+  }
+  flush();
+  return hidden;
+}
+
 function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): string | null {
   try {
     const hash = createHash("sha256").update(JSON.stringify(rounds));
@@ -504,9 +562,19 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
       privacy(path) === path && privacy(JSON.stringify(path)) === JSON.stringify(path) && prText(path);
     // Filter complete lines before paging, then check the complete sanitized patch too.
     const privatePatch = (patch: string) => {
+      const hidden = privatePatchLines(patch, [
+        ...loadPrivateStrings().map(({ value }) => value),
+        ...registeredCredentials(),
+      ]);
       const filtered = patch
         .split("\n")
-        .map((line) => (privacy(line) === line ? line : "[withheld: private text; 1 line]"))
+        .map((line, index) =>
+          hidden.has(index)
+            ? `${line[0]}[withheld: private text; 1 line]`
+            : privacy(line) === line
+              ? line
+              : "[withheld: private text; 1 line]",
+        )
         .join("\n");
       return privacy(filtered) === filtered
         ? filtered
