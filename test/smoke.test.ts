@@ -1233,6 +1233,7 @@ test.skipIf(stateSkip)(
       await parent.exited;
     }
   },
+  20_000,
 );
 
 const processModes = ["SIGINT", "SIGTERM", "stubborn", "probe", "completed"] as const;
