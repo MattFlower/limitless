@@ -1367,6 +1367,52 @@ test.each(["new", "old", "opposite", "hunks"])(
   },
 );
 
+test.each([
+  ["before", 1],
+  ["before", 2],
+  ["before", 3],
+  ["after", 1],
+  ["after", 2],
+  ["after", 3],
+] as const)(
+  "change view withholds hunk-edge credentials with a change %s at distance %i",
+  async (edge, distance) => {
+    const secretLines = Array.from({ length: 5 }, (_, i) => `clipped-${edge}-${distance}-secret-${i}`);
+    const base = [
+      ...Array.from({ length: 4 }, (_, i) => `public before ${i}`),
+      ...secretLines,
+      ...Array.from({ length: 4 }, (_, i) => `public after ${i}`),
+    ];
+    writeFileSync(join(f.repo, "hello.txt"), `${base.join("\n")}\n`);
+    await sh(["git", "add", "."], { cwd: f.repo });
+    await sh(["git", "commit", "-qm", "base clipped credential"], { cwd: f.repo });
+    const head = [...base];
+    const changed = edge === "before" ? 4 - distance : 8 + distance;
+    head[changed] = "public changed";
+    const c = await changeFixture(f, { "hello.txt": `${head.join("\n")}\n` });
+    const raw = (await sh(["git", "diff", "--unified=3", c.baseSha, c.headSha], { cwd: f.repo })).stdout;
+    expect(secretLines.filter((line) => raw.includes(`\n ${line}\n`))).toHaveLength(4 - distance);
+    registerCredential(`CLIPPED_${edge}_${distance}`, secretLines.join("\n"));
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        for (const line of secretLines) expect(page.diff.text).not.toContain(line);
+        expect(page.diff.text.match(/^ \[withheld: private text; 1 line\]$/gm)).toHaveLength(4 - distance);
+        expect(page.diff.text).toContain(`-${base[changed]}`);
+        expect(page.diff.text).toContain("+public changed");
+        expect(page.diff.text).toContain(" public ");
+        expect(page.diff.text).toMatch(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: |$)/m);
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
 test.each(["encoded", "CRLF", "no final newline", "overlapping"])(
   "change view maps %s multiline credential matches to whole patch lines",
   async (format) => {

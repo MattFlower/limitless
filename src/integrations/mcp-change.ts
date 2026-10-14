@@ -52,7 +52,7 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
   type Line = { index: number; prefix: string; text: string };
   let hunk: Line[] = [];
   let inHunk = false;
-  const scan = (side: Line[]) => {
+  const scan = (side: Line[], patterns = literals) => {
     const layers = side.map((line) => {
       const forms = normalizedLayers(line.text);
       // Withhold unsafe decoding at its source, retaining raw text for literal spans.
@@ -68,14 +68,24 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
         text += forms?.[Math.min(layer, forms.length - 1)] ?? "";
         return { index: line.index, start, end: text.length };
       });
-      for (const literal of literals) {
+      const withhold = (start: number, end: number) => {
+        for (const range of ranges) if (range.start < end && range.end > start) hidden.add(range.index);
+      };
+      for (const literal of patterns) {
         if (!literal) continue;
         let start = text.indexOf(literal);
         while (start >= 0) {
-          const end = start + literal.length;
-          for (const range of ranges) if (range.start < end && range.end > start) hidden.add(range.index);
+          withhold(start, start + literal.length);
           // Overlapping occurrences can involve additional patch lines.
           start = text.indexOf(literal, start + 1);
+        }
+        // Hunk context clips the file at line boundaries; protect either exposed fragment.
+        for (const { index } of literal.matchAll(/\n/gu)) {
+          const prefix = literal.slice(0, index + 1);
+          const suffix = literal.slice(index + 1);
+          if (prefix.replace(/\r?\n/gu, "") && text.endsWith(prefix))
+            withhold(text.length - prefix.length, text.length);
+          if (suffix.replace(/\r?\n/gu, "") && text.startsWith(suffix)) withhold(0, suffix.length);
         }
       }
     }
@@ -88,6 +98,11 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
   for (const [index, line] of patch.split("\n").entries()) {
     if (line.startsWith("@@ ")) {
       flush();
+      // Git can quote an isolated credential line as the hunk's function annotation.
+      scan(
+        [{ index, prefix: "", text: line.replace(/^@@ [^@]* @@ ?/u, "") }],
+        literals.flatMap((value) => (value.includes("\n") ? value.split(/\r?\n/u) : [value])),
+      );
       inHunk = true;
     } else if (inHunk && /^[-+ ]/u.test(line)) {
       hunk.push({ index, prefix: line[0] ?? "", text: `${line.slice(1)}\n` });
@@ -570,7 +585,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         .split("\n")
         .map((line, index) =>
           hidden.has(index)
-            ? `${line[0]}[withheld: private text; 1 line]`
+            ? `${/^@@ [^@]* @@/u.exec(line)?.[0]?.concat(" ") ?? line[0]}[withheld: private text; 1 line]`
             : privacy(line) === line
               ? line
               : "[withheld: private text; 1 line]",
