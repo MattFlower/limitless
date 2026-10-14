@@ -105,13 +105,7 @@ export function waitForFeed(store: Store, query: FeedQuery, signal?: AbortSignal
     if (msg.kind !== "feed" || msg.item.id <= cursor) return;
     if (query.repo !== undefined && msg.item.repo !== query.repo) return;
     if (query.ownRuns) {
-      const run = msg.item.runId === null ? null : store.getRun(msg.item.runId);
-      if (
-        run?.source !== "mcp" ||
-        query.consumer === undefined ||
-        run.requestedBy !== mcpRequestedBy(query.consumer)
-      )
-        return;
+      if (query.consumer === undefined || !store.feedItemOwnedBy(msg.item.id, query.consumer)) return;
     }
     wake();
   });

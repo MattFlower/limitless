@@ -1186,9 +1186,11 @@ Continue with `after` set to the returned `nextAfter`; do not combine `from` and
 An `after` past the end clamps to the highest issued ID so the next read can receive new items.
 
 Use `repo` for an exact repository slug match (the run's `repoSlug`), and `ownRuns: true` with
-`consumer` to see only runs created through MCP with that same consumer name. Pass `consumer`
-on `limitless_create_run` as well as feed reads. Runs from other sources, older runs without
-recorded provenance, and items without a run are excluded. Combined filters must both match;
+`consumer` to see runs created through MCP with that same consumer name and their review,
+conflict and CI fix rounds. Round ownership comes from the recorded parent run, regardless of
+the round's own source. Pass `consumer` on `limitless_create_run` as well as feed reads.
+Unrelated runs, older runs without recorded provenance, and items without a run are excluded.
+Combined filters must both match, including when waiting for new items;
 pagination and `hasMore` count matching items only. Consumer names are caller-supplied labels,
 not access control. Acknowledgements remain cumulative across filters, so use separate consumer
 names for independently acknowledged inboxes.
@@ -1281,12 +1283,16 @@ A changes verdict creates a new run on the **same PR branch**, preserving the or
 Review, conflict and CI fix rounds share sequential numbering starting at 1; each gets its own
 run ID and recorded reviewed/delivered SHA. The PR body appends a `Round <n>` section for
 addressed review findings. These are separate from the implementation loop's round counter.
+Round feed titles identify the kind and shared PR sequence: a conflict round 1 can be followed
+by a review round 2.
 
 The original run's **base commit** supplies `[policy] review_rounds` in `.limitless.toml`:
 default 3, any non-negative safe integer accepted, 0 allows no review repair rounds. Only review
 rounds count against this cap. At the cap, `review round limit reached` leaves the owner
-`needs_human`. `review round <n> (<run-id>) is still in flight` refuses another changes verdict
-while any kind of round is active; follow that run first.
+`needs_human`. An in-flight 409 names the active kind, shared round number and run ID. It refuses
+another changes verdict without queueing it. Review the new head after that kind's delivered
+event (`review.round_delivered`, `conflict.round_delivered` or `ci.round_delivered`) and resubmit
+against its SHA. If the round ends without delivery, inspect its status first.
 
 A changes verdict stales earlier approval, even when the cap prevents a new round. A delivered
 new head also stales approval of an older head. Inspect the delivered work and submit a **fresh
