@@ -431,67 +431,55 @@ test.skipIf(zshSkip !== null)(
       scratch = join(f.root, SCRATCH_NAME);
     mkdirSync(scratch);
     writeFileSync(join(f.root, "a.test.ts"), "");
+    // File signals avoid extra listeners: sandboxes may only allow the invocation's scratch socket.
     writeFileSync(
       f.fake,
-      `#!${process.execPath}\nawait fetch(process.env.TEST_CONTROL); process.exit(3);\n`,
+      '#!/bin/sh\n: > "$TEST_STARTED"\nwhile [ ! -e "$TEST_RELEASE" ]; do sleep 0.02; done\nexit 3\n',
       { mode: 0o755 },
     );
-    let started = Promise.withResolvers<void>(),
-      release = Promise.withResolvers<void>();
-    const server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch() {
-        started.resolve();
-        await release.promise;
-        return new Response("released");
-      },
-    });
-    try {
-      await withSlottedCommands(
-        f.config.commands,
-        f.root,
-        scratch,
-        1,
-        () => {},
-        async (path) => {
-          const env = agentEnv({
-            HOME: f.root,
-            ZDOTDIR: f.root,
-            ...agentShellEnv({ scratchDir: scratch, commandPath: path }),
-            TEST_REAL: f.real,
-            TEST_CONTROL: server.url.href,
-          });
-          for (const target of ["a.test.ts", ""]) {
-            started = Promise.withResolvers<void>();
-            release = Promise.withResolvers<void>();
-            // Keep the controlled executable immediately behind the directory zsh startup put first.
-            const command = sh(
-              ["/bin/zsh", "-c", "-l", `PATH="$path[1]:$TEST_REAL:/usr/bin:/bin" bun test ${target}`],
-              { cwd: f.root, env, allowFail: true, timeoutMs: 10000 },
-            );
-            try {
-              await Promise.race([
-                started.promise,
-                command.then(() => {
-                  throw new Error("controlled executable did not start");
-                }),
-              ]);
-              expect(agentTestSlots.snapshot().occupied).toBe(target ? 1 : 0);
-              expect(gateSlots.snapshot().occupied).toBe(target ? 0 : 1);
-            } finally {
-              release.resolve();
-              expect((await command).exitCode).toBe(3);
+    await withSlottedCommands(
+      f.config.commands,
+      f.root,
+      scratch,
+      1,
+      () => {},
+      async (path) => {
+        const env = agentEnv({
+          HOME: f.root,
+          ZDOTDIR: f.root,
+          ...agentShellEnv({ scratchDir: scratch, commandPath: path }),
+          TEST_REAL: f.real,
+        });
+        for (const [i, target] of ["a.test.ts", ""].entries()) {
+          const started = join(f.root, `started-${i}`),
+            release = join(f.root, `release-${i}`);
+          let exited = false;
+          // Keep the controlled executable immediately behind the directory zsh startup put first.
+          const command = sh(
+            [
+              "/bin/zsh",
+              "-c",
+              "-l",
+              `PATH="$path[1]:$TEST_REAL:/usr/bin:/bin" TEST_STARTED=${started} TEST_RELEASE=${release} bun test ${target}`,
+            ],
+            { cwd: f.root, env, allowFail: true, timeoutMs: 10000 },
+          ).finally(() => (exited = true));
+          try {
+            while (!existsSync(started)) {
+              if (exited) throw new Error("controlled executable did not start");
+              await Bun.sleep(10);
             }
-            expect(agentTestSlots.snapshot().occupied).toBe(0);
-            expect(gateSlots.snapshot().occupied).toBe(0);
+            expect(agentTestSlots.snapshot().occupied).toBe(target ? 1 : 0);
+            expect(gateSlots.snapshot().occupied).toBe(target ? 0 : 1);
+          } finally {
+            writeFileSync(release, "");
+            expect((await command).exitCode).toBe(3);
           }
-        },
-      );
-    } finally {
-      release.resolve();
-      server.stop(true);
-    }
+          expect(agentTestSlots.snapshot().occupied).toBe(0);
+          expect(gateSlots.snapshot().occupied).toBe(0);
+        }
+      },
+    );
   },
 );
 
