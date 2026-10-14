@@ -1763,9 +1763,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** Optional state is checkpointed atomically with the run's SHAs and other fields. */
-  updateRun(id: string, patch: RunPatch, state?: unknown): Run {
+  updateRun(
+    id: string,
+    patch: RunPatch,
+    state?: unknown,
+    excludeFromSupersession: readonly string[] = [],
+  ): Run {
     if (patch.merged && !this.pendingPublications)
-      return this.chatTransaction(() => this.updateRun(id, patch, state));
+      return this.chatTransaction(() => this.updateRun(id, patch, state, excludeFromSupersession));
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");
@@ -1777,7 +1782,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     if (run.prUrl && patch.prClosedUnmerged !== undefined)
       this.observeGithubPrState(run.prUrl, patch.prClosedUnmerged ? "CLOSED" : "OPEN");
     this.publish({ kind: "run", run });
-    if (patch.merged) this.supersedeByIssue(run);
+    if (patch.merged) this.supersedeByIssue(run, excludeFromSupersession);
     return run;
   }
 
@@ -1788,7 +1793,13 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   resolveRun(
     id: string,
     input: { kind: ResolutionKind; by: string; ref?: string | null; note?: string | null; at?: number },
-    opts: { from?: RunStatus[]; patch?: RunPatch; why?: string; data?: Record<string, unknown> } = {},
+    opts: {
+      from?: RunStatus[];
+      patch?: RunPatch;
+      why?: string;
+      data?: Record<string, unknown>;
+      excludeFromSupersession?: readonly string[];
+    } = {},
   ): Run | null {
     const { kind, by, ref = null, note = null, at = Date.now() } = input;
     const resolution: RunResolution = { kind, ref, note, by, at };
@@ -1806,48 +1817,82 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       });
       const run = this.getRun(id) as Run;
       this.publish({ kind: "run", run });
-      if (opts.patch?.merged) this.supersedeByIssue(run);
+      if (opts.patch?.merged) this.supersedeByIssue(run, opts.excludeFromSupersession);
       return run;
     });
   }
 
   /** Record a confirmed merge, preserving any existing manual resolution and terminal evidence. */
-  resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number | null): boolean {
+  resolveMergedRun(
+    id: string,
+    mergedBy: string | null,
+    mergedAt: number | null,
+    opts: { confirmedAt?: number; excludeFromSupersession?: readonly string[] } = {},
+  ): boolean {
     const current = this.getRun(id);
     const prUrl = current?.prUrl;
     if (!current || !prUrl) return false;
     mergedBy = current.mergedBy ?? mergedBy;
     mergedAt = current.mergedAt ?? mergedAt;
     if (current.merged && current.status !== "needs_human") {
-      if (current.mergedBy !== mergedBy || current.mergedAt !== mergedAt)
-        this.updateRun(id, { mergedBy, mergedAt });
+      this.fillMergedRunMetadata(id, mergedBy, mergedAt);
       return false;
     }
-    if (mergedAt === null) return false;
+    const at = mergedAt ?? opts.confirmedAt;
+    if (at === undefined) return false;
     if (current.status === "resolved" || current.status === "succeeded") {
-      this.updateRun(id, { merged: true, mergedBy, mergedAt });
+      this.updateRun(id, { merged: true, mergedBy, mergedAt }, undefined, opts.excludeFromSupersession);
       return true;
     }
     const run = this.resolveRun(
       id,
-      { kind: "merged", ref: prUrl, by: "github", at: mergedAt },
+      { kind: "merged", ref: prUrl, by: "github", at },
       {
         from: ["needs_human"],
         patch: { merged: true, mergedBy, mergedAt },
         why: `after PR merged by ${mergedBy ?? "unknown"}`,
         data: { mergedBy, mergedAt },
+        excludeFromSupersession: opts.excludeFromSupersession,
       },
     );
     return run !== null;
   }
 
+  /** Enrich the existing merge item as metadata arrives, without another merge transition. */
+  fillMergedRunMetadata(id: string, mergedBy: string | null, mergedAt: number | null): void {
+    this.chatTransaction(() => {
+      const current = this.getRun(id);
+      if (!current?.merged) return;
+      mergedBy = current.mergedBy ?? mergedBy;
+      mergedAt = current.mergedAt ?? mergedAt;
+      if (current.mergedBy === mergedBy && current.mergedAt === mergedAt) return;
+      this.db
+        .query(`UPDATE feed SET data = json_set(data,
+        '$.mergedBy', coalesce(json_extract(data, '$.mergedBy'), ?),
+        '$.mergedAt', coalesce(json_extract(data, '$.mergedAt'), ?)),
+        summary = ? WHERE kind = 'run.merged' AND run_id = ?`)
+        .run(
+          mergedBy,
+          mergedAt,
+          `${current.prUrl ?? "Run"} merged${mergedBy === null ? "" : ` by ${mergedBy}`}`,
+          id,
+        );
+      this.updateRun(id, { mergedBy, mergedAt });
+    });
+  }
+
   /** A merged run supersedes needs_human runs in its repository that close one of the same issues. */
-  supersedeByIssue(merged: Run): Run[] {
+  supersedeByIssue(merged: Run, exclude: readonly string[] = []): Run[] {
     const issues = closedIssues(merged.prompt);
     if (!issues.size) return [];
     const input = { kind: "superseded", ref: merged.prUrl ?? merged.id, by: "system" } as const;
     return this.listRuns({ status: ["needs_human"], repoId: merged.repoId, limit: Number.MAX_SAFE_INTEGER })
-      .filter((r) => r.id !== merged.id && [...closedIssues(r.prompt)].some((n) => issues.has(n)))
+      .filter(
+        (r) =>
+          r.id !== merged.id &&
+          !exclude.includes(r.id) &&
+          [...closedIssues(r.prompt)].some((n) => issues.has(n)),
+      )
       .flatMap((r) => this.resolveRun(r.id, input, { from: ["needs_human"] }) ?? []);
   }
 

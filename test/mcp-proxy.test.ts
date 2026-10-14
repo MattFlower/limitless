@@ -90,7 +90,7 @@ test("MCP approvals retain optional normalized consumer provenance on both backe
             },
           }),
         );
-        const reviewer = consumer === undefined ? "human" : `mcp:${consumer.trim()}`;
+        const reviewer = consumer === undefined ? "mcp" : `mcp:${consumer.trim()}`;
         expect(result.approval.sha).toBe(c.headSha);
         expect(
           f.factory.store.db.query("SELECT reviewer FROM review_approvals ORDER BY id DESC LIMIT 1").get(),
@@ -1739,17 +1739,17 @@ test("review and land forward validated payloads and return API results", async 
       {
         path: "/api/runs/r%2F1/review",
         method: "POST",
-        body: { verdict: "approve", reviewedSha: sha, findings: [] },
+        body: { verdict: "approve", reviewedSha: sha, findings: [], reviewer: "mcp" },
       },
       {
         path: "/api/runs/r%2F1/review",
         method: "POST",
-        body: { verdict: "approve", reviewedSha: sha, findings: [] },
+        body: { verdict: "approve", reviewedSha: sha, findings: [], reviewer: "mcp" },
       },
       {
         path: "/api/runs/r%2F1/review",
         method: "POST",
-        body: { verdict: "changes", reviewedSha: sha, findings: [finding] },
+        body: { verdict: "changes", reviewedSha: sha, findings: [finding], reviewer: "mcp" },
       },
       { path: "/api/land", method: "POST", body: { target: "r/1" } },
       { path: "/api/land", method: "POST", body: { target: "r/1", sha } },

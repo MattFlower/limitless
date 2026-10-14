@@ -97,6 +97,7 @@ const CI_FEED = new Set(["pr.ci_passed", "pr.ci_failed"]);
 const UNSETTLED_CI = new Set(["PENDING", "EXPECTED"]);
 /** A claim has to be this quiet before another queue may take the entry it holds. */
 const CLAIM_STALE_MS = 30_000;
+const MERGE_METADATA_TIMEOUT_MS = 30_000;
 
 /**
  * Which queue is draining each repository in this process. The store's claim is the durable half of
@@ -292,6 +293,8 @@ export class LandQueue {
     const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
     const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
     const beat = (): void => {
+      const current = this.store.getLandEntry(entry.id);
+      if (current && !this.isActive(current)) return;
       if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) controller.abort();
       else heartbeat = set(beat, CLAIM_STALE_MS / 3);
     };
@@ -370,15 +373,16 @@ export class LandQueue {
     const mergedBy = observation?.state === "MERGED" ? (observation.mergedBy?.login ?? null) : null;
     const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
     const owner = this.store.reviewRound(run.id)?.owner ?? run;
-    for (const id of new Set([run.id, owner.id])) {
-      const current = this.store.getRun(id);
-      this.store.updateRun(id, {
-        merged: true,
-        mergedBy: current?.mergedBy ?? mergedBy,
-        mergedAt: current?.mergedAt ?? mergedAt,
-      });
-    }
-    this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+    const ids = [...new Set([run.id, owner.id])];
+    this.store.db.transaction(() => {
+      if (!this.isActive(this.store.getLandEntry(entry.id) ?? entry)) return;
+      this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+      for (const id of ids)
+        this.store.resolveMergedRun(id, mergedBy, mergedAt, {
+          confirmedAt: this.now(),
+          excludeFromSupersession: ids,
+        });
+    })();
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
   }
 
@@ -617,8 +621,34 @@ export class LandQueue {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
     }
-    const observed = await (this.deps.client ?? getGitHubPr)(entry.prUrl, signal).catch(() => null);
-    this.landed(entry, run, sha, observed ? { ...observed, head: observed.headRefOid ?? "" } : null);
+    this.landed(entry, run, sha, null);
+    const observed = await this.mergeMetadata(entry.prUrl, signal);
+    if (observed?.state !== "MERGED" || observed.url !== entry.prUrl) return;
+    const at = observed.mergedAt ? Date.parse(observed.mergedAt) : NaN;
+    const owner = this.store.reviewRound(run.id)?.owner ?? run;
+    for (const id of new Set([run.id, owner.id]))
+      this.store.fillMergedRunMetadata(id, observed.mergedBy?.login ?? null, Number.isFinite(at) ? at : null);
+  }
+
+  private async mergeMetadata(url: string, signal: AbortSignal): Promise<GitHubPrView | null> {
+    const controller = new AbortController();
+    const bounded = AbortSignal.any([signal, controller.signal]);
+    const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
+    const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
+    const timer = set(() => controller.abort(), MERGE_METADATA_TIMEOUT_MS);
+    const aborted = Promise.withResolvers<null>();
+    const onAbort = () => aborted.resolve(null);
+    bounded.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (bounded.aborted) return null;
+      return await Promise.race([
+        (this.deps.client ?? getGitHubPr)(url, bounded).catch(() => null),
+        aborted.promise,
+      ]);
+    } finally {
+      clear(timer);
+      bounded.removeEventListener("abort", onAbort);
+    }
   }
 
   // ---- helpers -------------------------------------------------------------

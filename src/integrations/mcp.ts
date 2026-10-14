@@ -340,7 +340,11 @@ export function createMcpServer(backend: McpBackend): Server {
       "limitless_review",
       "Review a run's current PR head. Supply run, verdict (changes or approve), reviewedSha (full commit SHA), and findings (severity, title, detail; optional file and line). Optional consumer records approval provenance as mcp:<consumer>. Changes requires findings; approve accepts omitted findings or an empty array. Returns the approval or new review round. Inspect status after an uncertain response before retrying.",
       reviewSchema,
-      async ({ run, ...input }) => backend.review(run, ReviewVerdictSchema.parse(input)),
+      async ({ run, ...input }) =>
+        backend.review(run, {
+          ...ReviewVerdictSchema.parse(input),
+          reviewer: "mcp",
+        }),
     ),
     tool(
       "limitless_land",

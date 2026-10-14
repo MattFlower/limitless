@@ -316,8 +316,8 @@ async function settleIdle(): Promise<void> {
   for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
-async function waitWithoutClock(check: () => boolean): Promise<void> {
-  const end = Date.now() + 1_000;
+async function waitWithoutClock(check: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const end = Date.now() + timeoutMs;
   while (!check() && Date.now() < end) await settleIdle();
   expect(check()).toBe(true);
 }
@@ -351,7 +351,10 @@ test("two approved entries on one repository land in order, never checking at on
   const q = queue();
   await q.request({ target: first.run.id });
   await q.request({ target: second.run.id });
+  await waitFor(() => store.getRun(first.run.id)?.merged === true);
+  await waitWithoutClock(() => store.getRun(first.run.id)?.mergedBy === "owner", 15_000);
   await settle();
+  await waitWithoutClock(() => store.getRun(second.run.id)?.mergedBy === "owner", 15_000);
   const entries = store.listLandEntries();
   expect(entries.map((e) => [e.id, e.state])).toEqual([
     [1, "landed"],
@@ -381,7 +384,8 @@ test("later merge observations fill queue-landed parent metadata without another
   writeFileSync(join(root, "gh.no-metadata"), "");
   await queue().request({ target: round.id });
   await settle();
-  expect(store.getRun(pr.run.id)).toMatchObject({ merged: true, mergedBy: null, mergedAt: null });
+  for (const id of [pr.run.id, round.id])
+    expect(store.getRun(id)).toMatchObject({ merged: true, mergedBy: null, mergedAt: null });
   const feed = () => store.readFeed({ limit: 100 }).items.filter((item) => item.kind === "run.merged");
   expect(feed().filter((item) => item.runId === pr.run.id)).toHaveLength(1);
   let lookups = 0;
@@ -408,15 +412,110 @@ test("later merge observations fill queue-landed parent metadata without another
       return null;
     });
   }
-  expect(store.getRun(pr.run.id)).toMatchObject({
-    merged: true,
-    mergedBy: "owner",
-    mergedAt: Date.parse("2026-10-13T12:00:00Z"),
-  });
+  for (const id of [pr.run.id, round.id]) {
+    const metadata = { mergedBy: "owner", mergedAt: Date.parse("2026-10-13T12:00:00Z") };
+    expect(store.getRun(id)).toMatchObject({ merged: true, ...metadata });
+    expect(feed().find((item) => item.runId === id)?.data).toMatchObject(metadata);
+    expect(feed().find((item) => item.runId === id)?.summary).toContain("merged by owner");
+  }
   expect(feed()).toHaveLength(2); // one per run, including the round
   expect(lookups).toBe(0);
   expect(ghCalls("pr merge")).toHaveLength(1);
 });
+
+test.each(["complete", "fail", "abort", "timeout", "unmerged", "different PR"])(
+  "landing is recorded before the optional metadata read: %s",
+  async (outcome) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const round = roundRun(pr.run.id, url(1), head);
+    observe(1, head);
+    store.recordApproval(round.id, url(1), head, "orchestrator");
+    const response = Promise.withResolvers<GitHubPrView | null>();
+    let metadataSignal: AbortSignal | undefined;
+    const q = queue({
+      client: (_url, signal) => {
+        metadataSignal = signal;
+        return response.promise; // Deliberately ignores abort: the queue must bound the wait itself.
+      },
+    });
+    try {
+      const entry = await q.request({ target: round.id });
+      await waitFor(() => metadataSignal !== undefined);
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      for (const id of [round.id, pr.run.id])
+        expect(store.getRun(id)).toMatchObject({ merged: true, mergedBy: null, mergedAt: null });
+      expect(q.cancel(entry.id)).toBe(false);
+      if (outcome === "timeout") await clock.advance(30_000);
+      if (outcome === "abort") await q.stop();
+      if (outcome === "timeout" || outcome === "abort") expect(metadataSignal?.aborted).toBe(true);
+      if (outcome === "timeout")
+        await waitWithoutClock(() => !existsSync(join(paths.work, `land-${entry.id}`)), 15_000);
+      const observation: GitHubPrView = {
+        url: url(outcome === "different PR" ? 2 : 1),
+        state: outcome === "unmerged" ? "OPEN" : "MERGED",
+        headRefOid: head,
+        mergedBy: { login: "owner" },
+        mergedAt: "2026-10-13T12:00:00Z",
+        ci: null,
+        failing: [],
+      };
+      if (outcome === "fail") response.reject(new Error("metadata unavailable"));
+      else response.resolve(observation);
+      await waitFor(() => !existsSync(join(paths.work, `land-${entry.id}`)));
+      await q.stop();
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      for (const id of [round.id, pr.run.id]) {
+        const metadata =
+          outcome === "complete"
+            ? { mergedBy: "owner", mergedAt: Date.parse("2026-10-13T12:00:00Z") }
+            : { mergedBy: null, mergedAt: null };
+        expect(store.getRun(id)).toMatchObject({ merged: true, ...metadata });
+        const feed = store
+          .readFeed({ limit: 100 })
+          .items.filter((item) => item.kind === "run.merged" && item.runId === id);
+        expect(feed).toHaveLength(1);
+        expect(feed[0]?.data).toMatchObject(metadata);
+      }
+    } finally {
+      response.resolve(null);
+      await q.stop();
+    }
+  },
+);
+
+test.each([true, false])(
+  "landing resolves a same-issue needs_human round as merged (metadata: %s)",
+  async (metadata) => {
+    const pr = delivered(1, "pr-1");
+    store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("request\nCloses #42", pr.run.id);
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const round = roundRun(pr.run.id, url(1), head);
+    const repo = store.getRepo(pr.run.repoId);
+    if (!repo) throw new Error("missing repository");
+    const other = store.createRun(repo, { repo: SLUG, prompt: "other request\nCloses #42" });
+    const finishedAt = 123;
+    store.updateRun(other.id, { status: "needs_human" });
+    store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("review round\nCloses #42", round.id);
+    store.updateRun(round.id, { status: "needs_human", finishedAt, error: "review needs approval" });
+    observe(1, head);
+    store.recordApproval(round.id, url(1), head, "orchestrator");
+    if (!metadata) writeFileSync(join(root, "gh.no-metadata"), "");
+    const entry = await queue().request({ target: round.id });
+    await settle();
+    if (metadata) await waitWithoutClock(() => store.getRun(round.id)?.mergedBy === "owner", 15_000);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(store.getRun(round.id)).toMatchObject({
+      merged: true,
+      status: "resolved",
+      resolution: { kind: "merged", ref: url(1) },
+      finishedAt,
+      error: "review needs approval",
+    });
+    expect(store.getRun(pr.run.id)).toMatchObject({ merged: true, status: "succeeded", resolution: null });
+    expect(store.getRun(other.id)?.resolution?.kind).toBe("superseded");
+  },
+);
 
 test("three requests submitted together all land, with no further request", async () => {
   const prs = [1, 2, 3].map((n) => delivered(n, `pr-${n}`));
@@ -1406,6 +1505,7 @@ test("a review-round land merges current main into the approved head before chec
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
   expect(gateLog()).toEqual(["moved"]);
+  await waitWithoutClock(() => store.getRun(pr.run.id)?.mergedBy === "owner", 15_000);
   const metadata = { merged: true, mergedBy: "owner", mergedAt: Date.parse("2026-10-13T12:00:00Z") };
   expect(store.getRun(pr.run.id)).toMatchObject(metadata);
   expect(

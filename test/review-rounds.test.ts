@@ -762,6 +762,20 @@ test("approve records the reviewed head; a later push makes it stale", async () 
   });
   expect(factory.store.getRunDetail(original.id)?.review?.approval).toEqual({ sha: reviewed, stale: false });
   expect(kinds()).toContain("review.approved");
+  const reviewer = () =>
+    factory.store.db.query("SELECT reviewer FROM review_approvals ORDER BY id DESC LIMIT 1").get();
+  const approvalFeed = () =>
+    factory.store
+      .readFeed({ limit: 100 })
+      .items.filter((item) => item.kind === "review.approved")
+      .at(-1);
+  expect(reviewer()).toEqual({ reviewer: "matt" });
+  expect(approvalFeed()?.data.reviewer).toBe("matt");
+  expect(await review(original.id, { verdict: "approve", reviewedSha: reviewed })).toMatchObject({
+    status: 200,
+  });
+  expect(reviewer()).toEqual({ reviewer: "human" });
+  expect(approvalFeed()?.data.reviewer).toBe("human");
 
   const moved = await push(BRANCH, "feature.txt", "pushed after approval\n");
   // Any later look at the PR (here a verdict on the old head) sees the push.
