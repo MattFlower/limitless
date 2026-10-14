@@ -34,6 +34,7 @@ const PATCH_CAP = 16_000;
 const REPORT_CAP = 4_000;
 const FILES_CAP = 50;
 const DISTINCTIVE_LENGTH = 12;
+const normalizeWhitespace = (value: string) => value.replace(/\\+[nrt]/gu, " ").replace(/\s+/gu, " ");
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
 type HoldoutRedactor = (value: string) => string;
@@ -238,9 +239,15 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       if (observed !== undefined) {
         for (const detail of privateHoldoutDetails(standalone, publicSources, observed)) details.add(detail);
         const prose = observed.trim();
+        const words = normalizeWhitespace(normalizedLayers(prose)?.at(-1) ?? prose).trim();
         // Gate citations and generic notes are public; only private observations need
         // whole-prose matching when they have no distinctive literals to harvest.
-        if (prose && privateProse && !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources))
+        if (
+          privateProse &&
+          words.length >= DISTINCTIVE_LENGTH &&
+          words.split(" ").length > 1 &&
+          !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources)
+        )
           details.add(prose);
       }
     };
@@ -254,8 +261,9 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       collect(verify?.notes);
       for (const criterion of verify?.criteria ?? []) {
         // Public acceptance evidence/summaries stay public, as in preDeliveryVerifyArtifact.
-        if (rowKind(criterion.id, spec ?? null, holdout) !== "public") {
-          details.add(criterion.id);
+        const kind = rowKind(criterion.id, spec ?? null, holdout);
+        if (kind !== "public") {
+          if (kind === "holdout") details.add(criterion.id.trim());
           collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation], true);
         }
         collectOutput(criterion.gateEvidence);
@@ -323,12 +331,15 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
     const layers = normalizedLayers(text);
     return !layers || layers.some((layer) => boundary?.test(layer));
   };
-  const multilineDetails = [...details].filter((detail) => /[\r\n\t]/u.test(detail));
+  // Any phrase can wrap in a report, even if its catalogue entry is a single line.
+  const multilineDetails = [...details];
   const multiline = multilineDetails.length
     ? new RegExp(
         multilineDetails
           .map((detail) => {
-            const normalized = detail.normalize("NFKC").toLowerCase().replace(/\s+/gu, " ");
+            const normalized = normalizeWhitespace(
+              normalizedLayers(detail)?.at(-1) ?? detail.normalize("NFKC").toLowerCase(),
+            );
             const literal = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             return detail.length >= DISTINCTIVE_LENGTH ? literal : holdoutBoundaryPattern(normalized);
           })

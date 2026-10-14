@@ -253,6 +253,101 @@ test("shared holdout words leave PR code visible while holdout-only reports stay
   }
 });
 
+test.each([
+  ["\n", " "],
+  ["\\n", " "],
+  ["\\r\\n", " "],
+  ["\\u000a", " "],
+  ["\n", "\n"],
+  ["\n", "\\n"],
+  ["\n", "\\u000a"],
+])("wrapped holdout quotations stay private (report: %j, verifier: %j)", async (separator, evidenceSpace) => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "Exercise private behavior.",
+          steps: "Run the check.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+    lastVerify: {
+      criteria: [{ id: "H-1", evidence: ["the", "amber", "lantern", "glows"].join(evidenceSpace) }],
+    },
+  });
+  f.factory.store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    `Quoted result: the amber lantern${separator}glows\nPublic checks passed.`,
+  );
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      const withheld = "[withheld: holdout result or quotation; 1 line]\n";
+      expect(page.reports[0]?.text).toBe(
+        `${withheld.repeat(separator === "\n" ? 2 : 1)}Public checks passed.`,
+      );
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("malformed criterion IDs and generic evidence leave unrelated report lines public", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  f.factory.store.setRunState(c.run.id, {
+    holdout: {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "Exercise private behavior.",
+          steps: "Run the check.",
+          expected: "Done.",
+          edge_case: false,
+        },
+      ],
+    },
+    lastVerify: {
+      criteria: [
+        { id: "a", evidence: "Passed" },
+        { id: "1", publicSummary: "All done" },
+        { id: "H-2", evidence: "Congratulations" },
+        { id: " h-1 ", evidence: "the amber lantern glows" },
+        { id: "unknown", evidence: "the violet beacon shines" },
+      ],
+    },
+  });
+  const publicLines =
+    "All gates passed\n2 files changed\na public change\n1 public check: All done\nCongratulations H-2 check";
+  f.factory.store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    `${publicLines}\nH-1 met\nthe amber lantern glows\nthe violet beacon shines`,
+  );
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      expect(page.reports[0]?.text).toBe(
+        publicLines + "\n[withheld: holdout result or quotation; 1 line]".repeat(3),
+      );
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
 test("short literals in multiline holdout fields stay private in reports and visible in PR patches", async () => {
   const content =
     'const label = "xq-77";\nconst shortLabel = "qv";\nrun --dry a/b\nexit 3\nconst val9 = true;\nreadable ending\n';
