@@ -87,6 +87,18 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
             withhold(text.length - prefix.length, text.length);
           if (suffix.replace(/\r?\n/gu, "") && text.startsWith(suffix)) withhold(0, suffix.length);
         }
+        if (!literal.includes("\n")) continue;
+        // Both hunk edges can fall inside a long credential; protect whole-line runs from its middle.
+        const framed = `\n${literal}\n`;
+        for (let i = 0; i < ranges.length; i++) {
+          for (let j = i; j < ranges.length; j++) {
+            const run = text.slice(ranges[i]?.start, ranges[j]?.end);
+            if (!framed.includes(`\n${run}`)) break;
+            // Two or more lines: a lone shared line is not evidence of the credential.
+            if (j > i && run.endsWith("\n") && run.replace(/\s/gu, "").length >= 8)
+              withhold(ranges[i]?.start ?? 0, ranges[j]?.end ?? 0);
+          }
+        }
       }
     }
   };
