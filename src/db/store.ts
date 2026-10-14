@@ -90,6 +90,10 @@ function json(v: unknown): string | null {
 
 const FEED_SELECT =
   "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
+// A persisted round belongs to its parent, regardless of the round run's own source.
+const FEED_OWNERSHIP = `EXISTS (SELECT 1 FROM runs WHERE runs.id = COALESCE(
+  (SELECT source_run_id FROM review_rounds WHERE run_id = feed.run_id), feed.run_id)
+  AND source = 'mcp' AND requested_by = ?)`;
 type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
@@ -105,7 +109,21 @@ const LAND_PATCH_COLUMNS: Record<string, string> = {
   attempts: "attempts",
   reason: "reason",
 };
-const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
+const toFeedItem = (r: Row): FeedItem => {
+  const item = { ...r, data: parse(r.data, {}) } as FeedItem;
+  if (
+    [
+      "review.round_started",
+      "review.round_delivered",
+      "conflict.round_started",
+      "conflict.round_delivered",
+      "ci.round_started",
+      "ci.round_delivered",
+    ].includes(item.kind)
+  )
+    item.title += " (shared PR round sequence)";
+  return item;
+};
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
 const AUTH_SESSION_SELECT =
@@ -697,8 +715,7 @@ export class Store {
     const limit = Math.min(opts.limit ?? MAX_FEED_ITEMS, 1000);
     const query = this.db.query(`${FEED_SELECT} WHERE id > ?
       AND (? IS NULL OR repo = ?)
-      AND (? = 0 OR EXISTS (SELECT 1 FROM runs WHERE runs.id = feed.run_id
-        AND source = 'mcp' AND requested_by = ?)) ORDER BY id LIMIT ?`);
+      AND (? = 0 OR ${FEED_OWNERSHIP}) ORDER BY id LIMIT ?`);
     const items = (
       query.all(
         after,
@@ -725,6 +742,13 @@ export class Store {
 
   feedCursor(consumer: string): number {
     return this.feedNumber("SELECT acked_id AS n FROM feed_cursors WHERE consumer = ?", consumer);
+  }
+
+  /** Use the read filter for long-poll publications too. */
+  feedItemOwnedBy(id: number, consumer: string): boolean {
+    return !!this.db
+      .query(`SELECT 1 FROM feed WHERE id = ? AND ${FEED_OWNERSHIP}`)
+      .get(id, mcpRequestedBy(consumer));
   }
 
   /** The highest id ever issued, counting AUTOINCREMENT gaps and pruned items. */

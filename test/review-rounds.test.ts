@@ -720,7 +720,9 @@ test("at most one round in flight, and the fourth changes verdict leaves the run
   expect(pr.autoMerge).toBe(false);
   expect(await changes(original.id)).toMatchObject({
     status: 409,
-    body: { error: `review round 1 (${first.body.round?.id}) is still in flight` },
+    body: {
+      error: `review round 1 (${first.body.round?.id}) is still in flight and updating the PR (shared PR round sequence); review its new head after review.round_delivered; inspect its status if it ends without delivery`,
+    },
   });
   for (const round of [2, 3]) {
     const previous = factory.store.reviewRounds(PR_URL).at(-1) as { runId: string };

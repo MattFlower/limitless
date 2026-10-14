@@ -216,7 +216,7 @@ export async function submitReview(
     }));
     if ("active" in result)
       throw new ReviewRefused(
-        `review round ${result.active.round} (${result.active.runId}) is still in flight`,
+        `${result.active.kind === "ci" ? "CI fix" : result.active.kind} round ${result.active.round} (${result.active.runId}) is still in flight and updating the PR (shared PR round sequence); review its new head after ${result.active.kind}.round_delivered; inspect its status if it ends without delivery`,
         409,
       );
     if ("limited" in result) throw new ReviewRefused("review round limit reached", 409);

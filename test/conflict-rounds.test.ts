@@ -24,10 +24,12 @@ import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { submitReview } from "../src/pipeline/review-round.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub } from "./github-poller-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { approve, holdout, models, pass, policy, providers, roleOf, spec } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
@@ -1038,6 +1040,38 @@ test.each([false, true])(
   },
 );
 
+test.each(["conflict", "ci"] as const)(
+  "a changes verdict refuses an active %s round with its shared number and delivery event",
+  async (kind) => {
+    const id = await trigger();
+    if (kind === "ci")
+      factory.store.db.query("UPDATE review_rounds SET kind = 'ci' WHERE run_id = ?").run(id);
+    const route = (createHttpRoutes(factory)["/api/runs/:id/review"] as { POST: Route }).POST;
+    const res = await route(
+      requestWithParams(
+        `http://localhost:7400/api/runs/${owner.id}/review`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            verdict: "changes",
+            reviewedSha: owner.headSha,
+            findings: [{ severity: "major", title: "Fix it", detail: "Handle empty input" }],
+          }),
+        },
+        { id: owner.id },
+      ),
+      localServer,
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: `${kind === "ci" ? "CI fix" : "conflict"} round 1 (${id}) is still in flight and updating the PR (shared PR round sequence); review its new head after ${kind}.round_delivered; inspect its status if it ends without delivery`,
+    });
+    expect(factory.store.reviewRounds(url)).toMatchObject([{ runId: id, kind, round: 1 }]);
+    expect(factory.store.listRuns()).toHaveLength(2);
+  },
+);
+
 test("shared numbering survives previous-release inserts while the review cap ignores conflicts", async () => {
   const conflict = await trigger();
   factory.store.updateRun(conflict, { status: "succeeded" });
@@ -1070,6 +1104,15 @@ test("shared numbering survives previous-release inserts while the review cap ig
     { kind: "review", round: 2 },
     { kind: "review", round: 3 },
   ]);
+  const started = factory.store
+    .readFeed({ limit: 100 })
+    .items.filter((item) => item.kind.endsWith(".round_started"));
+  expect(started.map((item) => item.title)).toEqual([
+    expect.stringContaining("Conflict round 1"),
+    expect.stringContaining("Review round 2"),
+    expect.stringContaining("Review round 3"),
+  ]);
+  expect(started.every((item) => item.title.includes("shared PR round sequence"))).toBe(true);
   if ("run" in result) factory.store.updateRun(result.run.id, { status: "succeeded" });
   expect(factory.store.createReviewRound(repo, owner, review, request)).toHaveProperty("limited");
 });
