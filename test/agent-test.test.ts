@@ -31,10 +31,10 @@ import {
 } from "../src/cli/gate-slot.ts";
 import { AgentTestSession, agentTestLease, type TestWait } from "../src/gates/agent-tests.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
-import { SCRATCH_NAME } from "../src/harness/scratch.ts";
+import { agentShellEnv, removeScratch, SCRATCH_NAME } from "../src/harness/scratch.ts";
 import { withSlottedCommands } from "../src/harness/slotted.ts";
 import { readSlottedCommands } from "../src/harness/slotted-config.ts";
-import { sh } from "../src/util/proc.ts";
+import { agentEnv, sh } from "../src/util/proc.ts";
 
 import { waitClock } from "./wait-clock.ts";
 
@@ -383,6 +383,105 @@ test("empty commands install no wrappers and pass no PATH override", async () =>
   );
   expect(existsSync(join(f.root, "config.json"))).toBe(false);
 });
+
+const zshSkip = existsSync("/bin/zsh") ? null : "requires /bin/zsh";
+test.skipIf(zshSkip !== null)(
+  `agent zsh resolves wrappers without personal startup and removes its startup directory (${zshSkip ?? "zsh available"})`,
+  async () => {
+    const f = fixture(),
+      scratch = join(f.root, SCRATCH_NAME),
+      home = join(f.root, "home");
+    mkdirSync(scratch);
+    mkdirSync(home);
+    for (const name of [".zshenv", ".zprofile", ".zlogin", ".zshrc"])
+      writeFileSync(join(home, name), 'echo personal >> "$TEST_MARKER"\nexport PATH="$TEST_REAL"\n');
+    let zdotdir = "";
+    await withSlottedCommands(
+      f.config.commands,
+      f.root,
+      scratch,
+      1,
+      () => {},
+      async (path) => {
+        const env = agentEnv({
+          ZDOTDIR: home,
+          ...agentShellEnv({ scratchDir: scratch, commandPath: path }),
+          HOME: home,
+          TEST_MARKER: f.marker,
+          TEST_REAL: f.real,
+        });
+        zdotdir = env.ZDOTDIR ?? "";
+        for (const args of [["-c"], ["-c", "-l"]]) {
+          const result = await sh(["/bin/zsh", ...args, "command -v bun"], { cwd: f.root, env });
+          expect(result.stdout.trim()).toBe(join(path?.split(delimiter)[0] ?? "", "bun"));
+        }
+        expect(zdotdir.startsWith(`${scratch}/`)).toBe(true);
+        expect(existsSync(f.marker)).toBe(false);
+      },
+    );
+    removeScratch(scratch);
+    expect(existsSync(zdotdir)).toBe(false);
+  },
+);
+
+test.skipIf(zshSkip !== null)(
+  `login zsh holds and releases targeted and full-suite wrapper leases (${zshSkip ?? "zsh available"})`,
+  async () => {
+    const f = fixture(),
+      scratch = join(f.root, SCRATCH_NAME);
+    mkdirSync(scratch);
+    writeFileSync(join(f.root, "a.test.ts"), "");
+    // File signals avoid extra listeners: sandboxes may only allow the invocation's scratch socket.
+    writeFileSync(
+      f.fake,
+      '#!/bin/sh\n: > "$TEST_STARTED"\nwhile [ ! -e "$TEST_RELEASE" ]; do sleep 0.02; done\nexit 3\n',
+      { mode: 0o755 },
+    );
+    await withSlottedCommands(
+      f.config.commands,
+      f.root,
+      scratch,
+      1,
+      () => {},
+      async (path) => {
+        const env = agentEnv({
+          HOME: f.root,
+          ZDOTDIR: f.root,
+          ...agentShellEnv({ scratchDir: scratch, commandPath: path }),
+          TEST_REAL: f.real,
+        });
+        for (const [i, target] of ["a.test.ts", ""].entries()) {
+          const started = join(f.root, `started-${i}`),
+            release = join(f.root, `release-${i}`);
+          let exited = false;
+          // Keep the controlled executable immediately behind the directory zsh startup put first.
+          const command = sh(
+            [
+              "/bin/zsh",
+              "-c",
+              "-l",
+              `PATH="$path[1]:$TEST_REAL:/usr/bin:/bin" TEST_STARTED=${started} TEST_RELEASE=${release} bun test ${target}`,
+            ],
+            { cwd: f.root, env, allowFail: true, timeoutMs: 10000 },
+          ).finally(() => (exited = true));
+          try {
+            while (!existsSync(started)) {
+              if (exited) throw new Error("controlled executable did not start");
+              await Bun.sleep(10);
+            }
+            expect(agentTestSlots.snapshot().occupied).toBe(target ? 1 : 0);
+            expect(gateSlots.snapshot().occupied).toBe(target ? 0 : 1);
+          } finally {
+            writeFileSync(release, "");
+            expect((await command).exitCode).toBe(3);
+          }
+          expect(agentTestSlots.snapshot().occupied).toBe(0);
+          expect(gateSlots.snapshot().occupied).toBe(0);
+        }
+      },
+    );
+  },
+);
 
 test.each(["development", "production"])(
   "wrapper startup preserves cwd and inherited env without loading repository configuration (%s)",
