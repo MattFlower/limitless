@@ -52,7 +52,14 @@ import {
   prepareImplement,
   RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
-import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
+import {
+  gradeCase,
+  prepareCase,
+  prepareEvalGates,
+  schemaFor,
+  seedContent,
+  storedSchemaFor,
+} from "./prepare.ts";
 import { replayFinders, validateReplay } from "./replay.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
@@ -626,6 +633,7 @@ export class EvalRunner {
     let directory: string | undefined;
     let scratch: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
+    let preparationStarted: number | undefined;
     try {
       const replay =
         typeof replayId === "string" && system
@@ -655,7 +663,7 @@ export class EvalRunner {
         cleanup = checkout;
         if (item.snapshot) effective = { ...item, base: checkout.base };
       }
-      const preparationStarted = Date.now();
+      preparationStarted = Date.now();
       const implementation = "hidden" in effective ? await implementFor(effective, cwd) : undefined;
       const prepared =
         "hidden" in effective
@@ -670,7 +678,16 @@ export class EvalRunner {
               cfg.triageDecisionConfidence,
             );
       if (!prepared) throw new Error("missing trial preparation");
+      if ("defects" in effective && system?.setup) {
+        const { baseline } = await prepareEvalGates(effective, cwd, signal, true);
+        const failed = baseline.setup.find((step) => !step.ok);
+        if (!baseline.setupOk)
+          throw new Error(
+            redactCredentials(`review gate setup failed: ${failed?.command}\n${failed?.output}`),
+          );
+      }
       const preparationMs = Date.now() - preparationStarted;
+      if ("defects" in item) trial.details.preparationMs = preparationMs;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
       const reviewInput =
@@ -1181,6 +1198,9 @@ export class EvalRunner {
         details: {
           ...trial.details,
           preparationFailed: !trial.details.roundsUsed,
+          ...("defects" in item && preparationStarted !== undefined && !trial.details.roundsUsed
+            ? { preparationMs: Date.now() - preparationStarted }
+            : {}),
           ...("hidden" in item
             ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: "operational failure" }
             : {}),

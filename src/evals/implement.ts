@@ -26,12 +26,10 @@ import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
 import { agentEnv, sh } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
-import { gatesAt } from "./prepare.ts";
+import { prepareEvalGates } from "./prepare.ts";
 
 export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
-  const gates = await gatesAt(cwd, item.base, signal);
-  const baseline = await runGates(cwd, gates, signal, { holder: "eval baseline" });
-  signal.throwIfAborted();
+  const { gates, baseline } = await prepareEvalGates(item, cwd, signal);
   if (!baseline.setupOk) throw new Error("baseline gate setup failed");
   if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
     throw new Error("baseline gate check timed out");
