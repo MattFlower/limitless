@@ -95,7 +95,13 @@ test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and rep
     "hello.txt": "hello\nnew greeting\n",
     "src/count.ts": "export const publicCounterName = 3;\n",
   });
-  const report = "AC-1 met: src/count.ts sets the limit to 3 (verified at 100%).";
+  const report = [
+    "AC-1 met: src/count.ts sets the limit to 3 (verified at 100%).",
+    "## Checks",
+    "lint: bun run lint — Passed",
+    "typecheck: bun run typecheck — All checks passed.",
+    "Build complete.",
+  ].join("\n");
   f.factory.store.setRunState(c.run.id, {
     spec: {
       summary: "Add src/count.ts with a word limit of 3.",
@@ -106,15 +112,24 @@ test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and rep
       blocking_questions: [],
     },
     lastVerify: {
+      notes: "Passed",
       criteria: [
         {
           id: "AC-1",
           evidence: "Observed 'publicCounterName' in the public criterion.",
           publicSummary: "",
           status: "met",
+          gateEvidence: { check: "lint", command: "bun run lint" },
         },
       ],
     },
+    verifyResults: [
+      {
+        notes: "All checks passed.",
+        modelOutput: { notes: "Build complete." },
+        criteria: [{ id: "H-1", gateEvidence: { check: "typecheck", command: "bun run typecheck" } }],
+      },
+    ],
     holdout: {
       scenarios: [
         {
@@ -957,21 +972,34 @@ test.each([true, false])(
               status: "met",
               evidence: "src/count.ts:7 exports 'publicCounterName' with value 123.",
               publicSummary: "src/count.ts returns 123.",
+              gateEvidence: { check: "lint", command: "bun run lint" },
             },
             {
               id: "H-1",
               status: "met",
               evidence: "Observed 'runtimeProbeSecret' during verification.",
               publicSummary: "Behavior confirmed.",
+              gateEvidence: { check: "typecheck", command: "bun run typecheck" },
             },
           ],
-          notes: "",
+          notes: "Passed",
           ...(complete ? { overall: "pass" } : {}),
         }),
       },
       "Private verifier output withheld.",
     );
-    store.putArtifact(c.run.id, "report.md", "report", "src/count.ts:7 returns 123; runtimeProbeSecret");
+    store.recordOwnerDiagnostic(
+      { runId: c.run.id, invocationId: invocation.id, kind: "error", text: "All checks passed." },
+      "All checks passed.",
+    );
+    const publicReport =
+      "src/count.ts:7 returns 123.\n## Checks\nlint: bun run lint — Passed\ntypecheck: bun run typecheck\nAll checks passed.";
+    store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      `${publicReport}\nsrc/count.ts:7 returns 123; runtimeProbeSecret`,
+    );
     const connections = await changeConnections();
     try {
       for (const conn of [connections.direct, connections.proxy]) {
@@ -984,7 +1012,9 @@ test.each([true, false])(
           "+export const publicCounterName = 123;\n+export const limit = 7;\n",
         );
         expect(page.diff.text).toContain("+runtimeProbeSecret");
-        expect(page.reports[0]?.text).toBe("[withheld: holdout result or quotation; 1 line]");
+        expect(page.reports[0]?.text).toBe(
+          `${publicReport}\n[withheld: holdout result or quotation; 1 line]`,
+        );
         expect(JSON.stringify(page)).not.toMatch(/Observed '|invocationId|owner_diagnostics/);
       }
     } finally {

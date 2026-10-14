@@ -234,17 +234,20 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
             /[/_-]|[\p{L}$].*\d|\d.*[\p{L}$]/u.test(detail)))
       )
         details.add(detail);
-    const collect = (observed?: string) => {
+    const collect = (observed?: string, privateProse = false) => {
       if (observed !== undefined) {
         for (const detail of privateHoldoutDetails(standalone, publicSources, observed)) details.add(detail);
         const prose = observed.trim();
-        if (prose && !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources)) details.add(prose);
+        // Gate citations and generic notes are public; only private observations need
+        // whole-prose matching when they have no distinctive literals to harvest.
+        if (prose && privateProse && !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources))
+          details.add(prose);
       }
     };
-    const collectOutput = (value: unknown) => {
-      if (typeof value === "string") collect(value);
+    const collectOutput = (value: unknown, privateProse = false) => {
+      if (typeof value === "string") collect(value, privateProse);
       else if (value && typeof value === "object")
-        for (const field of Object.values(value)) collectOutput(field);
+        for (const field of Object.values(value)) collectOutput(field, privateProse);
     };
     collect();
     const collectVerification = (verify: z.output<typeof verificationText> | null | undefined) => {
@@ -253,7 +256,7 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
         // Public acceptance evidence/summaries stay public, as in preDeliveryVerifyArtifact.
         if (rowKind(criterion.id, spec ?? null, holdout) !== "public") {
           details.add(criterion.id);
-          collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation]);
+          collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation], true);
         }
         collectOutput(criterion.gateEvidence);
       }
