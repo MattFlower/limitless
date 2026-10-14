@@ -594,3 +594,50 @@ test("digest lists delivered conflict rounds under PRs awaiting review", async (
   expect(lines[1]).toContain("PRs awaiting review: 1");
   expect(lines[2]).toContain("PRs awaiting review: #1");
 });
+
+test("digest lists unread CI deliveries after earlier PR events are acknowledged until the new head is approved", async () => {
+  const prUrl = "https://github.com/o/r/pull/1";
+  const head = "b".repeat(40);
+  let approvedSha = "a".repeat(40);
+  const cursor = 2;
+  const items = [
+    item(1, "run.pr_opened", { runId: "parent", data: { prUrl } }),
+    item(2, "review.round_delivered", { runId: "review", data: { prUrl } }),
+    item(3, "ci.round_delivered", {
+      runId: "ci",
+      title: "CI fix round delivered",
+      data: { prUrl },
+    }),
+  ];
+  const api = async <T>(path: string, init?: RequestInit): Promise<T> => {
+    expect(init).toBeUndefined();
+    const url = new URL(path, "http://x");
+    if (url.pathname === "/api/feed") {
+      expect(url.searchParams.get("consumer")).toBe("session");
+      return { items: items.filter((i) => i.id > cursor), nextAfter: 3, pruned: false } as T;
+    }
+    if (url.pathname === "/api/runs/ci")
+      return {
+        run: { id: "ci", status: "succeeded", prUrl },
+        questions: [],
+        prSnapshot: { state: "OPEN", headRefOid: head },
+        review: { approval: { sha: approvedSha, stale: false } },
+      } as T;
+    if (url.pathname === "/api/land") return [] as T;
+    throw new Error("Unexpected digest request");
+  };
+  const read = async () => {
+    const lines: string[] = [];
+    await digestCommand([], { consumer: "session" }, { api, print: (line) => lines.push(line) });
+    return lines;
+  };
+  const first = await read();
+  expect(first[1]).toBe("Needs you: 0; PRs awaiting review: 1; Blocked lands: 0");
+  expect(first.slice(2)).toEqual([
+    'PRs awaiting review: #3 run="ci" "CI fix round delivered" "Check this item"',
+  ]);
+  approvedSha = head;
+  const approved = await read();
+  expect(approved[1]).toBe("Needs you: 0; PRs awaiting review: 0; Blocked lands: 0");
+  expect(approved.slice(2)).toEqual([]);
+});
