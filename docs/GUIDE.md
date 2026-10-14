@@ -245,6 +245,11 @@ the value is saved for resume and review. Unset or `[]` leaves agent PATH unchan
 Invalid values warn and disable slotting: use nonempty command strings with executable
 names, without path separators. Prefixes match argv tokens, including calls inside shell
 commands and package scripts; absolute executable paths bypass PATH wrappers.
+Wrappers cover shells that preserve the supplied PATH (including non-login sh and bash),
+and non-interactive zsh, including login zsh. Tool-enabled Codex and Claude invocations
+use a factory-owned `ZDOTDIR` in scratch, even without wrappers. Its startup files skip
+personal zsh configuration and restore wrappers to the front of PATH after system login
+setup. Other shells whose startup replaces PATH are not covered.
 
 Bare matched commands use the shared gate lane (`max_concurrent_gates`). File/path
 arguments or `-t`/`--test-name-pattern` use a separate small lane, fixed at two concurrent

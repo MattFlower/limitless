@@ -20,6 +20,7 @@ import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import { READ_PROBE } from "./read-policy.ts";
 import {
+  agentShellEnv,
   createScratch,
   type InvocationCommands,
   invocationCommands,
@@ -889,7 +890,7 @@ export async function runCodex(
   const proc = await processRunner({
     cmd: args,
     cwd: spec.cwd,
-    env: agentEnv({ ...scratchEnv(spec), ...(spec.commandPath ? { PATH: spec.commandPath } : {}) }),
+    env: agentEnv(agentShellEnv(spec)),
     stdin: prompt,
     signal,
     timeoutMs: spec.timeoutMs,

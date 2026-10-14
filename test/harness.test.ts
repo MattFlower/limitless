@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
@@ -12,6 +12,7 @@ import {
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -213,6 +214,80 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
   runCodex(spec, runner, {
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
+
+for (const harness of ["codex", "claude"] as const) {
+  test(`${harness} passes private zsh startup and optional wrapper PATH to tool-enabled agents`, async () => {
+    const startupDirs: string[] = [];
+    await confinedEdit(import.meta.dir, async (scratchDir) => {
+      for (const commands of [[], [["bun", "test"]]]) {
+        await withSlottedCommands(
+          commands,
+          import.meta.dir,
+          scratchDir,
+          1,
+          () => {},
+          async (path) => {
+            const result = await (harness === "codex" ? verifiedCodex : runClaude)(
+              {
+                cwd: import.meta.dir,
+                scratchDir,
+                commandPath: path,
+                prompt: "ready",
+                mode: "edit",
+                target: {
+                  modelId: `${harness}/test`,
+                  provider: harness,
+                  harness,
+                  model: "test",
+                  vendor: "other",
+                  tier: 4,
+                  billing: "subscription",
+                },
+                timeoutMs: 1000,
+                idleTimeoutMs: 1000,
+                maxToolCalls: 1,
+                signal: new AbortController().signal,
+                logPath: join(scratchDir, "log"),
+                onEvent: () => {},
+              },
+              async (opts) => {
+                expect(opts.env.PATH).toBe(path ?? process.env.PATH);
+                const zdotdir = opts.env.ZDOTDIR ?? "";
+                expect(zdotdir.startsWith(`${scratchDir}/`)).toBe(true);
+                expect(startupDirs).not.toContain(zdotdir);
+                startupDirs.push(zdotdir);
+                for (const name of [".zshenv", ".zprofile", ".zlogin"])
+                  expect(existsSync(join(zdotdir, name))).toBe(true);
+                if (opts.cmd[4]?.startsWith("limitless-started-")) opts.onStdoutLine?.(opts.cmd[4]);
+                opts.onStdoutLine?.(
+                  JSON.stringify(
+                    harness === "codex"
+                      ? { type: "turn.completed", usage: {} }
+                      : { type: "result", result: "ready" },
+                  ),
+                );
+                return {
+                  exitCode: 0,
+                  signal: null,
+                  cancelled: false,
+                  timedOut: false,
+                  idleTimedOut: false,
+                  stdout: "",
+                  stderr: "",
+                  truncated: false,
+                  durationMs: 1,
+                };
+              },
+            );
+            expect(result.status).toBe("ok");
+          },
+        );
+      }
+    });
+    expect(startupDirs).toHaveLength(2);
+    for (const directory of startupDirs) expect(existsSync(directory)).toBe(false);
+  });
+}
 
 test("CLI transcript redaction handles escaped multi-line scenario text", () => {
   const holdout = {
