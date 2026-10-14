@@ -166,6 +166,7 @@ does before implementation, compared against the scripts at the effective HEAD; 
 audit flags do not bypass the eval invocation. Review and verify retain the pipeline's scaled
 20/25-minute reading timeouts, 10-minute idle timeout, 150-tool limit and verify private sessions.
 
+Eval-only single review systems may use `standard`, `adversarial`, or `careful` on their one pinned finder; prompt variants have separate cache identities and only `standard` counts toward production routing policy.
 Panel review systems can set verifier `targets` to an ordered list. Each batch uses the first
 target whose vendor raised none of its candidates, then the first model that raised none.
 Targets must be unique by base model id and include a model outside all finders. A selected
