@@ -38,27 +38,32 @@ const rpc = (method: string, params: unknown = {}, id: number | undefined = 1) =
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
   });
 
-test("mounted MCP exposes only the protected change view", async () => {
+test("mounted MCP exposes PR code while protecting holdout-only report material", async () => {
   const hidden = "mountedHiddenSentinel";
+  const reportOnly = "mountedHoldoutOnlySentinel";
   const c = await changeFixture(f, { "hello.txt": `hello\n${hidden}\n` });
   f.factory.store.setRunState(c.run.id, {
     holdout: {
-      scenarios: [{ id: "H-1", description: hidden, steps: hidden, expected: hidden, edge_case: false }],
+      scenarios: [{ id: "H-1", description: hidden, steps: hidden, expected: reportOnly, edge_case: false }],
     },
   });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", hidden);
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", `${hidden}\n${reportOnly}`);
   const response = await route(
     rpc("tools/call", { name: "limitless_get_change", arguments: { run: c.run.id } }),
     localServer,
   );
   const message = await response.json();
-  expect(JSON.stringify(message)).not.toContain(hidden);
+  expect(JSON.stringify(message)).not.toContain(reportOnly);
   expect(resultValue(message.result)).toMatchObject({
     available: true,
     headSha: c.headSha,
     baseSha: c.baseSha,
-    diff: { text: expect.stringContaining(" hello\n+[private detail]\n") },
-    reports: [{ text: "[private detail] [1 private details withheld]" }],
+    diff: { text: expect.stringContaining(` hello\n+${hidden}\n`) },
+    reports: [
+      {
+        text: "[withheld: holdout result or quotation; 1 line]\n[withheld: holdout result or quotation; 1 line]",
+      },
+    ],
   });
 });
 
