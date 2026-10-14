@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls. M5.2 (2026-10-08): appended cases from orchestrator reviews and MERGE controls with fixed-seed PR splits, adjudicated under LABELS.md; cases left without a gold defect were dropped, and the per-case outcomes are in LABELS.md. Routing and prompt decisions use dev cases only.",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls. M5.2 (2026-10-08): appended cases from orchestrator reviews and MERGE controls with fixed-seed PR splits, adjudicated under LABELS.md; cases left without a gold defect were dropped, and the per-case outcomes are in LABELS.md. Routing and prompt decisions use dev cases only. 2026-10-14: a clean-case audit under LABELS.md relabelled review-088 and review-096 real; review-078 and review-082 stay clean (see LABELS.md).",
   "cases": [
     {
       "id": "review-001",
@@ -7773,7 +7773,7 @@
     },
     {
       "id": "review-088",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "9f2baeb0a05d34745c40e8273908756a948ed400",
       "head": "2393cd1f641ee7f896bf98524489f6d5249b6084",
@@ -7786,7 +7786,28 @@
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "scripts/land-pr.sh",
+          "lines": [116, 116],
+          "severity": "major",
+          "category": "security",
+          "summary": "The isolated post-check status still inspects populated submodules with their own git directories, so a submodule that points at the land clone's admin directory runs a clean filter from the clone's configuration, which the request says never applies after the checks.",
+          "required": true,
+          "foundBy": "M5.2 label audit 2026-10-14 (clean-case block by E1 @high, E2 claude/opus and E3)",
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "to": "real",
+          "on": "2026-10-14",
+          "rule": "evals/review/LABELS.md",
+          "by": "adjudication 2026-10-14 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+          "evidence": "Head scripts/land-pr.sh:116 runs `safe_git --git-dir=\"$push_repo\" --work-tree=\"$clone\" status --porcelain ...`; safe_git empties only filter keys found in the isolated repository. A populated gitlink whose .git file points at the clone's admin directory makes status run git there, and the clone's configured clean filter ran (git 2.54: marker created at HEAD). Base scripts/land-pr.sh:60 ran `safe_git status --porcelain` with the clone as GIT_DIR, so the clone's filter key was enumerated and emptied, and the override reached the submodule child: no marker at BASE. A filter in the submodule's own git directory runs at both revisions (pre-existing, not counted).",
+          "from": "clean"
+        }
+      ]
     },
     {
       "id": "review-089",
@@ -7979,7 +8000,7 @@
     },
     {
       "id": "review-096",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "4c50ba4a4abff33458b84ad6f42f6761247b1211",
       "head": "2e75ecc279d5555d8c92198ec660ba7216315af7",
@@ -7992,7 +8013,28 @@
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/app.ts",
+          "lines": [103, 107],
+          "severity": "major",
+          "category": "logic",
+          "summary": "The redundant-runtime-entry exception covers only a code-sourced built-in, so after the provider export writes the built-in Haiku model into config, the retained runtime row makes the next startup throw a catalog collision.",
+          "required": true,
+          "foundBy": "M5.2 label audit 2026-10-14 (clean-case block by E3)",
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "to": "real",
+          "on": "2026-10-14",
+          "rule": "evals/review/LABELS.md",
+          "by": "adjudication 2026-10-14 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+          "evidence": "Head src/app.ts:103-107 skips a runtime claude/haiku-5.5 only when `(existing.source ?? \"code\") === \"code\"`, else throws `catalog collision`; src/router/config-catalog.ts marks exported models source \"config\". Probe with an isolated LIMITLESS_HOME and config directory: a runtime row with the built-in's metadata, Factory starts (with the warning); providersExport(true, true); reload and construct Factory again: `catalog collision: claude/haiku-5.5`. Base src/router/catalog.ts has no built-in claude/haiku-5.5, so the runtime entry loads and export creates no conflicting config model. A second claim (the runtime row cannot be removed) was adjudicated low and is not gold.",
+          "from": "clean"
+        }
+      ]
     },
     {
       "id": "review-097",
