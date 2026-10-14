@@ -1310,7 +1310,7 @@ test("change view withholds multiline credentials before paging on both backends
   }
 });
 
-test.each(["new", "old", "opposite", "hunks"])(
+test.each(["new", "old", "opposite", "hunks", "files"])(
   "change view matches multiline credentials only within the %s hunk side",
   async (scenario) => {
     const alpha = `side-alpha-${scenario}`;
@@ -1321,7 +1321,7 @@ test.each(["new", "old", "opposite", "hunks"])(
         ? `public before\n${alpha}\nold value\npublic after\n`
         : scenario === "old"
           ? `public before\n${alpha}\n${beta}\npublic after\n`
-          : scenario === "opposite"
+          : scenario === "opposite" || scenario === "files"
             ? `public before\n${alpha}\npublic after\n`
             : `old before\n${alpha}\n${gap}\n${beta}\nold after\n`;
     const head =
@@ -1329,13 +1329,23 @@ test.each(["new", "old", "opposite", "hunks"])(
         ? `public before\n${alpha}\n${beta}\npublic after\n`
         : scenario === "old"
           ? `public before\nnew value\n${beta}\npublic after\n`
-          : scenario === "opposite"
-            ? `public before\n${beta}\npublic after\n`
-            : `public before\n${alpha}\n${gap}\n${beta}\npublic after\n`;
+          : scenario === "files"
+            ? `public before\n${alpha}\npublic changed\npublic after\n`
+            : scenario === "opposite"
+              ? `public before\n${beta}\npublic after\n`
+              : `public before\n${alpha}\n${gap}\n${beta}\npublic after\n`;
     writeFileSync(join(f.repo, "hello.txt"), base);
+    if (scenario === "opposite") writeFileSync(join(f.repo, "other.txt"), `${alpha}\n`);
     await sh(["git", "add", "."], { cwd: f.repo });
     await sh(["git", "commit", "-qm", "base hunk"], { cwd: f.repo });
-    const c = await changeFixture(f, { "hello.txt": head });
+    const c = await changeFixture(f, {
+      "hello.txt": head,
+      ...(scenario === "files"
+        ? { "other.txt": `public before\n${beta}\npublic after\n` }
+        : scenario === "opposite"
+          ? { "other.txt": `${beta}\n` }
+          : {}),
+    });
     registerCredential(`MULTILINE_SIDE_${scenario}`, `${alpha}\n${beta}`);
     const connections = await changeConnections();
     try {
@@ -1353,12 +1363,26 @@ test.each(["new", "old", "opposite", "hunks"])(
           expect(diff).not.toContain(beta);
           expect(diff.match(/\[withheld: private text; 1 line\]/g)).toHaveLength(2);
           expect(diff).toContain(scenario === "new" ? "-old value" : "+new value");
+        } else if (scenario === "files") {
+          expect(diff).toContain(alpha);
+          expect(diff).not.toContain("withheld");
         } else {
           expect(diff).toContain(alpha);
           expect(diff).toContain(beta);
           expect(diff).not.toContain("withheld");
           if (scenario === "hunks") expect(diff.match(/^@@ /gm)).toHaveLength(2);
           else expect(diff).toContain(`-${alpha}\n+${beta}`);
+        }
+        if (scenario === "files" || scenario === "opposite") {
+          const other = resultValue<ChangePage>(
+            await conn.client.callTool({
+              name: "limitless_get_change",
+              arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, file: 1 },
+            }),
+          );
+          expect(other.diff.text).toContain(`+${beta}`);
+          expect(other.diff.text).not.toContain("withheld");
+          expect(other.diff.text).toContain(scenario === "files" ? "+public after" : `-${alpha}`);
         }
       }
     } finally {

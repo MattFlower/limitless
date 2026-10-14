@@ -48,28 +48,32 @@ const catalogues = new WeakMap<Factory["store"], { key: string; catalogue: Catal
 /** Map literal matches in each file side back to their physical patch lines. */
 function privatePatchLines(patch: string, values: readonly string[]): Set<number> {
   const hidden = new Set<number>();
-  const literals = values.map((value) => value.normalize("NFKC").toLowerCase());
+  // Single-line values already pass through the ordinary per-line privacy filter.
+  const literals = values
+    .filter((value) => value.includes("\n"))
+    .map((value) => value.normalize("NFKC").toLowerCase());
+  if (!literals.length) return hidden;
   type Line = { index: number; prefix: string; text: string };
   let hunk: Line[] = [];
   let inHunk = false;
   const scan = (side: Line[], patterns = literals) => {
-    const layers = side.map((line) => {
-      const forms = normalizedLayers(line.text);
-      // Withhold unsafe decoding at its source, retaining raw text for literal spans.
-      if (!forms) hidden.add(line.index);
-      return forms ?? [line.text.normalize("NFKC").toLowerCase()];
-    });
-    const depth = layers.reduce((max, forms) => Math.max(max, forms?.length ?? 0), 0);
+    // The ordinary line filter withholds unsafe decoding; retain raw spans here.
+    const layers = side.map(
+      (line) => normalizedLayers(line.text) ?? [line.text.normalize("NFKC").toLowerCase()],
+    );
+    const depth = layers.reduce((max, forms) => Math.max(max, forms.length), 0);
     for (let layer = 0; layer < depth; layer++) {
       let text = "";
       const ranges = side.map((line, i) => {
         const forms = layers[i];
         const start = text.length;
         text += forms?.[Math.min(layer, forms.length - 1)] ?? "";
-        return { index: line.index, start, end: text.length };
+        return { index: line.index, prefix: line.prefix, start, end: text.length };
       });
-      const withhold = (start: number, end: number) => {
-        for (const range of ranges) if (range.start < end && range.end > start) hidden.add(range.index);
+      const withhold = (start: number, end: number, clipped = false) => {
+        for (const range of ranges)
+          if (range.start < end && range.end > start && (!clipped || range.prefix === " "))
+            hidden.add(range.index);
       };
       for (const literal of patterns) {
         if (!literal) continue;
@@ -79,23 +83,25 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
           // Overlapping occurrences can involve additional patch lines.
           start = text.indexOf(literal, start + 1);
         }
-        // Hunk context clips the file at line boundaries; protect either exposed fragment.
+        // Protect clipped context without treating isolated additions/deletions as whole credentials.
         for (const { index } of literal.matchAll(/\n/gu)) {
           const prefix = literal.slice(0, index + 1);
           const suffix = literal.slice(index + 1);
           if (prefix.replace(/\r?\n/gu, "") && text.endsWith(prefix))
-            withhold(text.length - prefix.length, text.length);
-          if (suffix.replace(/\r?\n/gu, "") && text.startsWith(suffix)) withhold(0, suffix.length);
+            withhold(text.length - prefix.length, text.length, true);
+          if (suffix.replace(/\r?\n/gu, "") && text.startsWith(suffix)) withhold(0, suffix.length, true);
         }
-        if (!literal.includes("\n")) continue;
         // Both hunk edges can fall inside a long credential; protect whole-line runs from its middle.
         const framed = `\n${literal}\n`;
-        for (let i = 0; i < ranges.length; i++) {
-          for (let j = i; j < ranges.length; j++) {
-            const run = text.slice(ranges[i]?.start, ranges[j]?.end);
-            if (!framed.includes(`\n${run}`)) break;
-            // Two or more lines: a lone shared line is not evidence of the credential.
-            if (j > i && run.endsWith("\n")) withhold(ranges[i]?.start ?? 0, ranges[j]?.end ?? 0);
+        // Adjacent pairs cover every longer run without enumerating all subranges.
+        for (let i = 1; i < ranges.length; i++) {
+          const previous = ranges[i - 1],
+            current = ranges[i];
+          if (!previous || !current) continue;
+          const pair = text.slice(previous.start, current.end);
+          if (pair.endsWith("\n") && framed.includes(`\n${pair}`)) {
+            hidden.add(previous.index);
+            hidden.add(current.index);
           }
         }
       }
@@ -112,7 +118,7 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
       // Git can quote an isolated credential line as the hunk's function annotation.
       scan(
         [{ index, prefix: "", text: line.replace(/^@@ [^@]* @@ ?/u, "") }],
-        literals.flatMap((value) => (value.includes("\n") ? value.split(/\r?\n/u) : [value])),
+        literals.flatMap((value) => value.split(/\r?\n/u)),
       );
       inHunk = true;
     } else if (inHunk && /^[-+ ]/u.test(line)) {
