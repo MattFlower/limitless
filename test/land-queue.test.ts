@@ -384,17 +384,29 @@ test("later merge observations fill queue-landed parent metadata without another
   expect(store.getRun(pr.run.id)).toMatchObject({ merged: true, mergedBy: null, mergedAt: null });
   const feed = () => store.readFeed({ limit: 100 }).items.filter((item) => item.kind === "run.merged");
   expect(feed().filter((item) => item.runId === pr.run.id)).toHaveLength(1);
+  let lookups = 0;
   for (const [login, mergedAt] of [
     [null, "2026-10-13T12:00:00Z"],
     ["owner", null],
     ["another-actor", "2026-10-13T13:00:00Z"],
   ]) {
-    await reconcileMergedRuns(store, async (prUrl) => ({
-      url: prUrl,
-      state: "MERGED",
-      mergedBy: login ? { login } : null,
-      mergedAt: mergedAt ?? null,
-    }));
+    store.saveGithubPr({
+      url: url(1),
+      repo: SLUG,
+      runId: pr.run.id,
+      delivered: 1,
+      nodeId: "PR_1",
+      data: JSON.stringify({
+        url: url(1),
+        state: "MERGED",
+        mergedBy: login ? { login } : null,
+        mergedAt: mergedAt ?? null,
+      }),
+    });
+    await reconcileMergedRuns(store, async () => {
+      lookups++;
+      return null;
+    });
   }
   expect(store.getRun(pr.run.id)).toMatchObject({
     merged: true,
@@ -402,6 +414,7 @@ test("later merge observations fill queue-landed parent metadata without another
     mergedAt: Date.parse("2026-10-13T12:00:00Z"),
   });
   expect(feed()).toHaveLength(2); // one per run, including the round
+  expect(lookups).toBe(0);
   expect(ghCalls("pr merge")).toHaveLength(1);
 });
 

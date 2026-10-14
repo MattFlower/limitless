@@ -203,6 +203,28 @@ test("a needs_human run with a pre-recorded merge still gets its resolution and 
   expect(store.readFeed().items.filter((item) => item.kind === "run.merged")).toHaveLength(1);
 });
 
+test("merged runs with permanently missing metadata never spend reconciliation requests", async () => {
+  const ids = [needsHuman(), needsHuman(`${prUrl}0`), needsHuman(`${prUrl}1`)];
+  for (const [i, id] of ids.entries())
+    store.updateRun(id, {
+      status: "succeeded",
+      merged: true,
+      mergedBy: i === 1 ? "owner" : null,
+      mergedAt: i === 2 ? 123456 : null,
+    });
+  const live = needsHuman(`${prUrl}2`);
+  const client = mock(async (url: string) => ({ url, state: "OPEN", mergedAt: null, mergedBy: null }));
+  for (const elapsed of [0, 300_000, 2 * 86_400_000])
+    await reconcileMergedRuns(
+      store,
+      client,
+      () => {},
+      () => Date.now() + elapsed,
+    );
+  expect(client.mock.calls.map(([url]) => url)).toEqual(Array(3).fill(`${prUrl}2`));
+  expect(store.getRun(live)?.merged).toBe(false);
+});
+
 test("only an exact merged PR resolves; failures remain retryable", async () => {
   let now = Date.now();
   const reconcile = (client: GitHubPrClient, log = () => {}) => {

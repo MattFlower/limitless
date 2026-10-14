@@ -4,7 +4,7 @@ import type { Store } from "../db/store.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { sh } from "../util/proc.ts";
 import { type GhRunner, runGh } from "./github.ts";
-import { type Context, rollup } from "./github-poller.ts";
+import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
 
 export interface GitHubPrState {
   url: string;
@@ -142,7 +142,7 @@ export async function reconcileMergedRuns(
       run.prUrl &&
       client.fresh !== null &&
       expired.has(run.prUrl) &&
-      (!run.merged || run.status === "needs_human" || run.mergedBy === null || run.mergedAt === null) &&
+      (!run.merged || run.status === "needs_human") &&
       pass.checked.has(run.prUrl) &&
       now() >= (pass.checked.get(run.prUrl) ?? 0) + 86_400_000 &&
       (pass.retries.get(run.prUrl)?.at ?? 0) <= now()
@@ -155,11 +155,18 @@ export async function reconcileMergedRuns(
   const failed = new Set<string>();
   for (const run of ordered) {
     if (signal?.aborted) return;
-    if (
-      !run.prUrl ||
-      (run.merged && run.status !== "needs_human" && run.mergedBy !== null && run.mergedAt !== null)
-    )
+    if (!run.prUrl) continue;
+    if (run.merged && run.status !== "needs_human") {
+      // Fill from observations we already have; missing metadata must never trigger another fetch.
+      if (run.mergedBy === null || run.mergedAt === null) {
+        const pr = savedSnapshot(store.githubPrData(run.prUrl));
+        if (pr?.url === run.prUrl && pr.state === "MERGED") {
+          const at = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
+          store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, Number.isFinite(at) ? at : null);
+        }
+      }
       continue;
+    }
     if (failed.has(run.prUrl)) continue;
     if (expired.has(run.prUrl) && !results.has(run.prUrl)) {
       if (!pass.checked.has(run.prUrl)) pass.checked.set(run.prUrl, now());
@@ -193,12 +200,8 @@ export async function reconcileMergedRuns(
       pass.retries.delete(run.prUrl);
       if (store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
-      if (pr.state === "MERGED" && (Number.isFinite(mergedAt) || run.merged)) {
-        store.resolveMergedRun(
-          run.id,
-          pr.mergedBy?.login ?? null,
-          Number.isFinite(mergedAt) ? mergedAt : null,
-        );
+      if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
+        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
         store.observeGithubPrState(pr.url, pr.state, now());
@@ -257,12 +260,7 @@ export function startGitHubNotifier(
       checking = false;
       if (pending) {
         pending = false;
-        if (
-          store
-            .listRuns({ status: ["needs_human", "succeeded", "resolved"], limit: Number.MAX_SAFE_INTEGER })
-            .some((run) => run.prUrl && (!run.merged || run.status === "needs_human"))
-        )
-          void check();
+        void check();
       }
     }
   };
