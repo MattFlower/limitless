@@ -1228,7 +1228,9 @@ test("clients omit another daemon's token and redact authentication errors and d
       },
     );
     expect(cli.exitCode).not.toBe(0);
-    expect(cli.stderr).toContain(`401: ${safeMessage}`);
+    expect(cli.stderr).toContain(
+      `401: API token withheld because the requested origin differs from its bound origin ${base}.`,
+    );
     expect(cli.stdout + cli.stderr).not.toContain(token);
     const deps = setupDeps({ home: f.factory.cfg.paths.home, configDir: f.factory.cfg.paths.configDir });
     const diagnostics = await doctor({
