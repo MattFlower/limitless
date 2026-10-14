@@ -8,9 +8,10 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
 import { ConfinementError, homeReadPolicy, policySpellings } from "./read-policy.ts";
@@ -84,6 +85,21 @@ export function scratchEnv({ scratchDir }: Pick<AgentSpec, "scratchDir">): Recor
   return scratchDir
     ? { TMPDIR: scratchDir, TMP: scratchDir, TEMP: scratchDir, TMPPREFIX: join(scratchDir, "zsh") }
     : {};
+}
+
+/** Keep personal zsh startup out of tools and restore wrappers after the system login PATH setup. */
+export function agentShellEnv(
+  spec: Pick<AgentSpec, "scratchDir" | "commandPath" | "noTools">,
+): Record<string, string> {
+  const env = { ...scratchEnv(spec), ...(spec.commandPath ? { PATH: spec.commandPath } : {}) };
+  if (spec.noTools && !spec.commandPath) return env;
+  if (!spec.scratchDir) throw new Error("Tool-enabled invocation requires a scratch directory");
+  const directory = mkdtempSync(join(spec.scratchDir, "zdot-"));
+  const wrapper = spec.commandPath?.split(delimiter)[0];
+  const startup = wrapper ? `export PATH='${wrapper.replaceAll("'", "'\\''")}':"$PATH"\n` : "";
+  for (const name of [".zshenv", ".zprofile", ".zlogin"])
+    writeFileSync(join(directory, name), name === ".zprofile" ? "" : startup, { mode: 0o600 });
+  return { ...env, ZDOTDIR: directory };
 }
 
 export function validateScratch(spec: AgentSpec): string {

@@ -245,6 +245,17 @@ the value is saved for resume and review. Unset or `[]` leaves agent PATH unchan
 Invalid values warn and disable slotting: use nonempty command strings with executable
 names, without path separators. Prefixes match argv tokens, including calls inside shell
 commands and package scripts; absolute executable paths bypass PATH wrappers.
+Wrappers cover shells that preserve the supplied PATH (including non-login sh and bash),
+and non-interactive zsh, including login zsh. Tool-enabled Codex and Claude invocations
+use a factory-owned `ZDOTDIR` in scratch, even without wrappers, so zsh reads none of
+`~/.zshenv`, `~/.zprofile`, `~/.zshrc` or `~/.zlogin`. Its startup files restore wrappers to
+the front of PATH after system login setup. Two gaps remain. The Claude CLI builds its shell
+snapshot by sourcing `~/.zshrc` directly, whatever `ZDOTDIR` says. The snapshot ends by
+exporting the PATH the factory supplied, so wrappers stay first, but an alias or function
+from that file named after a slotted command still runs instead of the wrapper. And an
+interactive non-login zsh (`zsh -i -c`) reads the system `/etc/zshrc` after the last
+restore; macOS's stock one leaves PATH alone. Other shells whose startup replaces PATH are
+not covered.
 
 Bare matched commands use the shared gate lane (`max_concurrent_gates`). File/path
 arguments or `-t`/`--test-name-pattern` use a separate small lane, fixed at two concurrent

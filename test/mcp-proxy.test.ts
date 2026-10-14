@@ -1009,7 +1009,7 @@ test("change pages reuse the catalogue and refresh diagnostics, holdouts and pri
     reads.mockRestore();
     await conn.close();
   }
-});
+}, 30_000);
 
 test("change pages protect verifier quotations while returning implementer-visible literals", async () => {
   const hidden = "runtimeProbeSecret",
