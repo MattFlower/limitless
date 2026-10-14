@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -9,10 +9,10 @@ import {
   parseRateLimits,
   runCodex,
 } from "../src/harness/codex.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
-import { withSlottedCommands } from "../src/harness/slotted.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -23,7 +23,7 @@ import {
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 import { fakeConfinement } from "./confinement.ts";
-import { test } from "./read-policy-support.ts";
+import { test, testReadPolicy } from "./read-policy-support.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -206,7 +206,14 @@ describe("CodexStreamParser", () => {
 // Tool-enabled editors run confined (#323): they need scratch, and a fake runner that swaps the
 // command keeps the sandbox's startup wrapper (the identity backend adds no profile).
 const confinedEdit = <T>(cwd: string, run: (scratchDir: string) => Promise<T>) =>
-  confinementScope.run(fakeConfinement, () => withScratch(cwd, run));
+  confinementScope.run(fakeConfinement, () =>
+    withScratch(cwd, (scratchDir) => {
+      // Injected runners inspect a controlled policy without touching the owner's credential paths.
+      const home = join(dirname(scratchDir), "home");
+      mkdirSync(home);
+      return readPolicyScope.run({ ...testReadPolicy, home, environment: {} }, () => run(scratchDir));
+    }),
+  );
 const swapCommand = (cmd: string[], replacement: string[]) =>
   cmd[4]?.startsWith("limitless-started-") ? [...cmd.slice(0, 5), ...replacement] : replacement;
 // A confined Codex editor runs only on a CLI whose sandbox was verified; this stub stands in for that probe.
@@ -219,69 +226,64 @@ for (const harness of ["codex", "claude"] as const) {
   test(`${harness} passes private zsh startup and optional wrapper PATH to tool-enabled agents`, async () => {
     const startupDirs: string[] = [];
     await confinedEdit(import.meta.dir, async (scratchDir) => {
-      for (const commands of [[], [["bun", "test"]]]) {
-        await withSlottedCommands(
-          commands,
-          import.meta.dir,
-          scratchDir,
-          1,
-          () => {},
-          async (path) => {
-            const result = await (harness === "codex" ? verifiedCodex : runClaude)(
-              {
-                cwd: import.meta.dir,
-                scratchDir,
-                commandPath: path,
-                prompt: "ready",
-                mode: "edit",
-                target: {
-                  modelId: `${harness}/test`,
-                  provider: harness,
-                  harness,
-                  model: "test",
-                  vendor: "other",
-                  tier: 4,
-                  billing: "subscription",
-                },
-                timeoutMs: 1000,
-                idleTimeoutMs: 1000,
-                maxToolCalls: 1,
-                signal: new AbortController().signal,
-                logPath: join(scratchDir, "log"),
-                onEvent: () => {},
-              },
-              async (opts) => {
-                expect(opts.env.PATH).toBe(path ?? process.env.PATH);
-                const zdotdir = opts.env.ZDOTDIR ?? "";
-                expect(zdotdir.startsWith(`${scratchDir}/`)).toBe(true);
-                expect(startupDirs).not.toContain(zdotdir);
-                startupDirs.push(zdotdir);
-                for (const name of [".zshenv", ".zprofile", ".zlogin"])
-                  expect(existsSync(join(zdotdir, name))).toBe(true);
-                if (opts.cmd[4]?.startsWith("limitless-started-")) opts.onStdoutLine?.(opts.cmd[4]);
-                opts.onStdoutLine?.(
-                  JSON.stringify(
-                    harness === "codex"
-                      ? { type: "turn.completed", usage: {} }
-                      : { type: "result", result: "ready" },
-                  ),
-                );
-                return {
-                  exitCode: 0,
-                  signal: null,
-                  cancelled: false,
-                  timedOut: false,
-                  idleTimedOut: false,
-                  stdout: "",
-                  stderr: "",
-                  truncated: false,
-                  durationMs: 1,
-                };
-              },
+      // Environment wiring needs no lease transport; the installed-wrapper test exercises it.
+      const directory = join(scratchDir, "wrappers");
+      mkdirSync(directory);
+      writeFileSync(join(directory, "bun"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      for (const path of [undefined, `${directory}${delimiter}${process.env.PATH ?? ""}`]) {
+        const result = await (harness === "codex" ? verifiedCodex : runClaude)(
+          {
+            cwd: import.meta.dir,
+            scratchDir,
+            commandPath: path,
+            prompt: "ready",
+            mode: "edit",
+            target: {
+              modelId: `${harness}/test`,
+              provider: harness,
+              harness,
+              model: "test",
+              vendor: "other",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 1000,
+            idleTimeoutMs: 1000,
+            maxToolCalls: 1,
+            signal: new AbortController().signal,
+            logPath: join(scratchDir, "log"),
+            onEvent: () => {},
+          },
+          async (opts) => {
+            expect(opts.env.PATH).toBe(path ?? process.env.PATH);
+            const zdotdir = opts.env.ZDOTDIR ?? "";
+            expect(zdotdir.startsWith(`${scratchDir}/`)).toBe(true);
+            expect(startupDirs).not.toContain(zdotdir);
+            startupDirs.push(zdotdir);
+            for (const name of [".zshenv", ".zprofile", ".zlogin"])
+              expect(existsSync(join(zdotdir, name))).toBe(true);
+            if (opts.cmd[4]?.startsWith("limitless-started-")) opts.onStdoutLine?.(opts.cmd[4]);
+            opts.onStdoutLine?.(
+              JSON.stringify(
+                harness === "codex"
+                  ? { type: "turn.completed", usage: {} }
+                  : { type: "result", result: "ready" },
+              ),
             );
-            expect(result.status).toBe("ok");
+            return {
+              exitCode: 0,
+              signal: null,
+              cancelled: false,
+              timedOut: false,
+              idleTimedOut: false,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+              durationMs: 1,
+            };
           },
         );
+        expect(result.status).toBe("ok");
       }
     });
     expect(startupDirs).toHaveLength(2);
