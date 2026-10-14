@@ -42,9 +42,13 @@ async function changeConnections() {
           ? "/api/land"
           : parsed.pathname.endsWith("/change")
             ? "/api/runs/:id/change"
-            : "/api/runs/:id";
+            : parsed.pathname.endsWith("/review")
+              ? "/api/runs/:id/review"
+              : "/api/runs/:id";
       const route = routes[key];
-      const handler = (typeof route === "function" ? route : (route as { GET: Route }).GET) as Route;
+      const handler = (
+        typeof route === "function" ? route : (route as Record<string, Route>)[init?.method ?? "GET"]
+      ) as Route;
       return handler(requestWithParams(url, init, { id: parsed.pathname.split("/")[3] ?? "" }), localServer);
     }),
   );
@@ -58,6 +62,104 @@ async function changeConnections() {
     },
   };
 }
+
+test("MCP approvals retain optional normalized consumer provenance on both backends", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" }, true);
+  f.factory.deps.gh = async () =>
+    JSON.stringify({
+      state: "OPEN",
+      headRefOid: c.headSha,
+      headRefName: "limitless/feature",
+      isCrossRepository: false,
+      headRepositoryOwner: { login: "test" },
+      headRepository: { name: "repo" },
+      autoMergeRequest: null,
+    });
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      for (const consumer of [" agent-a ", "x".repeat(200), undefined]) {
+        const result = resultValue<{ approval: { sha: string } }>(
+          await conn.client.callTool({
+            name: "limitless_review",
+            arguments: {
+              run: c.run.id,
+              verdict: "approve",
+              reviewedSha: c.headSha,
+              ...(consumer === undefined ? {} : { consumer }),
+            },
+          }),
+        );
+        const reviewer = consumer === undefined ? "human" : `mcp:${consumer.trim()}`;
+        expect(result.approval.sha).toBe(c.headSha);
+        expect(
+          f.factory.store.db.query("SELECT reviewer FROM review_approvals ORDER BY id DESC LIMIT 1").get(),
+        ).toEqual({ reviewer });
+        const feed = f.factory.store
+          .readFeed({ limit: 100 })
+          .items.filter((item) => item.kind === "review.approved");
+        expect(feed.at(-1)?.data.reviewer).toBe(reviewer);
+      }
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test.each([
+  "pagination pins",
+  "unknown file index",
+  "superseded pinned head",
+  "superseded snapshot",
+  "missing head commit",
+  "missing base commit",
+])("change-view refusals identify %s on both backends", async (failure) => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const connections = await changeConnections();
+  const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+  const missing = "d".repeat(40);
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      c.observe(c.headSha);
+      let args: Record<string, unknown> = pin;
+      let reason: string;
+      switch (failure) {
+        case "pagination pins":
+          args = { run: c.run.id, file: 1 };
+          reason = "Further reads require headSha and baseSha from the first page.";
+          break;
+        case "unknown file index":
+          args = { ...pin, file: 1 };
+          reason = "Unknown file index 1; change has 1 files.";
+          break;
+        case "superseded pinned head":
+          c.observe(c.baseSha);
+          reason = `PR head superseded; current head ${c.baseSha}; restart limitless_get_change.`;
+          break;
+        case "superseded snapshot":
+          f.factory.store.observePrHead(c.prUrl, c.baseSha);
+          reason = `PR head superseded; current head ${c.baseSha}; restart limitless_get_change.`;
+          break;
+        case "missing head commit":
+          c.observe(missing);
+          args = { run: c.run.id };
+          reason = `Required commit ${missing} unavailable in local cache.`;
+          break;
+        default:
+          args = { ...pin, baseSha: missing };
+          reason = `Required commit ${missing} unavailable in local cache.`;
+      }
+      const result = await conn.client.callTool({ name: "limitless_get_change", arguments: args });
+      if (failure === "pagination pins") {
+        expect(result.isError).toBe(true);
+        expect(result.content).toEqual([{ type: "text", text: reason }]);
+      } else expect(resultValue<unknown>(result)).toEqual({ available: false, reason });
+      expect(JSON.stringify(result)).not.toMatch(/fatal:|bad object|Change view request failed/);
+    }
+  } finally {
+    await connections.close();
+  }
+});
 
 test("HTTP-backed change pages match direct MCP for the pinned code and report", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
@@ -1833,7 +1935,7 @@ test("status explains review, input, land and terminal states using saved observ
       { ...entry, state: "blocked" },
     ];
     detail = base;
-    expect(resultValue(await read())).toMatchObject({ state: "Landed" });
+    expect(resultValue<unknown>(await read())).toMatchObject({ state: "Landed" });
     const before = urls.length;
     const missing = await proxy.client.callTool({ name: "limitless_status", arguments: { run: "missing" } });
     expect(missing.isError).toBe(true);
@@ -2366,10 +2468,12 @@ test("proxy feed tools match the direct backend and allow a 45-second long poll"
     const read = (conn: typeof proxy, args: Record<string, unknown>) =>
       conn.client.callTool({ name: "limitless_feed", arguments: args });
     for (const args of [{ consumer: "proxy" }, { after: 1 }, {}])
-      expect(resultValue(await read(proxy, args))).toEqual(resultValue(await read(direct, args)));
+      expect(resultValue<unknown>(await read(proxy, args))).toEqual(
+        resultValue<unknown>(await read(direct, args)),
+      );
     timeouts.mockClear();
-    expect(resultValue(await read(proxy, { consumer: "proxy", wait: 45 }))).toEqual(
-      resultValue(await read(direct, { consumer: "proxy", wait: 45 })),
+    expect(resultValue<unknown>(await read(proxy, { consumer: "proxy", wait: 45 }))).toEqual(
+      resultValue<unknown>(await read(direct, { consumer: "proxy", wait: 45 })),
     );
     expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([75_000]);
     timeouts.mockClear();
@@ -2381,8 +2485,8 @@ test("proxy feed tools match the direct backend and allow a 45-second long poll"
     expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([30_000]);
     const page = resultValue<{ items: { id: number }[] }>(await read(proxy, { consumer: "proxy" }));
     expect(page.items.map((i) => i.id)).toEqual([2]);
-    expect(resultValue(await read(proxy, { consumer: "proxy" }))).toEqual(
-      resultValue(await read(direct, { consumer: "proxy" })),
+    expect(resultValue<unknown>(await read(proxy, { consumer: "proxy" }))).toEqual(
+      resultValue<unknown>(await read(direct, { consumer: "proxy" })),
     );
     expect((await read(proxy, { wait: 46 })).isError).toBe(true);
   } finally {

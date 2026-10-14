@@ -3,6 +3,7 @@ import type { Config } from "../config.ts";
 import { type PrHead, prHeadProblem } from "../core/delivery.ts";
 import type { ReviewApproval, ReviewFinding, Run } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { FeedQuerySchema, mcpRequestedBy } from "../feed.ts";
 import { cachePath, ensureCache, readFileAt } from "../git/repos.ts";
 import { type GhRunner, quotedJson, runGh } from "../integrations/github.ts";
 
@@ -27,6 +28,7 @@ export const ReviewVerdictSchema = z
     reviewedSha: sha,
     findings: z.array(finding).max(50).default([]),
     reviewer: z.string().trim().min(1).max(100).optional(),
+    consumer: FeedQuerySchema.shape.consumer,
   })
   .strict()
   .refine((v) => (v.verdict === "changes") === v.findings.length > 0, {
@@ -191,7 +193,10 @@ export async function submitReview(
       throw new ReviewRefused(`head moved: the PR moved while ${reviewedSha} was being checked`, 409);
     if (pr.headSha !== reviewedSha)
       throw new ReviewRefused(`head moved: the PR is at ${pr.headSha}, not the reviewed ${reviewedSha}`, 409);
-    const reviewer = parsed.data.reviewer ?? "human";
+    const reviewer =
+      parsed.data.consumer === undefined
+        ? (parsed.data.reviewer ?? "human")
+        : mcpRequestedBy(parsed.data.consumer);
     if (verdict === "approve")
       return { approval: store.recordApproval(owner.id, prUrl, reviewedSha, reviewer) };
     // Changes requested: the PR must not land on its old head, nor on the round's before a new verdict.

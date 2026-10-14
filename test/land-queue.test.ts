@@ -18,7 +18,7 @@ import { worktreeGitScope } from "../src/git/command.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
-import type { GitHubPrView } from "../src/integrations/github-notifier.ts";
+import { type GitHubPrView, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -124,7 +124,7 @@ const baseRefName=existsSync(file+".base-"+pr)?readFileSync(file+".base-"+pr,"ut
 const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
 const flag=(n)=>args.includes(n);
 if(args[0]!=="pr"||args[1]!=="merge"){
- if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",statusCheckRollup:[]}));
+ if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({url:args[2],title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",mergedBy:merged&&!existsSync(file+".no-metadata")?{login:"owner"}:null,mergedAt:merged&&!existsSync(file+".no-metadata")?"2026-10-13T12:00:00Z":null,statusCheckRollup:[]}));
  process.exit(0);
 }
 if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
@@ -358,9 +358,51 @@ test("two approved entries on one repository land in order, never checking at on
     [2, "landed"],
   ]);
   expect([first, second].map((pr) => store.getRun(pr.run.id)?.merged)).toEqual([true, true]);
+  for (const pr of [first, second]) {
+    const metadata = { mergedBy: "owner", mergedAt: Date.parse("2026-10-13T12:00:00Z") };
+    expect(store.getRun(pr.run.id)).toMatchObject(metadata);
+    expect(
+      store
+        .readFeed({ limit: 100 })
+        .items.find((item) => item.kind === "run.merged" && item.runId === pr.run.id)?.data,
+    ).toMatchObject(metadata);
+  }
   // One repository, one entry at a time: the second check starts only after the first ends.
   expect(gateLog()).toEqual(["start", "end", "start", "end"]);
   expect(ghCalls("pr merge")).toHaveLength(2);
+});
+
+test("later merge observations fill queue-landed parent metadata without another merge event", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  const round = roundRun(pr.run.id, url(1), head);
+  observe(1, head);
+  store.recordApproval(round.id, url(1), head, "orchestrator");
+  writeFileSync(join(root, "gh.no-metadata"), "");
+  await queue().request({ target: round.id });
+  await settle();
+  expect(store.getRun(pr.run.id)).toMatchObject({ merged: true, mergedBy: null, mergedAt: null });
+  const feed = () => store.readFeed({ limit: 100 }).items.filter((item) => item.kind === "run.merged");
+  expect(feed().filter((item) => item.runId === pr.run.id)).toHaveLength(1);
+  for (const [login, mergedAt] of [
+    [null, "2026-10-13T12:00:00Z"],
+    ["owner", null],
+    ["another-actor", "2026-10-13T13:00:00Z"],
+  ]) {
+    await reconcileMergedRuns(store, async (prUrl) => ({
+      url: prUrl,
+      state: "MERGED",
+      mergedBy: login ? { login } : null,
+      mergedAt: mergedAt ?? null,
+    }));
+  }
+  expect(store.getRun(pr.run.id)).toMatchObject({
+    merged: true,
+    mergedBy: "owner",
+    mergedAt: Date.parse("2026-10-13T12:00:00Z"),
+  });
+  expect(feed()).toHaveLength(2); // one per run, including the round
+  expect(ghCalls("pr merge")).toHaveLength(1);
 });
 
 test("three requests submitted together all land, with no further request", async () => {
@@ -1351,6 +1393,13 @@ test("a review-round land merges current main into the approved head before chec
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
   expect(gateLog()).toEqual(["moved"]);
+  const metadata = { merged: true, mergedBy: "owner", mergedAt: Date.parse("2026-10-13T12:00:00Z") };
+  expect(store.getRun(pr.run.id)).toMatchObject(metadata);
+  expect(
+    store
+      .readFeed({ limit: 100 })
+      .items.find((item) => item.runId === pr.run.id && item.kind === "run.merged")?.data,
+  ).toMatchObject({ mergedBy: metadata.mergedBy, mergedAt: metadata.mergedAt });
   const landed = await remoteHead("pr-1");
   for (const sha of [head, await remoteHead("main")])
     expect((await sh(["git", "merge-base", "--is-ancestor", sha, landed], { cwd: bare })).exitCode).toBe(0);

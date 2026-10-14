@@ -381,7 +381,13 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const privacy = loadOutputPrivacy();
   if (!privacy) return { available: false, reason: "Privacy policy unavailable; content withheld." };
   const query = ChangeQuerySchema.safeParse(input);
-  if (!query.success) return { available: false, reason: "Invalid change-view request." };
+  if (!query.success)
+    return {
+      available: false,
+      reason: query.error.issues.some((issue) => issue.code === "custom")
+        ? "Further reads require headSha and baseSha from the first page."
+        : "Invalid change-view request.",
+    };
   const q = query.data;
   const { store } = factory;
   const owner = store.getRun(q.run);
@@ -397,15 +403,20 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     .safeParse(observed);
   if (!snapshot.success) return { available: false, reason: "Observed PR head unavailable." };
   const recorded = owner.prUrl ? store.prHead(owner.prUrl) : null;
+  const superseded = (sha: unknown) => ({
+    available: false,
+    reason: `PR head superseded${commitSha.safeParse(sha).success ? `; current head ${sha}` : ""}; restart limitless_get_change.`,
+  });
   const head = reviewableHead(
     snapshot.data.headRefOid,
     recorded && { ...recorded, pushing: store.pushingTo(owner.prUrl ?? "") },
   );
   if (head.problem)
-    return { available: false, reason: `PR head ${head.problem}; restart limitless_get_change.` };
+    return head.problem === "superseded"
+      ? superseded(recorded?.sha)
+      : { available: false, reason: "PR head unavailable; restart limitless_get_change." };
   const headSha = head.headSha;
-  if (q.headSha && q.headSha !== headSha)
-    return { available: false, reason: "PR head superseded; restart limitless_get_change." };
+  if (q.headSha && q.headSha !== headSha) return superseded(headSha);
   const baseBranch = snapshot.data.baseRefName ?? owner.baseBranch;
   const parsedComparison = commitSha.safeParse(snapshot.data.baseRefOid ?? owner.baseSha);
   if (!parsedComparison.success || !baseBranch)
@@ -430,8 +441,15 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const git = async (args: string[]) =>
     (await worktreeGit(["git", ...args], { cwd, signal, redactOutput: false })).stdout;
   try {
-    await git(["cat-file", "-e", `${headSha}^{commit}`]);
-    await git(["cat-file", "-e", `${comparison}^{commit}`]);
+    for (const sha of [headSha, comparison, ...(q.baseSha ? [q.baseSha] : [])]) {
+      const result = await worktreeGit(["git", "cat-file", "-e", `${sha}^{commit}`], {
+        cwd,
+        signal,
+        allowFail: true,
+      });
+      if (result.exitCode !== 0)
+        return { available: false, reason: `Required commit ${sha} unavailable in local cache.` };
+    }
     const baseSha = (await git(["merge-base", comparison, headSha])).trim();
     if (q.baseSha && q.baseSha !== baseSha)
       return { available: false, reason: "Comparison superseded; restart limitless_get_change." };
@@ -461,6 +479,8 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         };
       });
     const selected = files[q.file];
+    if (!selected && (q.file > 0 || files.length > 0))
+      return { available: false, reason: `Unknown file index ${q.file}; change has ${files.length} files.` };
     // Only files present in the delivered tree qualify for the visible PR diff.
     const deleted = new Set(
       (
@@ -555,7 +575,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
       reviewableHead(JSON.parse(current).headRefOid, { ...now, pushing: store.pushingTo(owner.prUrl ?? "") })
         .headSha !== headSha
     )
-      return { available: false, reason: "PR head superseded; restart limitless_get_change." };
+      return superseded(now?.sha);
     if (!key || catalogueKey(store, ids, owner.prUrl ? store.reviewRounds(owner.prUrl) : []) !== key)
       return { available: false, reason: "Holdout policy changed; restart limitless_get_change." };
     return privateOutputData(

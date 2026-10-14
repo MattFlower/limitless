@@ -83,17 +83,20 @@ Environment: LIMITLESS_URL, else http://127.0.0.1:<port>
              Port: LIMITLESS_PORT, else [server] port, else 7400`;
 
 const daemonUrl = (port: number) => process.env.LIMITLESS_URL ?? `http://127.0.0.1:${port}`;
+const tokenMismatch = (origin: string) =>
+  `API token withheld because the requested origin differs from its bound origin ${origin}.`;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const port = resolveClientPort();
   const base = daemonUrl(port);
   let res: Response;
   let text: string;
+  let boundOrigin: string | undefined;
   try {
     const url = `${base}${path}`;
     const headers = new Headers({
       "content-type": "application/json",
-      ...apiTokenHeaders(url),
+      ...apiTokenHeaders(url, undefined, undefined, (origin) => (boundOrigin = origin)),
     });
     for (const [key, value] of new Headers(init?.headers)) headers.set(key, value);
     res = await fetch(url, {
@@ -113,6 +116,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // not json
     }
+    if (res.status === 401 && boundOrigin) msg = tokenMismatch(boundOrigin);
     throw new ApiError(redactCredentials(`${res.status}: ${msg}`), res.status);
   }
   return JSON.parse(text) as T;
@@ -151,10 +155,15 @@ function formatEvent(e: RunEvent): string {
 async function follow(runId: string, after = 0, diagnosticsAfter?: number): Promise<void> {
   const port = resolveClientPort();
   const url = `${daemonUrl(port)}/api/runs/${runId}/stream?after=${after}`;
-  const res = await fetch(url, { headers: apiTokenHeaders(url) });
+  let boundOrigin: string | undefined;
+  const res = await fetch(url, {
+    headers: apiTokenHeaders(url, undefined, undefined, (origin) => (boundOrigin = origin)),
+  });
   if (!res.ok) {
     const reply = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new ApiError(redactCredentials(`${res.status}: ${reply?.error ?? res.statusText}`), res.status);
+    const msg =
+      res.status === 401 && boundOrigin ? tokenMismatch(boundOrigin) : (reply?.error ?? res.statusText);
+    throw new ApiError(redactCredentials(`${res.status}: ${msg}`), res.status);
   }
   if (!res.body) return;
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();

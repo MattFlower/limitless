@@ -1788,10 +1788,18 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** Record a confirmed merge, preserving any existing manual resolution and terminal evidence. */
-  resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number): boolean {
+  resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number | null): boolean {
     const current = this.getRun(id);
     const prUrl = current?.prUrl;
-    if (!current || !prUrl || (current.merged && current.status !== "needs_human")) return false;
+    if (!current || !prUrl) return false;
+    mergedBy = current.mergedBy ?? mergedBy;
+    mergedAt = current.mergedAt ?? mergedAt;
+    if (current.merged && current.status !== "needs_human") {
+      if (current.mergedBy !== mergedBy || current.mergedAt !== mergedAt)
+        this.updateRun(id, { mergedBy, mergedAt });
+      return false;
+    }
+    if (mergedAt === null) return false;
     if (current.status === "resolved" || current.status === "succeeded") {
       this.updateRun(id, { merged: true, mergedBy, mergedAt });
       return true;

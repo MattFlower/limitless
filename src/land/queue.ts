@@ -58,6 +58,8 @@ export interface LandObservation {
   failing: string[];
   statusNames?: string[];
   truncated?: boolean;
+  mergedBy?: { login: string } | null;
+  mergedAt?: string | null;
 }
 
 /** The `gh pr view` client a land reads its CI from when polling is off. */
@@ -354,7 +356,8 @@ export class LandQueue {
       }
       if (entry.pushedSha)
         await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
-      if ((await this.awaitCi(entry, head, signal)) === "merged") return this.landed(entry, run, head);
+      const ci = await this.awaitCi(entry, head, signal);
+      if (ci !== "green") return this.landed(entry, run, head, ci);
       await this.merge(entry, run, cwd, head, signal);
     } finally {
       await this.discard(repo, cwd);
@@ -362,8 +365,19 @@ export class LandQueue {
   }
 
   /** A PR that already merged is recorded, never merged again. */
-  private landed(entry: LandEntry, run: Run, sha: string): void {
-    this.store.updateRun(run.id, { merged: true });
+  private landed(entry: LandEntry, run: Run, sha: string, observation: LandObservation | null): void {
+    const at = observation?.mergedAt ? Date.parse(observation.mergedAt) : NaN;
+    const mergedBy = observation?.state === "MERGED" ? (observation.mergedBy?.login ?? null) : null;
+    const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
+    const owner = this.store.reviewRound(run.id)?.owner ?? run;
+    for (const id of new Set([run.id, owner.id])) {
+      const current = this.store.getRun(id);
+      this.store.updateRun(id, {
+        merged: true,
+        mergedBy: current?.mergedBy ?? mergedBy,
+        mergedAt: current?.mergedAt ?? mergedAt,
+      });
+    }
     this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
   }
@@ -419,7 +433,11 @@ export class LandQueue {
    * the fallback read covers a restart and polling off. A head that moved after we saw ours blocks
    * at once, and a transient failure is re-run once.
    */
-  private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
+  private async awaitCi(
+    entry: LandEntry,
+    sha: string,
+    signal: AbortSignal,
+  ): Promise<"green" | LandObservation> {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
     const rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     // GitHub may still report the approved head while our base merge propagates.
@@ -433,7 +451,7 @@ export class LandQueue {
         throw new LandBlocked("head moved after approval");
       const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
-      if (seen?.state === "MERGED") return "merged";
+      if (seen?.state === "MERGED") return seen;
       if (unexpectedHead(seen?.head)) throw new LandBlocked("head moved after approval");
       if (rerun) {
         const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
@@ -599,7 +617,8 @@ export class LandQueue {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
     }
-    this.landed(entry, run, sha);
+    const observed = await (this.deps.client ?? getGitHubPr)(entry.prUrl, signal).catch(() => null);
+    this.landed(entry, run, sha, observed ? { ...observed, head: observed.headRefOid ?? "" } : null);
   }
 
   // ---- helpers -------------------------------------------------------------
@@ -676,6 +695,8 @@ export class LandQueue {
           failing: snapshot.failing.map((f) => f.name),
           statusNames: snapshot.statusNames,
           truncated: snapshot.truncated,
+          mergedBy: snapshot.mergedBy,
+          mergedAt: snapshot.mergedAt,
         }
       : null;
   }
@@ -693,6 +714,8 @@ export class LandQueue {
           failing: pr.failing,
           statusNames: pr.statusNames,
           truncated: pr.truncated,
+          mergedBy: pr.mergedBy,
+          mergedAt: pr.mergedAt,
         }
       : null;
   }
