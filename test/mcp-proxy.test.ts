@@ -1452,40 +1452,51 @@ test.each(["encoded", "CRLF", "no final newline", "overlapping"])(
   },
 );
 
-test("change view withholds a hunk clipped inside a long multiline credential at both edges", async () => {
-  const secretLines = Array.from({ length: 10 }, (_, i) => `middle-clipped-secret-${i}`);
-  const base = [
-    ...Array.from({ length: 4 }, (_, i) => `public before ${i}`),
-    ...secretLines,
-    ...Array.from({ length: 4 }, (_, i) => `public after ${i}`),
-  ];
-  writeFileSync(join(f.repo, "hello.txt"), `${base.join("\n")}\n`);
-  await sh(["git", "add", "."], { cwd: f.repo });
-  await sh(["git", "commit", "-qm", "base long credential"], { cwd: f.repo });
-  const head = [...base];
-  head[9] = "public changed";
-  const c = await changeFixture(f, { "hello.txt": `${head.join("\n")}\n` });
-  const raw = (await sh(["git", "diff", "--unified=3", c.baseSha, c.headSha], { cwd: f.repo })).stdout;
-  expect(raw).not.toContain("public before");
-  expect(raw).not.toContain("public after");
-  registerCredential("MIDDLE_CLIPPED_CREDENTIAL", secretLines.join("\n"));
-  const connections = await changeConnections();
-  try {
-    for (const conn of [connections.direct, connections.proxy]) {
-      const page = resultValue<ChangePage>(
-        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
-      );
-      expect(page.available).toBe(true);
-      for (const line of secretLines) expect(page.diff.text).not.toContain(line);
-      expect(page.diff.text.match(/^ \[withheld: private text; 1 line\]$/gm)).toHaveLength(6);
-      expect(page.diff.text).toMatch(/^-\[withheld: private text; 1 line\]$/m);
-      expect(page.diff.text).toContain("+public changed");
-      expect(page.diff.text).toMatch(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: |$)/m);
+test.each([
+  ["long", (i: number) => `middle-clipped-secret-${i}`],
+  ["short", (i: number) => `${i}`],
+])(
+  "change view withholds a hunk clipped inside a %s-line multiline credential at both edges",
+  async (_, line) => {
+    const secretLines = Array.from({ length: 10 }, (_, i) => line(i));
+    const base = [
+      ...Array.from({ length: 4 }, (_, i) => `public before ${i}`),
+      ...secretLines,
+      ...Array.from({ length: 4 }, (_, i) => `public after ${i}`),
+    ];
+    writeFileSync(join(f.repo, "hello.txt"), `${base.join("\n")}\n`);
+    await sh(["git", "add", "."], { cwd: f.repo });
+    await sh(["git", "commit", "-qm", "base long credential"], { cwd: f.repo });
+    const head = [...base];
+    head[9] = "public changed";
+    const c = await changeFixture(f, { "hello.txt": `${head.join("\n")}\n` });
+    const raw = (await sh(["git", "diff", "--unified=3", c.baseSha, c.headSha], { cwd: f.repo })).stdout;
+    // Only the hunk header's function annotation may quote surrounding public text.
+    const content = raw.replace(/^@@.*$/gm, "");
+    expect(content).not.toContain("public before");
+    expect(content).not.toContain("public after");
+    registerCredential("MIDDLE_CLIPPED_CREDENTIAL", secretLines.join("\n"));
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        // Digits also occur in hunk headers, so check short secrets as whole patch lines.
+        for (const line of secretLines) expect(page.diff.text).not.toMatch(new RegExp(`^[-+ ]${line}$`, "m"));
+        for (const line of secretLines.filter((l) => l.length > 1))
+          expect(page.diff.text).not.toContain(line);
+        expect(page.diff.text.match(/^ \[withheld: private text; 1 line\]$/gm)).toHaveLength(6);
+        expect(page.diff.text).toMatch(/^-\[withheld: private text; 1 line\]$/m);
+        expect(page.diff.text).toContain("+public changed");
+        expect(page.diff.text).toMatch(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: |$)/m);
+      }
+    } finally {
+      await connections.close();
     }
-  } finally {
-    await connections.close();
-  }
-});
+  },
+);
 
 test("change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";

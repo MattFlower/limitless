@@ -95,8 +95,7 @@ function privatePatchLines(patch: string, values: readonly string[]): Set<number
             const run = text.slice(ranges[i]?.start, ranges[j]?.end);
             if (!framed.includes(`\n${run}`)) break;
             // Two or more lines: a lone shared line is not evidence of the credential.
-            if (j > i && run.endsWith("\n") && run.replace(/\s/gu, "").length >= 8)
-              withhold(ranges[i]?.start ?? 0, ranges[j]?.end ?? 0);
+            if (j > i && run.endsWith("\n")) withhold(ranges[i]?.start ?? 0, ranges[j]?.end ?? 0);
           }
         }
       }
