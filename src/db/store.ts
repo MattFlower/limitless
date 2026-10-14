@@ -665,8 +665,8 @@ export class Store {
     }
   }
 
-  /** Publish only after commit, including the run and its proposal linkage. */
-  private chatTransaction<T>(fn: () => T): T {
+  /** Buffer publications until the outermost store transaction commits; discard them on rollback. */
+  transaction<T>(fn: () => T): T {
     if (this.pendingPublications) return fn();
     const messages: StreamMessage[] = [];
     this.pendingPublications = messages;
@@ -860,7 +860,7 @@ export class Store {
   }
 
   proposeChat(conversationId: string, fields: ChatProposalFields, origin: ChatOrigin): ChatProposal {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const current = this.listChatProposals(conversationId).find(
         (p) => p.state === "pending" || p.state === "confirmed",
       );
@@ -895,7 +895,7 @@ export class Store {
   }
 
   confirmChat(conversationId: string, id: string): ChatProposal {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const proposal = this.chatProposal(conversationId, id);
       if (proposal.state === "superseded")
         throw new Error("Proposal has been superseded; confirm the current proposal");
@@ -910,7 +910,7 @@ export class Store {
   }
 
   resetChatConfirmation(conversationId: string, id: string): void {
-    this.chatTransaction(() => {
+    this.transaction(() => {
       const proposal = this.chatProposal(conversationId, id);
       // Creation can fail before consumption; never undo a committed run linkage.
       if (proposal.state !== "confirmed" || proposal.runId) return;
@@ -927,7 +927,7 @@ export class Store {
   }
 
   createChatRun(repo: Repo, req: CreateRunRequest, conversationId: string, proposalId: string): Run {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const proposal = this.chatProposal(conversationId, proposalId);
       if (proposal.state === "consumed" && proposal.runId) {
         const run = this.getRun(proposal.runId);
@@ -1115,7 +1115,7 @@ export class Store {
     review: { prUrl: string; reviewedSha: string; findings: ReviewFinding[]; cap: number },
     request: (round: number) => CreateRunRequest,
   ): { run: Run } | { active: ReviewRound } | { limited: Run } {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const all = this.reviewRounds(review.prUrl);
       const rounds = all.filter((r) => r.kind === "review");
       const active = all.find((r) => !TERMINAL_STATUSES.includes(r.status));
@@ -1289,7 +1289,7 @@ export class Store {
     now: number,
   ): Run | null {
     const table = kind === "ci" ? "ci_fix_triggers" : "conflict_triggers";
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const trigger = this.pendingRoundTriggers(kind).find((t) => t.id === id);
       if (!trigger || trigger.nextAttemptAt > now) return null;
       if (kind === "ci" && !this.ciFixTriggerReady(id)) return null;
@@ -1770,7 +1770,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     excludeFromSupersession: readonly string[] = [],
   ): Run {
     if (patch.merged && !this.pendingPublications)
-      return this.chatTransaction(() => this.updateRun(id, patch, state, excludeFromSupersession));
+      return this.transaction(() => this.updateRun(id, patch, state, excludeFromSupersession));
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");
@@ -1803,7 +1803,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   ): Run | null {
     const { kind, by, ref = null, note = null, at = Date.now() } = input;
     const resolution: RunResolution = { kind, ref, note, by, at };
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const from = this.getRun(id)?.status;
       if (!from || !(opts.from ?? ["needs_human", "failed"]).includes(from)) return null;
       const { sets, values } = buildUpdate({ ...opts.patch, status: "resolved" }, RUN_PATCH_COLUMNS);
@@ -1819,6 +1819,23 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       this.publish({ kind: "run", run });
       if (opts.patch?.merged) this.supersedeByIssue(run, opts.excludeFromSupersession);
       return run;
+    });
+  }
+
+  /** Resolve the exact PR's runs together, excluding its own rounds from issue supersession. */
+  resolveMergedPr(
+    repoId: string,
+    prUrl: string,
+    mergedBy: string | null,
+    mergedAt: number | null,
+    confirmedAt?: number,
+  ): void {
+    this.transaction(() => {
+      const ids = this.listRuns({ repoId, limit: Number.MAX_SAFE_INTEGER })
+        .filter((run) => run.prUrl === prUrl)
+        .map((run) => run.id);
+      for (const id of ids)
+        this.resolveMergedRun(id, mergedBy, mergedAt, { confirmedAt, excludeFromSupersession: ids });
     });
   }
 
@@ -1860,7 +1877,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
 
   /** Enrich the existing merge item as metadata arrives, without another merge transition. */
   fillMergedRunMetadata(id: string, mergedBy: string | null, mergedAt: number | null): void {
-    this.chatTransaction(() => {
+    this.transaction(() => {
       const current = this.getRun(id);
       if (!current?.merged) return;
       mergedBy = current.mergedBy ?? mergedBy;

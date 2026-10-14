@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Paths } from "../src/config.ts";
-import type { LandEntry, Run } from "../src/core/types.ts";
+import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
@@ -484,9 +484,14 @@ test.each(["complete", "fail", "abort", "timeout", "unmerged", "different PR"])(
   },
 );
 
-test.each([true, false])(
-  "landing resolves a same-issue needs_human round as merged (metadata: %s)",
-  async (metadata) => {
+test.each([
+  { metadata: true, target: "round" },
+  { metadata: false, target: "round" },
+  { metadata: true, target: "owner" },
+  { metadata: false, target: "owner" },
+])(
+  "landing through $target resolves every same-PR round as merged (metadata: $metadata)",
+  async ({ metadata, target }) => {
     const pr = delivered(1, "pr-1");
     store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("request\nCloses #42", pr.run.id);
     const head = await pushBranch("pr-1", "one.txt", "one\n");
@@ -495,13 +500,15 @@ test.each([true, false])(
     if (!repo) throw new Error("missing repository");
     const other = store.createRun(repo, { repo: SLUG, prompt: "other request\nCloses #42" });
     const finishedAt = 123;
-    store.updateRun(other.id, { status: "needs_human" });
+    store.updateRun(other.id, { status: "needs_human", prUrl: url(2) });
+    const second = roundRun(pr.run.id, url(1), head);
+    store.updateRun(second.id, { status: "needs_human" });
     store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("review round\nCloses #42", round.id);
     store.updateRun(round.id, { status: "needs_human", finishedAt, error: "review needs approval" });
     observe(1, head);
     store.recordApproval(round.id, url(1), head, "orchestrator");
     if (!metadata) writeFileSync(join(root, "gh.no-metadata"), "");
-    const entry = await queue().request({ target: round.id });
+    const entry = await queue().request({ target: target === "owner" ? pr.run.id : round.id });
     await settle();
     if (metadata) await waitWithoutClock(() => store.getRun(round.id)?.mergedBy === "owner", 15_000);
     expect(store.getLandEntry(entry.id)?.state).toBe("landed");
@@ -513,7 +520,81 @@ test.each([true, false])(
       error: "review needs approval",
     });
     expect(store.getRun(pr.run.id)).toMatchObject({ merged: true, status: "succeeded", resolution: null });
+    expect(store.getRun(second.id)).toMatchObject({
+      merged: true,
+      status: "resolved",
+      resolution: { kind: "merged", ref: url(1) },
+    });
+    for (const id of [pr.run.id, round.id, second.id])
+      expect(store.getRun(id)).toMatchObject({
+        mergedBy: metadata ? "owner" : null,
+        mergedAt: metadata ? Date.parse("2026-10-13T12:00:00Z") : null,
+      });
     expect(store.getRun(other.id)?.resolution?.kind).toBe("superseded");
+  },
+);
+
+test.each([false, true])(
+  "landing buffers run and feed publications until commit (rollback: %s)",
+  async (rollback) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const round = roundRun(pr.run.id, url(1), head);
+    store.updateRun(round.id, { status: "needs_human" });
+    observe(1, head);
+    store.recordApproval(round.id, url(1), head, "orchestrator");
+    const messages: StreamMessage[] = [];
+    const inTransaction: boolean[] = [];
+    const off = store.subscribe((msg) => {
+      if (
+        (msg.kind === "run" && msg.run.merged) ||
+        (msg.kind === "feed" && ["land.landed", "run.merged", "run.resolved"].includes(msg.item.kind))
+      ) {
+        messages.push(msg);
+        inTransaction.push(store.db.inTransaction);
+      }
+    });
+    const resolve = store.resolveMergedRun.bind(store);
+    let calls = 0;
+    const beforeCommit: number[] = [];
+    const fault = spyOn(store, "resolveMergedRun").mockImplementation((...args) => {
+      const result = resolve(...args);
+      beforeCommit.push(messages.length);
+      if (++calls === 2 && rollback) throw new Error("injected landing rollback");
+      return result;
+    });
+    const q = queue({ client: async () => null });
+    try {
+      const entry = await q.request({ target: round.id });
+      await settle();
+      await q.stop();
+      expect(calls).toBe(2);
+      expect(beforeCommit).toEqual([0, 0]);
+      expect(inTransaction.every((active) => !active)).toBe(true);
+      expect(store.getLandEntry(entry.id)?.state).toBe(rollback ? "blocked" : "landed");
+      for (const id of [pr.run.id, round.id]) expect(store.getRun(id)?.merged).toBe(!rollback);
+      const feed = messages.flatMap((msg) => (msg.kind === "feed" ? [msg.item] : []));
+      if (rollback) {
+        expect(messages).toEqual([]);
+        expect(
+          store
+            .readFeed({ limit: 100 })
+            .items.some((item) => item.kind === "land.landed" || item.kind === "run.merged"),
+        ).toBe(false);
+      } else {
+        expect(messages.filter((msg) => msg.kind === "run")).toHaveLength(2);
+        expect(feed.map((item) => item.kind).toSorted()).toEqual([
+          "land.landed",
+          "run.merged",
+          "run.merged",
+          "run.resolved",
+        ]);
+      }
+    } finally {
+      fault.mockRestore();
+      off();
+      await q.stop();
+    }
   },
 );
 
@@ -1431,45 +1512,58 @@ test("a cancel during the private-range check stays cancelled after a queue rest
   }
 });
 
-test("a cancel during successful CI observation stays cancelled after a queue restart", async () => {
-  const pr = delivered(1, "pr-1");
-  const head = await pushBranch("pr-1", "one.txt", "one\n");
-  observe(1, head);
-  approve(1, head);
-  const entered = Promise.withResolvers<void>();
-  const response = Promise.withResolvers<GitHubPrView | null>();
-  const q = queue({
-    polling: false,
-    client: async () => {
-      entered.resolve();
-      return response.promise;
-    },
-  });
-  try {
-    const entry = await q.request({ target: pr.run.id });
-    await entered.promise;
-    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
-    expect(q.cancel(entry.id)).toBe(true);
-    response.resolve({
-      url: url(1),
-      state: "OPEN",
-      mergedAt: null,
-      mergedBy: null,
-      headRefOid: head,
-      ci: "SUCCESS",
-      failing: [],
+test.each(["OPEN", "MERGED"])(
+  "a cancel during %s CI observation stays cancelled after a queue restart",
+  async (state) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const round = roundRun(pr.run.id, url(1), head);
+    store.updateRun(round.id, { status: "needs_human" });
+    observe(1, head);
+    approve(1, head);
+    const entered = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<GitHubPrView | null>();
+    const q = queue({
+      polling: false,
+      client: async () => {
+        entered.resolve();
+        return response.promise;
+      },
     });
-    await q.stop();
-    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", pushedSha: head });
-    const restarted = queue();
-    await restarted.stop();
-    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", attempts: 1 });
-    expect(ghCalls("pr merge")).toEqual([]);
-  } finally {
-    response.resolve(null);
-    await q.stop();
-  }
-});
+    try {
+      const entry = await q.request({ target: pr.run.id });
+      await entered.promise;
+      expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+      expect(q.cancel(entry.id)).toBe(true);
+      response.resolve({
+        url: url(1),
+        state,
+        mergedAt: state === "MERGED" ? "2026-10-13T12:00:00Z" : null,
+        mergedBy: state === "MERGED" ? { login: "owner" } : null,
+        headRefOid: head,
+        ci: "SUCCESS",
+        failing: [],
+      });
+      await q.stop();
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", pushedSha: head });
+      const restarted = queue();
+      await restarted.stop();
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", attempts: 1 });
+      expect(ghCalls("pr merge")).toEqual([]);
+      for (const id of [pr.run.id, round.id]) expect(store.getRun(id)?.merged).toBe(state === "MERGED");
+      if (state === "MERGED") {
+        expect(store.getRun(round.id)?.resolution).toMatchObject({ kind: "merged", ref: url(1) });
+        expect(store.getRun(pr.run.id)).toMatchObject({
+          mergedBy: "owner",
+          mergedAt: Date.parse("2026-10-13T12:00:00Z"),
+        });
+      }
+    } finally {
+      response.resolve(null);
+      await q.stop();
+    }
+  },
+);
 
 test("a cancel interrupts a CI read that never answers", async () => {
   const pr = delivered(1, "pr-1");

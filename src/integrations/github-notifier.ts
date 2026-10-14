@@ -162,7 +162,12 @@ export async function reconcileMergedRuns(
         const pr = savedSnapshot(store.githubPrData(run.prUrl));
         if (pr?.url === run.prUrl && pr.state === "MERGED") {
           const at = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
-          store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, Number.isFinite(at) ? at : null);
+          store.resolveMergedPr(
+            run.repoId,
+            pr.url,
+            pr.mergedBy?.login ?? null,
+            Number.isFinite(at) ? at : null,
+          );
         }
       }
       continue;
@@ -201,7 +206,7 @@ export async function reconcileMergedRuns(
       if (store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
       if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
-        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
+        store.resolveMergedPr(run.repoId, pr.url, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
         store.observeGithubPrState(pr.url, pr.state, now());

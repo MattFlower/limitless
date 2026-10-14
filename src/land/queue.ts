@@ -372,17 +372,11 @@ export class LandQueue {
     const at = observation?.mergedAt ? Date.parse(observation.mergedAt) : NaN;
     const mergedBy = observation?.state === "MERGED" ? (observation.mergedBy?.login ?? null) : null;
     const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
-    const owner = this.store.reviewRound(run.id)?.owner ?? run;
-    const ids = [...new Set([run.id, owner.id])];
-    this.store.db.transaction(() => {
-      if (!this.isActive(this.store.getLandEntry(entry.id) ?? entry)) return;
-      this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
-      for (const id of ids)
-        this.store.resolveMergedRun(id, mergedBy, mergedAt, {
-          confirmedAt: this.now(),
-          excludeFromSupersession: ids,
-        });
-    })();
+    this.store.transaction(() => {
+      const current = this.store.getLandEntry(entry.id);
+      if (current && this.isActive(current)) this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+      this.store.resolveMergedPr(run.repoId, entry.prUrl, mergedBy, mergedAt, this.now());
+    });
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
   }
 
@@ -625,9 +619,13 @@ export class LandQueue {
     const observed = await this.mergeMetadata(entry.prUrl, signal);
     if (observed?.state !== "MERGED" || observed.url !== entry.prUrl) return;
     const at = observed.mergedAt ? Date.parse(observed.mergedAt) : NaN;
-    const owner = this.store.reviewRound(run.id)?.owner ?? run;
-    for (const id of new Set([run.id, owner.id]))
-      this.store.fillMergedRunMetadata(id, observed.mergedBy?.login ?? null, Number.isFinite(at) ? at : null);
+    this.store.resolveMergedPr(
+      run.repoId,
+      entry.prUrl,
+      observed.mergedBy?.login ?? null,
+      Number.isFinite(at) ? at : null,
+      this.now(),
+    );
   }
 
   private async mergeMetadata(url: string, signal: AbortSignal): Promise<GitHubPrView | null> {
