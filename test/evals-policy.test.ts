@@ -979,6 +979,52 @@ test("only review systems matching [review] implementer_report are routing evide
   expect(selectEvidence([base], undefined, "omit").map((e) => e.modelId)).toEqual([local, metered]);
 });
 
+test("setup review arms do not affect routing evidence or policy summaries in either trial order", () => {
+  const base = evidence("review", [local]);
+  const control = {
+    name: "control",
+    mode: "single" as const,
+    finders: [{ target: local, prompt: "standard" as const }],
+    implementerReport: "include" as const,
+  };
+  const setup = { ...control, name: "setup", setup: true as const };
+  const trials = [control, setup].flatMap((s) =>
+    base.trials.map((t) => ({ ...t, pass: s === control, details: { ...t.details, system: s.name } })),
+  );
+  // Put setup first so a summary cannot accidentally take an empty, excluded arm.
+  const run = { run: { ...base.run, systems: [setup, control] }, trials };
+  const reviewSummary = (result: ReturnType<typeof generatePolicy>) =>
+    result.roles.find((r) => r.role === "review")?.candidates.map((c) => c.summary);
+  const expected = generatePolicy(
+    input([
+      {
+        run: { ...base.run, systems: [control] },
+        trials: trials.filter((t) => t.details.system === "control"),
+      },
+    ]),
+  );
+  for (const rows of [trials, [...trials].reverse()]) {
+    const entry = { ...run, trials: rows };
+    expect(selectEvidence([entry])[0]?.trials.map((t) => t.details.system)).toEqual(
+      Array(40).fill("control"),
+    );
+    const result = generatePolicy(input([entry]));
+    expect(result.generated).toEqual(expected.generated);
+    expect(reviewSummary(result)).toEqual(reviewSummary(expected));
+    expect(reviewSummary(result)?.[0]).toMatchObject({
+      candidate: "control",
+      passRate: 1,
+    });
+  }
+  const setupOnly = {
+    run: { ...base.run, systems: [setup] },
+    trials: trials.filter((t) => t.details.system === "setup"),
+  };
+  expect(selectEvidence([setupOnly])).toEqual([]);
+  expect(generatePolicy(input([setupOnly])).roles.find((r) => r.role === "review")?.candidates).toEqual([]);
+  expect(selectEvidence([base])[0]?.trials).toEqual(base.trials);
+});
+
 test("shared origin parser and predicate retain exact eval semantics", () => {
   expect(parseExcludeOrigins({})).toBeUndefined();
   expect(parseExcludeOrigins({ routing: { exclude_origins: [] } })).toEqual([]);

@@ -63,7 +63,8 @@ async function setupPins(f: Awaited<ReturnType<typeof fixture>>, setup: string[]
     `[gates]\nsetup = ${JSON.stringify(commands)}\nchecks = [{ name = "test", run = "touch check-ran" }]\n`;
   const commit = async (text: string) => {
     writeFileSync(join(f.source, ".limitless.toml"), text);
-    await sh(["git", "add", ".limitless.toml"], { cwd: f.source });
+    writeFileSync(join(f.source, ".gitignore"), "node_modules/\n");
+    await sh(["git", "add", ".limitless.toml", ".gitignore"], { cwd: f.source });
     await sh(["git", "commit", "-qm", "gate config"], { cwd: f.source });
     return (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
   };
@@ -80,7 +81,7 @@ const setupSystem = (name: string, setup = true) => ({
   ...(setup ? { setup: true } : {}),
 });
 
-test("review setup runs only base commands, in order, confined to the trial worktree and scratch", async () => {
+test.each([false, true])("review setup restores HEAD (seeded=%s)", async (seeded) => {
   const f = await fixture();
   let setupStartedAt = 0;
   let setupEndedAt = 0;
@@ -96,11 +97,24 @@ test("review setup runs only base commands, in order, confined to the trial work
   try {
     const commands = [
       'mkdir -p node_modules && printf base-one > node_modules/ready && touch "$TMPDIR/ready"',
-      'test -f "$TMPDIR/ready" && printf base-two >> node_modules/ready',
+      'test -f "$TMPDIR/ready" && printf base-two >> node_modules/ready && printf setup-overwrite > CURRENT.txt && git add CURRENT.txt && touch setup-output',
     ];
     await setupPins(f, commands);
-    f.respond((s) => {
+    if (seeded) {
+      f.item.seedPatch = "seed.patch";
+      f.item.kind = "seeded";
+      writeFileSync(
+        join(f.home, "seed.patch"),
+        "diff --git a/CURRENT.txt b/CURRENT.txt\n--- a/CURRENT.txt\n+++ b/CURRENT.txt\n@@ -1 +1 @@\n-new\n\\ No newline at end of file\n+seeded\n\\ No newline at end of file\n",
+      );
+      f.save();
+    }
+    f.respond(async (s) => {
       expect(s.mode).toBe("readonly");
+      expect(readFileSync(join(s.cwd, "CURRENT.txt"), "utf8")).toBe(seeded ? "seeded" : "new");
+      expect((await sh(["git", "diff", "HEAD", "--exit-code"], { cwd: s.cwd })).stdout).toBe("");
+      expect((await sh(["git", "diff", "--cached", "--exit-code"], { cwd: s.cwd })).stdout).toBe("");
+      expect(existsSync(join(s.cwd, "setup-output"))).toBe(true);
       expect(readFileSync(join(s.cwd, "node_modules/ready"), "utf8")).toBe("base-onebase-two");
       expect(readFileSync(join(s.cwd, ".limitless.toml"), "utf8")).toContain("head-setup-ran");
       expect(existsSync(join(s.cwd, "head-setup-ran"))).toBe(false);
@@ -140,12 +154,13 @@ test("review setup runs only base commands, in order, confined to the trial work
   }
 });
 
-test("failed review setup records preparation failure and timing while another trial completes", async () => {
+test.each(["setup", "restoration"])("review %s failure is trial-local", async (failure) => {
   const f = await fixture();
   const confinement = spyOn(fakeConfinement, "verify");
   try {
-    const command = "printf dependency-unavailable >&2 && exit 1";
-    await setupPins(f, [command, "touch later-setup-ran"]);
+    const command =
+      failure === "setup" ? "printf dependency-unavailable >&2 && exit 1" : "touch .git/index.lock";
+    await setupPins(f, failure === "setup" ? [command, "touch later-setup-ran"] : [command]);
     f.respond((s) => {
       expect(existsSync(join(s.cwd, "later-setup-ran"))).toBe(false);
       return { structured: reviewOutput() };
@@ -162,8 +177,10 @@ test("failed review setup records preparation failure and timing while another t
       durationMs: 0,
       details: { system: "prepared", preparationFailed: true },
     });
-    expect(report.trials[0]?.details.reason).toContain(command);
-    expect(report.trials[0]?.details.reason).toContain("dependency-unavailable");
+    if (failure === "setup") expect(report.trials[0]?.details.reason).toContain(command);
+    expect(report.trials[0]?.details.reason).toContain(
+      failure === "setup" ? "dependency-unavailable" : "index.lock",
+    );
     expect(report.trials[1]).toMatchObject({
       status: "ok",
       pass: true,

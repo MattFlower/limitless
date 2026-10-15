@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
 import { Semaphore } from "../gates/slots.ts";
+import { worktreeGit } from "../git/command.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
@@ -679,12 +680,15 @@ export class EvalRunner {
             );
       if (!prepared) throw new Error("missing trial preparation");
       if ("defects" in effective && system?.setup) {
+        const head = (await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal })).stdout.trim();
         const { baseline } = await prepareEvalGates(effective, cwd, signal, true);
         const failed = baseline.setup.find((step) => !step.ok);
         if (!baseline.setupOk)
           throw new Error(
             redactCredentials(`review gate setup failed: ${failed?.command}\n${failed?.output}`),
           );
+        // Review committed bytes (including seeds), retaining setup's dependencies and other outputs.
+        await worktreeGit(["git", "reset", "--hard", "-q", head], { cwd, signal });
       }
       const preparationMs = Date.now() - preparationStarted;
       if ("defects" in item) trial.details.preparationMs = preparationMs;
