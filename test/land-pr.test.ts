@@ -93,7 +93,8 @@ describe("land-pr private strings", () => {
     const config = join(root, "config");
     const bin = join(root, "bin");
     const gitBin = Bun.which("git");
-    const bunBin = Bun.which("bun");
+    // A PATH wrapper would dispatch back into the fake bun below.
+    const bunBin = process.execPath;
     if (!gitBin || !bunBin) throw new Error("missing tools");
     try {
       for (const dir of [source, config, bin]) mkdirSync(dir);

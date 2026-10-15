@@ -3127,8 +3127,8 @@ test("a rename that drops the executable bit is a mode transition of the origina
 
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
-    "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
-    "disguised.txt": " \n%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "ascii.pdf": "\x25PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "disguised.txt": " \n\x25PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
     "plain.pdf": "ordinary text\n",
     "archive.txt": "Rar!\x1a\x07\x01opaque ASCII container",
     "ordinary.txt": "ordinary text\n",
@@ -3156,7 +3156,7 @@ test("whole-blob classification catches a valid V7 TAR with its first NUL at 972
   const tar = Buffer.concat([...Array.from({ length: 19 }, () => header), Buffer.alloc(1024)]);
   writeFileSync(join(work, "late.tar"), tar);
   writeFileSync(join(work, "late.txt"), Buffer.concat([Buffer.alloc(9728, 0x61), Buffer.from([0])]));
-  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}%PDF-1.4\n%%EOF\n`);
+  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}\x25PDF-1.4\n%%EOF\n`);
   await commitAll(work, "late binary bytes");
   const diff = await diffSince(work, base);
   expect(diff.binaryPaths?.sort()).toEqual(["late-signature.txt", "late.tar", "late.txt"]);

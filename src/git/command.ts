@@ -17,6 +17,7 @@ const HARDENING = [
   "core.hooksPath=/dev/null",
   "-c",
   "core.fsmonitor=false",
+  // Resets and checkouts must not enter nested repositories with independent filters.
   "-c",
   "submodule.recurse=false",
   "-c",

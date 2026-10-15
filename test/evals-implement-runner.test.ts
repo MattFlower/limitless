@@ -181,6 +181,7 @@ for (const failure of ["setup", "timeout"] as const)
     }
   });
 
+// Sixteen real-Git trials need headroom when other gate files run in parallel.
 test("baseline gates are shared across repetitions and providers per case within each run", async () => {
   const f = await fixture("sh count-gates.sh", (_, observe) => ({
     "count-gates.sh": `if test -f answer; then echo candidate >> '${observe}/gate-runs'; else echo baseline >> '${observe}/gate-runs'; fi\n`,
@@ -200,7 +201,7 @@ test("baseline gates are shared across repetitions and providers per case within
   } finally {
     await f.close();
   }
-});
+}, 60_000);
 
 for (const role of ["triage", "review", "verify", "implement"])
   test(`implement contamination checks scope ${role} labels in base history`, async () => {
