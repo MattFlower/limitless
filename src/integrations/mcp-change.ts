@@ -45,96 +45,6 @@ const CATALOGUE_CHARACTERS_CAP = 256_000;
 type Catalogue = { redact: HoldoutRedactor; cacheable: boolean };
 const catalogues = new WeakMap<Factory["store"], { key: string; catalogue: Catalogue }>();
 
-/** Map literal matches in each file side back to their physical patch lines. */
-function privatePatchLines(patch: string, values: readonly string[]): Set<number> {
-  const hidden = new Set<number>();
-  // Single-line values already pass through the ordinary per-line privacy filter.
-  const literals = values
-    .filter((value) => value.includes("\n"))
-    .map((value) => value.normalize("NFKC").toLowerCase());
-  if (!literals.length) return hidden;
-  type Line = { index: number; prefix: string; text: string };
-  let hunk: Line[] = [];
-  let inHunk = false;
-  const scan = (side: Line[], patterns = literals) => {
-    // The ordinary line filter withholds unsafe decoding; retain raw spans here.
-    const layers = side.map(
-      (line) => normalizedLayers(line.text) ?? [line.text.normalize("NFKC").toLowerCase()],
-    );
-    const depth = layers.reduce((max, forms) => Math.max(max, forms.length), 0);
-    for (let layer = 0; layer < depth; layer++) {
-      let text = "";
-      const ranges = side.map((line, i) => {
-        const forms = layers[i];
-        const start = text.length;
-        text += forms?.[Math.min(layer, forms.length - 1)] ?? "";
-        return { index: line.index, prefix: line.prefix, start, end: text.length };
-      });
-      const withhold = (start: number, end: number, clipped = false) => {
-        for (const range of ranges)
-          if (range.start < end && range.end > start && (!clipped || range.prefix === " "))
-            hidden.add(range.index);
-      };
-      for (const literal of patterns) {
-        if (!literal) continue;
-        let start = text.indexOf(literal);
-        while (start >= 0) {
-          withhold(start, start + literal.length);
-          // Overlapping occurrences can involve additional patch lines.
-          start = text.indexOf(literal, start + 1);
-        }
-        // Protect clipped context without treating isolated additions/deletions as whole credentials.
-        for (const { index } of literal.matchAll(/\n/gu)) {
-          const prefix = literal.slice(0, index + 1);
-          const suffix = literal.slice(index + 1);
-          if (prefix.replace(/\r?\n/gu, "") && text.endsWith(prefix))
-            withhold(text.length - prefix.length, text.length, true);
-          if (suffix.replace(/\r?\n/gu, "") && text.startsWith(suffix)) withhold(0, suffix.length, true);
-        }
-        // Both hunk edges can fall inside a long credential; protect whole-line runs from its middle.
-        const framed = `\n${literal}\n`;
-        // Adjacent pairs cover every longer run without enumerating all subranges.
-        for (let i = 1; i < ranges.length; i++) {
-          const previous = ranges[i - 1],
-            current = ranges[i];
-          if (!previous || !current) continue;
-          const pair = text.slice(previous.start, current.end);
-          if (pair.endsWith("\n") && framed.includes(`\n${pair}`)) {
-            hidden.add(previous.index);
-            hidden.add(current.index);
-          }
-        }
-      }
-    }
-  };
-  const flush = () => {
-    scan(hunk.filter((line) => line.prefix !== "+"));
-    scan(hunk.filter((line) => line.prefix !== "-"));
-    hunk = [];
-  };
-  for (const [index, line] of patch.split("\n").entries()) {
-    if (line.startsWith("@@ ")) {
-      flush();
-      // Git can quote an isolated credential line as the hunk's function annotation.
-      scan(
-        [{ index, prefix: "", text: line.replace(/^@@ [^@]* @@ ?/u, "") }],
-        literals.flatMap((value) => value.split(/\r?\n/u)),
-      );
-      inHunk = true;
-    } else if (inHunk && /^[-+ ]/u.test(line)) {
-      hunk.push({ index, prefix: line[0] ?? "", text: `${line.slice(1)}\n` });
-    } else if (inHunk && line.startsWith("\\")) {
-      const previous = hunk.at(-1);
-      if (previous) previous.text = previous.text.slice(0, -1);
-    } else {
-      flush();
-      inHunk = false;
-    }
-  }
-  flush();
-  return hidden;
-}
-
 function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): string | null {
   try {
     const hash = createHash("sha256").update(JSON.stringify(rounds));
@@ -592,21 +502,29 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     const prText = (path: string) => !deleted.has(path);
     const safePath = (path: string) =>
       privacy(path) === path && privacy(JSON.stringify(path)) === JSON.stringify(path) && prText(path);
+    const normalizeNewlines = (value: string) => value.replace(/\r\n?/gu, "\n");
+    const multiline = [...loadPrivateStrings().map(({ value }) => value), ...registeredCredentials()]
+      .map((value) => normalizeNewlines(value.normalize("NFKC").toLowerCase()))
+      .filter((value) => value.includes("\n"));
+    const privateFile = async (path: string) => {
+      if (!multiline.length) return false;
+      for (const sha of [baseSha, headSha]) {
+        // Only an added file may lack a base side; every required blob read must succeed.
+        if (sha === baseSha && !(await git(["ls-tree", "-z", sha, "--", `:(literal)${path}`]))) continue;
+        const layers = normalizedLayers(await git(["show", "--no-textconv", `${sha}:${path}`]));
+        if (
+          !layers ||
+          layers.some((layer) => multiline.some((value) => normalizeNewlines(layer).includes(value)))
+        )
+          return true;
+      }
+      return false;
+    };
     // Filter complete lines before paging, then check the complete sanitized patch too.
     const privatePatch = (patch: string) => {
-      const hidden = privatePatchLines(patch, [
-        ...loadPrivateStrings().map(({ value }) => value),
-        ...registeredCredentials(),
-      ]);
       const filtered = patch
         .split("\n")
-        .map((line, index) =>
-          hidden.has(index)
-            ? `${/^@@ [^@]* @@/u.exec(line)?.[0]?.concat(" ") ?? line[0]}[withheld: private text; 1 line]`
-            : privacy(line) === line
-              ? line
-              : "[withheld: private text; 1 line]",
-        )
+        .map((line) => (privacy(line) === line ? line : "[withheld: private text; 1 line]"))
         .join("\n");
       return privacy(filtered) === filtered
         ? filtered
@@ -614,20 +532,22 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     };
     const patch =
       selected && !selected.binary && safePath(selected.path)
-        ? privatePatch(
-            await git([
-              "diff",
-              "--no-renames",
-              "--ignore-submodules=none",
-              "--unified=3",
-              "--diff-algorithm=myers",
-              "--no-indent-heuristic",
-              baseSha,
-              headSha,
-              "--",
-              `:(literal)${selected.path}`,
-            ]),
-          )
+        ? (await privateFile(selected.path))
+          ? "[withheld: private text; 1 file]"
+          : privatePatch(
+              await git([
+                "diff",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "--unified=3",
+                "--diff-algorithm=myers",
+                "--no-indent-heuristic",
+                baseSha,
+                headSha,
+                "--",
+                `:(literal)${selected.path}`,
+              ]),
+            )
         : selected && !selected.binary
           ? prText(selected.path)
             ? "[withheld: protected path; 1 file]"
