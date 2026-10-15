@@ -404,6 +404,24 @@ test("merge and rebase report inspection errors without checkout paths", async (
   }
 });
 
+test("merge and rebase refuse a gitlink whose name isn't valid UTF-8", async () => {
+  // Index names are bytes; decoded as UTF-8 they would name a different path than git inspects.
+  const entry = Buffer.concat([
+    Buffer.from(`160000 ${base} 0\tnest`),
+    Buffer.from([0xff]),
+    Buffer.from("\n"),
+  ]);
+  expect(Bun.spawnSync(["git", "update-index", "--index-info"], { cwd: work, stdin: entry }).exitCode).toBe(
+    0,
+  );
+  for (const operation of [() => factory("merge", base), () => rebaseOnto(work, base)]) {
+    const error = await operation().catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Cannot inspect the checkout for nested repositories");
+    expect(await headSha(work)).toBe(base);
+  }
+});
+
 test.each([false, true])(
   "stageAll matches add -A for a file replaced by a repository (ignored: %s) without running filters",
   async (ignored) => {

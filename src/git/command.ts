@@ -190,6 +190,9 @@ async function refusePopulatedRepositories(
       .filter((entry) => entry.startsWith("160000 "))
       .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
   );
+  // Output is decoded as UTF-8: a name with invalid bytes no longer names the path git inspects.
+  if ([...gitlinks].some((path) => path.includes("\uFFFD")))
+    throw new Error("Cannot inspect the checkout for nested repositories");
   for (const path of gitlinks) {
     let populated: boolean;
     try {
