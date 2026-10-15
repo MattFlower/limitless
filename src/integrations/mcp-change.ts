@@ -509,8 +509,12 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     const privateFile = async (path: string) => {
       if (!multiline.length) return false;
       for (const sha of [baseSha, headSha]) {
-        // Only an added file may lack a base side; every required blob read must succeed.
-        if (sha === baseSha && !(await git(["ls-tree", "-z", sha, "--", `:(literal)${path}`]))) continue;
+        const entry = await git(["ls-tree", "-z", sha, "--", `:(literal)${path}`]);
+        // Added files lack a base side; gitlinks reference commits outside this repository.
+        if (sha === baseSha && !entry) continue;
+        const type = /^[0-7]{6} (blob|tree|commit) [0-9a-f]+\t/u.exec(entry)?.[1];
+        if (!type) throw new Error("Invalid Git file metadata");
+        if (type !== "blob") continue;
         const layers = normalizedLayers(await git(["show", "--no-textconv", `${sha}:${path}`]));
         if (
           !layers ||

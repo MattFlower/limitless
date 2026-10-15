@@ -1552,7 +1552,60 @@ test("change view keeps deleted multiline credentials withheld", async () => {
   }
 });
 
-test.each(["base", "head", "base tree"])(
+test.each(["added", "modified", "blob to gitlink", "gitlink to blob"])(
+  "change view inspects only blobs for a submodule %s on both backends",
+  async (scenario) => {
+    const path = "module";
+    // Gitlink targets deliberately do not exist in this repository's object database.
+    const oldLink = "1".repeat(40);
+    const newLink = "2".repeat(40);
+    const secret = "gitlink-alpha-secret\ngitlink-beta-secret";
+    const git = (args: string[]) => sh(["git", ...args], { cwd: f.repo });
+    if (scenario !== "added") {
+      if (scenario === "blob to gitlink") {
+        writeFileSync(join(f.repo, path), `${secret}\n`);
+        await git(["add", path]);
+      } else {
+        mkdirSync(join(f.repo, path));
+        await git(["update-index", "--add", "--cacheinfo", `160000,${oldLink},${path}`]);
+      }
+      await git(["commit", "-qm", "base submodule entry"]);
+    }
+    rmSync(join(f.repo, path), { recursive: true, force: true });
+    if (scenario !== "gitlink to blob") {
+      mkdirSync(join(f.repo, path));
+      await git(["update-index", "--add", "--cacheinfo", `160000,${newLink},${path}`]);
+    }
+    const c = await changeFixture(f, scenario === "gitlink to blob" ? { [path]: `${secret}\n` } : {});
+    registerCredential("GITLINK_MULTILINE", secret);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        expect(page.files).toMatchObject([{ path, binary: false }]);
+        expect(page.reports[0]).toMatchObject({
+          available: true,
+          text: expect.stringContaining("Factory report"),
+        });
+        if (scenario === "added" || scenario === "modified") {
+          expect(page.diff.text).toContain(`+Subproject commit ${newLink}\n`);
+          if (scenario === "modified") expect(page.diff.text).toContain(`-Subproject commit ${oldLink}\n`);
+          expect(page.diff.text).not.toContain("withheld");
+        } else {
+          expect(page.diff.text).toBe("[withheld: private text; 1 file]");
+        }
+        expect(JSON.stringify(page)).not.toMatch(/gitlink-alpha|gitlink-beta/);
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each(["base", "head", "base tree", "head tree"])(
   "change view fails closed on a required %s inspection failure",
   async (side) => {
     const c = await changeFixture(f, { "hello.txt": "public changed\n" });
@@ -1560,8 +1613,12 @@ test.each(["base", "head", "base tree"])(
     const original = gitCommand.worktreeGit;
     const inspect = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
       if (
-        (side === "base tree" && cmd.includes("ls-tree")) ||
-        (cmd.includes("show") && cmd.includes(`${side === "base" ? c.baseSha : c.headSha}:hello.txt`))
+        (side.endsWith("tree") &&
+          cmd.includes("ls-tree") &&
+          cmd.includes(side === "base tree" ? c.baseSha : c.headSha)) ||
+        (!side.endsWith("tree") &&
+          cmd.includes("show") &&
+          cmd.includes(`${side === "base" ? c.baseSha : c.headSha}:hello.txt`))
       )
         throw new Error("private inspection diagnostic");
       return original(cmd, opts);
