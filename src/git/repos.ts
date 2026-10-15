@@ -16,6 +16,7 @@ import {
   emptyTreeId,
   NO_BIG_FILES,
   recordWorktree,
+  stageAll,
   worktreeGit,
   worktreeGitScope,
 } from "./command.ts";
@@ -447,7 +448,7 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
     rmSync(resolve(cwd, index.stdout.trim()), { force: true });
     await worktreeGit(["git", "read-tree", "HEAD"], { cwd });
   }
-  await worktreeGit(["git", "add", "-A"], { cwd });
+  await stageAll({ cwd });
   const status = await worktreeGit(["git", "status", "--porcelain"], { cwd });
   if (!status.stdout.trim()) return null;
   await worktreeGit(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });

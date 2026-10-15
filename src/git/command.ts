@@ -123,7 +123,13 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   // Discover includes, worktree, global, system and environment config with the same options.
   const { hooks, emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts));
   prefix.push(...hookFlags(hooks));
-  const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
+  const env = {
+    ...(opts.env ?? (process.env as Record<string, string>)),
+    LIMITLESS_GIT_EMPTY_HOOK: "",
+    LIMITLESS_GIT_SUBMODULE_IGNORE: "dirty",
+  };
+  if (["merge", "rebase", "commit"].includes(cmd[command] ?? ""))
+    prefix.push(...(await submoduleFlags(prefix, { ...opts, env })));
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.
@@ -145,6 +151,56 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
     ...opts,
     env,
   });
+}
+
+/** Internal dirty checks lack --ignore-submodules; override the names Git reads from .gitmodules. */
+async function submoduleFlags(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
+  let source = "--file=.gitmodules";
+  if (!existsSync(join(opts.cwd, ".gitmodules"))) {
+    source = "";
+    for (const rev of [":.gitmodules", "HEAD:.gitmodules"]) {
+      const blob = await sh([...git, "rev-parse", "--verify", "--quiet", rev], {
+        ...opts,
+        allowFail: true,
+      });
+      if (blob.exitCode === 0) {
+        source = `--blob=${blob.stdout.trim()}`;
+        break;
+      }
+      if (blob.exitCode !== 1) throw new Error("Cannot inspect submodule configuration");
+    }
+    if (!source) return [];
+  }
+  const query = ["--no-includes", "-z", "--name-only", "--get-regexp", "^submodule\\..*\\.path$"];
+  const keys = await sh([...git, "config", source, ...query], { ...opts, allowFail: true });
+  if (keys.exitCode !== 0 && keys.exitCode !== 1) throw new Error("Cannot inspect submodule configuration");
+  return keys.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((key) => `--config-env=${key.slice(0, -4)}ignore=LIMITLESS_GIT_SUBMODULE_IGNORE`);
+}
+
+/** Stage paths directly: `add` otherwise runs status inside unchanged populated repositories. */
+export async function stageAll(opts: Parameters<typeof sh>[1], forcePaths: string[] = []): Promise<void> {
+  if (worktreeGitScope.getStore() === false) {
+    await worktreeGit(["git", "add", "-A"], opts);
+    return;
+  }
+  const files = await worktreeGit(
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-v", "-z"],
+    opts,
+  );
+  // Preserve add's skip-worktree/assume-unchanged promises; strip tags and repository trailing slashes.
+  const paths = files.stdout
+    .split("\0")
+    .filter((entry) => entry.length > 0 && !/^[a-zS] /.test(entry))
+    .map((entry) => entry.slice(2).replace(/\/$/, ""));
+  const input = [...new Set([...paths, ...forcePaths])].join("\0");
+  if (input)
+    await worktreeGit(["git", "update-index", "--add", "--remove", "--replace", "-z", "--stdin"], {
+      ...opts,
+      stdin: `${input}\0`,
+    });
 }
 
 /** The empty tree's id in `opts.cwd`'s object format, as `worktreeGit` passes it to `--attr-source`. */

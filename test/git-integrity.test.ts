@@ -39,6 +39,7 @@ import {
   headSha,
   pushBranch,
   readFileAt,
+  rebaseOnto,
   removeWorktree,
   resetTo,
   sweepClassificationScratch,
@@ -222,7 +223,7 @@ test.each(["commitAll", "discardChanges", "diff"])(
     writeFileSync(file, "base\n");
     await git(nested, "add", ".");
     await git(nested, "commit", "-qm", "nested base");
-    writeFileSync(join(work, ".gitmodules"), '[submodule "nested"]\n\tpath = nested\n\tignore = none\n');
+    writeFileSync(join(work, ".gitmodules"), '[submodule "nested=repo"]\n\tpath = nested\n\tignore = none\n');
     if (operation !== "commitAll") await commitAll(work, "gitlink");
     await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
     writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
@@ -234,12 +235,20 @@ test.each(["commitAll", "discardChanges", "diff"])(
       expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
         `160000 commit ${await headSha(nested)}\tnested`,
       );
+      writeFileSync(join(work, "sample.test.ts"), edited);
+      dirtyMtime(1500);
+      expect(await commitAll(work, "parent edit with unchanged gitlink")).not.toBeNull();
+      expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe(edited);
+      expect(existsSync(marker)).toBe(false);
       await git(nested, "-c", "filter.attack.clean=", "commit", "--allow-empty", "-qm", "advance nested");
       dirtyMtime(2000);
       expect(await commitAll(work, "changed gitlink")).not.toBeNull();
       expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
         `160000 commit ${await headSha(nested)}\tnested`,
       );
+      rmSync(join(work, ".gitmodules"));
+      dirtyMtime(3000);
+      expect(await commitAll(work, "remove module settings")).not.toBeNull();
     } else if (operation === "discardChanges") {
       expect(await discardChanges(work)).toBe(false);
       writeFileSync(join(work, "sample.test.ts"), edited);
@@ -249,6 +258,56 @@ test.each(["commitAll", "discardChanges", "diff"])(
     } else {
       expect((await factory("diff", "--name-only")).stdout).toBe("");
     }
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
+test.each(["prepareMerge", "prepareMerge without worktree .gitmodules", "completeMerge", "rebaseOnto"])(
+  "%s does not run an unchanged gitlink's filter with ignore=none",
+  async (operation) => {
+    const nested = join(work, "nested");
+    const marker = join(dir, "nested-filter-ran");
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(join(nested, "file"), "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    const nestedHead = await headSha(nested);
+    writeFileSync(join(work, ".gitmodules"), '[submodule "nested=repo"]\n\tpath = nested\n\tignore = none\n');
+    const common = await commitAll(work, "gitlink");
+    if (!common) throw new Error("expected gitlink commit");
+    await git(seed, "reset", "--hard", common);
+    writeFileSync(join(seed, "base-only.txt"), "from base\n");
+    await git(seed, "add", ".");
+    await git(seed, "commit", "-qm", "base advances");
+    const nextBase = await headSha(seed);
+    writeFileSync(join(work, "sample.test.ts"), edited);
+    const head = await commitAll(work, "worker advances");
+    if (!head) throw new Error("expected worker commit");
+    // Isolate completion's staging from preparation's internal stash check.
+    if (operation === "completeMerge") expect(await prepareMerge(work, head, nextBase)).toEqual([]);
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    utimesSync(join(nested, "file"), 1000, 1000);
+    if (operation === "prepareMerge without worktree .gitmodules") rmSync(join(work, ".gitmodules"));
+    if (operation === "rebaseOnto") {
+      expect(await rebaseOnto(work, nextBase)).toBe("clean");
+      expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe(edited);
+    } else if (operation.startsWith("prepareMerge")) {
+      expect(await prepareMerge(work, head, nextBase)).toEqual([]);
+      expect((await factory("rev-parse", "MERGE_HEAD")).stdout.trim()).toBe(nextBase);
+    } else {
+      writeFileSync(join(work, "flag.test.ts"), edited);
+      const merged = await completeMerge(work, head, nextBase);
+      expect((await factory("rev-list", "--parents", "-n", "1", "HEAD")).stdout.trim()).toBe(
+        `${merged} ${head} ${nextBase}`,
+      );
+      expect(await readFileAt(work, "HEAD", "flag.test.ts")).toBe(edited);
+      expect(await readFileAt(work, "HEAD", "base-only.txt")).toBe("from base\n");
+    }
+    expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
+      `160000 commit ${nestedHead}\tnested`,
+    );
     expect(existsSync(marker)).toBe(false);
   },
 );
@@ -285,8 +344,7 @@ test("committed .gitmodules ignore=all cannot hide added or changed gitlinks", a
   writeFileSync(join(nested, "hidden.test.ts"), `${edited}// next\n`);
   await git(nested, "add", "-A");
   await git(nested, "commit", "-qm", "advance ignored repository");
-  await git(work, "update-index", "--cacheinfo", `160000,${await headSha(nested)},nested`);
-  await git(work, "-c", "submodule.nested.ignore=none", "commit", "-qm", "advance ignored gitlink");
+  expect(await commitAll(work, "advance ignored gitlink")).not.toBeNull();
   await assertVisible(first);
 });
 
