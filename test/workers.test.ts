@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -13,7 +13,7 @@ import { startWorkerListener } from "../src/server/workers.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import type { Capabilities } from "../src/workers/protocol.ts";
-import { privateFile, workerRequest } from "../src/workers/tls.ts";
+import { certificate, privateFile, workerRequest } from "../src/workers/tls.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
@@ -259,27 +259,41 @@ test.each([401, 403])(
 test.skipIf(seatbeltSkip !== null)(
   `worker credentials and coordinator TLS key are denied inside real gates (${seatbeltSkip})`,
   async () => {
-    const server = await listen();
-    const dir = join(home, "private");
+    const tls = await certificate(join(home, "worker-tls"));
+    const dir = join(home, "worker");
     mkdirSync(dir);
-    const files = [server.tls.keyPath, join(dir, "token"), join(dir, "fingerprint")];
+    const files = [tls.keyPath, join(dir, "token"), join(dir, "coordinator-fingerprint")];
     const protectedFiles = files.slice(1).map((p) => privateFile(p, "synthetic-private-file"));
+    const readable = join(home, "readable");
+    writeFileSync(readable, "gate-read-control");
     try {
+      for (const p of files) {
+        expect(statSync(p).mode & 0o777).toBe(0o600);
+        expect(privateReadPaths()).toContain(p);
+      }
       const run = await runLocalGates(
         home,
         {
-          setup: [],
+          setup: [`cat '${readable}'`],
           source: "none",
           protectedPaths: [],
           checks: files.map((p, i) => ({ name: `deny-${i}`, run: `cat '${p}'` })),
         },
         new AbortController().signal,
       );
+      expect(run.setupOk).toBe(true);
+      expect(run.setup[0]?.output).toContain("gate-read-control");
       expect(run.checks).toHaveLength(3);
-      expect(run.checks.every((r) => !r.ok)).toBe(true);
+      for (const check of run.checks) {
+        expect(check.ok).toBe(false);
+        expect(check.confinementError).toBe(false);
+        expect(check.output).toMatch(/Operation not permitted|Permission denied/);
+        expect(check.output).not.toContain("synthetic-private-file");
+      }
       for (const p of files) expect(statSync(p).mode & 0o777).toBe(0o600);
     } finally {
       for (const p of protectedFiles) p.release();
+      tls.release();
     }
   },
 );
