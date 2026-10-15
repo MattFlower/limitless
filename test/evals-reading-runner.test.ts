@@ -97,7 +97,7 @@ test.each([false, true])("review setup restores HEAD (seeded=%s)", async (seeded
   try {
     const commands = [
       'mkdir -p node_modules && printf base-one > node_modules/ready && touch "$TMPDIR/ready"',
-      'test -f "$TMPDIR/ready" && printf base-two >> node_modules/ready && printf setup-overwrite > CURRENT.txt && git add CURRENT.txt && touch setup-output',
+      'test -f "$TMPDIR/ready" && printf base-two >> node_modules/ready && printf setup-overwrite > CURRENT.txt && git add CURRENT.txt && printf "CURRENT.txt working-tree-encoding=UTF-16LE\\n" > .gitattributes && touch setup-output',
     ];
     await setupPins(f, commands);
     if (seeded) {
@@ -111,9 +111,16 @@ test.each([false, true])("review setup restores HEAD (seeded=%s)", async (seeded
     }
     f.respond(async (s) => {
       expect(s.mode).toBe("readonly");
-      expect(readFileSync(join(s.cwd, "CURRENT.txt"), "utf8")).toBe(seeded ? "seeded" : "new");
-      expect((await sh(["git", "diff", "HEAD", "--exit-code"], { cwd: s.cwd })).stdout).toBe("");
-      expect((await sh(["git", "diff", "--cached", "--exit-code"], { cwd: s.cwd })).stdout).toBe("");
+      expect(readFileSync(join(s.cwd, "CURRENT.txt"))).toEqual(Buffer.from(seeded ? "seeded" : "new"));
+      expect(
+        (await sh(["git", "--attr-source=HEAD", "diff", "HEAD", "--exit-code"], { cwd: s.cwd })).stdout,
+      ).toBe("");
+      expect(
+        (await sh(["git", "--attr-source=HEAD", "diff", "--cached", "--exit-code"], { cwd: s.cwd })).stdout,
+      ).toBe("");
+      expect(readFileSync(join(s.cwd, ".gitattributes"), "utf8")).toBe(
+        "CURRENT.txt working-tree-encoding=UTF-16LE\n",
+      );
       expect(existsSync(join(s.cwd, "setup-output"))).toBe(true);
       expect(readFileSync(join(s.cwd, "node_modules/ready"), "utf8")).toBe("base-onebase-two");
       expect(readFileSync(join(s.cwd, ".limitless.toml"), "utf8")).toContain("head-setup-ran");

@@ -687,8 +687,8 @@ export class EvalRunner {
           throw new Error(
             redactCredentials(`review gate setup failed: ${failed?.command}\n${failed?.output}`),
           );
-        // Review committed bytes (including seeds), retaining setup's dependencies and other outputs.
-        await worktreeGit(["git", "reset", "--hard", "-q", head], { cwd, signal });
+        // Pin attributes too: setup may leave .gitattributes. Retain dependencies and other outputs.
+        await worktreeGit(["git", `--attr-source=${head}`, "reset", "--hard", "-q", head], { cwd, signal });
       }
       const preparationMs = Date.now() - preparationStarted;
       if ("defects" in item) trial.details.preparationMs = preparationMs;
