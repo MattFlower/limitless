@@ -534,24 +534,30 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         ? filtered
         : privacy(`[withheld: private text; ${patch.split("\n").length} lines]`);
     };
+    const selectedPatch = async (path: string) => {
+      const args = [
+        "--no-renames",
+        "--ignore-submodules=none",
+        baseSha,
+        headSha,
+        "--",
+        `:(top,literal)${path}`,
+        // Exclude changed descendants explicitly: a trailing slash also excludes a gitlink.
+        ...files
+          .filter((file) => file.path.startsWith(`${path}/`))
+          .map((file) => `:(top,exclude,literal)${file.path}`),
+      ];
+      if ((await git(["diff", "--name-only", "-z", ...args])) !== `${path}\0`)
+        throw new Error("Invalid Git patch selection");
+      return privatePatch(
+        await git(["diff", "--unified=3", "--diff-algorithm=myers", "--no-indent-heuristic", ...args]),
+      );
+    };
     const patch =
       selected && !selected.binary && safePath(selected.path)
         ? (await privateFile(selected.path))
           ? "[withheld: private text; 1 file]"
-          : privatePatch(
-              await git([
-                "diff",
-                "--no-renames",
-                "--ignore-submodules=none",
-                "--unified=3",
-                "--diff-algorithm=myers",
-                "--no-indent-heuristic",
-                baseSha,
-                headSha,
-                "--",
-                `:(literal)${selected.path}`,
-              ]),
-            )
+          : await selectedPatch(selected.path)
         : selected && !selected.binary
           ? prText(selected.path)
             ? "[withheld: protected path; 1 file]"

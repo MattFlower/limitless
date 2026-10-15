@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -1552,6 +1552,87 @@ test("change view keeps deleted multiline credentials withheld", async () => {
   }
 });
 
+test.each(["file", "symlink", "gitlink"])(
+  "change view excludes deleted children of a directory replaced by a %s on both backends",
+  async (replacement) => {
+    const path = "nest[?]*";
+    const child = `${path}/secret.txt`;
+    const alpha = "replacement-alpha-secret".padEnd(600, "a");
+    const beta = "replacement-beta-secret";
+    const publicText = "public replacement end\n";
+    const git = (args: string[]) => sh(["git", ...args], { cwd: f.repo });
+    mkdirSync(join(f.repo, path));
+    writeFileSync(
+      join(f.repo, child),
+      `${"public child line\n".repeat(810)}${alpha}\n${beta}\n${"public child line\n".repeat(1500)}`,
+    );
+    await git(["add", "."]);
+    await git(["commit", "-qm", "base directory"]);
+    rmSync(join(f.repo, path), { recursive: true });
+    const link = "1".repeat(40);
+    if (replacement === "symlink") symlinkSync("public-target", join(f.repo, path));
+    if (replacement === "gitlink") {
+      await git(["rm", "--cached", "--", child]);
+      mkdirSync(join(f.repo, path));
+      await git(["update-index", "--add", "--cacheinfo", `160000,${link},${path}`]);
+    }
+    const c = await changeFixture(f, {
+      "hello.txt": "unrelated public change\n",
+      ...(replacement === "file" ? { [path]: publicText } : {}),
+    });
+    const raw = (await git(["diff", "--no-renames", c.baseSha, c.headSha, "--", `:(literal)${path}`])).stdout;
+    // A pinned page at 16000 would otherwise begin inside the deleted child's credential.
+    expect(raw.indexOf(alpha)).toBeGreaterThan(0);
+    expect(raw.indexOf(alpha)).toBeLessThan(16000);
+    expect(raw.indexOf(beta)).toBeGreaterThan(16000);
+    registerCredential("REPLACEMENT_MULTILINE", `${alpha}\n${beta}`);
+    const connections = await changeConnections();
+    const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const first = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        const file = first.files.find((entry) => entry.path === path)?.index;
+        expect(file).toBeNumber();
+        const read = async (diffOffset: number) =>
+          resultValue<ChangePage>(
+            await conn.client.callTool({
+              name: "limitless_get_change",
+              arguments: { ...pin, file, diffOffset },
+            }),
+          );
+        let diff = "";
+        for (const start of [0, 16000]) {
+          let offset: number | null = start;
+          while (offset !== null) {
+            const page = await read(offset);
+            expect(page.available).toBe(true);
+            expect(page.diff.text).not.toContain(alpha);
+            expect(page.diff.text).not.toContain(beta);
+            expect(page.diff.text).not.toContain(child);
+            expect(page.diff.text).not.toContain("public child line");
+            if (start === 0) diff += page.diff.text;
+            offset = page.diff.nextOffset;
+          }
+        }
+        expect(diff.match(/^diff --git /gm)).toHaveLength(1);
+        expect(diff).not.toContain("withheld");
+        expect(diff).toContain(
+          replacement === "file"
+            ? "+public replacement end"
+            : replacement === "symlink"
+              ? "+public-target"
+              : `+Subproject commit ${link}`,
+        );
+        expect(first.diff.text).toContain("+unrelated public change");
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
 test.each(["added", "modified", "blob to gitlink", "gitlink to blob"])(
   "change view inspects only blobs for a submodule %s on both backends",
   async (scenario) => {
@@ -1605,42 +1686,61 @@ test.each(["added", "modified", "blob to gitlink", "gitlink to blob"])(
   },
 );
 
-test.each(["base", "head", "base tree", "head tree"])(
-  "change view fails closed on a required %s inspection failure",
-  async (side) => {
-    const c = await changeFixture(f, { "hello.txt": "public changed\n" });
-    registerCredential("INSPECTION_MULTILINE", "inspection-alpha\ninspection-beta");
-    const original = gitCommand.worktreeGit;
-    const inspect = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
-      if (
-        (side.endsWith("tree") &&
-          cmd.includes("ls-tree") &&
-          cmd.includes(side === "base tree" ? c.baseSha : c.headSha)) ||
-        (!side.endsWith("tree") &&
-          cmd.includes("show") &&
-          cmd.includes(`${side === "base" ? c.baseSha : c.headSha}:hello.txt`))
-      )
-        throw new Error("private inspection diagnostic");
-      return original(cmd, opts);
-    });
-    const connections = await changeConnections();
-    try {
-      for (const conn of [connections.direct, connections.proxy]) {
-        expect(
-          resultValue<unknown>(
-            await conn.client.callTool({
-              name: "limitless_get_change",
-              arguments: { run: c.run.id },
-            }),
-          ),
-        ).toEqual({ available: false, reason: "Local comparison commits or Git inspection unavailable." });
-      }
-    } finally {
-      inspect.mockRestore();
-      await connections.close();
+test.each([
+  "base",
+  "head",
+  "base tree",
+  "head tree",
+  "patch selection",
+  "unexpected patch selection",
+  "empty patch selection",
+  "unterminated patch selection",
+])("change view fails closed on a required %s inspection failure", async (side) => {
+  const c = await changeFixture(f, { "hello.txt": "public changed\n" });
+  registerCredential("INSPECTION_MULTILINE", "inspection-alpha\ninspection-beta");
+  const original = gitCommand.worktreeGit;
+  const inspect = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
+    const selection = cmd.includes("--name-only") && !cmd.includes("--diff-filter=D");
+    if (
+      (side === "patch selection" && selection) ||
+      (side.endsWith("tree") &&
+        cmd.includes("ls-tree") &&
+        cmd.includes(side === "base tree" ? c.baseSha : c.headSha)) ||
+      (["base", "head"].includes(side) &&
+        cmd.includes("show") &&
+        cmd.includes(`${side === "base" ? c.baseSha : c.headSha}:hello.txt`))
+    )
+      throw new Error("private inspection diagnostic");
+    if (side.endsWith("patch selection") && selection) {
+      const result = await original(cmd, opts);
+      return {
+        ...result,
+        stdout: side.startsWith("unexpected")
+          ? "hello.txt\0private inspection diagnostic\0"
+          : side.startsWith("empty")
+            ? ""
+            : "hello.txt",
+      };
     }
-  },
-);
+    return original(cmd, opts);
+  });
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      expect(
+        resultValue<unknown>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id },
+          }),
+        ),
+      ).toEqual({ available: false, reason: "Local comparison commits or Git inspection unavailable." });
+    }
+  } finally {
+    inspect.mockRestore();
+    await connections.close();
+  }
+});
 
 test("change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";
