@@ -1395,6 +1395,56 @@ describe("process handling", () => {
     20_000,
   );
 
+  test("a frozen member is killed when cleanup reaches its deadline", async () => {
+    const children = new Map<ChildProcess, Promise<void>>();
+    const kill = process.kill.bind(process);
+    const writer = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+    const closed = new Promise<NodeJS.Signals | null>((resolve) =>
+      writer.once("close", (_code, signal) => resolve(signal)),
+    );
+    const signals: (string | number | undefined)[] = [];
+    const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === writer.pid && (signal === "SIGSTOP" || signal === "SIGKILL")) {
+        signals.push(signal);
+        kill(pid, signal);
+        // Report the freeze as lost so the sweep never reaches its own SIGKILL.
+        if (signal === "SIGSTOP") throw Object.assign(new Error("lost"), { code: "ESRCH" });
+        return true;
+      }
+      return kill(pid, signal);
+    });
+    try {
+      await processInspection.run(
+        async (withEnvironment, marker) =>
+          `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n` +
+          `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+        () =>
+          processScope.run(
+            { signal: new AbortController().signal, killGraceMs: 0, children, scratchDirs: new Set() },
+            async () => {
+              const invocation = runProcess({
+                cmd: ["/bin/sh", "-c", "exit 0"],
+                cwd: dir,
+                env: process.env as Record<string, string>,
+              });
+              await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
+              expect(processScope.getStore()?.terminationError?.message).toContain(
+                "Marked processes still alive: 1:",
+              );
+            },
+          ),
+      );
+      expect(signals[0]).toBe("SIGSTOP");
+      expect(signals.at(-1)).toBe("SIGKILL");
+      expect(signals.filter((signal) => signal === "SIGKILL")).toHaveLength(1);
+      expect(await closed).toBe("SIGKILL");
+    } finally {
+      killSpy.mockRestore();
+      if (writer.exitCode === null && writer.signalCode === null) writer.kill("SIGKILL");
+      await closed;
+    }
+  }, 20_000);
+
   test.each(["stdout", "stderr"])("runner reports only %s as truncated", async (stream) => {
     const res = await runProcess({
       cmd: [

@@ -245,57 +245,67 @@ async function stopMarkedProcesses(
   let growing = false,
     observed = false;
   let empty = false;
-  for (;;) {
-    const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
-    for (const pid of pids) {
-      if (protectedPids.has(pid) || claimed.has(pid)) continue;
-      const birth = await processBirth(pid);
-      if (birth !== null) {
-        if (observed) growing = true;
-        claimed.set(pid, { birth, stopped: false });
+  try {
+    for (;;) {
+      const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
+      for (const pid of pids) {
+        if (protectedPids.has(pid) || claimed.has(pid)) continue;
+        const birth = await processBirth(pid);
+        if (birth !== null) {
+          if (observed) growing = true;
+          claimed.set(pid, { birth, stopped: false });
+        }
       }
-    }
-    observed ||= claimed.size > 0;
-    // An already-claimed descendant stays ours after reparenting or an environment
-    // change. A reused PID is no longer that process and must never be signalled.
-    const deadline = performance.now() - started >= graceMs + 10_000;
-    const names: string[] = [];
-    for (const [pid, identity] of claimed) {
-      let name = "unknown";
-      const birth = await processBirth(pid, (value) => {
-        name = value;
-      });
-      if (birth !== identity.birth) claimed.delete(pid);
-      else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
-    }
-    // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
-    const exited = child.exitCode !== null || child.signalCode !== null;
-    if (!claimed.size && empty && exited) return;
-    empty = !claimed.size && exited;
-    if (deadline && claimed.size)
-      throw new Error(
-        `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : "remained stable"}`,
-      );
-    if (deadline && !exited) throw new Error(`Child process exit could not be confirmed: ${group}`);
-    // Freeze every newly discovered member, then rescan before killing the frozen set.
-    const freezing = [...claimed.values()].some((identity) => !identity.stopped);
-    for (const [pid, identity] of claimed) {
-      if (freezing && identity.stopped) continue;
-      if ((await processBirth(pid)) !== identity.birth) {
-        claimed.delete(pid);
-        continue;
+      observed ||= claimed.size > 0;
+      // An already-claimed descendant stays ours after reparenting or an environment
+      // change. A reused PID is no longer that process and must never be signalled.
+      const deadline = performance.now() - started >= graceMs + 10_000;
+      const names: string[] = [];
+      for (const [pid, identity] of claimed) {
+        let name = "unknown";
+        const birth = await processBirth(pid, (value) => {
+          name = value;
+        });
+        if (birth !== identity.birth) claimed.delete(pid);
+        else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
       }
+      // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
+      const exited = child.exitCode !== null || child.signalCode !== null;
+      if (!claimed.size && empty && exited) return;
+      empty = !claimed.size && exited;
+      if (deadline && claimed.size)
+        throw new Error(
+          `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : "remained stable"}`,
+        );
+      if (deadline && !exited) throw new Error(`Child process exit could not be confirmed: ${group}`);
+      // Freeze every newly discovered member, then rescan before killing the frozen set.
+      const freezing = [...claimed.values()].some((identity) => !identity.stopped);
+      for (const [pid, identity] of claimed) {
+        if (freezing && identity.stopped) continue;
+        if ((await processBirth(pid)) !== identity.birth) {
+          claimed.delete(pid);
+          continue;
+        }
+        try {
+          process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
+          identity.stopped = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+      }
+      // Yield even for empty snapshots: spawn/exit notifications and a racing fork
+      // must have an opportunity to arrive before we confirm shutdown.
+      if (claimed.size || !exited) await Bun.sleep(10);
+      else await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  } catch (error) {
+    // Never leave a frozen member behind: kill every claimed process that is still the same process.
+    for (const [pid, identity] of claimed)
       try {
-        process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
-        identity.stopped = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-      }
-    }
-    // Yield even for empty snapshots: spawn/exit notifications and a racing fork
-    // must have an opportunity to arrive before we confirm shutdown.
-    if (claimed.size || !exited) await Bun.sleep(10);
-    else await new Promise<void>((resolve) => setImmediate(resolve));
+        if (!protectedPids.has(pid) && (await processBirth(pid)) === identity.birth)
+          process.kill(pid, "SIGKILL");
+      } catch {}
+    throw error;
   }
 }
 
