@@ -28,7 +28,7 @@ export interface GateResult {
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
   confinementError?: boolean;
-  /** The first attempt of a check that was re-run; this result is the re-run. */
+  /** The first attempt of a check that was re-run; targeted evidence is kept separately. */
   firstAttempt?: GateResult;
   testCoverage?: TestCoverage;
   failedFiles?: string[];
@@ -58,7 +58,7 @@ export interface GateComparison {
   verdict: GateVerdict;
   blocking: boolean;
   result: GateResult;
-  /** The failing run that triggered a retry; `result` is then the retry. */
+  /** The failing run that triggered a retry. */
   firstAttempt?: GateResult;
 }
 
@@ -244,20 +244,25 @@ async function retryFailures(
         files.length <= UNSLOTTED_RETRY_MAX_FILES &&
         times.every((time) => time !== undefined && Number.isFinite(time) && time >= 0) &&
         times.reduce<number>((total, time) => total + (time ?? 0), 0) <= UNSLOTTED_RETRY_MAX_SECONDS;
-      const quoted = files
-        .map((file) => `'${(file.startsWith("-") ? `./${file}` : file).replaceAll("'", "'\\''")}'`)
-        .join(" ");
+      const quoted = files.map((file) => `'./${file.replaceAll("'", "'\\''")}'`).join(" ");
       const run = cfg.retryFiles.replace("{files}", () => quoted);
+      const timeoutSec = skipGateSlot
+        ? Math.min(check.timeoutSec ?? 900, 2 * UNSLOTTED_RETRY_MAX_SECONDS)
+        : check.timeoutSec;
       const attempt = (
-        await retryChecks(cwd, { ...cfg, setup: [], checks: [{ ...check, run }] }, signal, onWait, runner, {
-          targeted: true,
-          skipGateSlot,
-        })
+        await retryChecks(
+          cwd,
+          { ...cfg, setup: [], checks: [{ ...check, run, timeoutSec }] },
+          signal,
+          onWait,
+          runner,
+          { targeted: true, skipGateSlot },
+        )
       ).checks[0];
       if (!attempt) continue;
       targets.set(original, attempt);
       if (confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
-        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: attempt });
+        results.set(original, { ...original, firstAttempt: original, targetedRetry: attempt });
         continue;
       }
     }

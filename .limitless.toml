@@ -2,7 +2,7 @@
 [gates]
 setup = ["bun install --frozen-lockfile"]
 # Confirm structured failing files before repeating the full suite.
-retry_files = "bun test {files}"
+retry_files = "bun test --isolate {files}"
 checks = [
   { name = "lint", run = "bun run lint" },
   { name = "typecheck", run = "bun run typecheck" },

@@ -15,6 +15,7 @@ import {
   retryBaselineFailures,
   retryRegressions,
   runGates,
+  UNSLOTTED_RETRY_MAX_SECONDS,
 } from "../src/gates/run.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -495,14 +496,18 @@ test.each([
     const fullRuns = targeted === "pass" || targeted === "timeout";
     expect(calls).toEqual(
       fullRuns
-        ? ["bun test 'test/a.test.ts' 'test/b.test.ts'", "full-test"]
-        : ["bun test 'test/a.test.ts' 'test/b.test.ts'"],
+        ? ["bun test --isolate './test/a.test.ts' './test/b.test.ts'", "full-test"]
+        : ["bun test --isolate './test/a.test.ts' './test/b.test.ts'"],
     );
     expect(comparison?.firstAttempt).toBe(f.original);
     expect(comparison?.result.firstAttempt).toBe(f.original);
     expect(comparison?.firstAttempt?.ok).toBe(false);
     expect(comparison?.result.targetedRetry?.command).toBe(calls[0]);
-    expect(comparison?.result.command).toBe(calls.at(-1));
+    expect(comparison?.result.command).toBe(fullRuns ? "full-test" : f.original.command);
+    if (targeted === "fail") {
+      expect(formatGateFeedback(comparison ? [comparison] : [])).toContain("unreported.test.ts: load error");
+      expect(comparison?.result.output).toBe(f.original.output);
+    }
     expect(comparison?.verdict).toBe(
       targeted === "confinement" ? "confinement_error" : fullRuns && fullOk ? "flaky" : "regressed",
     );
@@ -533,8 +538,8 @@ test.each([
     const fullRuns = targeted === "pass" || targeted === "timeout";
     expect(calls).toEqual(
       fullRuns
-        ? ["bun test 'test/a.test.ts' 'test/b.test.ts'", "full-test"]
-        : ["bun test 'test/a.test.ts' 'test/b.test.ts'"],
+        ? ["bun test --isolate './test/a.test.ts' './test/b.test.ts'", "full-test"]
+        : ["bun test --isolate './test/a.test.ts' './test/b.test.ts'"],
     );
     expect(result.checks[0]?.ok).toBe(fullRuns && fullOk);
     expect(result.checks[0]?.firstAttempt).toBe(f.original);
@@ -563,12 +568,42 @@ test("known files without retry_files still use the full retry", async () => {
   }
 });
 
+test.each([
+  { timeoutSec: 37, knownTimes: true, skipGateSlot: true, expected: 37 },
+  { timeoutSec: undefined, knownTimes: true, skipGateSlot: true, expected: 120 },
+  { timeoutSec: 1800, knownTimes: false, skipGateSlot: false, expected: 1800 },
+])("targeted timeout policy: %j", async ({ timeoutSec, knownTimes, skipGateSlot, expected }) => {
+  const f = retryFixture();
+  try {
+    if (!knownTimes) f.original.failedFileTimes = undefined;
+    const calls: number[] = [];
+    await retryBaselineFailures(
+      { setupOk: true, setup: [], checks: [f.original] },
+      f.cwd,
+      { ...f.cfg, checks: [{ name: "test", run: "full-test", timeoutSec }] },
+      new AbortController().signal,
+      undefined,
+      async (cfg, options) => {
+        expect(options).toEqual({ targeted: true, skipGateSlot });
+        const check = cfg.checks[0];
+        if (!check?.timeoutSec) throw new Error("missing retry timeout");
+        calls.push(check.timeoutSec);
+        return { setupOk: true, setup: [], checks: [{ ...f.original, command: check.run }] };
+      },
+    );
+    expect(calls).toEqual([expected]);
+  } finally {
+    f.close();
+  }
+});
+
 test("file substitution shell-quotes apostrophes and literal replacement syntax", async () => {
   const f = retryFixture();
   try {
     const file = "test/space ' $&.test.ts";
     writeFileSync(join(f.cwd, file), "");
     f.original.failedFiles = [file];
+    f.original.failedFileTimes = { [file]: 1 };
     const { runner, calls } = recordingRetry("fail", false);
     await retryBaselineFailures(
       { setupOk: true, setup: [], checks: [f.original] },
@@ -578,7 +613,7 @@ test("file substitution shell-quotes apostrophes and literal replacement syntax"
       undefined,
       runner,
     );
-    expect(calls).toEqual(["bun test 'test/space '\\'' $&.test.ts'"]);
+    expect(calls).toEqual(["bun test --isolate './test/space '\\'' $&.test.ts'"]);
   } finally {
     f.close();
   }
@@ -590,17 +625,17 @@ function retryFixture() {
   for (const file of ["a.test.ts", "b.test.ts"]) writeFileSync(join(cwd, "test", file), "");
   const cfg: GateConfig = {
     setup: [],
-    checks: [{ name: "test", run: "full-test", timeoutSec: 37 }],
+    checks: [{ name: "test", run: "full-test", timeoutSec: 1800 }],
     source: "none",
     protectedPaths: [],
-    retryFiles: "bun test {files}",
+    retryFiles: "bun test --isolate {files}",
   };
   const original: GateResult = {
     name: "test",
     command: "full-test",
     ok: false,
     exitCode: 1,
-    output: "original failure",
+    output: "unreported.test.ts: load error\noriginal failure",
     durationMs: 10,
     failedFiles: ["test/a.test.ts", "test/b.test.ts"],
     failedFileTimes: { "test/a.test.ts": 1, "test/b.test.ts": 2 },
@@ -614,9 +649,10 @@ function recordingRetry(targeted: string, fullOk: boolean) {
     expect(cfg.setup).toEqual([]);
     const check = cfg.checks[0];
     if (!check) throw new Error("Missing retry check");
-    expect(check.timeoutSec).toBe(37);
     calls.push(check.run);
     const isTarget = options?.targeted;
+    expect(options?.skipGateSlot).toBe(!!isTarget);
+    expect(check.timeoutSec).toBe(isTarget ? 2 * UNSLOTTED_RETRY_MAX_SECONDS : 1800);
     const ok = isTarget ? targeted === "pass" : fullOk;
     return {
       setupOk: true,

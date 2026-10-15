@@ -1190,7 +1190,7 @@ test.each([false, true])(
     );
     expect(requests.map((req) => req.gates.checks[0]?.run)).toEqual(
       enabled
-        ? ["full-check", "full-check", "base-target 'greeting.txt'", "full-check"]
+        ? ["full-check", "full-check", "base-target './greeting.txt'", "full-check"]
         : ["full-check", "full-check", "full-check"],
     );
     expect(purposes).toEqual(
@@ -1211,40 +1211,78 @@ test.each([false, true])(
   },
 );
 
-test("baseline targeted confirmation has its own execution label and keeps both failures", async () => {
+test.each([false, true])("baseline targeted evidence is redacted before caching (pass=%s)", async (pass) => {
+  const secret = "synthetic-baseline-retry-file-credential-548";
+  registerCredential("BASELINE_RETRY_FILE_TEST_TOKEN", secret);
+  const file = `${secret}.test.ts`;
+  writeFileSync(join(fixture.repoDir, file), "");
   writeFileSync(
     join(fixture.repoDir, ".limitless.toml"),
     '[gates]\nchecks = [{ name = "check", run = "full-check" }]\nretry_files = "base-target {files}"\n',
   );
-  await sh(["git", "commit", "-qam", "baseline targeted retry"], { cwd: fixture.repoDir });
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "baseline targeted retry"], { cwd: fixture.repoDir });
   const purposes: string[] = [];
   const scripted = fake(async (handle, req) => {
     const state = fixture.factory?.store.listRuns()[0];
     if (state)
       purposes.push(fixture.factory?.store.getRunState<RunState>(state.id)?.gateExecution?.purpose ?? "");
-    const run = result(req, Number(handle.id) > 2);
+    const run = result(req, Number(handle.id) > (pass ? 1 : 2));
     if (handle.id === "1")
       run.checks = run.checks.map((check) => ({
         ...check,
-        failedFiles: ["greeting.txt"],
-        failedFileTimes: { "greeting.txt": 1 },
+        failedFiles: [file],
+        failedFileTimes: { [file]: 1 },
       }));
     return run;
   });
   const f = start(handler, false, false, { gateExecutor: scripted.executor });
   const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-  expect(purposes).toEqual(["baseline", "baseline-retry-targeted", "initial"]);
+  expect(purposes).toEqual(
+    pass
+      ? ["baseline", "baseline-retry-targeted", "baseline-retry", "initial"]
+      : ["baseline", "baseline-retry-targeted", "initial"],
+  );
   expect([...scripted.requests.values()].map((req) => req.gates.checks[0]?.run)).toEqual([
     "full-check",
-    "base-target 'greeting.txt'",
+    `base-target './${file}'`,
+    ...(pass ? ["full-check"] : []),
     "full-check",
   ]);
-  const baseline = f.store.getRunState<RunState>(run.id)?.baseline?.checks[0];
-  expect(baseline).toMatchObject({ ok: false, firstAttempt: { ok: false }, targetedRetry: { ok: false } });
+  const state = f.store.getRunState<RunState>(run.id);
+  const baseline = state?.baseline?.checks[0];
+  expect(baseline).toMatchObject({
+    ok: pass,
+    firstAttempt: {
+      ok: false,
+      failedFiles: ["[redacted].test.ts"],
+      failedFileTimes: { "[redacted].test.ts": 1 },
+    },
+    targetedRetry: { ok: pass, command: "base-target './[redacted].test.ts'" },
+  });
+  const row = f.store.db.query("SELECT gate_run FROM passing_baselines").get() as {
+    gate_run: string;
+  } | null;
+  if (pass) {
+    if (!row) throw new Error("missing baseline cache");
+    expect(JSON.parse(row.gate_run)).toEqual(state?.baseline);
+    expect(row.gate_run).not.toContain(secret);
+  } else expect(row).toBeNull();
+  const artifact = f.store.getArtifact(run.id, "baseline-gates.json");
+  if (!artifact) throw new Error("missing baseline artifact");
+  expect(JSON.parse(artifact)).toEqual(state?.baseline);
+  for (const persisted of [JSON.stringify(state), artifact, JSON.stringify(f.store.listEvents(run.id))])
+    expect(persisted).not.toContain(secret);
   expect(
     f.store
       .listEvents(run.id)
-      .some((event) => event.message === "baseline check: retry FAIL again (targeted: 1 files)"),
+      .some(
+        (event) =>
+          event.message ===
+          (pass
+            ? "baseline check: flaky (targeted: 1 files, then full retry)"
+            : "baseline check: retry FAIL again (targeted: 1 files)"),
+      ),
   ).toBe(true);
 });

@@ -24,6 +24,7 @@ import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
+  confinementFailed,
   type GateComparison,
   type GateHooks,
   type GateRun,
@@ -537,7 +538,7 @@ async function prepare(ctx: RunContext): Promise<void> {
             ),
         );
         ctx.checkCancelled();
-        return retried;
+        return redactGateData(retried);
       });
       ctx.state.baselineCached = false;
       const buildSha = ctx.deps.buildSha;
@@ -567,7 +568,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           if (cached && cacheableBaseline(cached, gates)) {
             ctx.state.baselineCached = true;
             ctx.log(`Baseline reused from cache (${key.baseSha.slice(0, 12)})`);
-            return cached;
+            return redactGateData(cached);
           }
           const fresh = await runBaseline();
           // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
@@ -586,7 +587,6 @@ async function prepare(ctx: RunContext): Promise<void> {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
     }
-    ctx.state.baseline = redactGateData(ctx.state.baseline);
     const baseline = ctx.state.baseline;
     if (baseline) {
       store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
@@ -605,7 +605,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           runId: ctx.run.id,
           type: "gate",
           level: "warn",
-          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}${retry.targetedRetry ? ` (targeted: ${firstAttempt.failedFiles?.length ?? 0} files${retry.command === retry.targetedRetry.command ? "" : ", then full retry"})` : ""}`,
+          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}${retry.targetedRetry ? ` (targeted: ${firstAttempt.failedFiles?.length ?? 0} files${retry.targetedRetry.ok || (retry.targetedRetry.timedOut && !confinementFailed(retry.targetedRetry)) ? ", then full retry" : ""})` : ""}`,
           data: { flaky: retry.ok, firstAttempt, retry },
         });
       }
@@ -1286,7 +1286,7 @@ async function oneRound(
             runId: ctx.run.id,
             type: "gate",
             level: "warn",
-            message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}${c.result.targetedRetry ? ` (targeted: ${c.firstAttempt?.failedFiles?.length ?? 0} files${c.result.command === c.result.targetedRetry.command ? "" : ", then full retry"})` : ""}`,
+            message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}${c.result.targetedRetry ? ` (targeted: ${c.firstAttempt?.failedFiles?.length ?? 0} files${c.result.targetedRetry.ok || (c.result.targetedRetry.timedOut && !confinementFailed(c.result.targetedRetry)) ? ", then full retry" : ""})` : ""}`,
             data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
           });
         }

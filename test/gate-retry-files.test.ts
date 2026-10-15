@@ -172,12 +172,110 @@ test.each([undefined, 123, "bun test", "bun test {files} {files}", "bun test {fi
 
 test("the repository test check retains worker, timeout and structured report settings", () => {
   const cfg = detectGates(join(import.meta.dir, ".."));
-  expect(cfg.retryFiles).toBe("bun test {files}");
+  expect(cfg.retryFiles).toBe("bun test --isolate {files}");
   expect(cfg.checks.find((check) => check.name === "test")).toEqual({
     name: "test",
     run: 'bun test --parallel=$(bun scripts/test-workers.ts) --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"',
     timeoutSec: 1800,
   });
+});
+
+test("targeted Bun arguments select exact paths and safely quote filenames", async () => {
+  const f = fixture();
+  try {
+    for (const file of ["a.test.ts", "test/space ' quote.test.ts"])
+      writeFileSync(
+        join(f.cwd, file),
+        'import { test, expect } from "bun:test"; test("reported file", () => expect(1).toBe(1));',
+      );
+    for (const file of ["data.test.ts", "test/a.test.ts"])
+      writeFileSync(join(f.cwd, file), 'throw new Error("unrelated file must not run");');
+    const original = {
+      ...failed,
+      ...parseJUnit(
+        `<testsuites>${suite("a.test.ts")}${suite("test/space &apos; quote.test.ts")}</testsuites>`,
+        f.cwd,
+      ),
+    };
+    expect(original.failedFiles).toEqual(["a.test.ts", "test/space ' quote.test.ts"]);
+    const calls: string[] = [];
+    const [result] = await confinementScope.run(fakeConfinement, () =>
+      retryRegressions(
+        [{ name: "test", result: original, verdict: "regressed", blocking: true }],
+        f.cwd,
+        { ...config, retryFiles: `'${process.execPath}' test {files}` },
+        [],
+        signal,
+        undefined,
+        async (cfg, options) => {
+          calls.push(cfg.checks[0]?.run ?? "");
+          return options?.targeted
+            ? runGates(f.cwd, cfg, signal)
+            : { setupOk: true, setup: [], checks: [{ ...failed, ok: true }] };
+        },
+      ),
+    );
+    expect(result?.result.targetedRetry?.ok).toBe(true);
+    expect(result?.result.targetedRetry?.output).toContain("2 pass");
+    expect(result?.result.targetedRetry?.output).not.toContain("unrelated file must not run");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toBe("full-test");
+    expect(result?.verdict).toBe("flaky");
+  } finally {
+    f.close();
+  }
+});
+
+test("the repository retry template isolates globals across reported files before the full retry", async () => {
+  const f = fixture();
+  try {
+    for (const file of ["test/a.test.ts", "test/b.test.ts"])
+      writeFileSync(
+        join(f.cwd, file),
+        'import { test, expect } from "bun:test"; test("isolated global", () => { expect(globalThis.owner).toBeUndefined(); globalThis.owner = "set"; });',
+      );
+    const full = `'${process.execPath}' test --parallel=1 ./test/a.test.ts ./test/b.test.ts`;
+    const cfg = {
+      ...config,
+      checks: [{ name: "test", run: full }],
+      retryFiles: detectGates(join(import.meta.dir, "..")).retryFiles?.replace(
+        /^bun /,
+        `'${process.execPath}' `,
+      ),
+    };
+    const calls: boolean[] = [];
+    const [result] = await confinementScope.run(fakeConfinement, () =>
+      retryRegressions(
+        [
+          {
+            name: "test",
+            result: {
+              ...failed,
+              command: full,
+              ...parseJUnit(`<testsuites>${suite()}${suite("test/b.test.ts")}</testsuites>`, f.cwd),
+            },
+            verdict: "regressed",
+            blocking: true,
+          },
+        ],
+        f.cwd,
+        cfg,
+        [],
+        signal,
+        undefined,
+        (retry, options) => {
+          calls.push(options?.targeted ?? false);
+          return runGates(f.cwd, retry, signal);
+        },
+      ),
+    );
+    expect(calls).toEqual([true, false]);
+    expect(result?.result.targetedRetry?.ok).toBe(true);
+    expect(result?.result.ok).toBe(true);
+    expect(result?.verdict).toBe("flaky");
+  } finally {
+    f.close();
+  }
 });
 
 test("real Bun JUnit capture keeps failing files, console excerpts and coverage", async () => {
