@@ -624,8 +624,8 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 /** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
-/** Panel finder prompts: coverage-first `standard`, `adversarial`, or one `careful` senior pass. */
-export type FinderPrompt = "standard" | "adversarial" | "careful";
+/** Finder prompts: `standard`, `adversarial`, `careful`, or eval-only `probe` reproduction. */
+export type FinderPrompt = "standard" | "adversarial" | "careful" | "probe";
 /**
  * One review finder; production may omit `target` (routed), evals may not. A single-mode review
  * always uses the reviewer prompt, named `standard`.
@@ -650,6 +650,8 @@ export interface RepoReviewLens extends ReviewLens {
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {
+  /** Eval only: run base-commit gate setup before reviewing. */
+  setup?: true;
   /** Eval only: the source panel system for stored finder replay. */
   replayFrom?: string;
   name: string;
@@ -768,6 +770,8 @@ export interface EvalTrial {
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
     preparationFailed?: boolean;
+    /** Review preparation, excluded from reviewer durationMs; absent on legacy trials. */
+    preparationMs?: number;
     interrupted?: boolean;
     /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */
     resumedFrom?: string;

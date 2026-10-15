@@ -18,6 +18,8 @@ export function validateReplay(
     const prior = source.systems?.find((s) => s.name === system.replayFrom);
     if (system.mode !== "panel" || prior?.mode !== "panel")
       throw new Error(`replay source system ${system.replayFrom} must exist and both systems must be panels`);
+    if (Boolean(system.setup) !== Boolean(prior.setup))
+      throw new Error(`replay setup mismatch for ${system.name}`);
     if (system.finders.length !== prior.finders.length)
       throw new Error(`replay finder count mismatch for ${system.name}`);
     for (const [i, finder] of system.finders.entries()) {

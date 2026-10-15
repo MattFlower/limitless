@@ -58,6 +58,7 @@ export function selectEvidence(
     const systems = entry.run.systems?.filter(
       (s) =>
         s.mode === "single" &&
+        !s.setup &&
         s.finders[0]?.prompt === "standard" &&
         s.implementerReport === implementerReport,
     );
@@ -133,6 +134,7 @@ export function generatePolicy(input: PolicyInput) {
         const systems = entry.run.systems?.filter(
           (s) =>
             s.mode === "single" &&
+            !s.setup &&
             s.finders[0]?.prompt === "standard" &&
             s.implementerReport === implementerReport &&
             s.finders[0]?.target === entry.modelId,

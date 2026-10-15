@@ -15,6 +15,7 @@ import {
   type EvalReviewSystem,
   expandRoster,
   parseEvalReviewSystems,
+  parseReviewRosters,
   productionReviewSystem,
   ReviewSystemSchema,
   readReviewLenses,
@@ -67,7 +68,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial" or "careful"',
+    'finder prompt must be "standard", "adversarial", "careful" or "probe"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -102,7 +103,7 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
 });
 
 test("single prompt variants are eval-only and retain the single-mode restrictions", () => {
-  for (const prompt of ["adversarial", "careful"] as const) {
+  for (const prompt of ["adversarial", "careful", "probe"] as const) {
     const finder = { target: "candidate-a", prompt };
     const variant = system({ finders: [finder] });
     expect(parseEvalReviewSystems(file(variant), "s.json")).toEqual([variant] as ReviewSystem[]);
@@ -123,6 +124,33 @@ test("single prompt variants are eval-only and retain the single-mode restrictio
     ])
       expect(() => parseEvalReviewSystems(file({ ...variant, ...forbidden }), "s.json")).toThrow();
   }
+});
+
+test("setup is eval-only for explicit systems and roster references", () => {
+  const explicit = system({ setup: true });
+  const reference = {
+    name: "prepared-roster",
+    roster: "quick",
+    targets: ["candidate-a"],
+    verifier: { target: "verifier-c" },
+    implementerReport: "include",
+    setup: true,
+  };
+  const parsed = parseEvalReviewSystems(file(explicit, reference), "s.json");
+  expect(parsed).toEqual([explicit, reference] as EvalReviewSystem[]);
+  for (const entry of parsed) {
+    expect(expandRoster(entry, DEFAULT_ROSTERS)).toMatchObject({ setup: true });
+    expect(ReviewSystemSchema.safeParse(expandRoster(entry, DEFAULT_ROSTERS)).success).toBe(false);
+  }
+  expect(ReviewSystemSchema.safeParse(explicit).success).toBe(false);
+  expect(
+    ReviewSystemSchema.safeParse(panel({ finders: [{ target: "candidate-a", prompt: "probe" }] })).success,
+  ).toBe(false);
+  expect(() => parseReviewRosters({ quick: [{ prompt: "probe" }] })).toThrow("eval-only");
+  expect(() => parseEvalReviewSystems(file(system({ setup: false })), "s.json")).toThrow();
+  expect(() =>
+    parseEvalReviewSystems(file(panel({ finders: [{ target: "candidate-a", prompt: "probe" }] })), "s.json"),
+  ).toThrow();
 });
 
 test("causal attribution is an opt-in panel option preserved by parsing and roster expansion", async () => {
