@@ -1608,6 +1608,62 @@ test("change view inspects the blob it diffs when a malformed tree repeats a pat
   }
 });
 
+test("change view refuses a blob-mode entry that names a tag object", async () => {
+  const alpha = "tagged-alpha-secret".padEnd(200, "a");
+  const beta = "tagged-beta-secret";
+  const git = async (args: string[], stdin?: string) =>
+    (await sh(["git", ...args], { cwd: f.repo, ...(stdin === undefined ? {} : { stdin }) })).stdout.trim();
+  const c = await changeFixture(f, { "visible.txt": "public addition\n" });
+  // An annotated tag whose target is a public blob already in the head tree: `cat-file blob` would
+  // read the target, while the patch shows the tag object, message included.
+  const target = await git(["rev-parse", `${c.headSha}:visible.txt`]);
+  const tag = await git(
+    ["mktag"],
+    `object ${target}\ntype blob\ntag t\ntagger T <t@example.com> 0 +0000\n\n${alpha}\n${beta}\n`,
+  );
+  const entries = (await git(["ls-tree", "-z", c.headSha]))
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [meta = "", name = ""] = line.split("\t");
+      const [mode = "", , oid = ""] = meta.split(" ");
+      return { mode: mode === "040000" ? "40000" : mode, name, oid };
+    });
+  entries.push({ mode: "100644", name: "a-tagged.txt", oid: tag });
+  const key = (e: { mode: string; name: string }) => (e.mode === "40000" ? `${e.name}/` : e.name);
+  entries.sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  const rawPath = join(f.repo, ".git", "tagged-tree");
+  writeFileSync(
+    rawPath,
+    Buffer.concat(
+      entries.map((e) => Buffer.concat([Buffer.from(`${e.mode} ${e.name}\0`), Buffer.from(e.oid, "hex")])),
+    ),
+  );
+  const tree = await git(["hash-object", "-w", "-t", "tree", "--literally", rawPath]);
+  const head = await git(["commit-tree", tree, "-p", c.headSha, "-m", "tagged head"]);
+  await git(["push", "-q", cachePath(f.factory.cfg.paths, c.repo), `${head}:refs/heads/tagged`]);
+  c.observe(head);
+  registerCredential("TAGGED_ENTRY_MULTILINE", `${alpha}\n${beta}`);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<unknown>(
+        await conn.client.callTool({
+          name: "limitless_get_change",
+          arguments: { run: c.run.id, headSha: head, baseSha: c.baseSha, file: 0 },
+        }),
+      );
+      expect(JSON.stringify(page)).not.toMatch(/tagged-alpha|tagged-beta/);
+      expect(page).toEqual({
+        available: false,
+        reason: "Local comparison commits or Git inspection unavailable.",
+      });
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
 test.each(["file", "symlink", "gitlink"])(
   "change view excludes deleted children of a directory replaced by a %s on both backends",
   async (replacement) => {

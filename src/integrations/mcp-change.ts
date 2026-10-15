@@ -536,6 +536,9 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
       ]) {
         // Absent sides are all zeros; gitlinks reference commits outside this repository.
         if (!oid || /^0+$/u.test(oid) || !["100644", "100755", "120000"].includes(mode ?? "")) continue;
+        // `cat-file blob` peels a tag to its target, but the patch shows the object itself.
+        if ((await git(["cat-file", "-t", oid])).trim() !== "blob")
+          throw new Error("Invalid Git file metadata");
         const layers = normalizedLayers(await git(["cat-file", "blob", oid]));
         if (
           !layers ||
