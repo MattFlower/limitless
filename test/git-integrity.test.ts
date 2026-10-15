@@ -262,12 +262,20 @@ test.each(["commitAll", "discardChanges", "diff"])(
   },
 );
 
-test.each(["empty", "include-only", "remapped", "missing", "untracked", "normal"])(
+test.each(["empty", "include-only", "remapped", "missing", "untracked", "normal", "ignored-fixture"])(
   "merge and rebase guard populated nested repositories with %s .gitmodules",
   async (form) => {
     const nested = join(work, "nested");
     const marker = join(dir, "nested-filter-ran");
-    if (form !== "normal") {
+    const ordinary = form === "normal" || form === "ignored-fixture";
+    if (form === "ignored-fixture") {
+      writeFileSync(join(work, ".gitignore"), "node_modules/\n");
+      const fixture = join(work, "node_modules/pkg/test/fixture");
+      mkdirSync(fixture, { recursive: true });
+      writeFileSync(join(fixture, ".git"), "ordinary fixture text\n");
+      await commitAll(work, "ignore dependencies");
+    }
+    if (!ordinary) {
       mkdirSync(nested);
       await git(nested, "init", "-qb", "main");
       writeFileSync(join(nested, "file"), "base\n");
@@ -275,7 +283,7 @@ test.each(["empty", "include-only", "remapped", "missing", "untracked", "normal"
       await git(nested, "commit", "-qm", "nested base");
     }
     const modules = '[submodule "nested=repo"]\n\tpath = nested\n\tignore = none\n';
-    if (form !== "untracked" && form !== "normal") {
+    if (form !== "untracked" && !ordinary) {
       writeFileSync(join(work, ".gitmodules"), modules);
       await commitAll(work, "gitlink");
     }
@@ -291,7 +299,7 @@ test.each(["empty", "include-only", "remapped", "missing", "untracked", "normal"
     await commitAll(work, "worker advances");
     if (form === "untracked") renameSync(join(dir, "parked"), nested);
     const head = await headSha(work);
-    if (form !== "normal") {
+    if (!ordinary) {
       await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
       writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
       utimesSync(join(nested, "file"), 1000, 1000);
@@ -304,19 +312,116 @@ test.each(["empty", "include-only", "remapped", "missing", "untracked", "normal"
     if (form === "remapped")
       writeFileSync(join(work, ".gitmodules"), modules.replace("path = nested", "path = elsewhere"));
     if (form === "missing") rmSync(join(work, ".gitmodules"));
-    if (form === "normal") {
+    if (ordinary || form === "untracked") {
       expect(await prepareMerge(work, head, nextBase)).toEqual([]);
       await factory("merge", "--abort");
       expect(await rebaseOnto(work, nextBase)).toBe("clean");
       expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe(edited);
       expect(await readFileAt(work, "HEAD", "base-only.txt")).toBe("from base\n");
     } else {
-      await expect(prepareMerge(work, head, nextBase)).rejects.toThrow("populated nested repository");
+      await expect(prepareMerge(work, head, nextBase)).rejects.toThrow(
+        "Cannot run merge or rebase with a populated nested repository",
+      );
       expect(existsSync(marker)).toBe(false);
-      await expect(rebaseOnto(work, nextBase)).rejects.toThrow("populated nested repository");
+      await expect(rebaseOnto(work, nextBase)).rejects.toThrow(
+        "Cannot run merge or rebase with a populated nested repository",
+      );
       expect(await headSha(work)).toBe(head);
       expect(await factory("rev-parse", "-q", "--verify", "MERGE_HEAD").catch(() => null)).toBeNull();
     }
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
+test.each(["index", "HEAD", "target", "nonempty directory"])(
+  "merge and rebase refuse a populated gitlink from %s before running its filter",
+  async (source) => {
+    const nested = join(work, "nested");
+    const marker = join(dir, "nested-filter-ran");
+    writeFileSync(join(work, "sample.test.ts"), edited);
+    await commitAll(work, "worker advances");
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(join(nested, "file"), "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    const nestedHead = await headSha(nested);
+    const modules = '[submodule "nested"]\n\tpath = nested\n\tignore = none\n';
+    if (source === "HEAD") {
+      writeFileSync(join(work, ".gitmodules"), modules);
+      await commitAll(work, "gitlink");
+      await factory("update-index", "--force-remove", "nested");
+    } else if (source !== "target") {
+      await factory("update-index", "--add", "--cacheinfo", `160000,${nestedHead},nested`);
+      writeFileSync(join(work, ".gitmodules"), modules);
+    }
+    writeFileSync(join(seed, "base-only.txt"), "from base\n");
+    if (source === "target") writeFileSync(join(seed, ".gitmodules"), modules);
+    await git(seed, "add", ".");
+    if (source === "target")
+      await git(seed, "update-index", "--add", "--cacheinfo", `160000,${nestedHead},nested`);
+    await git(seed, "commit", "-qm", "base advances");
+    const target = await headSha(seed);
+    const head = await headSha(work);
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    utimesSync(join(nested, "file"), 1000, 1000);
+    if (source === "nonempty directory") rmSync(join(nested, ".git"), { recursive: true });
+    for (const operation of [() => prepareMerge(work, head, target), () => rebaseOnto(work, target)]) {
+      await expect(operation()).rejects.toThrow(
+        "Cannot run merge or rebase with a populated nested repository",
+      );
+      expect(await headSha(work)).toBe(head);
+      expect(existsSync(marker)).toBe(false);
+    }
+  },
+);
+
+test("merge and rebase report inspection errors without checkout paths", async () => {
+  await factory("update-index", "--add", "--cacheinfo", `160000,${base},blocked/nested`);
+  // A symlink loop gives a deterministic filesystem error even when run as root.
+  symlinkSync("blocked", join(work, "blocked"));
+  for (const operation of [() => factory("merge", base), () => rebaseOnto(work, base)]) {
+    const error = await operation().catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Cannot inspect the checkout for nested repositories");
+    expect((error as Error).message).not.toContain(work);
+    expect((error as Error).message).not.toContain("blocked");
+    expect(await headSha(work)).toBe(base);
+  }
+});
+
+test.each([false, true])(
+  "stageAll matches add -A for a file replaced by a repository (ignored: %s) without running filters",
+  async (ignored) => {
+    if (ignored) {
+      writeFileSync(join(work, ".gitignore"), "sample.test.ts\n");
+      await commitAll(work, "ignore replacement path");
+    }
+    const nested = join(work, "sample.test.ts");
+    const marker = join(dir, "nested-filter-ran");
+    rmSync(nested);
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(join(nested, "file"), "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    // Compare native staging before planting the filter, then restore the original index.
+    await git(work, "add", "-A");
+    const native = (await git(work, "ls-files", "--stage", "sample.test.ts")).stdout;
+    const nestedHead = await headSha(nested);
+    expect(native).toBe(`160000 ${nestedHead} 0\tsample.test.ts\n`);
+    await factory("read-tree", "HEAD");
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    utimesSync(join(nested, "file"), 1000, 1000);
+    await stageAll({ cwd: work });
+    expect((await factory("ls-files", "--stage", "sample.test.ts")).stdout).toBe(native);
+    expect(existsSync(marker)).toBe(false);
+    expect(await commitAll(work, "replace file with gitlink")).not.toBeNull();
+    expect((await factory("ls-tree", "HEAD", "sample.test.ts")).stdout).toBe(
+      `160000 commit ${nestedHead}\tsample.test.ts\n`,
+    );
     expect(existsSync(marker)).toBe(false);
   },
 );

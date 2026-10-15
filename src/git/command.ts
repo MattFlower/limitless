@@ -1,6 +1,14 @@
 import { strict as assert } from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
@@ -131,7 +139,11 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
     ["merge", "rebase"].includes(cmd[command] ?? "") &&
     !cmd.slice(command + 1).some((arg) => arg === "--abort" || arg === "--quit")
   )
-    await refusePopulatedRepositories(prefix, { ...opts, env });
+    await refusePopulatedRepositories(
+      prefix,
+      { ...opts, env },
+      cmd.slice(command + 1).filter((arg) => !arg.startsWith("-")),
+    );
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.
@@ -156,26 +168,34 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
 }
 
 /** Internal merge/rebase dirty checks cannot safely inspect agent-created repositories. */
-async function refusePopulatedRepositories(git: string[], opts: Parameters<typeof sh>[1]): Promise<void> {
+async function refusePopulatedRepositories(
+  git: string[],
+  opts: Parameters<typeof sh>[1],
+  targets: string[],
+): Promise<void> {
   const index = await sh([...git, "ls-files", "--stage", "-z"], { ...opts, allowFail: false });
+  let entries = index.stdout;
+  for (const revision of new Set(["HEAD", ...targets]))
+    entries += (await sh([...git, "ls-tree", "-r", "-z", revision], { ...opts, allowFail: false })).stdout;
   const gitlinks = new Set(
-    index.stdout
+    entries
       .split("\0")
       .filter((entry) => entry.startsWith("160000 "))
       .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
   );
-  const inspect = (path: string) => {
-    const entries = readdirSync(join(opts.cwd, path), { withFileTypes: true });
-    if (
-      path &&
-      ((gitlinks.has(path) && entries.length) ||
-        lstatSync(join(opts.cwd, path, ".git"), { throwIfNoEntry: false }))
-    )
-      throw new Error("Cannot run merge or rebase with a populated nested repository");
-    for (const entry of entries)
-      if (entry.name !== ".git" && entry.isDirectory()) inspect(path ? `${path}/${entry.name}` : entry.name);
-  };
-  inspect("");
+  for (const path of gitlinks) {
+    let populated: boolean;
+    try {
+      const full = join(opts.cwd, path);
+      populated =
+        statSync(full, { throwIfNoEntry: false })?.isDirectory() === true &&
+        (lstatSync(join(full, ".git"), { throwIfNoEntry: false }) !== undefined ||
+          readdirSync(full).length > 0);
+    } catch {
+      throw new Error("Cannot inspect the checkout for nested repositories");
+    }
+    if (populated) throw new Error("Cannot run merge or rebase with a populated nested repository");
+  }
 }
 
 /** Stage paths directly: `add` otherwise runs status inside unchanged populated repositories. */
@@ -206,6 +226,17 @@ export async function stageAll(opts: Parameters<typeof sh>[1], forcePaths: strin
       ...opts,
       stdin: deleted.stdout,
     });
+  // A file replaced by a repository may be absent from diff-files when submodules are ignored.
+  // update-index only recognizes the replacement as a gitlink after the old entry is removed.
+  for (const path of new Set([...paths, ...removed]))
+    if (
+      existsSync(join(opts.cwd, path)) &&
+      lstatSync(join(opts.cwd, path), { throwIfNoEntry: false })?.isDirectory() &&
+      lstatSync(join(opts.cwd, path, ".git"), { throwIfNoEntry: false })
+    ) {
+      await worktreeGit(["git", "update-index", "--force-remove", "--", path], opts);
+      paths.push(path);
+    }
   const input = [...new Set([...paths, ...forcePaths.filter((path) => !removed.has(path))])].join("\0");
   if (input)
     await worktreeGit(["git", "update-index", "--add", "--remove", "--replace", "-z", "--stdin"], {
