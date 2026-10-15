@@ -405,6 +405,181 @@ test.each([
   }
 });
 
+test.each(["\n", "\r\n", "\\n", "\\r\\n", "\\u000a"])(
+  "overlapping and mid-word private quotations are withheld (%j)",
+  async (separator) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    f.factory.store.setRunState(c.run.id, {
+      holdout: {
+        scenarios: [
+          { id: "H-1", description: "Private behavior", steps: "Run it", expected: "Done", edge_case: false },
+        ],
+      },
+      lastVerify: {
+        criteria: [
+          { id: "H-1", evidence: "amber lantern", publicSummary: "lantern glows ultraviolet" },
+          { id: "unknown", evidence: "the amber lantern glows" },
+        ],
+      },
+    });
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      `amber${separator}lantern${separator}glows ultraviolet\nPublic neighbor\nthe amber lan${separator}tern glows\nPublic ending`,
+    );
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        const text = page.reports[0]?.text ?? "";
+        expect(text).not.toMatch(/amber|lantern|glows|ultraviolet|tern/);
+        expect(text).toContain("Public neighbor");
+        expect(text).toContain("Public ending");
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each(["red owl", "All checks passed."])(
+  "rendered private rows with %j evidence are withheld by structure",
+  async (evidence) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    const state: Parameters<typeof renderReport>[0]["state"] = {
+      implementerReport: "Quoted: red owl\nUnrelated summary neighbor",
+      spec: {
+        summary: "Public task",
+        assumptions: [],
+        requirements: [],
+        out_of_scope: [],
+        blocking_questions: [],
+        acceptance_criteria: [{ id: "AC-1", criterion: "Public criterion", how_to_verify: "Run checks" }],
+      },
+      holdout: {
+        scenarios: [
+          { id: "H-1", description: "Private behavior", steps: "Run it", expected: "Done", edge_case: false },
+        ],
+      },
+      lastVerify: {
+        modelId: "verifier",
+        overall: "pass",
+        notes: "",
+        criteria: [
+          { id: "AC-1", status: "met", evidence: "All checks passed.", publicSummary: "" },
+          { id: "H-1", status: "met", evidence, publicSummary: "red owl" },
+        ],
+      },
+    };
+    f.factory.store.setRunState(c.run.id, state);
+    const report = renderReport({
+      success: true,
+      runId: c.run.id,
+      prompt: "Public request",
+      state,
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    });
+    f.factory.store.putArtifact(c.run.id, "report.md", "report", report);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        const text = page.reports[0]?.text ?? "";
+        expect(text).toContain("Public criterion | All checks passed.");
+        expect(text).not.toContain("red owl");
+        expect(text).not.toContain("Private behavior");
+        expect(text).toContain("## Checks");
+        expect(text).toContain("Unrelated summary neighbor");
+      }
+      for (const damaged of [
+        report.replace("limitless-report:v1:", "limitless-report:broken:"),
+        report.slice(0, -5),
+        report.replace("Public criterion", "Changed criterion"),
+        report.replace(/\n<!-- limitless-report:v1:.* -->\n$/u, ""),
+      ]) {
+        f.factory.store.putArtifact(c.run.id, "report.md", "report", damaged);
+        for (const conn of [connections.direct, connections.proxy]) {
+          const page = resultValue<ChangePage>(
+            await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+          );
+          const text = page.reports[0]?.text ?? "";
+          expect(text).not.toContain("red owl");
+          expect(text).not.toContain("Private behavior");
+          expect(text).toContain("withheld");
+        }
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test("marked reports still filter model prose and withhold private spans before pagination", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const state: Parameters<typeof renderReport>[0]["state"] = {
+    implementerReport: `${"Readable summary line\n".repeat(220)}Quoted: red owl\nReadable neighbor\nthe amber lan\ntern glows\nReadable ending`,
+    holdout: {
+      scenarios: [
+        { id: "H-1", description: "Private behavior", steps: "Run it", expected: "Done", edge_case: false },
+      ],
+    },
+    lastVerify: {
+      modelId: "verifier",
+      overall: "pass",
+      notes: "",
+      criteria: [{ id: "H-1", status: "met", evidence: "red owl", publicSummary: "the amber lantern glows" }],
+    },
+  };
+  f.factory.store.setRunState(c.run.id, state);
+  f.factory.store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    renderReport({
+      success: true,
+      runId: c.run.id,
+      prompt: "Public request",
+      state,
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    }),
+  );
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      let text = "";
+      let offset = 0;
+      do {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, reportOffset: offset },
+          }),
+        );
+        const report = page.reports[0];
+        if (!report) throw new Error("Missing report");
+        text += report.text;
+        offset = report.nextOffset ?? 0;
+      } while (offset);
+      expect(text).not.toMatch(/red owl|amber|tern glows|Private behavior|limitless-report:/);
+      expect(text).toContain("Readable neighbor");
+      expect(text).toContain("Readable ending");
+      expect(text).toContain("## Checks");
+      expect(text).toContain("[withheld: holdout section;");
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
 test("malformed criterion IDs and generic evidence leave unrelated report lines public", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
   f.factory.store.setRunState(c.run.id, {

@@ -3,6 +3,7 @@ import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { RunContext, RunState } from "./context.ts";
+import { markReport, type ReportPart, reportJoin, reportText } from "./report-privacy.ts";
 import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
 
@@ -14,12 +15,18 @@ function escapeCell(s: string): string {
   return s.replace(/\|/g, "\\|").replace(/\n+/g, " ").slice(0, 300);
 }
 
-function table(header: string[], rows: string[][]): string {
-  return [
-    `| ${header.join(" | ")} |`,
-    `|${header.map(() => "---").join("|")}|`,
-    ...rows.map((r) => `| ${r.join(" | ")} |`),
-  ].join("\n");
+function table(header: string[], rows: string[][], privateRows: boolean[] = []): ReportPart {
+  return reportJoin(
+    [
+      `| ${header.join(" | ")} |`,
+      `|${header.map(() => "---").join("|")}|`,
+      ...rows.map((r, i) => {
+        const text = `| ${r.join(" | ")} |`;
+        return privateRows[i] ? reportText("private", text) : text;
+      }),
+    ],
+    "\n",
+  );
 }
 
 export interface ReportInput {
@@ -58,7 +65,7 @@ export interface ReportInput {
 export function renderReport(input: ReportInput): string {
   input = redactGateData(input);
   const { state } = input;
-  const blocks: string[] = [
+  const blocks: ReportPart[] = [
     input.success
       ? state.flow === "verify-change"
         ? "Verified by **Limitless** — checks below have no blocking regressions."
@@ -68,8 +75,8 @@ export function renderReport(input: ReportInput): string {
     ...(input.success && state.flow === "verify-change" && state.reviewedSha
       ? [`Verified commit: \`${state.reviewedSha}\``]
       : []),
-    ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
-    ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
+    ...(state.rebaseNote ? [reportText("prose", `> [!NOTE]\n> ${state.rebaseNote}`)] : []),
+    ...(state.terminalReason ? [reportText("prose", `🚧 ${state.terminalReason}`)] : []),
     ...(input.verifiedFailure
       ? [
           "## Failed after verification",
@@ -78,10 +85,13 @@ export function renderReport(input: ReportInput): string {
       : []),
     ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),
     "## Request",
-    input.prompt
-      .split("\n")
-      .map((l) => `> ${l}`)
-      .join("\n"),
+    reportText(
+      "prose",
+      input.prompt
+        .split("\n")
+        .map((l) => `> ${l}`)
+        .join("\n"),
+    ),
   ];
 
   if (Object.keys(input.models ?? {}).length)
@@ -91,7 +101,10 @@ export function renderReport(input: ReportInput): string {
     );
 
   if (state.implementerReport)
-    blocks.push("## Implementer's summary", state.implementerReport.trim().slice(0, 5000));
+    blocks.push(
+      "## Implementer's summary",
+      reportText("prose", state.implementerReport.trim().slice(0, 5000)),
+    );
 
   if (state.spec) {
     const verify = state.lastVerify;
@@ -114,11 +127,17 @@ export function renderReport(input: ReportInput): string {
                   : "❔";
           return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
         }),
+        state.spec.acceptance_criteria.map(
+          (ac) => rowKind(ac.id, state.spec ?? null, state.holdout) !== "public",
+        ),
       ),
     );
     if (verify) blocks.push(`Verified by \`${verify.modelId}\` in a separate session from the implementer.`);
     if (state.spec.assumptions.length) {
-      blocks.push("**Assumptions**", state.spec.assumptions.map((a) => `- ${a}`).join("\n"));
+      blocks.push(
+        "**Assumptions**",
+        reportText("prose", state.spec.assumptions.map((a) => `- ${a}`).join("\n")),
+      );
     }
   }
 
@@ -145,6 +164,7 @@ export function renderReport(input: ReportInput): string {
               : (result?.status ?? "unclear"),
           escapeCell(result?.evidence ?? "not verified"),
         ]),
+        results.map(({ scenario }) => rowKind(scenario.id, state.spec ?? null, state.holdout) !== "public"),
       ),
     );
     if (state.lastVerify)
@@ -152,12 +172,15 @@ export function renderReport(input: ReportInput): string {
     if (followUps.length)
       blocks.push(
         "**Holdout follow-ups** (not required by the request or spec; they did not trigger another round)",
-        followUps
-          .map(
-            ({ scenario, result }) =>
+        reportJoin(
+          followUps.map(({ scenario, result }) =>
+            reportText(
+              "private",
               `- ${scenario.id}: ${escapeCell(scenario.description)} — ${escapeCell(result?.evidence ?? "")}`,
-          )
-          .join("\n"),
+            ),
+          ),
+          "\n",
+        ),
       );
   }
 
@@ -207,27 +230,33 @@ export function renderReport(input: ReportInput): string {
           : [],
     );
     if (schedule.length) blocks.push(schedule.join("\n"));
-    blocks.push(`**${r.verdict}** — ${r.summary}`);
+    blocks.push(reportText("prose", `**${r.verdict}** — ${r.summary}`));
     if (r.findings.length) {
       blocks.push(
-        r.findings
-          .map(
-            (f) =>
-              `- ${severity(f)}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
-          )
-          .join("\n"),
+        reportText(
+          "prose",
+          r.findings
+            .map(
+              (f) =>
+                `- ${severity(f)}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
+            )
+            .join("\n"),
+        ),
       );
     }
   }
   if (state.reviewFollowUps?.length) {
     blocks.push(
       "## Review follow-ups",
-      state.reviewFollowUps
-        .map(
-          (f) =>
-            `- ${severity(f)}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
-        )
-        .join("\n"),
+      reportText(
+        "prose",
+        state.reviewFollowUps
+          .map(
+            (f) =>
+              `- ${severity(f)}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
+          )
+          .join("\n"),
+      ),
     );
   }
 
@@ -235,7 +264,10 @@ export function renderReport(input: ReportInput): string {
   if (audit.length) {
     blocks.push(
       "## Audit flags",
-      audit.map((f) => `- ${f.severity} [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n"),
+      reportText(
+        "prose",
+        audit.map((f) => `- ${f.severity} [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n"),
+      ),
     );
   }
 
@@ -275,7 +307,7 @@ export function renderReport(input: ReportInput): string {
 
   if (input.closesIssue) blocks.push(`Closes #${input.closesIssue}`);
   blocks.push(`Run \`${input.runId}\` · ${input.runUrl}`, "🤖 Generated by Limitless");
-  return `${blocks.join("\n\n")}\n`;
+  return markReport(blocks);
 }
 
 /**
