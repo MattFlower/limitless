@@ -57,6 +57,7 @@ export interface Config {
   maxConcurrentGates: number;
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
   baselineCache: boolean;
+  gateExecutor: "local";
   /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
   baselineEnv: string[];
   maxRounds: number; // implement ⇄ feedback rounds before escalation
@@ -296,6 +297,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   const gates = (raw.gates ?? {}) as Record<string, unknown>;
   if (gates.baseline_cache !== undefined && typeof gates.baseline_cache !== "boolean")
     throw new Error("gates.baseline_cache must be true or false");
+  if (gates.executor !== undefined && gates.executor !== "local")
+    throw new Error('gates.executor must be "local"');
   const baselineEnv = gates.baseline_env ?? [];
   if (!Array.isArray(baselineEnv) || !baselineEnv.every((v) => typeof v === "string"))
     throw new Error("gates.baseline_env must be an array of environment variable names");
@@ -360,6 +363,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     catalog,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
+    gateExecutor: "local",
     baselineEnv,
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),

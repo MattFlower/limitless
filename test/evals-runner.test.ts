@@ -1341,9 +1341,19 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
     expect(f.calls).toHaveLength(calls + 1);
     const live = await run([{ ...replaySystem, replayFrom: undefined }]);
     expect(live.trials[0]?.cacheKey).not.toBe(first.trials[0]?.cacheKey);
+    const setupSource = await run([{ ...system, setup: true }]);
+    const beforeSetupReplay = f.calls.length;
+    const setupReplay = await run([{ ...replaySystem, setup: true }], { replayFinders: setupSource.run.id });
+    expect(setupReplay.trials[0]?.status).toBe("ok");
+    expect(f.calls.slice(beforeSetupReplay).map((s) => s.target.modelId)).toEqual(["verifier-d"]);
     const request = { role: "review", systems: [replaySystem], replayFinders: source.run.id };
     const submit = (over = {}) => f.factory.evals.submit({ ...request, ...over });
     const count = f.factory.store.listEvalRuns().length;
+    const beforeMismatch = f.calls.length;
+    expect(() => submit({ systems: [{ ...replaySystem, setup: true }] })).toThrow(/setup mismatch/);
+    expect(() => submit({ replayFinders: setupSource.run.id })).toThrow(/setup mismatch/);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(count);
+    expect(f.calls).toHaveLength(beforeMismatch);
     for (const finders of [
       system.finders.slice(1),
       [...system.finders].reverse(),

@@ -22,6 +22,20 @@ export function launchFailureScan() {
 export const redactGateOutput = (output: string): string =>
   redactCredentials(stripVTControlCharacters(output));
 
+/** Prefer literal identity; sanitized stored names are usable only without collisions on either side. */
+export function findGateCounterpart<T extends { name: string }>(
+  gate: { name: string },
+  own: readonly { name: string }[],
+  other: readonly T[],
+): T | undefined {
+  const exact = other.find((entry) => entry.name === gate.name);
+  if (exact) return exact;
+  const name = redactGateOutput(gate.name);
+  if (own.filter((entry) => redactGateOutput(entry.name) === name).length !== 1) return undefined;
+  const matches = other.filter((entry) => redactGateOutput(entry.name) === name);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 /** Sanitize decoded historical data without changing rows; preserve the raw confinement verdict. */
 export const redactGateData = <T>(value: T): T =>
   value === undefined

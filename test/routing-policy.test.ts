@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
+import { providersExport } from "../src/cli/providers-export.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { evalSettings } from "../src/evals/settings.ts";
@@ -16,50 +17,106 @@ import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { customModel, providerFixture } from "./provider-config-support.ts";
 import { identitySnapshot } from "./routing-identity-support.ts";
 
-test("startup prefers built-in Haiku 5.5 over a retained runtime entry; other collisions fail", async () => {
-  const fixture = providerFixture([]);
+test.each(["built-in", "exported"])(
+  "shadowed runtime Haiku can be removed while retaining the %s definition",
+  async (source) => {
+    const exported = source === "exported";
+    const fixture = providerFixture([]);
+    const cfg = fixture.load();
+    let store = new Store(cfg.paths.db);
+    const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
+    const builtIn = catalog.models.find((m) => m.id === "claude/haiku-5.5");
+    if (!builtIn) throw new Error("missing Haiku 5.5");
+    const runtime = runtimeModel({ ...customModel, id: "haiku-5.5", provider: "claude" }, catalog.providers);
+    store.writeRuntimeModel(runtime.id, runtime);
+    const history = store.catalogHistory();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const oldHome = process.env.LIMITLESS_HOME;
+    const oldConfigDir = process.env.LIMITLESS_CONFIG_DIR;
+    let factory: Factory | undefined;
+    try {
+      factory = new Factory(cfg, { store, policyPath: join(import.meta.dir, "../routing/policy.json") });
+      expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([builtIn]);
+      factory.tracker.setHealthy("codex", false);
+      expect(factory.router.route("triage", "small").candidates[0]).toMatchObject({
+        modelId: "claude/haiku-5.5",
+        model: "claude-haiku-5-5",
+        effort: "medium",
+        vendor: "anthropic",
+        price: { input: 0.1, output: 0.5, cacheRead: 0.01 },
+      });
+      expect(warn).toHaveBeenCalledWith(
+        "[catalog] claude/haiku-5.5: redundant runtime entry; using built-in definition",
+      );
+      expect(store.runtimeModels()).toEqual([runtime]);
+      expect(store.catalogHistory()).toEqual(history);
+      expect(() => factory?.catalog.add({ ...customModel, id: "haiku-5.5", provider: "claude" })).toThrow(
+        "catalog collision: claude/haiku-5.5",
+      );
+      if (exported) {
+        process.env.LIMITLESS_HOME = cfg.paths.home;
+        process.env.LIMITLESS_CONFIG_DIR = fixture.configDir;
+        providersExport(true, true);
+        await factory.stop();
+        store.close();
+        store = new Store(cfg.paths.db);
+        warn.mockClear();
+        factory = new Factory(fixture.load(), { store });
+      }
+      expect(warn).toHaveBeenCalledWith(
+        `[catalog] claude/haiku-5.5: redundant runtime entry; using ${exported ? "exported config" : "built-in"} definition`,
+      );
+      const effective = { ...builtIn, ...(exported ? { source: "config" as const } : {}) };
+      expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([effective]);
+      expect(() => factory?.catalog.patch(runtime.id, { tier: 1 })).toThrow("read-only");
+      expect(factory.catalog.remove(runtime.id).models.find((m) => m.id === runtime.id)).toMatchObject(
+        effective,
+      );
+      expect(store.runtimeModels()).toEqual([]);
+      expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([effective]);
+      expect(() => factory?.catalog.remove(runtime.id)).toThrow("read-only");
+      await factory.stop();
+      store.close();
+      store = new Store(cfg.paths.db);
+      warn.mockClear();
+      factory = new Factory(fixture.load(), { store });
+      expect(
+        warn.mock.calls.flat().some((message) => String(message).includes("redundant runtime entry")),
+      ).toBe(false);
+      expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([effective]);
+    } finally {
+      if (oldHome === undefined) delete process.env.LIMITLESS_HOME;
+      else process.env.LIMITLESS_HOME = oldHome;
+      if (oldConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+      else process.env.LIMITLESS_CONFIG_DIR = oldConfigDir;
+      error.mockRestore();
+      warn.mockRestore();
+      await factory?.stop();
+      store.close();
+      fixture.close();
+    }
+  },
+);
+
+test.each([
+  { ...customModel, id: "config-only" },
+  { id: "haiku-5.5", model: "org/unrelated-model" },
+  { id: "haiku-5.5", price: { input: 1 } },
+  { id: "haiku-5.5", efforts: ["low", "medium"] },
+  { id: "haiku-5.5", checkpoint: "unrelated-checkpoint" },
+])("startup rejects a runtime collision with an unrelated config model %j", (model) => {
+  const fixture = providerFixture([{ id: "claude", models: [model] }]);
   const store = new Store(":memory:");
-  const cfg = fixture.load();
-  const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
-  const builtIn = catalog.models.find((m) => m.id === "claude/haiku-5.5");
-  if (!builtIn) throw new Error("missing Haiku 5.5");
-  const runtime = runtimeModel({ ...customModel, id: "haiku-5.5", provider: "claude" }, catalog.providers);
-  store.writeRuntimeModel(runtime.id, runtime);
-  const history = store.catalogHistory();
-  const warn = spyOn(console, "warn").mockImplementation(() => {});
-  let factory: Factory | undefined;
   try {
-    factory = new Factory(cfg, { store, policyPath: join(import.meta.dir, "../routing/policy.json") });
-    expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([builtIn]);
-    factory.tracker.setHealthy("codex", false);
-    expect(factory.router.route("triage", "small").candidates[0]).toMatchObject({
-      modelId: "claude/haiku-5.5",
-      model: "claude-haiku-5-5",
-      effort: "medium",
-      vendor: "anthropic",
-      price: { input: 0.1, output: 0.5, cacheRead: 0.01 },
-    });
-    expect(warn).toHaveBeenCalledWith(
-      "[catalog] claude/haiku-5.5: redundant runtime entry; using built-in definition",
+    const cfg = fixture.load();
+    const runtime = runtimeModel(
+      { ...customModel, id: model.id, provider: "claude" },
+      resolveCatalog().providers,
     );
-    expect(store.runtimeModels()).toEqual([runtime]);
-    expect(store.catalogHistory()).toEqual(history);
-    expect(() => factory?.catalog.add({ ...customModel, id: "haiku-5.5", provider: "claude" })).toThrow(
-      "catalog collision: claude/haiku-5.5",
-    );
-    expect(
-      () =>
-        new Factory(cfg, {
-          store,
-          models: MODELS.map((m) => (m.id === runtime.id ? { ...m, source: "config" } : m)),
-        }),
-    ).toThrow("catalog collision: claude/haiku-5.5");
-    const other = runtimeModel({ ...customModel, id: "luna", provider: "codex" }, catalog.providers);
-    store.writeRuntimeModel(other.id, other);
-    expect(() => new Factory(cfg, { store })).toThrow("catalog collision: codex/luna");
+    store.writeRuntimeModel(runtime.id, runtime);
+    expect(() => new Factory(cfg, { store })).toThrow(`catalog collision: claude/${model.id}`);
   } finally {
-    warn.mockRestore();
-    await factory?.stop();
     store.close();
     fixture.close();
   }

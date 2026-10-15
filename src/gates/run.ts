@@ -3,8 +3,15 @@ import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
+import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
-import { launchFailure, launchFailureScan, redactGateOutput, redactGateStreams } from "./output.ts";
+import {
+  findGateCounterpart,
+  launchFailure,
+  launchFailureScan,
+  redactGateOutput,
+  redactGateStreams,
+} from "./output.ts";
 import { gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -115,7 +122,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
 }
 
 /** Run setup and checks inside one machine-wide gate slot. */
-export async function runGates(
+export async function runLocalGates(
   cwd: string,
   cfg: GateConfig,
   signal: AbortSignal,
@@ -127,6 +134,16 @@ export async function runGates(
   } finally {
     release();
   }
+}
+
+/** Compatibility entry point for evals and standalone callers. */
+export function runGates(
+  cwd: string,
+  cfg: GateConfig,
+  signal: AbortSignal,
+  hooks: GateHooks = {},
+): Promise<GateRun> {
+  return executeGate({ repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg }, signal, hooks);
 }
 
 async function runAll(
@@ -152,6 +169,28 @@ async function runAll(
   return { setupOk: true, setup, checks };
 }
 
+/** Standalone retries own scratch per check; an outer command scope still shares setup. */
+async function retryChecks(
+  cwd: string,
+  cfg: GateConfig,
+  signal: AbortSignal,
+  onWait: GateHooks["onWait"],
+  runner?: GateRunner,
+): Promise<GateRun> {
+  if (runner) return runner(cfg);
+  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
+  try {
+    const checks: GateResult[] = [];
+    for (const check of cfg.checks) {
+      if (signal.aborted) break;
+      checks.push(await withCommandScratch(cwd, () => runOne(check, cwd, signal)));
+    }
+    return { setupOk: true, setup: [], checks };
+  } finally {
+    release();
+  }
+}
+
 /**
  * Re-run once, inside a slot, each baseline check that failed without timing out. A check that
  * fails on base never blocks later, so a flaky baseline failure would hide a real regression.
@@ -163,28 +202,27 @@ export async function retryBaselineFailures(
   cfg: GateConfig,
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
+  runner?: GateRunner,
 ): Promise<GateRun> {
-  const retryable = (r: GateResult) =>
-    !r.ok && !r.timedOut && !confinementFailed(r)
-      ? cfg.checks.find((k) => k.name === r.name && k.run === r.command)
-      : undefined;
+  const retryable = (r: GateResult) => {
+    if (r.ok || r.timedOut || confinementFailed(r)) return undefined;
+    const check = findGateCounterpart(r, run.checks, cfg.checks);
+    return check?.run === r.command ? check : undefined;
+  };
   if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
-  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
-  try {
-    const checks: GateResult[] = [];
-    for (const r of run.checks) {
-      const check = retryable(r);
-      if (!check || signal.aborted) {
-        checks.push(r);
-        continue;
-      }
-      const retry = await runOne(check, cwd, signal);
-      checks.push({ ...retry, firstAttempt: r });
-    }
-    return { ...run, checks };
-  } finally {
-    release();
-  }
+  const selected = run.checks.flatMap((r) => {
+    const check = retryable(r);
+    return check ? [check] : [];
+  });
+  const retry = await retryChecks(cwd, { ...cfg, setup: [], checks: selected }, signal, onWait, runner);
+  let index = 0;
+  return {
+    ...run,
+    checks: run.checks.map((r) => {
+      const result = retryable(r) ? retry.checks[index++] : undefined;
+      return result ? { ...result, firstAttempt: r } : r;
+    }),
+  };
 }
 
 /** Compare post-change gates with the baseline taken on the untouched base branch. */
@@ -215,7 +253,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     return out;
   }
   for (const r of after.checks) {
-    const before = baseline?.checks.find((b) => b.name === r.name);
+    const before = findGateCounterpart(r, after.checks, baseline?.checks ?? []);
     let verdict: GateVerdict;
     if (confinementFailed(r) || confinementFailed(before)) verdict = "confinement_error";
     else if (!before) verdict = r.ok ? "new_pass" : "new_failure";
@@ -256,33 +294,32 @@ export async function retryRegressions(
   changed: string[],
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
+  runner?: GateRunner,
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
-  const retryable = (c: GateComparison) =>
-    c.verdict === "regressed" && !c.result.timedOut && !pointsAt(c.result.output, changed)
-      ? cfg.checks.find((k) => k.name === c.name && k.run === c.result.command)
-      : undefined;
+  const retryable = (c: GateComparison) => {
+    if (c.verdict !== "regressed" || c.result.timedOut || pointsAt(c.result.output, changed))
+      return undefined;
+    const check = findGateCounterpart(c, cmp, cfg.checks);
+    return check?.run === c.result.command ? check : undefined;
+  };
   if (!cmp.some(retryable)) return cmp;
-  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
-  try {
-    const out: GateComparison[] = [];
-    for (const c of cmp) {
-      const check = retryable(c);
-      if (!check || signal.aborted) {
-        out.push(c);
-        continue;
-      }
-      const retry = await runOne(check, cwd, signal);
-      out.push({
-        ...c,
-        verdict: confinementFailed(retry) ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
-        blocking: !retry.ok,
-        result: retry,
-        firstAttempt: c.result,
-      });
-    }
-    return out;
-  } finally {
-    release();
-  }
+  const selected = cmp.flatMap((c) => {
+    const check = retryable(c);
+    return check ? [check] : [];
+  });
+  const retried = await retryChecks(cwd, { ...cfg, setup: [], checks: selected }, signal, onWait, runner);
+  let index = 0;
+  return cmp.map((c) => {
+    const retry = retryable(c) ? retried.checks[index++] : undefined;
+    return retry
+      ? {
+          ...c,
+          verdict: confinementFailed(retry) ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
+          blocking: !retry.ok,
+          result: retry,
+          firstAttempt: c.result,
+        }
+      : c;
+  });
 }

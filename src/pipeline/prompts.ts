@@ -3,7 +3,7 @@ import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { redactGateData } from "../gates/output.ts";
+import { findGateCounterpart, redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
   citationInSource,
@@ -171,13 +171,14 @@ Reply with a concise report: files changed, how you verified (commands and resul
 }
 
 export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): string {
-  cmp = redactGateData(cmp);
   const bad = cmp.filter((c) => c.blocking);
   if (!bad.length) return "";
   return bad
     .map((c) => {
+      const check = findGateCounterpart(c, cmp, cfg?.checks ?? []);
+      c = redactGateData(c);
       if (c.result.timedOut) {
-        const limit = cfg?.checks.find((k) => k.name === c.name)?.timeoutSec ?? 900;
+        const limit = check?.timeoutSec ?? 900;
         const output = stripVTControlCharacters(c.result.output);
         const last = [
           ...output.matchAll(
@@ -364,6 +365,8 @@ const FINDER_FRAMING: Record<FinderPrompt, string> = {
     "Assume the change can fail, and find out how. Trace bad and boundary inputs, retries, partial failure, ordering, restarts, and version skew between old and new code or data. Give no credit for intent: judge what the code does, not what its comments, names or commit messages say. Report every issue you believe is real, with your confidence; a separate step verifies each finding.",
   careful:
     "Review it as a careful senior engineer would, in one pass, and report the defects you find with your confidence.",
+  probe:
+    "For each proposed blocker or major finding, reproduce the defect with a probe: a throwaway test or command, with temporary files under TMPDIR. Run only the affected test files; never run the full suite. Put the attempted command and its observed result in the finding's detail. If a completed probe does not reproduce the defect, lower the finding to minor or omit it. If sandbox or environment limits prevent the probe from running (for example nested Seatbelt, loopback servers, or a Linux-only path), retain its severity and name the attempted command and the error in detail.",
 };
 
 export function reviewPrompt(input: {
