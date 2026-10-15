@@ -1045,23 +1045,20 @@ test.each([undefined, '"local"', '"lan"', '"remote"', "3"])("gate executor confi
   const fixture = providerFixture();
   try {
     writeFileSync(fixture.file, value === undefined ? "" : `[gates]\nexecutor = ${value}\n`);
-    if (value === undefined || value === '"local"' || value === '"lan"')
-      expect(fixture.load().gateExecutor).toBe(value === '"lan"' ? "lan" : "local");
-    else expect(() => fixture.load()).toThrow(/gates\.executor.*local/);
+    if (value === undefined || value === '"local"') expect(fixture.load().gateExecutor).toBe("local");
+    else expect(() => fixture.load()).toThrow('gates.executor must be "local"');
   } finally {
     fixture.close();
   }
 });
 
 test.each([
-  ['listen = "127.0.0.1:7443"\nrepos = ["owner/repo"]', true],
+  ['listen = "127.0.0.1:7443"', true],
   ['listen = "[::1]:7443"', true],
   ['listen = "missing-port"', false],
   ['listen = "127.0.0.1:99999"', false],
   ["listen = 12", false],
-  ['repos = ["not-a-repository"]', false],
-  ['repos = "owner/repo"', false],
-] as const)("worker config validates listener and repository opt-in: %s", (toml, valid) => {
+] as const)("worker config validates listener: %s", (toml, valid) => {
   const fixture = providerFixture();
   try {
     writeFileSync(fixture.file, `[workers]\n${toml}\n`);

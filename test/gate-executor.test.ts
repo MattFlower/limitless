@@ -1150,22 +1150,3 @@ test("local check events stream before completion and the start signal cancels r
     await execution.cancel();
   });
 });
-
-test("baseline cache separates local and LAN executor environments", async () => {
-  const { baselineCacheKey } = await import("../src/gates/cache.ts");
-  const input = {
-    repoId: "repo",
-    baseSha: "base",
-    gates,
-    lockfileHash: "locks",
-    bunVersion: Bun.version,
-    platform: process.platform,
-    arch: process.arch,
-    buildSha: "build",
-    envDigest: "env",
-  };
-  expect(baselineCacheKey(input)).toEqual(baselineCacheKey({ ...input, executor: "local" }));
-  expect(baselineCacheKey({ ...input, executor: "lan" }).envHash).not.toBe(
-    baselineCacheKey({ ...input, executor: "local" }).envHash,
-  );
-});

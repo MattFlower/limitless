@@ -199,9 +199,8 @@ use the file first, then the environment.
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
-| `[gates] executor` | `"local"` | `local` or `lan`; LAN gates also require the repository in `[workers] repos`. Older releases reject `lan`: restore `local` before rolling back. |
+| `[gates] executor` | `"local"` | `local` is the only supported value. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
-| `[workers] repos` | `[]` | Repository slugs allowed to send gate code to paired workers, for example `["owner/name"]`. Unlisted repositories run locally. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
 | `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
@@ -227,7 +226,7 @@ own CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains rea
 macOS Keychain access through `security`, network egress and the loopback API (#484) remain separate
 gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
 
-To pair a macOS gate worker, run `limitless worker pair --coordinator https://<host>:7443`
+To pair a macOS worker, run `limitless worker pair --coordinator https://<host>:7443`
 on that machine, then compare its printed code with `limitless workers ls` on the coordinator
 and run `limitless workers approve <code>`. Start it with
 `limitless worker --coordinator https://<host>:7443`; `limitless workers revoke <name>`
@@ -235,10 +234,10 @@ immediately removes its access. `--name <name>` overrides the pairing name. Pair
 after ten minutes. The coordinator creates and reuses a self-signed certificate under
 `<data>/worker-tls/`; workers pin its fingerprint and keep credentials under `<data>/worker/`.
 Changing the coordinator's certificate requires pairing again. Keep both machines on the same
-release SHA and Bun version; mismatches show as `needs update` and receive no jobs. Workers send
-heartbeats every ten seconds; stale workers stop receiving jobs after thirty seconds. Gate jobs
-retry an infrastructure failure once on a different worker, then execute locally. Check failures
-remain check failures. Bonjour discovery, power/idle selection and Linux workers are not supported.
+release SHA and Bun version; mismatches show as `needs update`. Workers send heartbeats every
+ten seconds and show as offline after thirty seconds without a heartbeat. This release covers
+pairing and heartbeats only: workers receive no gate jobs, and gates always run locally.
+Bonjour discovery, power/idle selection and Linux workers are not supported.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default
 branch:

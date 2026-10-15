@@ -70,7 +70,7 @@ Usage:
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
   limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
   limitless worker pair --coordinator https://<host>:<port> [--name <name>]
-  limitless worker --coordinator https://<host>:<port>  Run paired macOS gate worker
+  limitless worker --coordinator https://<host>:<port>  Send paired macOS worker heartbeats
   limitless workers ls|approve <code>|revoke <name>
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill

@@ -118,7 +118,6 @@ export function gateEnvDigest(env: Record<string, string>, extra: readonly strin
 }
 
 export interface BaselineKeyInputs {
-  executor?: "local" | "lan";
   repoId: string;
   baseSha: string;
   gates: GateConfig;
@@ -136,9 +135,7 @@ export function baselineCacheKey(i: BaselineKeyInputs): BaselineCacheKey {
     repoId,
     baseSha,
     gatesHash: gatesHash(gates),
-    envHash: sha256(
-      JSON.stringify(stable({ ...env, executor: i.executor ?? "local", version: GATE_ENV_VERSION })),
-    ),
+    envHash: sha256(JSON.stringify(stable({ ...env, version: GATE_ENV_VERSION }))),
   };
 }
 

@@ -1,6 +1,4 @@
 import { z } from "zod";
-import { launchFailure } from "../gates/output.ts";
-import type { GateResult } from "../gates/run.ts";
 
 export const Heartbeat = z
   .object({
@@ -24,52 +22,8 @@ export const Pair = z
   })
   .strict();
 export const Claim = z.object({ secret: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
-export const LeaseRequest = z.object({ jobs: z.array(z.string().uuid()).max(128).default([]) }).strict();
-export const Check: z.ZodType<GateResult> = z.lazy(() =>
-  z
-    .object({
-      name: z.string(),
-      command: z.string(),
-      ok: z.boolean(),
-      exitCode: z.number().int().nullable(),
-      durationMs: z.number().finite().nonnegative(),
-      output: z.string(),
-      failures: z.string().optional(),
-      timedOut: z.boolean().optional(),
-      confinementError: z.boolean().optional(),
-      firstAttempt: Check.optional(),
-      testCoverage: z
-        .object({
-          passedFiles: z.array(z.string()),
-          skippedFiles: z.array(z.string()),
-          summary: z
-            .object({ passed: z.number().int().nonnegative(), failed: z.number().int().nonnegative() })
-            .strict()
-            .optional(),
-        })
-        .strict()
-        .optional(),
-    })
-    .strict()
-    .refine((r) => !r.confinementError && !launchFailure(r.output), "Worker confinement failed")
-    .refine(
-      (r) => !r.ok || (r.exitCode === 0 && !r.timedOut && !r.confinementError),
-      "Inconsistent passing check",
-    ),
-);
-export const GateRunSchema = z
-  .object({ setupOk: z.boolean(), setup: z.array(Check), checks: z.array(Check) })
-  .strict();
-export const Result = z.object({ sha: z.string(), run: GateRunSchema }).strict();
-export const CheckEvent = z
-  .object({ type: z.literal("check"), phase: z.enum(["setup", "check"]), result: Check })
-  .strict();
 export const timing = {
   heartbeat: 10_000,
   fresh: 30_000,
-  lease: 60_000,
-  pickup: 60_000,
-  poll: 30_000,
-  tick: 100,
 };
 export type WorkerTiming = typeof timing;
