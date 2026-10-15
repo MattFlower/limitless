@@ -138,12 +138,19 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   if (
     ["merge", "rebase"].includes(cmd[command] ?? "") &&
     !cmd.slice(command + 1).some((arg) => arg === "--abort" || arg === "--quit")
-  )
-    await refusePopulatedRepositories(
-      prefix,
-      { ...opts, env },
-      cmd.slice(command + 1).filter((arg) => !arg.startsWith("-")),
-    );
+  ) {
+    try {
+      await refusePopulatedRepositories(
+        prefix,
+        { ...opts, env },
+        cmd.slice(command + 1).filter((arg) => !arg.startsWith("-")),
+      );
+    } catch (error) {
+      // Let callers classify failed Git inspection; safety refusals still throw with allowFail.
+      if (!opts.allowFail || !(error instanceof CommandError)) throw error;
+      return { stdout: error.stdout, stderr: error.stderr, exitCode: error.exitCode };
+    }
+  }
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.

@@ -377,6 +377,19 @@ test.each(["index", "HEAD", "target", "nonempty directory"])(
   },
 );
 
+test.each(["merge", "rebase"])("%s reports invalid targets without changing HEAD", async (operation) => {
+  const result = await worktreeGit(["git", operation, "invalid-target"], {
+    cwd: work,
+    allowFail: true,
+  });
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr).toContain("invalid-target");
+  await expect(
+    operation === "merge" ? prepareMerge(work, base, "invalid-target") : rebaseOnto(work, "invalid-target"),
+  ).rejects.toThrow(operation === "merge" ? "Merge preparation failed" : "rebase failed");
+  expect(await headSha(work)).toBe(base);
+});
+
 test("merge and rebase report inspection errors without checkout paths", async () => {
   await factory("update-index", "--add", "--cacheinfo", `160000,${base},blocked/nested`);
   // A symlink loop gives a deterministic filesystem error even when run as root.
