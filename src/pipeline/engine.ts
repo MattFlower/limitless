@@ -18,6 +18,7 @@ import {
   GateNameCollisionError,
   gateScriptNames,
   pickScripts,
+  readRetryFiles,
 } from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
@@ -393,6 +394,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 
 function gateEvents(ctx: RunContext): Required<GateHooks> {
   return {
+    skipGateSlot: false,
     holder: ctx.run.id,
     onResult: (r) =>
       ctx.store.addEvent({
@@ -501,6 +503,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           ctx.state.shadowLenses = { error: String((error as Error).message).slice(0, 500) };
         }
       gates = trusted ? trusted.gates : detectGates(wt.path);
+      gates.retryFiles = readRetryFiles(repoConfig, (message) => ctx.log(message, "warn"));
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = trusted
         ? trusted.scripts
@@ -517,8 +520,21 @@ async function prepare(ctx: RunContext): Promise<void> {
         const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
         ctx.checkCancelled();
         // Retry before resetting, so a check sees the same build output as its first attempt.
-        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait, (retry) =>
-          runGateExecution(ctx, "prepare", "baseline-retry", wt.path, retry, { onWait }),
+        const retried = await retryBaselineFailures(
+          run,
+          wt.path,
+          gates,
+          ctx.signal,
+          onWait,
+          (retry, options) =>
+            runGateExecution(
+              ctx,
+              "prepare",
+              options?.targeted ? "baseline-retry-targeted" : "baseline-retry",
+              wt.path,
+              retry,
+              { onWait, skipGateSlot: options?.skipGateSlot },
+            ),
         );
         ctx.checkCancelled();
         return retried;
@@ -589,7 +605,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           runId: ctx.run.id,
           type: "gate",
           level: "warn",
-          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}`,
+          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}${retry.targetedRetry ? ` (targeted: ${firstAttempt.failedFiles?.length ?? 0} files${retry.command === retry.targetedRetry.command ? "" : ", then full retry"})` : ""}`,
           data: { flaky: retry.ok, firstAttempt, retry },
         });
       }
@@ -1234,8 +1250,22 @@ async function oneRound(
             firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
           }));
           if (!baseTimeout)
-            cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait, (retry) =>
-              runGateExecution(ctx, "gates", "regression-retry", cwd, retry, { onWait: events.onWait }),
+            cmp = await retryRegressions(
+              cmp,
+              cwd,
+              gates,
+              changed,
+              ctx.signal,
+              events.onWait,
+              (retry, options) =>
+                runGateExecution(
+                  ctx,
+                  "gates",
+                  options?.targeted ? "regression-retry-targeted" : "regression-retry",
+                  cwd,
+                  retry,
+                  { onWait: events.onWait, skipGateSlot: options?.skipGateSlot },
+                ),
             );
           ctx.checkCancelled();
           baseTimeout ||= after.checks.some(
@@ -1256,7 +1286,7 @@ async function oneRound(
             runId: ctx.run.id,
             type: "gate",
             level: "warn",
-            message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}`,
+            message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}${c.result.targetedRetry ? ` (targeted: ${c.firstAttempt?.failedFiles?.length ?? 0} files${c.result.command === c.result.targetedRetry.command ? "" : ", then full retry"})` : ""}`,
             data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
           });
         }

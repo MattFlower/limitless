@@ -6,7 +6,7 @@ import type { GateConfig } from "./detect.ts";
 import type { GateResult, GateRun } from "./run.ts";
 
 /** Bump whenever how gates execute changes (environment, retries, result shape): old entries then miss. */
-export const GATE_ENV_VERSION = 2;
+export const GATE_ENV_VERSION = 3;
 export const BASELINE_CACHE_TTL_MS = 7 * 86_400_000;
 
 const LOCKFILES = [

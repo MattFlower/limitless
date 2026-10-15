@@ -1150,3 +1150,101 @@ test("local check events stream before completion and the start signal cancels r
     await execution.cancel();
   });
 });
+
+test.each([false, true])(
+  "targeted retry config stays on the base commit across opposite PR edits (base enabled=%s)",
+  async (enabled) => {
+    const baseConfig = `[gates]\nchecks = [{ name = "check", run = "full-check" }]\n${enabled ? 'retry_files = "base-target {files}"\n' : ""}`;
+    const changedConfig = `[gates]\nchecks = [{ name = "check", run = "full-check" }]\n${enabled ? "" : 'retry_files = "candidate-target {files}"\n'}`;
+    writeFileSync(join(fixture.repoDir, ".limitless.toml"), baseConfig);
+    await sh(["git", "commit", "-qam", "base retry configuration"], { cwd: fixture.repoDir });
+    const purposes: string[] = [];
+    const scripted = fake(async (handle, req) => {
+      const state = fixture.factory?.store.listRuns()[0];
+      if (state)
+        purposes.push(fixture.factory?.store.getRunState<RunState>(state.id)?.gateExecution?.purpose ?? "");
+      const run = result(req, handle.id !== "2");
+      if (handle.id === "2")
+        run.checks = run.checks.map((check) => ({
+          ...check,
+          output: "test failure",
+          failedFiles: ["greeting.txt"],
+          failedFileTimes: { "greeting.txt": 1 },
+        }));
+      return run;
+    });
+    const f = start(
+      (s) =>
+        roleOf(s) === "implement"
+          ? { files: { ".limitless.toml": changedConfig, "farewell.txt": "goodbye\n" } }
+          : handler(s),
+      false,
+      false,
+      { gateExecutor: scripted.executor },
+    );
+    const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const requests = [...scripted.requests.values()];
+    expect(requests.map((req) => req.gates.retryFiles)).toEqual(
+      Array(enabled ? 4 : 3).fill(enabled ? "base-target {files}" : undefined),
+    );
+    expect(requests.map((req) => req.gates.checks[0]?.run)).toEqual(
+      enabled
+        ? ["full-check", "full-check", "base-target 'greeting.txt'", "full-check"]
+        : ["full-check", "full-check", "full-check"],
+    );
+    expect(purposes).toEqual(
+      enabled
+        ? ["baseline", "initial", "regression-retry-targeted", "regression-retry"]
+        : ["baseline", "initial", "regression-retry"],
+    );
+    expect(requests[2]?.skipGateSlot).toBe(enabled);
+    const comparison = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
+    expect(comparison?.verdict).toBe("flaky");
+    expect(comparison?.firstAttempt?.ok).toBe(false);
+    if (enabled)
+      expect(
+        f.store
+          .listEvents(run.id)
+          .some((event) => event.message.includes("targeted: 1 files, then full retry")),
+      ).toBe(true);
+  },
+);
+
+test("baseline targeted confirmation has its own execution label and keeps both failures", async () => {
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    '[gates]\nchecks = [{ name = "check", run = "full-check" }]\nretry_files = "base-target {files}"\n',
+  );
+  await sh(["git", "commit", "-qam", "baseline targeted retry"], { cwd: fixture.repoDir });
+  const purposes: string[] = [];
+  const scripted = fake(async (handle, req) => {
+    const state = fixture.factory?.store.listRuns()[0];
+    if (state)
+      purposes.push(fixture.factory?.store.getRunState<RunState>(state.id)?.gateExecution?.purpose ?? "");
+    const run = result(req, Number(handle.id) > 2);
+    if (handle.id === "1")
+      run.checks = run.checks.map((check) => ({
+        ...check,
+        failedFiles: ["greeting.txt"],
+        failedFileTimes: { "greeting.txt": 1 },
+      }));
+    return run;
+  });
+  const f = start(handler, false, false, { gateExecutor: scripted.executor });
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(purposes).toEqual(["baseline", "baseline-retry-targeted", "initial"]);
+  expect([...scripted.requests.values()].map((req) => req.gates.checks[0]?.run)).toEqual([
+    "full-check",
+    "base-target 'greeting.txt'",
+    "full-check",
+  ]);
+  const baseline = f.store.getRunState<RunState>(run.id)?.baseline?.checks[0];
+  expect(baseline).toMatchObject({ ok: false, firstAttempt: { ok: false }, targetedRetry: { ok: false } });
+  expect(
+    f.store
+      .listEvents(run.id)
+      .some((event) => event.message === "baseline check: retry FAIL again (targeted: 1 files)"),
+  ).toBe(true);
+});

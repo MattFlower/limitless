@@ -1,13 +1,15 @@
 # Gates and policy the Limitless factory applies when it works on this repository.
 [gates]
 setup = ["bun install --frozen-lockfile"]
+# Confirm structured failing files before repeating the full suite.
+retry_files = "bun test {files}"
 checks = [
   { name = "lint", run = "bun run lint" },
   { name = "typecheck", run = "bun run typecheck" },
   # The full suite takes about 18 minutes while two gates and a land check share the machine (2026-10-04),
   # so the 900 s default timed out the test gate in nearly every run, and a check that also times out
   # on the base counts as still failing and doesn't block.
-  { name = "test", run = "bun test --parallel=$(bun scripts/test-workers.ts)", timeoutSec = 1800 },
+  { name = "test", run = 'bun test --parallel=$(bun scripts/test-workers.ts) --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"', timeoutSec = 1800 },
 ]
 
 [limits]
