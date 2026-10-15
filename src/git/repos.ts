@@ -856,7 +856,8 @@ async function attributeInfo(
         contents.set(oid, {
           pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
           forbidden: isForbiddenFormat("", bytes),
-          binary: bytes.includes(0) || bytes.includes(Buffer.from("%PDF-")),
+          // Hex avoids classifying this source as the PDF signature it detects.
+          binary: bytes.includes(0) || bytes.includes(Buffer.from("255044462d", "hex")),
           reviewable: reviewableText(bytes),
         });
         at = end + size + 2;

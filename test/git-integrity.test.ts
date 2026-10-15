@@ -3183,6 +3183,15 @@ test("a rename that drops the executable bit is a mode transition of the origina
   expect(diff.binaryPaths?.sort()).toEqual(["renamed.com", "renamed.png"]);
 });
 
+test("factory Git source remains reviewable by the content audit", async () => {
+  const source = readFileSync(new URL("../src/git/repos.ts", import.meta.url), "utf8");
+  writeFileSync(join(work, "repos.ts"), source);
+  await commitAll(work, "add factory Git source");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths).toEqual([]);
+  expect(diff.binaryErrors ?? []).toEqual([]);
+});
+
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
     "ascii.pdf": "\x25PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
