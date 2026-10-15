@@ -7,6 +7,7 @@ import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontext
 import type { FeedPage, Question, Run } from "../src/core/types.ts";
 import * as diagnosticCatalogue from "../src/db/owner-diagnostics.ts";
 import * as gitCommand from "../src/git/command.ts";
+import { cachePath } from "../src/git/repos.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -1552,6 +1553,61 @@ test("change view keeps deleted multiline credentials withheld", async () => {
   }
 });
 
+test("change view inspects the blob it diffs when a malformed tree repeats a path", async () => {
+  const alpha = "malformed-alpha-secret".padEnd(200, "a");
+  const beta = "malformed-beta-secret";
+  const git = async (args: string[], stdin?: string) =>
+    (await sh(["git", ...args], { cwd: f.repo, ...(stdin === undefined ? {} : { stdin }) })).stdout.trim();
+  mkdirSync(join(f.repo, "foo"));
+  writeFileSync(join(f.repo, "foo", "bar"), "public nested content\n");
+  await git(["add", "."]);
+  await git(["commit", "-qm", "base nested file"]);
+  const c = await changeFixture(f, { "visible.txt": "public addition\n" });
+  // A root entry literally named "foo/bar", which ordinary commits cannot create, sorts after the
+  // "foo" tree and renders as the same path as the public nested file.
+  const secret = await git(["hash-object", "-w", "--stdin"], `${alpha}\n${beta}\n`);
+  const entries = (await git(["ls-tree", "-z", c.headSha]))
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [meta = "", name = ""] = line.split("\t");
+      const [mode = "", , oid = ""] = meta.split(" ");
+      return { mode: mode === "040000" ? "40000" : mode, name, oid };
+    });
+  entries.push({ mode: "100644", name: "foo/bar", oid: secret });
+  const key = (e: { mode: string; name: string }) => (e.mode === "40000" ? `${e.name}/` : e.name);
+  entries.sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  const raw = Buffer.concat(
+    entries.map((e) => Buffer.concat([Buffer.from(`${e.mode} ${e.name}\0`), Buffer.from(e.oid, "hex")])),
+  );
+  const rawPath = join(f.repo, ".git", "malformed-tree");
+  writeFileSync(rawPath, raw);
+  const tree = await git(["hash-object", "-w", "-t", "tree", "--literally", rawPath]);
+  const head = await git(["commit-tree", tree, "-p", c.headSha, "-m", "malformed head"]);
+  await git(["push", "-q", cachePath(f.factory.cfg.paths, c.repo), `${head}:refs/heads/malformed`]);
+  c.observe(head);
+  registerCredential("MALFORMED_TREE_MULTILINE", `${alpha}\n${beta}`);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const read = async (diffOffset: number) =>
+        resultValue<ChangePage>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id, headSha: head, baseSha: c.baseSha, file: 0, diffOffset },
+          }),
+        );
+      const first = await read(0);
+      expect(first.files[0]?.path).toBe("foo/bar");
+      for (const page of [first, await read(16000)])
+        expect(JSON.stringify(page)).not.toMatch(/malformed-alpha|malformed-beta/);
+      expect(first.diff.text).toBe("[withheld: private text; 1 file]");
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
 test.each(["file", "symlink", "gitlink"])(
   "change view excludes deleted children of a directory replaced by a %s on both backends",
   async (replacement) => {
@@ -1689,8 +1745,8 @@ test.each(["added", "modified", "blob to gitlink", "gitlink to blob"])(
 test.each([
   "base",
   "head",
-  "base tree",
-  "head tree",
+  "raw selection",
+  "ambiguous raw selection",
   "patch selection",
   "unexpected patch selection",
   "empty patch selection",
@@ -1698,19 +1754,23 @@ test.each([
 ])("change view fails closed on a required %s inspection failure", async (side) => {
   const c = await changeFixture(f, { "hello.txt": "public changed\n" });
   registerCredential("INSPECTION_MULTILINE", "inspection-alpha\ninspection-beta");
+  const blob = async (sha: string) =>
+    (await sh(["git", "rev-parse", `${sha}:hello.txt`], { cwd: f.repo })).stdout.trim();
+  const blobs = { base: await blob(c.baseSha), head: await blob(c.headSha) };
   const original = gitCommand.worktreeGit;
   const inspect = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
     const selection = cmd.includes("--name-only") && !cmd.includes("--diff-filter=D");
+    const raw = cmd.includes("--raw");
     if (
       (side === "patch selection" && selection) ||
-      (side.endsWith("tree") &&
-        cmd.includes("ls-tree") &&
-        cmd.includes(side === "base tree" ? c.baseSha : c.headSha)) ||
-      (["base", "head"].includes(side) &&
-        cmd.includes("show") &&
-        cmd.includes(`${side === "base" ? c.baseSha : c.headSha}:hello.txt`))
+      (side === "raw selection" && raw) ||
+      ((side === "base" || side === "head") && cmd.includes("cat-file") && cmd.includes(blobs[side]))
     )
       throw new Error("private inspection diagnostic");
+    if (side === "ambiguous raw selection" && raw) {
+      const result = await original(cmd, opts);
+      return { ...result, stdout: result.stdout + result.stdout };
+    }
     if (side.endsWith("patch selection") && selection) {
       const result = await original(cmd, opts);
       return {

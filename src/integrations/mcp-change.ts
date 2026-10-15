@@ -506,16 +506,37 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     const multiline = [...loadPrivateStrings().map(({ value }) => value), ...registeredCredentials()]
       .map((value) => normalizeNewlines(value.normalize("NFKC").toLowerCase()))
       .filter((value) => value.includes("\n"));
+    // The patch's exact selection: a trailing slash would also exclude a gitlink, so changed
+    // descendants are excluded one by one.
+    const selection = (path: string) => [
+      "--no-renames",
+      "--ignore-submodules=none",
+      baseSha,
+      headSha,
+      "--",
+      `:(top,literal)${path}`,
+      ...files
+        .filter((file) => file.path.startsWith(`${path}/`))
+        .map((file) => `:(top,exclude,literal)${file.path}`),
+    ];
+    // Inspect the blobs this selection diffs, not whatever a path lookup finds: a malformed tree
+    // can hold two entries that render as the same path.
     const privateFile = async (path: string) => {
       if (!multiline.length) return false;
-      for (const sha of [baseSha, headSha]) {
-        const entry = await git(["ls-tree", "-z", sha, "--", `:(literal)${path}`]);
-        // Added files lack a base side; gitlinks reference commits outside this repository.
-        if (sha === baseSha && !entry) continue;
-        const type = /^[0-7]{6} (blob|tree|commit) [0-9a-f]+\t/u.exec(entry)?.[1];
-        if (!type) throw new Error("Invalid Git file metadata");
-        if (type !== "blob") continue;
-        const layers = normalizedLayers(await git(["show", "--no-textconv", `${sha}:${path}`]));
+      const records = (await git(["diff", "--raw", "-z", "--no-abbrev", ...selection(path)])).split("\0");
+      if (records.length !== 3 || records[1] !== path || records[2] !== "")
+        throw new Error("Invalid Git patch selection");
+      const meta = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) [A-Z][0-9]*$/u.exec(
+        records[0] ?? "",
+      );
+      if (!meta) throw new Error("Invalid Git file metadata");
+      for (const [mode, oid] of [
+        [meta[1], meta[3]],
+        [meta[2], meta[4]],
+      ]) {
+        // Absent sides are all zeros; gitlinks reference commits outside this repository.
+        if (!oid || /^0+$/u.test(oid) || !["100644", "100755", "120000"].includes(mode ?? "")) continue;
+        const layers = normalizedLayers(await git(["cat-file", "blob", oid]));
         if (
           !layers ||
           layers.some((layer) => multiline.some((value) => normalizeNewlines(layer).includes(value)))
@@ -535,18 +556,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         : privacy(`[withheld: private text; ${patch.split("\n").length} lines]`);
     };
     const selectedPatch = async (path: string) => {
-      const args = [
-        "--no-renames",
-        "--ignore-submodules=none",
-        baseSha,
-        headSha,
-        "--",
-        `:(top,literal)${path}`,
-        // Exclude changed descendants explicitly: a trailing slash also excludes a gitlink.
-        ...files
-          .filter((file) => file.path.startsWith(`${path}/`))
-          .map((file) => `:(top,exclude,literal)${file.path}`),
-      ];
+      const args = selection(path);
       if ((await git(["diff", "--name-only", "-z", ...args])) !== `${path}\0`)
         throw new Error("Invalid Git patch selection");
       return privatePatch(
