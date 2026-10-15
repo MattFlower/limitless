@@ -8,6 +8,7 @@ import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { summarize } from "./evals/stats.ts";
+import { gateExecutorFor } from "./gates/executor.ts";
 import { gateSlots } from "./gates/slots.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
@@ -34,6 +35,7 @@ import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  gateExecutor?: EngineDeps["gateExecutor"];
   confinement?: EngineDeps["confinement"];
   faults?: EngineDeps["faults"];
   bootSha?: string;
@@ -168,6 +170,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
+      gateExecutor: opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor),
       confinement: opts.confinement ?? seatbeltForPort(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
@@ -204,6 +207,7 @@ export class Factory {
       ciReruns: cfg.githubCiReruns,
       client: getGitHubPr,
       confinement: this.deps.confinement,
+      gateExecutor: this.deps.gateExecutor,
       ...opts.land,
     });
     this.concierge = new Concierge(this);

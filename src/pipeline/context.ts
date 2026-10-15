@@ -22,6 +22,7 @@ import type {
 import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
+import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
@@ -46,6 +47,7 @@ import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schem
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  gateExecutor?: GateExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
   faults?: FaultPlan;
   gh?: GhRunner;
@@ -81,6 +83,7 @@ export interface RunState {
   reviewLenses?: RepoReviewLens[];
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
+  gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
@@ -297,7 +300,8 @@ export class RunContext {
     this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
-    this.state = deps.store.getRunState<RunState>(run.id) ?? {
+    const stored = deps.store.getRunState<RunState>(run.id);
+    this.state = stored ?? {
       flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
       phase: "prepare",
       answers: [],
@@ -308,6 +312,9 @@ export class RunContext {
       toolCommands: [],
     };
     this.state = redactGateData(this.state);
+    // Executable inputs must survive reload literally; diagnostics still need legacy redaction.
+    if (stored?.gatesConfig) this.state.gatesConfig = stored.gatesConfig;
+    if (stored?.baselineScripts) this.state.baselineScripts = stored.baselineScripts;
   }
 
   get store(): Store {

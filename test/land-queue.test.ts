@@ -1035,6 +1035,35 @@ test.each([
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
+test("colliding sanitized base gate names block landing without exposing credentials", async () => {
+  const secret = "synthetic-land-gate-name-collision-486";
+  registerCredential("land-gate-name-collision", secret);
+  writeFileSync(
+    join(seed, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = "check [redacted]", run = "true" }, { name = "check ${secret}", run = "true" }]\n`,
+  );
+  await sh(["git", "commit", "-qam", "colliding base gates"], { cwd: seed });
+  await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  const q = queue();
+  const entry = await q.request({ target: pr.run.id });
+  await settle();
+  const blocked = store.getLandEntry(entry.id);
+  expect(blocked).toMatchObject({
+    state: "blocked",
+    reason: '.limitless.toml gate names must stay distinct once sanitized: "check [redacted]"',
+  });
+  const feed = store.readFeed({ limit: 100 }).items;
+  expect(feed.some((item) => item.kind === "land.blocked")).toBe(true);
+  expect(JSON.stringify([blocked?.reason, feed, landLog])).not.toContain(secret);
+  expect(gateLog()).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(await remoteHead("pr-1")).toBe(head);
+});
+
 test("stopping mid-check leaves a later entry unstarted", async () => {
   rmSync(gateReleasePath());
   const first = delivered(1, "pr-1");

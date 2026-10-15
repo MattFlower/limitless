@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { redactGateOutput } from "./output.ts";
 
 export interface GateCommand {
   name: string;
@@ -40,7 +41,7 @@ export function detectGates(cwd: string): GateConfig {
       protectedPaths: Array.isArray(policy.protected_paths) ? (policy.protected_paths as string[]) : [],
     };
     if (policy.merge === "auto" || policy.merge === "pr" || policy.merge === "none") cfg.merge = policy.merge;
-    return cfg;
+    return assertDistinctGateNames(cfg);
   }
 
   const setup: string[] = [];
@@ -95,7 +96,32 @@ export function detectGates(cwd: string): GateConfig {
     }
   }
 
-  return { setup, checks, source: checks.length || setup.length ? "detected" : "none", protectedPaths: [] };
+  return assertDistinctGateNames({
+    setup,
+    checks,
+    source: checks.length || setup.length ? "detected" : "none",
+    protectedPaths: [],
+  });
+}
+
+export class GateNameCollisionError extends Error {}
+
+/**
+ * Stored gate results are sanitized on reload, so check names that only differ by terminal formatting or
+ * a registered credential (or simply repeat) can't be told apart afterwards: refuse instead of guessing.
+ * Re-checked wherever a stored configuration is compared, since credentials may be registered later.
+ */
+export function assertDistinctGateNames(cfg: GateConfig): GateConfig {
+  const names = new Set<string>();
+  for (const { name } of cfg.checks) {
+    const key = redactGateOutput(name);
+    if (names.has(key))
+      throw new GateNameCollisionError(
+        `${cfg.source} gate names must stay distinct once sanitized: "${key}"`,
+      );
+    names.add(key);
+  }
+  return cfg;
 }
 
 /** package.json script names that gate commands invoke (e.g. "bun run lint" → "lint"). */

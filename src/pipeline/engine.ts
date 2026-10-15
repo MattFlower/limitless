@@ -11,8 +11,15 @@ import {
   lockfileHash,
   singleFlight,
 } from "../gates/cache.ts";
-import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import {
+  assertDistinctGateNames,
+  detectGates,
+  type GateConfig,
+  GateNameCollisionError,
+  gateScriptNames,
+  pickScripts,
+} from "../gates/detect.ts";
+import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
@@ -22,7 +29,6 @@ import {
   gateEnv,
   retryBaselineFailures,
   retryRegressions,
-  runGates,
 } from "../gates/run.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
@@ -80,6 +86,7 @@ import {
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
+import { runGateExecution } from "./gate-execution.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -310,6 +317,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (
       verifiedFailure &&
       !(e instanceof DeliveryHeadError) &&
+      !(e instanceof GateNameCollisionError) &&
       !terminationBlocked &&
       !ctx.state.terminalReason?.startsWith("the resolution leaves no change against ")
     ) {
@@ -498,16 +506,20 @@ async function prepare(ctx: RunContext): Promise<void> {
         ? trusted.scripts
         : pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
       ctx.log(
-        `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
+        redactGateOutput(
+          `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
+        ),
       );
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const runBaseline = commandScope(wt.path, async (): Promise<GateRun> => {
-        const run = await runGates(wt.path, gates, ctx.signal, { onWait });
+        const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
         ctx.checkCancelled();
         // Retry before resetting, so a check sees the same build output as its first attempt.
-        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
+        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait, (retry) =>
+          runGateExecution(ctx, "prepare", "baseline-retry", wt.path, retry, { onWait }),
+        );
         ctx.checkCancelled();
         return retried;
       });
@@ -532,9 +544,10 @@ async function prepare(ctx: RunContext): Promise<void> {
         // A bypass still runs the baseline and refreshes the entry if it passes.
         const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
         const baseline = async (): Promise<GateRun> => {
-          const cached = bypass
-            ? null
-            : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
+          const cached =
+            bypass || ctx.state.gateExecution?.stage === "prepare"
+              ? null
+              : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
           if (cached && cacheableBaseline(cached, gates)) {
             ctx.state.baselineCached = true;
             ctx.log(`Baseline reused from cache (${key.baseSha.slice(0, 12)})`);
@@ -557,6 +570,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
     }
+    ctx.state.baseline = redactGateData(ctx.state.baseline);
     const baseline = ctx.state.baseline;
     if (baseline) {
       store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
@@ -972,7 +986,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
 
 async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
-  const gates = ctx.state.gatesConfig as GateConfig;
+  const gates = assertDistinctGateNames(ctx.state.gatesConfig as GateConfig);
   const baseSha = ctx.run.baseSha as string;
   const merge = ctx.state.conflictRound === round;
   const previousHead = ctx.state.preRebaseHead;
@@ -1114,7 +1128,7 @@ async function oneRound(
   holdout: Promise<Error | null> | null,
 ): Promise<boolean> {
   const cwd = ctx.state.worktreePath as string;
-  const gates = ctx.state.gatesConfig as GateConfig;
+  const gates = assertDistinctGateNames(ctx.state.gatesConfig as GateConfig);
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
   const privateStrings = () => privateEntries(ctx, cwd);
   const changeDiff = () =>
@@ -1181,30 +1195,37 @@ async function oneRound(
         try {
           await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
           testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
-          let after = await runGates(cwd, gates, ctx.signal, events);
+          let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events);
           ctx.checkCancelled();
           baseTimeout = after.checks.some(
-            (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
+            (r) =>
+              r.timedOut && findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
           );
           const failed = after.checks.filter((r) => !r.ok);
           const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
           if (timeoutOnly && !baseTimeout) {
             const first = after;
-            ctx.store.putArtifact(ctx.run.id, `gates-timeout-${round}.json`, "gates", JSON.stringify(first));
-            ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
-            await ctx.save();
+            ctx.store.putArtifact(
+              ctx.run.id,
+              `gates-timeout-${round}.json`,
+              "gates",
+              JSON.stringify(redactGateData(first)),
+            );
             ctx.log(
-              `Gate checks timed out; re-running gates (timeout re-runs: ${ctx.state.gateTimeoutReruns})`,
+              `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + 1})`,
               "warn",
             );
             // The re-run starts from the committed tree too, not from what the first attempt left behind.
             await checkoutCommitted(cwd);
-            after = await runGates(cwd, gates, ctx.signal, events);
+            after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
             ctx.checkCancelled();
-            after.checks = after.checks.map((r) => ({
-              ...r,
-              firstAttempt: first.checks.find((c) => c.name === r.name),
-            }));
+            after = {
+              ...after,
+              checks: after.checks.map((r) => ({
+                ...r,
+                firstAttempt: findGateCounterpart(r, after.checks, first.checks),
+              })),
+            };
           }
           const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
           // Retry before discarding, so a check sees the same build output as its first attempt.
@@ -1212,10 +1233,14 @@ async function oneRound(
             ...c,
             firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
           }));
-          if (!baseTimeout) cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait);
+          if (!baseTimeout)
+            cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait, (retry) =>
+              runGateExecution(ctx, "gates", "regression-retry", cwd, retry, { onWait: events.onWait }),
+            );
           ctx.checkCancelled();
           baseTimeout ||= after.checks.some(
-            (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
+            (r) =>
+              r.timedOut && findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
           );
         } finally {
           // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
@@ -1225,6 +1250,7 @@ async function oneRound(
             throw error;
           });
         }
+        cmp = redactGateData(cmp);
         for (const c of cmp.filter((c) => c.firstAttempt)) {
           ctx.store.addEvent({
             runId: ctx.run.id,
@@ -2449,7 +2475,14 @@ async function mergeForDelivery(
     await ctx.stage(
       "gates",
       async () => {
-        const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
+        const after = await runGateExecution(
+          ctx,
+          "gates",
+          "rebase",
+          cwd,
+          assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
+          gateEvents(ctx),
+        );
         ctx.checkCancelled();
         await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
         await mergeGit(cwd, ["clean", "-fdq"]);
@@ -2461,18 +2494,18 @@ async function mergeForDelivery(
             : (ctx.state.baseline ?? null),
           after,
         );
-        ctx.state.lastGates = comparison;
+        ctx.state.lastGates = redactGateData(comparison);
         await ctx.save();
         ctx.store.putArtifact(
           ctx.run.id,
           `gates-rebase-${ctx.state.round}.json`,
           "gates",
-          JSON.stringify(comparison, null, 2),
+          JSON.stringify(redactGateData(comparison), null, 2),
         );
         const regressed =
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
-          previous.some((c) => c.result.ok && !after.checks.find((r) => r.name === c.name)?.ok);
+          previous.some((c) => c.result.ok && !findGateCounterpart(c, previous, after.checks)?.ok);
         if (regressed) throw new MergeRegressedError("post-merge gates regressed");
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       },

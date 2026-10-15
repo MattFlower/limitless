@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Factory } from "../src/app.ts";
+import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { mergeGit } from "../src/git/merge.ts";
@@ -205,7 +205,12 @@ export function pipelineSetup(state: PipelineFixture) {
     return join(state.home, "target");
   }
 
-  function start(handler: Handler, effortRouting = false, freeProviders = false): Factory {
+  function start(
+    handler: Handler,
+    effortRouting = false,
+    freeProviders = false,
+    options: Pick<FactoryOptions, "gateExecutor" | "faults"> = {},
+  ): Factory {
     const alpha = models[0];
     const beta = models[1];
     if (!alpha || !beta) throw new Error("missing fixture models");
@@ -231,6 +236,7 @@ export function pipelineSetup(state: PipelineFixture) {
           : models,
       policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
       bootSha: "test-build",
+      ...options,
     });
     state.factory.start();
     return state.factory;
