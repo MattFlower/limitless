@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, expect, mock, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -9,9 +12,11 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { apiTokenHeaders, readApiToken } from "../src/cli/api-token.ts";
+import { resolveClientPort } from "../src/cli/client-port.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { localDeployClient } from "../src/cli/deploy-wait.ts";
 import { localLeaseClient } from "../src/cli/gate-slot.ts";
@@ -44,6 +49,7 @@ const daemonPort = () => {
   return port;
 };
 const tokenPath = () => join(f.factory.cfg.paths.home, "api-token");
+const originPath = () => `${tokenPath()}.origin`;
 beforeAll(async () => {
   f = await fixture();
   f.factory.cfg.port = 0;
@@ -73,6 +79,298 @@ const exempt = (path: string) =>
   path === "/enroll" ||
   path.startsWith("/api/auth/passkey/") ||
   path === "/api/auth/logout";
+
+test("token headers match normalized origins, fall back for stale bindings and reject invalid records", () => {
+  const home = mkdtempSync(join(tmpdir(), "limitless-token-origin-"));
+  const previousHome = process.env.LIMITLESS_HOME;
+  const previousPort = process.env.LIMITLESS_PORT;
+  const previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
+  process.env.LIMITLESS_HOME = home;
+  process.env.LIMITLESS_CONFIG_DIR = home;
+  delete process.env.LIMITLESS_PORT;
+  const secret = "a".repeat(64);
+  const path = join(home, "api-token.origin");
+  const bind = (origin: string, value = secret) =>
+    writeFileSync(
+      path,
+      JSON.stringify({ origin, tokenHash: createHash("sha256").update(value).digest("hex") }),
+    );
+  try {
+    writeFileSync(join(home, "api-token"), secret);
+    const expected = { authorization: `Bearer ${secret}` };
+    expect(apiTokenHeaders("http://127.0.0.1:7400/api/runs")).toEqual(expected);
+    for (const url of ["http://127.0.0.1:7401", "http://localhost:7400", "https://127.0.0.1:7400"])
+      expect(apiTokenHeaders(url)).toEqual({});
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
+    expect(apiTokenHeaders("http://127.0.0.1:7412/api/runs")).toEqual(expected);
+    for (const url of ["http://127.0.0.1:7400", "http://localhost:7412", "https://127.0.0.1:7412"])
+      expect(apiTokenHeaders(url)).toEqual({});
+    process.env.LIMITLESS_PORT = "7401";
+    expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual(expected);
+    expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+    expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+    expect(apiTokenHeaders("http://127.0.0.1:7413", home, 7413)).toEqual(expected);
+    expect(apiTokenHeaders("http://127.0.0.1:7401", home, 7413)).toEqual({});
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 49752\n");
+    for (const [env, selected] of [
+      ["+49751", 49751],
+      ["7413.0", 7413],
+      ["1e3", 1000],
+      ["0x1cf4", 7412],
+    ] as const) {
+      process.env.LIMITLESS_PORT = env;
+      expect(loadConfig({ readOnly: true }).port).toBe(selected);
+      expect(resolveClientPort()).toBe(selected);
+      for (const stale of [false, true]) {
+        if (stale) bind("http://127.0.0.1:49752", "b".repeat(64));
+        expect(apiTokenHeaders(`http://127.0.0.1:${selected}`)).toEqual(expected);
+        for (const url of [
+          "http://127.0.0.1:49752",
+          `http://localhost:${selected}`,
+          `https://127.0.0.1:${selected}`,
+        ])
+          expect(apiTokenHeaders(url)).toEqual({});
+      }
+      rmSync(path);
+    }
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
+    process.env.LIMITLESS_PORT = "7400@evil.example";
+    expect(apiTokenHeaders("http://evil.example")).toEqual({});
+    for (const invalid of ["", "0", "NaN", "7400@evil.example"]) {
+      process.env.LIMITLESS_PORT = invalid;
+      expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual(expected);
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+    }
+    for (const [invalid, selected] of [
+      ["-1", -1],
+      ["65536", 65536],
+      ["7412.5", 7412.5],
+      ["Infinity", 7400],
+    ] as const) {
+      process.env.LIMITLESS_PORT = invalid;
+      expect(loadConfig({ readOnly: true }).port).toBe(selected);
+      expect(resolveClientPort()).toBe(selected);
+      expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+    }
+    delete process.env.LIMITLESS_PORT;
+    for (const [invalid, selected] of [
+      ["0", 0],
+      ["-1", -1],
+      ["65536", 65536],
+      ["7412.5", 7412.5],
+      ['"7412"', 7400],
+      ["true", 7400],
+      ['"7400@evil.example"', 7400],
+      ["inf", 7400],
+      ["nan", 7400],
+    ] as const) {
+      writeFileSync(join(home, "config.toml"), `[server]\nport = ${invalid}\n`);
+      expect(loadConfig({ readOnly: true }).port).toBe(selected);
+      expect(resolveClientPort()).toBe(selected);
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+      expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+    }
+    writeFileSync(join(home, "config.toml"), "[server]\n");
+    expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual(expected);
+    for (const invalid of [0, -1, 65536, 7412.5, Number.NaN, Number.POSITIVE_INFINITY])
+      expect(apiTokenHeaders("http://127.0.0.1:7400", home, invalid)).toEqual({});
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7412\n");
+    process.env.LIMITLESS_PORT = "7401";
+    bind("http://127.0.0.1");
+    expect(apiTokenHeaders("HTTP://127.0.0.1:80/a?b=1#c")).toEqual(expected);
+    for (const url of [
+      "http://127.0.0.1:81",
+      "http://localhost",
+      "http://[::1]",
+      "https://127.0.0.1",
+      "https://127.0.0.1:80",
+      "http://127.0.0.1.example.com",
+      "blob:http://127.0.0.1/id",
+      "invalid",
+    ])
+      expect(apiTokenHeaders(url)).toEqual({});
+    for (const record of ["{", "null", "{}", JSON.stringify({ origin: "http://127.0.0.1" })]) {
+      writeFileSync(path, record);
+      expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+    }
+    delete process.env.LIMITLESS_PORT;
+    bind("http://127.0.0.1:7401", "b".repeat(64));
+    expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual(expected);
+    expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+    for (const url of ["http://127.0.0.1:7400", "http://localhost:7412", "https://127.0.0.1:7412"])
+      expect(apiTokenHeaders(url)).toEqual({});
+    process.env.LIMITLESS_PORT = "7401";
+    expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual(expected);
+    expect(apiTokenHeaders("http://127.0.0.1:7412")).toEqual({});
+    for (const origin of ["garbage", "file:///", "http://127.0.0.1:7401/path"]) {
+      for (const value of [secret, "b".repeat(64)]) {
+        bind(origin, value);
+        expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+      }
+    }
+    rmSync(path);
+    mkdirSync(path);
+    expect(apiTokenHeaders("http://127.0.0.1:7401")).toEqual({});
+    expect(redactCredentials(`failure: ${secret}`)).toBe("failure: [redacted]");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.LIMITLESS_HOME;
+    else process.env.LIMITLESS_HOME = previousHome;
+    if (previousPort === undefined) delete process.env.LIMITLESS_PORT;
+    else process.env.LIMITLESS_PORT = previousPort;
+    if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
+  }
+});
+
+test("CLI uses the configured port and its environment override for an older daemon", async () => {
+  const home = mkdtempSync(join(tmpdir(), "limitless-token-config-"));
+  const secret = "c".repeat(64);
+  const seen: (string | null)[] = [];
+  const stub = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      seen.push(req.headers.get("authorization"));
+      return Response.json([]);
+    },
+  });
+  try {
+    writeFileSync(join(home, "api-token"), secret);
+    writeFileSync(join(home, "config.toml"), `[server]\nport = ${stub.port}\n`);
+    const env: Record<string, string> = { ...process.env, LIMITLESS_HOME: home, LIMITLESS_CONFIG_DIR: home };
+    delete env.LIMITLESS_URL;
+    delete env.LIMITLESS_PORT;
+    for (const stale of [false, true]) {
+      if (stale)
+        writeFileSync(
+          join(home, "api-token.origin"),
+          JSON.stringify({ origin: "https://example.com", tokenHash: "stale" }),
+        );
+      const result = await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
+        cwd: home,
+        env,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+    }
+    writeFileSync(join(home, "config.toml"), "[server]\nport = 7400\n");
+    expect(
+      (
+        await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
+          cwd: home,
+          env: { ...env, LIMITLESS_PORT: `+${stub.port}` },
+        })
+      ).exitCode,
+    ).toBe(0);
+    expect(seen).toEqual(Array(3).fill(`Bearer ${secret}`));
+  } finally {
+    await stub.stop(true);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test.each(["unreadable", "invalid TOML", "invalid port", "unrelated setting", "environment override"])(
+  "CLI, lease, deploy and MCP requests tolerate %s configuration",
+  async (kind) => {
+    const home = mkdtempSync(join(tmpdir(), "limitless-client-config-"));
+    const config = join(home, "config.toml");
+    const secret = "d".repeat(64);
+    const keys = ["LIMITLESS_HOME", "LIMITLESS_CONFIG_DIR", "LIMITLESS_PORT", "LIMITLESS_URL"];
+    const previous = keys.map((key) => process.env[key]);
+    const seen: (string | null)[] = [];
+    const stub = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seen.push(req.headers.get("authorization"));
+        if (new URL(req.url).pathname === "/api/health")
+          return Response.json({ ok: true, uptimeMs: 0, draining: false, active: [] });
+        return Response.json(
+          new URL(req.url).pathname === "/api/admin/gate-slot" ? { id: "lease", acquired: true } : [],
+        );
+      },
+    });
+    const base = `http://127.0.0.1:${stub.port}`;
+    try {
+      process.env.LIMITLESS_HOME = home;
+      process.env.LIMITLESS_CONFIG_DIR = home;
+      process.env.LIMITLESS_URL = base;
+      delete process.env.LIMITLESS_PORT;
+      writeFileSync(join(home, "api-token"), secret);
+      writeFileSync(
+        config,
+        kind === "invalid TOML"
+          ? `credential = "${secret}"\n[server\n`
+          : `[server]\nport = ${kind === "invalid port" ? '"7400"' : stub.port}\n[review]\nmode = "invalid"\n`,
+      );
+      if (kind === "unreadable" || kind === "environment override") chmodSync(config, 0);
+      if (kind === "environment override") process.env.LIMITLESS_PORT = `+${stub.port}`;
+      const authorized = kind === "unrelated setting" || kind === "environment override";
+      expect(apiTokenHeaders(base)).toEqual(authorized ? { authorization: `Bearer ${secret}` } : {});
+      expect(apiTokenHeaders("http://127.0.0.1:7400")).toEqual({});
+      const result = await sh([process.execPath, join(import.meta.dir, "../src/cli/main.ts"), "ls"], {
+        cwd: home,
+        env: { ...process.env, LIMITLESS_URL: base },
+        allowFail: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+      await expect(httpBackend(base).list(undefined, 20)).resolves.toEqual([]);
+      const lease = localLeaseClient();
+      const originalFetch = globalThis.fetch;
+      const requestUrls: string[] = [];
+      // Forward the default-port request to our port-0 server without occupying a shared port.
+      const forward = spyOn(globalThis, "fetch").mockImplementation(
+        Object.assign(
+          (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            requestUrls.push(String(url));
+            return originalFetch(`${base}${new URL(String(url)).pathname}`, init);
+          },
+          { preconnect: fetch.preconnect },
+        ),
+      );
+      try {
+        await expect(lease({ name: "test" }, new AbortController().signal)).resolves.toEqual({
+          id: "lease",
+          acquired: true,
+        });
+        // `limitless deploy` builds its lease client from the routing port.
+        await expect(
+          localLeaseClient(resolveClientPort())({ name: "deploy" }, new AbortController().signal),
+        ).resolves.toEqual({ id: "lease", acquired: true });
+        await expect(
+          localDeployClient(resolveClientPort()).health(new AbortController().signal),
+        ).resolves.toMatchObject({ ok: true });
+      } finally {
+        forward.mockRestore();
+      }
+      const routedBase = `http://127.0.0.1:${authorized ? stub.port : 7400}`;
+      expect(requestUrls).toEqual([
+        `${routedBase}/api/admin/gate-slot`,
+        `${routedBase}/api/admin/gate-slot`,
+        `${routedBase}/api/health`,
+      ]);
+      expect(seen).toEqual([
+        authorized ? `Bearer ${secret}` : null,
+        authorized ? `Bearer ${secret}` : null,
+        authorized ? `Bearer ${secret}` : null,
+        authorized ? `Bearer ${secret}` : null,
+        authorized ? `Bearer ${secret}` : null,
+      ]);
+    } finally {
+      keys.forEach((key, i) => {
+        const value = previous[i];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      });
+      await stub.stop(true);
+      chmodSync(config, 0o600);
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test("all registered mutations, admin routes and MCP require credentials", async () => {
   const routes = createHttpRoutes(f.factory, { routes: { "/mcp": () => new Response("ok") } });
@@ -332,7 +630,7 @@ test("the lease client sends an agent's capability, never the API token, as its 
   const capability = "11111111-1111-4111-8111-111111111111";
   try {
     await localLeaseClient(1)({ token: capability, name: "bun test" }, new AbortController().signal);
-    await localLeaseClient(1)({ name: "deploy" }, new AbortController().signal);
+    await localLeaseClient(daemonPort())({ name: "deploy" }, new AbortController().signal);
     const sent = fetcher.mock.calls.map(([, init]) => new Headers(init?.headers).get("authorization"));
     expect(sent).toEqual([`Bearer ${capability}`, `Bearer ${token}`]);
   } finally {
@@ -370,6 +668,11 @@ function editorSpec(): AgentSpec {
 
 test("startup rotates a private 0600 token protected in every sandbox spelling", async () => {
   expect(statSync(tokenPath()).mode & 0o777).toBe(0o600);
+  expect(statSync(originPath()).mode & 0o777).toBe(0o600);
+  expect(JSON.parse(readFileSync(originPath(), "utf8"))).toEqual({
+    origin: base,
+    tokenHash: createHash("sha256").update(token).digest("hex"),
+  });
   expect(token).toMatch(/^[a-f0-9]{64}$/);
   expect(redactCredentials(token)).toBe("[redacted]");
   const spec = editorSpec();
@@ -383,7 +686,7 @@ test("startup rotates a private 0600 token protected in every sandbox spelling",
   const rotated = createApiToken(alias);
   try {
     const path = join(alias, "api-token");
-    for (const spelling of [path, realpathSync(path)]) {
+    for (const spelling of [path, realpathSync(path), `${path}.origin`, realpathSync(`${path}.origin`)]) {
       expect(privateReadPaths()).toContain(spelling);
       expect(buildCodexArgs(spec).join(" ")).toContain(`${JSON.stringify(spelling)}="none"`);
       expect(seatbeltProfile(writeRoots(spec.cwd, spec.scratchDir ?? ""))).toContain(
@@ -404,6 +707,8 @@ test("startup rotates a private 0600 token protected in every sandbox spelling",
   expect(next).not.toBe(token);
   expect(next).not.toBe(rotated.token);
   token = next;
+  expect(apiTokenHeaders(base, f.factory.cfg.paths.home)).toEqual({ authorization: `Bearer ${next}` });
+  expect(JSON.parse(readFileSync(originPath(), "utf8")).origin).toBe(base);
 });
 
 test("startup protects a not-yet-published token before resuming queued land checks", async () => {
@@ -425,12 +730,14 @@ test("startup protects a not-yet-published token before resuming queued land che
   const land = spyOn(startup.factory.land, "start").mockImplementation(() => {
     expect(startup.factory.land.list()[0]?.state).toBe("queued");
     expect(privateReadPaths()).toContain(path);
+    expect(privateReadPaths()).toContain(`${path}.origin`);
     observations.push(seatbeltProfile(writeRoots(startup.repo, scratch)));
     expect(() => readFileSync(path)).toThrow();
   });
   const start = spyOn(startup.factory, "start").mockImplementation(() => {
     expect(privateReadPaths()).toContain(path);
     expect(readFileSync(path, "utf8")).toMatch(/^[a-f0-9]{64}$/);
+    expect(statSync(`${path}.origin`).mode & 0o777).toBe(0o600);
   });
   let running: Awaited<ReturnType<typeof startDaemon>> | undefined;
   try {
@@ -452,6 +759,7 @@ test("startup protects a not-yet-published token before resuming queued land che
     await startup.close();
   }
   expect(privateReadPaths()).not.toContain(path);
+  expect(privateReadPaths()).not.toContain(`${path}.origin`);
 });
 
 test("with enforcement on, the daemon accepts a live agent-test capability for gate-slot only", async () => {
@@ -695,6 +1003,7 @@ for (const owner of ["startHttp", "startDaemon"] as const) {
 
 test("failed binds never replace the running daemon's token or leak private path registrations", async () => {
   const before = readFileSync(tokenPath());
+  const originBefore = readFileSync(originPath());
   const paths = privateReadPaths();
   const previous = process.env.LIMITLESS_HOME;
   process.env.LIMITLESS_HOME = f.factory.cfg.paths.home;
@@ -710,9 +1019,10 @@ test("failed binds never replace the running daemon's token or leak private path
       }) as unknown as typeof Bun.serve<undefined>;
       await expect(startHttp(f.factory, {}, bind)).rejects.toThrow("injected bind failure");
       expect(readFileSync(tokenPath())).toEqual(before);
+      expect(readFileSync(originPath())).toEqual(originBefore);
       expect(privateReadPaths()).toEqual(paths);
       if (failedBind === 2) expect(stop).toHaveBeenCalledWith(true);
-      expect((await fetch(`${base}/api/runs`, { headers: apiTokenHeaders() })).status).toBe(200);
+      expect((await fetch(`${base}/api/runs`, { headers: apiTokenHeaders(base) })).status).toBe(200);
       const lease = localLeaseClient(daemonPort());
       const held = await lease({ name: "failed-second-start" }, new AbortController().signal);
       expect(held.acquired).toBe(true);
@@ -721,6 +1031,7 @@ test("failed binds never replace the running daemon's token or leak private path
     // Refcounts, not just membership: stopping the owner must remove the final registration.
     await server.stop(true);
     expect(privateReadPaths()).not.toContain(tokenPath());
+    expect(privateReadPaths()).not.toContain(originPath());
     f.factory.cfg.listenLan = lanBefore;
     server = await startHttp(f.factory);
     base = `http://127.0.0.1:${server.port}`;
@@ -797,7 +1108,7 @@ test("local clients authenticate, pick up rotation, omit missing tokens and keep
       await lease({ id: renewed.id, release: true }, signal);
       renameSync(tokenPath(), `${tokenPath()}.missing`);
       try {
-        expect(apiTokenHeaders()).toEqual({});
+        expect(apiTokenHeaders(base)).toEqual({});
         expect(readApiToken()).toBeNull();
         mkdirSync(tokenPath());
         try {
@@ -844,18 +1155,30 @@ test("local clients authenticate, pick up rotation, omit missing tokens and keep
   }
 });
 
-test("clients preserve daemon authentication errors, and doctor sends the token for access reads", async () => {
-  const message = "API token required: update the limitless CLI";
+test("clients omit another daemon's token and redact authentication errors and diagnostics", async () => {
+  const previous = process.env.LIMITLESS_HOME;
+  process.env.LIMITLESS_HOME = f.factory.cfg.paths.home;
+  const message = `API token required: update the limitless CLI (${token})`;
+  const safeMessage = "API token required: update the limitless CLI ([redacted])";
+  const seen: (string | null)[] = [];
   const accessHeaders: (string | null)[] = [];
   const stub = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(req) {
+      seen.push(req.headers.get("authorization"));
       const path = new URL(req.url).pathname;
       if (path === "/api/health") return Response.json({ ok: true, sha: "test" });
       if (path === "/api/github/access") {
         accessHeaders.push(req.headers.get("authorization"));
-        return Response.json([]);
+        return Response.json([
+          {
+            repo: "test/repo",
+            since: 0,
+            reason: "ip",
+            detail: `denied ${token}`,
+          },
+        ]);
       }
       if (path.endsWith("/events")) return Response.json([]);
       if (path === "/api/runs" && req.method === "POST")
@@ -867,8 +1190,27 @@ test("clients preserve daemon authentication errors, and doctor sends the token 
   if (!port) throw new Error("stub has no port");
   try {
     const signal = new AbortController().signal;
-    await expect(localLeaseClient(port)({ name: "test" }, signal)).rejects.toThrow(`HTTP 401: ${message}`);
-    await expect(localDeployClient(port).admin("drain", signal)).rejects.toThrow(`HTTP 401: ${message}`);
+    await expect(localLeaseClient(port)({ name: "test" }, signal)).rejects.toThrow(
+      `HTTP 401: ${safeMessage}`,
+    );
+    await expect(localDeployClient(port).admin("drain", signal)).rejects.toThrow(`HTTP 401: ${safeMessage}`);
+    await expect(httpBackend(`http://127.0.0.1:${port}`).detail("test")).rejects.toThrow(safeMessage);
+    const escaped = JSON.stringify({ error: message }).replace(
+      /[0-9a-f]/g,
+      (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    const escapedError = await httpBackend(
+      `http://127.0.0.1:${port}`,
+      async () => new Response(escaped, { status: 401 }),
+    )
+      .detail("test")
+      .then(
+        () => "",
+        (e: Error) => e.message,
+      );
+    expect(escapedError).toContain(safeMessage);
+    expect(escapedError).not.toContain(token);
+    expect(escapedError).not.toContain(escaped.slice(escaped.indexOf(":") + 2, -2));
     const cli = await sh(
       [
         process.execPath,
@@ -886,17 +1228,26 @@ test("clients preserve daemon authentication errors, and doctor sends the token 
       },
     );
     expect(cli.exitCode).not.toBe(0);
-    expect(cli.stderr).toContain(`401: ${message}`);
+    expect(cli.stderr).toContain(
+      `401: API token withheld because the requested origin differs from its bound origin ${base}.`,
+    );
+    expect(cli.stdout + cli.stderr).not.toContain(token);
     const deps = setupDeps({ home: f.factory.cfg.paths.home, configDir: f.factory.cfg.paths.configDir });
-    await doctor({
+    const diagnostics = await doctor({
       ...deps,
       url: `http://127.0.0.1:${stub.port}`,
       run: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
       readJson: async () => null,
     });
-    expect(accessHeaders).toEqual([`Bearer ${token}`]);
+    expect(accessHeaders).toEqual([null]);
+    expect(JSON.stringify(diagnostics)).not.toContain(token);
+    expect(JSON.stringify(diagnostics)).toContain("denied [redacted]");
+    expect(seen.length).toBeGreaterThan(5);
+    expect(seen.every((header) => header === null)).toBe(true);
   } finally {
     await stub.stop(true);
+    if (previous === undefined) delete process.env.LIMITLESS_HOME;
+    else process.env.LIMITLESS_HOME = previous;
   }
 });
 

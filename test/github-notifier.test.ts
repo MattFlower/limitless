@@ -184,6 +184,61 @@ test("merged PR resolves once, preserves evidence, and survives reopening", asyn
   expect(store.listEvents(id).filter((event) => event.type === "status")).toHaveLength(2);
 });
 
+test("reconciliation resolves a persisted PR owner and all rounds together without superseding them", async () => {
+  const id = needsHuman();
+  const owner = store.updateRun(id, { branch: `limitless/${id}-fix` });
+  const repo = store.getRepo(owner.repoId);
+  if (!repo) throw new Error("missing owner repository");
+  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("owner\nCloses #42", id);
+  const rounds = [];
+  for (let i = 0; i < 2; i++) {
+    const result = store.createReviewRound(
+      repo,
+      owner,
+      { prUrl, reviewedSha: SHA, findings: [], cap: 3 },
+      (round) => ({
+        repo: repo.slug,
+        prompt: "round\nCloses #42",
+        baseBranch: owner.branch ?? undefined,
+        deliveryBranch: owner.branch ?? undefined,
+        sourceRef: { kind: "review-round", runId: id, round, prUrl, reviewedSha: SHA },
+      }),
+    );
+    if (!("run" in result)) throw new Error("round refused");
+    rounds.push(result.run.id);
+    store.updateRun(result.run.id, { status: "needs_human", finishedAt: 123, error: "round review" });
+  }
+  const other = needsHuman(`${prUrl}0`);
+  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("other PR\nCloses #42", other);
+  store.close();
+  store = new Store(join(dir, "store.db"));
+  const client = mock(async (url: string) =>
+    url === prUrl
+      ? {
+          url,
+          state: "MERGED",
+          mergedAt: "2026-09-27T20:00:00Z",
+          mergedBy: { login: "owner" },
+        }
+      : null,
+  );
+  await reconcileMergedRuns(store, client);
+  for (const runId of [id, ...rounds]) {
+    expect(store.getRun(runId)).toMatchObject({
+      status: "resolved",
+      merged: true,
+      mergedBy: "owner",
+      resolution: { kind: "merged", ref: prUrl },
+    });
+  }
+  for (const runId of rounds)
+    expect(store.getRun(runId)).toMatchObject({ finishedAt: 123, error: "round review" });
+  expect(store.getRun(other)?.resolution?.kind).toBe("superseded");
+  store.close();
+  store = new Store(join(dir, "store.db"));
+  for (const runId of [id, ...rounds]) expect(store.getRun(runId)?.resolution?.kind).toBe("merged");
+});
+
 test("a needs_human run with a pre-recorded merge still gets its resolution and metadata", async () => {
   const id = needsHuman();
   store.updateRun(id, { merged: true });
@@ -201,6 +256,28 @@ test("a needs_human run with a pre-recorded merge still gets its resolution and 
     resolution: { kind: "merged" },
   });
   expect(store.readFeed().items.filter((item) => item.kind === "run.merged")).toHaveLength(1);
+});
+
+test("merged runs with permanently missing metadata never spend reconciliation requests", async () => {
+  const ids = [needsHuman(), needsHuman(`${prUrl}0`), needsHuman(`${prUrl}1`)];
+  for (const [i, id] of ids.entries())
+    store.updateRun(id, {
+      status: "succeeded",
+      merged: true,
+      mergedBy: i === 1 ? "owner" : null,
+      mergedAt: i === 2 ? 123456 : null,
+    });
+  const live = needsHuman(`${prUrl}2`);
+  const client = mock(async (url: string) => ({ url, state: "OPEN", mergedAt: null, mergedBy: null }));
+  for (const elapsed of [0, 300_000, 2 * 86_400_000])
+    await reconcileMergedRuns(
+      store,
+      client,
+      () => {},
+      () => Date.now() + elapsed,
+    );
+  expect(client.mock.calls.map(([url]) => url)).toEqual(Array(3).fill(`${prUrl}2`));
+  expect(store.getRun(live)?.merged).toBe(false);
 });
 
 test("only an exact merged PR resolves; failures remain retryable", async () => {

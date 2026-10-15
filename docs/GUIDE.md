@@ -246,6 +246,17 @@ the value is saved for resume and review. Unset or `[]` leaves agent PATH unchan
 Invalid values warn and disable slotting: use nonempty command strings with executable
 names, without path separators. Prefixes match argv tokens, including calls inside shell
 commands and package scripts; absolute executable paths bypass PATH wrappers.
+Wrappers cover shells that preserve the supplied PATH (including non-login sh and bash),
+and non-interactive zsh, including login zsh. Tool-enabled Codex and Claude invocations
+use a factory-owned `ZDOTDIR` in scratch, even without wrappers, so zsh reads none of
+`~/.zshenv`, `~/.zprofile`, `~/.zshrc` or `~/.zlogin`. Its startup files restore wrappers to
+the front of PATH after system login setup. Two gaps remain. The Claude CLI builds its shell
+snapshot by sourcing `~/.zshrc` directly, whatever `ZDOTDIR` says. The snapshot ends by
+exporting the PATH the factory supplied, so wrappers stay first, but an alias or function
+from that file named after a slotted command still runs instead of the wrapper. And an
+interactive non-login zsh (`zsh -i -c`) reads the system `/etc/zshrc` after the last
+restore; macOS's stock one leaves PATH alone. Other shells whose startup replaces PATH are
+not covered.
 
 Bare matched commands use the shared gate lane (`max_concurrent_gates`). File/path
 arguments or `-t`/`--test-name-pattern` use a separate small lane, fixed at two concurrent
@@ -1187,9 +1198,11 @@ Continue with `after` set to the returned `nextAfter`; do not combine `from` and
 An `after` past the end clamps to the highest issued ID so the next read can receive new items.
 
 Use `repo` for an exact repository slug match (the run's `repoSlug`), and `ownRuns: true` with
-`consumer` to see only runs created through MCP with that same consumer name. Pass `consumer`
-on `limitless_create_run` as well as feed reads. Runs from other sources, older runs without
-recorded provenance, and items without a run are excluded. Combined filters must both match;
+`consumer` to see runs created through MCP with that same consumer name and their review,
+conflict and CI fix rounds. Round ownership comes from the recorded parent run, regardless of
+the round's own source. Pass `consumer` on `limitless_create_run` as well as feed reads.
+Unrelated runs, older runs without recorded provenance, and items without a run are excluded.
+Combined filters must both match, including when waiting for new items;
 pagination and `hasMore` count matching items only. Consumer names are caller-supplied labels,
 not access control. Acknowledgements remain cumulative across filters, so use separate consumer
 names for independently acknowledged inboxes.
@@ -1282,12 +1295,16 @@ A changes verdict creates a new run on the **same PR branch**, preserving the or
 Review, conflict and CI fix rounds share sequential numbering starting at 1; each gets its own
 run ID and recorded reviewed/delivered SHA. The PR body appends a `Round <n>` section for
 addressed review findings. These are separate from the implementation loop's round counter.
+Round feed titles identify the kind and shared PR sequence: a conflict round 1 can be followed
+by a review round 2.
 
 The original run's **base commit** supplies `[policy] review_rounds` in `.limitless.toml`:
 default 3, any non-negative safe integer accepted, 0 allows no review repair rounds. Only review
 rounds count against this cap. At the cap, `review round limit reached` leaves the owner
-`needs_human`. `review round <n> (<run-id>) is still in flight` refuses another changes verdict
-while any kind of round is active; follow that run first.
+`needs_human`. An in-flight 409 names the active kind, shared round number and run ID. It refuses
+another changes verdict without queueing it. Review the new head after that kind's delivered
+event (`review.round_delivered`, `conflict.round_delivered` or `ci.round_delivered`) and resubmit
+against its SHA. If the round ends without delivery, inspect its status first.
 
 A changes verdict stales earlier approval, even when the cap prevents a new round. A delivered
 new head also stales approval of an older head. Inspect the delivered work and submit a **fresh
@@ -1500,6 +1517,15 @@ Omit `api_key_env` for CLI login authentication or an unauthenticated server. Li
 fields such as `apiKey` are rejected. During this migration only, the deprecated built-in
 mtplx provider retains its internal static-token fallback under its original ID; export omits
 that token. An explicit `api_key_env` replaces the fallback.
+
+**An agent can read its backend's token.** When an agent works through an
+`anthropic-compatible` provider, the factory writes the provider's key to a mode-0600 file in
+its own temporary directory for that invocation, and the Claude CLI reads it from there. The
+key stays out of the agent's environment, but the agent's tools run as the same user and are
+not denied reads of that file while the invocation runs, so an agent can print the token.
+Give each such provider a token scoped to that backend alone, with no other privileges and a
+spending limit where the backend offers one, and rotate it if a run may have exposed it. Local
+servers that need no key carry no such risk (#335).
 
 Part 1 keeps built-ins alongside configured providers: a matching ID takes precedence;
 omission does not remove a provider. Startup notes identify implicit deprecated machine

@@ -90,6 +90,10 @@ function json(v: unknown): string | null {
 
 const FEED_SELECT =
   "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
+// A persisted round belongs to its parent, regardless of the round run's own source.
+const FEED_OWNERSHIP = `EXISTS (SELECT 1 FROM runs WHERE runs.id = COALESCE(
+  (SELECT source_run_id FROM review_rounds WHERE run_id = feed.run_id), feed.run_id)
+  AND source = 'mcp' AND requested_by = ?)`;
 type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
@@ -105,7 +109,21 @@ const LAND_PATCH_COLUMNS: Record<string, string> = {
   attempts: "attempts",
   reason: "reason",
 };
-const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
+const toFeedItem = (r: Row): FeedItem => {
+  const item = { ...r, data: parse(r.data, {}) } as FeedItem;
+  if (
+    [
+      "review.round_started",
+      "review.round_delivered",
+      "conflict.round_started",
+      "conflict.round_delivered",
+      "ci.round_started",
+      "ci.round_delivered",
+    ].includes(item.kind)
+  )
+    item.title += " (shared PR round sequence)";
+  return item;
+};
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
 const AUTH_SESSION_SELECT =
@@ -647,8 +665,8 @@ export class Store {
     }
   }
 
-  /** Publish only after commit, including the run and its proposal linkage. */
-  private chatTransaction<T>(fn: () => T): T {
+  /** Buffer publications until the outermost store transaction commits; discard them on rollback. */
+  transaction<T>(fn: () => T): T {
     if (this.pendingPublications) return fn();
     const messages: StreamMessage[] = [];
     this.pendingPublications = messages;
@@ -697,8 +715,7 @@ export class Store {
     const limit = Math.min(opts.limit ?? MAX_FEED_ITEMS, 1000);
     const query = this.db.query(`${FEED_SELECT} WHERE id > ?
       AND (? IS NULL OR repo = ?)
-      AND (? = 0 OR EXISTS (SELECT 1 FROM runs WHERE runs.id = feed.run_id
-        AND source = 'mcp' AND requested_by = ?)) ORDER BY id LIMIT ?`);
+      AND (? = 0 OR ${FEED_OWNERSHIP}) ORDER BY id LIMIT ?`);
     const items = (
       query.all(
         after,
@@ -725,6 +742,13 @@ export class Store {
 
   feedCursor(consumer: string): number {
     return this.feedNumber("SELECT acked_id AS n FROM feed_cursors WHERE consumer = ?", consumer);
+  }
+
+  /** Use the read filter for long-poll publications too. */
+  feedItemOwnedBy(id: number, consumer: string): boolean {
+    return !!this.db
+      .query(`SELECT 1 FROM feed WHERE id = ? AND ${FEED_OWNERSHIP}`)
+      .get(id, mcpRequestedBy(consumer));
   }
 
   /** The highest id ever issued, counting AUTOINCREMENT gaps and pruned items. */
@@ -836,7 +860,7 @@ export class Store {
   }
 
   proposeChat(conversationId: string, fields: ChatProposalFields, origin: ChatOrigin): ChatProposal {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const current = this.listChatProposals(conversationId).find(
         (p) => p.state === "pending" || p.state === "confirmed",
       );
@@ -871,7 +895,7 @@ export class Store {
   }
 
   confirmChat(conversationId: string, id: string): ChatProposal {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const proposal = this.chatProposal(conversationId, id);
       if (proposal.state === "superseded")
         throw new Error("Proposal has been superseded; confirm the current proposal");
@@ -886,7 +910,7 @@ export class Store {
   }
 
   resetChatConfirmation(conversationId: string, id: string): void {
-    this.chatTransaction(() => {
+    this.transaction(() => {
       const proposal = this.chatProposal(conversationId, id);
       // Creation can fail before consumption; never undo a committed run linkage.
       if (proposal.state !== "confirmed" || proposal.runId) return;
@@ -903,7 +927,7 @@ export class Store {
   }
 
   createChatRun(repo: Repo, req: CreateRunRequest, conversationId: string, proposalId: string): Run {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const proposal = this.chatProposal(conversationId, proposalId);
       if (proposal.state === "consumed" && proposal.runId) {
         const run = this.getRun(proposal.runId);
@@ -1091,7 +1115,7 @@ export class Store {
     review: { prUrl: string; reviewedSha: string; findings: ReviewFinding[]; cap: number },
     request: (round: number) => CreateRunRequest,
   ): { run: Run } | { active: ReviewRound } | { limited: Run } {
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const all = this.reviewRounds(review.prUrl);
       const rounds = all.filter((r) => r.kind === "review");
       const active = all.find((r) => !TERMINAL_STATUSES.includes(r.status));
@@ -1265,7 +1289,7 @@ export class Store {
     now: number,
   ): Run | null {
     const table = kind === "ci" ? "ci_fix_triggers" : "conflict_triggers";
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const trigger = this.pendingRoundTriggers(kind).find((t) => t.id === id);
       if (!trigger || trigger.nextAttemptAt > now) return null;
       if (kind === "ci" && !this.ciFixTriggerReady(id)) return null;
@@ -1739,9 +1763,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** Optional state is checkpointed atomically with the run's SHAs and other fields. */
-  updateRun(id: string, patch: RunPatch, state?: unknown): Run {
+  updateRun(
+    id: string,
+    patch: RunPatch,
+    state?: unknown,
+    excludeFromSupersession: readonly string[] = [],
+  ): Run {
     if (patch.merged && !this.pendingPublications)
-      return this.chatTransaction(() => this.updateRun(id, patch, state));
+      return this.transaction(() => this.updateRun(id, patch, state, excludeFromSupersession));
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");
@@ -1753,7 +1782,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     if (run.prUrl && patch.prClosedUnmerged !== undefined)
       this.observeGithubPrState(run.prUrl, patch.prClosedUnmerged ? "CLOSED" : "OPEN");
     this.publish({ kind: "run", run });
-    if (patch.merged) this.supersedeByIssue(run);
+    if (patch.merged) this.supersedeByIssue(run, excludeFromSupersession);
     return run;
   }
 
@@ -1764,11 +1793,17 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   resolveRun(
     id: string,
     input: { kind: ResolutionKind; by: string; ref?: string | null; note?: string | null; at?: number },
-    opts: { from?: RunStatus[]; patch?: RunPatch; why?: string; data?: Record<string, unknown> } = {},
+    opts: {
+      from?: RunStatus[];
+      patch?: RunPatch;
+      why?: string;
+      data?: Record<string, unknown>;
+      excludeFromSupersession?: readonly string[];
+    } = {},
   ): Run | null {
     const { kind, by, ref = null, note = null, at = Date.now() } = input;
     const resolution: RunResolution = { kind, ref, note, by, at };
-    return this.chatTransaction(() => {
+    return this.transaction(() => {
       const from = this.getRun(id)?.status;
       if (!from || !(opts.from ?? ["needs_human", "failed"]).includes(from)) return null;
       const { sets, values } = buildUpdate({ ...opts.patch, status: "resolved" }, RUN_PATCH_COLUMNS);
@@ -1782,40 +1817,99 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       });
       const run = this.getRun(id) as Run;
       this.publish({ kind: "run", run });
-      if (opts.patch?.merged) this.supersedeByIssue(run);
+      if (opts.patch?.merged) this.supersedeByIssue(run, opts.excludeFromSupersession);
       return run;
     });
   }
 
+  /** Resolve the exact PR's runs together, excluding its own rounds from issue supersession. */
+  resolveMergedPr(
+    repoId: string,
+    prUrl: string,
+    mergedBy: string | null,
+    mergedAt: number | null,
+    confirmedAt?: number,
+  ): void {
+    this.transaction(() => {
+      const ids = this.listRuns({ repoId, limit: Number.MAX_SAFE_INTEGER })
+        .filter((run) => run.prUrl === prUrl)
+        .map((run) => run.id);
+      for (const id of ids)
+        this.resolveMergedRun(id, mergedBy, mergedAt, { confirmedAt, excludeFromSupersession: ids });
+    });
+  }
+
   /** Record a confirmed merge, preserving any existing manual resolution and terminal evidence. */
-  resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number): boolean {
+  resolveMergedRun(
+    id: string,
+    mergedBy: string | null,
+    mergedAt: number | null,
+    opts: { confirmedAt?: number; excludeFromSupersession?: readonly string[] } = {},
+  ): boolean {
     const current = this.getRun(id);
     const prUrl = current?.prUrl;
-    if (!current || !prUrl || (current.merged && current.status !== "needs_human")) return false;
+    if (!current || !prUrl) return false;
+    mergedBy = current.mergedBy ?? mergedBy;
+    mergedAt = current.mergedAt ?? mergedAt;
+    if (current.merged && current.status !== "needs_human") {
+      this.fillMergedRunMetadata(id, mergedBy, mergedAt);
+      return false;
+    }
+    const at = mergedAt ?? opts.confirmedAt;
+    if (at === undefined) return false;
     if (current.status === "resolved" || current.status === "succeeded") {
-      this.updateRun(id, { merged: true, mergedBy, mergedAt });
+      this.updateRun(id, { merged: true, mergedBy, mergedAt }, undefined, opts.excludeFromSupersession);
       return true;
     }
     const run = this.resolveRun(
       id,
-      { kind: "merged", ref: prUrl, by: "github", at: mergedAt },
+      { kind: "merged", ref: prUrl, by: "github", at },
       {
         from: ["needs_human"],
         patch: { merged: true, mergedBy, mergedAt },
         why: `after PR merged by ${mergedBy ?? "unknown"}`,
         data: { mergedBy, mergedAt },
+        excludeFromSupersession: opts.excludeFromSupersession,
       },
     );
     return run !== null;
   }
 
+  /** Enrich the existing merge item as metadata arrives, without another merge transition. */
+  fillMergedRunMetadata(id: string, mergedBy: string | null, mergedAt: number | null): void {
+    this.transaction(() => {
+      const current = this.getRun(id);
+      if (!current?.merged) return;
+      mergedBy = current.mergedBy ?? mergedBy;
+      mergedAt = current.mergedAt ?? mergedAt;
+      if (current.mergedBy === mergedBy && current.mergedAt === mergedAt) return;
+      this.db
+        .query(`UPDATE feed SET data = json_set(data,
+        '$.mergedBy', coalesce(json_extract(data, '$.mergedBy'), ?),
+        '$.mergedAt', coalesce(json_extract(data, '$.mergedAt'), ?)),
+        summary = ? WHERE kind = 'run.merged' AND run_id = ?`)
+        .run(
+          mergedBy,
+          mergedAt,
+          `${current.prUrl ?? "Run"} merged${mergedBy === null ? "" : ` by ${mergedBy}`}`,
+          id,
+        );
+      this.updateRun(id, { mergedBy, mergedAt });
+    });
+  }
+
   /** A merged run supersedes needs_human runs in its repository that close one of the same issues. */
-  supersedeByIssue(merged: Run): Run[] {
+  supersedeByIssue(merged: Run, exclude: readonly string[] = []): Run[] {
     const issues = closedIssues(merged.prompt);
     if (!issues.size) return [];
     const input = { kind: "superseded", ref: merged.prUrl ?? merged.id, by: "system" } as const;
     return this.listRuns({ status: ["needs_human"], repoId: merged.repoId, limit: Number.MAX_SAFE_INTEGER })
-      .filter((r) => r.id !== merged.id && [...closedIssues(r.prompt)].some((n) => issues.has(n)))
+      .filter(
+        (r) =>
+          r.id !== merged.id &&
+          !exclude.includes(r.id) &&
+          [...closedIssues(r.prompt)].some((n) => issues.has(n)),
+      )
       .flatMap((r) => this.resolveRun(r.id, input, { from: ["needs_human"] }) ?? []);
   }
 

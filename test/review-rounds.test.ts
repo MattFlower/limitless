@@ -720,7 +720,9 @@ test("at most one round in flight, and the fourth changes verdict leaves the run
   expect(pr.autoMerge).toBe(false);
   expect(await changes(original.id)).toMatchObject({
     status: 409,
-    body: { error: `review round 1 (${first.body.round?.id}) is still in flight` },
+    body: {
+      error: `review round 1 (${first.body.round?.id}) is still in flight and updating the PR (shared PR round sequence); review its new head after review.round_delivered; inspect its status if it ends without delivery`,
+    },
   });
   for (const round of [2, 3]) {
     const previous = factory.store.reviewRounds(PR_URL).at(-1) as { runId: string };
@@ -760,6 +762,20 @@ test("approve records the reviewed head; a later push makes it stale", async () 
   });
   expect(factory.store.getRunDetail(original.id)?.review?.approval).toEqual({ sha: reviewed, stale: false });
   expect(kinds()).toContain("review.approved");
+  const reviewer = () =>
+    factory.store.db.query("SELECT reviewer FROM review_approvals ORDER BY id DESC LIMIT 1").get();
+  const approvalFeed = () =>
+    factory.store
+      .readFeed({ limit: 100 })
+      .items.filter((item) => item.kind === "review.approved")
+      .at(-1);
+  expect(reviewer()).toEqual({ reviewer: "matt" });
+  expect(approvalFeed()?.data.reviewer).toBe("matt");
+  expect(await review(original.id, { verdict: "approve", reviewedSha: reviewed })).toMatchObject({
+    status: 200,
+  });
+  expect(reviewer()).toEqual({ reviewer: "human" });
+  expect(approvalFeed()?.data.reviewer).toBe("human");
 
   const moved = await push(BRANCH, "feature.txt", "pushed after approval\n");
   // Any later look at the PR (here a verdict on the old head) sees the push.

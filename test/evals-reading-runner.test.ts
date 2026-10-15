@@ -1,10 +1,11 @@
-import { expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import { expect, setDefaultTimeout, spyOn } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand } from "../src/cli/eval.ts";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema, validateRequest } from "../src/evals/cases.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
+import * as preparation from "../src/evals/prepare.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
@@ -12,13 +13,16 @@ import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import * as review from "../src/pipeline/review.ts";
+import { parseEvalReviewSystems } from "../src/pipeline/review-system.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
 import { MODELS, type ModelDef, type ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { test } from "./read-policy-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -53,6 +57,155 @@ async function fixture(
   };
   return { ...f, item, verifyItem, save, run, clean };
 }
+
+async function setupPins(f: Awaited<ReturnType<typeof fixture>>, setup: string[]) {
+  const config = (commands: string[]) =>
+    `[gates]\nsetup = ${JSON.stringify(commands)}\nchecks = [{ name = "test", run = "touch check-ran" }]\n`;
+  const commit = async (text: string) => {
+    writeFileSync(join(f.source, ".limitless.toml"), text);
+    writeFileSync(join(f.source, ".gitignore"), "node_modules/\n");
+    await sh(["git", "add", ".limitless.toml", ".gitignore"], { cwd: f.source });
+    await sh(["git", "commit", "-qm", "gate config"], { cwd: f.source });
+    return (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+  };
+  f.item.base = await commit(config(setup));
+  f.item.head = await commit(config(["touch head-setup-ran"]));
+  f.save();
+}
+
+const setupSystem = (name: string, setup = true) => ({
+  name,
+  mode: "single",
+  finders: [{ target: "candidate-a", prompt: "standard" }],
+  implementerReport: "include",
+  ...(setup ? { setup: true } : {}),
+});
+
+test.each([false, true])("review setup restores HEAD (seeded=%s)", async (seeded) => {
+  const f = await fixture();
+  let setupStartedAt = 0;
+  let setupEndedAt = 0;
+  const confinement = spyOn(fakeConfinement, "verify").mockImplementation(async () => {
+    setupStartedAt ||= Date.now();
+  });
+  const prepareGates = preparation.prepareEvalGates;
+  const prepared = spyOn(preparation, "prepareEvalGates").mockImplementation(async (...args) => {
+    const result = await prepareGates(...args);
+    setupEndedAt = Date.now();
+    return result;
+  });
+  try {
+    const commands = [
+      'mkdir -p node_modules && printf base-one > node_modules/ready && touch "$TMPDIR/ready"',
+      'test -f "$TMPDIR/ready" && printf base-two >> node_modules/ready && printf setup-overwrite > CURRENT.txt && git add CURRENT.txt && printf "CURRENT.txt working-tree-encoding=UTF-16LE\\n" > .gitattributes && touch setup-output',
+    ];
+    await setupPins(f, commands);
+    if (seeded) {
+      f.item.seedPatch = "seed.patch";
+      f.item.kind = "seeded";
+      writeFileSync(
+        join(f.home, "seed.patch"),
+        "diff --git a/CURRENT.txt b/CURRENT.txt\n--- a/CURRENT.txt\n+++ b/CURRENT.txt\n@@ -1 +1 @@\n-new\n\\ No newline at end of file\n+seeded\n\\ No newline at end of file\n",
+      );
+      f.save();
+    }
+    f.respond(async (s) => {
+      expect(s.mode).toBe("readonly");
+      expect(readFileSync(join(s.cwd, "CURRENT.txt"))).toEqual(Buffer.from(seeded ? "seeded" : "new"));
+      expect(
+        (await sh(["git", "--attr-source=HEAD", "diff", "HEAD", "--exit-code"], { cwd: s.cwd })).stdout,
+      ).toBe("");
+      expect(
+        (await sh(["git", "--attr-source=HEAD", "diff", "--cached", "--exit-code"], { cwd: s.cwd })).stdout,
+      ).toBe("");
+      expect(readFileSync(join(s.cwd, ".gitattributes"), "utf8")).toBe(
+        "CURRENT.txt working-tree-encoding=UTF-16LE\n",
+      );
+      expect(existsSync(join(s.cwd, "setup-output"))).toBe(true);
+      expect(readFileSync(join(s.cwd, "node_modules/ready"), "utf8")).toBe("base-onebase-two");
+      expect(readFileSync(join(s.cwd, ".limitless.toml"), "utf8")).toContain("head-setup-ran");
+      expect(existsSync(join(s.cwd, "head-setup-ran"))).toBe(false);
+      expect(existsSync(join(s.cwd, "check-ran"))).toBe(false);
+      expect(confinement.mock.calls.map(([, opts]) => opts.cmd)).toEqual(
+        commands.map((command) => ["/bin/sh", "-c", command]),
+      );
+      const scratches = confinement.mock.calls.map(([roots, opts]) => {
+        expect(opts.cwd).toBe(s.cwd);
+        expect(roots.write).toContain(s.cwd);
+        expect(opts.env.LIMITLESS_CONFINED).toBe("1");
+        const scratch = opts.env.TMPDIR;
+        if (!scratch) throw new Error("missing setup scratch");
+        expect(roots.write).toContain(scratch);
+        return scratch;
+      });
+      expect(new Set(scratches).size).toBe(1);
+      return { structured: reviewOutput() };
+    });
+    const report = await f.run({ models: undefined, systems: [setupSystem("prepared")] });
+    expect(report.trials[0]).toMatchObject({
+      status: "ok",
+      pass: true,
+    });
+    // Reviewer timing starts after setup; preparation includes the setup execution.
+    expect(report.trials[0]?.createdAt).toBeGreaterThanOrEqual(setupEndedAt);
+    expect(report.trials[0]?.details.preparationMs).toBeGreaterThanOrEqual(setupEndedAt - setupStartedAt);
+    expect(report.summaries[0]?.p50LatencyMs).toBe(report.trials[0]?.durationMs);
+    for (const [, opts] of confinement.mock.calls) {
+      expect(existsSync(opts.env.TMPDIR ?? "")).toBe(false);
+    }
+    await f.clean();
+  } finally {
+    confinement.mockRestore();
+    prepared.mockRestore();
+    await f.close();
+  }
+});
+
+test.each(["setup", "restoration"])("review %s failure is trial-local", async (failure) => {
+  const f = await fixture();
+  const confinement = spyOn(fakeConfinement, "verify");
+  try {
+    const command =
+      failure === "setup" ? "printf dependency-unavailable >&2 && exit 1" : "touch .git/index.lock";
+    await setupPins(f, failure === "setup" ? [command, "touch later-setup-ran"] : [command]);
+    f.respond((s) => {
+      expect(existsSync(join(s.cwd, "later-setup-ran"))).toBe(false);
+      return { structured: reviewOutput() };
+    });
+    const report = await f.run({
+      models: undefined,
+      concurrency: 1,
+      systems: [setupSystem("prepared"), setupSystem("control", false)],
+    });
+    expect(report.run.status).toBe("completed");
+    expect(report.trials[0]).toMatchObject({
+      status: "error",
+      pass: false,
+      durationMs: 0,
+      details: { system: "prepared", preparationFailed: true },
+    });
+    if (failure === "setup") expect(report.trials[0]?.details.reason).toContain(command);
+    expect(report.trials[0]?.details.reason).toContain(
+      failure === "setup" ? "dependency-unavailable" : "index.lock",
+    );
+    expect(report.trials[1]).toMatchObject({
+      status: "ok",
+      pass: true,
+      details: { system: "control", grade: { pass: true } },
+    });
+    for (const trial of report.trials) {
+      expect(typeof trial.details.preparationMs).toBe("number");
+      expect(typeof trial.durationMs).toBe("number");
+    }
+    expect(report.summaries.map((s) => s.latencyDenominator)).toEqual([0, 1]);
+    expect(f.calls).toHaveLength(1);
+    expect(confinement).toHaveBeenCalledTimes(1);
+    await f.clean();
+  } finally {
+    confinement.mockRestore();
+    await f.close();
+  }
+});
 
 test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD and agent harness", async () => {
   const f = await fixture();
@@ -196,6 +349,117 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
       expect(omitted).toContain(kept);
     expect(omitted).toContain("# Automated check results");
     expect(omitted).toContain("- test `test`: FAIL, regressed (BLOCKING)");
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["adversarial", "careful", "probe"] as const)(
+  "single %s eval uses the panel finder framing and production grading",
+  async (prompt) => {
+    const f = await fixture();
+    try {
+      const systems = parseEvalReviewSystems(
+        JSON.stringify({
+          systems: [
+            {
+              name: "variant",
+              mode: "single",
+              finders: [{ target: "candidate-a", prompt }],
+              implementerReport: "include",
+            },
+          ],
+        }),
+        "systems.json",
+      );
+      const output = { ...reviewOutput(), verdict: "approve" as const };
+      // Confidence does not change the single review's severity-based blocking rule.
+      output.findings = output.findings.map((finding) => ({ ...finding, confidence: 0.1 }));
+      output.findings.push(...reviewOutput(30, "minor", "other.ts").findings);
+      f.respond(async (s) => {
+        expect(s.target.modelId).toBe("candidate-a");
+        expect(s.mode).toBe("readonly");
+        expect(s.schema).toBe(ReviewSchema);
+        expect(s.jsonSchema).toEqual(toStrictJsonSchema(ReviewSchema));
+        expect(s.systemAppend).toBe(FACTORY_PREAMBLE);
+        const diff = await diffSince(s.cwd, f.sha);
+        expect(s.prompt).toBe(
+          reviewPrompt({
+            ...f.item.input,
+            baseSha: f.sha,
+            stat: diff.stat,
+            audit: [],
+            implementerReportMode: "include",
+            finder: prompt,
+          }),
+        );
+        return { structured: output };
+      });
+      const report = await f.run({ models: undefined, systems });
+      expect(f.calls).toHaveLength(1);
+      const persisted = f.factory.evals.report(report.run.id);
+      expect(persisted?.run.systems?.[0]?.finders[0]?.prompt).toBe(prompt);
+      expect(persisted?.trials[0]).toMatchObject({
+        status: "ok",
+        pass: true,
+        score: 1,
+        details: {
+          system: "variant",
+          grade: {
+            review: {
+              blockingFindings: 1,
+              requiredMatched: 1,
+              requestChanges: true,
+              verdictMatch: true,
+            },
+          },
+        },
+      });
+      expect(review.blockingReviewFindings(output)).toHaveLength(1);
+      expect(review.reviewVerdict(output)).toBe("request_changes");
+      await f.clean();
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test.each([
+  ["standard", "adversarial", false, false],
+  ["adversarial", "standard", false, false],
+  ["standard", "probe", false, false],
+  ["probe", "standard", false, false],
+  ["standard", "standard", false, true],
+  ["standard", "standard", true, false],
+] as const)("single caches: %s then %s, setup %s then %s", async (first, second, firstSetup, secondSetup) => {
+  const f = await fixture();
+  try {
+    f.respond(() => ({ structured: reviewOutput() }));
+    const run = (prompt: string, setup: boolean) =>
+      f.run({
+        models: undefined,
+        systems: [
+          {
+            name: "candidate",
+            mode: "single",
+            finders: [{ target: "candidate-a", prompt }],
+            implementerReport: "include",
+            ...(setup ? { setup: true } : {}),
+          },
+        ],
+      });
+    const a = await run(first, firstSetup);
+    const b = await run(second, secondSetup);
+    expect(a.trials[0]?.status).toBe("ok");
+    expect(b.trials[0]?.status).toBe("ok");
+    expect(a.trials[0]?.cacheKey).not.toBe(b.trials[0]?.cacheKey);
+    expect(a.summaries[0]?.cached).toBe(0);
+    expect(b.summaries[0]?.cached).toBe(0);
+    expect(f.calls).toHaveLength(2);
+    expect((await run(first, firstSetup)).summaries[0]?.cached).toBe(1);
+    expect((await run(second, secondSetup)).summaries[0]?.cached).toBe(1);
+    expect(f.calls).toHaveLength(2);
     await f.clean();
   } finally {
     await f.close();

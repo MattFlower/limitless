@@ -56,7 +56,11 @@ export function selectEvidence(
     // Routing picks production's reviewer, so only systems reviewing the way production does count.
     // Submission rejects duplicate configurations, which leaves at most one such system per target.
     const systems = entry.run.systems?.filter(
-      (s) => s.mode === "single" && s.implementerReport === implementerReport,
+      (s) =>
+        s.mode === "single" &&
+        !s.setup &&
+        s.finders[0]?.prompt === "standard" &&
+        s.implementerReport === implementerReport,
     );
     const counted = new Set(systems?.map((s) => s.name));
     const scopes = entry.run.role === "implement" ? IMPLEMENT_COMPLEXITIES : [undefined];
@@ -130,6 +134,8 @@ export function generatePolicy(input: PolicyInput) {
         const systems = entry.run.systems?.filter(
           (s) =>
             s.mode === "single" &&
+            !s.setup &&
+            s.finders[0]?.prompt === "standard" &&
             s.implementerReport === implementerReport &&
             s.finders[0]?.target === entry.modelId,
         );

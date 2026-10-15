@@ -760,7 +760,7 @@ export async function startHttp(
   let lan: Server<undefined> | undefined;
   try {
     if (factory.cfg.listenLan) lan = bind(factory.cfg.listenLan);
-    credential.publish();
+    credential.publish(local.url);
   } catch (error) {
     await Promise.allSettled([
       Promise.resolve().then(() => local.stop(true)),

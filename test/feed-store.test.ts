@@ -1,11 +1,72 @@
 import { expect, test } from "bun:test";
 import { cpSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import type { StreamMessage } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { Store } from "../src/db/store.ts";
-import { allItems, feedStore } from "./feed-support.ts";
+import { allItems, feedRound, feedStore } from "./feed-support.ts";
 
 const DAY = 86_400_000;
+
+test("ownRuns includes persisted rounds by their MCP parent's consumer, with pagination and acknowledgements", () => {
+  const f = feedStore();
+  try {
+    const repo = f.repo();
+    const parent = (source: "mcp" | "cli", consumer: string) =>
+      f.store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "Parent work",
+        source,
+        requestedBy: `mcp:${consumer}`,
+      });
+    const mine = parent("mcp", "worker");
+    const other = parent("mcp", "other");
+    const cli = parent("cli", "worker");
+    const expected: { kind: string; runId: string; data: Record<string, unknown> }[] = [];
+    for (const [index, kind] of (["conflict", "review", "ci"] as const).entries()) {
+      const round = index + 1;
+      const run = feedRound(f.store, repo, mine, kind, round);
+      f.store.markRoundDelivered(run.id, "b".repeat(40));
+      f.store.updateRun(run.id, { status: "succeeded" });
+      for (const event of ["started", "delivered"]) {
+        expected.push({
+          kind: `${kind}.round_${event}`,
+          runId: run.id,
+          data: { sourceRunId: mine.id, round },
+        });
+      }
+      expected.push({ kind: "run.succeeded", runId: run.id, data: { status: "succeeded" } });
+      for (const owner of [other, cli]) {
+        const unrelated = feedRound(f.store, repo, owner, kind, round);
+        // The child's own provenance cannot override the parent's ownership.
+        f.store.db
+          .query("UPDATE runs SET source = 'mcp', requested_by = 'mcp:worker' WHERE id = ?")
+          .run(unrelated.id);
+        f.store.markRoundDelivered(unrelated.id, "c".repeat(40));
+      }
+    }
+    f.store.updateRun(mine.id, { status: "failed" });
+    expected.push({ kind: "run.failed", runId: mine.id, data: { status: "failed" } });
+    f.store.daemonStarted("boot", "test", "test");
+    f.reopen();
+    const query = { consumer: "worker", ownRuns: true, repo: repo.slug, limit: 2 };
+    const items = [];
+    for (;;) {
+      const page = f.store.readFeed(query);
+      items.push(...page.items);
+      expect(page.items.length).toBeLessThanOrEqual(2);
+      expect(page.nextAfter).toBe(page.items.at(-1)?.id ?? -1);
+      f.store.ackFeed("worker", page.nextAfter);
+      if (!page.hasMore) break;
+    }
+    expect(items).toMatchObject(expected);
+    expect(items).toHaveLength(expected.length);
+    expect(f.store.readFeed(query).items).toEqual([]);
+    expect(f.store.readFeed({ ...query, repo: "local/feed-extra", after: 0 }).items).toEqual([]);
+  } finally {
+    f.close();
+  }
+});
 
 test("gate timeout re-run counts survive reopening and publish each cumulative increase once", () => {
   const f = feedStore();
@@ -123,6 +184,45 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
       pruned: false,
       hasMore: false,
     });
+  } finally {
+    f.close();
+  }
+});
+
+test("buffered store transactions discard run and feed messages on rollback and drain after commit", () => {
+  const f = feedStore();
+  try {
+    const run = f.run();
+    const messages: StreamMessage[] = [];
+    const transactions: boolean[] = [];
+    f.store.subscribe((msg) => {
+      messages.push(msg);
+      transactions.push(f.store.db.inTransaction);
+    });
+    const write = () =>
+      f.store.transaction(() => {
+        f.store.updateRun(run.id, { status: "needs_human" });
+        f.store.resolveRun(run.id, { kind: "done_elsewhere", by: "human" });
+      });
+    expect(() =>
+      f.store.transaction(() => {
+        write();
+        expect(messages).toEqual([]);
+        expect(allItems(f.store)).toHaveLength(2);
+        throw new Error("rollback");
+      }),
+    ).toThrow("rollback");
+    expect(messages).toEqual([]);
+    expect(allItems(f.store)).toEqual([]);
+    expect(f.store.getRun(run.id)?.status).toBe("queued");
+    f.store.transaction(() => {
+      write();
+      expect(messages).toEqual([]);
+    });
+    expect(messages.filter((msg) => msg.kind === "run")).toHaveLength(2);
+    expect(messages.flatMap((msg) => (msg.kind === "feed" ? [msg.item] : []))).toEqual(allItems(f.store));
+    expect(allItems(f.store).map((item) => item.kind)).toEqual(["run.needs_human", "run.resolved"]);
+    expect(transactions).toEqual(messages.map(() => false));
   } finally {
     f.close();
   }

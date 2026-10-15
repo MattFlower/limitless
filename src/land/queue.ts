@@ -59,6 +59,8 @@ export interface LandObservation {
   failing: string[];
   statusNames?: string[];
   truncated?: boolean;
+  mergedBy?: { login: string } | null;
+  mergedAt?: string | null;
 }
 
 /** The `gh pr view` client a land reads its CI from when polling is off. */
@@ -97,6 +99,7 @@ const CI_FEED = new Set(["pr.ci_passed", "pr.ci_failed"]);
 const UNSETTLED_CI = new Set(["PENDING", "EXPECTED"]);
 /** A claim has to be this quiet before another queue may take the entry it holds. */
 const CLAIM_STALE_MS = 30_000;
+const MERGE_METADATA_TIMEOUT_MS = 30_000;
 
 /**
  * Which queue is draining each repository in this process. The store's claim is the durable half of
@@ -292,6 +295,8 @@ export class LandQueue {
     const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
     const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
     const beat = (): void => {
+      const current = this.store.getLandEntry(entry.id);
+      if (current && !this.isActive(current)) return;
       if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) controller.abort();
       else heartbeat = set(beat, CLAIM_STALE_MS / 3);
     };
@@ -356,7 +361,8 @@ export class LandQueue {
       }
       if (entry.pushedSha)
         await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
-      if ((await this.awaitCi(entry, head, signal)) === "merged") return this.landed(entry, run, head);
+      const ci = await this.awaitCi(entry, head, signal);
+      if (ci !== "green") return this.landed(entry, run, head, ci);
       await this.merge(entry, run, cwd, head, signal);
     } finally {
       await this.discard(repo, cwd);
@@ -364,9 +370,15 @@ export class LandQueue {
   }
 
   /** A PR that already merged is recorded, never merged again. */
-  private landed(entry: LandEntry, run: Run, sha: string): void {
-    this.store.updateRun(run.id, { merged: true });
-    this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+  private landed(entry: LandEntry, run: Run, sha: string, observation: LandObservation | null): void {
+    const at = observation?.mergedAt ? Date.parse(observation.mergedAt) : NaN;
+    const mergedBy = observation?.state === "MERGED" ? (observation.mergedBy?.login ?? null) : null;
+    const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
+    this.store.transaction(() => {
+      const current = this.store.getLandEntry(entry.id);
+      if (current && this.isActive(current)) this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+      this.store.resolveMergedPr(run.repoId, entry.prUrl, mergedBy, mergedAt, this.now());
+    });
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
   }
 
@@ -431,7 +443,11 @@ export class LandQueue {
    * the fallback read covers a restart and polling off. A head that moved after we saw ours blocks
    * at once, and a transient failure is re-run once.
    */
-  private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
+  private async awaitCi(
+    entry: LandEntry,
+    sha: string,
+    signal: AbortSignal,
+  ): Promise<"green" | LandObservation> {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
     const rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     // GitHub may still report the approved head while our base merge propagates.
@@ -445,7 +461,7 @@ export class LandQueue {
         throw new LandBlocked("head moved after approval");
       const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
-      if (seen?.state === "MERGED") return "merged";
+      if (seen?.state === "MERGED") return seen;
       if (unexpectedHead(seen?.head)) throw new LandBlocked("head moved after approval");
       if (rerun) {
         const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
@@ -611,7 +627,38 @@ export class LandQueue {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
     }
-    this.landed(entry, run, sha);
+    this.landed(entry, run, sha, null);
+    const observed = await this.mergeMetadata(entry.prUrl, signal);
+    if (observed?.state !== "MERGED" || observed.url !== entry.prUrl) return;
+    const at = observed.mergedAt ? Date.parse(observed.mergedAt) : NaN;
+    this.store.resolveMergedPr(
+      run.repoId,
+      entry.prUrl,
+      observed.mergedBy?.login ?? null,
+      Number.isFinite(at) ? at : null,
+      this.now(),
+    );
+  }
+
+  private async mergeMetadata(url: string, signal: AbortSignal): Promise<GitHubPrView | null> {
+    const controller = new AbortController();
+    const bounded = AbortSignal.any([signal, controller.signal]);
+    const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
+    const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
+    const timer = set(() => controller.abort(), MERGE_METADATA_TIMEOUT_MS);
+    const aborted = Promise.withResolvers<null>();
+    const onAbort = () => aborted.resolve(null);
+    bounded.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (bounded.aborted) return null;
+      return await Promise.race([
+        (this.deps.client ?? getGitHubPr)(url, bounded).catch(() => null),
+        aborted.promise,
+      ]);
+    } finally {
+      clear(timer);
+      bounded.removeEventListener("abort", onAbort);
+    }
   }
 
   // ---- helpers -------------------------------------------------------------
@@ -688,6 +735,8 @@ export class LandQueue {
           failing: snapshot.failing.map((f) => f.name),
           statusNames: snapshot.statusNames,
           truncated: snapshot.truncated,
+          mergedBy: snapshot.mergedBy,
+          mergedAt: snapshot.mergedAt,
         }
       : null;
   }
@@ -705,6 +754,8 @@ export class LandQueue {
           failing: pr.failing,
           statusNames: pr.statusNames,
           truncated: pr.truncated,
+          mergedBy: pr.mergedBy,
+          mergedAt: pr.mergedAt,
         }
       : null;
   }

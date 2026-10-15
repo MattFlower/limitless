@@ -365,6 +365,8 @@ const FINDER_FRAMING: Record<FinderPrompt, string> = {
     "Assume the change can fail, and find out how. Trace bad and boundary inputs, retries, partial failure, ordering, restarts, and version skew between old and new code or data. Give no credit for intent: judge what the code does, not what its comments, names or commit messages say. Report every issue you believe is real, with your confidence; a separate step verifies each finding.",
   careful:
     "Review it as a careful senior engineer would, in one pass, and report the defects you find with your confidence.",
+  probe:
+    "For each proposed blocker or major finding, reproduce the defect with a probe: a throwaway test or command, with temporary files under TMPDIR. Run only the affected test files; never run the full suite. Put the attempted command and its observed result in the finding's detail. If a completed probe does not reproduce the defect, lower the finding to minor or omit it. If sandbox or environment limits prevent the probe from running (for example nested Seatbelt, loopback servers, or a Linux-only path), retain its severity and name the attempted command and the error in detail.",
 };
 
 export function reviewPrompt(input: {

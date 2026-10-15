@@ -166,6 +166,8 @@ does before implementation, compared against the scripts at the effective HEAD; 
 audit flags do not bypass the eval invocation. Review and verify retain the pipeline's scaled
 20/25-minute reading timeouts, 10-minute idle timeout, 150-tool limit and verify private sessions.
 
+Eval-only single review systems may use `standard`, `adversarial`, `careful`, or `probe` on their one pinned finder; `probe` requires reproducing blocker/major findings with targeted commands and recording results in `detail` (environment errors retain severity). Prompt variants have separate cache identities and only `standard` counts toward production routing policy.
+Explicit and roster-based eval systems may set `setup: true` to run the base commit's confined gate setup in each trial's worktree; preparation time is recorded separately from reviewer time, and setup variants have separate cache identities. Production accepts neither `setup` nor `probe`.
 Panel review systems can set verifier `targets` to an ordered list. Each batch uses the first
 target whose vendor raised none of its candidates, then the first model that raised none.
 Targets must be unique by base model id and include a model outside all finders. A selected

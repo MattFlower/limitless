@@ -2,7 +2,7 @@ import { z } from "zod";
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
-import type { ModelDef, ProviderDef } from "./catalog.ts";
+import { MODELS, type ModelDef, type ProviderDef } from "./catalog.ts";
 import { runtimeModel } from "./config-catalog.ts";
 import { originExclusion } from "./origins.ts";
 import { validatePolicy, validateRunModels } from "./policy.ts";
@@ -143,6 +143,15 @@ export class RuntimeCatalog {
   }
 
   remove(id: string) {
+    if (
+      MODELS.some((m) => m.id === id) &&
+      this.models.some((m) => m.id === id && m.source !== "runtime") &&
+      this.store.runtimeModels().some((m) => m.id === id)
+    ) {
+      this.store.writeRuntimeModel(id, null);
+      this.store.publishCatalog();
+      return this.snapshot();
+    }
     this.editable(id);
     return this.apply(id, null);
   }

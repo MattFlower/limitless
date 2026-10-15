@@ -15,7 +15,9 @@ import {
   type EvalReviewSystem,
   expandRoster,
   parseEvalReviewSystems,
+  parseReviewRosters,
   productionReviewSystem,
+  ReviewSystemSchema,
   readReviewLenses,
 } from "../src/pipeline/review-system.ts";
 import { MODELS, type ModelDef, PROVIDERS } from "../src/router/catalog.ts";
@@ -66,11 +68,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial" or "careful"',
-  ],
-  [
-    file(system({ finders: [{ target: "candidate-a", prompt: "careful" }] })),
-    'mode "single" uses the "standard" prompt',
+    'finder prompt must be "standard", "adversarial", "careful" or "probe"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -83,7 +81,7 @@ const invalid: [string, string][] = [
   ],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "standard", local: true }] })),
-    'mode "single" uses the "standard" prompt, with no lens, family or local finder',
+    'mode "single" takes no lens, family or local finder',
   ],
   [
     file(panel({ finders: [{ target: "candidate-a", prompt: "standard", local: true }] })),
@@ -102,6 +100,57 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
     prompt,
   }));
   expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]).toMatchObject({ finders });
+});
+
+test("single prompt variants are eval-only and retain the single-mode restrictions", () => {
+  for (const prompt of ["adversarial", "careful", "probe"] as const) {
+    const finder = { target: "candidate-a", prompt };
+    const variant = system({ finders: [finder] });
+    expect(parseEvalReviewSystems(file(variant), "s.json")).toEqual([variant] as ReviewSystem[]);
+    expect(ReviewSystemSchema.safeParse(variant).success).toBe(false);
+    for (const forbidden of [
+      { finders: [] },
+      { finders: [finder, finder] },
+      { finders: [{ ...finder, lens: { name: "ops", focus: "Rollback" } }] },
+      { finders: [{ ...finder, family: "cross" }] },
+      { finders: [{ ...finder, family: "implementer" }] },
+      { finders: [{ ...finder, local: true }] },
+      { finders: [{ ...finder, local: false }] },
+      { finders: [{ prompt }] },
+      { verifier: {} },
+      { causalAttribution: true },
+      { causalAttribution: false },
+      { implementerReport: undefined },
+    ])
+      expect(() => parseEvalReviewSystems(file({ ...variant, ...forbidden }), "s.json")).toThrow();
+  }
+});
+
+test("setup is eval-only for explicit systems and roster references", () => {
+  const explicit = system({ setup: true });
+  const reference = {
+    name: "prepared-roster",
+    roster: "quick",
+    targets: ["candidate-a"],
+    verifier: { target: "verifier-c" },
+    implementerReport: "include",
+    setup: true,
+  };
+  const parsed = parseEvalReviewSystems(file(explicit, reference), "s.json");
+  expect(parsed).toEqual([explicit, reference] as EvalReviewSystem[]);
+  for (const entry of parsed) {
+    expect(expandRoster(entry, DEFAULT_ROSTERS)).toMatchObject({ setup: true });
+    expect(ReviewSystemSchema.safeParse(expandRoster(entry, DEFAULT_ROSTERS)).success).toBe(false);
+  }
+  expect(ReviewSystemSchema.safeParse(explicit).success).toBe(false);
+  expect(
+    ReviewSystemSchema.safeParse(panel({ finders: [{ target: "candidate-a", prompt: "probe" }] })).success,
+  ).toBe(false);
+  expect(() => parseReviewRosters({ quick: [{ prompt: "probe" }] })).toThrow("eval-only");
+  expect(() => parseEvalReviewSystems(file(system({ setup: false })), "s.json")).toThrow();
+  expect(() =>
+    parseEvalReviewSystems(file(panel({ finders: [{ target: "candidate-a", prompt: "probe" }] })), "s.json"),
+  ).toThrow();
 });
 
 test("causal attribution is an opt-in panel option preserved by parsing and roster expansion", async () => {
@@ -402,10 +451,19 @@ test("candidates sharing a target stay distinct after a store reload", () => {
   }
 });
 
-test("eval policy counts only systems matching the daemon's [review] implementer_report", async () => {
+test("eval policy counts only standard systems matching the daemon's [review] implementer_report", async () => {
   const f = await evalFixture();
   try {
-    const systems = [system(), system({ name: "without", implementerReport: "omit" })] as ReviewSystem[];
+    const systems = [
+      ...(["adversarial", "careful"] as const).map((prompt) =>
+        system({
+          name: prompt,
+          finders: [{ target: "candidate-a", prompt }],
+        }),
+      ),
+      system(),
+      system({ name: "without", implementerReport: "omit" }),
+    ] as ReviewSystem[];
     const trial = (name: string): EvalTrial => ({
       effort: "default",
       evalRunId: "",

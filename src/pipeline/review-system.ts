@@ -33,8 +33,8 @@ const LensSchema = z.strictObject(lensShape);
 const FinderSchema = z
   .strictObject({
     target: TargetSchema.optional(),
-    prompt: z.enum(["standard", "adversarial", "careful"], {
-      error: 'finder prompt must be "standard", "adversarial" or "careful"',
+    prompt: z.enum(["standard", "adversarial", "careful", "probe"], {
+      error: 'finder prompt must be "standard", "adversarial", "careful" or "probe"',
     }),
     lens: LensSchema.optional(),
     family: z.enum(["cross", "implementer"]).optional(),
@@ -52,7 +52,7 @@ const VerifierSchema = z
   .refine((v) => v.target === undefined || v.targets === undefined, {
     message: 'a verifier takes "target" or "targets", not both',
   });
-export const ReviewSystemSchema = z
+const ReviewSystemBaseSchema = z
   .strictObject({
     name: z.string().trim().min(1, "system name must not be empty"),
     mode: z.enum(["single", "panel"], { error: 'unsupported review system mode; use "single" or "panel"' }),
@@ -66,14 +66,11 @@ export const ReviewSystemSchema = z
   .superRefine((system, ctx) => {
     if (system.mode === "single" && system.finders.length !== 1)
       ctx.addIssue({ code: "custom", path: ["finders"], message: 'mode "single" takes exactly one finder' });
-    if (
-      system.mode === "single" &&
-      system.finders.some((f) => f.prompt !== "standard" || f.lens || f.family || f.local)
-    )
+    if (system.mode === "single" && system.finders.some((f) => f.lens || f.family || f.local))
       ctx.addIssue({
         code: "custom",
         path: ["finders"],
-        message: 'mode "single" uses the "standard" prompt, with no lens, family or local finder',
+        message: 'mode "single" takes no lens, family or local finder',
       });
     if (system.mode === "single" && system.verifier)
       ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "single" takes no verifier' });
@@ -94,12 +91,21 @@ export const ReviewSystemSchema = z
       ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "panel" needs a verifier' });
   }) satisfies z.ZodType<ReviewSystem>;
 
+export const ReviewSystemSchema = ReviewSystemBaseSchema.refine(
+  (system) => system.finders.every((f) => f.prompt !== "probe"),
+  { path: ["finders"], message: 'the "probe" prompt is eval-only' },
+).refine((system) => system.mode !== "single" || system.finders.every((f) => f.prompt === "standard"), {
+  path: ["finders"],
+  message: 'mode "single" uses the "standard" prompt',
+});
+
 /**
  * An eval candidate built from the daemon's configured roster for a profile: `targets` pins each of
  * its finders in order, then one per inline repo lens.
  */
 const RosterReferenceSchema = z.strictObject({
   name: z.string().trim().min(1, "system name must not be empty"),
+  setup: z.literal(true).optional(),
   replayFrom: z.string().trim().min(1).optional(),
   roster: z.enum(["quick", "standard", "deep"]),
   causalAttribution: z.literal(true).optional(),
@@ -112,7 +118,18 @@ const RosterReferenceSchema = z.strictObject({
 });
 export type RosterReference = z.infer<typeof RosterReferenceSchema>;
 export type EvalReviewSystem = ReviewSystem | RosterReference;
-const EvalSystemSchema = ReviewSystemSchema.safeExtend({ replayFrom: z.string().trim().min(1).optional() });
+const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
+  setup: z.literal(true).optional(),
+  replayFrom: z.string().trim().min(1).optional(),
+})
+  .refine((system) => system.mode !== "single" || system.finders.every((f) => f.local === undefined), {
+    path: ["finders"],
+    message: 'mode "single" takes no local finder option',
+  })
+  .refine((system) => system.mode === "single" || system.finders.every((f) => f.prompt !== "probe"), {
+    path: ["finders"],
+    message: 'the "probe" prompt requires mode "single"',
+  });
 
 /** Eval candidates: uniquely named, and every finder pinned so results never depend on live routing. */
 export const EvalReviewSystemsSchema = z
@@ -167,6 +184,7 @@ export function expandRoster(
       `review system ${JSON.stringify(system.name)}: roster ${system.roster} has ${finders.length} finders with its lenses; give ${finders.length} targets, not ${system.targets.length}`,
     );
   return EvalSystemSchema.parse({
+    setup: system.setup,
     replayFrom: system.replayFrom,
     causalAttribution: system.causalAttribution,
     name: system.name,
@@ -220,6 +238,7 @@ export const DEFAULT_ROSTERS: Record<ResolvedProfile, ReviewFinder[]> = {
 };
 const RosterSchema = z
   .array(FinderSchema)
+  .refine((roster) => roster.every((f) => f.prompt !== "probe"), 'the "probe" prompt is eval-only')
   .refine((roster) => roster.some((f) => !f.local), "a roster needs at least one finder that is not local");
 const RostersSchema = z.strictObject({
   quick: RosterSchema.default(DEFAULT_ROSTERS.quick),

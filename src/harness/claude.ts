@@ -4,9 +4,9 @@ import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
+  agentShellEnv,
   invocationCommands,
   readConfinement,
-  scratchEnv,
   scratchParent,
   validateDenyRead,
   validateScratch,
@@ -303,6 +303,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const args = buildClaudeArgs(spec, sessionId, keyFile);
   const editing = spec.mode === "edit" && !spec.noTools;
   const roots = editing ? writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead) : null;
+  const shellEnv = agentShellEnv(spec);
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
   const runner: typeof runProcess = (opts) =>
@@ -364,8 +365,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     cwd: spec.cwd,
     env: agentEnv({
       ...envExtra,
-      ...scratchEnv(spec),
-      ...(spec.commandPath ? { PATH: spec.commandPath } : {}),
+      ...shellEnv,
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
       // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
       // cwd record) must land in the scratch directly: its parent is outside the boundary.

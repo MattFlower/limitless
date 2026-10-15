@@ -34,9 +34,10 @@ const PATCH_CAP = 16_000;
 const REPORT_CAP = 4_000;
 const FILES_CAP = 50;
 const DISTINCTIVE_LENGTH = 12;
+const normalizeWhitespace = (value: string) => value.replace(/\\+[nrt]/gu, " ").replace(/\s+/gu, " ");
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
-type HoldoutRedactor = (value: string, keep?: (line: string) => number) => string;
+type HoldoutRedactor = (value: string) => string;
 // Retain at most 2,048 details totaling 256K UTF-16 characters per store. Larger catalogues
 // still redact each read, but their patterns are not retained. Privacy filters load each read.
 const CATALOGUE_DETAILS_CAP = 2_048;
@@ -96,29 +97,16 @@ const verificationText = z.object({
 });
 
 /**
- * Header lines (whose only free text is the already-vetted path) and hunk ranges are Git's
- * own structure; holdout redaction applies to code lines and hunk context only.
- */
-function patchStructure() {
-  let header = true;
-  return (line: string) => {
-    if (line.startsWith("diff --git ")) header = true;
-    const hunk = /^@@ [^@]* @@/.exec(line);
-    if (hunk) header = false;
-    return header ? line.length : (hunk?.[0].length ?? 0);
-  };
-}
-
-/**
  * The rendered report clips holdout scenarios, so phrase matching cannot vet them; drop the
  * whole section. It always precedes the Checks heading, and any earlier or later lookalike
  * headings only widen what is dropped.
  */
-function withoutHoldoutSection(report: string) {
+function withoutHoldoutSection(report: string, redact: HoldoutRedactor) {
   const start = report.indexOf("## Holdout scenarios");
-  if (start < 0) return report;
+  if (start < 0) return redact(report);
   const end = report.lastIndexOf("\n\n## Checks");
-  return `${report.slice(0, start)}[Holdout scenarios withheld from agents]${end > start ? report.slice(end) : "\n"}`;
+  const section = report.slice(start, end > start ? end : undefined);
+  return `${redact(report.slice(0, start))}[withheld: holdout section; 1 section, ${section.split("\n").length} lines]${end > start ? redact(report.slice(end)) : "\n"}`;
 }
 
 /** Match before paging and retain a line map through decoding, including escaped line breaks. */
@@ -247,22 +235,37 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
             /[/_-]|[\p{L}$].*\d|\d.*[\p{L}$]/u.test(detail)))
       )
         details.add(detail);
-    const collect = (observed?: string) => {
-      if (observed !== undefined)
+    const collect = (observed?: string, privateProse = false) => {
+      if (observed !== undefined) {
         for (const detail of privateHoldoutDetails(standalone, publicSources, observed)) details.add(detail);
+        const prose = observed.trim();
+        const words = normalizeWhitespace(normalizedLayers(prose)?.at(-1) ?? prose).trim();
+        // Gate citations and generic notes are public; only private observations need
+        // whole-prose matching when they have no distinctive literals to harvest.
+        if (
+          privateProse &&
+          words.length >= DISTINCTIVE_LENGTH &&
+          words.split(" ").length > 1 &&
+          !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources)
+        )
+          details.add(prose);
+      }
     };
-    const collectOutput = (value: unknown) => {
-      if (typeof value === "string") collect(value);
+    const collectOutput = (value: unknown, privateProse = false) => {
+      if (typeof value === "string") collect(value, privateProse);
       else if (value && typeof value === "object")
-        for (const field of Object.values(value)) collectOutput(field);
+        for (const field of Object.values(value)) collectOutput(field, privateProse);
     };
     collect();
     const collectVerification = (verify: z.output<typeof verificationText> | null | undefined) => {
       collect(verify?.notes);
       for (const criterion of verify?.criteria ?? []) {
         // Public acceptance evidence/summaries stay public, as in preDeliveryVerifyArtifact.
-        if (rowKind(criterion.id, spec ?? null, holdout) !== "public")
-          collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation]);
+        const kind = rowKind(criterion.id, spec ?? null, holdout);
+        if (kind !== "public") {
+          if (kind === "holdout") details.add(criterion.id.trim());
+          collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation], true);
+        }
         collectOutput(criterion.gateEvidence);
       }
     };
@@ -323,17 +326,20 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       [...details].map((detail) => holdoutBoundaryPattern(detail.normalize("NFKC").toLowerCase())).join("|"),
       "iu",
     );
-  // Any detail, however short, that appears once text is decoded or normalized withholds the value.
+  // Any detail, however short, is private even after decoding or normalization.
   const encoded = (text: string) => {
     const layers = normalizedLayers(text);
     return !layers || layers.some((layer) => boundary?.test(layer));
   };
-  const multilineDetails = [...details].filter((detail) => /[\r\n\t]/u.test(detail));
+  // Any phrase can wrap in a report, even if its catalogue entry is a single line.
+  const multilineDetails = [...details];
   const multiline = multilineDetails.length
     ? new RegExp(
         multilineDetails
           .map((detail) => {
-            const normalized = detail.normalize("NFKC").toLowerCase().replace(/\s+/gu, " ");
+            const normalized = normalizeWhitespace(
+              normalizedLayers(detail)?.at(-1) ?? detail.normalize("NFKC").toLowerCase(),
+            );
             const literal = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             return detail.length >= DISTINCTIVE_LENGTH ? literal : holdoutBoundaryPattern(normalized);
           })
@@ -341,34 +347,26 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
         "giu",
       )
     : null;
-  const holdoutRedact: HoldoutRedactor = (value, keep) => {
+  const holdoutRedact: HoldoutRedactor = (value) => {
     if (multiline) {
-      const matched = redactMultiline(value, multiline, keep);
-      if (matched === null) return "[withheld: holdout text]";
+      const matched = redactMultiline(value, multiline);
+      if (matched === null)
+        return `[withheld: holdout result or quotation; ${value.split("\n").length} lines]`;
       value = matched;
     }
     if (!pattern) return value;
-    let removed = 0;
-    let hidden = false;
-    const replace = (text: string) => {
-      const replaced = text.replace(pattern, () => {
-        removed++;
-        return "[private detail]";
-      });
-      if (encoded(replaced)) hidden = true;
-      return replaced;
-    };
-    const safe = keep
-      ? value
-          .split("\n")
-          .map((line) => {
-            const kept = keep(line);
-            return line.slice(0, kept) + replace(line.slice(kept));
-          })
-          .join("\n")
-      : replace(value);
-    if (hidden || privateMatches(safe, distinctive).length) return "[withheld: holdout text]";
-    return removed ? `${safe}${keep ? "\n" : " "}[${removed} private details withheld]` : safe;
+    return value
+      .split("\n")
+      .map((line) => {
+        pattern.lastIndex = 0;
+        return line.includes("[private detail]") ||
+          pattern.test(line) ||
+          encoded(line) ||
+          privateMatches(line, distinctive).length
+          ? "[withheld: holdout result or quotation; 1 line]"
+          : line;
+      })
+      .join("\n");
   };
   return {
     redact: holdoutRedact,
@@ -383,7 +381,13 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const privacy = loadOutputPrivacy();
   if (!privacy) return { available: false, reason: "Privacy policy unavailable; content withheld." };
   const query = ChangeQuerySchema.safeParse(input);
-  if (!query.success) return { available: false, reason: "Invalid change-view request." };
+  if (!query.success)
+    return {
+      available: false,
+      reason: query.error.issues.some((issue) => issue.code === "custom")
+        ? "Further reads require headSha and baseSha from the first page."
+        : "Invalid change-view request.",
+    };
   const q = query.data;
   const { store } = factory;
   const owner = store.getRun(q.run);
@@ -399,15 +403,20 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     .safeParse(observed);
   if (!snapshot.success) return { available: false, reason: "Observed PR head unavailable." };
   const recorded = owner.prUrl ? store.prHead(owner.prUrl) : null;
+  const superseded = (sha: unknown) => ({
+    available: false,
+    reason: `PR head superseded${commitSha.safeParse(sha).success ? `; current head ${sha}` : ""}; restart limitless_get_change.`,
+  });
   const head = reviewableHead(
     snapshot.data.headRefOid,
     recorded && { ...recorded, pushing: store.pushingTo(owner.prUrl ?? "") },
   );
   if (head.problem)
-    return { available: false, reason: `PR head ${head.problem}; restart limitless_get_change.` };
+    return head.problem === "superseded"
+      ? superseded(recorded?.sha)
+      : { available: false, reason: "PR head unavailable; restart limitless_get_change." };
   const headSha = head.headSha;
-  if (q.headSha && q.headSha !== headSha)
-    return { available: false, reason: "PR head superseded; restart limitless_get_change." };
+  if (q.headSha && q.headSha !== headSha) return superseded(headSha);
   const baseBranch = snapshot.data.baseRefName ?? owner.baseBranch;
   const parsedComparison = commitSha.safeParse(snapshot.data.baseRefOid ?? owner.baseSha);
   if (!parsedComparison.success || !baseBranch)
@@ -424,14 +433,23 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   if (key && catalogue.cacheable) catalogues.set(store, { key, catalogue });
   else catalogues.delete(store);
   const holdoutRedact = catalogue.redact;
-  const protect = (value: string, keep?: (line: string) => number) => privacy(holdoutRedact(value, keep));
-  const safe = (value: string) => protect(value) === value;
+  const protect = (value: string) =>
+    privacy(value) === value
+      ? privacy(holdoutRedact(value))
+      : privacy(`[withheld: private text; ${value.split("\n").length} lines]`);
   const cwd = cachePath(factory.cfg.paths, repo);
   const git = async (args: string[]) =>
     (await worktreeGit(["git", ...args], { cwd, signal, redactOutput: false })).stdout;
   try {
-    await git(["cat-file", "-e", `${headSha}^{commit}`]);
-    await git(["cat-file", "-e", `${comparison}^{commit}`]);
+    for (const sha of [headSha, comparison, ...(q.baseSha ? [q.baseSha] : [])]) {
+      const result = await worktreeGit(["git", "cat-file", "-e", `${sha}^{commit}`], {
+        cwd,
+        signal,
+        allowFail: true,
+      });
+      if (result.exitCode !== 0)
+        return { available: false, reason: `Required commit ${sha} unavailable in local cache.` };
+    }
     const baseSha = (await git(["merge-base", comparison, headSha])).trim();
     if (q.baseSha && q.baseSha !== baseSha)
       return { available: false, reason: "Comparison superseded; restart limitless_get_change." };
@@ -461,9 +479,42 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         };
       });
     const selected = files[q.file];
+    if (!selected && (q.file > 0 || files.length > 0))
+      return { available: false, reason: `Unknown file index ${q.file}; change has ${files.length} files.` };
+    // Only files present in the delivered tree qualify for the visible PR diff.
+    const deleted = new Set(
+      (
+        await git([
+          "diff",
+          "--no-renames",
+          "--ignore-submodules=none",
+          "--diff-filter=D",
+          "--name-only",
+          "-z",
+          baseSha,
+          headSha,
+          "--",
+        ])
+      )
+        .split("\0")
+        .filter(Boolean),
+    );
+    const prText = (path: string) => !deleted.has(path);
+    const safePath = (path: string) =>
+      privacy(path) === path && privacy(JSON.stringify(path)) === JSON.stringify(path) && prText(path);
+    // Filter complete lines before paging, then check the complete sanitized patch too.
+    const privatePatch = (patch: string) => {
+      const filtered = patch
+        .split("\n")
+        .map((line) => (privacy(line) === line ? line : "[withheld: private text; 1 line]"))
+        .join("\n");
+      return privacy(filtered) === filtered
+        ? filtered
+        : privacy(`[withheld: private text; ${patch.split("\n").length} lines]`);
+    };
     const patch =
-      selected && !selected.binary && safe(selected.path) && safe(JSON.stringify(selected.path))
-        ? protect(
+      selected && !selected.binary && safePath(selected.path)
+        ? privatePatch(
             await git([
               "diff",
               "--no-renames",
@@ -476,9 +527,12 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
               "--",
               `:(literal)${selected.path}`,
             ]),
-            patchStructure(),
           )
-        : "";
+        : selected && !selected.binary
+          ? prText(selected.path)
+            ? "[withheld: protected path; 1 file]"
+            : `[withheld: file absent from PR head; 1 file, ${selected.deletions ?? 0} lines]`
+          : "";
     const pin = { run: owner.id, headSha, baseSha };
     const page = (text: string, offset: number, cap: number) => ({
       text: text.slice(offset, offset + cap),
@@ -494,13 +548,19 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         : {
             run,
             available: true,
-            ...page(protect(withoutHoldoutSection(report)), q.reportOffset, REPORT_CAP),
+            ...page(
+              privacy(report) === report
+                ? privacy(withoutHoldoutSection(report, holdoutRedact))
+                : protect(report),
+              q.reportOffset,
+              REPORT_CAP,
+            ),
           };
     });
     const listing = [];
     let size = 0;
     for (const file of files.slice(q.filesOffset, q.filesOffset + FILES_CAP)) {
-      const entry = { ...file, path: protect(file.path) };
+      const entry = { ...file, path: prText(file.path) ? privacy(file.path) : protect(file.path) };
       size += JSON.stringify(entry).length;
       if (size > PATCH_CAP && listing.length) break;
       listing.push(entry.path.length > REPORT_CAP ? { ...entry, path: "[withheld: oversized path]" } : entry);
@@ -515,7 +575,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
       reviewableHead(JSON.parse(current).headRefOid, { ...now, pushing: store.pushingTo(owner.prUrl ?? "") })
         .headSha !== headSha
     )
-      return { available: false, reason: "PR head superseded; restart limitless_get_change." };
+      return superseded(now?.sha);
     if (!key || catalogueKey(store, ids, owner.prUrl ? store.reviewRounds(owner.prUrl) : []) !== key)
       return { available: false, reason: "Holdout policy changed; restart limitless_get_change." };
     return privateOutputData(

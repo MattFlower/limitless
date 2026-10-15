@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
 import { Semaphore } from "../gates/slots.ts";
+import { worktreeGit } from "../git/command.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
@@ -23,6 +24,7 @@ import {
   panelIdentity,
   pickVerifier,
   type ReviewRequest,
+  reviewRequest,
   runReview,
   type VerifierRequest,
 } from "../pipeline/review.ts";
@@ -51,7 +53,14 @@ import {
   prepareImplement,
   RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
-import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
+import {
+  gradeCase,
+  prepareCase,
+  prepareEvalGates,
+  schemaFor,
+  seedContent,
+  storedSchemaFor,
+} from "./prepare.ts";
 import { replayFinders, validateReplay } from "./replay.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
@@ -625,6 +634,7 @@ export class EvalRunner {
     let directory: string | undefined;
     let scratch: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
+    let preparationStarted: number | undefined;
     try {
       const replay =
         typeof replayId === "string" && system
@@ -654,7 +664,7 @@ export class EvalRunner {
         cleanup = checkout;
         if (item.snapshot) effective = { ...item, base: checkout.base };
       }
-      const preparationStarted = Date.now();
+      preparationStarted = Date.now();
       const implementation = "hidden" in effective ? await implementFor(effective, cwd) : undefined;
       const prepared =
         "hidden" in effective
@@ -669,13 +679,30 @@ export class EvalRunner {
               cfg.triageDecisionConfidence,
             );
       if (!prepared) throw new Error("missing trial preparation");
+      if ("defects" in effective && system?.setup) {
+        const head = (await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal })).stdout.trim();
+        const { baseline } = await prepareEvalGates(effective, cwd, signal, true);
+        const failed = baseline.setup.find((step) => !step.ok);
+        if (!baseline.setupOk)
+          throw new Error(
+            redactCredentials(`review gate setup failed: ${failed?.command}\n${failed?.output}`),
+          );
+        // Pin attributes too: setup may leave .gitattributes. Retain dependencies and other outputs.
+        await worktreeGit(["git", `--attr-source=${head}`, "reset", "--hard", "-q", head], { cwd, signal });
+      }
       const preparationMs = Date.now() - preparationStarted;
+      if ("defects" in item) trial.details.preparationMs = preparationMs;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
       const reviewInput =
         "review" in prepared && prepared.review
           ? { ...prepared.review, ...(system ? { system } : {}) }
           : undefined;
+      const finder = system?.mode === "single" ? system.finders[0]?.prompt : undefined;
+      if (reviewInput && finder && finder !== "standard") {
+        reviewInput.prompt = { ...reviewInput.prompt, finder };
+        prompt = reviewRequest(reviewInput).prompt;
+      }
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
       // Panel targets beyond the trial's own (its first finder) are pinned in the system. A bare
       // target is an unset effort, which today's model default must not restore (as for the trial).
@@ -1175,6 +1202,9 @@ export class EvalRunner {
         details: {
           ...trial.details,
           preparationFailed: !trial.details.roundsUsed,
+          ...("defects" in item && preparationStarted !== undefined && !trial.details.roundsUsed
+            ? { preparationMs: Date.now() - preparationStarted }
+            : {}),
           ...("hidden" in item
             ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: "operational failure" }
             : {}),
