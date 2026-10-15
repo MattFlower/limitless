@@ -502,6 +502,52 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
     const prText = (path: string) => !deleted.has(path);
     const safePath = (path: string) =>
       privacy(path) === path && privacy(JSON.stringify(path)) === JSON.stringify(path) && prText(path);
+    const normalizeNewlines = (value: string) => value.replace(/\r\n?/gu, "\n");
+    const multiline = [...loadPrivateStrings().map(({ value }) => value), ...registeredCredentials()]
+      .map((value) => normalizeNewlines(value.normalize("NFKC").toLowerCase()))
+      .filter((value) => value.includes("\n"));
+    // The patch's exact selection: a trailing slash would also exclude a gitlink, so changed
+    // descendants are excluded one by one.
+    const selection = (path: string) => [
+      "--no-renames",
+      "--ignore-submodules=none",
+      baseSha,
+      headSha,
+      "--",
+      `:(top,literal)${path}`,
+      ...files
+        .filter((file) => file.path.startsWith(`${path}/`))
+        .map((file) => `:(top,exclude,literal)${file.path}`),
+    ];
+    // Inspect the blobs this selection diffs, not whatever a path lookup finds: a malformed tree
+    // can hold two entries that render as the same path.
+    const privateFile = async (path: string) => {
+      if (!multiline.length) return false;
+      const records = (await git(["diff", "--raw", "-z", "--no-abbrev", ...selection(path)])).split("\0");
+      if (records.length !== 3 || records[1] !== path || records[2] !== "")
+        throw new Error("Invalid Git patch selection");
+      const meta = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) [A-Z][0-9]*$/u.exec(
+        records[0] ?? "",
+      );
+      if (!meta) throw new Error("Invalid Git file metadata");
+      for (const [mode, oid] of [
+        [meta[1], meta[3]],
+        [meta[2], meta[4]],
+      ]) {
+        // Absent sides are all zeros; gitlinks reference commits outside this repository.
+        if (!oid || /^0+$/u.test(oid) || !["100644", "100755", "120000"].includes(mode ?? "")) continue;
+        // `cat-file blob` peels a tag to its target, but the patch shows the object itself.
+        if ((await git(["cat-file", "-t", oid])).trim() !== "blob")
+          throw new Error("Invalid Git file metadata");
+        const layers = normalizedLayers(await git(["cat-file", "blob", oid]));
+        if (
+          !layers ||
+          layers.some((layer) => multiline.some((value) => normalizeNewlines(layer).includes(value)))
+        )
+          return true;
+      }
+      return false;
+    };
     // Filter complete lines before paging, then check the complete sanitized patch too.
     const privatePatch = (patch: string) => {
       const filtered = patch
@@ -512,22 +558,19 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
         ? filtered
         : privacy(`[withheld: private text; ${patch.split("\n").length} lines]`);
     };
+    const selectedPatch = async (path: string) => {
+      const args = selection(path);
+      if ((await git(["diff", "--name-only", "-z", ...args])) !== `${path}\0`)
+        throw new Error("Invalid Git patch selection");
+      return privatePatch(
+        await git(["diff", "--unified=3", "--diff-algorithm=myers", "--no-indent-heuristic", ...args]),
+      );
+    };
     const patch =
       selected && !selected.binary && safePath(selected.path)
-        ? privatePatch(
-            await git([
-              "diff",
-              "--no-renames",
-              "--ignore-submodules=none",
-              "--unified=3",
-              "--diff-algorithm=myers",
-              "--no-indent-heuristic",
-              baseSha,
-              headSha,
-              "--",
-              `:(literal)${selected.path}`,
-            ]),
-          )
+        ? (await privateFile(selected.path))
+          ? "[withheld: private text; 1 file]"
+          : await selectedPatch(selected.path)
         : selected && !selected.binary
           ? prText(selected.path)
             ? "[withheld: protected path; 1 file]"
