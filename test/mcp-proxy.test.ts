@@ -521,6 +521,78 @@ test.each(["red owl", "All checks passed."])(
   },
 );
 
+test.each(["evidence", "publicSummary"] as const)(
+  "public acceptance evidence quoting private %s stays withheld in marked reports",
+  async (field) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    const privateProse = "All checks passed. The amber lantern glows.";
+    const state: Parameters<typeof renderReport>[0]["state"] = {
+      spec: {
+        summary: "Public task",
+        assumptions: [],
+        requirements: [],
+        out_of_scope: [],
+        blocking_questions: [],
+        acceptance_criteria: [
+          { id: "AC-1", criterion: "Public criterion", how_to_verify: "Run checks" },
+          { id: "AC-2", criterion: "Unrelated criterion", how_to_verify: "Run checks" },
+        ],
+      },
+      holdout: {
+        scenarios: [
+          { id: "H-1", description: "Private behavior", steps: "Run it", expected: "Done", edge_case: false },
+        ],
+      },
+      lastVerify: {
+        modelId: "verifier",
+        overall: "pass",
+        notes: "",
+        criteria: [
+          { id: "AC-1", status: "met", evidence: `Quoted: ${privateProse}`, publicSummary: "" },
+          { id: "AC-2", status: "met", evidence: "All checks passed.", publicSummary: "" },
+          {
+            id: "H-1",
+            status: "met",
+            evidence: "All checks passed.",
+            publicSummary: "All checks passed.",
+            [field]: privateProse,
+          },
+        ],
+      },
+    };
+    f.factory.store.setRunState(c.run.id, state);
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      renderReport({
+        success: true,
+        runId: c.run.id,
+        prompt: "Public request",
+        state,
+        invocations: [],
+        totals: { costUsd: 0, costEquivUsd: 0 },
+        runUrl: "u",
+      }),
+    );
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        const text = page.reports[0]?.text ?? "";
+        expect(text).not.toContain("amber lantern");
+        expect(text).not.toContain("Quoted:");
+        expect(text).toContain("Unrelated criterion | All checks passed.");
+        expect(text).toContain("## Checks");
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
 test("marked reports still filter model prose and withhold private spans before pagination", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
   const state: Parameters<typeof renderReport>[0]["state"] = {

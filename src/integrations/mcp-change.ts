@@ -115,7 +115,7 @@ function withoutHoldoutSection(report: string, redact: HoldoutRedactor) {
   return `${redact(report.slice(0, start))}[withheld: holdout section; 1 section, ${section.split("\n").length} lines]${end > start ? redact(report.slice(end)) : "\n"}`;
 }
 
-/** Only validated factory spans can opt out of whole-private-prose matching. */
+/** Only validated factory structure can exempt generic private-row wording. */
 function redactReport(report: string, catalogue: Catalogue): string {
   const structure = reportStructure(report);
   if (structure === null) return "[withheld: invalid report structure]";
@@ -345,10 +345,21 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
   // Legacy unknown rows retain their generic-wording exemptions; marked model prose matches them too.
   const allDetails = new Set([...details, ...proseDetails]);
   const allProseDetails = new Set([...allDetails, ...shortProseDetails]);
+  // Public rows also contain model-written evidence. Keep the whole-prose backstop
+  // there, exempting only complete generic status messages, never distinctive suffixes.
+  const factoryDetails = new Set([
+    ...details,
+    ...[...proseDetails].filter(
+      (detail) =>
+        !/^(?:all )?(?:checks|tests|gates) passed[.!]?$/iu.test(
+          normalizeWhitespace(normalizedLayers(detail)?.at(-1) ?? detail).trim(),
+        ),
+    ),
+  ]);
   return {
     redact: buildRedactor(allDetails, privateRows),
     proseRedact: buildRedactor(allProseDetails),
-    factoryRedact: buildRedactor(details),
+    factoryRedact: buildRedactor(factoryDetails),
     cacheable:
       allProseDetails.size <= CATALOGUE_DETAILS_CAP &&
       [...allProseDetails].reduce((size, detail) => size + detail.length, 0) <= CATALOGUE_CHARACTERS_CAP,
