@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
@@ -101,8 +102,14 @@ export class Factory {
     for (const model of this.store.runtimeModels()) {
       const existing = this.models.find((m) => m.id === model.id);
       if (existing) {
-        if (MODELS.some((m) => m.id === model.id)) {
-          console.warn(`[catalog] ${model.id}: redundant runtime entry; using built-in definition`);
+        const builtIn = MODELS.find((m) => m.id === model.id);
+        if (
+          builtIn &&
+          existing.source !== "runtime" &&
+          isDeepStrictEqual({ ...existing, source: undefined }, { ...builtIn, source: undefined })
+        ) {
+          const source = existing.source === "config" ? "exported config" : "built-in";
+          console.warn(`[catalog] ${model.id}: redundant runtime entry; using ${source} definition`);
           continue;
         }
         throw new Error(`catalog collision: ${model.id}`);

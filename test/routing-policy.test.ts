@@ -61,8 +61,12 @@ test.each(["built-in", "exported"])(
         await factory.stop();
         store.close();
         store = new Store(cfg.paths.db);
+        warn.mockClear();
         factory = new Factory(fixture.load(), { store });
       }
+      expect(warn).toHaveBeenCalledWith(
+        `[catalog] claude/haiku-5.5: redundant runtime entry; using ${exported ? "exported config" : "built-in"} definition`,
+      );
       const effective = { ...builtIn, ...(exported ? { source: "config" as const } : {}) };
       expect(factory.models.filter((m) => m.id === runtime.id)).toEqual([effective]);
       expect(() => factory?.catalog.patch(runtime.id, { tier: 1 })).toThrow("read-only");
@@ -95,17 +99,23 @@ test.each(["built-in", "exported"])(
   },
 );
 
-test("startup rejects a runtime collision with an unrelated config model", () => {
-  const fixture = providerFixture([{ id: "claude", models: [{ ...customModel, id: "config-only" }] }]);
+test.each([
+  { ...customModel, id: "config-only" },
+  { id: "haiku-5.5", model: "org/unrelated-model" },
+  { id: "haiku-5.5", price: { input: 1 } },
+  { id: "haiku-5.5", efforts: ["low", "medium"] },
+  { id: "haiku-5.5", checkpoint: "unrelated-checkpoint" },
+])("startup rejects a runtime collision with an unrelated config model %j", (model) => {
+  const fixture = providerFixture([{ id: "claude", models: [model] }]);
   const store = new Store(":memory:");
   try {
     const cfg = fixture.load();
     const runtime = runtimeModel(
-      { ...customModel, id: "config-only", provider: "claude" },
+      { ...customModel, id: model.id, provider: "claude" },
       resolveCatalog().providers,
     );
     store.writeRuntimeModel(runtime.id, runtime);
-    expect(() => new Factory(cfg, { store })).toThrow("catalog collision: claude/config-only");
+    expect(() => new Factory(cfg, { store })).toThrow(`catalog collision: claude/${model.id}`);
   } finally {
     store.close();
     fixture.close();
