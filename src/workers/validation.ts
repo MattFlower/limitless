@@ -21,14 +21,27 @@ export function validCheck(req: GateRequest, r: GateResult, phase: "setup" | "ch
 }
 export function validRun(req: GateRequest, run: GateRun) {
   const checks = requestedChecks(req);
+  if (
+    run.setup.length > req.gates.setup.length ||
+    !run.setup.every(
+      (r, i) =>
+        validCheck(req, r, "setup") &&
+        r.name === `setup${req.gates.setup.length > 1 ? `-${i + 1}` : ""}` &&
+        r.command === redactGateOutput(req.gates.setup[i] ?? ""),
+    )
+  )
+    return false;
+  if (!run.setupOk)
+    return (
+      run.checks.length === 0 &&
+      run.setup.length > 0 &&
+      run.setup.every((r, i) => (i === run.setup.length - 1 ? !r.ok : r.ok))
+    );
   return (
     run.checks.length === checks.length &&
     new Set(run.checks.map((r) => r.name)).size === checks.length &&
     run.checks.every((r) => validCheck(req, r, "check")) &&
     run.setup.length === req.gates.setup.length &&
-    run.setup.every(
-      (r, i) => validCheck(req, r, "setup") && r.command === redactGateOutput(req.gates.setup[i] ?? ""),
-    ) &&
-    run.setupOk === run.setup.every((r) => r.ok)
+    run.setup.every((r) => r.ok)
   );
 }

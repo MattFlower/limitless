@@ -18,6 +18,7 @@ import { registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import type { Capabilities } from "../src/workers/protocol.ts";
 import { privateFile, workerRequest } from "../src/workers/tls.ts";
+import { validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
@@ -64,8 +65,8 @@ afterEach(async () => {
   else process.env.LIMITLESS_CONFIG_DIR = restoreConfig;
   rmSync(home, { recursive: true, force: true });
 });
-async function listen() {
-  listener = await startWorkerListener(workers, cfg.paths, "127.0.0.1:0", () => {});
+async function listen(address = "127.0.0.1:0") {
+  listener = await startWorkerListener(workers, cfg.paths, address, () => {});
   if (!listener) throw new Error("Missing listener");
   return listener;
 }
@@ -197,7 +198,7 @@ test.each(["releaseSha", "bunVersion"] as const)(
   30_000,
 );
 
-async function loop() {
+async function loop(options: Parameters<typeof runWorker>[4] = {}) {
   if (!listener) throw new Error("Missing listener");
   workers.times.poll = 1000;
   const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
@@ -208,7 +209,9 @@ async function loop() {
   const task = runWorker(listener.url.origin, remote, releaseSha, controller.signal, {
     confinement: fakeConfinement,
     heartbeatMs: 250,
+    retryMs: 5,
     machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+    ...options,
   });
   void task.catch(() => {});
   return {
@@ -254,6 +257,151 @@ test("a worker runs real checks from the exact bundle head and returns the local
     await worker.stop();
   }
 }, 180_000);
+
+test("a real worker setup failure completes once without infrastructure retry or local fallback", async () => {
+  await listen();
+  const req = await request(true);
+  req.gates.setup = ["test -f tracked", "echo broken-setup; exit 9", "echo must-not-run"];
+  const worker = await loop();
+  try {
+    const run = await confinementScope.run(fakeConfinement, () =>
+      executeGate(req, AbortSignal.timeout(120_000), {}, gateExecutorFor("lan", workers, [req.repo])),
+    );
+    expect(run.setupOk).toBe(false);
+    expect(run.setup.map(({ name, ok, exitCode }) => ({ name, ok, exitCode }))).toEqual([
+      { name: "setup-1", ok: true, exitCode: 0 },
+      { name: "setup-2", ok: false, exitCode: 9 },
+    ]);
+    expect(run.checks).toEqual([]);
+    expect(workers.jobs("1=1")).toHaveLength(1);
+    expect(workers.jobs("1=1")[0]).toMatchObject({
+      state: "done",
+      attempt: 1,
+      worker: "loop-runner",
+      failure_reason: null,
+    });
+    expect(store.listEvents(req.runId ?? "").filter((e) => e.type === "gate")).toEqual([]);
+
+    // A setup failure permits only a matching prefix ending at the first failure.
+    const first = run.setup[0],
+      failed = run.setup[1];
+    if (!first || !failed) throw new Error("Missing setup results");
+    for (const invalid of [
+      { ...run, setup: [] },
+      { ...run, setup: [first] },
+      { ...run, setup: [failed] },
+      { ...run, setup: [failed, first] },
+      { ...run, setup: [first, { ...failed, name: "setup-1" }] },
+      { ...run, setup: [...run.setup, { ...first, name: "setup-3", command: req.gates.setup[2] ?? "" }] },
+      { ...run, checks: [first] },
+      { ...run, setupOk: true },
+    ])
+      expect(validRun(req, invalid)).toBe(false);
+  } finally {
+    await worker.stop();
+  }
+}, 150_000);
+
+test("a worker survives connection failures, 503s and a coordinator restart with its job still running", async () => {
+  const server = await listen(),
+    address = `127.0.0.1:${server.url.port}`,
+    req = await request(true);
+  req.gates.setup = [];
+  const started = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>();
+  const paths = ["/worker/heartbeat", "/worker/lease"];
+  const disconnected = new Map(paths.map((p) => [p, Promise.withResolvers<void>()])),
+    recovered = new Map(paths.map((p) => [p, Promise.withResolvers<void>()])),
+    unavailable = new Set<string>();
+  let offline = false;
+  const worker = await loop({
+    heartbeatMs: 10,
+    confinement: {
+      ...fakeConfinement,
+      async verify(_roots, opts) {
+        started.resolve();
+        const abort = () => finish.resolve();
+        opts.signal?.addEventListener("abort", abort, { once: true });
+        await finish.promise;
+        opts.signal?.removeEventListener("abort", abort);
+        opts.signal?.throwIfAborted();
+      },
+    },
+    async request(...args) {
+      const path = args[1];
+      try {
+        const reply = await workerRequest(...args);
+        if (offline && paths.includes(path)) {
+          if (!unavailable.has(path)) {
+            unavailable.add(path);
+            return { ...reply, status: 503 };
+          }
+          recovered.get(path)?.resolve();
+        }
+        return reply;
+      } catch (error) {
+        if (offline) disconnected.get(path)?.resolve();
+        throw error;
+      }
+    },
+  });
+  const alive = <T>(promise: Promise<T>) =>
+    Promise.race([
+      promise,
+      worker.task.then(() => {
+        throw new Error("Worker exited before reconnecting");
+      }),
+    ]);
+  const executor = gateExecutorFor("lan", workers, [req.repo]);
+  const handle = await executor.start(req, new AbortController().signal);
+  try {
+    await alive(started.promise);
+    offline = true;
+    await server.stop();
+    listener = undefined;
+    await alive(Promise.all([...disconnected.values()].map((p) => p.promise)));
+    store.close();
+    store = new Store(cfg.paths.db);
+    workers = new WorkerStore(store, releaseSha, { poll: 30, tick: 5 });
+    await listen(address);
+    await alive(Promise.all([...recovered.values()].map((p) => p.promise)));
+    expect(unavailable.size).toBe(2);
+    finish.resolve();
+    const run = await alive(
+      executeGate(req, AbortSignal.timeout(120_000), {}, gateExecutorFor("lan", workers, [req.repo]), handle),
+    );
+    expect(fields(run)).toEqual([
+      { name: "pass", ok: true, exitCode: 0 },
+      { name: "fail", ok: false, exitCode: 7 },
+    ]);
+    expect(workers.jobs("1=1")).toHaveLength(1);
+    expect(workers.job(handle.id)).toMatchObject({ state: "done", attempt: 1, failure_reason: null });
+  } finally {
+    finish.resolve();
+    await worker.stop();
+  }
+}, 150_000);
+
+test.each([401, 403])(
+  "a %d response stops the worker without retrying",
+  async (status) => {
+    await listen();
+    let requests = 0;
+    const worker = await loop({
+      async request(...args) {
+        requests++;
+        return { ...(await workerRequest(...args)), status };
+      },
+    });
+    try {
+      await expect(worker.task).rejects.toThrow(`Coordinator refused worker request (${status})`);
+      expect(requests).toBe(1);
+    } finally {
+      await worker.stop();
+    }
+  },
+  30_000,
+);
 
 test("repos without opt-in use local execution without creating jobs", async () => {
   const req = await request();

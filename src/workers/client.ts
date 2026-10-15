@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { cpus, hostname, release, totalmem } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import type { GateRequest } from "../gates/executor.ts";
@@ -106,6 +107,8 @@ export async function runWorker(
     confinement?: ConfinementBackend;
     heartbeatMs?: number;
     machineState?: typeof machineState;
+    request?: typeof workerRequest;
+    retryMs?: number;
   } = {},
 ) {
   if (process.platform !== "darwin" && !options.confinement)
@@ -120,14 +123,28 @@ export async function runWorker(
     combined = AbortSignal.any([signal, stop.signal]);
   const jobs = new Map<string, { controller: AbortController; task: Promise<void> }>();
   const call = async (path: string, body?: unknown, requestSignal = combined) => {
-    const reply = await workerRequest(coordinator, path, body, {
-      token: token.value,
-      pin: pin.value,
-      signal: requestSignal,
-      timeoutMs: path.endsWith("/bundle") ? 300_000 : undefined,
-    });
-    if (reply.status !== 200) throw new Error(`Coordinator refused worker request (${reply.status})`);
-    return reply;
+    let delay = options.retryMs ?? 1000;
+    for (;;) {
+      requestSignal.throwIfAborted();
+      const reply = await (options.request ?? workerRequest)(coordinator, path, body, {
+        token: token.value,
+        pin: pin.value,
+        signal: requestSignal,
+        timeoutMs: path.endsWith("/bundle") ? 300_000 : undefined,
+      }).catch(() => {
+        requestSignal.throwIfAborted();
+        return undefined;
+      });
+      if (reply?.status === 200) return reply;
+      if (reply && reply.status < 500) {
+        const error = new Error(`Coordinator refused worker request (${reply.status})`);
+        if (reply.status === 401 || reply.status === 403) stop.abort(error);
+        throw error;
+      }
+      // Keep gates and heartbeat requests alive across a coordinator restart.
+      await sleep(delay, undefined, { signal: requestSignal });
+      delay = Math.min(delay * 2, 10_000);
+    }
   };
   const heartbeat = async () => {
     const slots = gateSlots.snapshot(),
@@ -216,19 +233,11 @@ export async function runWorker(
     await heartbeat();
     beats = (async () => {
       while (!combined.aborted) {
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            combined.removeEventListener("abort", done);
-            resolve();
-          };
-          const timer = setTimeout(done, options.heartbeatMs ?? timing.heartbeat);
-          combined.addEventListener("abort", done, { once: true });
-        });
+        await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal: combined });
         if (!combined.aborted) await heartbeat();
       }
     })();
-    void beats.catch(() => stop.abort());
+    void beats.catch((error: unknown) => stop.abort(error));
     while (!combined.aborted) {
       const leased = Lease.parse((await call("/worker/lease", { jobs: [...jobs.keys()] })).json());
       for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
