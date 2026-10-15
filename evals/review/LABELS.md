@@ -240,3 +240,49 @@ Result: of the 183 candidates, 90 were confirmed at blocker or major (gold), 43 
 | review-105 | #421 | dev | 2 | 0 | 0 | 0 | kept |
 | review-106 | #421 | dev | 2 | 2 | 0 | 0 | kept |
 | review-107 | #424 | heldout | 2 | 0 | 0 | 0 | kept |
+
+## M5.2 clean-case audit — 2026-10-14
+
+Recorded 2026-10-14 (checked with `date`), under the rule above: an independent adjudication by
+codex/sol-6.1 at high effort, then the orchestrator re-running the evidence, recorded in
+`labelHistory`. The audit covers every blocking finding on a dev clean case by every stored dev
+system, not only the variant being decided: E1 (`codex/sol-6.1@medium` and `@high`, #508), E2
+(`claude/opus`, #522) and E3 (`codex/sol-6.1@medium` with the adversarial prompt, #531). Only
+review-082 was queued for audit in advance (#508). The other cases were examined after E3's result
+was known, so reports give every result both as registered and after the audit, and any decision
+that changes stays provisional until its held-out confirmation. Each adjudication used the same
+instructions; only the case and the claims differed.
+
+| Case | PR | Split | Gold | Optional | Downgraded | Rejected | Outcome |
+|---|---|---|---|---|---|---|---|
+| review-078 | #396 | dev | 0 | 0 | 1 | 0 | stays clean |
+| review-082 | #399 | dev | 0 | 0 | 0 | 1 | stays clean |
+| review-088 | #405 | dev | 1 | 0 | 0 | 0 | relabelled real |
+| review-096 | #415 | dev | 1 | 0 | 1 | 0 | relabelled real |
+
+- **review-078** (blocked by E1 `@high` once): when origin exclusion leaves only a self-verifying
+  verifier, the error drops the exclusion reason. Newly exposed but low severity: the run still
+  stops before verification.
+- **review-082** (blocked by every system): two claims.
+  - Claim 1 is rejected because it isn't new: non-UTF-8 executable scripts still need
+    `Allow: binary`, but base required it for every executable path.
+  - Claim 2 was confirmed major: an edited Latin-1 script whose mode changes from 100755 to
+    100644 newly needs the allowance.
+  - The case still stays clean, because clean cases are merged heads with no later fix. This
+    behaviour was never fixed; it was adopted as the rule in AGENTS.md ("an executable or
+    mode-changed file needs Allow: binary unless its content is reviewable text"). A gold defect
+    here would count a reviewer that follows AGENTS.md as having missed it.
+  - An earlier adjudication of the same claims rated claim 2 low. Its instructions included that
+    AGENTS.md text as context, unlike the others, so it isn't used.
+  - No E1, E2 or E3 verdict depends on this case.
+- **review-088** (blocked by E1 `@high` and E3 on both trials, and by E2 once): the isolated
+  post-check `status` runs a clean filter from the land clone's configuration through a populated
+  submodule whose `.git` points at the clone's admin directory. Base emptied the clone's filter keys
+  and did not run it. The same gap in today's factory git calls is #533.
+- **review-096** (blocked by E3 once and E2 once): after `limitless providers export --write`, the
+  retained runtime `claude/haiku-5.5` row makes startup throw `catalog collision`, reproduced in an
+  isolated home. A second claim, that the row can't be removed, is low. Still open on main as #534.
+
+After the audit, the dev clean set is four cases (eight trials at k=2) instead of six. A rule of
+"at most one more clean false block" is therefore looser on dev than it was, so held-out carries
+more of the weight for decisions measured after this audit.
