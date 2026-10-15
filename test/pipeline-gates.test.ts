@@ -1,13 +1,15 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import * as proc from "../src/util/proc.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { test } from "./read-policy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 let home: string;
@@ -35,6 +37,81 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["credential command", "escaped identity"])(
+    "literal gate state survives restart: %s",
+    async (scenario) => {
+      const secret = "synthetic-gate-resume-credential-494";
+      registerCredential("resume-command-test", secret);
+      const name = scenario === "escaped identity" ? "\x1b[31mcheck" : "check";
+      const command = scenario === "escaped identity" ? "exit 1" : `test "$(cat expected.txt)" = '${secret}'`;
+      writeFileSync(join(repoDir, "expected.txt"), secret);
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        `[gates]\nchecks = [{ name = ${JSON.stringify(name)}, run = ${JSON.stringify(command)} }]\n`,
+      );
+      await sh(["git", "add", "."], { cwd: repoDir });
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "literal gates"], {
+        cwd: repoDir,
+      });
+      const f = start((s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      await f.stop();
+      const commands: string[] = [];
+      const realProcess = proc.runProcess;
+      const processSpy = spyOn(proc, "runProcess").mockImplementation((opts) => {
+        if (opts.cmd[0] === "/bin/sh") commands.push(opts.cmd.at(-1) ?? "");
+        return realProcess(opts);
+      });
+      try {
+        const verdicts = [];
+        for (const restart of [false, true]) {
+          commands.length = 0;
+          f.deps.faults = restart
+            ? {
+                "store:save": {
+                  action: "kill",
+                  when: (c) => c.stage === "gates" && c.checkpoint === "gate-started",
+                },
+              }
+            : undefined;
+          const run = await f.createRun({
+            repo: repoDir,
+            prompt: "Add farewell",
+            profile: "quick",
+            noBaselineCache: true,
+          });
+          const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+          if (restart) expect(await execute()).toBe("running");
+          expect(await execute()).toBe("succeeded");
+          const state = f.store.getRunState<RunState>(run.id);
+          expect(state?.baseline?.checks[0]?.name).toBe(name);
+          expect(state?.lastGates?.[0]).toMatchObject({
+            name,
+            verdict: scenario === "escaped identity" ? "still_failing" : "pass",
+            blocking: false,
+            result: { name, command },
+          });
+          expect(state?.gateEvidence?.checks[0]?.name).toBe(name);
+          expect(commands).toEqual(Array(scenario === "escaped identity" ? 3 : 2).fill(command));
+          verdicts.push(state?.lastGates?.[0]?.verdict);
+          const outward = JSON.stringify([
+            f.store.listEvents(run.id),
+            f.store.getArtifact(run.id, "gates-0.json"),
+            f.store.getArtifact(run.id, "baseline-gates.json"),
+          ]);
+          expect(outward).not.toContain(secret);
+          expect(outward).not.toContain("\\u001b");
+        }
+        expect(verdicts[1]).toBe(verdicts[0]);
+      } finally {
+        processSpy.mockRestore();
+      }
+    },
+  );
+
   test.each([
     "passes",
     "twice",

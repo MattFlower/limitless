@@ -3,7 +3,7 @@ import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { findGateCounterpart, redactGateData } from "../gates/output.ts";
+import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
   citationInSource,
@@ -202,6 +202,7 @@ export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): str
 }
 
 export function formatAuditFeedback(findings: AuditFinding[]): string {
+  findings = redactGateData(findings);
   const block = findings.filter((f) => f.severity === "block");
   if (!block.length) return "";
   return `### Policy violations\n${block.map((f) => `- [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n")}`;
@@ -209,6 +210,7 @@ export function formatAuditFeedback(findings: AuditFinding[]): string {
 
 /** `panel`: a finding without a ruling blocks only because the verifier left it out (fail closed). */
 export function formatReviewFeedback(findings: Review["findings"], panel = false): string {
+  findings = redactGateData(findings);
   if (!findings.length) return "";
   return `### Code review findings (must fix)\n${findings
     .map(
@@ -320,7 +322,9 @@ export function formatVerifyFeedback(
     })
     .join("\n");
   // Printed once: repeating the public sources per holdout bloated feedback and the needs_human error.
-  return `### Checks not met\n${items}${unvalidated ? "\n\nUnvalidated attributions: check them against the original request and specification above." : ""}`;
+  return redactGateOutput(
+    `### Checks not met\n${items}${unvalidated ? "\n\nUnvalidated attributions: check them against the original request and specification above." : ""}`,
+  );
 }
 
 /**

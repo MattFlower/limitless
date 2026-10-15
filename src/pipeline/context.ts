@@ -23,7 +23,7 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
-import { redactGateData } from "../gates/output.ts";
+import { redactGateData, redactGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
@@ -311,10 +311,18 @@ export class RunContext {
       feedback: null,
       toolCommands: [],
     };
-    this.state = redactGateData(this.state);
-    // Executable inputs must survive reload literally; diagnostics still need legacy redaction.
-    if (stored?.gatesConfig) this.state.gatesConfig = stored.gatesConfig;
-    if (stored?.baselineScripts) this.state.baselineScripts = stored.baselineScripts;
+    this.state = redactGateDiagnostics(this.state);
+    for (const field of [
+      "feedback",
+      "terminalReason",
+      "needsHumanReason",
+      "implementerReport",
+      "implementerIssue",
+      "rebaseNote",
+    ] as const) {
+      const value = this.state[field];
+      if (typeof value === "string") this.state[field] = redactGateOutput(value);
+    }
   }
 
   get store(): Store {
@@ -387,7 +395,15 @@ export class RunContext {
   }
 
   log(message: string, level: RunEvent["level"] = "info", data?: unknown): void {
-    this.store.addEvent({ runId: this.run.id, type: "log", level, message, data });
+    this.event({ runId: this.run.id, type: "log", level, message, data });
+  }
+
+  event(event: Parameters<Store["addEvent"]>[0]): RunEvent {
+    return this.store.addEvent({
+      ...event,
+      message: redactGateOutput(event.message),
+      data: redactGateData(event.data),
+    });
   }
 
   checkCancelled(): void {
@@ -410,7 +426,7 @@ export class RunContext {
     const checkSha =
       cacheable && this.state.worktreePath ? await headSha(this.state.worktreePath) : undefined;
     if (cacheable && cache?.round === round && cache.sha === checkSha && Object.hasOwn(cache.values, name))
-      return redactGateData(cache.values[name]) as T;
+      return cache.values[name] as T;
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
@@ -438,7 +454,7 @@ export class RunContext {
       this.store.finishStage(
         stage.id,
         "succeeded",
-        summary + (chain ? `; pinned chain: ${chain.join(", ")}` : ""),
+        redactGateOutput(summary + (chain ? `; pinned chain: ${chain.join(", ")}` : "")),
       );
       return value;
     } catch (e) {
@@ -452,7 +468,10 @@ export class RunContext {
       this.store.finishStage(
         stage.id,
         cancelled ? "cancelled" : "failed",
-        (e as Error).message.slice(0, 500) + (chain ? `; pinned chain: ${chain.join(", ")}` : ""),
+        redactGateOutput((e as Error).message + (chain ? `; pinned chain: ${chain.join(", ")}` : "")).slice(
+          0,
+          500,
+        ),
       );
       throw cancelled && !(e instanceof SimulatedTermination) ? new CancelledError() : e;
     } finally {
@@ -722,8 +741,8 @@ export class RunContext {
         const spec: AgentSpec = {
           fast: invocation.fast,
           cwd: opts.cwd ?? shadow?.cwd ?? this.state.worktreePath ?? this.runDir,
-          prompt: opts.prompt,
-          systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
+          prompt: redactGateOutput(opts.prompt),
+          systemAppend: redactGateOutput([opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n")),
           target,
           mode: opts.mode,
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
@@ -800,7 +819,7 @@ export class RunContext {
               scratchDir,
               this.deps.cfg.port,
               (data) =>
-                this.store.addEvent({
+                this.event({
                   runId: this.run.id,
                   invocationId: invocation.id,
                   type: "log",
@@ -1027,7 +1046,7 @@ export class RunContext {
       data?: unknown,
       level: RunEvent["level"] = "info",
     ) => {
-      const event = this.store.addEvent({
+      const event = this.event({
         runId,
         invocationId,
         type,

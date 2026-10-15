@@ -51,6 +51,23 @@ export const redactGateData = <T>(value: T): T =>
         }),
       );
 
+/** Reload diagnostics without rewriting executable inputs or gate comparison identities. */
+export const redactGateDiagnostics = <T>(value: T): T =>
+  JSON.parse(
+    JSON.stringify(value, (_key, v: unknown) => {
+      if (v && typeof v === "object" && "ok" in v && "output" in v && typeof v.output === "string")
+        return {
+          ...v,
+          confinementError: ("confinementError" in v ? v.confinementError : null) ?? launchFailure(v.output),
+          output: redactGateOutput(v.output),
+          ...("failures" in v && typeof v.failures === "string"
+            ? { failures: redactGateOutput(v.failures) }
+            : {}),
+        };
+      return v;
+    }),
+  );
+
 /** Runner redaction covers accidental disclosure before framing or cuts. Deliberate cross-stream
  * splitting, interleaving or encoding requires keeping credentials out of gates' reach (#335). */
 export function redactGateStreams(stdout: string, stderr: string) {
