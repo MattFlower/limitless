@@ -126,10 +126,12 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   const env = {
     ...(opts.env ?? (process.env as Record<string, string>)),
     LIMITLESS_GIT_EMPTY_HOOK: "",
-    LIMITLESS_GIT_SUBMODULE_IGNORE: "dirty",
   };
-  if (["merge", "rebase", "commit"].includes(cmd[command] ?? ""))
-    prefix.push(...(await submoduleFlags(prefix, { ...opts, env })));
+  if (
+    ["merge", "rebase"].includes(cmd[command] ?? "") &&
+    !cmd.slice(command + 1).some((arg) => arg === "--abort" || arg === "--quit")
+  )
+    await refusePopulatedRepositories(prefix, { ...opts, env });
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.
@@ -153,31 +155,27 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   });
 }
 
-/** Internal dirty checks lack --ignore-submodules; override the names Git reads from .gitmodules. */
-async function submoduleFlags(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
-  let source = "--file=.gitmodules";
-  if (!existsSync(join(opts.cwd, ".gitmodules"))) {
-    source = "";
-    for (const rev of [":.gitmodules", "HEAD:.gitmodules"]) {
-      const blob = await sh([...git, "rev-parse", "--verify", "--quiet", rev], {
-        ...opts,
-        allowFail: true,
-      });
-      if (blob.exitCode === 0) {
-        source = `--blob=${blob.stdout.trim()}`;
-        break;
-      }
-      if (blob.exitCode !== 1) throw new Error("Cannot inspect submodule configuration");
-    }
-    if (!source) return [];
-  }
-  const query = ["--no-includes", "-z", "--name-only", "--get-regexp", "^submodule\\..*\\.path$"];
-  const keys = await sh([...git, "config", source, ...query], { ...opts, allowFail: true });
-  if (keys.exitCode !== 0 && keys.exitCode !== 1) throw new Error("Cannot inspect submodule configuration");
-  return keys.stdout
-    .split("\0")
-    .filter(Boolean)
-    .map((key) => `--config-env=${key.slice(0, -4)}ignore=LIMITLESS_GIT_SUBMODULE_IGNORE`);
+/** Internal merge/rebase dirty checks cannot safely inspect agent-created repositories. */
+async function refusePopulatedRepositories(git: string[], opts: Parameters<typeof sh>[1]): Promise<void> {
+  const index = await sh([...git, "ls-files", "--stage", "-z"], { ...opts, allowFail: false });
+  const gitlinks = new Set(
+    index.stdout
+      .split("\0")
+      .filter((entry) => entry.startsWith("160000 "))
+      .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
+  );
+  const inspect = (path: string) => {
+    const entries = readdirSync(join(opts.cwd, path), { withFileTypes: true });
+    if (
+      path &&
+      ((gitlinks.has(path) && entries.length) ||
+        lstatSync(join(opts.cwd, path, ".git"), { throwIfNoEntry: false }))
+    )
+      throw new Error("Cannot run merge or rebase with a populated nested repository");
+    for (const entry of entries)
+      if (entry.name !== ".git" && entry.isDirectory()) inspect(path ? `${path}/${entry.name}` : entry.name);
+  };
+  inspect("");
 }
 
 /** Stage paths directly: `add` otherwise runs status inside unchanged populated repositories. */
@@ -186,6 +184,13 @@ export async function stageAll(opts: Parameters<typeof sh>[1], forcePaths: strin
     await worktreeGit(["git", "add", "-A"], opts);
     return;
   }
+  // Remove obsolete paths before adding replacements; update-index cannot traverse a new symlink
+  // or stage a directory in place of the old file. diff-files honors the index's skip/assume flags.
+  const deleted = await worktreeGit(
+    ["git", "diff-files", "--ignore-submodules=dirty", "--diff-filter=D", "--name-only", "-z"],
+    opts,
+  );
+  const removed = new Set(deleted.stdout.split("\0").filter(Boolean));
   const files = await worktreeGit(
     ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-v", "-z"],
     opts,
@@ -194,8 +199,14 @@ export async function stageAll(opts: Parameters<typeof sh>[1], forcePaths: strin
   const paths = files.stdout
     .split("\0")
     .filter((entry) => entry.length > 0 && !/^[a-zS] /.test(entry))
+    .filter((entry) => entry.startsWith("? ") || !removed.has(entry.slice(2)))
     .map((entry) => entry.slice(2).replace(/\/$/, ""));
-  const input = [...new Set([...paths, ...forcePaths])].join("\0");
+  if (deleted.stdout)
+    await worktreeGit(["git", "update-index", "--force-remove", "-z", "--stdin"], {
+      ...opts,
+      stdin: deleted.stdout,
+    });
+  const input = [...new Set([...paths, ...forcePaths.filter((path) => !removed.has(path))])].join("\0");
   if (input)
     await worktreeGit(["git", "update-index", "--add", "--remove", "--replace", "-z", "--stdin"], {
       ...opts,
