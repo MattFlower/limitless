@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
@@ -20,7 +21,7 @@ import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
-import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
+import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
@@ -101,8 +102,14 @@ export class Factory {
     for (const model of this.store.runtimeModels()) {
       const existing = this.models.find((m) => m.id === model.id);
       if (existing) {
-        if (existing.id === "claude/haiku-5.5" && (existing.source ?? "code") === "code") {
-          console.warn("[catalog] claude/haiku-5.5: redundant runtime entry; using built-in definition");
+        const builtIn = MODELS.find((m) => m.id === model.id);
+        if (
+          builtIn &&
+          existing.source !== "runtime" &&
+          isDeepStrictEqual({ ...existing, source: undefined }, { ...builtIn, source: undefined })
+        ) {
+          const source = existing.source === "config" ? "exported config" : "built-in";
+          console.warn(`[catalog] ${model.id}: redundant runtime entry; using ${source} definition`);
           continue;
         }
         throw new Error(`catalog collision: ${model.id}`);
