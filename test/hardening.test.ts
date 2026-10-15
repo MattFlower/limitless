@@ -27,12 +27,15 @@ import { executeRun } from "../src/pipeline/engine.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import {
+  agentEnv,
   invocationScratch,
   linuxAncestryInspection,
   linuxCallerAncestors,
   ProcessTerminationError,
+  processBirth,
   processInspection,
   processScope,
+  registerCredential,
   runProcess,
   sh,
 } from "../src/util/proc.ts";
@@ -113,7 +116,7 @@ describe("process handling", () => {
     const signals: number[] = [];
     const kill = process.kill.bind(process);
     const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-      if (signal === "SIGTERM" || signal === "SIGKILL") {
+      if (signal === "SIGSTOP" || signal === "SIGTERM" || signal === "SIGKILL") {
         signals.push(pid);
         if (pid === ancestor) return true;
       }
@@ -307,7 +310,7 @@ describe("process handling", () => {
       const kill = process.kill.bind(process);
       const signals: number[] = [];
       const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-        if (signal === "SIGTERM" || signal === "SIGKILL") signals.push(pid);
+        if (signal === "SIGSTOP" || signal === "SIGTERM" || signal === "SIGKILL") signals.push(pid);
         return kill(pid, signal);
       });
       let owner: Promise<unknown> | undefined;
@@ -664,7 +667,7 @@ describe("process handling", () => {
     const signals: number[] = [];
     let pid: number | undefined;
     const killSpy = spyOn(process, "kill").mockImplementation((target, signal) => {
-      if (signal === "SIGTERM" || signal === "SIGKILL") {
+      if (signal === "SIGSTOP" || signal === "SIGTERM" || signal === "SIGKILL") {
         signals.push(target);
         // A regression must record the unsafe target without killing the test or its ancestors.
         if (protectedPids.includes(target)) throw new Error("protected process signalled");
@@ -734,7 +737,7 @@ describe("process handling", () => {
       const signalled: number[] = [];
       let plainInspections = 0;
       const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-        if (signal === "SIGTERM" || signal === "SIGKILL") signalled.push(pid);
+        if (signal === "SIGSTOP" || signal === "SIGTERM" || signal === "SIGKILL") signalled.push(pid);
         return kill(pid, signal);
       });
       try {
@@ -858,7 +861,7 @@ describe("process handling", () => {
       const kill = process.kill.bind(process);
       const signals: number[] = [];
       const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-        if (signal === "SIGTERM" || signal === "SIGKILL") signals.push(pid);
+        if (signal === "SIGSTOP" || signal === "SIGTERM" || signal === "SIGKILL") signals.push(pid);
         return kill(pid, signal);
       });
       try {
@@ -1179,7 +1182,7 @@ describe("process handling", () => {
             expect(result.exitCode).toBe(0);
             const writerPid = Number(readFileSync(pidFile, "utf8"));
             const writerSignals = signals.filter(({ pid }) => pid === writerPid).map(({ signal }) => signal);
-            expect(writerSignals[0]).toBe("SIGTERM");
+            expect(writerSignals[0]).toBe("SIGSTOP");
             expect(writerSignals.slice(1)).toContain("SIGKILL");
             expect(writerSignals.slice(1).every((signal) => signal === "SIGKILL")).toBe(true);
             expect(() => kill(writerPid, 0)).toThrow();
@@ -1271,7 +1274,7 @@ describe("process handling", () => {
         const pid = Number(readFileSync(pidFile, "utf8"));
         expect(result.exitCode).toBe(0);
         expect(pid).toBeGreaterThan(0);
-        expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGTERM");
+        expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGSTOP");
         expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGKILL");
         expect(() => kill(pid, 0)).toThrow();
         expect(kill(control.pid ?? 0, 0)).toBe(true);
@@ -1295,72 +1298,102 @@ describe("process handling", () => {
     },
   );
 
-  test("surviving descendants block cleanup and report termination failure", async () => {
-    const children = new Map<ChildProcess, Promise<void>>();
-    const kill = process.kill.bind(process);
-    const writer = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-    let kills = 0;
-    const signals: (string | number | undefined)[] = [];
-    const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
-      if (pid === writer.pid && (signal === "SIGTERM" || signal === "SIGKILL")) {
-        kills++;
-        signals.push(signal);
-        return true;
-      }
-      return kill(pid, signal);
-    });
-    const started = performance.now();
-    try {
-      await processInspection.run(
-        async (withEnvironment, marker) =>
-          `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n` +
-          `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
-        () =>
-          processScope.run(
-            {
-              signal: new AbortController().signal,
-              killGraceMs: 0,
-              children,
-              scratchDirs: new Set(),
-            },
-            async () => {
-              const invocation = runProcess({
-                cmd: ["/bin/sh", "-c", "exit 0"],
-                cwd: dir,
-                env: process.env as Record<string, string>,
-              });
-              let stopped = false;
-              void Promise.all(children.values()).then(() => {
-                stopped = true;
-              });
-              await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
-              expect(stopped).toBe(false);
-              expect(processScope.getStore()?.terminationError?.message).toContain(
-                "Marked processes still alive",
-              );
-              let cleanup = false;
-              try {
-                await sh(["/bin/sh", "-c", "touch cleanup-started"], { cwd: dir });
-                cleanup = true;
-              } catch (error) {
-                expect(error).toBeInstanceOf(ProcessTerminationError);
-              }
-              expect(cleanup).toBe(false);
-              expect(existsSync(join(dir, "cleanup-started"))).toBe(false);
-            },
-          ),
+  test.each([false, true])(
+    "surviving descendants block cleanup and report termination failure (growing=%s)",
+    async (growing) => {
+      const children = new Map<ChildProcess, Promise<void>>();
+      const kill = process.kill.bind(process);
+      registerCredential("CLEANUP_COMMAND", "sleep");
+      const writers = Array.from({ length: growing ? 2 : 1 }, () =>
+        spawn("/bin/sleep", ["30"], { stdio: "ignore" }),
       );
-      expect(kills).toBeGreaterThan(1);
-      expect(signals.slice(0, 2)).toEqual(["SIGTERM", "SIGKILL"]);
-      expect(performance.now() - started).toBeLessThan(15_000);
-      expect(children.size).toBe(1);
-      expect(kill(writer.pid ?? 0, 0)).toBe(true);
-    } finally {
-      killSpy.mockRestore();
-      writer.kill("SIGKILL");
-      await new Promise<void>((resolve) => writer.once("close", () => resolve()));
-    }
-  }, 20_000);
+      let scans = 0;
+      let kills = 0;
+      const signals: (string | number | undefined)[] = [];
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (
+          writers.some((writer) => pid === writer.pid) &&
+          (signal === "SIGSTOP" || signal === "SIGTERM" || signal === "SIGKILL")
+        ) {
+          kills++;
+          signals.push(signal);
+          return true;
+        }
+        return kill(pid, signal);
+      });
+      const started = performance.now();
+      try {
+        await processInspection.run(
+          async (withEnvironment, marker) => {
+            if (withEnvironment) scans++;
+            return (
+              writers
+                .slice(0, scans > 1 ? writers.length : 1)
+                .map(
+                  (writer) =>
+                    `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n`,
+                )
+                .join("") +
+              `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`
+            );
+          },
+          () =>
+            processScope.run(
+              {
+                signal: new AbortController().signal,
+                killGraceMs: 0,
+                children,
+                scratchDirs: new Set(),
+              },
+              async () => {
+                const invocation = runProcess({
+                  cmd: ["/bin/sh", "-c", "exit 0"],
+                  cwd: dir,
+                  env: process.env as Record<string, string>,
+                });
+                let stopped = false;
+                void Promise.all(children.values()).then(() => {
+                  stopped = true;
+                });
+                await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
+                expect(stopped).toBe(false);
+                const message = processScope.getStore()?.terminationError?.message;
+                expect(message).toContain(`Marked processes still alive: ${writers.length}:`);
+                expect(message).toContain("([redacted])");
+                expect(message).not.toContain("(sleep)");
+                expect(message).toContain(growing ? "set kept growing" : "set remained stable");
+                let cleanup = false;
+                try {
+                  await sh(["/bin/sh", "-c", "touch cleanup-started"], { cwd: dir });
+                  cleanup = true;
+                } catch (error) {
+                  expect(error).toBeInstanceOf(ProcessTerminationError);
+                }
+                expect(cleanup).toBe(false);
+                expect(existsSync(join(dir, "cleanup-started"))).toBe(false);
+              },
+            ),
+        );
+        expect(kills).toBeGreaterThan(1);
+        expect(signals.slice(0, writers.length)).toEqual(writers.map(() => "SIGSTOP"));
+        expect(signals[writers.length]).toBe("SIGKILL");
+        expect(performance.now() - started).toBeLessThan(15_000);
+        expect(children.size).toBe(1);
+        for (const writer of writers) expect(kill(writer.pid ?? 0, 0)).toBe(true);
+      } finally {
+        killSpy.mockRestore();
+        await Promise.all(
+          writers.map(async (writer) => {
+            if (writer.exitCode !== null || writer.signalCode !== null) return;
+            const closed = new Promise<void>((resolve) => writer.once("close", () => resolve()));
+            writer.kill("SIGKILL");
+            await closed;
+          }),
+        );
+      }
+    },
+    20_000,
+  );
 
   test.each(["stdout", "stderr"])("runner reports only %s as truncated", async (stream) => {
     const res = await runProcess({
@@ -1640,6 +1673,116 @@ describe("pipeline hardening", () => {
       await Bun.sleep(25);
     }
   }
+
+  test("a fake-harness round continues only after freezing and reaping a forking leftover", () =>
+    processInspection.run(
+      async (_environment, marker) =>
+        `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+      async () => {
+        const repo = await setupRepo({ "a.txt": "a\n" });
+        const forks = join(dir, "forks");
+        const writerPid = join(dir, "forker-pid");
+        const release = join(dir, "release-forker");
+        const script = `trap '' TERM; echo $$ > "$1"; i=0; while [ $i -lt 100 ]; do sleep 0.05 & p=$!; echo "$p" >> "$2"; wait "$p"; i=$((i+1)); done`;
+        const launcher = `
+      const {spawn}=require('node:child_process'), fs=require('node:fs');
+      spawn('/bin/sh', ['-c', ${JSON.stringify(script)}, 'sh', ${JSON.stringify(writerPid)}, ${JSON.stringify(forks)}], {stdio:'ignore'}).unref();
+      let ready=false;
+      setInterval(()=>{
+        if(!ready && fs.existsSync(${JSON.stringify(forks)}) && fs.readFileSync(${JSON.stringify(forks)},'utf8').trim().split('\\n').length>=2) {
+          ready=true; console.log(fs.readFileSync(${JSON.stringify(writerPid)},'utf8').trim());
+        }
+        if(fs.existsSync(${JSON.stringify(release)})) process.exit(0);
+      }, 5);
+    `;
+        const signals: { pid: number; signal: string | number | undefined }[] = [];
+        const kill = process.kill.bind(process);
+        const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+          signals.push({ pid, signal });
+          return kill(pid, signal);
+        });
+        let continued = false;
+        let pid: number | undefined;
+        let birth: string | null = null;
+        const f = new Factory(loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") }), {
+          confinement: fakeConfinement,
+          providers,
+          models,
+          policy,
+          harnesses: {
+            fake: fakeHarness(async (spec) => {
+              if (role(spec.prompt) === "triage")
+                return {
+                  structured: {
+                    title: "t",
+                    task_class: "feature",
+                    complexity: "small",
+                    risk: "low",
+                    ambiguity: "low",
+                    blocking_questions: [],
+                    summary: "s",
+                    suggested_profile: "quick",
+                  },
+                };
+              if (role(spec.prompt) === "implement") {
+                let cleanupStarted = 0;
+                const result = await processInspection.exit(() =>
+                  runProcess({
+                    cmd: [process.execPath, "-e", launcher],
+                    cwd: spec.cwd,
+                    env: agentEnv(),
+                    timeoutMs: 5000,
+                    onStdoutLine: async (line) => {
+                      pid = Number(line);
+                      birth = await processBirth(pid);
+                      cleanupStarted = performance.now();
+                      writeFileSync(release, "");
+                    },
+                  }),
+                );
+                expect(result.timedOut).toBe(false);
+                const forker = Number(readFileSync(writerPid, "utf8"));
+                expect(readFileSync(forks, "utf8").trim().split("\n").length).toBeGreaterThanOrEqual(2);
+                expect(signals.filter((s) => s.pid === forker).map((s) => s.signal)).toEqual([
+                  "SIGSTOP",
+                  "SIGKILL",
+                ]);
+                expect(await processBirth(forker)).toBeNull();
+                expect(performance.now() - cleanupStarted).toBeLessThan(10_100);
+                return { files: { "a.txt": "changed\n" } };
+              }
+              continued = true;
+              expect(await processBirth(Number(readFileSync(writerPid, "utf8")))).toBeNull();
+              return {
+                structured: {
+                  verdict: "approve",
+                  summary: "Checked the changed file and confirmed invocation cleanup completed",
+                  findings: [],
+                },
+              };
+            }),
+          },
+        });
+        f.start();
+        try {
+          const run = await f.createRun({ repo, prompt: "change a" });
+          const status = await waitDone(f, run.id);
+          expect({ status, error: f.store.getRun(run.id)?.error }).toMatchObject({ status: "succeeded" });
+          expect(continued).toBe(true);
+          expect(
+            f.store
+              .listStages(run.id)
+              .some((s) => s.name === "gates" && s.round === 0 && s.status === "succeeded"),
+          ).toBe(true);
+        } finally {
+          await f.stop();
+          f.store.close();
+          killSpy.mockRestore();
+          if (pid !== undefined && birth !== null && (await processBirth(pid)) === birth)
+            kill(pid, "SIGKILL");
+        }
+      },
+    ));
 
   test.each([false, true])("an unconfirmed termination blocks cleanup and resume (shutdown=%s)", (shutdown) =>
     processInspection.run(

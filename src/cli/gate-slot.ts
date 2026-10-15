@@ -106,7 +106,7 @@ export interface LeaseOptions {
   signal?: AbortSignal;
   warn?: (s: string) => void;
   /** Agent wrappers fail on queue exhaustion and prove nested reuse and running recovery. */
-  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void };
+  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void; assertActive?: () => void };
 }
 export async function withGateLease<T>(
   name: string,
@@ -211,6 +211,7 @@ export async function withGateLease<T>(
             )
           : new Error("gate-slot wait passed the acquisition deadline");
       while (!state?.acquired) {
+        opts.agentTest?.assertActive?.();
         opts.signal?.throwIfAborted();
         if (!first) {
           if (clock.now() >= deadline) throw pastDeadline();
@@ -268,6 +269,7 @@ export async function withGateLease<T>(
       warn(e);
     }
     opts.signal?.throwIfAborted();
+    opts.agentTest?.assertActive?.();
     return await work();
   } finally {
     stopped = true;

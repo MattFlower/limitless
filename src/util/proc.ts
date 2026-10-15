@@ -206,14 +206,15 @@ function linuxMarkedProcesses(
 }
 
 /** Confirm identity and disappearance without relying on marker membership. */
-export async function processBirth(pid: number): Promise<string | null> {
+export async function processBirth(pid: number, name?: (value: string) => void): Promise<string | null> {
   if (inspectionPlatform === "darwin") {
     if (!darwin) throw new Error("Native process inspection is unavailable");
-    return darwin.darwinProcessBirth(pid);
+    return darwin.darwinProcessBirth(pid, name);
   }
   if (inspectionPlatform === "linux") {
     try {
       const row = await readFile(`/proc/${pid}/stat`, "utf8");
+      name?.(row.slice(row.indexOf("(") + 1, row.lastIndexOf(")")));
       const fields = row
         .slice(row.lastIndexOf(")") + 2)
         .trim()
@@ -240,33 +241,53 @@ async function stopMarkedProcesses(
   if (group === undefined) return;
   const protectedPids = callerAncestors();
   const started = performance.now();
-  const claimed = new Map<number, { birth: string; termed: boolean }>();
+  const claimed = new Map<number, { birth: string; stopped: boolean }>();
+  let growing = false,
+    observed = false;
   let empty = false;
   for (;;) {
     const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
     for (const pid of pids) {
       if (protectedPids.has(pid) || claimed.has(pid)) continue;
       const birth = await processBirth(pid);
-      if (birth !== null) claimed.set(pid, { birth, termed: false });
+      if (birth !== null) {
+        if (observed) growing = true;
+        claimed.set(pid, { birth, stopped: false });
+      }
     }
+    observed ||= claimed.size > 0;
     // An already-claimed descendant stays ours after reparenting or an environment
     // change. A reused PID is no longer that process and must never be signalled.
-    for (const [pid, identity] of claimed)
-      if ((await processBirth(pid)) !== identity.birth) claimed.delete(pid);
+    const deadline = performance.now() - started >= graceMs + 10_000;
+    const names: string[] = [];
+    for (const [pid, identity] of claimed) {
+      let name = "unknown";
+      const birth = await processBirth(pid, (value) => {
+        name = value;
+      });
+      if (birth !== identity.birth) claimed.delete(pid);
+      else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
+    }
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
     const exited = child.exitCode !== null || child.signalCode !== null;
     if (!claimed.size && empty && exited) return;
     empty = !claimed.size && exited;
-    if (performance.now() - started >= graceMs + 10_000)
+    if (deadline && claimed.size)
       throw new Error(
-        `Marked processes still alive: ${[...new Set([...claimed.keys(), ...(!exited ? [group] : [])])].join(", ")}`,
+        `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : "remained stable"}`,
       );
+    if (deadline && !exited) throw new Error(`Child process exit could not be confirmed: ${group}`);
+    // Freeze every newly discovered member, then rescan before killing the frozen set.
+    const freezing = [...claimed.values()].some((identity) => !identity.stopped);
     for (const [pid, identity] of claimed) {
-      const signal = identity.termed && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
-      if (signal === "SIGTERM" && identity.termed) continue;
+      if (freezing && identity.stopped) continue;
+      if ((await processBirth(pid)) !== identity.birth) {
+        claimed.delete(pid);
+        continue;
+      }
       try {
-        process.kill(pid, signal);
-        identity.termed = true;
+        process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
+        identity.stopped = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }

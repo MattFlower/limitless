@@ -1008,6 +1008,38 @@ test("cancellation while waiting retires the reservation before rejecting", asyn
   expect(f.time.pending).toBe(0);
 });
 
+test("an acquisition reply arriving after invocation closure cannot start work", async () => {
+  const f = rig();
+  let active = true,
+    ran = false;
+  await expect(
+    withGateLease(
+      "closed",
+      async () => {
+        ran = true;
+      },
+      {
+        ...f,
+        agentTest: {
+          lane: "small",
+          onLease: () => {},
+          assertActive: () => {
+            if (!active) throw new LeaseRejected("invocation ended");
+          },
+        },
+        client: async (body, signal) => {
+          const reply = await f.client(body, signal);
+          if (body.name) active = false;
+          return reply;
+        },
+      },
+    ),
+  ).rejects.toThrow("invocation ended");
+  expect(ran).toBe(false);
+  expect(f.slots.snapshot().occupied).toBe(0);
+  expect(f.time.pending).toBe(0);
+});
+
 test("main dispatches gate-slot and warns on an injected connection refusal", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gate-slot-main-"));
   try {
