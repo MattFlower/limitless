@@ -2,6 +2,37 @@ import { expect, test } from "bun:test";
 import { reviewPrompt } from "../src/pipeline/prompts.ts";
 import { registerCredential } from "../src/util/proc.ts";
 
+test("probe finder requires reproduction and distinguishes negative results from environment errors", () => {
+  const prompt = reviewPrompt({
+    prompt: "Fix the bug",
+    spec: null,
+    baseSha: "base",
+    stat: "",
+    gates: [],
+    audit: [],
+    implementerReport: "",
+    finder: "probe",
+  });
+  for (const instruction of [
+    "For each proposed blocker or major finding",
+    "reproduce the defect",
+    "throwaway test or command",
+    "temporary files under TMPDIR",
+    "only the affected test files",
+    "never run the full suite",
+    "attempted command and its observed result in the finding's detail",
+    "completed probe does not reproduce",
+    "lower the finding to minor or omit it",
+    "sandbox or environment limits",
+    "nested Seatbelt",
+    "loopback servers",
+    "Linux-only path",
+    "retain its severity",
+    "attempted command and the error in detail",
+  ])
+    expect(prompt).toContain(instruction);
+});
+
 test("large first-parent excerpts are bounded after redaction with full diff command and stats", () => {
   const secret = "review-patch-cutoff-credential";
   registerCredential("REVIEW_PATCH_CUTOFF_FIXTURE", secret);

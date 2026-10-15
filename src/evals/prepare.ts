@@ -4,6 +4,7 @@ import { DEFAULT_DECISION_CONFIDENCE } from "../config.ts";
 import { parseAllow } from "../core/allow.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
+import { runGates } from "../gates/run.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
 import { triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
@@ -53,6 +54,20 @@ export async function gatesAt(cwd: string, revision: string, signal: AbortSignal
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+export async function prepareEvalGates(
+  item: { base: string },
+  cwd: string,
+  signal: AbortSignal,
+  setupOnly = false,
+) {
+  const gates = await gatesAt(cwd, item.base, signal);
+  const baseline = await runGates(cwd, setupOnly ? { ...gates, checks: [] } : gates, signal, {
+    holder: setupOnly ? "eval review setup" : "eval baseline",
+  });
+  signal.throwIfAborted();
+  return { gates, baseline };
 }
 
 export async function prepareCase(
