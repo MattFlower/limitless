@@ -11,27 +11,34 @@ function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
 }
 
-function escapeCell(s: string, privateRendering = false): string {
-  const escaped = s.replace(/\|/g, "\\|").replace(/\r?\n/g, "\\n");
-  // Private rows are withheld by structure; other cells must stay whole at the display limit.
-  if (privateRendering) return escaped.slice(0, 300);
-  return escaped.length > 300 ? "[withheld: oversized cell]" : escaped;
+// Line breaks stay visible as <br> so the change view can still join a wrapped quotation.
+function clipCell(s: string): { text: string; clipped: boolean } {
+  const escaped = s.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+  return { text: escaped.slice(0, 300), clipped: escaped.length > 300 };
 }
 
-/** The summary is one author span: omit it whole if it exceeds the display budget. */
-function clipSummary(text: string): string {
-  return text.length > 5000 ? "[withheld: oversized summary]" : text;
+function escapeCell(s: string): string {
+  return clipCell(s).text;
 }
 
-function table(header: string[], rows: string[][], rowAuthors: ("private" | "verifier")[] = []): ReportPart {
+/** Clip at a line boundary where possible; the manifest records the cut for the change view. */
+function clipSummary(text: string): { text: string; clipped: boolean } {
+  if (text.length <= 5000) return { text, clipped: false };
+  const line = text.lastIndexOf("\n", 5000);
+  return { text: text.slice(0, line > 0 ? line : 5000).trimEnd(), clipped: true };
+}
+
+type RowSpan = { kind: "private" | "verifier"; clipped?: boolean };
+
+function table(header: string[], rows: string[][], rowSpans: (RowSpan | undefined)[] = []): ReportPart {
   return reportJoin(
     [
       `| ${header.join(" | ")} |`,
       `|${header.map(() => "---").join("|")}|`,
       ...rows.map((r, i) => {
         const text = `| ${r.join(" | ")} |`;
-        const author = rowAuthors[i];
-        return author ? reportText(author, text) : text;
+        const span = rowSpans[i];
+        return span ? reportText(span.kind, text, span.clipped) : text;
       }),
     ],
     "\n",
@@ -109,14 +116,14 @@ export function renderReport(input: ReportInput): string {
       ...Object.entries(input.models ?? {}).map(([role, chain]) => `- ${role}: \`${chain.join(", ")}\``),
     );
 
-  if (state.implementerReport)
-    blocks.push(
-      "## Implementer's summary",
-      reportText("implementer", clipSummary(state.implementerReport.trim())),
-    );
+  if (state.implementerReport) {
+    const summary = clipSummary(state.implementerReport.trim());
+    blocks.push("## Implementer's summary", reportText("implementer", summary.text, summary.clipped));
+  }
 
   if (state.spec) {
     const verify = state.lastVerify;
+    const spans: RowSpan[] = [];
     blocks.push(
       "## Acceptance criteria",
       table(
@@ -134,11 +141,16 @@ export function renderReport(input: ReportInput): string {
                 : v.status === "blocked"
                   ? "🚧 blocked"
                   : "❔";
-          return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
+          // Evidence is the row's last cell, so a clipped row's tail is the evidence's cut.
+          const evidence = clipCell(v?.evidence ?? "not verified");
+          spans.push(
+            rowKind(ac.id, state.spec ?? null, state.holdout) !== "public"
+              ? { kind: "private" }
+              : { kind: "verifier", clipped: evidence.clipped },
+          );
+          return [`${icon} ${ac.id}`, escapeCell(ac.criterion), evidence.text];
         }),
-        state.spec.acceptance_criteria.map((ac) =>
-          rowKind(ac.id, state.spec ?? null, state.holdout) !== "public" ? "private" : "verifier",
-        ),
+        spans,
       ),
     );
     if (verify) blocks.push(`Verified by \`${verify.modelId}\` in a separate session from the implementer.`);
@@ -165,15 +177,15 @@ export function renderReport(input: ReportInput): string {
         ["", "Scenario", "Result", "Evidence"],
         results.map(({ scenario, result }) => [
           scenario.id,
-          escapeCell(scenario.description, true),
+          escapeCell(scenario.description),
           result?.status === "blocked"
             ? "🚧 blocked"
             : result?.status === "unmet"
               ? `unmet (${result.requirement ? result.requirement.replace("_", " ") : "unclassified"})`
               : (result?.status ?? "unclear"),
-          escapeCell(result?.evidence ?? "not verified", true),
+          escapeCell(result?.evidence ?? "not verified"),
         ]),
-        results.map(() => "private"),
+        results.map(() => ({ kind: "private" })),
       ),
     );
     if (state.lastVerify)
@@ -185,7 +197,7 @@ export function renderReport(input: ReportInput): string {
           followUps.map(({ scenario, result }) =>
             reportText(
               "private",
-              `- ${scenario.id}: ${escapeCell(scenario.description, true)} — ${escapeCell(result?.evidence ?? "", true)}`,
+              `- ${scenario.id}: ${escapeCell(scenario.description)} — ${escapeCell(result?.evidence ?? "")}`,
             ),
           ),
           "\n",

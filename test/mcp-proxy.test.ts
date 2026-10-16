@@ -702,17 +702,55 @@ test.each(["summary", "notes"])(
   },
 );
 
-test.each(["summary", "cell"])("clipping never reveals private prefixes in a %s", async (field) => {
-  const phrase =
-    field === "summary"
-      ? "the amber lantern glows ultraviolet"
-      : `the amber lantern glows ultraviolet ${"a long private observation of hidden behavior. ".repeat(10)}`;
-  const state = privateReportState(phrase);
-  if (field === "summary") state.implementerReport = `${"x".repeat(4979)}\n${phrase}`;
-  else state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: phrase, publicSummary: "" });
+test.each(["summary", "unbroken summary", "wrapped summary", "cell"])(
+  "clipping never reveals private prefixes in a %s",
+  async (field) => {
+    const phrase =
+      field === "cell"
+        ? `the amber lantern glows ultraviolet ${"a long private observation of hidden behavior. ".repeat(10)}`
+        : "the amber lantern glows ultraviolet";
+    const state = privateReportState(phrase);
+    if (field === "summary") state.implementerReport = `${"x".repeat(4979)}\n${phrase}`;
+    else if (field === "unbroken summary") state.implementerReport = `${"x".repeat(4979)} ${phrase}`;
+    else if (field === "wrapped summary")
+      state.implementerReport = `Visible start\n${"x".repeat(4960)}\n> the amber\n> lantern glows ultraviolet`;
+    else state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: phrase, publicSummary: "" });
+    await renderedPages(state, (text) => {
+      expect(text).not.toContain("amber");
+      for (let i = 0; i + 40 <= phrase.length; i++) expect(text).not.toContain(phrase.slice(i, i + 40));
+      if (field === "wrapped summary") expect(text).toContain("Visible start");
+      expect(text).toContain("## Checks");
+    });
+  },
+);
+
+test("clipped public evidence without private text stays visible", async () => {
+  const evidence = `Ran bun test; observed ${"ordinary public output line. ".repeat(15)}`;
+  const state = privateReportState("the amber lantern glows ultraviolet");
+  state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence, publicSummary: "" });
   await renderedPages(state, (text) => {
-    expect(text).not.toContain("amber lantern");
-    for (let i = 0; i + 40 <= phrase.length; i++) expect(text).not.toContain(phrase.slice(i, i + 40));
+    expect(text).toContain(
+      "| ✅ AC-1 | Public criterion | Ran bun test; observed ordinary public output line.",
+    );
+    expect(text).not.toContain("amber");
+  });
+});
+
+test("public evidence quoting one sentence of a holdout description is withheld", async () => {
+  const state = privateReportState("red owl");
+  const scenario = state.holdout?.scenarios[0];
+  if (!scenario) throw new Error("Missing scenario");
+  scenario.description =
+    "The cache warms before the scheduler starts. Stale ledger entries are evicted at midnight.";
+  state.lastVerify?.criteria.push({
+    id: "AC-1",
+    status: "met",
+    evidence: "Observed: stale ledger entries are evicted at midnight.",
+    publicSummary: "",
+  });
+  state.terminalReason = "Stale ledger entries are evicted at midnight.";
+  await renderedPages(state, (text) => {
+    expect(text).not.toMatch(/ledger|midnight/i);
     expect(text).toContain("## Checks");
   });
 });

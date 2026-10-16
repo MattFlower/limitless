@@ -6,16 +6,18 @@ const spanSchema = z.object({
   kind: z.enum(["private", "verifier", "implementer", "prose"]),
   start: z.number().int().nonnegative(),
   end: z.number().int().nonnegative(),
+  /** The factory clipped this span, so its tail may end inside private text. */
+  clipped: z.literal(true).optional(),
 });
 type Span = z.infer<typeof spanSchema>;
 const manifestSchema = z.object({ digest: z.string(), spans: z.array(spanSchema) });
 const digest = (body: string, spans: Span[]) =>
   createHash("sha256").update(body).update(JSON.stringify(spans)).digest("hex");
 
-export type ReportPart = string | { kind: Span["kind"]; text: string } | ReportPart[];
+export type ReportPart = string | { kind: Span["kind"]; text: string; clipped?: boolean } | ReportPart[];
 
-export function reportText(kind: Span["kind"], text: string): ReportPart {
-  return { kind, text };
+export function reportText(kind: Span["kind"], text: string, clipped = false): ReportPart {
+  return { kind, text, clipped };
 }
 
 export function reportJoin(parts: ReportPart[], separator: string): ReportPart[] {
@@ -30,7 +32,12 @@ export function markReport(blocks: ReportPart[]): string {
     if (typeof part === "string") body += part;
     else if (Array.isArray(part)) part.forEach(append);
     else {
-      spans.push({ kind: part.kind, start: body.length, end: body.length + part.text.length });
+      spans.push({
+        kind: part.kind,
+        start: body.length,
+        end: body.length + part.text.length,
+        ...(part.clipped ? { clipped: true as const } : {}),
+      });
       body += part.text;
     }
   };

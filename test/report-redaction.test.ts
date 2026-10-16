@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { buildReportRedactor } from "../src/integrations/mcp-change.ts";
+import { renderReport } from "../src/pipeline/report.ts";
 import {
   markReport,
   reportStructure,
@@ -52,6 +53,51 @@ test("footer stripping preserves marker text quoted inside the report", () => {
   const body = stripReportManifest(report);
   expect(body).toContain("> Explain <!-- limitless-report:v2: metadata");
   expect(body).toEndWith("## Checks\n");
+});
+
+test("published reports keep long public cells and summaries readable", () => {
+  const criterion = `Public criterion ${"word ".repeat(80)}`;
+  const evidence = `Command output\nsecond line ${"ok ".repeat(120)}`;
+  const report = renderReport({
+    success: true,
+    runId: "r",
+    prompt: "Public request",
+    state: {
+      implementerReport: `First line\n${"y".repeat(4980)}\nLast line beyond the limit`,
+      spec: {
+        summary: "Public task",
+        assumptions: [],
+        requirements: [],
+        out_of_scope: [],
+        blocking_questions: [],
+        acceptance_criteria: [{ id: "AC-1", criterion, how_to_verify: "Run checks" }],
+      },
+      lastVerify: {
+        modelId: "verifier",
+        overall: "pass",
+        notes: "",
+        criteria: [{ id: "AC-1", status: "met", evidence, publicSummary: "" }],
+      },
+    },
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+  });
+  expect(report).not.toContain("[withheld");
+  expect(report).toContain(`| ✅ AC-1 | ${criterion.slice(0, 300)} | Command output<br>second line ok ok`);
+  expect(report).toContain(`First line\n${"y".repeat(4980)}\n\n## Acceptance criteria`);
+  expect(report).not.toContain("Last line beyond the limit");
+  const spans = reportStructure(report)?.spans ?? [];
+  expect(spans.filter((span) => span.clipped).map((span) => span.kind)).toEqual(["implementer", "verifier"]);
+});
+
+test("clipped spans withhold a tail that starts a private string", () => {
+  const redact = buildReportRedactor(new Set(["the amber lantern glows ultraviolet"]));
+  expect(redact("Visible\nends with the amber lan<br>tern gl", true)).toBe(
+    "Visible\n[withheld: holdout result or quotation; 1 line]",
+  );
+  expect(redact("Visible\nends with the amber lantern gl")).toBe("Visible\nends with the amber lantern gl");
+  expect(redact("Visible\nends with the", true)).toBe("Visible\nends with the");
 });
 
 test("private strings with wrapped words match their unwrapped quotations", () => {
