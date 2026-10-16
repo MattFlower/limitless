@@ -545,9 +545,9 @@ Per-defect catches (dev split; `k/2` is trials caught, `u` under-rated):
 Clean cases: review-082 blocks in every Sol trial and one Opus trial; review-078 blocks in one
 `@high` trial; review-079 and review-097 never block.
 
-## Appendix B. Draft issues (not filed; for approval)
+## Appendix B. Draft issues (filed on 2026-10-15 as #551, #552 and #553)
 
-### B1. M5.2: union of two adversarial reviewer samples (pre-registered)
+### B1. M5.2: union of two adversarial reviewer samples (pre-registered; filed as #551)
 
 M5.2 Review parity, next variant after #531. Design recorded before the run.
 
@@ -587,7 +587,7 @@ decides nothing; it shows the direction and that dev clean blocks do not move.
 
 **Out of scope.** More than two samples; a verifier; any production change before held-out.
 
-### B2. M5.2: a requirement-and-entry-point trace pass as a second finder (pre-registered)
+### B2. M5.2: a requirement-and-entry-point trace pass as a second finder (pre-registered; filed as #552)
 
 **Question.** Does a second finder that only looks for unguarded paths raise recall on the
 orchestrator's spec-mismatch and every-path findings without more false blocks?
@@ -615,7 +615,7 @@ separately: added, landed on gold, blocked a clean case.
 **Budget and scope.** About 150 source lines plus tests. Out of scope: a verifier, the probe
 prompt, production adoption.
 
-### B3. M5.2: per-item recurring-defect sweep in the adversarial prompt (pre-registered)
+### B3. M5.2: per-item recurring-defect sweep in the adversarial prompt (pre-registered; filed as #553)
 
 **Question.** Does asking the reviewer to apply the repository's recurring-defect list item by item
 raise recall without more false blocks?
