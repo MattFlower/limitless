@@ -12,7 +12,6 @@ import {
   type Review,
   renderSpec,
   requirementEntries,
-  requirementSource,
   rowKind,
   type Spec,
   type Verify,
@@ -340,7 +339,11 @@ function groundedCitation(
   holdout: Holdout | undefined,
   publicSources: string,
 ): string | null {
-  const quote = citedRequirement(citation, sourceText, requirementEntries(requirement, spec));
+  const quote = citedRequirement(
+    citation,
+    sourceText,
+    requirementEntries(requirement, spec).map(redactGateOutput),
+  );
   if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote) return null;
   return quote;
 }
@@ -348,9 +351,7 @@ function groundedCitation(
 function publicSource(requirement: "request" | "spec", request: string, spec: Spec | null): string {
   return requirement === "request"
     ? redactGateOutput(request)
-    : spec
-      ? requirementSource("spec", request, spec)
-      : "";
+    : requirementEntries("spec", spec).map(redactGateOutput).join("\n");
 }
 
 function gateTable(cmp: GateComparison[]): string {
