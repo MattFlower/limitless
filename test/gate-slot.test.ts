@@ -13,6 +13,7 @@ import {
 } from "../src/cli/gate-slot.ts";
 import { AgentTestSession } from "../src/gates/agent-tests.ts";
 import { GATE_LEASE_EXPIRY_MS, Semaphore } from "../src/gates/slots.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { waitClock } from "./wait-clock.ts";
 
 function rig(limit = 1) {
@@ -571,26 +572,50 @@ test("an abandoned queued lease admitted at 29 seconds still expires by 30 secon
   expect(f.time.pending).toBe(0);
 });
 
-test("deadline and zero budget cancel before executing once; default budget is 1800 seconds", async () => {
+test("responsive contention waits beyond positive, zero and default budgets with periodic progress", async () => {
   for (const maxWaitMs of [0, 500, undefined]) {
     const f = rig();
-    const release = await f.slots.acquire(signal);
     let executions = 0;
-    const warnings: string[] = [];
+    let acquired = false;
+    let holder = maxWaitMs === 0 ? undefined : "pipeline holder-secret";
+    const output: string[] = [];
+    const requests: Record<string, unknown>[] = [];
+    registerCredential("gate-slot-test", "holder-secret");
     const start = f.clock.now();
-    expect(
-      await withGateLease("land", async () => ++executions, {
-        ...f,
-        maxWaitMs,
-        warn: (s) => warnings.push(s),
-      }),
-    ).toBe(1);
-    expect(executions).toBe(1);
-    expect(f.clock.now() - start).toBe(maxWaitMs ?? 1_800_000);
-    expect(warnings.join()).toContain("deadline");
-    release();
+    const work = withGateLease("land", async () => ++executions, {
+      clock: { ...f.clock, sleep: (ms) => new Promise((resolve) => f.clock.timeout(resolve, ms)) },
+      maxWaitMs,
+      warn: (s) => output.push(s),
+      client: async (body) => {
+        requests.push(body);
+        if (acquired && !body.release) await new Promise<void>((resolve) => f.clock.timeout(resolve, 1000));
+        return maxWaitMs === 0 && !acquired
+          ? { id: "", acquired: false, busy: true, holder }
+          : { id: "lease", acquired, holder };
+      },
+    });
     await f.time.flush();
-    expect(f.slots.snapshot().occupied).toBe(0);
+    await f.time.advance(maxWaitMs ?? 1_800_000);
+    expect(executions).toBe(0);
+    for (let i = 0; i < 2; i++) {
+      await f.time.advance(180_000);
+      expect(executions).toBe(0);
+      expect(output.at(-1)).toContain(`${Math.floor((f.clock.now() - start) / 1000)}s`);
+      expect(output.at(-1)).toContain(
+        holder ? holder.replace("holder-secret", "[redacted]") : "unknown holder",
+      );
+      holder = "latest holder";
+    }
+    expect(output.length).toBeGreaterThanOrEqual(2);
+    expect(output.join()).not.toContain("holder-secret");
+    expect(output.join()).not.toContain("coordination unavailable");
+    acquired = true;
+    await f.time.advance(250);
+    expect(executions).toBe(0);
+    await f.time.advance(1000);
+    expect(await work).toBe(1);
+    expect(executions).toBe(1);
+    expect(requests.filter((body) => body.release)).toEqual([{ id: "lease", release: true }]);
     expect(f.time.pending).toBe(0);
   }
   const f = rig();
@@ -622,6 +647,51 @@ test("late acquisition responses are retired after bounded fallback", async () =
   expect(f.slots.snapshot().occupied).toBe(0);
   expect(warnings.join()).toContain("deadline");
 });
+
+test.each([false, true])(
+  "unavailability after a prolonged responsive wait stays bounded (stall=%s)",
+  async (stall) => {
+    const f = rig();
+    const output: string[] = [];
+    const releases: unknown[] = [];
+    let unavailable = false,
+      executions = 0;
+    const work = withGateLease("deploy", async () => ++executions, {
+      clock: { ...f.clock, sleep: (ms) => new Promise((resolve) => f.clock.timeout(resolve, ms)) },
+      maxWaitMs: 500,
+      warn: (s) => output.push(s),
+      client: async (body, signal) => {
+        if (body.release) {
+          releases.push(body);
+          return { id: "lease", acquired: false };
+        }
+        if (unavailable) {
+          if (!stall) throw new Error("ECONNREFUSED");
+          return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason)));
+        }
+        return { id: "lease", acquired: false, holder: "factory gate" };
+      },
+    });
+    await f.time.flush();
+    await f.time.advance(180_000);
+    expect(executions).toBe(0);
+    expect(output.join()).toContain("factory gate");
+    expect(output.join()).not.toContain("coordination unavailable");
+    unavailable = true;
+    await f.time.advance(250);
+    if (stall) {
+      expect(executions).toBe(0);
+      await f.time.advance(1999);
+      expect(executions).toBe(0);
+      await f.time.advance(1);
+    }
+    expect(await work).toBe(1);
+    expect(executions).toBe(1);
+    expect(output.filter((s) => s.includes("coordination unavailable"))).toHaveLength(1);
+    expect(releases).toEqual([{ id: "lease", release: true }]);
+    expect(f.time.pending).toBe(0);
+  },
+);
 
 test("a failed waiting poll retries the same lease and starts only after acquisition", async () => {
   for (const timeout of [false, true]) {

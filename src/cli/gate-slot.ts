@@ -197,6 +197,8 @@ export async function withGateLease<T>(
       let reused = false;
       let state: Reply | undefined;
       let first = true,
+        responsive = false,
+        progressAt = started,
         holder: string | undefined,
         failure: unknown,
         parentChecked = false;
@@ -210,12 +212,14 @@ export async function withGateLease<T>(
               ),
             )
           : new Error("gate-slot wait passed the acquisition deadline");
+      // Responsive ordinary leases keep polling with bounded requests beyond the wait deadline.
+      const remaining = () => (responsive ? 2000 : deadline - clock.now());
       while (!state?.acquired) {
         opts.signal?.throwIfAborted();
         if (!first) {
-          if (clock.now() >= deadline) throw pastDeadline();
-          await clock.sleep(Math.min(250, deadline - clock.now()));
-          if (clock.now() >= deadline) throw pastDeadline();
+          if (remaining() <= 0) throw pastDeadline();
+          await clock.sleep(Math.min(250, remaining()));
+          if (remaining() <= 0) throw pastDeadline();
         }
         try {
           if (opts.agentTest?.parentId && !parentChecked) {
@@ -233,12 +237,22 @@ export async function withGateLease<T>(
             if (maxWait && clock.now() >= deadline) throw pastDeadline();
           }
           state = await request(
-            id ? { id } : { name, immediate: maxWait === 0 },
-            maxWait ? Math.max(1, Math.min(2000, deadline - clock.now())) : 2000,
+            id ? { id } : { name, immediate: !!opts.agentTest && maxWait === 0 },
+            maxWait ? Math.max(1, Math.min(2000, remaining())) : 2000,
           );
           id = state.busy ? undefined : state.id;
           holder = state.holder ?? holder;
+          responsive = !opts.agentTest;
+          if (responsive && !state.acquired && clock.now() - progressAt >= 180_000) {
+            (opts.warn ?? console.warn)(
+              redactCredentials(
+                `gate-slot: waiting ${Math.floor((clock.now() - started) / 1000)}s; holder: ${holder || "unknown holder"}`,
+              ),
+            );
+            progressAt = clock.now();
+          }
         } catch (e) {
+          responsive = false;
           if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
           failure = e;
           // Agent commands wait through stalls; silence alone cannot justify running unslotted.
@@ -257,7 +271,7 @@ export async function withGateLease<T>(
           throw new Error("gate-slot lease expired");
         }
       }
-      if (!reused && maxWait && clock.now() >= deadline) throw pastDeadline();
+      if (opts.agentTest && !reused && maxWait && clock.now() >= deadline) throw pastDeadline();
       if (id) opts.agentTest?.onLease(id);
       if (!reused) beat();
     } catch (e) {
