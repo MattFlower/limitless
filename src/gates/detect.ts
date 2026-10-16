@@ -14,6 +14,7 @@ export interface GateConfig {
   source: ".limitless.toml" | "detected" | "none";
   /** Globs the implementer must not touch (audit blocks edits to them). */
   protectedPaths: string[];
+  retryFiles?: string;
   /** Repo-level merge policy override. */
   merge?: "auto" | "pr" | "none";
 }
@@ -27,7 +28,7 @@ function readJson(path: string): Record<string, unknown> | null {
 }
 
 /** Read `.limitless.toml` from the repo root, or infer gates from the toolchain. */
-export function detectGates(cwd: string): GateConfig {
+export function detectGates(cwd: string, warn: (message: string) => void = console.warn): GateConfig {
   const tomlPath = join(cwd, ".limitless.toml");
   if (existsSync(tomlPath)) {
     const raw = Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>;
@@ -39,6 +40,7 @@ export function detectGates(cwd: string): GateConfig {
       checks: checks.filter((c) => c && typeof c.name === "string" && typeof c.run === "string"),
       source: ".limitless.toml",
       protectedPaths: Array.isArray(policy.protected_paths) ? (policy.protected_paths as string[]) : [],
+      retryFiles: readRetryFiles(readFileSync(tomlPath, "utf8"), warn),
     };
     if (policy.merge === "auto" || policy.merge === "pr" || policy.merge === "none") cfg.merge = policy.merge;
     return assertDistinctGateNames(cfg);
@@ -102,6 +104,22 @@ export function detectGates(cwd: string): GateConfig {
     source: checks.length || setup.length ? "detected" : "none",
     protectedPaths: [],
   });
+}
+
+/** Call with the base commit's contents; candidate configuration must never steer retries. */
+export function readRetryFiles(
+  contents: string | null,
+  warn: (message: string) => void = console.warn,
+): string | undefined {
+  if (contents === null) return undefined;
+  const raw = Bun.TOML.parse(contents) as { gates?: { retry_files?: unknown } };
+  const value = raw.gates?.retry_files;
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && value.split("{files}").length === 2) return value;
+  warn(
+    "Invalid [gates].retry_files; expected a string with exactly one {files} placeholder; targeted retries disabled",
+  );
+  return undefined;
 }
 
 export class GateNameCollisionError extends Error {}

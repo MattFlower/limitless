@@ -16,7 +16,7 @@ import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
-import { worktreeGit } from "../git/command.ts";
+import { stageAll, worktreeGit } from "../git/command.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
 import { runConfined } from "../harness/sandbox.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
@@ -195,7 +195,7 @@ export async function gradeImplement(
   try {
     signal.throwIfAborted();
     // The wrapper blanks hooks and every filter driver, so the commit holds the bytes on disk.
-    await worktreeGit(["git", "add", "-A"], { cwd, env, signal });
+    await stageAll({ cwd, env, signal });
     await worktreeGit(
       [
         "git",

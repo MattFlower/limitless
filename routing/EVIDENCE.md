@@ -105,7 +105,16 @@ The spec writer's Codex model moves from Sol 6.0 (`codex/sol`, backend model `gp
 - `spec.default`: `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`, then `claude/opus`;
 - `spec.large`: `claude/opus`, then `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`.
 
-Both Sol models default to medium effort in the catalog, so the effort doesn't change. While `[routing] prefer = ["codex"]` is set, the first group resolves to Sol 6.1. No spec eval exists, so this is an owner decision rather than a generated update. `routing/overrides.json` pins both cells so `limitless eval policy --write` keeps them. The holdout and verify groups still use `codex/sol` from the built-in defaults.
+Both Sol models default to medium effort in the catalog, so the effort doesn't change. While `[routing] prefer = ["codex"]` is set, the first group resolves to Sol 6.1. No spec eval exists, so this is an owner decision rather than a generated update. `routing/overrides.json` pins both cells so `limitless eval policy --write` keeps them. The holdout and verify groups still use `codex/sol` from the built-in defaults; the next section moves them too.
+
+## Owner decision: holdout and verify = `codex/sol-6.1` replaces `codex/sol` (2026-10-15)
+
+Same change as spec, in the holdout author and verifier groups. Nothing else in the built-in chains changes:
+- `holdout.default`: `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`, then `claude/opus`;
+- `verify.default`: `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`, then `claude/opus`;
+- `verify.large`: `claude/opus`, then `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`.
+
+Both Sol models default to medium effort. The verifier still avoids the implementer's vendor: a Sol-implemented run keeps a non-OpenAI verifier (Sonnet 5.5), and Sol 6.1 verifies only runs implemented by another vendor, or when no other vendor is available. Neither role has a completed eval, so this is an owner decision rather than a generated update. `routing/overrides.json` pins the three cells so `limitless eval policy --write` keeps them. After this change, no role in the effective policy routes to `codex/sol` (Sol 6.0) first. It remains only as an interchangeable alternative in the review groups.
 
 ## Owner decision: implement = `claude/opus` → `codex/sol@medium` (2026-09-28)
 
