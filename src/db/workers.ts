@@ -1,4 +1,5 @@
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registerCredential } from "../util/proc.ts";
@@ -25,6 +26,22 @@ export interface WorkerRow {
   last_heartbeat_at: number | null;
   capabilities: string | null;
 }
+export interface JobRow {
+  id: string;
+  run_id: string | null;
+  request: string;
+  state: "queued" | "leased" | "done" | "failed" | "cancelled";
+  worker: string | null;
+  attempt: number;
+  lease_expires_at: number | null;
+  result: string | null;
+  failure_reason: string | null;
+  excluded: string;
+  events: string;
+  created_at: number;
+  updated_at: number;
+}
+
 /** All worker transitions are synchronous SQLite transactions; no observation crosses an await. */
 export class WorkerStore {
   pairingKey?: string;
@@ -156,9 +173,121 @@ export class WorkerStore {
       });
   }
   heartbeat(w: WorkerRow, c: Capabilities) {
+    this.sweep();
     this.store.db
       .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
       .run(this.now(), JSON.stringify(c), w.name);
-    return { cancelled: c.jobs };
+    const cancelled: string[] = [];
+    for (const id of c.jobs) {
+      const j = this.job(id);
+      if (j?.state !== "leased" || j.worker !== w.name) cancelled.push(id);
+      else
+        this.store.db
+          .query(
+            "UPDATE gate_jobs SET lease_expires_at=?,updated_at=? WHERE id=? AND state='leased' AND worker=?",
+          )
+          .run(this.now() + this.times.lease, this.now(), id, w.name);
+    }
+    return { cancelled };
+  }
+  jobs(where: string, ...args: string[]) {
+    return this.store.db.query<JobRow, string[]>(`SELECT * FROM gate_jobs WHERE ${where}`).all(...args);
+  }
+  job(id: string) {
+    return this.store.db.query<JobRow, [string]>("SELECT * FROM gate_jobs WHERE id=?").get(id);
+  }
+  enqueue(req: GateRequest) {
+    const id = randomUUID(),
+      now = this.now();
+    this.store.db
+      .query(
+        "INSERT INTO gate_jobs (id,run_id,request,state,created_at,updated_at) VALUES (?,?,?,'queued',?,?)",
+      )
+      .run(id, req.runId ?? null, JSON.stringify(req), now, now);
+    return id;
+  }
+  lease(name: string) {
+    return this.store.db.transaction(() => {
+      this.sweep();
+      const w = this.worker(name);
+      if (!w || !this.available(w)) return null;
+      const c: Capabilities = JSON.parse(w.capabilities ?? "{}");
+      const unreported = this.jobs("state='leased' AND worker=?", name).filter((j) => !c.jobs.includes(j.id));
+      if (unreported.length >= c.freeSlots) return null;
+      const j = this.jobs("state='queued'").find(
+        (job) => !(JSON.parse(job.excluded) as string[]).includes(name),
+      );
+      if (!j) return null;
+      const changed = this.store.db
+        .query(
+          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='queued'",
+        )
+        .run(name, this.now() + this.times.lease, this.now(), j.id);
+      return changed.changes === 1 ? this.job(j.id) : null;
+    })();
+  }
+  holds(id: string, name: string) {
+    this.sweep();
+    const j = this.job(id);
+    return j?.state === "leased" && j.worker === name ? j : null;
+  }
+  event(id: string, event: ExecutionEvent) {
+    const j = this.job(id);
+    if (!j || !["queued", "leased", "failed"].includes(j.state)) return;
+    const events: ExecutionEvent[] = JSON.parse(j.events);
+    events.push(this.sanitize(event));
+    this.store.db.query("UPDATE gate_jobs SET events=? WHERE id=?").run(JSON.stringify(events), id);
+    if (event.type === "status" && j.run_id)
+      this.store.addEvent({
+        runId: j.run_id,
+        type: "gate",
+        level: "warn",
+        message: this.sanitize(event.text),
+      });
+  }
+  fail(id: string, reason: string) {
+    const j = this.job(id);
+    if (!j || !["queued", "leased"].includes(j.state)) return;
+    reason = this.sanitize(reason);
+    this.event(id, { type: "status", text: `LAN infrastructure failure: ${reason}` });
+    const excluded: string[] = JSON.parse(j.excluded);
+    if (j.worker) excluded.push(j.worker);
+    this.store.db
+      .query(
+        "UPDATE gate_jobs SET state=?,attempt=?,worker=NULL,lease_expires_at=NULL,failure_reason=?,excluded=?,updated_at=? WHERE id=? AND state IN ('queued','leased')",
+      )
+      .run(
+        j.attempt < 2 ? "queued" : "failed",
+        Math.min(2, j.attempt + 1),
+        reason,
+        JSON.stringify(excluded),
+        this.now(),
+        id,
+      );
+  }
+  sweep() {
+    const now = this.now();
+    for (const j of this.jobs("state IN ('queued','leased')")) {
+      if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
+        this.fail(j.id, "No worker picked up job");
+      else if (j.state === "leased") {
+        const w = j.worker ? this.worker(j.worker) : null;
+        if (w?.state !== "approved") this.fail(j.id, "Worker disconnected or revoked");
+        else if ((j.lease_expires_at ?? 0) <= now) this.fail(j.id, "Lease expired");
+        else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh) this.fail(j.id, "Worker disconnected");
+      }
+    }
+  }
+  cancel(id: string) {
+    this.store.db
+      .query(
+        "UPDATE gate_jobs SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','leased','failed')",
+      )
+      .run(this.now(), id);
+  }
+  complete(id: string, run: unknown, local = false) {
+    this.store.db
+      .query("UPDATE gate_jobs SET state='done',result=?,updated_at=? WHERE id=? AND state=?")
+      .run(JSON.stringify(this.sanitize(run)), this.now(), id, local ? "failed" : "leased");
   }
 }

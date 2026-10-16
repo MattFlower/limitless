@@ -548,6 +548,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       else {
         // Keyed by the commit actually checked out, so verify-change caches its PR base.
         const key = baselineCacheKey({
+          executor: cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local",
           repoId: ctx.repo.id,
           baseSha: await headSha(wt.path),
           gates,

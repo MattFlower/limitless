@@ -1,14 +1,22 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { cpus, hostname, release, totalmem } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import type { Config } from "../config.ts";
+import type { GateRequest } from "../gates/executor.ts";
+import { redactGateData } from "../gates/output.ts";
+import { runLocalGates } from "../gates/run.ts";
 import { gateSlots } from "../gates/slots.ts";
+import { worktreeGit } from "../git/command.ts";
+import { addDetachedWorktree, withRepoLock } from "../git/repos.ts";
+import { readPolicyScope } from "../harness/read-policy.ts";
+import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { agentEnv, registerCredential, sh } from "../util/proc.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
+import { requestedChecks } from "./validation.ts";
 
 export async function pairWorker(
   coordinator: string,
@@ -64,6 +72,29 @@ export async function pairWorker(
   }
 }
 
+const WireRequest = z.object({
+  repo: z.string(),
+  cwd: z.string(),
+  runId: z.string().optional(),
+  baseSha: z.union([z.literal(""), z.string().regex(/^[a-f0-9]{40,64}$/)]),
+  headSha: z.string().regex(/^[a-f0-9]{40,64}$/),
+  checks: z.array(z.string()).optional(),
+  gates: z.object({
+    setup: z.array(z.string()),
+    checks: z.array(
+      z.object({ name: z.string(), run: z.string(), timeoutSec: z.number().positive().optional() }),
+    ),
+    source: z.enum([".limitless.toml", "detected", "none"]),
+    protectedPaths: z.array(z.string()),
+    retryFiles: z.string().optional(),
+    merge: z.enum(["auto", "pr", "none"]).optional(),
+  }),
+});
+const Lease = z.object({
+  job: z.object({ id: z.string().uuid(), request: WireRequest }).nullable(),
+  cancelled: z.array(z.string()).default([]),
+});
+
 async function machineState(): Promise<{ onAC: boolean; idleSeconds: number }> {
   const [power, idle] = await Promise.all([
     sh(["/usr/bin/pmset", "-g", "batt"], { cwd: process.cwd(), env: agentEnv(), timeoutMs: 5000 }),
@@ -80,13 +111,14 @@ export async function runWorker(
   releaseSha: string,
   signal: AbortSignal,
   options: {
+    confinement?: ConfinementBackend;
     heartbeatMs?: number;
     machineState?: typeof machineState;
     request?: typeof workerRequest;
     retryMs?: number;
   } = {},
 ) {
-  if (process.platform !== "darwin" && !options.machineState)
+  if (process.platform !== "darwin" && !options.confinement)
     throw new Error("Workers require macOS Seatbelt");
   const home = join(cfg.paths.home, "worker");
   mkdirSync(home, { recursive: true });
@@ -97,43 +129,146 @@ export async function runWorker(
     const pin = privateFile(join(home, "coordinator-fingerprint"));
     held.push(pin.release);
     registerWorkerToken(token.value);
-    const call = async (body: Capabilities) => {
+    const stop = new AbortController(),
+      combined = AbortSignal.any([signal, stop.signal]);
+    const jobs = new Map<string, { controller: AbortController; task: Promise<void> }>();
+    const call = async (path: string, body?: unknown, requestSignal = combined) => {
       let delay = options.retryMs ?? 1000;
       for (;;) {
-        signal.throwIfAborted();
-        const reply = await (options.request ?? workerRequest)(coordinator, "/worker/heartbeat", body, {
+        requestSignal.throwIfAborted();
+        const reply = await (options.request ?? workerRequest)(coordinator, path, redactGateData(body), {
           token: token.value,
           pin: pin.value,
-          signal,
+          signal: requestSignal,
+          timeoutMs: path.endsWith("/bundle") ? 300_000 : undefined,
         }).catch(() => {
-          signal.throwIfAborted();
+          requestSignal.throwIfAborted();
           return undefined;
         });
-        if (reply?.status === 200) return;
-        if (reply && reply.status < 500)
-          throw new Error(`Coordinator refused worker request (${reply.status})`);
-        await sleep(delay, undefined, { signal });
+        if (reply?.status === 200) return reply;
+        if (reply && reply.status < 500) {
+          const error = new Error(`Coordinator refused worker request (${reply.status})`);
+          if (reply.status === 401 || reply.status === 403) stop.abort(error);
+          throw error;
+        }
+        // Keep gates and heartbeat requests alive across a coordinator restart.
+        await sleep(delay, undefined, { signal: requestSignal });
         delay = Math.min(delay * 2, 10_000);
       }
     };
-    while (!signal.aborted) {
+    const heartbeat = async () => {
       const slots = gateSlots.snapshot(),
         state = await (options.machineState ?? machineState)();
-      await call({
+      const body: Capabilities = {
         releaseSha,
         bunVersion: Bun.version,
         os: "darwin",
         osVersion: release(),
         cpuCount: cpus().length,
         ramBytes: totalmem(),
-        freeSlots: Math.max(0, slots.limit - slots.occupied),
+        freeSlots: Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
         ...state,
-        jobs: [],
-      });
-      await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal });
+        jobs: [...jobs.keys()],
+      };
+      const reply = z
+        .object({ cancelled: z.array(z.string()) })
+        .parse((await call("/worker/heartbeat", body)).json());
+      for (const id of reply.cancelled) jobs.get(id)?.controller.abort();
+    };
+    const run = async (id: string, req: GateRequest, jobSignal: AbortSignal) => {
+      const root = mkdtempSync(join(cfg.paths.work, "worker-")),
+        cwd = join(root, "checkout"),
+        cache = join(cfg.paths.repos, `${encodeURIComponent(req.repo)}.git`);
+      try {
+        const bundle = join(root, "job.bundle");
+        writeFileSync(bundle, (await call(`/worker/jobs/${id}/bundle`, undefined, jobSignal)).data);
+        await withRepoLock(cache, async () => {
+          if (!existsSync(cache)) {
+            for (const dir of ["objects", "refs"]) mkdirSync(join(cache, dir), { recursive: true });
+            writeFileSync(join(cache, "HEAD"), "ref: refs/heads/main\n");
+            await worktreeGit(
+              [
+                "git",
+                "init",
+                "--bare",
+                "--template=",
+                `--object-format=${req.headSha.length === 64 ? "sha256" : "sha1"}`,
+              ],
+              { cwd: cache, signal: jobSignal },
+            );
+          }
+          await worktreeGit(["git", "bundle", "verify", bundle], { cwd: cache, signal: jobSignal });
+          await worktreeGit(
+            ["git", "fetch", "--no-tags", bundle, "+refs/limitless-bundles/*:refs/limitless-bundles/*"],
+            { cwd: cache, signal: jobSignal },
+          );
+          await addDetachedWorktree(cache, req.headSha, cwd, jobSignal);
+        });
+        const sha = (
+          await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal: jobSignal })
+        ).stdout.trim();
+        if (sha !== req.headSha) throw new Error("Worker checkout SHA mismatch");
+        let posts = Promise.resolve();
+        const gates = { ...req.gates, checks: requestedChecks(req) };
+        const run = await readPolicyScope.run(cfg.readPolicy, () =>
+          confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
+            runLocalGates(cwd, gates, jobSignal, {
+              onResult(result, phase) {
+                posts = posts.then(async () => {
+                  await call(
+                    `/worker/jobs/${id}/events`,
+                    redactGateData({ type: "check", phase, result }),
+                    jobSignal,
+                  );
+                });
+                void posts.catch(() => jobs.get(id)?.controller.abort());
+              },
+            }),
+          ),
+        );
+        await posts;
+        jobSignal.throwIfAborted();
+        await call(`/worker/jobs/${id}/result`, redactGateData({ run, sha }), jobSignal);
+      } catch (error) {
+        if (!jobSignal.aborted) await call(`/worker/jobs/${id}/failure`, {}).catch(() => {});
+        if (combined.aborted) throw error;
+      } finally {
+        if (existsSync(cwd))
+          await withRepoLock(cache, () =>
+            worktreeGit(["git", "worktree", "remove", "--force", cwd], { cwd: cache }),
+          ).catch(() => {});
+        rmSync(root, { recursive: true, force: true });
+      }
+    };
+    let beats: Promise<void> | undefined;
+    try {
+      await heartbeat();
+      beats = (async () => {
+        while (!combined.aborted) {
+          await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal: combined });
+          if (!combined.aborted) await heartbeat();
+        }
+      })();
+      void beats.catch((error: unknown) => stop.abort(error));
+      while (!combined.aborted) {
+        const leased = Lease.parse((await call("/worker/lease", { jobs: [...jobs.keys()] })).json());
+        for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
+        if (!leased.job) continue;
+        const { id, request } = leased.job,
+          controller = new AbortController();
+        const task = run(id, request, AbortSignal.any([combined, controller.signal])).finally(() =>
+          jobs.delete(id),
+        );
+        jobs.set(id, { controller, task });
+        void task.catch(() => stop.abort());
+      }
+    } catch (error) {
+      if (!signal.aborted) throw error;
+    } finally {
+      stop.abort();
+      for (const job of jobs.values()) job.controller.abort();
+      await Promise.allSettled([...(beats ? [beats] : []), ...[...jobs.values()].map((j) => j.task)]);
     }
-  } catch (error) {
-    if (!signal.aborted) throw error;
   } finally {
     for (const release of held) release();
   }
