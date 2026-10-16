@@ -16,6 +16,9 @@
     "default": ["claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6", "claude/opus"],
     "large": ["claude/opus", "claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6"]
   },
+  "holdout": {
+    "default": ["claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6", "claude/opus"]
+  },
   "implement": {
     "trivial": ["codex/sol-6.1@high", "claude/opus"],
     "small": ["codex/sol-6.1@high", "claude/opus"],
@@ -25,5 +28,9 @@
   "review": {
     "default": ["codex/sol-6.1|codex/sol|codex/sol-5.6|claude/opus", "openrouter/glm-5.3", "claude/opus"],
     "large": ["claude/opus", "codex/sol-6.1|codex/sol|codex/sol-5.6|claude/sonnet-5.5"]
+  },
+  "verify": {
+    "default": ["claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6", "claude/opus"],
+    "large": ["claude/opus", "claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6"]
   }
 }

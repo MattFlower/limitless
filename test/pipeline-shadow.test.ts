@@ -166,6 +166,59 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     expect(f.store.listInvocations(run.id)).toEqual([]);
   });
 
+  test("a completed shadow with a redacted range is preserved on resume", async () => {
+    const baseSha = "0123456789abcdef0123456789abcdef01234567";
+    registerCredential("shadow-range-test", baseSha);
+    const f = start(() => {
+      throw new Error("no model should be invoked");
+    });
+    await f.stop();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    ctx.artifact(
+      "review-0.shadow.json",
+      "review-shadow",
+      JSON.stringify({
+        status: "completed",
+        range: `${baseSha}..head`,
+        blocking: [],
+      }),
+    );
+    const before = f.store.getArtifact(run.id, "review-0.shadow.json");
+    expect(JSON.parse(before ?? "null").range).toBe("[redacted]..head");
+    const restored = new RunContext(f.deps, run, repo, new AbortController().signal);
+    await shadowReview(
+      restored,
+      {
+        round: 0,
+        baseSha,
+        reviewedSha: "head",
+        profile: "quick",
+        input: {
+          timeoutMs: 1,
+          prompt: {
+            prompt: run.prompt,
+            spec: null,
+            baseSha,
+            stat: "",
+            gates: [],
+            audit: [],
+            implementerReport: "",
+          },
+        },
+      },
+      () => {
+        throw new Error("no review dependencies should be needed");
+      },
+      Promise.resolve(),
+    );
+    expect(shadowOf(f, run.id, 0).status).toBe("completed");
+    expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBe(before);
+    expect(f.store.listInvocations(run.id)).toEqual([]);
+  });
+
   test("a pinned production reviewer leaves the shadow panel's targets unchanged", async () => {
     const calls = newCalls();
     const f = start(scenario(calls));

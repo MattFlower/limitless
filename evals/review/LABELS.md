@@ -286,3 +286,39 @@ instructions; only the case and the claims differed.
 After the audit, the dev clean set is four cases (eight trials at k=2) instead of six. A rule of
 "at most one more clean false block" is therefore looser on dev than it was, so held-out carries
 more of the weight for decisions measured after this audit.
+
+## M5.2 fresh clean set — procedure, 2026-10-15
+
+Recorded on 2026-10-15 (checked with `date`), for #542, before any candidate was selected or
+adjudicated.
+
+**Why.** The clean set no longer discriminates. Dev has 4 clean cases after the 2026-10-14
+audit. Production's reviewer and the adversarial variant blocked the 3 held-out clean cases in
+5 and 6 of 6 trials (#541).
+
+- **Candidates.** Merged pull requests in MattFlower/limitless and MattFlower/limitless-sandbox,
+  merged from 2026-10-08 up to two days before selection. Excluded:
+  - hand-built pull requests (branches under `hand/`);
+  - pull requests already used for a case;
+  - any pull request with a later fix: a later commit, pull request or issue that corrects a
+    defect in its change, found by a line-level survey of later history.
+- **Pins.** The case base is the merged pull request's base on main, and the case head is the
+  head that merged. Cases whose `base..head` history contains `evals/*` carry `snapshot: true`.
+  The request is the pull request's original issue or description, with private strings,
+  paths and internal identifiers replaced by placeholders.
+- **Blind vetting by two vendors.** Before any measured system runs on a candidate, two
+  adjudicators each review it once, with the same instructions: codex/sol-6.1 at high effort,
+  and claude/opus. Each reports every defect of medium or higher severity introduced or newly
+  exposed by `base..head`, with a reproduction or quoted code at head against base. Two vendors,
+  because a clean set filtered by one model family would favour reviewers of that family.
+- **Verification.** The orchestrator re-runs or re-quotes every claim, rejections included.
+  - A confirmed defect of medium or higher severity makes the candidate a real case. It is
+    labelled under the 2026-10-08 rule and leaves the clean set.
+  - Claims that don't hold are recorded here, and the candidate stays clean.
+  - Low-severity findings never change the label.
+- **Split and size.** Candidates take the fixed-seed pull-request split (`assignReviewSplits`
+  in `scripts/review-pending.ts`). Selection continues until each split has at least 12 clean
+  cases or candidates run out, and the counts are reported either way.
+- **Use.** The new clean cases join their splits. Decisions measured before this set existed
+  keep their recorded verdicts. Results for systems built on either adjudicator's model carry
+  the usual independence caveat.

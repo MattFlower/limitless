@@ -7,6 +7,7 @@ import { cacheableBaseline } from "../src/gates/cache.ts";
 import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
+import { redactGateData } from "../src/gates/output.ts";
 import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
@@ -1147,4 +1148,140 @@ test("local check events stream before completion and the start signal cancels r
     expect(completed.checks.find((c) => c.name === "pending")?.ok ?? false).toBe(false);
     await execution.cancel();
   });
+});
+
+test.each([false, true])(
+  "targeted retry config stays on the base commit across opposite PR edits (base enabled=%s)",
+  async (enabled) => {
+    const baseConfig = `[gates]\nchecks = [{ name = "check", run = "full-check" }]\n${enabled ? 'retry_files = "base-target {files}"\n' : ""}`;
+    const changedConfig = `[gates]\nchecks = [{ name = "check", run = "full-check" }]\n${enabled ? "" : 'retry_files = "candidate-target {files}"\n'}`;
+    writeFileSync(join(fixture.repoDir, ".limitless.toml"), baseConfig);
+    await sh(["git", "commit", "-qam", "base retry configuration"], { cwd: fixture.repoDir });
+    const purposes: string[] = [];
+    const scripted = fake(async (handle, req) => {
+      const state = fixture.factory?.store.listRuns()[0];
+      if (state)
+        purposes.push(fixture.factory?.store.getRunState<RunState>(state.id)?.gateExecution?.purpose ?? "");
+      const run = result(req, handle.id !== "2");
+      if (handle.id === "2")
+        run.checks = run.checks.map((check) => ({
+          ...check,
+          output: "test failure",
+          failedFiles: ["greeting.txt"],
+          failedFileTimes: { "greeting.txt": 1 },
+        }));
+      return run;
+    });
+    const f = start(
+      (s) =>
+        roleOf(s) === "implement"
+          ? { files: { ".limitless.toml": changedConfig, "farewell.txt": "goodbye\n" } }
+          : handler(s),
+      false,
+      false,
+      { gateExecutor: scripted.executor },
+    );
+    const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const requests = [...scripted.requests.values()];
+    expect(requests.map((req) => req.gates.retryFiles)).toEqual(
+      Array(enabled ? 4 : 3).fill(enabled ? "base-target {files}" : undefined),
+    );
+    expect(requests.map((req) => req.gates.checks[0]?.run)).toEqual(
+      enabled
+        ? ["full-check", "full-check", "base-target './greeting.txt'", "full-check"]
+        : ["full-check", "full-check", "full-check"],
+    );
+    expect(purposes).toEqual(
+      enabled
+        ? ["baseline", "initial", "regression-retry-targeted", "regression-retry"]
+        : ["baseline", "initial", "regression-retry"],
+    );
+    expect(requests[2]?.skipGateSlot).toBe(enabled);
+    const comparison = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
+    expect(comparison?.verdict).toBe("flaky");
+    expect(comparison?.firstAttempt?.ok).toBe(false);
+    if (enabled)
+      expect(
+        f.store
+          .listEvents(run.id)
+          .some((event) => event.message.includes("targeted: 1 files, then full retry")),
+      ).toBe(true);
+  },
+);
+
+test.each([false, true])("baseline targeted evidence is redacted before caching (pass=%s)", async (pass) => {
+  const secret = "synthetic-baseline-retry-file-credential-548";
+  registerCredential("BASELINE_RETRY_FILE_TEST_TOKEN", secret);
+  const file = `${secret}.test.ts`;
+  writeFileSync(join(fixture.repoDir, file), "");
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    '[gates]\nchecks = [{ name = "check", run = "full-check" }]\nretry_files = "base-target {files}"\n',
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "baseline targeted retry"], { cwd: fixture.repoDir });
+  const purposes: string[] = [];
+  const scripted = fake(async (handle, req) => {
+    const state = fixture.factory?.store.listRuns()[0];
+    if (state)
+      purposes.push(fixture.factory?.store.getRunState<RunState>(state.id)?.gateExecution?.purpose ?? "");
+    const run = result(req, Number(handle.id) > (pass ? 1 : 2));
+    if (handle.id === "1")
+      run.checks = run.checks.map((check) => ({
+        ...check,
+        failedFiles: [file],
+        failedFileTimes: { [file]: 1 },
+      }));
+    return run;
+  });
+  const f = start(handler, false, false, { gateExecutor: scripted.executor });
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(purposes).toEqual(
+    pass
+      ? ["baseline", "baseline-retry-targeted", "baseline-retry", "initial"]
+      : ["baseline", "baseline-retry-targeted", "initial"],
+  );
+  expect([...scripted.requests.values()].map((req) => req.gates.checks[0]?.run)).toEqual([
+    "full-check",
+    `base-target './${file}'`,
+    ...(pass ? ["full-check"] : []),
+    "full-check",
+  ]);
+  const state = f.store.getRunState<RunState>(run.id);
+  const baseline = state?.baseline?.checks[0];
+  expect(baseline).toMatchObject({
+    ok: pass,
+    firstAttempt: {
+      ok: false,
+      failedFiles: [file],
+      failedFileTimes: { [file]: 1 },
+    },
+    targetedRetry: { ok: pass, command: `base-target './${file}'` },
+  });
+  const row = f.store.db.query("SELECT gate_run FROM passing_baselines").get() as {
+    gate_run: string;
+  } | null;
+  if (pass) {
+    if (!row) throw new Error("missing baseline cache");
+    expect(JSON.parse(row.gate_run)).toEqual(redactGateData(state?.baseline));
+    expect(row.gate_run).not.toContain(secret);
+  } else expect(row).toBeNull();
+  const artifact = f.store.getArtifact(run.id, "baseline-gates.json");
+  if (!artifact) throw new Error("missing baseline artifact");
+  expect(JSON.parse(artifact)).toEqual(redactGateData(state?.baseline));
+  for (const persisted of [artifact, JSON.stringify(f.store.listEvents(run.id))])
+    expect(persisted).not.toContain(secret);
+  expect(
+    f.store
+      .listEvents(run.id)
+      .some(
+        (event) =>
+          event.message ===
+          (pass
+            ? "baseline check: flaky (targeted: 1 files, then full retry)"
+            : "baseline check: retry FAIL again (targeted: 1 files)"),
+      ),
+  ).toBe(true);
 });

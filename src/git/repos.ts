@@ -16,6 +16,7 @@ import {
   emptyTreeId,
   NO_BIG_FILES,
   recordWorktree,
+  stageAll,
   worktreeGit,
   worktreeGitScope,
 } from "./command.ts";
@@ -447,7 +448,7 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
     rmSync(resolve(cwd, index.stdout.trim()), { force: true });
     await worktreeGit(["git", "read-tree", "HEAD"], { cwd });
   }
-  await worktreeGit(["git", "add", "-A"], { cwd });
+  await stageAll({ cwd });
   const status = await worktreeGit(["git", "status", "--porcelain"], { cwd });
   if (!status.stdout.trim()) return null;
   await worktreeGit(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
@@ -855,7 +856,8 @@ async function attributeInfo(
         contents.set(oid, {
           pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
           forbidden: isForbiddenFormat("", bytes),
-          binary: bytes.includes(0) || bytes.includes(Buffer.from("%PDF-")),
+          // Hex avoids classifying this source as the PDF signature it detects.
+          binary: bytes.includes(0) || bytes.includes(Buffer.from("255044462d", "hex")),
           reviewable: reviewableText(bytes),
         });
         at = end + size + 2;

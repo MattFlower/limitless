@@ -5,6 +5,7 @@ import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { verifierPrompt } from "../src/pipeline/prompts.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { customProvider, providerFixture } from "./provider-config-support.ts";
 
@@ -249,6 +250,84 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
       0,
     );
     expect(cached).toEqual([cleanComparison]);
+  } finally {
+    await factory.stop();
+    store.close();
+    fixture.close();
+  }
+});
+
+test("stored escape-split findings are sanitized before encoding verifier model input", async () => {
+  const secret = "synthetic-panel-credential-549";
+  registerCredential("panel-prompt-test", secret);
+  const title = "leak synthetic-panel\x1b[31m-credential-549 here";
+  const fixture = providerFixture([customProvider]);
+  const store = new Store(":memory:");
+  let calls = 0;
+  const factory = new Factory(fixture.load(), {
+    store,
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        calls++;
+        expect(spec.prompt.match(/"title": "leak \[redacted\] here"/g)).toHaveLength(3);
+        expect(spec.prompt).not.toContain("synthetic-panel");
+        expect(spec.prompt).not.toContain("credential-549");
+        expect(spec.prompt).not.toContain("\\u001b");
+        return { structured: { results: [] } };
+      }),
+    },
+  });
+  try {
+    const repo = store.upsertRepo({
+      slug: "fixture/repo",
+      kind: "local",
+      localPath: fixture.root,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const initial = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    initial.state.lastReview = {
+      verdict: "request_changes",
+      summary: "Check this",
+      modelId: "claude/haiku",
+      findings: [
+        {
+          severity: "major",
+          security: false,
+          file: "file.ts",
+          line: 1,
+          title,
+          detail: "Bug",
+          suggestion: "Fix",
+        },
+      ],
+    };
+    await initial.save();
+    const restored = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    const finding = restored.state.lastReview?.findings[0];
+    if (!finding) throw new Error("missing stored finding");
+    expect(finding.title).toBe(title);
+    const prior = { ...finding, id: "P1", status: "unaddressed" };
+    const outcome = await restored.invoke({
+      role: "review",
+      stage: store.startStage(run.id, "review", 0),
+      prompt: verifierPrompt({
+        prompt: run.prompt,
+        spec: null,
+        baseSha: "base",
+        stat: "",
+        candidates: [{ ...finding, id: "C1", failure_scenario: "Bug" }],
+        fix: { review: 2, sha: "previous", prior: [prior], resolved: [prior] },
+      }),
+      mode: "readonly",
+      complexity: "small",
+      constraints: { only: "claude/haiku" },
+    });
+    expect(outcome.result.status).toBe("ok");
+    expect(calls).toBe(1);
+    expect(restored.state.lastReview?.findings[0]?.title).toBe(title);
   } finally {
     await factory.stop();
     store.close();

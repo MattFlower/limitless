@@ -18,6 +18,10 @@ import {
 } from "./schemas.ts";
 import { specCriteriaRange } from "./spec-criteria.ts";
 
+/** Sanitize decoded values before JSON escapes can hide terminal-split credentials. */
+export const promptJson = (value: unknown, space?: number): string =>
+  JSON.stringify(redactGateData(value), null, space);
+
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
 - You run non-interactively: nobody can answer questions during this session. When something is ambiguous, choose the most reasonable conservative interpretation and state the assumption in your final message.
@@ -487,12 +491,11 @@ ${sealedFence(input.firstParentPatch.slice(0, PATCH_LIMIT) || "(empty diff)")}
 Reviewed commit: ${input.previous.sha}. Current HEAD: ${input.headSha ?? "HEAD"}.
 Previous blocking findings (the only findings sent back for implementation):
 ${fence(
-  JSON.stringify(
+  promptJson(
     input.previous.findings.map((f, i) => ({
       id: `P${i + 1}`,
       ...brief(f, "unresolved at the previous review; recheck it against the fix diff"),
     })),
-    null,
     2,
   ),
 )}
@@ -500,9 +503,8 @@ ${
   fix && input.previous.resolved?.length
     ? `Earlier blocking findings already resolved (do not raise them again unless the fix diff reintroduces one, as a regression):
 ${fence(
-  JSON.stringify(
+  promptJson(
     input.previous.resolved.map((f) => brief(f, "resolved")),
-    null,
     2,
   ),
 )}
@@ -590,15 +592,15 @@ Previously reviewed: ${input.fix.sha}. Head: ${input.headSha ?? "HEAD"}. Inspect
 ${fence(input.stat.trim() || "(empty diff)")}
 
 # Prior blocking findings (status from this re-review's finders, not proof)
-${fence(JSON.stringify(input.fix.prior, null, 2))}
-${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(JSON.stringify(input.fix.resolved, null, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed, or asks you to recheck it when no finder repeated it: REFUTE it when the fix diff resolves it, else CONFIRM it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
+${fence(promptJson(input.fix.prior, 2))}
+${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(promptJson(input.fix.resolved, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed, or asks you to recheck it when no finder repeated it: REFUTE it when the fix diff resolves it, else CONFIRM it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
     : `# Change under review
 Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}`
 }
 
 # Candidates (claims to check, not facts)
-${fence(JSON.stringify(input.candidates, null, 2))}
+${fence(promptJson(input.candidates, 2))}
 
 # Verdicts
 - CONFIRMED: the code shows the failure happens.

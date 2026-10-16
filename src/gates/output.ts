@@ -42,7 +42,11 @@ export const redactGateData = <T>(value: T): T =>
   value === undefined
     ? value
     : JSON.parse(
-        JSON.stringify(value, (_key, v: unknown) => {
+        JSON.stringify(value, (key, v: unknown) => {
+          if (key === "failedFileTimes" && v && typeof v === "object")
+            return Object.fromEntries(
+              Object.entries(v).map(([file, time]) => [redactGateOutput(file), time]),
+            );
           if (typeof v === "string") return redactGateOutput(v);
           if (v && typeof v === "object" && "ok" in v && "output" in v && typeof v.output === "string") {
             if ("confinementError" in v && v.confinementError != null) return v;

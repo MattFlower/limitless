@@ -141,7 +141,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     (req.method === "GET" && (path === "/api/health" || path === "/api/auth/session")) ||
     (req.method === "POST" && path === "/api/auth/logout");
   const protectedRequest = (req: Request, path: string) =>
-    !tokenExempt(req, path) && (factory.cfg.requireApiToken || path === "/api/auth/logout-all");
+    !tokenExempt(req, path) &&
+    (factory.cfg.requireApiToken || path === "/api/auth/logout-all" || path.startsWith("/api/workers"));
   const handle =
     (
       fn: (
@@ -153,6 +154,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     async (req: Request & { params: Record<string, string> }, server: Server<undefined>) => {
       const url = new URL(req.url);
       const path = url.pathname;
+      if (path.startsWith("/worker/")) return new Response(null, { status: 404 });
       const access = classifyRequest(
         server.requestIP(req)?.address ?? null,
         req.headers,
@@ -273,6 +275,20 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     return id;
   };
   const routes: Record<string, unknown> = {
+    "/api/workers": handle(() => json(factory.workers.list())),
+    "/api/workers/approve": {
+      POST: handle(async (req) => {
+        const input = await body<{ code: string }>(req);
+        if (typeof input.code !== "string") return error("Pairing code required");
+        return json(factory.workers.approve(input.code));
+      }),
+    },
+    "/api/workers/:name/revoke": {
+      POST: handle((req) => {
+        factory.workers.revoke(req.params.name ?? "");
+        return json({ ok: true });
+      }),
+    },
     "/api/admin/gate-slot": {
       POST: handle(async (req) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);

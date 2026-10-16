@@ -1,5 +1,5 @@
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
-import { redactHoldoutText } from "./prompts.ts";
+import { promptJson, redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
 export function preDeliveryVerifyArtifact(
@@ -30,7 +30,7 @@ export function preDeliveryVerifyArtifact(
       ? `Factory gate ${redact(gate.check, criterion.id)} passed at ${gate.sha} (stage ${gate.stageId}); commands: ${redact(gate.command, criterion.id)}`
       : redactHoldoutText(criterion.evidence, holdout, publicSources, !publicRow);
   };
-  return JSON.stringify(
+  return promptJson(
     {
       ...published,
       notes: redactHoldoutText(verify.notes, holdout, publicSources),
@@ -53,7 +53,6 @@ export function preDeliveryVerifyArtifact(
             },
       ),
     },
-    null,
     2,
   );
 }

@@ -134,18 +134,33 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
   ]);
 });
 
-test("committed spec cells write with Sol 6.1 instead of Sol 6.0", () => {
+test.each(["spec", "holdout", "verify"] as const)(
+  "committed %s cells use Sol 6.1 instead of Sol 6.0",
+  (role) => {
+    const tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+    const committed = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
+    const router = new Router(tracker, committed, MODELS, ["codex"]);
+    const ids = (complexity: "trivial" | "small" | "medium" | "large") =>
+      router.route(role, complexity).candidates.map((c) => c.modelId);
+    for (const complexity of ["trivial", "small", "medium"] as const) {
+      expect(ids(complexity)[0]).toBe("codex/sol-6.1");
+      expect(ids(complexity)).not.toContain("codex/sol");
+    }
+    // Holdout has no large cell, so large uses its default chain.
+    expect(ids("large").slice(0, 2)).toEqual(
+      role === "holdout" ? ["codex/sol-6.1", "codex/sol-5.6"] : ["claude/opus", "codex/sol-6.1"],
+    );
+    expect(ids("large")).not.toContain("codex/sol");
+  },
+);
+
+test("a Sol-implemented run keeps a non-OpenAI verifier under the committed policy", () => {
   const tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
   const committed = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
   const router = new Router(tracker, committed, MODELS, ["codex"]);
-  const ids = (complexity: "trivial" | "small" | "medium" | "large") =>
-    router.route("spec", complexity).candidates.map((c) => c.modelId);
-  for (const complexity of ["trivial", "small", "medium"] as const) {
-    expect(ids(complexity)[0]).toBe("codex/sol-6.1");
-    expect(ids(complexity)).not.toContain("codex/sol");
-  }
-  expect(ids("large").slice(0, 2)).toEqual(["claude/opus", "codex/sol-6.1"]);
-  expect(ids("large")).not.toContain("codex/sol");
+  expect(router.route("verify", "medium", { avoidVendor: "openai" }).candidates[0]?.modelId).toBe(
+    "claude/sonnet-5.5",
+  );
 });
 
 test("live policy removes sticky targets, preserves exclusions and tiers, and explicit only targets win", () => {
