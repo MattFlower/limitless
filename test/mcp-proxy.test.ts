@@ -11,7 +11,9 @@ import { cachePath } from "../src/git/repos.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
 import type { RunState } from "../src/pipeline/context.ts";
-import { renderReport } from "../src/pipeline/report.ts";
+import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
+import { renderReport, renderReportArtifacts } from "../src/pipeline/report.ts";
+import { markReportArtifacts, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import {
@@ -475,24 +477,31 @@ async function renderedPages(
   state: Parameters<typeof renderReport>[0]["state"],
   check: (text: string) => void,
   prepare?: (runId: string) => void,
+  sourcesMode: "normal" | "missing" | "mismatch" | "malformed" | "missing entry" = "normal",
 ) {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
   f.factory.store.setRunState(c.run.id, state);
   prepare?.(c.run.id);
-  f.factory.store.putArtifact(
-    c.run.id,
-    "report.md",
-    "report",
-    renderReport({
-      success: false,
-      runId: c.run.id,
-      prompt: "Public request",
-      state,
-      invocations: [],
-      totals: { costUsd: 0, costEquivUsd: 0 },
-      runUrl: "u",
-    }),
-  );
+  const rendered = renderReportArtifacts({
+    success: false,
+    runId: c.run.id,
+    prompt: "Public request",
+    state,
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+  });
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", rendered.report);
+  if (sourcesMode !== "missing") {
+    if (sourcesMode === "mismatch") rendered.sources.digest = "different digest";
+    if (sourcesMode === "missing entry") rendered.sources.sources = {};
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report-sources.json",
+      "report",
+      sourcesMode === "malformed" ? "{" : JSON.stringify(rendered.sources),
+    );
+  }
   const connections = await changeConnections();
   try {
     for (const conn of [connections.direct, connections.proxy]) {
@@ -559,6 +568,167 @@ test.each(quotationForms)(
     });
   },
 );
+
+test.each(["missing", "mismatch", "malformed", "missing entry"] as const)(
+  "clipped spans fail closed with %s sources while public text stays visible",
+  async (mode) => {
+    const state = privateReportState("red owl");
+    state.implementerReport = "Short public neighbor";
+    state.lastVerify?.criteria.push({
+      id: "AC-1",
+      status: "met",
+      evidence: "Visible clipped output ".repeat(30),
+      publicSummary: "",
+    });
+    await renderedPages(
+      state,
+      (text) => {
+        expect(text).not.toContain("Visible clipped output");
+        expect(text).toContain("[withheld:");
+        expect(text).toContain("Short public neighbor");
+      },
+      undefined,
+      mode,
+    );
+  },
+);
+
+test("report sources refresh between reads and invalidate an in-flight view", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const { store } = f.factory;
+  const rendered = markReportArtifacts([
+    reportText("prose", "Visible clipped prefix", "Visible clipped prefix and tail"),
+  ]);
+  store.putArtifact(c.run.id, "report.md", "report", rendered.report);
+  const saveSources = () =>
+    store.putArtifact(c.run.id, "report-sources.json", "report", JSON.stringify(rendered.sources));
+  saveSources();
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const read = async () =>
+        resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+      saveSources();
+      expect((await read()).reports[0]?.text).toContain("Visible clipped prefix");
+      store.putArtifact(c.run.id, "report-sources.json", "report", "{}");
+      expect((await read()).reports[0]?.text).not.toContain("Visible clipped prefix");
+      saveSources();
+      const original = gitCommand.worktreeGit;
+      const inspect = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
+        const result = await original(cmd, opts);
+        store.putArtifact(c.run.id, "report-sources.json", "report", "{}");
+        return result;
+      });
+      try {
+        const page = await read();
+        expect(page).toMatchObject({
+          available: false,
+          reason: "Holdout policy changed; restart limitless_get_change.",
+        });
+      } finally {
+        inspect.mockRestore();
+      }
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("clipped criterion cells match complete sources before the display cut", async () => {
+  const state = privateReportState('"the amber lantern glows ultraviolet"');
+  if (!state.spec) throw new Error("Missing spec");
+  state.spec.acceptance_criteria[0] = {
+    id: "AC-1",
+    criterion: `${"x".repeat(280)} the **amber** lantern glows ultraviolet`,
+    how_to_verify: "Run checks",
+  };
+  await renderedPages(state, (text) => {
+    expect(text).not.toContain("amber** lante");
+    expect(text).not.toContain("lantern glows");
+    expect(text).toContain("[withheld:");
+  });
+});
+
+test.each([
+  "red <em>owl</em>",
+  "red <b>owl</b>",
+  "red <code>owl</code>",
+  'red <span class="x">owl</span>',
+  "red <!--x-->owl",
+  "r\u200bed owl",
+  "red o\u2060wl",
+])("author backstops see through inline wrappers and format characters: %j", async (quotation) => {
+  const state = privateReportState('"red owl"');
+  if (!state.spec) throw new Error("Missing spec");
+  state.spec.assumptions = [quotation, "Returns Array<string> owl"];
+  state.implementerReport = `${quotation}\nUnrelated summary neighbor`;
+  state.lastReview = { modelId: "reviewer", verdict: "approve", summary: quotation, findings: [] };
+  state.terminalReason = quotation;
+  state.rebaseNote = quotation;
+  state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: quotation, publicSummary: "" });
+  await renderedPages(state, (text) => {
+    expect(text).not.toContain(quotation);
+    expect(text).not.toContain("AC-1");
+    expect(text).not.toContain("🚧");
+    expect(text).toContain("Returns Array<string> owl");
+    expect(text).toContain("Unrelated summary neighbor");
+    expect(text).toContain("[withheld:");
+  });
+});
+
+test.each(["fallback", "verbatim"])("implementer matching uses rendered feedback: %s", async (mode) => {
+  const state = privateReportState("Private observation");
+  const scenario = state.holdout?.scenarios[0];
+  const row = state.lastVerify?.criteria[0];
+  if (!scenario || !row || !state.lastVerify) throw new Error("Missing verifier");
+  scenario.description = "All checks passed.";
+  row.publicSummary =
+    mode === "fallback" ? "All checks passed." : "The result contained a distinctive received observation";
+  expect(formatVerifyFeedback(state.lastVerify, state.spec ?? null, state.holdout)).toContain(
+    mode === "fallback" ? "The verifier could not confirm this private scenario." : row.publicSummary,
+  );
+  state.implementerReport =
+    mode === "fallback"
+      ? "Ordinary build status: All checks passed."
+      : `Quoted feedback: ${row.publicSummary}`;
+  await renderedPages(state, (text) => {
+    if (mode === "fallback") expect(text).toContain("Ordinary build status: All checks passed.");
+    else {
+      expect(text).not.toContain("distinctive received observation");
+      expect(text).toContain("[withheld:");
+    }
+  });
+});
+
+test.each([false, true])("public criteria use the spec matcher; private evidence quote=%s", async (quote) => {
+  const phrase = quote ? "A distinctive private verifier observation" : "All checks passed.";
+  const state = privateReportState(phrase);
+  const row = state.lastVerify?.criteria[0];
+  if (!state.spec || !row) throw new Error("Missing fixture rows");
+  row.status = "met";
+  row.publicSummary = "";
+  state.spec.acceptance_criteria[0] = {
+    id: "AC-1",
+    criterion: "All checks passed.",
+    how_to_verify: "Run checks",
+  };
+  state.lastVerify?.criteria.push({
+    id: "AC-1",
+    status: "met",
+    evidence: quote
+      ? `Ran public command successfully. Quoted: ${phrase}`
+      : "Ran public command successfully.",
+    publicSummary: "",
+  });
+  await renderedPages(state, (text) => {
+    if (quote) {
+      expect(text).not.toContain("Ran public command successfully.");
+      expect(text).not.toContain("AC-1");
+    } else expect(text).toContain("| ✅ AC-1 | All checks passed. | Ran public command successfully. |");
+  });
+});
 
 test.each(["implementer", "verifier"] as const)(
   "gap 4 generic evidence follows %s provenance",

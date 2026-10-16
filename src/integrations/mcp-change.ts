@@ -7,8 +7,8 @@ import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
 import { loadPrivateStrings, normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
-import { holdoutBoundaryPattern, privateHoldoutDetails, redactHoldoutText } from "../pipeline/prompts.ts";
-import { reportStructure } from "../pipeline/report-privacy.ts";
+import { holdoutBoundaryPattern, privateHoldoutDetails, privateVerifySummary } from "../pipeline/prompts.ts";
+import { reportSourcesSchema, reportStructure } from "../pipeline/report-privacy.ts";
 import { HoldoutSchema, renderSpec, rowKind, SpecSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registeredCredentials } from "../util/proc.ts";
@@ -69,6 +69,9 @@ function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): 
       if (!run) return null;
       hash.update(JSON.stringify([id, run.prompt, run.state_json]));
       hash.update(
+        JSON.stringify([store.getArtifact(id, "report.md"), store.getArtifact(id, "report-sources.json")]),
+      );
+      hash.update(
         JSON.stringify(
           store.db
             .query("SELECT id FROM invocations WHERE run_id = ? AND role = 'verify' ORDER BY id")
@@ -121,27 +124,46 @@ function withoutHoldoutSection(report: string, redact: HoldoutRedactor) {
 }
 
 /** Apply each author’s backstop only within validated factory structure. */
-function redactReport(report: string, catalogue: Catalogue): string {
+function redactReport(report: string, catalogue: Catalogue, sourcesArtifact: string | null): string {
   const structure = reportStructure(report);
   if (structure === null) return "[withheld: invalid report structure]";
   if (!structure) return withoutHoldoutSection(report, catalogue.redact);
   const { body, spans } = structure;
+  let sources: Record<string, string> = {};
+  try {
+    const parsed = reportSourcesSchema.safeParse(JSON.parse(sourcesArtifact ?? "null"));
+    if (parsed.success && parsed.data.digest === structure.digest) sources = parsed.data.sources;
+  } catch {
+    // Clipped spans fail closed without a valid, matching sources artifact.
+  }
   let filtered = "";
   let cursor = 0;
-  for (const span of spans) {
+  for (const [index, span] of spans.entries()) {
     filtered += catalogue.factoryRedact(body.slice(cursor, span.start));
     const text = body.slice(span.start, span.end);
+    const source = span.clipped ? sources[index] : undefined;
     filtered +=
-      span.kind === "private"
-        ? `[withheld: private verifier rendering; ${text.split("\n").length} lines]`
-        : span.kind === "verifier"
-          ? catalogue.verifierRedact(text, span.source)
-          : span.kind === "implementer"
-            ? catalogue.implementerRedact(text, span.source)
-            : catalogue.factoryRedact(text, span.source);
+      span.clipped && source === undefined
+        ? "[withheld: clipped report span without matching source]"
+        : span.kind === "private"
+          ? `[withheld: private verifier rendering; ${text.split("\n").length} lines]`
+          : span.kind === "verifier"
+            ? catalogue.verifierRedact(text, source)
+            : span.kind === "implementer"
+              ? catalogue.implementerRedact(text, source)
+              : catalogue.factoryRedact(text, source);
     cursor = span.end;
   }
   filtered += catalogue.factoryRedact(body.slice(cursor));
+  // An evidence-cell match withholds its whole acceptance row, including id and criterion.
+  filtered = filtered
+    .split("\n")
+    .map((line) =>
+      line.startsWith("| ") && /\[(?:withheld:|private detail\])/u.test(line)
+        ? "[withheld: report row containing private or unconfirmed text]"
+        : line,
+    )
+    .join("\n");
   return withoutHoldoutSection(filtered, (text) => text);
 }
 
@@ -178,12 +200,20 @@ function markdownProjection(text: string, origins: LineRange[]) {
     decodeHTML(match[0]).normalize("NFKC").toLowerCase(),
   );
   replace(/\\+(?:r\\+n|[nrt])/gu, (match) => (match[0].endsWith("t") ? "\t" : "\n"));
+  replace(/[\p{Cf}\u00ad]/gu, () => "");
   // Report table cells render line breaks as <br>.
   replace(/<br\s*\/?>/giu, () => "\n");
+  replace(/<!--[\s\S]*?-->/gu, () => "");
+  replace(/<\/?(?:em|strong|b|i|u|s|code|span|sub|sup|mark|kbd|a|del|ins|small)\b[^>]*>/giu, () => "");
   replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/gu, (match) => match[1] ?? "");
   replace(/!?\[([^\]]*)\]\([^)]*\)/gu, (match) => match[1] ?? "");
   replace(/^[ \t]*(?:>[ \t]*|(?:[-+*]|\d+[.)])[ \t]+)+/gmu, () => "");
-  replace(/[*_~`|]/gu, () => "");
+  replace(/[*_~]+/gu, (match) => {
+    const before = match.input[match.index - 1] ?? "";
+    const after = match.input[match.index + match[0].length] ?? "";
+    return /[\p{L}\p{N}_]/u.test(before) && /[\p{L}\p{N}_]/u.test(after) ? match[0] : "";
+  });
+  replace(/[`|]/gu, () => "");
   replace(/\s+/gu, (match) => (/[\r\n]/u.test(match[0]) ? "\0" : " "));
   return { text, origins };
 }
@@ -327,14 +357,11 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
             kind !== "unknown" &&
             criterion.status !== "met" &&
             criterion.status !== "blocked" &&
-            !(criterion.status === "unmet" && criterion.requirement === "not_required") &&
-            criterion.publicSummary?.trim()
+            !(criterion.status === "unmet" && criterion.requirement === "not_required")
           ) {
-            receivedSummaries.add(criterion.publicSummary.trim());
-            if (holdout)
-              receivedSummaries.add(
-                redactHoldoutText(criterion.publicSummary.trim(), holdout, publicSources),
-              );
+            receivedSummaries.add(
+              privateVerifySummary(criterion.publicSummary ?? "", holdout, publicSources),
+            );
           }
           collectOutput(
             [criterion.evidence, criterion.publicSummary, criterion.requirementCitation],
@@ -433,12 +460,13 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
     const layers = normalizedLayers(text);
     return !layers || layers.some((layer) => boundary?.test(layer));
   };
-  const matchForm = (detail: string) =>
-    normalizeWhitespace(
-      normalizeMarkdown(
-        normalizedLayers(decodeHTML(detail))?.at(-1) ?? detail.normalize("NFKC").toLowerCase(),
-      ),
-    );
+  let invalidCatalogue = false;
+  const matchForm = (detail: string) => {
+    const layers = normalizedLayers(decodeHTML(detail));
+    const normalized = normalizeWhitespace(normalizeMarkdown(layers?.at(-1) ?? ""));
+    if (!layers || !normalized) invalidCatalogue = true;
+    return normalized;
+  };
   // Any phrase can wrap in a report, even if its catalogue entry is a single line.
   const multilineDetails = [...details];
   const multiline = multilineDetails.length
@@ -466,6 +494,7 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
       )
     : null;
   const holdoutRedact = (value: string): string => {
+    if (invalidCatalogue) return "[withheld: private matching normalization unavailable]";
     if (!pattern && !privateRows.size) return value;
     if (multiline) {
       const matched = redactMultiline(value, multiline);
@@ -495,7 +524,11 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
   };
   return (value, source) => {
     if (source === undefined) return holdoutRedact(value);
+    // Command cells add a closing backtick after the cut; all other clipped displays are prefixes.
+    const prefix = value.startsWith("`") && value.endsWith("`") ? value.slice(0, -1) : value;
+    if (!source.startsWith(prefix)) return "[withheld: invalid clipped source mapping]";
     const original = source.split("\n");
+    if (value.split("\n").length > original.length) return "[withheld: invalid clipped source mapping]";
     const filtered = holdoutRedact(source).split("\n");
     // A normalization failure withholds the entire source rather than individual lines.
     if (original.length !== filtered.length)
@@ -722,7 +755,9 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
             run,
             available: true,
             ...page(
-              privacy(report) === report ? privacy(redactReport(report, catalogue)) : protect(report),
+              privacy(report) === report
+                ? privacy(redactReport(report, catalogue, store.getArtifact(run, "report-sources.json")))
+                : protect(report),
               q.reportOffset,
               REPORT_CAP,
             ),

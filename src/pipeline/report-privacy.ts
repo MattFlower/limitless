@@ -2,12 +2,11 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 const marker = "<!-- limitless-report:";
-const spanSchema = z.object({
+const spanSchema = z.strictObject({
   kind: z.enum(["private", "verifier", "implementer", "prose"]),
   start: z.number().int().nonnegative(),
   end: z.number().int().nonnegative(),
-  /** Complete rendering before clipping, so privacy matching never sees partial syntax. */
-  source: z.string().optional(),
+  clipped: z.boolean().optional(),
 });
 type Span = z.infer<typeof spanSchema>;
 const manifestSchema = z.object({ digest: z.string(), spans: z.array(spanSchema) });
@@ -16,7 +15,7 @@ const digest = (body: string, spans: Span[]) =>
 
 export type ReportPart = string | { kind: Span["kind"]; text: string; source?: string } | ReportPart[];
 
-export function reportText(kind: Span["kind"], text: string, source?: string): ReportPart {
+export function reportText(kind: Span["kind"], text: string, source?: string) {
   return { kind, text, source };
 }
 
@@ -24,31 +23,46 @@ export function reportJoin(parts: ReportPart[], separator: string): ReportPart[]
   return parts.flatMap((part, index) => (index ? [separator, part] : [part]));
 }
 
-/** Keep Markdown unchanged and record the factory's spans in an integrity-checked manifest. */
+export const reportSourcesSchema = z.strictObject({
+  digest: z.string(),
+  sources: z.record(z.string(), z.string()),
+});
+export type ReportArtifacts = { report: string; sources: z.infer<typeof reportSourcesSchema> };
+
 export function markReport(blocks: ReportPart[]): string {
+  return markReportArtifacts(blocks).report;
+}
+
+/** Keep Markdown unchanged; only the separate sources artifact carries complete clipped text. */
+export function markReportArtifacts(blocks: ReportPart[]): ReportArtifacts {
   let body = "";
   const spans: Span[] = [];
+  const sources: Record<string, string> = {};
   const append = (part: ReportPart): void => {
     if (typeof part === "string") body += part;
     else if (Array.isArray(part)) part.forEach(append);
     else {
+      if (part.source !== undefined) sources[spans.length] = part.source;
       spans.push({
         kind: part.kind,
         start: body.length,
         end: body.length + part.text.length,
-        ...(part.source !== undefined ? { source: part.source } : {}),
+        ...(part.source !== undefined ? { clipped: true } : {}),
       });
       body += part.text;
     }
   };
   append(reportJoin(blocks, "\n\n"));
   body += "\n";
-  const manifest = Buffer.from(JSON.stringify({ digest: digest(body, spans), spans })).toString("base64url");
-  return `${body}\n${marker}v3:${manifest} -->\n`;
+  const hash = digest(body, spans);
+  const manifest = Buffer.from(JSON.stringify({ digest: hash, spans })).toString("base64url");
+  return { report: `${body}\n${marker}v3:${manifest} -->\n`, sources: { digest: hash, sources } };
 }
 
 /** null means a damaged marked report; undefined means a legacy, unmarked report. */
-export function reportStructure(report: string): { body: string; spans: Span[] } | null | undefined {
+export function reportStructure(
+  report: string,
+): { body: string; spans: Span[]; digest: string } | null | undefined {
   if (!report.includes(marker)) return undefined;
   const footer = /\n<!-- limitless-report:v3:([A-Za-z0-9_-]+) -->\n$/u.exec(report);
   if (!footer) return null;
@@ -64,7 +78,7 @@ export function reportStructure(report: string): { body: string; spans: Span[] }
       if (span.start < end || span.end < span.start || span.end > body.length) return null;
       end = span.end;
     }
-    return parsed.data.digest === digest(body, spans) ? { body, spans } : null;
+    return parsed.data.digest === digest(body, spans) ? { body, spans, digest: parsed.data.digest } : null;
   } catch {
     return null;
   }

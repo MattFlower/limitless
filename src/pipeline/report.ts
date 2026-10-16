@@ -3,7 +3,13 @@ import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { RunContext, RunState } from "./context.ts";
-import { markReport, type ReportPart, reportJoin, reportText } from "./report-privacy.ts";
+import {
+  markReportArtifacts,
+  type ReportArtifacts,
+  type ReportPart,
+  reportJoin,
+  reportText,
+} from "./report-privacy.ts";
 import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
 
@@ -11,35 +17,43 @@ function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
 }
 
-// Line breaks stay visible as <br> so the change view can still join a wrapped quotation.
-function clipCell(s: string): { text: string; source?: string } {
-  const escaped = s.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
-  return { text: escaped.slice(0, 300), source: escaped.length > 300 ? escaped : undefined };
+/** Every display cut retains the complete rendering for privacy matching. */
+function clipText(text: string, limit: number, atLine = false): { text: string; source?: string } {
+  if (text.length <= limit) return { text };
+  const line = atLine ? text.lastIndexOf("\n", limit) : -1;
+  const displayed = text.slice(0, line > 0 ? line : limit);
+  return { text: atLine ? displayed.trimEnd() : displayed, source: text };
 }
 
+// Line breaks stay visible as <br> so the change view can still join a wrapped quotation.
+function clipCell(s: string): { text: string; source?: string } {
+  return clipText(s.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>"), 300);
+}
+
+// Only private spans may discard a clipped source: the view always withholds them whole.
 function escapeCell(s: string): string {
   return clipCell(s).text;
 }
 
-/** Retain the complete source in the manifest for matching before the display cut. */
-function clipSummary(text: string): { text: string; source?: string } {
-  if (text.length <= 5000) return { text };
-  const line = text.lastIndexOf("\n", 5000);
-  return { text: text.slice(0, line > 0 ? line : 5000).trimEnd(), source: text };
+function cell(kind: "prose" | "verifier", text: string) {
+  const clipped = clipCell(text);
+  return reportText(kind, clipped.text, clipped.source);
 }
 
-type RowSpan = { kind: "private" | "verifier"; source?: string };
-
-function table(header: string[], rows: string[][], rowSpans: (RowSpan | undefined)[] = []): ReportPart {
+function table(
+  header: string[],
+  rows: (string | ReturnType<typeof reportText>)[][],
+  privateRows: boolean[] = [],
+): ReportPart {
   return reportJoin(
     [
       `| ${header.join(" | ")} |`,
       `|${header.map(() => "---").join("|")}|`,
-      ...rows.map((r, i) => {
-        const text = `| ${r.join(" | ")} |`;
-        const span = rowSpans[i];
-        return span ? reportText(span.kind, text, span.source) : text;
-      }),
+      ...rows.map((row, index) =>
+        privateRows[index]
+          ? reportText("private", `| ${row.map((c) => (typeof c === "string" ? c : c.text)).join(" | ")} |`)
+          : ["| ", reportJoin(row, " | "), " |"],
+      ),
     ],
     "\n",
   );
@@ -79,6 +93,10 @@ export interface ReportInput {
 
 /** Markdown evidence report used as the PR body. Each block is one markdown element. */
 export function renderReport(input: ReportInput): string {
+  return renderReportArtifacts(input).report;
+}
+
+export function renderReportArtifacts(input: ReportInput): ReportArtifacts {
   input = redactGateData(input);
   const { state } = input;
   const blocks: ReportPart[] = [
@@ -117,13 +135,13 @@ export function renderReport(input: ReportInput): string {
     );
 
   if (state.implementerReport) {
-    const summary = clipSummary(state.implementerReport.trim());
+    const summary = clipText(state.implementerReport.trim(), 5000, true);
     blocks.push("## Implementer's summary", reportText("implementer", summary.text, summary.source));
   }
 
   if (state.spec) {
     const verify = state.lastVerify;
-    const spans: RowSpan[] = [];
+    const privateRows: boolean[] = [];
     blocks.push(
       "## Acceptance criteria",
       table(
@@ -141,22 +159,17 @@ export function renderReport(input: ReportInput): string {
                 : v.status === "blocked"
                   ? "🚧 blocked"
                   : "❔";
-          const evidence = clipCell(v?.evidence ?? "not verified");
-          const cells = [`${icon} ${ac.id}`, escapeCell(ac.criterion), evidence.text];
-          spans.push(
-            rowKind(ac.id, state.spec ?? null, state.holdout) !== "public"
-              ? { kind: "private" }
-              : {
-                  kind: "verifier",
-                  source:
-                    evidence.source === undefined
-                      ? undefined
-                      : `| ${[...cells.slice(0, -1), evidence.source].join(" | ")} |`,
-                },
-          );
-          return cells;
+          const isPrivate = rowKind(ac.id, state.spec ?? null, state.holdout) !== "public";
+          privateRows.push(isPrivate);
+          return isPrivate
+            ? [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")]
+            : [
+                reportText("prose", `${icon} ${ac.id}`),
+                cell("prose", ac.criterion),
+                cell("verifier", v?.evidence ?? "not verified"),
+              ];
         }),
-        spans,
+        privateRows,
       ),
     );
     if (verify) blocks.push(`Verified by \`${verify.modelId}\` in a separate session from the implementer.`);
@@ -191,7 +204,7 @@ export function renderReport(input: ReportInput): string {
               : (result?.status ?? "unclear"),
           escapeCell(result?.evidence ?? "not verified"),
         ]),
-        results.map(() => ({ kind: "private" })),
+        results.map(() => true),
       ),
     );
     if (state.lastVerify)
@@ -227,7 +240,17 @@ export function renderReport(input: ReportInput): string {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
           const row = [g.name, `${icon} ${g.result.timedOut ? "timed out" : g.verdict.replace("_", " ")}`];
-          return commands ? [...row, `\`${escapeCell(g.result.command)}\``] : row;
+          const command = clipCell(g.result.command);
+          return commands
+            ? [
+                ...row,
+                reportText(
+                  "prose",
+                  `\`${command.text}\``,
+                  command.source === undefined ? undefined : `\`${command.source}\``,
+                ),
+              ]
+            : row;
         }),
       ),
     );
@@ -334,7 +357,7 @@ export function renderReport(input: ReportInput): string {
 
   if (input.closesIssue) blocks.push(`Closes #${input.closesIssue}`);
   blocks.push(`Run \`${input.runId}\` · ${input.runUrl}`, "🤖 Generated by Limitless");
-  return markReport(blocks);
+  return markReportArtifacts(blocks);
 }
 
 /**
@@ -351,8 +374,21 @@ export function buildReport(
   success: boolean,
   verifiedFailure?: ReportInput["verifiedFailure"],
 ): string {
+  return buildReportArtifacts(ctx, success, verifiedFailure).report;
+}
+
+export function saveReport(ctx: RunContext, rendered: ReportArtifacts): void {
+  ctx.store.putArtifact(ctx.run.id, "report-sources.json", "report", JSON.stringify(rendered.sources));
+  ctx.store.putArtifact(ctx.run.id, "report.md", "report", rendered.report);
+}
+
+export function buildReportArtifacts(
+  ctx: RunContext,
+  success: boolean,
+  verifiedFailure?: ReportInput["verifiedFailure"],
+): ReportArtifacts {
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
-  return renderReport({
+  return renderReportArtifacts({
     success,
     signalWarnings: ctx.store.countEvents(ctx.run.id, "signal_attempt"),
     runId: ctx.run.id,
