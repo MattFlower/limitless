@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { Factory } from "../src/app.ts";
+import type { DeployClock } from "../src/cli/deploy-wait.ts";
+import { type LeaseClient, withGateLease } from "../src/cli/gate-slot.ts";
 import { loadConfig } from "../src/config.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { AgentTestSession, type TestWait } from "../src/gates/agent-tests.ts";
 import { agentTestSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -188,6 +191,89 @@ test("gate leases share health occupancy and admin mutation protections", async 
     gateSlots.setLimit(limit);
     await f.close();
   }
+});
+
+test("ordinary busy replies supply redacted current holders to waiting progress", async () => {
+  const f = await fixture("lease-holder-test");
+  const limit = gateSlots.limit;
+  gateSlots.setLimit(1);
+  registerCredential("gate-slot-http-test", "http-holder-secret");
+  const release = await gateSlots.acquire(
+    new AbortController().signal,
+    undefined,
+    "pipeline http-holder-secret",
+  );
+  const next = gateSlots.acquire(new AbortController().signal, undefined, "pipeline next-holder");
+  const time = waitClock();
+  const clock: DeployClock = {
+    now: time.now,
+    sleep: (ms) => new Promise((resolve) => time.timer.set(resolve, ms)),
+    timeout: (fn, ms) => {
+      const id = time.timer.set(fn, ms);
+      return () => time.timer.clear(id);
+    },
+  };
+  const output: string[] = [];
+  const replies: Awaited<ReturnType<LeaseClient>>[] = [];
+  const initial = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  let executions = 0;
+  const route = (createHttpRoutes(f.factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+  const work = withGateLease("deploy", async () => ++executions, {
+    clock,
+    maxWaitMs: 60_000,
+    signal: controller.signal,
+    warn: (s) => output.push(s),
+    client: async (body) => {
+      const response = await route(
+        requestWithParams("http://localhost:7400/api/admin/gate-slot", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        localServer,
+      );
+      expect(response.status).toBe(200);
+      const reply = (await response.json()) as Awaited<ReturnType<LeaseClient>>;
+      replies.push(reply);
+      initial.resolve();
+      return reply;
+    },
+  });
+  try {
+    await initial.promise;
+    await time.flush();
+    expect(replies[0]).toMatchObject({ acquired: false, holder: "pipeline [redacted]" });
+    await time.advance(180_000);
+    expect(executions).toBe(0);
+    expect(replies[1]).toMatchObject({ acquired: false, holder: "pipeline [redacted]" });
+    expect(output).toEqual(["gate-slot: waiting 180s; holder: pipeline [redacted]"]);
+    release();
+    const releaseNext = await next;
+    await time.advance(180_000);
+    expect(executions).toBe(0);
+    expect(replies[2]).toMatchObject({ acquired: false, holder: "pipeline next-holder" });
+    expect(output).toEqual([
+      "gate-slot: waiting 180s; holder: pipeline [redacted]",
+      "gate-slot: waiting 360s; holder: pipeline next-holder",
+    ]);
+    expect(JSON.stringify(replies)).not.toContain("http-holder-secret");
+    releaseNext();
+    await time.flush();
+    await time.advance(250);
+    expect(await work).toBe(1);
+    expect(executions).toBe(1);
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    release();
+    (await next)();
+    await time.advance(250);
+    await work.catch(() => {});
+    gateSlots.setLimit(limit);
+    await f.close();
+  }
+  expect(time.pending).toBe(0);
 });
 
 test("the gate-slot route counts running registrations above the cap and rejects invalid flags", async () => {
