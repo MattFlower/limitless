@@ -94,11 +94,12 @@ export class WorkerStore {
   }
   claim(secret: string) {
     Claim.parse({ secret });
-    registerCredential("LIMITLESS_WORKER_CLAIM_SECRET", secret);
     const w = this.store.db
       .query<WorkerRow, [string]>("SELECT * FROM workers WHERE pairing_secret_hash=?")
       .get(tokenHash(secret));
-    if (!w || w.state === "revoked" || w.pairing_expires_at <= this.now())
+    if (!w) throw new Error("Pairing expired or revoked");
+    registerCredential("LIMITLESS_WORKER_CLAIM_SECRET", secret);
+    if (w.state === "revoked" || w.pairing_expires_at <= this.now())
       throw new Error("Pairing expired or revoked");
     return w.state === "approved" ? { token: this.issued(w) } : { pending: true };
   }

@@ -242,7 +242,10 @@ test("claim secrets isolate pending, approved, revoked and expired pairings acro
   const second = workers.pair("second", "b".repeat(64), server.tls.fingerprint);
   workers.approve(first.code);
   const claim = (secret: string) => call("/worker/pair/claim", { secret });
-  expect((await claim("0".repeat(64))).status).toBe(400);
+  const unknown = randomBytes(32).toString("hex");
+  expect(redactCredentials(unknown)).toBe(unknown);
+  expect((await claim(unknown)).status).toBe(400);
+  expect(redactCredentials(unknown)).toBe(unknown);
   expect((await claim(second.secret)).json()).toEqual({ pending: true });
   const firstToken = (await claim(first.secret)).json();
   await server.stop();
