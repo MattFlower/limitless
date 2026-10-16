@@ -155,6 +155,7 @@ test("eval API shares JSON, Origin and Cloudflare guards and validates before pe
   }
 });
 
+// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
 test("review and verify API reports preserve role grades and text/JSON metrics", async () => {
   const f = await evalFixture();
   try {
@@ -204,7 +205,7 @@ test("review and verify API reports preserve role grades and text/JSON metrics",
   } finally {
     await f.close();
   }
-});
+}, 20_000);
 
 test("POST evals validates targets before scheduling and returns persisted efforts", async () => {
   const { enableEfforts, invalidTargets } = await import("./evals-support.ts");
