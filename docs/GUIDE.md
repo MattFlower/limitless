@@ -227,8 +227,8 @@ macOS Keychain access through `security`, network egress and the loopback API (#
 gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
 
 To pair a macOS worker, run `limitless worker pair --coordinator https://<host>:7443`
-on that machine, then compare its printed code with `limitless workers ls` on the coordinator
-and run `limitless workers approve <code>`. Start it with
+on that machine, then compare all 16 characters of its printed code with `limitless workers ls`
+on the coordinator and run `limitless workers approve <code>` with the complete code. Start it with
 `limitless worker --coordinator https://<host>:7443`; `limitless workers revoke <name>`
 immediately removes its access. `--name <name>` overrides the pairing name. Pair requests expire
 after ten minutes. The coordinator creates and reuses a self-signed certificate under

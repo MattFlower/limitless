@@ -2,7 +2,14 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { redactGateData } from "../gates/output.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registerCredential } from "../util/proc.ts";
-import { type Capabilities, Heartbeat, pairingCode, timing, type WorkerTiming } from "../workers/protocol.ts";
+import {
+  type Capabilities,
+  Claim,
+  Heartbeat,
+  pairingCode,
+  timing,
+  type WorkerTiming,
+} from "../workers/protocol.ts";
 import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -86,6 +93,8 @@ export class WorkerStore {
     return { name: w.name, state: "approved" };
   }
   claim(secret: string) {
+    Claim.parse({ secret });
+    registerCredential("LIMITLESS_WORKER_CLAIM_SECRET", secret);
     const w = this.store.db
       .query<WorkerRow, [string]>("SELECT * FROM workers WHERE pairing_secret_hash=?")
       .get(tokenHash(secret));

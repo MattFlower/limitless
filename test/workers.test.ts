@@ -13,7 +13,7 @@ import { createApiToken } from "../src/server/api-token.ts";
 import { startHttp } from "../src/server/http.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
-import { redactCredentials } from "../src/util/proc.ts";
+import { redactCredentials, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, pairingCode } from "../src/workers/protocol.ts";
 import { certificate, workerRequest } from "../src/workers/tls.ts";
@@ -73,6 +73,23 @@ async function paired(name = "runner") {
   };
   return token;
 }
+test("pairing codes carry 80 digest bits and approval requires all sixteen symbols", () => {
+  // SHA-256 starts fc579917943cf97e15118b1405dc17eb for these inputs;
+  // each symbol encodes the low five bits of a distinct digest byte.
+  expect(pairingCode("a".repeat(64), "c".repeat(64), "d".repeat(64))).toBe("6Z3ZW638XTMWF6ZM");
+  workers.pairingKey = "test-pairing-key";
+  const pending = workers.pair("runner", "c".repeat(64), "a".repeat(64));
+  expect(pending.code).toMatch(/^[A-HJ-NP-Z2-9]{16}$/);
+  expect(workers.worker("runner")?.pairing_code).toBe(pending.code);
+  expect(workers.list()[0]?.code).toBe(pending.code);
+  const last = pending.code.endsWith("A") ? "B" : "A";
+  for (const code of [pending.code.slice(0, 8), pending.code.slice(0, -1) + last]) {
+    expect(() => workers.approve(code)).toThrow("No pending pairing with that code");
+    expect(workers.worker("runner")?.state).toBe("pending");
+  }
+  expect(workers.approve(pending.code)).toEqual({ name: "runner", state: "approved" });
+});
+
 test("pairing grants no access before owner approval; claims require a separate secret and revocation is immediate", async () => {
   await listen();
   const pending = (await call("/worker/pair", { name: "runner", fingerprint: "a".repeat(64) })).json() as {
@@ -243,6 +260,40 @@ test("claim secrets isolate pending, approved, revoked and expired pairings acro
   expect((await claim(second.secret)).json()).toEqual(secondToken);
   now += 600_000;
   expect((await claim(second.secret)).status).toBe(400);
+});
+
+test("a fresh coordinator process registers an incoming claim secret before reconstructing its token", async () => {
+  workers.pairingKey = "test-pairing-key";
+  const pending = workers.pair("runner", "a".repeat(64), "b".repeat(64));
+  workers.approve(pending.code);
+  const expected = workers.claim(pending.secret);
+  const script = `
+    import assert from "node:assert/strict";
+    import { Store } from "./src/db/store.ts";
+    import { WorkerStore } from "./src/db/workers.ts";
+    import { redactCredentials } from "./src/util/proc.ts";
+    const { db, secret, key, expected } = JSON.parse(await Bun.stdin.text());
+    const store = new Store(db);
+    try {
+      const workers = new WorkerStore(store, ${JSON.stringify(releaseSha)});
+      workers.pairingKey = key;
+      assert.equal(redactCredentials(secret), secret);
+      assert.deepEqual(workers.claim(secret), expected);
+      assert.equal(redactCredentials(secret), "[redacted]");
+    } finally {
+      store.close();
+    }
+  `;
+  await sh([process.execPath, "-e", script], {
+    cwd: join(import.meta.dir, ".."),
+    stdin: JSON.stringify({
+      db: cfg.paths.db,
+      secret: pending.secret,
+      key: workers.pairingKey,
+      expected,
+    }),
+    timeoutMs: 10_000,
+  });
 });
 
 test("expired pending requests are hidden and pruned within the pending cap without removing other states", () => {
