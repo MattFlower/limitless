@@ -131,7 +131,9 @@ export async function runWorker(
     registerWorkerToken(token.value);
     const stop = new AbortController(),
       combined = AbortSignal.any([signal, stop.signal]);
-    const jobs = new Map<string, { controller: AbortController; task: Promise<void> }>();
+    const jobs = new Map<string, { controller: AbortController; task: Promise<void>; reported: boolean }>();
+    const heldJobs = () =>
+      [...jobs].filter(([, job]) => job.reported && !job.controller.signal.aborted).map(([id]) => id);
     const call = async (path: string, body?: unknown, requestSignal = combined) => {
       let delay = options.retryMs ?? 1000;
       for (;;) {
@@ -168,7 +170,7 @@ export async function runWorker(
         ramBytes: totalmem(),
         freeSlots: Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
         ...state,
-        jobs: [...jobs.keys()],
+        jobs: heldJobs(),
       };
       const reply = z
         .object({ cancelled: z.array(z.string()) })
@@ -233,6 +235,8 @@ export async function runWorker(
         if (!jobSignal.aborted) await call(`/worker/jobs/${id}/failure`, {}).catch(() => {});
         if (combined.aborted) throw error;
       } finally {
+        const job = jobs.get(id);
+        if (job) job.reported = false;
         if (existsSync(cwd))
           await withRepoLock(cache, () =>
             worktreeGit(["git", "worktree", "remove", "--force", cwd], { cwd: cache }),
@@ -251,7 +255,7 @@ export async function runWorker(
       })();
       void beats.catch((error: unknown) => stop.abort(error));
       while (!combined.aborted) {
-        const leased = Lease.parse((await call("/worker/lease", { jobs: [...jobs.keys()] })).json());
+        const leased = Lease.parse((await call("/worker/lease", { jobs: heldJobs() })).json());
         for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
         if (!leased.job) continue;
         const { id, request } = leased.job,
@@ -259,7 +263,7 @@ export async function runWorker(
         const task = run(id, request, AbortSignal.any([combined, controller.signal])).finally(() =>
           jobs.delete(id),
         );
-        jobs.set(id, { controller, task });
+        jobs.set(id, { controller, task, reported: true });
         void task.catch(() => stop.abort());
       }
     } catch (error) {

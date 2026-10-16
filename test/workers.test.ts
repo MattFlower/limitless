@@ -8,10 +8,25 @@ import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { tokenHash, WorkerStore } from "../src/db/workers.ts";
-import { executeGate, type GateRequest, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
+import {
+  executeGate,
+  type GateRequest,
+  type GateRunner,
+  gateExecutorFor,
+  localExecutor,
+} from "../src/gates/executor.ts";
 import { redactGateData } from "../src/gates/output.ts";
-import { type GateRun, runLocalGates } from "../src/gates/run.ts";
+import {
+  compareGates,
+  type GateRun,
+  retryBaselineFailures,
+  retryRegressions,
+  runLocalGates,
+} from "../src/gates/run.ts";
+import { withRepoLock } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
+import { RunContext } from "../src/pipeline/context.ts";
+import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { createApiToken } from "../src/server/api-token.ts";
 import { startHttp } from "../src/server/http.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
@@ -716,6 +731,161 @@ test("a real worker setup failure completes once without infrastructure retry or
     await worker.stop();
   }
 }, 150_000);
+
+test.each([
+  ["baseline", false],
+  ["baseline", true],
+  ["regression", false],
+  ["regression", true],
+] as const)(
+  "LAN %s retries rebuild setup in their fresh worker checkout (targeted=%s)",
+  async (kind, targeted) => {
+    await listen();
+    const req = await request(true),
+      attempted = join(home, "attempted");
+    req.gates.setup = ["mkdir -p node_modules; touch node_modules/ready"];
+    req.gates.checks = [
+      {
+        name: "check",
+        run: `test -f node_modules/ready || { echo missing-setup; exit 2; }; test -f '${attempted}' || { touch '${attempted}'; echo transient; exit 1; }`,
+      },
+    ];
+    if (targeted) req.gates.retryFiles = `${req.gates.checks[0]?.run}; : {files}`;
+    cfg.workers.repos = [req.repo];
+    cfg.gateExecutor = "lan";
+    const factory = new Factory(cfg, {
+      store,
+      bootSha: releaseSha,
+      models: [],
+      providers: [],
+      gateExecutor: gateExecutorFor("lan", workers, [req.repo]),
+    });
+    const run = store.getRun(req.runId ?? ""),
+      repo = store.getRepoBySlug(req.repo);
+    if (!run || !repo) throw new Error("Missing run or repo");
+    const ctx = new RunContext(factory.deps, run, repo, AbortSignal.timeout(120_000));
+    ctx.state.gatesConfig = req.gates;
+    const worker = await loop();
+    const stage = kind === "baseline" ? "prepare" : "gates";
+    try {
+      const first = await runGateExecution(
+        ctx,
+        stage,
+        kind === "baseline" ? "baseline" : "initial",
+        req.cwd,
+        req.gates,
+      );
+      expect(first.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
+      expect(first.checks[0]?.output).toContain("transient");
+      expect(existsSync(join(req.cwd, "node_modules", "ready"))).toBe(false);
+      if (targeted && first.checks[0]) first.checks[0].failedFiles = ["tracked"];
+      const retry: GateRunner = (gates, options) =>
+        runGateExecution(ctx, stage, `${kind}-retry${options?.targeted ? "-targeted" : ""}`, req.cwd, gates);
+      if (kind === "baseline") {
+        const retried = await retryBaselineFailures(first, req.cwd, req.gates, ctx.signal, undefined, retry);
+        expect(retried.checks[0]).toMatchObject({ ok: true, firstAttempt: { ok: false } });
+      } else {
+        const baseline = {
+          ...first,
+          checks: first.checks.map((check) => ({ ...check, ok: true, exitCode: 0 })),
+        };
+        const retried = await retryRegressions(
+          compareGates(baseline, first),
+          req.cwd,
+          req.gates,
+          [],
+          ctx.signal,
+          undefined,
+          retry,
+        );
+        expect(retried[0]).toMatchObject({ verdict: "flaky", blocking: false, firstAttempt: { ok: false } });
+      }
+      const jobs = workers.jobs("1=1");
+      expect(jobs).toHaveLength(targeted ? 3 : 2);
+      for (const job of jobs) {
+        expect(job).toMatchObject({ state: "done", worker: "loop-runner", attempt: 1 });
+        expect(JSON.parse(job.request).gates.setup).toEqual(req.gates.setup);
+      }
+    } finally {
+      await worker.stop();
+      await factory.stop();
+    }
+  },
+  150_000,
+);
+
+test.each(["done", "cancelled", "failed"] as const)(
+  "worker stops reporting a %s job while repository cleanup is blocked",
+  async (state) => {
+    await listen();
+    const req = await request(true);
+    req.gates.setup = [];
+    req.gates.checks = [{ name: "check", run: "true" }];
+    const locked = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>(),
+      finished = Promise.withResolvers<void>();
+    const reports = new Map(
+      ["/worker/heartbeat", "/worker/lease"].map((path) => [path, Promise.withResolvers<string[]>()]),
+    );
+    let lock: Promise<void> | undefined,
+      terminal = false;
+    const id = workers.enqueue(req);
+    const worker = await loop({
+      confinement: {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          // Hold cleanup at the real cache lock, after bundle import has released it.
+          const cache = join(home, "remote", "repos", `${encodeURIComponent(req.repo)}.git`);
+          lock = withRepoLock(cache, async () => {
+            locked.resolve();
+            await release.promise;
+          });
+          await locked.promise;
+          if (state === "failed") throw new Error("Worker execution failed");
+          if (state === "cancelled") {
+            workers.cancel(id);
+            await new Promise<void>((resolve) =>
+              opts.signal?.addEventListener("abort", () => resolve(), { once: true }),
+            );
+            terminal = true;
+            finished.resolve();
+            opts.signal?.throwIfAborted();
+          }
+        },
+      },
+      async request(...args) {
+        const [_, path, body] = args;
+        if (terminal && reports.has(path)) reports.get(path)?.resolve((body as { jobs: string[] }).jobs);
+        const reply = await workerRequest(...args);
+        if (path.endsWith("/result") || path.endsWith("/failure")) {
+          terminal = true;
+          finished.resolve();
+        }
+        return reply;
+      },
+    });
+    try {
+      await finished.promise;
+      for (const report of reports.values()) expect(await report.promise).not.toContain(id);
+      expect(workers.job(id)?.state).toBe(state === "failed" ? "queued" : state);
+      // The worker must still await cleanup when shutting down.
+      let stopped = false;
+      worker.controller.abort();
+      const stopping = worker.task.then(() => {
+        stopped = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(stopped).toBe(false);
+      release.resolve();
+      await stopping;
+    } finally {
+      release.resolve();
+      await worker.stop();
+      await lock;
+    }
+  },
+  30_000,
+);
 
 test("a worker survives connection failures, 503s and a coordinator restart with its job still running", async () => {
   const server = await listen(),
