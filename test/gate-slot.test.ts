@@ -678,22 +678,24 @@ test.each([false, true])(
     expect(output.join()).toContain("factory gate");
     expect(output.join()).not.toContain("coordination unavailable");
     unavailable = true;
-    await f.time.advance(250);
-    if (stall) {
+    // A single failed or stalled poll must retain the queue position past the deadline.
+    for (let elapsed = 250; elapsed <= GATE_LEASE_EXPIRY_MS; elapsed += 250) {
+      await f.time.advance(250);
       expect(executions).toBe(0);
-      await f.time.advance(1999);
-      expect(executions).toBe(0);
-      await f.time.advance(1);
+      expect(output.join()).not.toContain("coordination unavailable");
     }
+    await f.time.advance(1);
     expect(await work).toBe(1);
     expect(executions).toBe(1);
     expect(output.filter((s) => s.includes("coordination unavailable"))).toHaveLength(1);
+    expect(output.at(-1)).toContain("daemon is unreachable");
+    expect(output.at(-1)).toContain(stall ? "request timed out" : "ECONNREFUSED");
     expect(releases).toEqual([{ id: "lease", release: true }]);
     expect(f.time.pending).toBe(0);
   },
 );
 
-test("a failed waiting poll retries the same lease and starts only after acquisition", async () => {
+test("a failed waiting poll past the deadline retries the same lease until acquisition", async () => {
   for (const timeout of [false, true]) {
     const f = rig();
     const release = await f.slots.acquire(signal, undefined, "pipeline");
@@ -709,13 +711,14 @@ test("a failed waiting poll retries the same lease and starts only after acquisi
       },
       {
         ...f,
+        maxWaitMs: 500,
         clock: { ...f.clock, sleep: (ms) => new Promise((resolve) => f.clock.timeout(resolve, ms)) },
         warn: (s) => warnings.push(s),
         client: (body, signal) => {
           requests.push(body);
           if (body.id && !body.release && ++polls === 1) {
             if (timeout) return new Promise(() => {});
-            throw new Error("ECONNREFUSED");
+            throw new Error("ECONNRESET");
           }
           return f.client(body, signal);
         },
@@ -723,7 +726,7 @@ test("a failed waiting poll retries the same lease and starts only after acquisi
     );
     try {
       await f.time.flush();
-      await f.time.advance(250);
+      await f.time.advance(750);
       if (timeout) await f.time.advance(2000);
       expect(executions).toBe(0);
       expect(warnings).toEqual([]);
@@ -743,7 +746,7 @@ test("a failed waiting poll retries the same lease and starts only after acquisi
   }
 });
 
-test("failed polls fall back only after silence exceeds lease expiry or the wait deadline", async () => {
+test("failed polls after a reply fall back only after silence exceeds lease expiry", async () => {
   for (const maxWaitMs of [500, 60_000]) {
     const f = rig();
     const release = await f.slots.acquire(signal);
@@ -757,11 +760,9 @@ test("failed polls fall back only after silence exceeds lease expiry or the wait
         async () => {
           executions++;
           const elapsed = f.clock.now() - start;
-          if (maxWaitMs === 500) expect(elapsed).toBe(maxWaitMs);
-          else {
-            expect(f.clock.now() - lastReply).toBeGreaterThan(GATE_LEASE_EXPIRY_MS);
-            expect(elapsed).toBeLessThan(maxWaitMs);
-          }
+          expect(f.clock.now() - lastReply).toBeGreaterThan(GATE_LEASE_EXPIRY_MS);
+          if (maxWaitMs === 500) expect(elapsed).toBeGreaterThan(maxWaitMs);
+          else expect(elapsed).toBeLessThan(maxWaitMs);
         },
         {
           ...f,
@@ -777,7 +778,7 @@ test("failed polls fall back only after silence exceeds lease expiry or the wait
       );
       expect(executions).toBe(1);
       expect(warnings).toHaveLength(1);
-      expect(warnings[0]).toContain(maxWaitMs === 500 ? "deadline" : "daemon is unreachable");
+      expect(warnings[0]).toContain("daemon is unreachable");
     } finally {
       release();
     }

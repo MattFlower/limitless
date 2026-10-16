@@ -213,7 +213,10 @@ export async function withGateLease<T>(
             )
           : new Error("gate-slot wait passed the acquisition deadline");
       // Responsive ordinary leases keep polling with bounded requests beyond the wait deadline.
-      const remaining = () => (responsive ? 2000 : deadline - clock.now());
+      const remaining = () =>
+        responsive
+          ? Math.max(1, Math.min(2000, lastReply + GATE_LEASE_EXPIRY_MS - clock.now() + 1))
+          : deadline - clock.now();
       while (!state?.acquired) {
         opts.signal?.throwIfAborted();
         if (!first) {
@@ -238,7 +241,7 @@ export async function withGateLease<T>(
           }
           state = await request(
             id ? { id } : { name, immediate: !!opts.agentTest && maxWait === 0 },
-            maxWait ? Math.max(1, Math.min(2000, remaining())) : 2000,
+            maxWait || responsive ? Math.max(1, Math.min(2000, remaining())) : 2000,
           );
           id = state.busy ? undefined : state.id;
           holder = state.holder ?? holder;
@@ -252,7 +255,6 @@ export async function withGateLease<T>(
             progressAt = clock.now();
           }
         } catch (e) {
-          responsive = false;
           if (e instanceof LeaseRejected || opts.signal?.aborted) throw e;
           failure = e;
           // Agent commands wait through stalls; silence alone cannot justify running unslotted.
@@ -263,7 +265,7 @@ export async function withGateLease<T>(
                 clock.now() - lastReply > GATE_LEASE_EXPIRY_MS
           )
             throw opts.agentTest ? e : new Error(`gate-slot daemon is unreachable: ${e}`);
-          if (clock.now() >= deadline) throw pastDeadline();
+          if (!responsive && clock.now() >= deadline) throw pastDeadline();
         }
         first = false;
         if (state?.expired && maxWait) {
