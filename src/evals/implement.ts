@@ -17,7 +17,7 @@ import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { stageAll, worktreeGit } from "../git/command.ts";
-import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
+import { diffSince, discardChanges, readFileAt, withGitBundle } from "../git/repos.ts";
 import { runConfined } from "../harness/sandbox.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
@@ -221,9 +221,21 @@ export async function gradeImplement(
     checkout = createScratch(cwd);
     const opts = { cwd: checkout, env, signal };
     await worktreeGit(["git", "init", "-q"], opts);
-    await worktreeGit(
-      ["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base],
-      opts,
+    await withGitBundle(cwd, [commit, item.base], signal, (bundle) =>
+      worktreeGit(
+        [
+          "git",
+          "fetch",
+          "-q",
+          "--no-tags",
+          "--no-recurse-submodules",
+          "--no-write-fetch-head",
+          bundle,
+          commit,
+          item.base,
+        ],
+        opts,
+      ),
     );
     await worktreeGit(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit], opts);
     // Audit before gates run: their commands could move HEAD or rewrite the grading repository.

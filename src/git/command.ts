@@ -12,6 +12,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
+import { gitSh } from "./confinement.ts";
 import { harden } from "./hardening.ts";
 
 /** Each pipeline run has its own scope; `false` opts out of the hardened git wrapper. */
@@ -87,10 +88,21 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
 export class WorktreeCleanError extends Error {}
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
-export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1], retryClean = false) {
+export const worktreeGit = (cmd: string[], opts: Parameters<typeof sh>[1], retryClean = false) =>
+  runGit(cmd, opts, retryClean, gitSh);
+
+/** Only factory-owned repositories and remote transports; never a checkout dirty check. */
+export const cacheGit = (cmd: string[], opts: Parameters<typeof sh>[1]) => runGit(cmd, opts, false, sh);
+
+async function runGit(
+  cmd: string[],
+  opts: Parameters<typeof sh>[1],
+  retryClean: boolean,
+  execute: typeof sh,
+) {
   const run = async (cmd: string[], opts: Parameters<typeof sh>[1]) => {
     try {
-      return await sh(cmd, opts);
+      return await execute(cmd, opts);
     } catch (error) {
       if (
         !retryClean ||
@@ -100,14 +112,17 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
       )
         throw error;
       try {
-        return await sh(cmd, opts);
+        return await execute(cmd, opts);
       } catch (retryError) {
         if (!(retryError instanceof CommandError)) throw retryError;
         throw new WorktreeCleanError(retryError.message, { cause: retryError });
       }
     }
   };
-  if (worktreeGitScope.getStore() === false) return run(cmd, opts);
+  if (worktreeGitScope.getStore() === false) {
+    execute = sh;
+    return run(cmd, opts);
+  }
   opts.signal?.throwIfAborted();
   opts = { ...opts, env: trustedEnv(opts.cwd, opts.env ?? (process.env as Record<string, string>)) };
   // Not bound to the first caller's signal: an aborted first call must not fail every later one.
@@ -129,7 +144,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   }
   const prefix = [...cmd.slice(0, command), ...HARDENING];
   // Discover includes, worktree, global, system and environment config with the same options.
-  const { hooks, emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts));
+  const { hooks, emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts, execute), execute);
   prefix.push(...hookFlags(hooks));
   const env = {
     ...(opts.env ?? (process.env as Record<string, string>)),
@@ -144,6 +159,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
         prefix,
         { ...opts, env },
         cmd.slice(command + 1).filter((arg) => !arg.startsWith("-")),
+        execute,
       );
     } catch (error) {
       // Let callers classify failed Git inspection; safety refusals still throw with allowFail.
@@ -154,7 +170,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.
-    const empty = emptyTree ?? (await hashEmptyTree(prefix, { ...opts, env }));
+    const empty = emptyTree ?? (await hashEmptyTree(prefix, { ...opts, env }, execute));
     prefix.push(`--attr-source=${empty}`);
     // Patch text is parsed by the audit, so repository config must not change its format.
     const canonical = ["color.ui=never", "color.diff=never", "diff.submodule=short", NO_BIG_FILES].concat(
@@ -179,11 +195,13 @@ async function refusePopulatedRepositories(
   git: string[],
   opts: Parameters<typeof sh>[1],
   targets: string[],
+  execute: typeof sh,
 ): Promise<void> {
-  const index = await sh([...git, "ls-files", "--stage", "-z"], { ...opts, allowFail: false });
+  const index = await execute([...git, "ls-files", "--stage", "-z"], { ...opts, allowFail: false });
   let entries = index.stdout;
   for (const revision of new Set(["HEAD", ...targets]))
-    entries += (await sh([...git, "ls-tree", "-r", "-z", revision], { ...opts, allowFail: false })).stdout;
+    entries += (await execute([...git, "ls-tree", "-r", "-z", revision], { ...opts, allowFail: false }))
+      .stdout;
   const gitlinks = new Set(
     entries
       .split("\0")
@@ -257,15 +275,20 @@ export async function stageAll(opts: Parameters<typeof sh>[1], forcePaths: strin
 
 /** The empty tree's id in `opts.cwd`'s object format, as `worktreeGit` passes it to `--attr-source`. */
 export async function emptyTreeId(opts: Parameters<typeof sh>[1]): Promise<string> {
-  if (worktreeGitScope.getStore() === false) return hashEmptyTree(["git"], opts);
+  const execute = gitSh;
+  if (worktreeGitScope.getStore() === false) return hashEmptyTree(["git"], opts, sh);
   opts = { ...opts, env: trustedEnv(opts.cwd, opts.env ?? (process.env as Record<string, string>)) };
   const prefix = ["git", ...HARDENING];
-  const { emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts));
+  const { emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts, execute), execute);
   return emptyTree ?? hashEmptyTree(prefix, opts);
 }
 
-async function hashEmptyTree(git: string[], opts: Parameters<typeof sh>[1]): Promise<string> {
-  const empty = await sh([...git, "hash-object", "-t", "tree", "--stdin"], {
+async function hashEmptyTree(
+  git: string[],
+  opts: Parameters<typeof sh>[1],
+  execute = gitSh,
+): Promise<string> {
+  const empty = await execute([...git, "hash-object", "-t", "tree", "--stdin"], {
     ...opts,
     stdin: "",
     allowFail: false,
@@ -282,12 +305,15 @@ export async function emptyHookFlags(git: string[], opts: Parameters<typeof sh>[
   return hookFlags(await hookKeys(git, opts));
 }
 
-async function hookKeys(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
+async function hookKeys(git: string[], opts: Parameters<typeof sh>[1], execute = gitSh): Promise<string[]> {
   // Config lookup cannot run hooks; errors other than "no matching keys" must fail closed.
-  const hooks = await sh([...git, "config", "--null", "--name-only", "--get-regexp", "^(hook|filter)\\."], {
-    ...opts,
-    allowFail: false,
-  }).catch((error: unknown) => {
+  const hooks = await execute(
+    [...git, "config", "--null", "--name-only", "--get-regexp", "^(hook|filter)\\."],
+    {
+      ...opts,
+      allowFail: false,
+    },
+  ).catch((error: unknown) => {
     if (error instanceof CommandError && error.exitCode === 1) return { stdout: "" };
     throw error;
   });
