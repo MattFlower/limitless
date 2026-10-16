@@ -346,7 +346,11 @@ function groundedCitation(
 }
 
 function publicSource(requirement: "request" | "spec", request: string, spec: Spec | null): string {
-  return requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
+  return requirement === "request"
+    ? redactGateOutput(request)
+    : spec
+      ? requirementSource("spec", request, spec)
+      : "";
 }
 
 function gateTable(cmp: GateComparison[]): string {

@@ -103,5 +103,5 @@ export async function shadowReview(
   // A call still running past the settle wait may yet add spend the artifact never sees.
   if (spent.some((i) => i.status === "running")) Object.assign(usage, { partial: true });
   const artifact = { round, system: system?.name, baseSha, reviewedSha, range, ...record, usage };
-  ctx.store.putArtifact(ctx.run.id, name, "review-shadow", JSON.stringify(artifact, null, 2));
+  ctx.artifact(name, "review-shadow", JSON.stringify(artifact, null, 2));
 }

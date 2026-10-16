@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { redactGateOutput } from "../gates/output.ts";
 
 /** JSON Schema acceptable to both Claude (--json-schema) and OpenAI strict structured outputs. */
 export function toStrictJsonSchema(schema: z.ZodType): Record<string, unknown> {
@@ -430,12 +431,12 @@ export function citedRequirement(
 /** The complete entries of a public source a short citation may quote in full; none for the request. */
 export function requirementEntries(requirement: "request" | "spec", spec: Spec | null): string[] {
   return requirement === "spec" && spec
-    ? [...spec.requirements, ...spec.acceptance_criteria.map((ac) => ac.criterion)]
+    ? [...spec.requirements, ...spec.acceptance_criteria.map((ac) => ac.criterion)].map(redactGateOutput)
     : [];
 }
 
 export function requirementSource(requirement: "request" | "spec", request: string, spec: Spec): string {
-  return requirement === "request" ? request : requirementEntries("spec", spec).join("\n");
+  return requirement === "request" ? redactGateOutput(request) : requirementEntries("spec", spec).join("\n");
 }
 
 /** Diagnostics contain no private evidence and can be persisted and shown in feedback. */

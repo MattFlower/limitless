@@ -311,7 +311,28 @@ export class RunContext {
       feedback: null,
       toolCommands: [],
     };
-    this.state = redactGateDiagnostics(this.state);
+    const comparisons = <T extends GateComparison>(checks: T[]): T[] =>
+      checks.map((check) => ({
+        ...check,
+        result: redactGateDiagnostics(check.result),
+        ...(check.firstAttempt ? { firstAttempt: redactGateDiagnostics(check.firstAttempt) } : {}),
+      }));
+    const baseline = this.state.baseline;
+    if (baseline) {
+      baseline.setup = baseline.setup.map(redactGateDiagnostics);
+      baseline.checks = baseline.checks.map(redactGateDiagnostics);
+    }
+    for (const field of ["preRebaseGates", "lastGates"] as const) {
+      const checks = this.state[field];
+      if (checks) this.state[field] = comparisons(checks);
+    }
+    if (this.state.gateEvidence) this.state.gateEvidence.checks = comparisons(this.state.gateEvidence.checks);
+    if (this.state.lastVerifiedEvidence?.lastGates)
+      this.state.lastVerifiedEvidence.lastGates = comparisons(this.state.lastVerifiedEvidence.lastGates);
+    const completed = this.state.completedChecks?.values;
+    if (Array.isArray(completed?.gates)) completed.gates = comparisons(completed.gates);
+    if (this.state.shadowLenses && "error" in this.state.shadowLenses)
+      this.state.shadowLenses.error = redactGateOutput(this.state.shadowLenses.error);
     for (const field of [
       "feedback",
       "terminalReason",
@@ -327,6 +348,14 @@ export class RunContext {
 
   get store(): Store {
     return this.deps.store;
+  }
+
+  /** Artifacts are outward copies; decode JSON so escaped controls are sanitized as text. */
+  artifact(name: string, kind: string, content: string): void {
+    const safe = name.endsWith(".json")
+      ? JSON.stringify(redactGateData(JSON.parse(content)), null, content.includes("\n") ? 2 : undefined)
+      : redactGateOutput(content);
+    this.store.putArtifact(this.run.id, name, kind, safe);
   }
 
   get complexity(): Complexity {

@@ -574,7 +574,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     }
     const baseline = redactGateData(ctx.state.baseline);
     if (baseline) {
-      store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
+      ctx.artifact("baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
       for (const r of [...baseline.setup, ...baseline.checks]) {
         ctx.event({
           runId: ctx.run.id,
@@ -697,12 +697,7 @@ async function triage(ctx: RunContext): Promise<void> {
       complexity: t.complexity,
       resolvedProfile: profile,
     });
-    ctx.store.putArtifact(
-      ctx.run.id,
-      "triage.json",
-      "triage",
-      JSON.stringify({ ...t, model: target.modelId }, null, 2),
-    );
+    ctx.artifact("triage.json", "triage", JSON.stringify({ ...t, model: target.modelId }, null, 2));
     const verifying = ctx.state.flow === "verify-change";
     const questions = !verifying && profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
     if (questions.length) {
@@ -837,7 +832,7 @@ async function spec(ctx: RunContext): Promise<void> {
       await discardChanges(ctx.state.worktreePath as string);
       s = SpecSchema.parse(result.structured);
     }
-    ctx.store.putArtifact(ctx.run.id, "spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
+    ctx.artifact("spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
     const unanswered = s.blocking_questions.filter(Boolean);
     if (unanswered.length && ctx.state.answers.length === 0) {
       for (const q of unanswered) ctx.store.askQuestion(ctx.run.id, q);
@@ -1063,12 +1058,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         )
           ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
         ctx.state.implementerReport = result.finalText;
-        ctx.store.putArtifact(
-          ctx.run.id,
-          `implement-${round}.md`,
-          "report",
-          result.finalText || "(no report)",
-        );
+        ctx.artifact(`implement-${round}.md`, "report", result.finalText || "(no report)");
         ctx.state.implementerIssue =
           result.status === "ok"
             ? null
@@ -1208,12 +1198,7 @@ async function oneRound(
           const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
           if (timeoutOnly && !baseTimeout) {
             const first = after;
-            ctx.store.putArtifact(
-              ctx.run.id,
-              `gates-timeout-${round}.json`,
-              "gates",
-              JSON.stringify(redactGateData(first)),
-            );
+            ctx.artifact(`gates-timeout-${round}.json`, "gates", JSON.stringify(redactGateData(first)));
             ctx.log(
               `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + 1})`,
               "warn",
@@ -1275,12 +1260,7 @@ async function oneRound(
                 })),
               }
             : undefined;
-        ctx.store.putArtifact(
-          ctx.run.id,
-          `gates-${round}.json`,
-          "gates",
-          JSON.stringify(redactGateData(cmp), null, 2),
-        );
+        ctx.artifact(`gates-${round}.json`, "gates", JSON.stringify(redactGateData(cmp), null, 2));
         if (baseTimeout) {
           await ctx.save();
           throw new NeedsHumanError("gate timed out on the base revision too");
@@ -1371,7 +1351,7 @@ async function oneRound(
           data: f,
         });
       }
-      ctx.store.putArtifact(ctx.run.id, "diff.patch", "diff", diff.patch);
+      ctx.artifact("diff.patch", "diff", diff.patch);
       const blocks = findings.filter((f) => f.severity === "block").length;
       return {
         summary: `+${diff.added}/-${diff.removed} in ${diff.files.length} files; ${blocks} blocking, ${findings.length - blocks} warnings`,
@@ -1600,8 +1580,7 @@ async function oneRound(
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();
       // Panel artifacts are numbered by review (R1-R3), single ones by implementation round.
-      ctx.store.putArtifact(
-        ctx.run.id,
+      ctx.artifact(
         scope?.kind === "resolution" ? "review-resolution.json" : `review-${panelReview ?? round}.json`,
         "review",
         JSON.stringify(
@@ -1737,8 +1716,7 @@ async function oneRound(
           ];
           await ctx.save();
           const publicSources = await ctx.publicHoldoutSources();
-          ctx.store.putArtifact(
-            ctx.run.id,
+          ctx.artifact(
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
             preDeliveryVerifyArtifact(
@@ -1767,8 +1745,7 @@ async function oneRound(
       Object.assign(recorded, verify);
       ctx.state.lastVerify = { ...verify, modelId: recorded.modelId };
       await ctx.save();
-      ctx.store.putArtifact(
-        ctx.run.id,
+      ctx.artifact(
         recorded.attempt === 1 ? `verify-${round}-retry.json` : `verify-${round}.json`,
         "verify",
         preDeliveryVerifyArtifact(
@@ -1985,7 +1962,7 @@ async function deliverVerifiedDraft(
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
   const report = buildReport(ctx, false, { sha, stage, reason, base });
-  ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+  ctx.artifact("report.md", "report", report);
   ctx.checkCancelled();
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
   // keep the draft below from finding it.
@@ -2170,7 +2147,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
         ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
-        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, true));
+        ctx.artifact("report.md", "report", buildReport(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `PR ${pr.url} — merged`, value: undefined };
@@ -2186,7 +2163,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.state.verification) {
       await discardChanges(cwd);
       if (!success) {
-        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+        ctx.artifact("report.md", "report", buildReport(ctx, false));
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
@@ -2254,7 +2231,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.state.needsHumanReason = undefined;
-                ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+                ctx.artifact("report.md", "report", buildReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
@@ -2271,7 +2248,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;
-            ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+            ctx.artifact("report.md", "report", buildReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
           });
@@ -2279,7 +2256,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");
         }
-        ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+        ctx.artifact("report.md", "report", report);
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
@@ -2328,17 +2305,11 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
     const publish = () => {
-      ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+      ctx.artifact("report.md", "report", report);
       if (ctx.state.holdout) {
-        ctx.store.putArtifact(
-          ctx.run.id,
-          "holdout-scenarios.json",
-          "holdout",
-          JSON.stringify(ctx.state.holdout, null, 2),
-        );
+        ctx.artifact("holdout-scenarios.json", "holdout", JSON.stringify(ctx.state.holdout, null, 2));
         for (const result of ctx.state.verifyResults ?? [])
-          ctx.store.putArtifact(
-            ctx.run.id,
+          ctx.artifact(
             result.attempt === 1 ? `verify-${result.round}-retry.json` : `verify-${result.round}.json`,
             "verify",
             JSON.stringify({ ...result, modelOutput: undefined }, null, 2),
@@ -2509,8 +2480,7 @@ async function mergeForDelivery(
         );
         ctx.state.lastGates = comparison;
         await ctx.save();
-        ctx.store.putArtifact(
-          ctx.run.id,
+        ctx.artifact(
           `gates-rebase-${ctx.state.round}.json`,
           "gates",
           JSON.stringify(redactGateData(comparison), null, 2),

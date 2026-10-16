@@ -117,7 +117,8 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
         source: "detected" as const,
         protectedPaths: [literal],
       },
-      baselineScripts: { check: literal },
+      baselineScripts: { ok: "true", output: literal },
+      shadowLenses: { error: literal },
       previewConfig: {
         paths: [literal],
         build: literal,
@@ -154,12 +155,13 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
       },
       baseline: { setupOk: true, setup: [result], checks: [{ ...result, firstAttempt: result }] },
       lastGates: [comparison],
+      lastVerifiedEvidence: { lastGates: [comparison] },
       preRebaseGates: [comparison],
       gateEvidence: { stageId: 1, sha: literal, checks: [{ ...comparison, testCommand: literal }] },
       completedChecks: {
         round: 0,
         sha: literal,
-        values: { gates: [comparison], audit: [{ id: literal, detail: literal }] },
+        values: { gates: [comparison], audit: [{ id: literal, detail: literal, ok: true, output: literal }] },
       },
       feedback: literal,
       terminalReason: literal,
@@ -187,12 +189,14 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
       implementerReport: "[redacted]",
       implementerIssue: "[redacted]",
       rebaseNote: "[redacted]",
+      shadowLenses: { error: "[redacted]" },
       baseline: {
         setupOk: true,
         setup: [cleanResult],
         checks: [{ ...cleanResult, firstAttempt: cleanResult }],
       },
       lastGates: [cleanComparison],
+      lastVerifiedEvidence: { lastGates: [cleanComparison] },
       preRebaseGates: [cleanComparison],
       gateEvidence: { ...state.gateEvidence, checks: [{ ...cleanComparison, testCommand: literal }] },
       completedChecks: {
@@ -200,7 +204,28 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
         values: { ...state.completedChecks.values, gates: [cleanComparison] },
       },
     });
+    loaded.state.shadowLenses = [{ name: literal, focus: literal, profiles: ["deep"] }];
+    const confinement = "sandbox_" + "apply: Operation not permitted";
+    registerCredential("reload-confinement-test", confinement);
+    loaded.state.baseline = {
+      setupOk: false,
+      setup: [{ ...result, output: confinement }],
+      checks: [
+        { ...result, output: confinement, confinementError: false },
+        { ...result, output: literal, confinementError: true },
+      ],
+    };
     await loaded.save();
+    const reloaded = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    expect(reloaded.state.shadowLenses).toEqual(loaded.state.shadowLenses);
+    expect(reloaded.state.baseline?.setup[0]).toMatchObject({ output: "[redacted]", confinementError: true });
+    expect(reloaded.state.baseline?.checks.map((r) => r.confinementError)).toEqual([false, true]);
+    loaded.artifact("decoded.json", "test", JSON.stringify({ nested: [literal] }));
+    loaded.artifact("diagnostic.txt", "test", literal);
+    expect(JSON.parse(store.getArtifact(run.id, "decoded.json") ?? "null")).toEqual({
+      nested: ["[redacted]"],
+    });
+    expect(store.getArtifact(run.id, "diagnostic.txt")).toBe("[redacted]");
     expect(store.getRunState<RunState>(run.id)).toEqual(loaded.state);
     loaded.log(literal, "warn", { gate: result });
     expect(store.listEvents(run.id)).toMatchObject([

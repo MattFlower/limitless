@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 
@@ -41,11 +41,17 @@ for (const evidence of [
   "different-sha",
   "prior-round",
   "resume",
+  "resume-redacted",
   "resume-other-sha",
   "resume-retried",
   "resume-failed-stage",
 ] as const) {
   test(`loopback verification uses confined gate evidence: ${evidence}`, async () => {
+    // Fixture gates use this runtime, independently of the agent's slotted command shims.
+    process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
+    const secret = "synthetic-verification-artifact-549";
+    const gateName = evidence === "resume-redacted" ? `\x1b[31m${secret}` : "test";
+    if (evidence === "resume-redacted") registerCredential("verify-artifact-test", secret);
     mkdirSync(join(repoDir, "test"));
     writeFileSync(
       join(repoDir, "test/loopback.test.ts"),
@@ -64,7 +70,7 @@ test("loopback server", () => {
         ? "[gates]\nchecks = []\n"
         : evidence === "unrelated"
           ? `[gates]\nchecks = [{ name = "unrelated", run = "true" }]\n`
-          : `[gates]\nchecks = [{ name = "test", run = "${command}" }]\n`,
+          : `[gates]\nchecks = [{ name = ${JSON.stringify(gateName)}, run = "${command}" }]\n`,
     );
     await sh(["git", "add", "."], { cwd: repoDir });
     await sh(["git", "commit", "-qm", "loopback gate fixture"], { cwd: repoDir });
@@ -188,7 +194,7 @@ test("loopback server", () => {
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     unsubscribe();
-    const succeeds = ["matching", "suite", "resume"].includes(evidence);
+    const succeeds = ["matching", "suite", "resume", "resume-redacted"].includes(evidence);
     expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
@@ -196,12 +202,22 @@ test("loopback server", () => {
       const gate = state?.gateEvidence;
       expect(result?.status).toBe("met");
       expect(gate?.sha).toMatch(/^[a-f0-9]{40}$/);
-      expect(result?.evidence).toContain(`Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`);
+      expect(result?.evidence).toContain(
+        `Factory gate ${gateName} passed at ${gate?.sha} (stage ${gate?.stageId})`,
+      );
       expect(result?.gateEvidence?.stageId).toBe(gate?.stageId);
       expect(f.store.getStage(gate?.stageId ?? -1)?.status).toBe("succeeded");
       expect(f.store.getArtifact(run.id, "verify-0.json")).toContain(
-        `Factory gate test passed at ${gate?.sha} (stage ${gate?.stageId})`,
+        `Factory gate ${evidence === "resume-redacted" ? "[redacted]" : "test"} passed at ${gate?.sha} (stage ${gate?.stageId})`,
       );
+      if (evidence === "resume-redacted") {
+        const artifact = JSON.parse(f.store.getArtifact(run.id, "verify-0.json") ?? "null");
+        expect(artifact.criteria[0].gateEvidence.check).toBe("[redacted]");
+        expect(JSON.stringify(artifact)).not.toContain(secret);
+        expect(JSON.stringify(artifact)).not.toContain("\\u001b");
+        expect(result?.gateEvidence?.check).toBe(gateName);
+        expect(state?.gatesConfig?.checks[0]?.name).toBe(gateName);
+      }
       expect(attempts).toBe(1);
     } else {
       expect(result?.status).toBe("blocked");
@@ -362,5 +378,77 @@ for (const failure of ["throw", "timeout", "quota", "cancelled"] as const) {
     expect(existsSync(join(cwd, "incidental.txt"))).toBe(false);
     expect(new Set(paths).size).toBe(paths.length);
     for (const path of paths) expect(existsSync(path)).toBe(false);
+  });
+}
+
+for (const grounded of [true, false]) {
+  test(`resumed verifier grounds citations in its sanitized public source: ${grounded}`, async () => {
+    const secret = "synthetic-citation-source-549";
+    registerCredential("citation-source-test", secret);
+    const requirement = `Run ${secret} before delivery`;
+    const citation = grounded
+      ? "Run [redacted] before delivery"
+      : "Run an unstated operation before delivery";
+    const implementationPrompts: string[] = [];
+    const verificationPrompts: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verificationPrompts.push(s.prompt);
+        return {
+          structured:
+            verificationPrompts.length > 1
+              ? pass
+              : {
+                  ...pass,
+                  overall: "fail",
+                  criteria: pass.criteria.map((c) =>
+                    c.id === "H-1"
+                      ? {
+                          ...c,
+                          status: "unmet",
+                          requirement: "spec",
+                          requirementCitation: citation,
+                          evidence: `The requirement "${citation}" was not satisfied.`,
+                          publicSummary: "The required operation did not run.",
+                        }
+                      : c,
+                  ),
+                },
+        };
+      }
+      implementationPrompts.push(s.prompt);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    f.deps.faults = { "stage:verify:before": { action: "kill", occurrence: 1 } };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+    const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+    expect(await execute()).toBe("running");
+    const stored = f.store.getRunState<RunState>(run.id);
+    if (!stored?.spec) throw new Error("missing saved specification");
+    stored.spec.requirements = [requirement];
+    f.store.setRunState(run.id, stored);
+    f.deps.faults = undefined;
+    expect(await execute()).toBe("succeeded");
+    expect(verificationPrompts[0]).toContain("Run [redacted] before delivery");
+    expect(verificationPrompts[0]).not.toContain(secret);
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.spec?.requirements).toEqual([requirement]);
+    const notes = state?.verifyResults?.[0]?.notes;
+    const feedback = implementationPrompts[1] ?? "";
+    if (grounded) {
+      expect(notes).not.toContain("citation validation failed");
+      expect(feedback).toContain('this requirement of the specification: "Run [redacted] before delivery"');
+      expect(feedback).not.toContain("citation was not found");
+    } else {
+      expect(notes).toContain("citation is not a stated public requirement");
+      expect(feedback).toContain("citation was not found");
+      expect(feedback).not.toContain(citation);
+    }
   });
 }
