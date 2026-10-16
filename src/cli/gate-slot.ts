@@ -268,9 +268,9 @@ export async function withGateLease<T>(
           if (!responsive && clock.now() >= deadline) throw pastDeadline();
         }
         first = false;
-        if (state?.expired && maxWait) {
-          if (opts.agentTest) throw new LeaseRejected("agent-test lease expired while waiting");
-          throw new Error("gate-slot lease expired");
+        if (state?.expired) {
+          if (!opts.agentTest) id = undefined;
+          else if (maxWait) throw new LeaseRejected("agent-test lease expired while waiting");
         }
       }
       if (opts.agentTest && !reused && maxWait && clock.now() >= deadline) throw pastDeadline();

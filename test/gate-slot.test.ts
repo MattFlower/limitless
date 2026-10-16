@@ -628,6 +628,65 @@ test("responsive contention waits beyond positive, zero and default budgets with
   );
 });
 
+test.each([60_000, 0])("expired ordinary reservations are replaced (maxWaitMs=%s)", async (maxWaitMs) => {
+  const f = rig();
+  const requests: Record<string, unknown>[] = [];
+  const output: string[] = [];
+  let registrations = 0,
+    executions = 0,
+    acquired = false;
+  const work = withGateLease("deploy", async () => ++executions, {
+    maxWaitMs,
+    clock: { ...f.clock, sleep: (ms) => new Promise((resolve) => f.clock.timeout(resolve, ms)) },
+    warn: (s) => output.push(s),
+    client: async (body) => {
+      requests.push(body);
+      if (body.name) return { id: ++registrations === 1 ? "q" : "replacement", acquired: false };
+      if (body.id === "q") return { id: "q", acquired: false, expired: true };
+      return { id: "replacement", acquired };
+    },
+  });
+  await f.time.flush();
+  await f.time.advance(250);
+  expect(executions).toBe(0);
+  await f.time.advance(250);
+  expect(requests).toEqual([
+    { name: "deploy", immediate: false },
+    { id: "q" },
+    { name: "deploy", immediate: false },
+  ]);
+  await f.time.advance(179_500);
+  expect(executions).toBe(0);
+  expect(output).toEqual(["gate-slot: waiting 180s; holder: unknown holder"]);
+  await f.time.advance(180_000);
+  expect(executions).toBe(0);
+  expect(output).toEqual([
+    "gate-slot: waiting 180s; holder: unknown holder",
+    "gate-slot: waiting 360s; holder: unknown holder",
+  ]);
+  acquired = true;
+  await f.time.advance(250);
+  expect(await work).toBe(1);
+  expect(executions).toBe(1);
+  expect(requests.slice(3, -1)).toEqual(Array(3).fill({ id: "replacement" }));
+  expect(requests.at(-1)).toEqual({ id: "replacement", release: true });
+  expect(f.time.pending).toBe(0);
+});
+
+test("an expired queued agent reservation rejects without running work", async () => {
+  const f = rig();
+  let executions = 0;
+  const work = withGateLease("bun test", async () => ++executions, {
+    ...f,
+    maxWaitMs: 60_000,
+    agentTest: { lane: "gate", onLease: () => {} },
+    client: async (body) => ({ id: "q", acquired: false, expired: body.id === "q" }),
+  });
+  await expect(work).rejects.toBeInstanceOf(LeaseRejected);
+  expect(executions).toBe(0);
+  expect(f.time.pending).toBe(0);
+});
+
 test("late acquisition responses are retired after bounded fallback", async () => {
   const f = rig();
   const late = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>();
