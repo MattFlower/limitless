@@ -1,16 +1,21 @@
 import { expect } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
+import type { GateConfig } from "../src/gates/detect.ts";
+import type { GateRunner } from "../src/gates/executor.ts";
 import { extractFailures } from "../src/gates/failures.ts";
 import {
   compareGates,
   type GateComparison,
+  type GateResult,
   type GateRun,
   retryBaselineFailures,
   retryRegressions,
   runGates,
+  UNSLOTTED_RETRY_MAX_SECONDS,
 } from "../src/gates/run.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -467,3 +472,233 @@ for (const consumer of ["feedback", "review"]) {
     if (consumer === "feedback") expect(message.length).toBeLessThan(3_300);
   });
 }
+
+test.each([
+  { targeted: "fail", fullOk: false },
+  { targeted: "fail", fullOk: true },
+  { targeted: "pass", fullOk: false },
+  { targeted: "pass", fullOk: true },
+  { targeted: "timeout", fullOk: true },
+  { targeted: "confinement", fullOk: true },
+])("regression retry: targeted $targeted / full ok $fullOk", async ({ targeted, fullOk }) => {
+  const f = retryFixture();
+  try {
+    const { runner, calls } = recordingRetry(targeted, fullOk);
+    const [comparison] = await retryRegressions(
+      [{ name: "test", verdict: "regressed", blocking: true, result: f.original }],
+      f.cwd,
+      f.cfg,
+      [],
+      new AbortController().signal,
+      undefined,
+      runner,
+    );
+    const fullRuns = targeted === "pass" || targeted === "timeout";
+    expect(calls).toEqual(
+      fullRuns
+        ? ["bun test --isolate './test/a.test.ts' './test/b.test.ts'", "full-test"]
+        : ["bun test --isolate './test/a.test.ts' './test/b.test.ts'"],
+    );
+    expect(comparison?.firstAttempt).toBe(f.original);
+    expect(comparison?.result.firstAttempt).toBe(f.original);
+    expect(comparison?.firstAttempt?.ok).toBe(false);
+    expect(comparison?.result.targetedRetry?.command).toBe(calls[0]);
+    expect(comparison?.result.command).toBe(fullRuns ? "full-test" : f.original.command);
+    if (targeted === "fail") {
+      expect(formatGateFeedback(comparison ? [comparison] : [])).toContain("unreported.test.ts: load error");
+      expect(comparison?.result.output).toBe(f.original.output);
+    }
+    expect(comparison?.verdict).toBe(
+      targeted === "confinement" ? "confinement_error" : fullRuns && fullOk ? "flaky" : "regressed",
+    );
+    expect(comparison?.blocking).toBe(!(fullRuns && fullOk));
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  { targeted: "fail", fullOk: false },
+  { targeted: "pass", fullOk: true },
+  { targeted: "pass", fullOk: false },
+  { targeted: "timeout", fullOk: true },
+  { targeted: "confinement", fullOk: true },
+])("baseline retry: targeted $targeted / full ok $fullOk", async ({ targeted, fullOk }) => {
+  const f = retryFixture();
+  try {
+    const { runner, calls } = recordingRetry(targeted, fullOk);
+    const result = await retryBaselineFailures(
+      { setupOk: true, setup: [], checks: [f.original] },
+      f.cwd,
+      f.cfg,
+      new AbortController().signal,
+      undefined,
+      runner,
+    );
+    const fullRuns = targeted === "pass" || targeted === "timeout";
+    expect(calls).toEqual(
+      fullRuns
+        ? ["bun test --isolate './test/a.test.ts' './test/b.test.ts'", "full-test"]
+        : ["bun test --isolate './test/a.test.ts' './test/b.test.ts'"],
+    );
+    expect(result.checks[0]?.ok).toBe(fullRuns && fullOk);
+    expect(result.checks[0]?.firstAttempt).toBe(f.original);
+    expect(result.checks[0]?.targetedRetry?.command).toBe(calls[0]);
+  } finally {
+    f.close();
+  }
+});
+
+test("known files without retry_files still use the full retry", async () => {
+  const f = retryFixture();
+  try {
+    const { runner, calls } = recordingRetry("pass", true);
+    await retryRegressions(
+      [{ name: "test", verdict: "regressed", blocking: true, result: f.original }],
+      f.cwd,
+      { ...f.cfg, retryFiles: undefined },
+      [],
+      new AbortController().signal,
+      undefined,
+      runner,
+    );
+    expect(calls).toEqual(["full-test"]);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  { timeoutSec: 37, knownTimes: true, skipGateSlot: true, expected: 37 },
+  { timeoutSec: undefined, knownTimes: true, skipGateSlot: true, expected: 120 },
+  { timeoutSec: 1800, knownTimes: false, skipGateSlot: false, expected: 1800 },
+])("targeted timeout policy: %j", async ({ timeoutSec, knownTimes, skipGateSlot, expected }) => {
+  const f = retryFixture();
+  try {
+    if (!knownTimes) f.original.failedFileTimes = undefined;
+    const calls: number[] = [];
+    await retryBaselineFailures(
+      { setupOk: true, setup: [], checks: [f.original] },
+      f.cwd,
+      { ...f.cfg, checks: [{ name: "test", run: "full-test", timeoutSec }] },
+      new AbortController().signal,
+      undefined,
+      async (cfg, options) => {
+        expect(options).toEqual({ targeted: true, skipGateSlot });
+        const check = cfg.checks[0];
+        if (!check?.timeoutSec) throw new Error("missing retry timeout");
+        calls.push(check.timeoutSec);
+        return { setupOk: true, setup: [], checks: [{ ...f.original, command: check.run }] };
+      },
+    );
+    expect(calls).toEqual([expected]);
+  } finally {
+    f.close();
+  }
+});
+
+test("file substitution shell-quotes apostrophes and literal replacement syntax", async () => {
+  const f = retryFixture();
+  try {
+    const file = "test/space ' $&.test.ts";
+    writeFileSync(join(f.cwd, file), "");
+    f.original.failedFiles = [file];
+    f.original.failedFileTimes = { [file]: 1 };
+    const { runner, calls } = recordingRetry("fail", false);
+    await retryBaselineFailures(
+      { setupOk: true, setup: [], checks: [f.original] },
+      f.cwd,
+      f.cfg,
+      new AbortController().signal,
+      undefined,
+      runner,
+    );
+    expect(calls).toEqual(["bun test --isolate './test/space '\\'' $&.test.ts'"]);
+  } finally {
+    f.close();
+  }
+});
+
+function retryFixture() {
+  const cwd = mkdtempSync(join(tmpdir(), "gate-feedback-retry-"));
+  mkdirSync(join(cwd, "test"));
+  for (const file of ["a.test.ts", "b.test.ts"]) writeFileSync(join(cwd, "test", file), "");
+  const cfg: GateConfig = {
+    setup: [],
+    checks: [{ name: "test", run: "full-test", timeoutSec: 1800 }],
+    source: "none",
+    protectedPaths: [],
+    retryFiles: "bun test --isolate {files}",
+  };
+  const original: GateResult = {
+    name: "test",
+    command: "full-test",
+    ok: false,
+    exitCode: 1,
+    output: "unreported.test.ts: load error\noriginal failure",
+    durationMs: 10,
+    failedFiles: ["test/a.test.ts", "test/b.test.ts"],
+    failedFileTimes: { "test/a.test.ts": 1, "test/b.test.ts": 2 },
+  };
+  return { cwd, cfg, original, close: () => rmSync(cwd, { recursive: true, force: true }) };
+}
+
+function recordingRetry(targeted: string, fullOk: boolean) {
+  const calls: string[] = [];
+  const runner: GateRunner = async (cfg, options) => {
+    expect(cfg.setup).toEqual([]);
+    const check = cfg.checks[0];
+    if (!check) throw new Error("Missing retry check");
+    calls.push(check.run);
+    const isTarget = options?.targeted;
+    expect(options?.skipGateSlot).toBe(!!isTarget);
+    expect(check.timeoutSec).toBe(isTarget ? 2 * UNSLOTTED_RETRY_MAX_SECONDS : 1800);
+    const ok = isTarget ? targeted === "pass" : fullOk;
+    return {
+      setupOk: true,
+      setup: [],
+      checks: [
+        {
+          name: check.name,
+          command: check.run,
+          ok,
+          exitCode: ok ? 0 : 1,
+          output: "retry",
+          durationMs: 1,
+          ...(isTarget && targeted === "timeout" ? { timedOut: true } : {}),
+          ...(isTarget && targeted === "confinement" ? { confinementError: true } : {}),
+        },
+      ],
+    };
+  };
+  return { runner, calls };
+}
+
+test("structured failure filenames and timing keys are redacted at gate callbacks", async () => {
+  const f = retryFixture();
+  const secret = "synthetic-junit-file-credential-480";
+  registerCredential("JUNIT_FILE_TOKEN", secret);
+  try {
+    const file = `test/${secret}.test.ts`;
+    writeFileSync(join(f.cwd, file), "");
+    writeFileSync(join(f.cwd, "report.xml"), `<testsuite file="${file}" failures="1" time="2"/>`);
+    const observed: string[] = [];
+    const result = await confinementScope.run(fakeConfinement, () =>
+      runGates(
+        f.cwd,
+        {
+          ...f.cfg,
+          checks: [{ name: "test", run: 'cp report.xml "$LIMITLESS_GATE_REPORT"; exit 1' }],
+        },
+        new AbortController().signal,
+        { onResult: (r) => observed.push(JSON.stringify(r)) },
+      ),
+    );
+    expect(result.checks[0]?.failedFiles).toEqual([file]);
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toContain("[redacted].test.ts");
+    expect(observed[0]).not.toContain(secret);
+  } finally {
+    f.close();
+  }
+});
