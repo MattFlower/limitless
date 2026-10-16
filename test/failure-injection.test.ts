@@ -1665,7 +1665,11 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     f.scheduler.start();
   `,
   );
-  const child = Bun.spawn([process.execPath, worker], { stdout: "ignore", stderr: "pipe" });
+  // Bun's test preload is not inherited by the daemon subprocess.
+  const child = Bun.spawn(
+    [process.execPath, `--preload=${join(import.meta.dir, "git-preload.ts")}`, worker],
+    { stdout: "ignore", stderr: "pipe" },
+  );
   let gatePid: number | undefined;
   const groupSignals: number[] = [];
   const kill = process.kill.bind(process);
