@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { redactGateData } from "../gates/output.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registerCredential } from "../util/proc.ts";
-import { type Capabilities, Heartbeat, timing, type WorkerTiming } from "../workers/protocol.ts";
+import { type Capabilities, Heartbeat, pairingCode, timing, type WorkerTiming } from "../workers/protocol.ts";
 import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -36,29 +36,34 @@ export class WorkerStore {
       loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]"),
     );
   }
-  pair(name: string, fingerprint: string) {
-    const now = this.now();
-    const existing = this.worker(name);
-    if (
-      existing &&
-      (existing.state === "approved" || (existing.state === "pending" && existing.pairing_expires_at > now))
-    )
-      throw new Error("Worker name already paired or pending");
-    const count =
-      this.store.db
-        .query<{ n: number }, [number]>(
-          "SELECT count(*) n FROM workers WHERE state='pending' AND pairing_expires_at>?",
-        )
-        .get(now)?.n ?? 0;
-    if (count >= 100) throw new PairingLimitError("Too many pending requests");
-    const secret = randomBytes(32).toString("hex"),
-      code = [...randomBytes(8)].map((b) => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[b % 32]).join("");
-    this.store.db
-      .query(
-        "INSERT OR REPLACE INTO workers (name,fingerprint,state,pairing_code,pairing_secret_hash,pairing_expires_at,created_at) VALUES (?,?,'pending',?,?,?,?)",
+  pair(name: string, fingerprint: string, coordinator: string) {
+    return this.store.db.transaction(() => {
+      const now = this.now();
+      this.store.db.query("DELETE FROM workers WHERE state='pending' AND pairing_expires_at<=?").run(now);
+      const existing = this.worker(name);
+      if (
+        existing &&
+        (existing.state === "approved" || (existing.state === "pending" && existing.pairing_expires_at > now))
       )
-      .run(name, fingerprint, code, tokenHash(secret), now + 600_000, now);
-    return { code, secret, expiresAt: now + 600_000 };
+        throw new Error("Worker name already paired or pending");
+      const count =
+        this.store.db
+          .query<{ n: number }, [number]>(
+            "SELECT count(*) n FROM workers WHERE state='pending' AND pairing_expires_at>?",
+          )
+          .get(now)?.n ?? 0;
+      if (count >= 100) throw new PairingLimitError("Too many pending requests");
+      const secret = randomBytes(32).toString("hex"),
+        nonce = randomBytes(32).toString("hex"),
+        code = pairingCode(coordinator, fingerprint, nonce);
+      registerCredential("LIMITLESS_WORKER_CLAIM_SECRET", secret);
+      this.store.db
+        .query(
+          "INSERT OR REPLACE INTO workers (name,fingerprint,state,pairing_code,pairing_secret_hash,pairing_expires_at,created_at) VALUES (?,?,'pending',?,?,?,?)",
+        )
+        .run(name, fingerprint, code, tokenHash(secret), now + 600_000, now);
+      return { code, secret, nonce, expiresAt: now + 600_000 };
+    })();
   }
   // Reconstruct an issued token after a restart without persisting its plaintext.
   private issued(w: WorkerRow) {
@@ -117,8 +122,10 @@ export class WorkerStore {
   }
   list() {
     return this.store.db
-      .query<WorkerRow, []>("SELECT * FROM workers ORDER BY name")
-      .all()
+      .query<WorkerRow, [number]>(
+        "SELECT * FROM workers WHERE state!='pending' OR pairing_expires_at>? ORDER BY name",
+      )
+      .all(this.now())
       .map((w) => {
         const c: Capabilities | null = w.capabilities ? JSON.parse(w.capabilities) : null;
         return this.sanitize({

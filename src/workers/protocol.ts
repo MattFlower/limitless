@@ -1,4 +1,12 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
+
+export function pairingCode(coordinator: string, worker: string, nonce: string): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(["limitless-worker-pair-v1", coordinator, worker, nonce]))
+    .digest();
+  return [...digest.subarray(0, 8)].map((b) => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[b % 32]).join("");
+}
 
 export const Heartbeat = z
   .object({

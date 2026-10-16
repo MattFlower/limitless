@@ -30,7 +30,7 @@ export async function startWorkerListener(
         limits.set(ip, limit);
         if (++limit.count >= 5) return json({ error: "Pairing rate limit exceeded" }, 429);
         const p = Pair.parse(await req.json());
-        const pending = workers.pair(p.name, p.fingerprint);
+        const pending = workers.pair(p.name, p.fingerprint, tls.fingerprint);
         log(`Worker pairing code: ${pending.code}`);
         return json(pending);
       }

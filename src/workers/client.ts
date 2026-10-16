@@ -5,8 +5,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import { gateSlots } from "../gates/slots.ts";
-import { agentEnv, sh } from "../util/proc.ts";
-import { type Capabilities, timing } from "./protocol.ts";
+import { protectPrivateFile } from "../util/private-reads.ts";
+import { agentEnv, registerCredential, sh } from "../util/proc.ts";
+import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
 
 export async function pairWorker(
@@ -28,9 +29,14 @@ export async function pairWorker(
     );
     if (first.status !== 200) throw new Error(`Pairing refused (${first.status})`);
     const pending = z
-      .object({ code: z.string(), secret: z.string(), expiresAt: z.number() })
+      .object({
+        nonce: z.string().regex(/^[a-f0-9]{64}$/),
+        secret: z.string().regex(/^[a-f0-9]{64}$/),
+        expiresAt: z.number(),
+      })
       .parse(first.json());
-    print(`Worker pairing code: ${pending.code}`);
+    registerCredential("LIMITLESS_WORKER_CLAIM_SECRET", pending.secret);
+    print(`Worker pairing code: ${pairingCode(first.fingerprint, cert.fingerprint, pending.nonce)}`);
     while (Date.now() < pending.expiresAt) {
       const reply = await workerRequest(
         coordinator,
@@ -84,10 +90,13 @@ export async function runWorker(
     throw new Error("Workers require macOS Seatbelt");
   const home = join(cfg.paths.home, "worker");
   mkdirSync(home, { recursive: true });
-  const token = privateFile(join(home, "token")),
-    pin = privateFile(join(home, "coordinator-fingerprint"));
-  registerWorkerToken(token.value);
+  const held = [protectPrivateFile(join(home, "key.pem"))];
   try {
+    const token = privateFile(join(home, "token"));
+    held.push(token.release);
+    const pin = privateFile(join(home, "coordinator-fingerprint"));
+    held.push(pin.release);
+    registerWorkerToken(token.value);
     const call = async (body: Capabilities) => {
       let delay = options.retryMs ?? 1000;
       for (;;) {
@@ -126,7 +135,6 @@ export async function runWorker(
   } catch (error) {
     if (!signal.aborted) throw error;
   } finally {
-    token.release();
-    pin.release();
+    for (const release of held) release();
   }
 }

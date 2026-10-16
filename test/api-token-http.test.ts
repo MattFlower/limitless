@@ -716,6 +716,13 @@ test("startup protects a not-yet-published token before resuming queued land che
   startup.factory.cfg.port = 0;
   startup.factory.cfg.githubPoll = false;
   const path = join(startup.factory.cfg.paths.home, "api-token");
+  const workerPaths = [
+    "worker-tls/key.pem",
+    "worker/token",
+    "worker/key.pem",
+    "worker/coordinator-fingerprint",
+  ].map((p) => join(startup.factory.cfg.paths.home, p));
+  expect(startup.factory.cfg.workers.listen).toBeUndefined();
   const scratch = join(startup.home, "scratch", SCRATCH_NAME);
   mkdirSync(scratch, { recursive: true });
   startup.factory.store.createLandEntry({
@@ -731,11 +738,13 @@ test("startup protects a not-yet-published token before resuming queued land che
     expect(startup.factory.land.list()[0]?.state).toBe("queued");
     expect(privateReadPaths()).toContain(path);
     expect(privateReadPaths()).toContain(`${path}.origin`);
+    for (const p of workerPaths) expect(privateReadPaths()).toContain(p);
     observations.push(seatbeltProfile(writeRoots(startup.repo, scratch)));
     expect(() => readFileSync(path)).toThrow();
   });
   const start = spyOn(startup.factory, "start").mockImplementation(() => {
     expect(privateReadPaths()).toContain(path);
+    for (const p of workerPaths) expect(privateReadPaths()).toContain(p);
     expect(readFileSync(path, "utf8")).toMatch(/^[a-f0-9]{64}$/);
     expect(statSync(`${path}.origin`).mode & 0o777).toBe(0o600);
   });
@@ -760,6 +769,7 @@ test("startup protects a not-yet-published token before resuming queued land che
   }
   expect(privateReadPaths()).not.toContain(path);
   expect(privateReadPaths()).not.toContain(`${path}.origin`);
+  for (const p of workerPaths) expect(privateReadPaths()).not.toContain(p);
 });
 
 test("with enforcement on, the daemon accepts a live agent-test capability for gate-slot only", async () => {
