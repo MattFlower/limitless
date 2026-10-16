@@ -2,7 +2,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { GateConfig } from "./detect.ts";
 import { redactGateData } from "./output.ts";
-import { type GateHooks, type GateResult, type GateRun, runLocalGates } from "./run.ts";
+import {
+  type GateHooks,
+  type GateResult,
+  type GateRetryOptions,
+  type GateRun,
+  runLocalGates,
+} from "./run.ts";
 
 export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
@@ -30,9 +36,10 @@ export interface GateRequest {
   headSha: string;
   gates: GateConfig;
   checks?: string[];
+  skipGateSlot?: boolean;
 }
 export type GateExecutor = Executor<GateRequest, GateRun>;
-export type GateRunner = (gates: GateConfig) => Promise<GateRun>;
+export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
 
 const liveExecutions = new WeakMap<GateExecutor, Map<string, Execution<GateRun>>>();
 
@@ -109,6 +116,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
         {
           onWait: slotHooks.onWait,
           holder: slotHooks.holder,
+          skipGateSlot: req.skipGateSlot,
           onResult(r, phase) {
             results.push({ type: "check", phase, result: r });
             notify();
