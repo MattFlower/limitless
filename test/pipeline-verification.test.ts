@@ -55,7 +55,10 @@ for (const evidence of [
     mkdirSync(join(repoDir, "test"));
     writeFileSync(
       join(repoDir, "test/loopback.test.ts"),
-      `import { expect, test } from "bun:test";
+      // The redaction case checks artifacts, so its gate must also pass where listening is denied.
+      evidence === "resume-redacted"
+        ? `import { expect, test } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n`
+        : `import { expect, test } from "bun:test";
 test("loopback server", () => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });
   try { expect(server.port).toBeGreaterThan(0); } finally { server.stop(true); }

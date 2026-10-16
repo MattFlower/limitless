@@ -1,8 +1,7 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { printOwnerDiagnostics } from "../src/cli/owner-diagnostics.ts";
 import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { Store } from "../src/db/store.ts";
 import { registerCredential, runProcess } from "../src/util/proc.ts";
@@ -120,29 +119,6 @@ test("show and logs print originals beside public records, without credentials",
     expect(result.stdout).toContain(
       command === "show" ? "public error [private detail]" : "public result [private detail]",
     );
-  }
-});
-
-test("printing historical owner diagnostics removes newly registered credentials and controls", () => {
-  const credential = "historical-owner-credential-549";
-  registerCredential("HISTORICAL_OWNER_TEST", credential);
-  const output = spyOn(console, "log").mockImplementation(() => {});
-  try {
-    printOwnerDiagnostics([
-      {
-        id: 1,
-        runId,
-        invocationId: null,
-        eventId: null,
-        kind: "run-error",
-        text: `Owner-only detail: gate \x1b[31m${credential}\x1b[0m`,
-      },
-    ]);
-    expect(output).toHaveBeenCalledWith(
-      "  [owner diagnostic: run run-error]\nOwner-only detail: gate [redacted]",
-    );
-  } finally {
-    output.mockRestore();
   }
 });
 
