@@ -445,6 +445,278 @@ test.each(["\n", "\r\n", "\\n", "\\r\\n", "\\u000a"])(
   },
 );
 
+function privateReportState(phrase: string): Parameters<typeof renderReport>[0]["state"] {
+  return {
+    spec: {
+      summary: "Public task",
+      assumptions: [],
+      requirements: [],
+      out_of_scope: [],
+      blocking_questions: [],
+      acceptance_criteria: [{ id: "AC-1", criterion: "Public criterion", how_to_verify: "Run checks" }],
+    },
+    holdout: {
+      scenarios: [
+        { id: "H-1", description: "Private behavior", steps: "Run it", expected: "Done", edge_case: false },
+      ],
+    },
+    lastVerify: {
+      modelId: "verifier",
+      overall: "fail",
+      notes: "",
+      criteria: [
+        { id: "H-1", status: "unmet", requirement: "request", evidence: phrase, publicSummary: phrase },
+      ],
+    },
+  };
+}
+
+async function renderedPages(
+  state: Parameters<typeof renderReport>[0]["state"],
+  check: (text: string) => void,
+  prepare?: (runId: string) => void,
+) {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  f.factory.store.setRunState(c.run.id, state);
+  prepare?.(c.run.id);
+  f.factory.store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    renderReport({
+      success: false,
+      runId: c.run.id,
+      prompt: "Public request",
+      state,
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    }),
+  );
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      let text = "";
+      let offset = 0;
+      do {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: {
+              run: c.run.id,
+              headSha: c.headSha,
+              baseSha: c.baseSha,
+              reportOffset: offset,
+            },
+          }),
+        );
+        const report = page.reports[0];
+        if (!report) throw new Error("Missing report");
+        text += report.text;
+        offset = report.nextOffset ?? 0;
+      } while (offset);
+      check(text);
+    }
+  } finally {
+    await connections.close();
+  }
+}
+
+const quotationForms = [
+  ["plain", "red owl", "red owl"],
+  ["link", "red owl", "[red owl](u)"],
+  ["image", "red owl", "![red owl](u)"],
+  ["emphasis", "red owl", "**red** _owl_"],
+  ["code", "red owl", "`red owl`"],
+  ["blockquote", "red owl", "> red\n> owl"],
+  ["list", "red owl", "- red\n- owl"],
+  ["table", "red owl", "| red owl |"],
+  ["numeric entity", "red owl", "&#114;ed owl"],
+  ["hex entity", "red owl", "&#x72;ed owl"],
+  ["named entity", "red & owl", "red &amp; owl"],
+  ["named whitespace", "red owl", "red&NewLine;owl"],
+  ["wrap", "red owl", "red\nowl"],
+  ["mid-word", "red owl", "red o\nwl"],
+  ["escaped pipe", "the amber|lantern glows", "the amber|lantern glows"],
+  ["long quoted wrap", "the amber lantern glows ultraviolet", "> the amber lan\n> tern glows ultraviolet"],
+  ["wrapped label", "the amber lantern glows ultraviolet", "![the amber lan\ntern glows ultraviolet](u)"],
+];
+
+test.each(quotationForms)(
+  "author backstops withhold %s quotations in rendered reports",
+  async (_form, phrase = "", quotation = "") => {
+    const state = privateReportState(phrase);
+    state.implementerReport = `${quotation}\nUnrelated summary neighbor`;
+    state.terminalReason = quotation;
+    state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: quotation, publicSummary: "" });
+    await renderedPages(state, (text) => {
+      expect(text).not.toMatch(/red|owl|amber|lantern|ultraviolet|Private behavior|&#|&amp;/);
+      expect(text).not.toContain("AC-1");
+      expect(text).not.toContain("🚧");
+      expect(text).toContain("## Implementer's summary\n\n[withheld:");
+      expect(text).toContain("Unrelated summary neighbor");
+      expect(text).toContain("## Checks");
+    });
+  },
+);
+
+test.each(["implementer", "verifier"] as const)(
+  "gap 4 generic evidence follows %s provenance",
+  async (author) => {
+    const phrase = "All checks passed.";
+    const state = privateReportState(phrase);
+    const privateRow = state.lastVerify?.criteria[0];
+    if (!privateRow || !state.spec) throw new Error("Missing fixture rows");
+    privateRow.status = "met";
+    privateRow.publicSummary = "";
+    state.implementerReport = `Ordinary build status: ${phrase}`;
+    state.lastReview = {
+      modelId: "reviewer",
+      verdict: "approve",
+      summary: `Ordinary review: ${phrase}`,
+      findings: [],
+    };
+    if (author === "verifier") {
+      state.spec.assumptions = [`Ordinary assumption: ${phrase}`];
+      state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: phrase, publicSummary: "" });
+      state.terminalReason = phrase;
+    }
+    await renderedPages(state, (text) => {
+      expect(text).toContain(`Ordinary build status: ${phrase}`);
+      expect(text).toContain(`Ordinary review: ${phrase}`);
+      expect(text).not.toContain("Private behavior");
+      if (author === "verifier") {
+        expect(text).toContain(`Ordinary assumption: ${phrase}`);
+        expect(text).not.toContain("AC-1");
+        expect(text).not.toContain(`🚧 ${phrase}`);
+      }
+    });
+  },
+);
+
+test.each(["unknown row", "notes", "no holdout"])(
+  "private verifier material without scenarios: %s",
+  async (source) => {
+    const state = privateReportState("red owl");
+    state.holdout = source === "no holdout" ? undefined : { scenarios: [] };
+    if (!state.lastVerify) throw new Error("Missing verifier");
+    state.lastVerify.criteria[0] = { id: "unknown", status: "unmet", evidence: "red owl", publicSummary: "" };
+    if (source === "notes") {
+      state.lastVerify.criteria = [];
+      state.lastVerify.notes = "red owl";
+    }
+    state.lastVerify.criteria.push({
+      id: "AC-1",
+      status: "met",
+      evidence: "[red owl](u)",
+      publicSummary: "",
+    });
+    state.terminalReason = "![red owl](u)";
+    await renderedPages(state, (text) => {
+      expect(text).not.toContain("red owl");
+      expect(text).not.toContain("AC-1");
+      expect(text).toContain("## Checks");
+    });
+  },
+);
+
+test.each(["\n", "\r\n", "\\n", "\\r\\n", "\\u000a"])(
+  "marked author spans withhold overlapping phrases (%j)",
+  async (separator) => {
+    const state = privateReportState("amber lantern");
+    state.holdout?.scenarios.push({
+      id: "H-2",
+      description: "Second private behavior",
+      steps: "Run it",
+      expected: "Done",
+      edge_case: false,
+    });
+    state.lastVerify?.criteria.push({
+      id: "H-2",
+      status: "unmet",
+      requirement: "request",
+      evidence: "lantern glows ultraviolet",
+      publicSummary: "lantern glows ultraviolet",
+    });
+    const quote = `amber${separator}lantern${separator}glows ultraviolet`;
+    state.implementerReport = `${quote}\nUnrelated summary neighbor`;
+    state.terminalReason = quote;
+    state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: quote, publicSummary: "" });
+    await renderedPages(state, (text) => {
+      expect(text).not.toMatch(/amber|lantern|glows|ultraviolet/);
+      expect(text).toContain("Unrelated summary neighbor");
+      expect(text).toContain("## Checks");
+    });
+  },
+);
+
+test.each(["summary", "notes"])(
+  "unreceived diagnostic %s stays visible only in other authors' prose",
+  async (source) => {
+    const state = privateReportState("A separate private observation");
+    if (!state.lastVerify) throw new Error("Missing verifier");
+    state.lastVerify.criteria = [
+      { id: "AC-1", status: "met", evidence: "All checks passed.", publicSummary: "" },
+    ];
+    state.implementerReport = "Ordinary build status: All checks passed.";
+    await renderedPages(
+      state,
+      (text) => {
+        expect(text).toContain("Ordinary build status: All checks passed.");
+        expect(text).not.toContain("AC-1");
+      },
+      (runId) => {
+        const invocation = f.factory.store.createInvocation({
+          runId,
+          stageId: null,
+          role: "verify",
+          harness: "fake",
+          provider: "fake",
+          model: "test",
+          modelId: "fake/m",
+        });
+        f.factory.store.recordOwnerDiagnostic(
+          {
+            runId,
+            invocationId: invocation.id,
+            kind: "result",
+            text: JSON.stringify(
+              source === "notes"
+                ? { notes: "All checks passed." }
+                : {
+                    criteria: [
+                      {
+                        id: "H-1",
+                        status: "unmet",
+                        requirement: "request",
+                        publicSummary: "All checks passed.",
+                      },
+                    ],
+                  },
+            ),
+          },
+          "Private diagnostic",
+        );
+      },
+    );
+  },
+);
+
+test.each(["summary", "cell"])("clipping never reveals private prefixes in a %s", async (field) => {
+  const phrase =
+    field === "summary"
+      ? "the amber lantern glows ultraviolet"
+      : `the amber lantern glows ultraviolet ${"a long private observation of hidden behavior. ".repeat(10)}`;
+  const state = privateReportState(phrase);
+  if (field === "summary") state.implementerReport = `${"x".repeat(4979)}\n${phrase}`;
+  else state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: phrase, publicSummary: "" });
+  await renderedPages(state, (text) => {
+    expect(text).not.toContain("amber lantern");
+    for (let i = 0; i + 40 <= phrase.length; i++) expect(text).not.toContain(phrase.slice(i, i + 40));
+    expect(text).toContain("## Checks");
+  });
+});
+
 test.each(["red owl", "All checks passed."])(
   "rendered private rows with %j evidence are withheld by structure",
   async (evidence) => {
@@ -470,7 +742,7 @@ test.each(["red owl", "All checks passed."])(
         notes: "",
         criteria: [
           { id: "AC-1", status: "met", evidence: "All checks passed.", publicSummary: "" },
-          { id: "H-1", status: "met", evidence, publicSummary: "red owl" },
+          { id: "H-1", status: "unmet", requirement: "request", evidence, publicSummary: "red owl" },
         ],
       },
     };
@@ -492,17 +764,19 @@ test.each(["red owl", "All checks passed."])(
           await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
         );
         const text = page.reports[0]?.text ?? "";
-        expect(text).toContain("Public criterion | All checks passed.");
+        if (evidence === "red owl") expect(text).toContain("Public criterion | All checks passed.");
+        else expect(text).not.toContain("All checks passed.");
         expect(text).not.toContain("red owl");
         expect(text).not.toContain("Private behavior");
         expect(text).toContain("## Checks");
         expect(text).toContain("Unrelated summary neighbor");
       }
       for (const damaged of [
-        report.replace("limitless-report:v1:", "limitless-report:broken:"),
+        report.replace("limitless-report:v2:", "limitless-report:broken:"),
+        report.replace("limitless-report:v2:", "limitless-report:v99:"),
         report.slice(0, -5),
         report.replace("Public criterion", "Changed criterion"),
-        report.replace(/\n<!-- limitless-report:v1:.* -->\n$/u, ""),
+        report.replace(/\n<!-- limitless-report:v2:.* -->\n$/u, ""),
       ]) {
         f.factory.store.putArtifact(c.run.id, "report.md", "report", damaged);
         for (const conn of [connections.direct, connections.proxy]) {
@@ -513,6 +787,8 @@ test.each(["red owl", "All checks passed."])(
           expect(text).not.toContain("red owl");
           expect(text).not.toContain("Private behavior");
           expect(text).toContain("withheld");
+          if (damaged.includes("limitless-report:"))
+            expect(text).toBe("[withheld: invalid report structure]");
         }
       }
     } finally {
@@ -584,7 +860,7 @@ test.each(["evidence", "publicSummary"] as const)(
         const text = page.reports[0]?.text ?? "";
         expect(text).not.toContain("amber lantern");
         expect(text).not.toContain("Quoted:");
-        expect(text).toContain("Unrelated criterion | All checks passed.");
+        expect(text).not.toContain("Unrelated criterion | All checks passed.");
         expect(text).toContain("## Checks");
       }
     } finally {
@@ -606,7 +882,15 @@ test("marked reports still filter model prose and withhold private spans before 
       modelId: "verifier",
       overall: "pass",
       notes: "",
-      criteria: [{ id: "H-1", status: "met", evidence: "red owl", publicSummary: "the amber lantern glows" }],
+      criteria: [
+        {
+          id: "H-1",
+          status: "unmet",
+          requirement: "request",
+          evidence: "red owl",
+          publicSummary: "the amber lantern glows",
+        },
+      ],
     },
   };
   f.factory.store.setRunState(c.run.id, state);
@@ -641,7 +925,8 @@ test("marked reports still filter model prose and withhold private spans before 
         text += report.text;
         offset = report.nextOffset ?? 0;
       } while (offset);
-      expect(text).not.toMatch(/red owl|amber|tern glows|Private behavior|limitless-report:/);
+      expect(text).not.toMatch(/amber|tern glows|Private behavior|limitless-report:/);
+      expect(text).toContain("Quoted: red owl");
       expect(text).toContain("Readable neighbor");
       expect(text).toContain("Readable ending");
       expect(text).toContain("## Checks");

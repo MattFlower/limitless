@@ -101,6 +101,7 @@ import {
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
+import { stripReportManifest } from "./report-privacy.ts";
 import {
   blockingReviewFindings,
   FinderSkipped,
@@ -1929,7 +1930,7 @@ async function checkPublication(ctx: RunContext, body: string, pr?: { sha: strin
   try {
     const entries = privateEntries(ctx, cwd);
     if (!entries.length) return;
-    checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
+    checkPrivateText(stripReportManifest(body), pr ? "PR body" : "PR comment", entries);
     if (!pr) return;
     checkPrivateText(pr.title, "PR title", entries);
     checkPrivateText(ctx.run.deliveryBranch ?? ctx.run.branch ?? "", "Branch name", entries);
@@ -1991,7 +1992,7 @@ async function deliverVerifiedDraft(
     branch,
     base,
     title: `[needs human] ${ctx.run.title}`,
-    body: report,
+    body: stripReportManifest(report),
     cwd,
     draft: true,
     signal: ctx.signal,
@@ -2248,7 +2249,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
-              const body = `${marker}\n${report}`;
+              const body = `${marker}\n${stripReportManifest(report)}`;
               await checkPublication(ctx, body);
               await runner([...comment, "--body", body], ctx.signal);
             },
@@ -2377,7 +2378,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       branch: ctx.run.branch as string,
       base: ctx.run.baseBranch as string,
       title,
-      body: report,
+      body: stripReportManifest(report),
       cwd,
       draft: !success,
       signal: ctx.signal,

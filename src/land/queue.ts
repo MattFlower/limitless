@@ -44,6 +44,7 @@ import {
   savedSnapshot,
 } from "../integrations/github-poller.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
+import { stripReportManifest } from "../pipeline/report-privacy.ts";
 import { redactCredentials } from "../util/proc.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
@@ -619,7 +620,7 @@ export class LandQueue {
       this.publication(entry, run, cwd),
       {
         title: run.title ?? "",
-        body: this.store.getArtifact(run.id, "report.md") ?? "",
+        body: stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? ""),
         auto: false,
       },
     );
@@ -677,7 +678,11 @@ export class LandQueue {
       "Merge subject",
       entries,
     );
-    checkPrivateText(this.store.getArtifact(run.id, "report.md") ?? "", "Merge body", entries);
+    checkPrivateText(
+      stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? ""),
+      "Merge body",
+      entries,
+    );
     checkPrivateText(entry.headBranch, "Branch name", entries);
     return entries;
   }

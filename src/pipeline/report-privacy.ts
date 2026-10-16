@@ -3,7 +3,7 @@ import { z } from "zod";
 
 const marker = "<!-- limitless-report:";
 const spanSchema = z.object({
-  kind: z.enum(["private", "prose"]),
+  kind: z.enum(["private", "verifier", "implementer", "prose"]),
   start: z.number().int().nonnegative(),
   end: z.number().int().nonnegative(),
 });
@@ -37,13 +37,13 @@ export function markReport(blocks: ReportPart[]): string {
   append(reportJoin(blocks, "\n\n"));
   body += "\n";
   const manifest = Buffer.from(JSON.stringify({ digest: digest(body, spans), spans })).toString("base64url");
-  return `${body}\n${marker}v1:${manifest} -->\n`;
+  return `${body}\n${marker}v2:${manifest} -->\n`;
 }
 
 /** null means a damaged marked report; undefined means a legacy, unmarked report. */
 export function reportStructure(report: string): { body: string; spans: Span[] } | null | undefined {
   if (!report.includes(marker)) return undefined;
-  const footer = /\n<!-- limitless-report:v1:([A-Za-z0-9_-]+) -->\n$/u.exec(report);
+  const footer = /\n<!-- limitless-report:v2:([A-Za-z0-9_-]+) -->\n$/u.exec(report);
   if (!footer) return null;
   try {
     const parsed = manifestSchema.safeParse(
@@ -61,4 +61,9 @@ export function reportStructure(report: string): { body: string; spans: Span[] }
   } catch {
     return null;
   }
+}
+
+/** Publication keeps the Markdown body; only the stored change-view artifact needs metadata. */
+export function stripReportManifest(report: string): string {
+  return report.replace(/(?:^|\n)<!-- limitless-report:[^\n]*\n?$/u, "");
 }

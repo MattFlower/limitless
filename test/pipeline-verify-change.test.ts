@@ -352,6 +352,8 @@ protected_paths = ["protected.txt"]
         expect(comments).toHaveLength(1);
         expect(comments[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
         expect(comments[0]?.at(-1)).not.toContain("generated.txt");
+        expect(comments[0]?.at(-1)).not.toContain("limitless-report:");
+        expect(f.store.getArtifact(runId, "report.md")).toContain("<!-- limitless-report:");
         expect(comments[0]?.at(-1)).toContain(`Verified commit: \`${head}\``);
         expect(f.store.getArtifact(runId, "report.md")).toContain(`Verified commit: \`${head}\``);
         expect(comments[0]?.at(-1)).toContain(`<!-- limitless-verification:${runId} -->`);

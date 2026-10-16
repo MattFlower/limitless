@@ -11,18 +11,27 @@ function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
 }
 
-function escapeCell(s: string): string {
-  return s.replace(/\|/g, "\\|").replace(/\n+/g, " ").slice(0, 300);
+function escapeCell(s: string, privateRendering = false): string {
+  const escaped = s.replace(/\|/g, "\\|").replace(/\r?\n/g, "\\n");
+  // Private rows are withheld by structure; other cells must stay whole at the display limit.
+  if (privateRendering) return escaped.slice(0, 300);
+  return escaped.length > 300 ? "[withheld: oversized cell]" : escaped;
 }
 
-function table(header: string[], rows: string[][], privateRows: boolean[] = []): ReportPart {
+/** The summary is one author span: omit it whole if it exceeds the display budget. */
+function clipSummary(text: string): string {
+  return text.length > 5000 ? "[withheld: oversized summary]" : text;
+}
+
+function table(header: string[], rows: string[][], rowAuthors: ("private" | "verifier")[] = []): ReportPart {
   return reportJoin(
     [
       `| ${header.join(" | ")} |`,
       `|${header.map(() => "---").join("|")}|`,
       ...rows.map((r, i) => {
         const text = `| ${r.join(" | ")} |`;
-        return privateRows[i] ? reportText("private", text) : text;
+        const author = rowAuthors[i];
+        return author ? reportText(author, text) : text;
       }),
     ],
     "\n",
@@ -76,7 +85,7 @@ export function renderReport(input: ReportInput): string {
       ? [`Verified commit: \`${state.reviewedSha}\``]
       : []),
     ...(state.rebaseNote ? [reportText("prose", `> [!NOTE]\n> ${state.rebaseNote}`)] : []),
-    ...(state.terminalReason ? [reportText("prose", `🚧 ${state.terminalReason}`)] : []),
+    ...(state.terminalReason ? [reportText("verifier", `🚧 ${state.terminalReason}`)] : []),
     ...(input.verifiedFailure
       ? [
           "## Failed after verification",
@@ -103,7 +112,7 @@ export function renderReport(input: ReportInput): string {
   if (state.implementerReport)
     blocks.push(
       "## Implementer's summary",
-      reportText("prose", state.implementerReport.trim().slice(0, 5000)),
+      reportText("implementer", clipSummary(state.implementerReport.trim())),
     );
 
   if (state.spec) {
@@ -127,8 +136,8 @@ export function renderReport(input: ReportInput): string {
                   : "❔";
           return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
         }),
-        state.spec.acceptance_criteria.map(
-          (ac) => rowKind(ac.id, state.spec ?? null, state.holdout) !== "public",
+        state.spec.acceptance_criteria.map((ac) =>
+          rowKind(ac.id, state.spec ?? null, state.holdout) !== "public" ? "private" : "verifier",
         ),
       ),
     );
@@ -156,15 +165,15 @@ export function renderReport(input: ReportInput): string {
         ["", "Scenario", "Result", "Evidence"],
         results.map(({ scenario, result }) => [
           scenario.id,
-          escapeCell(scenario.description),
+          escapeCell(scenario.description, true),
           result?.status === "blocked"
             ? "🚧 blocked"
             : result?.status === "unmet"
               ? `unmet (${result.requirement ? result.requirement.replace("_", " ") : "unclassified"})`
               : (result?.status ?? "unclear"),
-          escapeCell(result?.evidence ?? "not verified"),
+          escapeCell(result?.evidence ?? "not verified", true),
         ]),
-        results.map(({ scenario }) => rowKind(scenario.id, state.spec ?? null, state.holdout) !== "public"),
+        results.map(() => "private"),
       ),
     );
     if (state.lastVerify)
@@ -176,7 +185,7 @@ export function renderReport(input: ReportInput): string {
           followUps.map(({ scenario, result }) =>
             reportText(
               "private",
-              `- ${scenario.id}: ${escapeCell(scenario.description)} — ${escapeCell(result?.evidence ?? "")}`,
+              `- ${scenario.id}: ${escapeCell(scenario.description, true)} — ${escapeCell(result?.evidence ?? "", true)}`,
             ),
           ),
           "\n",
