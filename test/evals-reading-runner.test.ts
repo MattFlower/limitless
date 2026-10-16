@@ -207,6 +207,7 @@ test.each(["setup", "restoration"])("review %s failure is trial-local", async (f
   }
 });
 
+// #556 measurement (2026-10-16): alone 13.68 s, paired load 24.65 s; real Git across cache and prompt variants.
 test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD and agent harness", async () => {
   const f = await fixture();
   try {
@@ -353,7 +354,7 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
   } finally {
     await f.close();
   }
-});
+}, 60_000);
 
 test.each(["adversarial", "careful", "probe"] as const)(
   "single %s eval uses the panel finder framing and production grading",
