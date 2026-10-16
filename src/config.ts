@@ -58,6 +58,7 @@ export interface Config {
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
   baselineCache: boolean;
   gateExecutor: "local";
+  workers: { listen?: string };
   /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
   baselineEnv: string[];
   maxRounds: number; // implement ⇄ feedback rounds before escalation
@@ -299,6 +300,22 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     throw new Error("gates.baseline_cache must be true or false");
   if (gates.executor !== undefined && gates.executor !== "local")
     throw new Error('gates.executor must be "local"');
+  const workers = raw.workers ?? {};
+  if (!workers || typeof workers !== "object" || Array.isArray(workers))
+    throw new Error("workers must be a table");
+  const { listen } = workers as Record<string, unknown>;
+  if (listen !== undefined) {
+    const match = typeof listen === "string" ? /^(\[[0-9a-fA-F:]+\]|[^:\s/]+):(\d+)$/.exec(listen) : null;
+    if (
+      !match?.[1] ||
+      (match[1].startsWith("[")
+        ? isIP(match[1].slice(1, -1)) !== 6
+        : !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(match[1])) ||
+      Number(match[2]) < 1 ||
+      Number(match[2]) > 65535
+    )
+      throw new Error('workers.listen must be "<address>:<port>" with port 1–65535');
+  }
   const baselineEnv = gates.baseline_env ?? [];
   if (!Array.isArray(baselineEnv) || !baselineEnv.every((v) => typeof v === "string"))
     throw new Error("gates.baseline_env must be an array of environment variable names");
@@ -364,6 +381,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
     gateExecutor: "local",
+    workers: { listen: listen as string | undefined },
     baselineEnv,
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
