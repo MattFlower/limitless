@@ -20,9 +20,13 @@ stored data, ⚠️ weak evidence.
   pooled recall with 2 of 8 clean blocks; `@high` is at 42.9% with 3 of 8; the **adversarial
   prompt is at 45.9% with 2 of 8**. Under the registered rule (+8 points, at most +1 clean block)
   both `@high` and the adversarial prompt now pass; the adversarial prompt does so at +7% tokens
-  and +6% time. #535 landed on 2026-10-15; these numbers stay provisional until
-  `limitless eval regrade` rewrites the stored grades of E1, E2 and E3, the regraded table is
-  posted on #531, and the held-out confirmation that the rule requires has run.
+  and +6% time. The stored grades were regraded on 2026-10-14 after #535 deployed, and the
+  adversarial prompt had its one held-out confirmation on 2026-10-15 (#541): **not confirmed**,
+  recall 25.6% → 32.6% (+7.0, short of +8) and clean blocks 5 → 6 of 6. Production stays on the
+  standard prompt, and `@high` was not sent to held-out. The dev pass did not carry over, and
+  the held-out clean set is saturated: both systems block nearly every one of its 3 clean cases,
+  so it cannot tell variants apart. A fresh, blind-vetted clean set (#542, procedure in PR #543)
+  comes before the next held-out decision.
 - **Production misses 30 of the 49 dev defects in both trials.** Primary need: 13 required reading
   files the diff did not touch (callers, other entry points, persisted state), 9 required running
   code with an adversarial input (encodings, chunk boundaries, real tool output, a crafted
@@ -66,7 +70,21 @@ trials on the 4 remaining clean cases (review-078, 079, 082, 097) whose derived 
 
 As registered (pre-audit, 47 defects, 6 clean cases): E1 medium 35.1% and 2/12, E1 high 42.6% and
 5/12, E2 12.8%, E3 44.7% and 5/12. The audit removed the two clean cases that produced all of
-E3's extra blocks and two of E1 high's three.
+E3's extra blocks and two of E1 high's three. The daemon's stored grades were regraded to the
+post-audit labels on 2026-10-14 and agree with the replay.
+
+**Held-out (#541, eval-mv92iu6p0y8ns1b0ifjg8t, 2026-10-15, labels frozen, 19 real cases with 43
+required defects and 3 clean cases, k=2):**
+
+| System | Pooled recall | High / medium severity | Clean blocks | p50 trial | API-equiv / trial |
+|---|---|---|---|---|---|
+| E1 standard (production) | 25.6% (22/86) | 10/18, 12/68 | 5/6 | 81 s | $0.17 |
+| E3 adversarial | 32.6% (28/86) | 8/18, 20/68 | 6/6 | 97 s | $0.20 |
+
++7.0 points against the +8 required, so the adversarial prompt was not confirmed and has used its
+one held-out run. Its gains were at medium severity; high-severity recall fell from 10 to 8 of 18.
+Held-out recall is 8 to 13 points below dev for both systems, which is what the orchestrator's
+exposure to held-out during labelling (LABELS.md) and the smaller dev clean set would predict.
 
 Other observations from the same data:
 
@@ -74,7 +92,11 @@ Other observations from the same data:
   (both trials, every Sol system). Its finding ("restrict the mode condition to media paths as
   requested") contradicts the adjudicated label, and #508 queued it for audit. With 4 clean cases,
   the false-block denominator is 8 trials; the Wilson 95% upper bound on 2/8 is 0.60, so the
-  measure cannot separate variants that differ by one block from noise.
+  measure cannot separate variants that differ by one block from noise. Held-out is worse: its 3
+  clean cases (review-068, 092, 108) are blocked in 5 and 6 of 6 trials by the standard and
+  adversarial systems (#541), so the false-block guard there is saturated. #542 (procedure in PR
+  #543) builds a fresh clean set of at least 12 cases per split, vetted blind by two vendors
+  before any measured system sees it.
 - **Union across systems:** E1 medium ∪ E3 catches 27/49 over all trials (first trials only
   23/49); E1 high ∪ E3 29/49; all four systems 31/49 (63%). 18 defects were caught by nothing.
 - **Trial-to-trial variance:** E1 medium catches 14 defects in both trials and 5 in one; E3 18 in
@@ -341,12 +363,14 @@ change. Costs are per review from the stored trials ($0.18 and 125 s for product
 
 **Already in flight, ordered first because they are free or paid for:**
 
-- **A0. Adopt the adversarial prompt after the audit.** #535 landed on 2026-10-15; next,
-  `eval regrade` E1, E2 and E3, post the regraded table on #531, and run the held-out
-  confirmation that is being pre-registered.
-  Expected: +12 points on dev (provisional), +0 clean blocks, +7% tokens. Build: none (the
-  production schema today refuses a non-standard single prompt; adoption is a small schema and
-  config change). Risk: the clean denominator is 8 trials; see A4.
+- **A0. The adversarial prompt: settled, not adopted.** Its held-out run (#541) gave +7.0 points
+  and one more clean block, so under the rule production stays on the standard prompt and the
+  prompt's one held-out run is spent. What carries forward: the direction was the same on dev
+  and held-out (+9.6 as registered, +12.2 after the audit, +7.0 held-out), the gain was all at
+  medium severity, and it is the cheapest lever measured (+7% tokens). New variants compare
+  against the standard prompt; a variant built on the adversarial prompt (A1, A3) is measured as
+  "adversarial plus X" against production, with the stored E3 trials reported as the attribution
+  of the gain. No held-out decision should run before A4's fresh clean set exists (#542).
 - **A0b. Probe with dependencies (#530, PR #536).** Its `setup: true` baseline is the first
   honest measurement of production. Run the probe arm with the adversarial framing as well as the
   standard one, since the adversarial prompt is the likely production base by then. Expected: the
@@ -395,8 +419,9 @@ change. Costs are per review from the stored trials ($0.18 and 125 s for product
   (one union trial per case) and reports recall and clean blocks; this is a pre-check, not the
   decision. Step 2, paid: run the adversarial reviewer at k=4 on the 35 dev cases (about $27,
   2 hours at eval concurrency); form two union trials per case (t0∪t1, t2∪t3) and compare against
-  the single-sample pooled recall of the same four samples, so the baseline is paid once.
-  Held-out once if adopted.
+  the single-sample pooled recall of the same four samples (the attribution of the union's gain)
+  and against production's stored standard-prompt trials (the rule's baseline, 33/98 and 2/8).
+  Held-out once if adopted, after A4's fresh clean set exists.
 
 ### A2. A requirement-and-entry-point trace pass (second finder, union)
 
@@ -437,23 +462,29 @@ change. Costs are per review from the stored trials ($0.18 and 125 s for product
 - **Cost.** +10 to 20% tokens, no added time.
 - **Build.** About 60 lines: prompt assembly from base AGENTS.md (the lens machinery already reads
   base `.limitless.toml`), schema field, eval-only prompt variant `adversarial-checklist`.
-- **Measure.** Dev at k=2 against the adversarial baseline (E3's stored trials). Secondary: count
-  findings whose `checked` names an input or command versus a bare pattern match, to see whether
-  the list drives probes.
+- **Measure.** Dev at k=2 against production's stored standard-prompt trials for the rule, with
+  E3's stored adversarial trials reported alongside so the checklist's own contribution is
+  visible. Secondary: count findings whose `checked` names an input or command versus a bare
+  pattern match, to see whether the list drives probes. Held-out after A4.
 
 **Supporting proposals, lower in rank:**
 
-- **A4. Widen the clean denominator.** Add the 13 clean cases outside the M5.2 splits
-  (review-068 onward and the held-out-v3 clean set, all merged PRs with no later finding) to every
-  dev arm's false-block measure at k=2: 26 more trials, about $5 per system. With 8 trials a
-  single block is a 12.5-point swing and the Wilson upper bound sits at 0.6; with 34 the measure
-  can tell variants apart. Pre-register the rule as "clean blocks up by at most 1 in 34".
+- **A4. Widen the clean denominator.** #542 (procedure pre-registered in PR #543) does this
+  properly: at least 12 new clean cases per split from merged PRs since 2026-10-08, vetted blind
+  by two vendors before any measured system sees them. Until it lands, the 13 clean cases outside
+  the M5.2 splits (the M4.5 clean set and the held-out-v3 clean set, all merged PRs with no later
+  finding) can widen a dev arm's false-block measure at k=2 for about $5 per system, but they
+  were vetted by one vendor and "no later fix found" has twice hidden real defects, so they are a
+  stopgap, not the fix. With 8 trials a single block is a 12.5-point swing and the Wilson upper
+  bound sits at 0.6; with 30 or more the measure can tell variants apart.
 - **A5. "Report everything" without adversarial framing.** A `standard-full` single prompt that
   adds only the "Report every issue you believe is real" sentence, to separate the two parts of
   E3's gain. Free to build; one paid arm ($13).
-- **A6. `@high`.** Passes the rule post-audit (+9 points, +1 block) at +70% cost and +90% time.
-  Hold it as the fallback if the adversarial prompt fails held-out, or stack it later on whatever
-  is adopted; the union E1 high ∪ E3 at 29/49 says the two gains overlap only partly.
+- **A6. `@high`.** Passes the rule post-audit on dev (+9 points, +1 block) at +70% cost and
+  +90% time, and was not sent to held-out (#541 chose the cheaper adversarial prompt, which then
+  failed). It is the one dev-passing variant with an unused held-out run, but a held-out check
+  needs A4's clean set first. The union E1 high ∪ E3 at 29/49 says its gain overlaps the
+  adversarial prompt's only partly.
 - **A7. Omit the implementer report** (`[review] implementer_report = "omit"`, already
   supported). research/08 §2.3: author framing cut detection by 5 points on Opus 4.5 and far more
   on weaker models. Free to build; one paid arm.
@@ -471,10 +502,11 @@ a causal-attribution verifier (null result, #235).
 
 ### Suggested order
 
-1. A0 and A4 now (regrade, held-out for the adversarial prompt, wider clean denominator), so the
-   next decisions rest on a denominator that can move.
-2. A1's free replay this week; its paid arm with A0b's probe arm in one eval run (shared baseline).
-3. A2, then A3, each on the then-current production system.
+1. A4 now (#542's fresh clean set), so the next held-out decision rests on a denominator that can
+   move; dev arms can run before it lands, held-out runs cannot.
+2. A1's paid arm with A0b's probe arm in one eval run (shared baseline); A1's free replay is done
+   (above).
+3. A2, then A3, each against production's standard prompt.
 
 ## Appendix A. Replay method
 
@@ -558,9 +590,12 @@ the orchestrator's findings than one sample, without more false blocks on clean 
 defects than one (research/14 §1); SWR-Bench reports same-model aggregation raising recall at
 n up to 10. Union, never vote: majority filtering loses rare real bugs.
 
-**Systems.** Baseline: `codex/sol-6.1@medium` with the adversarial prompt, one sample (E3's stored
-trials plus the two new samples below). Variant D: the same reviewer sampled twice in parallel,
-findings unioned by file and ±5 lines, verdict derived as today.
+**Systems.** Production baseline for the rule: `codex/sol-6.1@medium` with the standard prompt,
+one sample (E1's stored dev trials, 33/98 and 2/8; the adversarial prompt was not confirmed on
+held-out in #541, so production is the standard prompt). Attribution baseline: the adversarial
+prompt, one sample (E3's stored trials plus the two new samples below). Variant D: the
+adversarial reviewer sampled twice in parallel, findings unioned by file and ±5 lines (panel
+merge, merged line kept as an alias), verdict derived as today.
 
 **Build (eval first).** `samples: 2` on single systems in the eval schema; parallel invocation in
 `runReview`; union through the existing merge with the agreement count recorded; `samples` in the
@@ -574,8 +609,10 @@ eval run, about $27 and 2 hours.
 **Measures.** Pooled blocking recall with Wilson 95% (overall and by severity and category), clean
 false blocks (with the wider clean set if #A4 has landed), verdict accuracy, tokens and time.
 
-**Decision rule.** Adopt only if dev recall rises by at least 8 points over the single-sample
-baseline and clean false blocks rise by at most 1. Held-out once if adopted.
+**Decision rule.** Adopt only if dev recall rises by at least 8 points over the production
+baseline and clean false blocks rise by at most 1; the gain over the single adversarial sample is
+reported as attribution. Held-out once if adopted, and only after #542's fresh clean set exists:
+the current held-out clean set is saturated (#541: 5 and 6 of 6 trials blocked).
 
 **Pre-check, already run on stored data (not the measurement).** Unioning the two stored
 adversarial trials per dev case gives 27/49 (55.1%) against 45/98 single-sample, +9.2 points
@@ -602,15 +639,18 @@ that outlives a restart; report only an unguarded path cited by file and line wi
 violates. No logic review. Single mode accepts a second finder with this prompt; findings are
 unioned with the main reviewer's by the existing merge; no verifier. Eval-only until adopted.
 
-**Systems.** Baseline: the then-current production reviewer (adversarial if adopted). Variant E:
-baseline plus the trace finder.
+**Systems.** Baseline: production's reviewer, `codex/sol-6.1@medium` with the standard prompt
+(E1's stored dev trials, 33/98 and 2/8). Variant E: baseline plus the trace finder.
 
-**Cases and run.** The 35 dev ids, k=2. One eval run, about $27 plus the trace pass's input tokens.
+**Cases and run.** The 35 dev ids, k=2. One eval run, about $14 plus the trace pass's input
+tokens (the baseline is stored).
 
 **Measures.** As #531, plus recall by category and the trace finder's findings reported
 separately: added, landed on gold, blocked a clean case.
 
-**Decision rule.** As #531 (+8 points, at most +1 clean block). Held-out once if adopted.
+**Decision rule.** As #531 (+8 points, at most +1 clean block). Held-out once if adopted, and
+only after #542's fresh clean set exists (#541 showed the current held-out clean set is
+saturated).
 
 **Budget and scope.** About 150 source lines plus tests. Out of scope: a verifier, the probe
 prompt, production adoption.
@@ -631,14 +671,18 @@ read from the base commit's AGENTS.md (never the PR's), capped in length, and a 
 `checklist[]` output field per item: `applies` (changed hunks), `checked` (command, traced path or
 input tried), `finding` (id or none). Grading ignores the field.
 
-**Systems.** Baseline: E3's stored adversarial trials. Variant F: the checklist prompt.
+**Systems.** Baseline for the rule: production's reviewer, `codex/sol-6.1@medium` with the
+standard prompt (E1's stored dev trials, 33/98 and 2/8; the adversarial prompt alone was not
+confirmed on held-out, #541). Attribution: E3's stored adversarial trials. Variant F: the
+adversarial prompt plus the checklist.
 
 **Cases and run.** The 35 dev ids, k=2, about $15.
 
-**Measures.** As #531, plus how many findings cite a command or input in `checked` versus a bare
-pattern match.
+**Measures.** As #531, plus the gain over E3 (what the checklist adds beyond the adversarial
+framing) and how many findings cite a command or input in `checked` versus a bare pattern match.
 
-**Decision rule.** As #531. Held-out once if adopted.
+**Decision rule.** As #531 against the production baseline. Held-out once if adopted, and only
+after #542's fresh clean set exists.
 
 **Budget and scope.** About 60 source lines plus tests. Out of scope: lenses, the probe prompt,
 production adoption.
