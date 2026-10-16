@@ -4,6 +4,7 @@ import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { Store } from "./db/store.ts";
+import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
@@ -63,6 +64,7 @@ export interface FactoryOptions {
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
+  readonly workers: WorkerStore;
   readonly routing: RuntimePolicy;
   readonly catalog: RuntimeCatalog;
   get policy(): Policy {
@@ -95,6 +97,7 @@ export class Factory {
     gateSlots.setLimit(cfg.maxConcurrentGates);
     const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
     this.store = opts.store ?? new Store(cfg.paths.db);
+    this.workers = new WorkerStore(this.store, opts.bootSha);
     this.models = [...(opts.models ?? catalog.models)];
     this.evalSettings = evalSettings(cfg.raw);
     this.providerDefs = (opts.providers ?? catalog.providers).map((provider) => ({
