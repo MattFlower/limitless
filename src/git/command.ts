@@ -1,6 +1,14 @@
 import { strict as assert } from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
@@ -17,6 +25,9 @@ const HARDENING = [
   "core.hooksPath=/dev/null",
   "-c",
   "core.fsmonitor=false",
+  // Resets and checkouts must not enter nested repositories with independent filters.
+  "-c",
+  "submodule.recurse=false",
   "-c",
   "diff.external=",
   "-c",
@@ -120,7 +131,26 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   // Discover includes, worktree, global, system and environment config with the same options.
   const { hooks, emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts));
   prefix.push(...hookFlags(hooks));
-  const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
+  const env = {
+    ...(opts.env ?? (process.env as Record<string, string>)),
+    LIMITLESS_GIT_EMPTY_HOOK: "",
+  };
+  if (
+    ["merge", "rebase"].includes(cmd[command] ?? "") &&
+    !cmd.slice(command + 1).some((arg) => arg === "--abort" || arg === "--quit")
+  ) {
+    try {
+      await refusePopulatedRepositories(
+        prefix,
+        { ...opts, env },
+        cmd.slice(command + 1).filter((arg) => !arg.startsWith("-")),
+      );
+    } catch (error) {
+      // Let callers classify failed Git inspection; safety refusals still throw with allowFail.
+      if (!opts.allowFail || !(error instanceof CommandError)) throw error;
+      return { stdout: error.stdout, stderr: error.stderr, exitCode: error.exitCode };
+    }
+  }
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.
@@ -135,10 +165,94 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1],
   const indicators = ["new=+", "old=-", "context= "].map((value) => `--output-indicator-${value}`);
   const format = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", ...indicators];
   const flags = inspection ? ["--no-ext-diff", "--no-textconv", ...format] : [];
+  // Nested repositories have their own filters, which parent config discovery cannot suppress.
+  // Explicit commit-range --ignore-submodules=none flags below still expose gitlinks to the audit.
+  if (["status", "diff"].includes(cmd[command] ?? "")) flags.push("--ignore-submodules=dirty");
   return run([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
     ...opts,
     env,
   });
+}
+
+/** Internal merge/rebase dirty checks cannot safely inspect agent-created repositories. */
+async function refusePopulatedRepositories(
+  git: string[],
+  opts: Parameters<typeof sh>[1],
+  targets: string[],
+): Promise<void> {
+  const index = await sh([...git, "ls-files", "--stage", "-z"], { ...opts, allowFail: false });
+  let entries = index.stdout;
+  for (const revision of new Set(["HEAD", ...targets]))
+    entries += (await sh([...git, "ls-tree", "-r", "-z", revision], { ...opts, allowFail: false })).stdout;
+  const gitlinks = new Set(
+    entries
+      .split("\0")
+      .filter((entry) => entry.startsWith("160000 "))
+      .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
+  );
+  // Output is decoded as UTF-8: a name with invalid bytes no longer names the path git inspects.
+  if ([...gitlinks].some((path) => path.includes("\uFFFD")))
+    throw new Error("Cannot inspect the checkout for nested repositories");
+  for (const path of gitlinks) {
+    let populated: boolean;
+    try {
+      const full = join(opts.cwd, path);
+      populated =
+        statSync(full, { throwIfNoEntry: false })?.isDirectory() === true &&
+        (lstatSync(join(full, ".git"), { throwIfNoEntry: false }) !== undefined ||
+          readdirSync(full).length > 0);
+    } catch {
+      throw new Error("Cannot inspect the checkout for nested repositories");
+    }
+    if (populated) throw new Error("Cannot run merge or rebase with a populated nested repository");
+  }
+}
+
+/** Stage paths directly: `add` otherwise runs status inside unchanged populated repositories. */
+export async function stageAll(opts: Parameters<typeof sh>[1], forcePaths: string[] = []): Promise<void> {
+  if (worktreeGitScope.getStore() === false) {
+    await worktreeGit(["git", "add", "-A"], opts);
+    return;
+  }
+  // Remove obsolete paths before adding replacements; update-index cannot traverse a new symlink
+  // or stage a directory in place of the old file. diff-files honors the index's skip/assume flags.
+  const deleted = await worktreeGit(
+    ["git", "diff-files", "--ignore-submodules=dirty", "--diff-filter=D", "--name-only", "-z"],
+    opts,
+  );
+  const removed = new Set(deleted.stdout.split("\0").filter(Boolean));
+  const files = await worktreeGit(
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-v", "-z"],
+    opts,
+  );
+  // Preserve add's skip-worktree/assume-unchanged promises; strip tags and repository trailing slashes.
+  const paths = files.stdout
+    .split("\0")
+    .filter((entry) => entry.length > 0 && !/^[a-zS] /.test(entry))
+    .filter((entry) => entry.startsWith("? ") || !removed.has(entry.slice(2)))
+    .map((entry) => entry.slice(2).replace(/\/$/, ""));
+  if (deleted.stdout)
+    await worktreeGit(["git", "update-index", "--force-remove", "-z", "--stdin"], {
+      ...opts,
+      stdin: deleted.stdout,
+    });
+  // A file replaced by a repository may be absent from diff-files when submodules are ignored.
+  // update-index only recognizes the replacement as a gitlink after the old entry is removed.
+  for (const path of new Set([...paths, ...removed]))
+    if (
+      existsSync(join(opts.cwd, path)) &&
+      lstatSync(join(opts.cwd, path), { throwIfNoEntry: false })?.isDirectory() &&
+      lstatSync(join(opts.cwd, path, ".git"), { throwIfNoEntry: false })
+    ) {
+      await worktreeGit(["git", "update-index", "--force-remove", "--", path], opts);
+      paths.push(path);
+    }
+  const input = [...new Set([...paths, ...forcePaths.filter((path) => !removed.has(path))])].join("\0");
+  if (input)
+    await worktreeGit(["git", "update-index", "--add", "--remove", "--replace", "-z", "--stdin"], {
+      ...opts,
+      stdin: `${input}\0`,
+    });
 }
 
 /** The empty tree's id in `opts.cwd`'s object format, as `worktreeGit` passes it to `--attr-source`. */

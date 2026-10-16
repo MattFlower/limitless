@@ -5,6 +5,7 @@ import { parseAllow } from "../core/allow.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { runGates } from "../gates/run.ts";
+import { worktreeGit } from "../git/command.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
 import { triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
@@ -89,7 +90,7 @@ export async function prepareCase(
   }
   if (patch !== undefined) {
     await sh(["git", "apply", "--index", "-"], { cwd, stdin: patch, signal });
-    await sh(
+    await worktreeGit(
       [
         "git",
         "-c",

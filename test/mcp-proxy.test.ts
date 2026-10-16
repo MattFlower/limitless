@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { FeedPage, Question, Run } from "../src/core/types.ts";
 import * as diagnosticCatalogue from "../src/db/owner-diagnostics.ts";
+import * as gitCommand from "../src/git/command.ts";
+import { cachePath } from "../src/git/repos.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -584,6 +586,7 @@ test.each(["maxWords", "cafe\u0301"])(
   },
 );
 
+// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
 test.each([2, 3])(
   "change pages expose %i-line PR prose but protect its holdout quotation in reports",
   async (length) => {
@@ -649,6 +652,7 @@ test.each([2, 3])(
       await connections.close();
     }
   },
+  20_000,
 );
 
 test.each(["\\n", "\\r", "\\r\\n", "\\t", "\\u000a", "\\u000d", "\\u0009"])(
@@ -1264,17 +1268,611 @@ test("a rendered report never exposes a clipped holdout scenario description", a
   }
 });
 
+test.each(["LF", "CRLF"])(
+  "change view withholds %s multiline credentials before paging on both backends",
+  async (format) => {
+    const alpha = `boundary-alpha-${"a".repeat(180)}`;
+    const beta = "boundary-beta-secret";
+    const newline = format === "CRLF" ? "\r\n" : "\n";
+    const c = await changeFixture(f, {
+      "added.txt": ["public before", "p".repeat(15830), alpha, beta, "public after", ""].join(newline),
+    });
+    const raw = (await sh(["git", "diff", c.baseSha, c.headSha], { cwd: f.repo })).stdout;
+    expect(raw.indexOf(alpha)).toBeLessThan(16000);
+    expect(raw.indexOf(beta)).toBeGreaterThan(16000);
+    registerCredential("MULTILINE_CHANGE_CREDENTIAL", `${alpha}\n${beta}`);
+    const connections = await changeConnections();
+    const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const read = async (diffOffset: number) =>
+          resultValue<ChangePage>(
+            await conn.client.callTool({ name: "limitless_get_change", arguments: { ...pin, diffOffset } }),
+          );
+        let offset: number | null = 0;
+        let diff = "";
+        let pages = 0;
+        while (offset !== null) {
+          const page = await read(offset);
+          expect(page.available).toBe(true);
+          expect(page.diff.text).not.toMatch(/boundary-alpha|boundary-beta/);
+          diff += page.diff.text;
+          offset = page.diff.nextOffset;
+          pages++;
+        }
+        expect(pages).toBe(1);
+        expect(diff).toBe("[withheld: private text; 1 file]");
+        for (const pinnedOffset of [1, 16000, raw.indexOf(beta)]) {
+          const page = await read(pinnedOffset);
+          expect(page.diff.text).not.toMatch(/boundary-alpha|boundary-beta/);
+        }
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each(["new", "old", "opposite", "hunks", "files"])(
+  "change view matches complete multiline credentials only within the %s file side",
+  async (scenario) => {
+    const alpha = `side-alpha-${scenario}`;
+    const beta = `side-beta-${scenario}`;
+    const gap = Array.from({ length: 12 }, (_, i) => `public gap ${i}`).join("\n");
+    const base =
+      scenario === "new"
+        ? `public before\n${alpha}\nold value\npublic after\n`
+        : scenario === "old"
+          ? `public before\n${alpha}\n${beta}\npublic after\n`
+          : scenario === "opposite" || scenario === "files"
+            ? `public before\n${alpha}\npublic after\n`
+            : `old before\n${alpha}\n${gap}\n${beta}\nold after\n`;
+    const head =
+      scenario === "new"
+        ? `public before\n${alpha}\n${beta}\npublic after\n`
+        : scenario === "old"
+          ? `public before\nnew value\n${beta}\npublic after\n`
+          : scenario === "files"
+            ? `public before\n${alpha}\npublic changed\npublic after\n`
+            : scenario === "opposite"
+              ? `public before\n${beta}\npublic after\n`
+              : `public before\n${alpha}\n${gap}\n${beta}\npublic after\n`;
+    writeFileSync(join(f.repo, "hello.txt"), base);
+    if (scenario === "opposite") writeFileSync(join(f.repo, "other.txt"), `${alpha}\n`);
+    await sh(["git", "add", "."], { cwd: f.repo });
+    await sh(["git", "commit", "-qm", "base hunk"], { cwd: f.repo });
+    const c = await changeFixture(f, {
+      "hello.txt": head,
+      ...(scenario === "files"
+        ? { "other.txt": `public before\n${beta}\npublic after\n` }
+        : scenario === "opposite"
+          ? { "other.txt": `${beta}\n` }
+          : {}),
+    });
+    const raw = (
+      await sh(
+        [
+          "git",
+          "diff",
+          "--diff-algorithm=myers",
+          "--no-indent-heuristic",
+          c.baseSha,
+          c.headSha,
+          "--",
+          "hello.txt",
+        ],
+        { cwd: f.repo },
+      )
+    ).stdout;
+    registerCredential(`MULTILINE_SIDE_${scenario}`, `${alpha}\n${beta}`);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        const diff = page.diff.text;
+        expect(page.available).toBe(true);
+        if (scenario === "new" || scenario === "old") {
+          expect(diff).toBe("[withheld: private text; 1 file]");
+          expect(diff).not.toContain(alpha);
+          expect(diff).not.toContain(beta);
+        } else {
+          expect(diff).toBe(raw);
+          expect(diff).toContain("public before");
+          expect(diff).toContain("public after");
+          expect(diff).toContain("@@ ");
+          expect(diff).toContain(alpha);
+          expect(diff).not.toContain("withheld");
+          if (scenario !== "files") expect(diff).toContain(beta);
+          if (scenario === "hunks") expect(diff.match(/^@@ /gm)).toHaveLength(2);
+          if (scenario === "opposite") expect(diff).toContain(`-${alpha}\n+${beta}`);
+        }
+        if (scenario === "files" || scenario === "opposite") {
+          const other = resultValue<ChangePage>(
+            await conn.client.callTool({
+              name: "limitless_get_change",
+              arguments: { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha, file: 1 },
+            }),
+          );
+          expect(other.diff.text).toContain(`+${beta}`);
+          expect(other.diff.text).not.toContain("withheld");
+          expect(other.diff.text).toContain(scenario === "files" ? "+public after" : `-${alpha}`);
+        }
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each([
+  ["before", 1],
+  ["before", 2],
+  ["before", 3],
+  ["after", 1],
+  ["after", 2],
+  ["after", 3],
+] as const)(
+  "change view withholds hunk-edge credentials with a change %s at distance %i",
+  async (edge, distance) => {
+    const secretLines = Array.from({ length: 5 }, (_, i) => `clipped-${edge}-${distance}-secret-${i}`);
+    const base = [
+      ...Array.from({ length: 4 }, (_, i) => `public before ${i}`),
+      ...secretLines,
+      ...Array.from({ length: 4 }, (_, i) => `public after ${i}`),
+    ];
+    writeFileSync(join(f.repo, "hello.txt"), `${base.join("\n")}\n`);
+    await sh(["git", "add", "."], { cwd: f.repo });
+    await sh(["git", "commit", "-qm", "base clipped credential"], { cwd: f.repo });
+    const head = [...base];
+    const changed = edge === "before" ? 4 - distance : 8 + distance;
+    head[changed] = "public changed";
+    const c = await changeFixture(f, { "hello.txt": `${head.join("\n")}\n` });
+    const raw = (await sh(["git", "diff", "--unified=3", c.baseSha, c.headSha], { cwd: f.repo })).stdout;
+    expect(secretLines.filter((line) => raw.includes(`\n ${line}\n`))).toHaveLength(4 - distance);
+    registerCredential(`CLIPPED_${edge}_${distance}`, secretLines.join("\n"));
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        for (const line of secretLines) expect(page.diff.text).not.toContain(line);
+        expect(page.diff.text).toBe("[withheld: private text; 1 file]");
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each(["encoded", "CRLF", "CR", "normalized", "no final newline", "overlapping"])(
+  "change view withholds files with %s multiline credential matches",
+  async (format) => {
+    const alpha = `mapped-alpha-${format}`;
+    const beta = `mapped-beta-${format}`;
+    const newline = format === "CRLF" ? "\r\n" : format === "CR" ? "\r" : "\n";
+    const secret = `${alpha}${newline}${beta}`;
+    const content =
+      format === "encoded"
+        ? `${encodeURIComponent(encodeURIComponent(alpha))}\n${[...beta].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join("")}\npublic after\n`
+        : format === "overlapping"
+          ? `${alpha}\n${beta}\n${alpha}\npublic after\n`
+          : `${secret}${format === "no final newline" ? "" : `${newline}public after${newline}`}`;
+    const normalizedContent = format === "normalized" ? content.toUpperCase().replace(/A/g, "Ａ") : content;
+    const c = await changeFixture(f, {
+      "literal[?]*:file.txt": `public before${newline}${normalizedContent}`,
+    });
+    registerCredential(`MAPPED_MULTILINE_${format}`, secret);
+    if (format === "overlapping") registerCredential("OVERLAPPING_MULTILINE", `${beta}\n${alpha}`);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        expect(page.diff.text).toBe("[withheld: private text; 1 file]");
+        expect(page.diff.text).not.toContain(alpha);
+        expect(page.diff.text).not.toContain(beta);
+        expect(page.diff.text).not.toContain(encodeURIComponent(alpha));
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each([
+  ["long", (i: number) => `middle-clipped-secret-${i}`],
+  ["short", (i: number) => `${i}`],
+  ["EOF without final newline", (i: number) => `eof-clipped-secret-${i}`],
+])("change view withholds a hunk clipped inside a multiline credential (%s)", async (format, line) => {
+  const eof = format === "EOF without final newline";
+  const secretLines = Array.from({ length: 10 }, (_, i) => line(i));
+  const base = [
+    ...Array.from({ length: 4 }, (_, i) => `public before ${i}`),
+    ...secretLines,
+    ...(eof ? [] : Array.from({ length: 4 }, (_, i) => `public after ${i}`)),
+  ];
+  const ending = eof ? "" : "\n";
+  writeFileSync(join(f.repo, "hello.txt"), `${base.join("\n")}${ending}`);
+  await sh(["git", "add", "."], { cwd: f.repo });
+  await sh(["git", "commit", "-qm", "base long credential"], { cwd: f.repo });
+  const head = [...base];
+  head[eof ? 12 : 9] = "public changed";
+  const c = await changeFixture(f, { "hello.txt": `${head.join("\n")}${ending}` });
+  const raw = (await sh(["git", "diff", "--unified=3", c.baseSha, c.headSha], { cwd: f.repo })).stdout;
+  // Only the hunk header's function annotation may quote surrounding public text.
+  const content = raw.replace(/^@@.*$/gm, "");
+  expect(content).not.toContain("public before");
+  expect(content).not.toContain("public after");
+  if (eof) {
+    expect(raw).toContain("\\ No newline at end of file");
+    expect(content).not.toContain(secretLines[0] ?? "");
+    expect(content).toContain(secretLines.at(-1) ?? "");
+  }
+  registerCredential("MIDDLE_CLIPPED_CREDENTIAL", secretLines.join("\n"));
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      expect(page.available).toBe(true);
+      // Digits also occur in hunk headers, so check short secrets as whole patch lines.
+      for (const line of secretLines) expect(page.diff.text).not.toMatch(new RegExp(`^[-+ ]${line}$`, "m"));
+      for (const line of secretLines.filter((l) => l.length > 1)) expect(page.diff.text).not.toContain(line);
+      expect(page.diff.text).toBe("[withheld: private text; 1 file]");
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("change view keeps deleted multiline credentials withheld", async () => {
+  const secret = "deleted-alpha-secret\ndeleted-beta-secret";
+  writeFileSync(join(f.repo, "hello.txt"), `${secret}\n`);
+  await sh(["git", "add", "."], { cwd: f.repo });
+  await sh(["git", "commit", "-qm", "base deleted credential"], { cwd: f.repo });
+  rmSync(join(f.repo, "hello.txt"));
+  const c = await changeFixture(f, { "visible.txt": "public addition\n" });
+  registerCredential("DELETED_MULTILINE", secret);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+      );
+      expect(page.available).toBe(true);
+      expect(page.diff.text).toBe("[withheld: file absent from PR head; 1 file, 2 lines]");
+      expect(JSON.stringify(page)).not.toMatch(/deleted-alpha|deleted-beta/);
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("change view inspects the blob it diffs when a malformed tree repeats a path", async () => {
+  const alpha = "malformed-alpha-secret".padEnd(200, "a");
+  const beta = "malformed-beta-secret";
+  const git = async (args: string[], stdin?: string) =>
+    (await sh(["git", ...args], { cwd: f.repo, ...(stdin === undefined ? {} : { stdin }) })).stdout.trim();
+  mkdirSync(join(f.repo, "foo"));
+  writeFileSync(join(f.repo, "foo", "bar"), "public nested content\n");
+  await git(["add", "."]);
+  await git(["commit", "-qm", "base nested file"]);
+  const c = await changeFixture(f, { "visible.txt": "public addition\n" });
+  // A root entry literally named "foo/bar", which ordinary commits cannot create, sorts after the
+  // "foo" tree and renders as the same path as the public nested file.
+  const secret = await git(["hash-object", "-w", "--stdin"], `${alpha}\n${beta}\n`);
+  const entries = (await git(["ls-tree", "-z", c.headSha]))
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [meta = "", name = ""] = line.split("\t");
+      const [mode = "", , oid = ""] = meta.split(" ");
+      return { mode: mode === "040000" ? "40000" : mode, name, oid };
+    });
+  entries.push({ mode: "100644", name: "foo/bar", oid: secret });
+  const key = (e: { mode: string; name: string }) => (e.mode === "40000" ? `${e.name}/` : e.name);
+  entries.sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  const raw = Buffer.concat(
+    entries.map((e) => Buffer.concat([Buffer.from(`${e.mode} ${e.name}\0`), Buffer.from(e.oid, "hex")])),
+  );
+  const rawPath = join(f.repo, ".git", "malformed-tree");
+  writeFileSync(rawPath, raw);
+  const tree = await git(["hash-object", "-w", "-t", "tree", "--literally", rawPath]);
+  const head = await git(["commit-tree", tree, "-p", c.headSha, "-m", "malformed head"]);
+  await git(["push", "-q", cachePath(f.factory.cfg.paths, c.repo), `${head}:refs/heads/malformed`]);
+  c.observe(head);
+  registerCredential("MALFORMED_TREE_MULTILINE", `${alpha}\n${beta}`);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const read = async (diffOffset: number) =>
+        resultValue<ChangePage>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id, headSha: head, baseSha: c.baseSha, file: 0, diffOffset },
+          }),
+        );
+      const first = await read(0);
+      expect(first.files[0]?.path).toBe("foo/bar");
+      for (const page of [first, await read(16000)])
+        expect(JSON.stringify(page)).not.toMatch(/malformed-alpha|malformed-beta/);
+      expect(first.diff.text).toBe("[withheld: private text; 1 file]");
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("change view refuses a blob-mode entry that names a tag object", async () => {
+  const alpha = "tagged-alpha-secret".padEnd(200, "a");
+  const beta = "tagged-beta-secret";
+  const git = async (args: string[], stdin?: string) =>
+    (await sh(["git", ...args], { cwd: f.repo, ...(stdin === undefined ? {} : { stdin }) })).stdout.trim();
+  const c = await changeFixture(f, { "visible.txt": "public addition\n" });
+  // An annotated tag whose target is a public blob already in the head tree: `cat-file blob` would
+  // read the target, while the patch shows the tag object, message included.
+  const target = await git(["rev-parse", `${c.headSha}:visible.txt`]);
+  const tag = await git(
+    ["mktag"],
+    `object ${target}\ntype blob\ntag t\ntagger T <t@example.com> 0 +0000\n\n${alpha}\n${beta}\n`,
+  );
+  const entries = (await git(["ls-tree", "-z", c.headSha]))
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [meta = "", name = ""] = line.split("\t");
+      const [mode = "", , oid = ""] = meta.split(" ");
+      return { mode: mode === "040000" ? "40000" : mode, name, oid };
+    });
+  entries.push({ mode: "100644", name: "a-tagged.txt", oid: tag });
+  const key = (e: { mode: string; name: string }) => (e.mode === "40000" ? `${e.name}/` : e.name);
+  entries.sort((a, b) => Buffer.compare(Buffer.from(key(a)), Buffer.from(key(b))));
+  const rawPath = join(f.repo, ".git", "tagged-tree");
+  writeFileSync(
+    rawPath,
+    Buffer.concat(
+      entries.map((e) => Buffer.concat([Buffer.from(`${e.mode} ${e.name}\0`), Buffer.from(e.oid, "hex")])),
+    ),
+  );
+  const tree = await git(["hash-object", "-w", "-t", "tree", "--literally", rawPath]);
+  const head = await git(["commit-tree", tree, "-p", c.headSha, "-m", "tagged head"]);
+  await git(["push", "-q", cachePath(f.factory.cfg.paths, c.repo), `${head}:refs/heads/tagged`]);
+  c.observe(head);
+  registerCredential("TAGGED_ENTRY_MULTILINE", `${alpha}\n${beta}`);
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<unknown>(
+        await conn.client.callTool({
+          name: "limitless_get_change",
+          arguments: { run: c.run.id, headSha: head, baseSha: c.baseSha, file: 0 },
+        }),
+      );
+      expect(JSON.stringify(page)).not.toMatch(/tagged-alpha|tagged-beta/);
+      expect(page).toEqual({
+        available: false,
+        reason: "Local comparison commits or Git inspection unavailable.",
+      });
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test.each(["file", "symlink", "gitlink"])(
+  "change view excludes deleted children of a directory replaced by a %s on both backends",
+  async (replacement) => {
+    const path = "nest[?]*";
+    const child = `${path}/secret.txt`;
+    const alpha = "replacement-alpha-secret".padEnd(600, "a");
+    const beta = "replacement-beta-secret";
+    const publicText = "public replacement end\n";
+    const git = (args: string[]) => sh(["git", ...args], { cwd: f.repo });
+    mkdirSync(join(f.repo, path));
+    writeFileSync(
+      join(f.repo, child),
+      `${"public child line\n".repeat(810)}${alpha}\n${beta}\n${"public child line\n".repeat(1500)}`,
+    );
+    await git(["add", "."]);
+    await git(["commit", "-qm", "base directory"]);
+    rmSync(join(f.repo, path), { recursive: true });
+    const link = "1".repeat(40);
+    if (replacement === "symlink") symlinkSync("public-target", join(f.repo, path));
+    if (replacement === "gitlink") {
+      await git(["rm", "--cached", "--", child]);
+      mkdirSync(join(f.repo, path));
+      await git(["update-index", "--add", "--cacheinfo", `160000,${link},${path}`]);
+    }
+    const c = await changeFixture(f, {
+      "hello.txt": "unrelated public change\n",
+      ...(replacement === "file" ? { [path]: publicText } : {}),
+    });
+    const raw = (await git(["diff", "--no-renames", c.baseSha, c.headSha, "--", `:(literal)${path}`])).stdout;
+    // A pinned page at 16000 would otherwise begin inside the deleted child's credential.
+    expect(raw.indexOf(alpha)).toBeGreaterThan(0);
+    expect(raw.indexOf(alpha)).toBeLessThan(16000);
+    expect(raw.indexOf(beta)).toBeGreaterThan(16000);
+    registerCredential("REPLACEMENT_MULTILINE", `${alpha}\n${beta}`);
+    const connections = await changeConnections();
+    const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const first = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        const file = first.files.find((entry) => entry.path === path)?.index;
+        expect(file).toBeNumber();
+        const read = async (diffOffset: number) =>
+          resultValue<ChangePage>(
+            await conn.client.callTool({
+              name: "limitless_get_change",
+              arguments: { ...pin, file, diffOffset },
+            }),
+          );
+        let diff = "";
+        for (const start of [0, 16000]) {
+          let offset: number | null = start;
+          while (offset !== null) {
+            const page = await read(offset);
+            expect(page.available).toBe(true);
+            expect(page.diff.text).not.toContain(alpha);
+            expect(page.diff.text).not.toContain(beta);
+            expect(page.diff.text).not.toContain(child);
+            expect(page.diff.text).not.toContain("public child line");
+            if (start === 0) diff += page.diff.text;
+            offset = page.diff.nextOffset;
+          }
+        }
+        expect(diff.match(/^diff --git /gm)).toHaveLength(1);
+        expect(diff).not.toContain("withheld");
+        expect(diff).toContain(
+          replacement === "file"
+            ? "+public replacement end"
+            : replacement === "symlink"
+              ? "+public-target"
+              : `+Subproject commit ${link}`,
+        );
+        expect(first.diff.text).toContain("+unrelated public change");
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each(["added", "modified", "blob to gitlink", "gitlink to blob"])(
+  "change view inspects only blobs for a submodule %s on both backends",
+  async (scenario) => {
+    const path = "module";
+    // Gitlink targets deliberately do not exist in this repository's object database.
+    const oldLink = "1".repeat(40);
+    const newLink = "2".repeat(40);
+    const secret = "gitlink-alpha-secret\ngitlink-beta-secret";
+    const git = (args: string[]) => sh(["git", ...args], { cwd: f.repo });
+    if (scenario !== "added") {
+      if (scenario === "blob to gitlink") {
+        writeFileSync(join(f.repo, path), `${secret}\n`);
+        await git(["add", path]);
+      } else {
+        mkdirSync(join(f.repo, path));
+        await git(["update-index", "--add", "--cacheinfo", `160000,${oldLink},${path}`]);
+      }
+      await git(["commit", "-qm", "base submodule entry"]);
+    }
+    rmSync(join(f.repo, path), { recursive: true, force: true });
+    if (scenario !== "gitlink to blob") {
+      mkdirSync(join(f.repo, path));
+      await git(["update-index", "--add", "--cacheinfo", `160000,${newLink},${path}`]);
+    }
+    const c = await changeFixture(f, scenario === "gitlink to blob" ? { [path]: `${secret}\n` } : {});
+    registerCredential("GITLINK_MULTILINE", secret);
+    const connections = await changeConnections();
+    try {
+      for (const conn of [connections.direct, connections.proxy]) {
+        const page = resultValue<ChangePage>(
+          await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+        );
+        expect(page.available).toBe(true);
+        expect(page.files).toMatchObject([{ path, binary: false }]);
+        expect(page.reports[0]).toMatchObject({
+          available: true,
+          text: expect.stringContaining("Factory report"),
+        });
+        if (scenario === "added" || scenario === "modified") {
+          expect(page.diff.text).toContain(`+Subproject commit ${newLink}\n`);
+          if (scenario === "modified") expect(page.diff.text).toContain(`-Subproject commit ${oldLink}\n`);
+          expect(page.diff.text).not.toContain("withheld");
+        } else {
+          expect(page.diff.text).toBe("[withheld: private text; 1 file]");
+        }
+        expect(JSON.stringify(page)).not.toMatch(/gitlink-alpha|gitlink-beta/);
+      }
+    } finally {
+      await connections.close();
+    }
+  },
+);
+
+test.each([
+  "base",
+  "head",
+  "raw selection",
+  "ambiguous raw selection",
+  "patch selection",
+  "unexpected patch selection",
+  "empty patch selection",
+  "unterminated patch selection",
+])("change view fails closed on a required %s inspection failure", async (side) => {
+  const c = await changeFixture(f, { "hello.txt": "public changed\n" });
+  registerCredential("INSPECTION_MULTILINE", "inspection-alpha\ninspection-beta");
+  const blob = async (sha: string) =>
+    (await sh(["git", "rev-parse", `${sha}:hello.txt`], { cwd: f.repo })).stdout.trim();
+  const blobs = { base: await blob(c.baseSha), head: await blob(c.headSha) };
+  const original = gitCommand.worktreeGit;
+  const inspect = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
+    const selection = cmd.includes("--name-only") && !cmd.includes("--diff-filter=D");
+    const raw = cmd.includes("--raw");
+    if (
+      (side === "patch selection" && selection) ||
+      (side === "raw selection" && raw) ||
+      ((side === "base" || side === "head") && cmd.includes("cat-file") && cmd.includes(blobs[side]))
+    )
+      throw new Error("private inspection diagnostic");
+    if (side === "ambiguous raw selection" && raw) {
+      const result = await original(cmd, opts);
+      return { ...result, stdout: result.stdout + result.stdout };
+    }
+    if (side.endsWith("patch selection") && selection) {
+      const result = await original(cmd, opts);
+      return {
+        ...result,
+        stdout: side.startsWith("unexpected")
+          ? "hello.txt\0private inspection diagnostic\0"
+          : side.startsWith("empty")
+            ? ""
+            : "hello.txt",
+      };
+    }
+    return original(cmd, opts);
+  });
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      expect(
+        resultValue<unknown>(
+          await conn.client.callTool({
+            name: "limitless_get_change",
+            arguments: { run: c.run.id },
+          }),
+        ),
+      ).toEqual({ available: false, reason: "Local comparison commits or Git inspection unavailable." });
+    }
+  } finally {
+    inspect.mockRestore();
+    await connections.close();
+  }
+});
+
+// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
 test("change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";
   const c = await changeFixture(f, {
-    "hello.txt": `hello\n${"safe line\n".repeat(3000)}${privacyTexts.join("\n")}\n`,
-    "holdout-patch.txt": [...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join(""),
+    "hello.txt": `hello\n${"safe line\n".repeat(3000)}${privacyTexts.join("\n")}\npublic neighbor after secrets\n`,
+    "holdout-patch.txt": `${"safe line\n".repeat(3000)}privacy-test-credential\nsecret-host.example\npublic neighbor after secrets\n${[...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("")}\n`,
     [`${hidden}.txt`]: "private path\n",
     "secret-host.example.txt": "private configured path\n",
     "privacy-test-credential.txt": "private credential path\n",
   });
   writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "secret-host.example\n");
   registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+  registerCredential("UNRELATED_MULTILINE", "unrelated-first-line\nunrelated-second-line");
   f.factory.store.setRunState(c.run.id, {
     holdout: {
       scenarios: [
@@ -1297,30 +1895,32 @@ test("change view preserves PR text and withholds private paths, patch lines, re
         conn.client.callTool({ name: "limitless_get_change", arguments: args });
       const first = resultValue<ChangePage>(await read(pin));
       expect(first.files).toHaveLength(5);
+      for (const secret of privacyTexts) expect(JSON.stringify(first)).not.toContain(secret);
       for (const args of [
-        pin,
-        ...first.files.map((file) => ({ ...pin, file: file.index, diffOffset: 1, reportOffset: 1 })),
+        ...first.files
+          .filter((file) => !["hello.txt", "holdout-patch.txt"].includes(file.path))
+          .map((file) => ({ ...pin, file: file.index, diffOffset: 1, reportOffset: 1 })),
         { ...pin, [hidden]: "invalid" },
       ]) {
         const output = JSON.stringify(await read(args));
         for (const secret of privacyTexts) expect(output).not.toContain(secret);
       }
-      expect(first.diff.text).toContain("+safe line");
-      let diff = first.diff.text;
-      let offset = first.diff.nextOffset;
+      // Unsafe decoding prevents ruling out a multiline match in the complete hello.txt.
+      expect(first.diff.text).toBe("[withheld: private text; 1 file]");
+      const file = first.files.find((file) => file.path === "holdout-patch.txt")?.index;
+      const ordinary = resultValue<ChangePage>(await read({ ...pin, file }));
+      expect(ordinary.diff.text).toContain("+safe line");
+      let diff = ordinary.diff.text;
+      let offset = ordinary.diff.nextOffset;
       while (offset !== null) {
-        const next = resultValue<ChangePage>(await read({ ...pin, diffOffset: offset }));
+        const next = resultValue<ChangePage>(await read({ ...pin, file, diffOffset: offset }));
         for (const secret of privacyTexts) expect(JSON.stringify(next)).not.toContain(secret);
         diff += next.diff.text;
         offset = next.diff.nextOffset;
       }
       expect(diff).toContain("[withheld: private text; 1 line]");
-      const visibleHoldout = resultValue<ChangePage>(
-        await read({ ...pin, file: first.files.find((file) => file.path === "holdout-patch.txt")?.index }),
-      );
-      expect(visibleHoldout.diff.text).toContain(
-        [...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join(""),
-      );
+      expect(diff).toContain("+public neighbor after secrets");
+      expect(diff).toContain([...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join(""));
       expect(first.reports[0]?.text).toContain("withheld");
     }
     rmSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"));
@@ -1344,7 +1944,7 @@ test("change view preserves PR text and withholds private paths, patch lines, re
   } finally {
     await connections.close();
   }
-});
+}, 20_000);
 
 test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [index, report] as const))(
   "change view protects the complete report before paging on both backends (encoding %i)",
