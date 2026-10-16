@@ -1187,6 +1187,7 @@ test.each(["maxWords", "cafe\u0301"])(
   },
 );
 
+// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
 test.each([2, 3])(
   "change pages expose %i-line PR prose but protect its holdout quotation in reports",
   async (length) => {
@@ -1252,6 +1253,7 @@ test.each([2, 3])(
       await connections.close();
     }
   },
+  20_000,
 );
 
 test.each(["\\n", "\\r", "\\r\\n", "\\t", "\\u000a", "\\u000d", "\\u0009"])(
@@ -2459,6 +2461,7 @@ test.each([
   }
 });
 
+// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
 test("change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";
   const c = await changeFixture(f, {
@@ -2542,7 +2545,7 @@ test("change view preserves PR text and withholds private paths, patch lines, re
   } finally {
     await connections.close();
   }
-});
+}, 20_000);
 
 test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [index, report] as const))(
   "change view protects the complete report before paging on both backends (encoding %i)",
