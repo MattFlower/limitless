@@ -7,7 +7,8 @@ import type { Factory } from "../src/app.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
-import { sh } from "../src/util/proc.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { connect, resultValue } from "./mcp-support.ts";
 import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
@@ -752,6 +753,44 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const implement = f.store.listStages(run.id).filter((s) => s.name === "implement");
     expect(implement.length).toBe(5);
     expect(f.store.getRun(run.id)?.error).toContain("Still failing");
+  });
+
+  test("resuming legacy feedback redacts credentials from round-exhaustion errors and events", async () => {
+    const secret = "synthetic-legacy-feedback-credential-486";
+    registerCredential("legacy-feedback-test", secret);
+    const f = start(() => {
+      throw new Error("exhausted run must not invoke agents");
+    });
+    await f.stop();
+    const repo = f.store.upsertRepo({
+      slug: "test/repo",
+      kind: "local",
+      url: repoDir,
+      localPath: repoDir,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = f.store.createRun(repo, { repo: repo.slug, prompt: "Add farewell", profile: "quick" });
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    f.store.setRunState(run.id, {
+      ...ctx.state,
+      phase: "loop",
+      round: 5,
+      previewConfig: null,
+      slottedCommands: [],
+      holdoutStatus: "complete",
+      feedback: `Gate failed with credential ${secret}`,
+    } satisfies RunState);
+
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    const resumed = f.store.getRun(run.id);
+    expect(resumed?.status).toBe("needs_human");
+    expect(resumed?.error).toContain("Still failing after 5 implementation rounds");
+    expect(resumed?.error).toContain("Gate failed with credential [redacted]");
+    expect(resumed?.error).not.toContain(secret);
+    const events = JSON.stringify(f.store.listEvents(run.id));
+    expect(events).toContain("Still failing after 5 implementation rounds");
+    expect(events).not.toContain(secret);
   });
 });
 

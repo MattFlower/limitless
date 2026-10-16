@@ -84,6 +84,37 @@ describe("detectGates", () => {
     expect(g.protectedPaths).toEqual(["migrations/**"]);
   });
 
+  test.each(["formatting", "credential"])("refuses sanitized gate name collisions (%s)", (kind) => {
+    const secret = "synthetic-detect-gate-name-credential-486";
+    proc.registerCredential("detect-gate-name-test", secret);
+    const sanitized = kind === "formatting" ? "check" : "check [redacted]";
+    const names = [sanitized, kind === "formatting" ? "check\x1b[31m" : `check ${secret}`];
+    const dir = tempDir({
+      ".limitless.toml": `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "true" }`).join(", ")}]\n`,
+    });
+    try {
+      expect(() => detectGates(dir)).toThrow(
+        `.limitless.toml gate names must stay distinct once sanitized: "${sanitized}"`,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps literal gate names when sanitized names are distinct", () => {
+    const secret = "synthetic-detect-control-credential-486";
+    proc.registerCredential("detect-gate-name-control", secret);
+    const names = ["check\x1b[31m", `other ${secret}`];
+    const dir = tempDir({
+      ".limitless.toml": `[gates]\nchecks = [${names.map((name) => `{ name = ${JSON.stringify(name)}, run = "true" }`).join(", ")}]\n`,
+    });
+    try {
+      expect(detectGates(dir).checks).toEqual(names.map((name) => ({ name, run: "true" })));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("go and rust", () => {
     expect(detectGates(tempDir({ "go.mod": "module x" })).checks.map((c) => c.name)).toEqual(["vet", "test"]);
     expect(detectGates(tempDir({ "Cargo.toml": "[package]" })).checks.map((c) => c.name)).toEqual([
@@ -542,6 +573,31 @@ describe("runGates / compareGates", () => {
       ["test", "still_failing", false],
       ["types", "pass", false],
     ]);
+  });
+
+  test("gate counterparts prefer exact names and reject sanitized ambiguity on either side", () => {
+    const base = (checks: GateRun["checks"]): GateRun => ({ setupOk: true, setup: [], checks });
+    const red = "check\x1b[31m";
+    const blue = "check\x1b[34m";
+    // Exact identities win even when sanitized names collide.
+    expect(
+      compareGates(base([r("check", false), r(red, true)]), base([r("check", false), r(red, false)])).map(
+        (c) => [c.verdict, c.blocking],
+      ),
+    ).toEqual([
+      ["still_failing", false],
+      ["regressed", true],
+    ]);
+    // A unique counterpart on one side is insufficient when the other side collides.
+    const cases: [GateRun["checks"], GateRun["checks"]][] = [
+      [[r("check", false)], [r(red, false), r(blue, false)]],
+      [[r(red, false), r(blue, false)], [r("check", false)]],
+    ];
+    for (const [before, after] of cases) {
+      expect(compareGates(base(before), base(after)).map((c) => [c.verdict, c.blocking])).toEqual(
+        after.map(() => ["new_failure", true]),
+      );
+    }
   });
 
   test("setup failure after change is blocking", () => {
@@ -1379,6 +1435,51 @@ const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal
   sandbox.confinementScope.run(fakeConfinement, () =>
     productionRetry(cmp, cwd, cfg, changed, signal, onWait),
   );
+
+test.each(["baseline", "regression"])("standalone %s retries own scratch per check", async (kind) => {
+  const cwd = tempDir({});
+  const signal = new AbortController().signal;
+  const cfg: GateConfig = {
+    setup: [],
+    source: "none",
+    protectedPaths: [],
+    checks: ["first", "second"].map((name) => ({
+      name,
+      run: 'if test -f "$HOME/marker"; then echo true; else echo false; fi; touch "$HOME/marker"',
+    })),
+  };
+  const failed: GateRun = {
+    setupOk: true,
+    setup: [],
+    checks: cfg.checks.map((c) => ({
+      name: c.name,
+      command: c.run,
+      ok: false,
+      exitCode: 1,
+      durationMs: 0,
+      output: "transient",
+    })),
+  };
+  try {
+    const checks =
+      kind === "baseline"
+        ? (await retryBaselineFailures(failed, cwd, cfg, signal)).checks
+        : (
+            await retryRegressions(
+              compareGates({ ...failed, checks: failed.checks.map((r) => ({ ...r, ok: true })) }, failed),
+              cwd,
+              cfg,
+              [],
+              signal,
+            )
+          ).map((c) => c.result);
+    expect(checks.map((r) => r.output)).toEqual(["false", "false"]);
+    expect(checks.every((r) => r.ok)).toBe(true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 describe("confined gates on the committed tree", () => {
   const git = (cwd: string, ...args: string[]) =>
     sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });
