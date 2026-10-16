@@ -20,8 +20,9 @@ stored data, ⚠️ weak evidence.
   pooled recall with 2 of 8 clean blocks; `@high` is at 42.9% with 3 of 8; the **adversarial
   prompt is at 45.9% with 2 of 8**. Under the registered rule (+8 points, at most +1 clean block)
   both `@high` and the adversarial prompt now pass; the adversarial prompt does so at +7% tokens
-  and +6% time. These numbers are provisional until #535 lands and `limitless eval regrade`
-  rewrites the stored grades, and until the held-out confirmation that the rule requires.
+  and +6% time. #535 landed on 2026-10-15; these numbers stay provisional until
+  `limitless eval regrade` rewrites the stored grades of E1, E2 and E3, the regraded table is
+  posted on #531, and the held-out confirmation that the rule requires has run.
 - **Production misses 30 of the 49 dev defects in both trials.** Primary need: 13 required reading
   files the diff did not touch (callers, other entry points, persisted state), 9 required running
   code with an adversarial input (encodings, chunk boundaries, real tool output, a crafted
@@ -340,8 +341,9 @@ change. Costs are per review from the stored trials ($0.18 and 125 s for product
 
 **Already in flight, ordered first because they are free or paid for:**
 
-- **A0. Adopt the adversarial prompt after the audit.** Land #535, `eval regrade` E1, E2 and E3,
-  post the regraded table on #531, and run the held-out confirmation that is being pre-registered.
+- **A0. Adopt the adversarial prompt after the audit.** #535 landed on 2026-10-15; next,
+  `eval regrade` E1, E2 and E3, post the regraded table on #531, and run the held-out
+  confirmation that is being pre-registered.
   Expected: +12 points on dev (provisional), +0 clean blocks, +7% tokens. Build: none (the
   production schema today refuses a non-standard single prompt; adoption is a small schema and
   config change). Risk: the clean denominator is 8 trials; see A4.
@@ -362,6 +364,27 @@ change. Costs are per review from the stored trials ($0.18 and 125 s for product
   single-sample mean of 45.9%, +9 points; E1 medium +5 points. Expect regression toward +5 to +8
   on fresh samples. Clean blocks: the OR of two samples; in stored data the only clean block
   (review-082) already fails in every trial, so +0 there, but on held-out expect some increase.
+- **Pre-check on stored data (2026-10-15, free).** A replay that unions the two stored E3 trials
+  per case with the panel merge rules (dedupe by file, line and title; merge within ±5 lines,
+  keeping the more severe finding and the other line as an alias) and grades the union with
+  `blockingReviewFindings` and the grader's one-to-one matching, cross-checked against
+  `gradeReview` on every grading:
+
+  | | single sample, pooled ×2 | union of 2 |
+  |---|---|---|
+  | E3 adversarial @medium | 45/98 (45.9%) | **27/49 (55.1%)**, Wilson 41–68%, +9.2 points |
+  | clean blocks | 2/8 | 1/4 |
+  | E1 standard @medium | 33/98 (33.7%) | 19/49 (38.8%), +5.1 |
+  | E1 standard @high | 42/98 (42.9%) | 23/49 (46.9%), +4.1 |
+
+  The gain is spread across categories (privacy 9/30 → 6/15, logic 13/20 → 7/10, security
+  6/12 → 4/6); spec-mismatch stays 0 in every variant, since a second sample does not look where
+  the first never looked. Resampling the 31 real cases, the gain's 95% interval is +3.7 to +15.7
+  and the probability of at least +8 is 64%, with only 8 of 31 cases improving. The baseline
+  prompt's samples are less diverse (its interval cannot reach +8). Merging within ±5 lines costs
+  one defect against exact dedupe (27 against 28), so the registered design must name the merge.
+  This settles nothing under the rule: the stored pair is the data the proposal came from, and
+  the registered baseline is four fresh samples.
 - **Cost.** 2× reviewer tokens (+$0.19 per review) and no added wall time when parallel (two
   provider slots for about 2 minutes).
 - **Build.** About 80 lines: a `samples` field on single systems (eval and production schema), a
@@ -460,7 +483,8 @@ opened read-only) imports `blockingReviewFindings` from `src/pipeline/review.ts`
 trial's `output_json` for the four systems above, and applies `gradeReview`'s matching (file
 normalisation, ±5 lines, line 0 for completeness, one-to-one assignment most-severe-first) with
 one change: it returns the matched defect per finding instead of counts. Labels came from
-`evals/review/cases.json` on PR #535's branch. Pooled recall per system matched the registered
+`evals/review/cases.json` on PR #535's branch (merged to main on 2026-10-15, unchanged). Pooled
+recall per system matched the registered
 reports when run against the pre-audit labels (33/94, 40/94, 12/94, 42/94), which checks the
 replay against the grader.
 
@@ -552,6 +576,14 @@ false blocks (with the wider clean set if #A4 has landed), verdict accuracy, tok
 
 **Decision rule.** Adopt only if dev recall rises by at least 8 points over the single-sample
 baseline and clean false blocks rise by at most 1. Held-out once if adopted.
+
+**Pre-check, already run on stored data (not the measurement).** Unioning the two stored
+adversarial trials per dev case gives 27/49 (55.1%) against 45/98 single-sample, +9.2 points
+with a resampled 95% interval of +3.7 to +15.7 (P(≥ +8) = 64%), and 1/4 clean blocks against
+2/8. The same union on the standard prompt gains +5.1 at medium and +4.1 at high. Exact dedupe
+gives 28/49; the ±5-line merge 27/49, so the merge rule is fixed here: panel merge, with the
+merged line kept as an alias. The stored pair is the data the proposal came from, so this
+decides nothing; it shows the direction and that dev clean blocks do not move.
 
 **Out of scope.** More than two samples; a verifier; any production change before held-out.
 
