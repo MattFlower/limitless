@@ -99,6 +99,14 @@ Effort-before-switch preference unchanged: no qualifying B1 paired recovery evid
 | openrouter/glm-5.3; run=eval-mukdtwern7lc; created=2026-09-27T22:20:33.747Z; finished=2026-09-28T00:21:26.967Z; k=1 | pass rate: 1.0000 (3/3), CI [0.4385, 1.0000]; prediction coverage=3/3 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs claude/opus; nonInferior=true; difference=0.0000; lower=0.0000; paired=3; complete candidate/reference=3/3 | 0.6100 (metered; attempts=3); recorded metered=$1.8301; API-equivalent=$1.8301 | 454815.0000 ms (n=3) | ineligible: pass rate lower bound 0.4385 is below floor 0.6 |
 | LAN llama.cpp model; run=eval-mukdtwern7lc; created=2026-09-27T22:20:33.747Z; finished=2026-09-28T00:21:26.967Z; k=1 | pass rate: 1.0000 (3/3), CI [0.4385, 1.0000]; prediction coverage=3/3 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs claude/opus; nonInferior=true; difference=0.0000; lower=0.0000; paired=3; complete candidate/reference=3/3 | 0.0000 (free; attempts=3); recorded metered=$0.0000; API-equivalent=$0.0000 | 989191.0000 ms (n=3) | ineligible: pass rate lower bound 0.4385 is below floor 0.6 |
 
+## Owner decision: spec = `codex/sol-6.1` replaces `codex/sol` (2026-10-15)
+
+The spec writer's Codex model moves from Sol 6.0 (`codex/sol`, backend model `gpt-6-sol`) to Sol 6.1 (`codex/sol-6.1`, backend model `gpt-6.1-sol`), matching implement and review. Nothing else in the built-in chain changes:
+- `spec.default`: `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`, then `claude/opus`;
+- `spec.large`: `claude/opus`, then `claude/sonnet-5.5|codex/sol-6.1|codex/sol-5.6`.
+
+Both Sol models default to medium effort in the catalog, so the effort doesn't change. While `[routing] prefer = ["codex"]` is set, the first group resolves to Sol 6.1. No spec eval exists, so this is an owner decision rather than a generated update. `routing/overrides.json` pins both cells so `limitless eval policy --write` keeps them. The holdout and verify groups still use `codex/sol` from the built-in defaults.
+
 ## Owner decision: implement = `claude/opus` → `codex/sol@medium` (2026-09-28)
 
 The generated implement cells above (`codex/luna@medium` first) are **not adopted**. Every cell (trivial, small, medium, large) routes to `claude/opus`, with `codex/sol@medium` as the fallback.
