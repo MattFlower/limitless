@@ -239,15 +239,18 @@ function birthTime(birth: string): number {
   return birth.split(":").reduce((time, field) => time * 1_000_000 + Number(field), 0);
 }
 
+export function linuxBirthClock(uptime: string, hz: bigint): number {
+  const [seconds, fraction = ""] = uptime.trim().split(/\s+/)[0]?.split(".") ?? [];
+  return Number((BigInt(`${seconds}${fraction}`) * hz) / 10n ** BigInt(fraction.length));
+}
+
 function birthClock(): number {
   if (inspectionPlatform === "darwin") return Date.now() * 1000;
   // Linux starttime uses boot-relative USER_HZ ticks. AT_CLKTCK supplies their rate.
   const auxv = readFileSync("/proc/self/auxv");
   for (let offset = 0; offset + 16 <= auxv.length; offset += 16)
     if (auxv.readBigUInt64LE(offset) === 17n)
-      return (
-        Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]) * Number(auxv.readBigUInt64LE(offset + 8))
-      );
+      return linuxBirthClock(readFileSync("/proc/uptime", "utf8"), auxv.readBigUInt64LE(offset + 8));
   throw new Error("Process birth clock could not be confirmed");
 }
 
@@ -264,7 +267,7 @@ async function stopMarkedProcesses(
   const protectedPids = callerAncestors();
   const started = performance.now();
   const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
-  const bornAt = (processBirthInspection.getStore()?.now ?? birthClock)();
+  let bornAt: number | null | undefined;
   const claimed = new Map<number, { birth: string; stopped: boolean; frozen: boolean }>();
   let growing = false;
   let empty = false;
@@ -275,7 +278,15 @@ async function stopMarkedProcesses(
         if (protectedPids.has(pid) || claimed.has(pid)) continue;
         const birth = await readBirth(pid);
         if (birth !== null) {
-          growing ||= birthTime(birth) > bornAt;
+          if (bornAt === undefined) {
+            try {
+              bornAt = (processBirthInspection.getStore()?.now ?? birthClock)();
+            } catch {
+              bornAt = null; // Growth is diagnostic only; ownership still comes from identity checks.
+            }
+          }
+          // Allow one clock quantum: milliseconds for macOS births, USER_HZ ticks for Linux.
+          growing ||= bornAt !== null && birthTime(birth) > bornAt + (birth.includes(":") ? 1000 : 1);
           claimed.set(pid, { birth, stopped: false, frozen: false });
         }
       }
@@ -311,7 +322,7 @@ async function stopMarkedProcesses(
       empty = !claimed.size && exited;
       if (deadline && claimed.size)
         throw new Error(
-          `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : "remained stable"}`,
+          `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : bornAt === null ? "growth unknown" : "remained stable"}`,
         );
       if (deadline && !exited) throw new Error(`Child process exit could not be confirmed: ${group}`);
       // Yield even for empty snapshots: spawn/exit notifications and a racing fork

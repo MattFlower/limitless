@@ -30,6 +30,7 @@ import {
   agentEnv,
   invocationScratch,
   linuxAncestryInspection,
+  linuxBirthClock,
   linuxCallerAncestors,
   ProcessTerminationError,
   processBirth,
@@ -1299,15 +1300,88 @@ describe("process handling", () => {
     },
   );
 
+  test.each(["empty", "gone", "claimed"])(
+    "an unavailable growth clock does not block cleanup or later scoped commands (%s)",
+    async (state) => {
+      const writer = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+      const closed = new Promise<void>((resolve) => writer.once("close", () => resolve()));
+      const signals: (string | number | undefined)[] = [];
+      const kill = process.kill.bind(process);
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (pid === writer.pid) signals.push(signal);
+        return kill(pid, signal);
+      });
+      let clockCalls = 0;
+      try {
+        await processBirthInspection.run(
+          {
+            now: () => {
+              clockCalls++;
+              throw new Error("diagnostic clock unavailable");
+            },
+            read: async () => (state === "gone" || signals.includes("SIGKILL") ? null : "1"),
+          },
+          () =>
+            processInspection.run(
+              async (withEnvironment, marker) =>
+                `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker} LIMITLESS_INVOCATION=${marker}\n` +
+                (state !== "empty" && !signals.includes("SIGKILL")
+                  ? `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`
+                  : ""),
+              () =>
+                processScope.run(
+                  {
+                    signal: new AbortController().signal,
+                    killGraceMs: 0,
+                    children: new Map(),
+                    scratchDirs: new Set(),
+                  },
+                  async () => {
+                    const result = await runProcess({
+                      cmd: ["/bin/sh", "-c", "exit 0"],
+                      cwd: dir,
+                      env: {},
+                    });
+                    expect(result.exitCode).toBe(0);
+                    expect(signals).toEqual(state === "claimed" ? ["SIGSTOP", "SIGKILL"] : []);
+                    expect(processScope.getStore()?.terminationError).toBeUndefined();
+                    expect(await sh(["/bin/sh", "-c", "printf continued"], { cwd: dir })).toEqual({
+                      stdout: "continued",
+                      stderr: "",
+                      exitCode: 0,
+                    });
+                    expect(clockCalls).toBe(state === "claimed" ? 1 : 0);
+                  },
+                ),
+            ),
+        );
+      } finally {
+        killSpy.mockRestore();
+        if (writer.exitCode === null && writer.signalCode === null) writer.kill("SIGKILL");
+        await closed;
+      }
+    },
+  );
+
   test.each([
     { started: 1000, births: ["999", "1000"], growing: false },
-    { started: 1000, births: ["999", "1001"], growing: true },
+    { started: 1000, births: ["999", "1001"], growing: false },
+    { started: 1000, births: ["999", "1002"], growing: true },
     { started: 100_500_000, births: ["99:999999", "100:500000"], growing: false },
-    { started: 100_500_000, births: ["100:499999", "100:500001"], growing: true },
-    { started: 1000, births: ["1001", "999"], growing: true },
+    { started: 100_500_000, births: ["100:499999", "100:500999"], growing: false },
+    { started: 100_500_000, births: ["100:499999", "100:501000"], growing: false },
+    { started: 100_500_000, births: ["100:501000", "100:499999"], growing: false },
+    { started: 100_500_000, births: ["100:499999", "100:501001"], growing: true },
+    { started: 100_500_000, births: ["100:501001", "100:499999"], growing: true },
+    { started: 1000, births: ["1002", "999"], growing: true },
+    { uptime: "10.03 0.00\n", births: ["1003", "1004"], growing: false },
+    { uptime: "10.03 0.00\n", births: ["1004", "1003"], growing: false },
+    { uptime: "10.03 0.00\n", births: ["1003", "1005"], growing: true },
+    { uptime: "10.03 0.00\n", births: ["1005", "1003"], growing: true },
+    { started: null, births: ["999", "1002"], growing: null },
   ])(
     "surviving descendants report birth-time growth, not discovery order (%j)",
-    async ({ started: cleanupStart, births, growing }) => {
+    async ({ started: cleanupStart, uptime, births, growing }) => {
       const children = new Map<ChildProcess, Promise<void>>();
       const kill = process.kill.bind(process);
       registerCredential("CLEANUP_COMMAND", "sleep");
@@ -1315,6 +1389,7 @@ describe("process handling", () => {
         spawn("/bin/sleep", ["30"], { stdio: "ignore" }),
       );
       let scans = 0;
+      let clockCalls = 0;
       let kills = 0;
       const signals: (string | number | undefined)[] = [];
       const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
@@ -1335,7 +1410,11 @@ describe("process handling", () => {
       try {
         await processBirthInspection.run(
           {
-            now: () => cleanupStart,
+            now: () => {
+              clockCalls++;
+              if (cleanupStart === null) throw new Error("diagnostic clock unavailable");
+              return uptime === undefined ? (cleanupStart ?? 0) : linuxBirthClock(uptime, 100n);
+            },
             read: async (pid, name) => {
               name?.("sleep");
               return births[writers.findIndex((writer) => writer.pid === pid)] ?? null;
@@ -1383,7 +1462,13 @@ describe("process handling", () => {
                     expect(message).toContain(`Marked processes still alive: ${writers.length}:`);
                     expect(message).toContain("([redacted])");
                     expect(message).not.toContain("(sleep)");
-                    expect(message).toContain(growing ? "set kept growing" : "set remained stable");
+                    expect(message).toContain(
+                      growing === null
+                        ? "growth unknown"
+                        : growing
+                          ? "set kept growing"
+                          : "set remained stable",
+                    );
                     let cleanup = false;
                     try {
                       await sh(["/bin/sh", "-c", "touch cleanup-started"], { cwd: dir });
@@ -1398,6 +1483,7 @@ describe("process handling", () => {
             ),
         );
         expect(kills).toBeGreaterThan(1);
+        expect(clockCalls).toBe(1);
         expect(signals.slice(0, writers.length)).toEqual(writers.map(() => "SIGSTOP"));
         expect(signals[writers.length]).toBe("SIGKILL");
         expect(elapsed() - started).toBeLessThan(15_000);
