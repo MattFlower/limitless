@@ -33,6 +33,7 @@ import {
   linuxCallerAncestors,
   ProcessTerminationError,
   processBirth,
+  processBirthInspection,
   processInspection,
   processScope,
   registerCredential,
@@ -1298,13 +1299,19 @@ describe("process handling", () => {
     },
   );
 
-  test.each([false, true])(
-    "surviving descendants block cleanup and report termination failure (growing=%s)",
-    async (growing) => {
+  test.each([
+    { started: 1000, births: ["999", "1000"], growing: false },
+    { started: 1000, births: ["999", "1001"], growing: true },
+    { started: 100_500_000, births: ["99:999999", "100:500000"], growing: false },
+    { started: 100_500_000, births: ["100:499999", "100:500001"], growing: true },
+    { started: 1000, births: ["1001", "999"], growing: true },
+  ])(
+    "surviving descendants report birth-time growth, not discovery order (%j)",
+    async ({ started: cleanupStart, births, growing }) => {
       const children = new Map<ChildProcess, Promise<void>>();
       const kill = process.kill.bind(process);
       registerCredential("CLEANUP_COMMAND", "sleep");
-      const writers = Array.from({ length: growing ? 2 : 1 }, () =>
+      const writers = Array.from({ length: births.length }, () =>
         spawn("/bin/sleep", ["30"], { stdio: "ignore" }),
       );
       let scans = 0;
@@ -1326,58 +1333,68 @@ describe("process handling", () => {
       let now = 0;
       const clock = spyOn(performance, "now").mockImplementation(() => now);
       try {
-        await processInspection.run(
-          async (withEnvironment, marker) => {
-            if (withEnvironment) {
-              scans++;
-              now += 2500;
-            }
-            return (
-              writers
-                .slice(0, scans > 1 ? writers.length : 1)
-                .map(
-                  (writer) =>
-                    `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n`,
-                )
-                .join("") +
-              `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`
-            );
+        await processBirthInspection.run(
+          {
+            now: () => cleanupStart,
+            read: async (pid, name) => {
+              name?.("sleep");
+              return births[writers.findIndex((writer) => writer.pid === pid)] ?? null;
+            },
           },
           () =>
-            processScope.run(
-              {
-                signal: new AbortController().signal,
-                killGraceMs: 0,
-                children,
-                scratchDirs: new Set(),
-              },
-              async () => {
-                const invocation = runProcess({
-                  cmd: ["/bin/sh", "-c", "exit 0"],
-                  cwd: dir,
-                  env: process.env as Record<string, string>,
-                });
-                let stopped = false;
-                void Promise.all(children.values()).then(() => {
-                  stopped = true;
-                });
-                await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
-                expect(stopped).toBe(false);
-                const message = processScope.getStore()?.terminationError?.message;
-                expect(message).toContain(`Marked processes still alive: ${writers.length}:`);
-                expect(message).toContain("([redacted])");
-                expect(message).not.toContain("(sleep)");
-                expect(message).toContain(growing ? "set kept growing" : "set remained stable");
-                let cleanup = false;
-                try {
-                  await sh(["/bin/sh", "-c", "touch cleanup-started"], { cwd: dir });
-                  cleanup = true;
-                } catch (error) {
-                  expect(error).toBeInstanceOf(ProcessTerminationError);
+            processInspection.run(
+              async (withEnvironment, marker) => {
+                if (withEnvironment) {
+                  scans++;
+                  now += 2500;
                 }
-                expect(cleanup).toBe(false);
-                expect(existsSync(join(dir, "cleanup-started"))).toBe(false);
+                return (
+                  writers
+                    .slice(0, scans > 1 ? writers.length : 1)
+                    .map(
+                      (writer) =>
+                        `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n`,
+                    )
+                    .join("") +
+                  `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`
+                );
               },
+              () =>
+                processScope.run(
+                  {
+                    signal: new AbortController().signal,
+                    killGraceMs: 0,
+                    children,
+                    scratchDirs: new Set(),
+                  },
+                  async () => {
+                    const invocation = runProcess({
+                      cmd: ["/bin/sh", "-c", "exit 0"],
+                      cwd: dir,
+                      env: process.env as Record<string, string>,
+                    });
+                    let stopped = false;
+                    void Promise.all(children.values()).then(() => {
+                      stopped = true;
+                    });
+                    await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
+                    expect(stopped).toBe(false);
+                    const message = processScope.getStore()?.terminationError?.message;
+                    expect(message).toContain(`Marked processes still alive: ${writers.length}:`);
+                    expect(message).toContain("([redacted])");
+                    expect(message).not.toContain("(sleep)");
+                    expect(message).toContain(growing ? "set kept growing" : "set remained stable");
+                    let cleanup = false;
+                    try {
+                      await sh(["/bin/sh", "-c", "touch cleanup-started"], { cwd: dir });
+                      cleanup = true;
+                    } catch (error) {
+                      expect(error).toBeInstanceOf(ProcessTerminationError);
+                    }
+                    expect(cleanup).toBe(false);
+                    expect(existsSync(join(dir, "cleanup-started"))).toBe(false);
+                  },
+                ),
             ),
         );
         expect(kills).toBeGreaterThan(1);
@@ -1401,6 +1418,91 @@ describe("process handling", () => {
       }
     },
     20_000,
+  );
+
+  test.each(["unavailable", "changed", "gone", "killed", "signal-failure"])(
+    "identity failures kill only eligible successfully frozen members (%s)",
+    async (state) => {
+      const writers = Array.from({ length: 3 }, () => spawn("/bin/sleep", ["30"], { stdio: "ignore" }));
+      const closed = writers.map(
+        (writer) =>
+          new Promise<NodeJS.Signals | null>((resolve) =>
+            writer.once("close", (_code, signal) => resolve(signal)),
+          ),
+      );
+      const signals = writers.map(() => [] as (string | number | undefined)[]);
+      const reads = writers.map(() => 0);
+      const kill = process.kill.bind(process);
+      const secret = "cleanup-inspection-secret";
+      registerCredential("CLEANUP_INSPECTION", secret);
+      const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        const index = writers.findIndex((writer) => writer.pid === pid);
+        if (index >= 0) {
+          signals[index]?.push(signal);
+          // Keep the PID alive after a reported KILL to exercise loss of the frozen exception.
+          if (state === "killed" && index === 0 && signal === "SIGKILL") return true;
+          if (state === "signal-failure" && index === 0 && signal === "SIGKILL")
+            throw new Error("cleanup signal denied");
+        }
+        return kill(pid, signal);
+      });
+      try {
+        await processBirthInspection.run(
+          {
+            now: () => 10,
+            read: async (pid) => {
+              const index = writers.findIndex((writer) => writer.pid === pid);
+              if (index < 0) return null;
+              reads[index] = (reads[index] ?? 0) + 1;
+              const stopped = signals[index]?.includes("SIGSTOP");
+              if (index === 0 && stopped && state === "changed") return "2";
+              if (index === 0 && stopped && state === "gone") return null;
+              if (index === 0 && stopped && state === "killed" && !signals[index]?.includes("SIGKILL"))
+                return "1";
+              if (stopped || (index === 2 && (reads[index] ?? 0) > (state === "killed" ? 2 : 1)))
+                throw new Error(`identity inspection failed for ${pid}: ${secret}`);
+              return "1";
+            },
+          },
+          () =>
+            processInspection.run(
+              async (withEnvironment, marker) =>
+                writers
+                  .map(
+                    (writer) =>
+                      `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n`,
+                  )
+                  .join("") +
+                `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+              async () => {
+                const error = await runProcess({ cmd: ["/bin/sh", "-c", "exit 0"], cwd: dir, env: {} }).catch(
+                  (error: unknown) => error,
+                );
+                expect(error).toBeInstanceOf(ProcessTerminationError);
+                expect(signals[1]).toEqual(["SIGSTOP", "SIGKILL"]);
+                expect(String(error)).toContain("identity inspection failed");
+                expect(String(error)).toContain("[redacted]");
+                expect(String(error)).not.toContain(secret);
+                expect(String(error instanceof Error ? error.cause : "")).not.toContain(secret);
+                if (state === "signal-failure") expect(String(error)).toContain("cleanup signal denied");
+              },
+            ),
+        );
+        expect(signals[0]).toEqual(
+          state === "changed" || state === "gone" ? ["SIGSTOP"] : ["SIGSTOP", "SIGKILL"],
+        );
+        expect(signals[2]).toEqual(state === "killed" ? ["SIGSTOP", "SIGKILL"] : []);
+        expect(reads.every((count) => count <= 7)).toBe(true);
+        if (state === "unavailable") expect(await closed[0]).toBe("SIGKILL");
+        expect(await closed[1]).toBe("SIGKILL");
+        if (state === "killed") expect(await closed[2]).toBe("SIGKILL");
+      } finally {
+        killSpy.mockRestore();
+        for (const writer of writers)
+          if (writer.exitCode === null && writer.signalCode === null) writer.kill("SIGKILL");
+        await Promise.all(closed);
+      }
+    },
   );
 
   test("a frozen member is killed when cleanup reaches its deadline", async () => {

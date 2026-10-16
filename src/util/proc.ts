@@ -229,6 +229,28 @@ export async function processBirth(pid: number, name?: (value: string) => void):
   throw new Error("Process birth time inspection is unsupported on this platform");
 }
 
+/** Scoped identity and matching birth-clock backend for shutdown tests. */
+export const processBirthInspection = new AsyncLocalStorage<{
+  read: typeof processBirth;
+  now: () => number;
+}>();
+
+function birthTime(birth: string): number {
+  return birth.split(":").reduce((time, field) => time * 1_000_000 + Number(field), 0);
+}
+
+function birthClock(): number {
+  if (inspectionPlatform === "darwin") return Date.now() * 1000;
+  // Linux starttime uses boot-relative USER_HZ ticks. AT_CLKTCK supplies their rate.
+  const auxv = readFileSync("/proc/self/auxv");
+  for (let offset = 0; offset + 16 <= auxv.length; offset += 16)
+    if (auxv.readBigUInt64LE(offset) === 17n)
+      return (
+        Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]) * Number(auxv.readBigUInt64LE(offset + 8))
+      );
+  throw new Error("Process birth clock could not be confirmed");
+}
+
 async function stopMarkedProcesses(
   marker: string,
   child: ChildProcess,
@@ -241,22 +263,22 @@ async function stopMarkedProcesses(
   if (group === undefined) return;
   const protectedPids = callerAncestors();
   const started = performance.now();
-  const claimed = new Map<number, { birth: string; stopped: boolean }>();
-  let growing = false,
-    observed = false;
+  const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
+  const bornAt = (processBirthInspection.getStore()?.now ?? birthClock)();
+  const claimed = new Map<number, { birth: string; stopped: boolean; frozen: boolean }>();
+  let growing = false;
   let empty = false;
   try {
     for (;;) {
       const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
       for (const pid of pids) {
         if (protectedPids.has(pid) || claimed.has(pid)) continue;
-        const birth = await processBirth(pid);
+        const birth = await readBirth(pid);
         if (birth !== null) {
-          if (observed) growing = true;
-          claimed.set(pid, { birth, stopped: false });
+          growing ||= birthTime(birth) > bornAt;
+          claimed.set(pid, { birth, stopped: false, frozen: false });
         }
       }
-      observed ||= claimed.size > 0;
       // An already-claimed descendant stays ours after reparenting or an environment
       // change. A reused PID is no longer that process and must never be signalled.
       const deadline = performance.now() - started >= graceMs + 10_000;
@@ -266,18 +288,20 @@ async function stopMarkedProcesses(
       for (const [pid, identity] of claimed) {
         let name = "unknown";
         const birth = deadline
-          ? await processBirth(pid, (value) => {
+          ? await readBirth(pid, (value) => {
               name = value;
             })
-          : await processBirth(pid);
+          : await readBirth(pid);
         if (birth !== identity.birth) claimed.delete(pid);
         else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
         else if (!freezing || !identity.stopped) {
           try {
             process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
             identity.stopped = true;
+            identity.frozen = freezing;
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+            identity.frozen = false;
           }
         }
       }
@@ -296,13 +320,29 @@ async function stopMarkedProcesses(
       else await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } catch (error) {
-    // Never leave a frozen member behind: kill every claimed process that is still the same process.
-    for (const [pid, identity] of claimed)
+    const failures = [error];
+    for (const [pid, identity] of claimed) {
+      if (protectedPids.has(pid)) continue;
+      let birth: string | null | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          birth = await readBirth(pid);
+          break;
+        } catch (inspectionError) {
+          if (attempt === 0) failures.push(inspectionError);
+          if (performance.now() - started >= graceMs + 10_000) break;
+        }
+      }
+      // Only a successfully frozen member cannot exit and have its PID reused while
+      // inspection is unavailable. A delivered KILL ends that exception as well.
+      if (birth !== identity.birth && !(birth === undefined && identity.frozen)) continue;
       try {
-        if (!protectedPids.has(pid) && (await processBirth(pid)) === identity.birth)
-          process.kill(pid, "SIGKILL");
-      } catch {}
-    throw error;
+        process.kill(pid, "SIGKILL");
+      } catch (signalError) {
+        failures.push(signalError);
+      }
+    }
+    throw new Error(redactCredentials(failures.map(String).join("; ")));
   }
 }
 
