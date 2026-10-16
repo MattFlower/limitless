@@ -134,6 +134,20 @@ test("committed triage order keeps Luna first and Haiku 5.5 as the Codex outage 
   ]);
 });
 
+test("committed spec cells write with Sol 6.1 instead of Sol 6.0", () => {
+  const tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+  const committed = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
+  const router = new Router(tracker, committed, MODELS, ["codex"]);
+  const ids = (complexity: "trivial" | "small" | "medium" | "large") =>
+    router.route("spec", complexity).candidates.map((c) => c.modelId);
+  for (const complexity of ["trivial", "small", "medium"] as const) {
+    expect(ids(complexity)[0]).toBe("codex/sol-6.1");
+    expect(ids(complexity)).not.toContain("codex/sol");
+  }
+  expect(ids("large").slice(0, 2)).toEqual(["claude/opus", "codex/sol-6.1"]);
+  expect(ids("large")).not.toContain("codex/sol");
+});
+
 test("live policy removes sticky targets, preserves exclusions and tiers, and explicit only targets win", () => {
   const { router } = setup();
   const selected = router.cellRevision("implement", "small");
