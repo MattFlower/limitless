@@ -500,9 +500,23 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
     if (!pattern && !privateRows.size) return value;
     if (multiline) {
       const matched = redactMultiline(value, multiline, clipped ? prefixes : []);
-      if (matched === null)
+      // A cut can split rendered syntax (`<br>`, an entity, a link) in the last token, so also
+      // match the clipped tail without that token.
+      const trimmed = clipped
+        ? redactMultiline(value.replace(/[^\s|]*[\s|]*$/u, ""), multiline, prefixes)
+        : "";
+      if (matched === null || trimmed === null)
         return `[withheld: holdout result or quotation; ${value.split("\n").length} lines]`;
-      value = matched;
+      const trimmedLines = trimmed.split("\n");
+      const tailHidden = clipped && trimmedLines.at(-1) === "[private detail]";
+      value = matched
+        .split("\n")
+        .map((line, index) =>
+          trimmedLines[index] === "[private detail]" || (tailHidden && index >= trimmedLines.length)
+            ? "[private detail]"
+            : line,
+        )
+        .join("\n");
     }
     return value
       .split("\n")

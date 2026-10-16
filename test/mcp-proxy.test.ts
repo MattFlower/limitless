@@ -724,6 +724,22 @@ test.each(["summary", "unbroken summary", "wrapped summary", "cell"])(
   },
 );
 
+test.each([
+  ["a generated <br>", `${"x".repeat(280)} the amber lantern\nglows ultraviolet`],
+  ["an entity", `${"x".repeat(278)} the amber lantern &#103;lows ultraviolet`],
+  [
+    "a link target",
+    `${"x".repeat(250)} [the amber lantern glows ultraviolet](https://example.com/${"p".repeat(40)})`,
+  ],
+])("a cell clipped inside %s never reveals a private prefix", async (_syntax, evidence) => {
+  const state = privateReportState("the amber lantern glows ultraviolet");
+  state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence, publicSummary: "" });
+  await renderedPages(state, (text) => {
+    expect(text).not.toMatch(/amber|lantern/);
+    expect(text).toContain("## Checks");
+  });
+});
+
 test("clipped public evidence without private text stays visible", async () => {
   const evidence = `Ran bun test; observed ${"ordinary public output line. ".repeat(15)}`;
   const state = privateReportState("the amber lantern glows ultraviolet");
