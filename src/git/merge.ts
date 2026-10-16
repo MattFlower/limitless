@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { agentEnv } from "../util/proc.ts";
-import { worktreeGit, worktreeGitScope } from "./command.ts";
+import { stageAll, worktreeGit, worktreeGitScope } from "./command.ts";
 
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
 export function mergeGit(cwd: string, args: string[], allowFail = false, stdin?: string) {
@@ -141,7 +141,7 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
   for (const path of new Set([...untracked, ...unmerged, ...edited, ...touched, ...staged]))
     if (await leftoverMarkers(cwd, head, base, mergeBase, path)) markers.push(path);
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
-  await mergeGit(cwd, ["add", "-A"]);
+  await stageAll({ cwd, env: agentEnv() });
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)
     throw new Error("Merge index still contains unmerged entries");
   if (worktreeGitScope.getStore() !== false) {
@@ -154,14 +154,7 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
     const index = await mergeGit(cwd, ["rev-parse", "--git-path", "index"]);
     rmSync(resolve(cwd, index.stdout.trim()), { force: true });
     await mergeGit(cwd, ["read-tree", "HEAD"]);
-    await mergeGit(cwd, ["add", "-A"]);
-    if (present.length)
-      await mergeGit(
-        cwd,
-        ["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
-        false,
-        present.map((path) => `:(literal)${path}\0`).join(""),
-      );
+    await stageAll({ cwd, env: agentEnv() }, present);
   }
   await requireMerge(cwd, head, base);
   await mergeGit(cwd, ["commit", "-q", "-m", `limitless: merge base ${base}`]);

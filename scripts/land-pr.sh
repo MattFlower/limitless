@@ -114,7 +114,7 @@ export LIMITLESS_LAND_SOURCE_DIR="$clone" LIMITLESS_LAND_SOURCE_COMMON_DIR="$com
 check_private "$pr" "$repo" "$subject"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
-if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
+if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --ignore-submodules=dirty --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
   echo "Cannot inspect worktree; refusing to land" >&2
   exit 1
 fi

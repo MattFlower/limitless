@@ -40,6 +40,7 @@ export async function runGateExecution(
         baseSha: ctx.run.baseSha ?? "",
         headSha: sha,
         gates,
+        skipGateSlot: hooks.skipGateSlot,
         checks: gates.checks.map((c) => c.name),
       },
       ctx.signal,
