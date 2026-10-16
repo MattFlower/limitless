@@ -316,7 +316,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
             return error("invalid lease");
           const acquired = slots.heartbeat(id, release === true);
-          return json({ id, acquired: acquired ?? false, expired: acquired === undefined });
+          return json({
+            id,
+            acquired: acquired ?? false,
+            expired: acquired === undefined,
+            holder: acquired ? undefined : slots.snapshot().holders.join(", ") || undefined,
+          });
         }
         if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
         if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
@@ -324,7 +329,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const lease = await slots.lease(name, immediate === true, undefined, undefined, running === true);
         if (req.signal.aborted) slots.heartbeat(lease, true);
         req.signal.throwIfAborted();
-        return json({ id: lease, acquired: slots.heartbeat(lease) ?? false });
+        const acquired = slots.heartbeat(lease) ?? false;
+        return json({
+          id: lease,
+          acquired,
+          holder: acquired ? undefined : slots.snapshot().holders.join(", ") || undefined,
+        });
       }, true),
     },
     "/api/admin/drain": admin("drain"),
