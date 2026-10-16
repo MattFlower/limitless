@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Limitless: a personal software factory, from request to pull request.">
+  <title>Limitless · A personal software factory</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><a class="brand" href="index.html">Limitless</a><nav aria-label="Main"><a href="#features">Features</a><a href="docs/guide.html">Documentation</a><a href="https://github.com/MattFlower/limitless">GitHub ↗</a></nav></header>
+  <main class="landing">
+    <section class="hero">
+      <p class="eyebrow">Your request. A working pull request.</p>
+      <h1>A personal<br>software factory.</h1>
+      <p>Give Limitless a request and a repository. A deterministic pipeline plans, implements, verifies and delivers the change, with models working inside stages.</p>
+      <p>Route work across Claude and ChatGPT subscriptions, OpenRouter and local models. Production gates and Claude editors use macOS confinement; service management uses launchd.</p>
+      <a class="button" href="docs/guide.html#2-install-and-first-run">Install Limitless</a> <a href="docs/architecture.html#3-the-run-pipeline">Explore the design ↗</a>
+    </section>
+    <section>
+      <p class="eyebrow">How a run works</p><h2>From intent to evidence.</h2>
+      <p class="flow">prepare → triage → (clarify) → spec → implement ⇄ gates · audit · review · verify → deliver</p>
+      <p>Start in a fresh worktree with baseline checks. Define acceptance criteria, implement the change, then check it with gates, a deterministic diff audit, adversarial review and separate acceptance verification. Failed checks feed back into implementation.</p>
+      <p>Profiles set the depth: quick skips spec, holdout and verify; standard and deep include a holdout author working in parallel with implementation.</p>
+    </section>
+    <section id="features">
+      <p class="eyebrow">Mission control</p><h2>See the work as it happens.</h2>
+      <article><h3>Follow every run</h3><p>Live runs, a queue, quota gauges and spend in one dashboard.</p><img src="screenshots/dashboard.png" alt="Demo dashboard with runs, queue and spend" width="1440" height="1000"></article>
+      <article><h3>Inspect the evidence</h3><p>Stage timelines, invocations, gates, reviews and per-model cost explain the result.</p><img src="screenshots/run-detail.png" alt="Demo run with stages, gates and invocation costs" loading="lazy"><img src="screenshots/run-review.png" alt="Demo run review artifact with approval and findings" loading="lazy"></article>
+      <article><h3>Start with a request</h3><p>Choose a repository and profile, describe the change and submit a run from the UI.</p><img src="screenshots/new-run.png" alt="New run form with demo repository and request" loading="lazy"></article>
+      <article><h3>Choose models by role</h3><p>Inspect model tiers, vendors, prices and supported reasoning efforts.</p><img src="screenshots/models.png" alt="Model catalog and routing configuration" loading="lazy"></article>
+      <article><h3>Track providers and quotas</h3><p>See provider health, subscription windows and metered spend.</p><img src="screenshots/providers.png" alt="Demo provider health and quota overview" loading="lazy"></article>
+      <article><h3>Calibrate with evaluations</h3><p>Evaluate models and generate a routing policy from measured results.</p><img src="screenshots/evals.png" alt="Demo evaluations and model results" loading="lazy"></article>
+      <article><h3>Tune routing by role</h3><p>Inspect effective routing chains and change role-specific model choices.</p><img src="screenshots/setup.png" alt="Setup page using isolated demo configuration" loading="lazy"></article>
+    </section>
+    <section class="get-started"><h2>Make your first run.</h2><nav aria-label="Getting started"><a href="docs/guide.html#2-install-and-first-run">Installation ↗</a><a href="docs/readme.html#configuration">Configuration ↗</a><a href="docs/guide.html#3-starting-work">Usage ↗</a><a href="docs/operations.html">Operations ↗</a></nav></section>
+  </main>
+  <footer>Limitless · <a href="docs/readme.html">Read the README</a> · Screenshots use demo data.</footer>
+</body>
+</html>
