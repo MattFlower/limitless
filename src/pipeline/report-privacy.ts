@@ -6,18 +6,18 @@ const spanSchema = z.object({
   kind: z.enum(["private", "verifier", "implementer", "prose"]),
   start: z.number().int().nonnegative(),
   end: z.number().int().nonnegative(),
-  /** The factory clipped this span, so its tail may end inside private text. */
-  clipped: z.literal(true).optional(),
+  /** Complete rendering before clipping, so privacy matching never sees partial syntax. */
+  source: z.string().optional(),
 });
 type Span = z.infer<typeof spanSchema>;
 const manifestSchema = z.object({ digest: z.string(), spans: z.array(spanSchema) });
 const digest = (body: string, spans: Span[]) =>
   createHash("sha256").update(body).update(JSON.stringify(spans)).digest("hex");
 
-export type ReportPart = string | { kind: Span["kind"]; text: string; clipped?: boolean } | ReportPart[];
+export type ReportPart = string | { kind: Span["kind"]; text: string; source?: string } | ReportPart[];
 
-export function reportText(kind: Span["kind"], text: string, clipped = false): ReportPart {
-  return { kind, text, clipped };
+export function reportText(kind: Span["kind"], text: string, source?: string): ReportPart {
+  return { kind, text, source };
 }
 
 export function reportJoin(parts: ReportPart[], separator: string): ReportPart[] {
@@ -36,7 +36,7 @@ export function markReport(blocks: ReportPart[]): string {
         kind: part.kind,
         start: body.length,
         end: body.length + part.text.length,
-        ...(part.clipped ? { clipped: true as const } : {}),
+        ...(part.source !== undefined ? { source: part.source } : {}),
       });
       body += part.text;
     }
@@ -44,13 +44,13 @@ export function markReport(blocks: ReportPart[]): string {
   append(reportJoin(blocks, "\n\n"));
   body += "\n";
   const manifest = Buffer.from(JSON.stringify({ digest: digest(body, spans), spans })).toString("base64url");
-  return `${body}\n${marker}v2:${manifest} -->\n`;
+  return `${body}\n${marker}v3:${manifest} -->\n`;
 }
 
 /** null means a damaged marked report; undefined means a legacy, unmarked report. */
 export function reportStructure(report: string): { body: string; spans: Span[] } | null | undefined {
   if (!report.includes(marker)) return undefined;
-  const footer = /\n<!-- limitless-report:v2:([A-Za-z0-9_-]+) -->\n$/u.exec(report);
+  const footer = /\n<!-- limitless-report:v3:([A-Za-z0-9_-]+) -->\n$/u.exec(report);
   if (!footer) return null;
   try {
     const parsed = manifestSchema.safeParse(

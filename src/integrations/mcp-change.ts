@@ -39,10 +39,8 @@ const DISTINCTIVE_LENGTH = 12;
 const normalizeWhitespace = (value: string) => value.replace(/\\+[nrt]/gu, " ").replace(/\s+/gu, " ");
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
-/** A clipped value may end inside a private string, so its tail is also matched against prefixes. */
-type HoldoutRedactor = (value: string, clipped?: boolean) => string;
-// A clipped tail may show at most a short fragment (about one word) of a private string.
-const CLIPPED_PREFIX_LENGTH = 4;
+/** Clipped spans supply their complete rendering for matching before the display cut. */
+type HoldoutRedactor = (value: string, source?: string) => string;
 // Retain at most 2,048 details totaling 256K UTF-16 characters per store. Larger catalogues
 // still redact each read, but their patterns are not retained. Privacy filters load each read.
 const CATALOGUE_DETAILS_CAP = 2_048;
@@ -137,10 +135,10 @@ function redactReport(report: string, catalogue: Catalogue): string {
       span.kind === "private"
         ? `[withheld: private verifier rendering; ${text.split("\n").length} lines]`
         : span.kind === "verifier"
-          ? catalogue.verifierRedact(text, span.clipped)
+          ? catalogue.verifierRedact(text, span.source)
           : span.kind === "implementer"
-            ? catalogue.implementerRedact(text, span.clipped)
-            : catalogue.factoryRedact(text, span.clipped);
+            ? catalogue.implementerRedact(text, span.source)
+            : catalogue.factoryRedact(text, span.source);
     cursor = span.end;
   }
   filtered += catalogue.factoryRedact(body.slice(cursor));
@@ -195,7 +193,7 @@ function normalizeMarkdown(text: string): string {
 }
 
 /** Match before paging, across wraps and at every offset, then withhold original lines. */
-function redactMultiline(value: string, pattern: RegExp, prefixes: string[] = []): string | null {
+function redactMultiline(value: string, pattern: RegExp): string | null {
   const lines = value.split("\n");
   const layers = lines.map((line) => normalizedLayers(decodeHTML(line)));
   if (layers.some((layer) => layer === null)) return null;
@@ -218,32 +216,6 @@ function redactMultiline(value: string, pattern: RegExp, prefixes: string[] = []
         if (range) for (let line = range.first; line <= range.last; line++) hidden.add(line);
       }
     }
-    // At a clip point, withhold a tail that starts a private string at a word boundary.
-    let compact = "";
-    const positions: number[] = [];
-    if (prefixes.length)
-      for (let i = 0; i < projection.text.length; i++) {
-        const character = projection.text[i] ?? " ";
-        if (character === " " || character === "\0") continue;
-        compact += character.toLowerCase();
-        positions.push(i);
-      }
-    for (const prefix of prefixes)
-      for (
-        let start = Math.max(0, compact.length - prefix.length + 1);
-        start <= compact.length - CLIPPED_PREFIX_LENGTH;
-        start++
-      ) {
-        const at = positions[start] ?? 0;
-        if (
-          compact[start] !== prefix[0] ||
-          /[\p{L}\p{N}_$]/u.test(projection.text[at - 1] ?? "") ||
-          !prefix.startsWith(compact.slice(start))
-        )
-          continue;
-        for (let line = projection.origins[at]?.first ?? 0; line < lines.length; line++) hidden.add(line);
-        break;
-      }
   }
   return lines.map((line, index) => (hidden.has(index) ? "[private detail]" : line)).join("\n");
 }
@@ -420,9 +392,9 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
   // Author redactors apply only to marked reports, so compile them on first use.
   const lazy = (details: Set<string>): HoldoutRedactor => {
     let built: HoldoutRedactor | undefined;
-    return (value, clipped) => {
+    return (value, source) => {
       built ??= buildReportRedactor(details);
-      return built(value, clipped);
+      return built(value, source);
     };
   };
   return {
@@ -467,9 +439,6 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
         normalizedLayers(decodeHTML(detail))?.at(-1) ?? detail.normalize("NFKC").toLowerCase(),
       ),
     );
-  const prefixes = [...details]
-    .map((detail) => matchForm(detail).replace(/[ \0]/gu, "").toLowerCase())
-    .filter((prefix) => prefix.length > CLIPPED_PREFIX_LENGTH);
   // Any phrase can wrap in a report, even if its catalogue entry is a single line.
   const multilineDetails = [...details];
   const multiline = multilineDetails.length
@@ -496,27 +465,13 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
         "giu",
       )
     : null;
-  const holdoutRedact: HoldoutRedactor = (value, clipped = false) => {
+  const holdoutRedact = (value: string): string => {
     if (!pattern && !privateRows.size) return value;
     if (multiline) {
-      const matched = redactMultiline(value, multiline, clipped ? prefixes : []);
-      // A cut can split rendered syntax (`<br>`, an entity, a link) in the last token, so also
-      // match the clipped tail without that token.
-      const trimmed = clipped
-        ? redactMultiline(value.replace(/[^\s|]*[\s|]*$/u, ""), multiline, prefixes)
-        : "";
-      if (matched === null || trimmed === null)
+      const matched = redactMultiline(value, multiline);
+      if (matched === null)
         return `[withheld: holdout result or quotation; ${value.split("\n").length} lines]`;
-      const trimmedLines = trimmed.split("\n");
-      const tailHidden = clipped && trimmedLines.at(-1) === "[private detail]";
-      value = matched
-        .split("\n")
-        .map((line, index) =>
-          trimmedLines[index] === "[private detail]" || (tailHidden && index >= trimmedLines.length)
-            ? "[private detail]"
-            : line,
-        )
-        .join("\n");
+      value = matched;
     }
     return value
       .split("\n")
@@ -538,7 +493,18 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
       })
       .join("\n");
   };
-  return holdoutRedact;
+  return (value, source) => {
+    if (source === undefined) return holdoutRedact(value);
+    const original = source.split("\n");
+    const filtered = holdoutRedact(source).split("\n");
+    // A normalization failure withholds the entire source rather than individual lines.
+    if (original.length !== filtered.length)
+      return `[withheld: holdout result or quotation; ${value.split("\n").length} lines]`;
+    return value
+      .split("\n")
+      .map((line, index) => (filtered[index] === original[index] ? line : filtered[index]))
+      .join("\n");
+  };
 }
 
 /** Saved observations only: no fetch, working-tree bytes, arbitrary paths, or artifact reads. */

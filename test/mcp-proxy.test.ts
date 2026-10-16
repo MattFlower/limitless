@@ -726,14 +726,28 @@ test.each(["summary", "unbroken summary", "wrapped summary", "cell"])(
 
 test.each([
   ["a generated <br>", `${"x".repeat(280)} the amber lantern\nglows ultraviolet`],
+  ["a generated <br> after two words", `${"x".repeat(287)} the amber\nlantern glows ultraviolet`],
   ["an entity", `${"x".repeat(278)} the amber lantern &#103;lows ultraviolet`],
   [
     "a link target",
     `${"x".repeat(250)} [the amber lantern glows ultraviolet](https://example.com/${"p".repeat(40)})`,
   ],
+  [
+    "a link target after two words",
+    `${"x".repeat(250)} [the amber](https://example.com/${"p".repeat(40)}) lantern glows ultraviolet`,
+  ],
 ])("a cell clipped inside %s never reveals a private prefix", async (_syntax, evidence) => {
   const state = privateReportState("the amber lantern glows ultraviolet");
   state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence, publicSummary: "" });
+  await renderedPages(state, (text) => {
+    expect(text).not.toMatch(/amber|lantern/);
+    expect(text).toContain("## Checks");
+  });
+});
+
+test("a summary clipped inside a link target never reveals a private prefix", async () => {
+  const state = privateReportState("the amber lantern glows ultraviolet");
+  state.implementerReport = `${"x".repeat(4950)} [the amber](https://example.com/${"p".repeat(40)}) lantern glows ultraviolet`;
   await renderedPages(state, (text) => {
     expect(text).not.toMatch(/amber|lantern/);
     expect(text).toContain("## Checks");
@@ -826,11 +840,12 @@ test.each(["red owl", "All checks passed."])(
         expect(text).toContain("Unrelated summary neighbor");
       }
       for (const damaged of [
-        report.replace("limitless-report:v2:", "limitless-report:broken:"),
-        report.replace("limitless-report:v2:", "limitless-report:v99:"),
+        report.replace("limitless-report:v3:", "limitless-report:broken:"),
+        report.replace("limitless-report:v3:", "limitless-report:v99:"),
+        report.replace("limitless-report:v3:", "limitless-report:v2:"),
         report.slice(0, -5),
         report.replace("Public criterion", "Changed criterion"),
-        report.replace(/\n<!-- limitless-report:v2:.* -->\n$/u, ""),
+        report.replace(/\n<!-- limitless-report:v3:.* -->\n$/u, ""),
       ]) {
         f.factory.store.putArtifact(c.run.id, "report.md", "report", damaged);
         for (const conn of [connections.direct, connections.proxy]) {

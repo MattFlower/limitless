@@ -33,7 +33,7 @@ test("publication strips only report metadata while stored structure stays valid
   const report = markReport([
     "## Checks",
     reportText("private", "Private evidence"),
-    reportText("verifier", "Public evidence"),
+    reportText("verifier", "Public evidence", "Public evidence\nUnrendered source"),
   ]);
   expect(reportStructure(report)).toBeTruthy();
   expect(report).toContain("<!-- limitless-report:");
@@ -43,6 +43,16 @@ test("publication strips only report metadata while stored structure stays valid
   expect(stripReportManifest(body)).toBe(body);
   expect(stripReportManifest("")).toBe("");
   expect(stripReportManifest(`${body}\n<!-- limitless-report:v99:broken`)).toBe(body);
+});
+
+test("report integrity covers the unclipped matching source", () => {
+  const report = markReport([reportText("verifier", "Visible prefix", "Visible prefix and private tail")]);
+  const encoded = /limitless-report:v3:([A-Za-z0-9_-]+)/u.exec(report)?.[1];
+  if (!encoded) throw new Error("Missing report manifest");
+  const manifest = Buffer.from(encoded, "base64url").toString("utf8");
+  const tampered = Buffer.from(manifest.replace("private tail", "public tail")).toString("base64url");
+  expect(reportStructure(report)?.spans[0]?.source).toBe("Visible prefix and private tail");
+  expect(reportStructure(report.replace(encoded, tampered))).toBeNull();
 });
 
 test("footer stripping preserves marker text quoted inside the report", () => {
@@ -88,16 +98,24 @@ test("published reports keep long public cells and summaries readable", () => {
   expect(report).toContain(`First line\n${"y".repeat(4980)}\n\n## Acceptance criteria`);
   expect(report).not.toContain("Last line beyond the limit");
   const spans = reportStructure(report)?.spans ?? [];
-  expect(spans.filter((span) => span.clipped).map((span) => span.kind)).toEqual(["implementer", "verifier"]);
+  expect(spans.filter((span) => span.source).map((span) => span.kind)).toEqual(["implementer", "verifier"]);
+  expect(spans.find((span) => span.kind === "implementer")?.source).toEndWith("Last line beyond the limit");
+  expect(spans.find((span) => span.kind === "verifier")?.source).toContain(evidence.replaceAll("\n", "<br>"));
 });
 
 test("clipped spans withhold a tail that starts a private string", () => {
   const redact = buildReportRedactor(new Set(["the amber lantern glows ultraviolet"]));
-  expect(redact("Visible\nends with the amber lan<br>tern gl", true)).toBe(
+  const source = "Visible\nends with the amber lan<br>tern glows ultraviolet";
+  expect(redact("Visible\nends with the amber lan<br>tern gl", source)).toBe(
     "Visible\n[withheld: holdout result or quotation; 1 line]",
   );
   expect(redact("Visible\nends with the amber lantern gl")).toBe("Visible\nends with the amber lantern gl");
-  expect(redact("Visible\nends with the", true)).toBe("Visible\nends with the");
+  expect(redact("Visible\nends with the", "Visible\nends with the public output")).toBe(
+    "Visible\nends with the",
+  );
+  expect(redact("Visible\nends with the", source)).toBe(
+    "Visible\n[withheld: holdout result or quotation; 1 line]",
+  );
 });
 
 test("private strings with wrapped words match their unwrapped quotations", () => {

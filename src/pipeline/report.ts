@@ -12,23 +12,23 @@ function money(n: number): string {
 }
 
 // Line breaks stay visible as <br> so the change view can still join a wrapped quotation.
-function clipCell(s: string): { text: string; clipped: boolean } {
+function clipCell(s: string): { text: string; source?: string } {
   const escaped = s.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
-  return { text: escaped.slice(0, 300), clipped: escaped.length > 300 };
+  return { text: escaped.slice(0, 300), source: escaped.length > 300 ? escaped : undefined };
 }
 
 function escapeCell(s: string): string {
   return clipCell(s).text;
 }
 
-/** Clip at a line boundary where possible; the manifest records the cut for the change view. */
-function clipSummary(text: string): { text: string; clipped: boolean } {
-  if (text.length <= 5000) return { text, clipped: false };
+/** Retain the complete source in the manifest for matching before the display cut. */
+function clipSummary(text: string): { text: string; source?: string } {
+  if (text.length <= 5000) return { text };
   const line = text.lastIndexOf("\n", 5000);
-  return { text: text.slice(0, line > 0 ? line : 5000).trimEnd(), clipped: true };
+  return { text: text.slice(0, line > 0 ? line : 5000).trimEnd(), source: text };
 }
 
-type RowSpan = { kind: "private" | "verifier"; clipped?: boolean };
+type RowSpan = { kind: "private" | "verifier"; source?: string };
 
 function table(header: string[], rows: string[][], rowSpans: (RowSpan | undefined)[] = []): ReportPart {
   return reportJoin(
@@ -38,7 +38,7 @@ function table(header: string[], rows: string[][], rowSpans: (RowSpan | undefine
       ...rows.map((r, i) => {
         const text = `| ${r.join(" | ")} |`;
         const span = rowSpans[i];
-        return span ? reportText(span.kind, text, span.clipped) : text;
+        return span ? reportText(span.kind, text, span.source) : text;
       }),
     ],
     "\n",
@@ -118,7 +118,7 @@ export function renderReport(input: ReportInput): string {
 
   if (state.implementerReport) {
     const summary = clipSummary(state.implementerReport.trim());
-    blocks.push("## Implementer's summary", reportText("implementer", summary.text, summary.clipped));
+    blocks.push("## Implementer's summary", reportText("implementer", summary.text, summary.source));
   }
 
   if (state.spec) {
@@ -141,14 +141,20 @@ export function renderReport(input: ReportInput): string {
                 : v.status === "blocked"
                   ? "🚧 blocked"
                   : "❔";
-          // Evidence is the row's last cell, so a clipped row's tail is the evidence's cut.
           const evidence = clipCell(v?.evidence ?? "not verified");
+          const cells = [`${icon} ${ac.id}`, escapeCell(ac.criterion), evidence.text];
           spans.push(
             rowKind(ac.id, state.spec ?? null, state.holdout) !== "public"
               ? { kind: "private" }
-              : { kind: "verifier", clipped: evidence.clipped },
+              : {
+                  kind: "verifier",
+                  source:
+                    evidence.source === undefined
+                      ? undefined
+                      : `| ${[...cells.slice(0, -1), evidence.source].join(" | ")} |`,
+                },
           );
-          return [`${icon} ${ac.id}`, escapeCell(ac.criterion), evidence.text];
+          return cells;
         }),
         spans,
       ),
