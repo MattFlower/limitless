@@ -261,13 +261,25 @@ async function stopMarkedProcesses(
       // change. A reused PID is no longer that process and must never be signalled.
       const deadline = performance.now() - started >= graceMs + 10_000;
       const names: string[] = [];
+      // Freeze every newly discovered member, then rescan before killing the frozen set.
+      const freezing = [...claimed.values()].some((identity) => !identity.stopped);
       for (const [pid, identity] of claimed) {
         let name = "unknown";
-        const birth = await processBirth(pid, (value) => {
-          name = value;
-        });
+        const birth = deadline
+          ? await processBirth(pid, (value) => {
+              name = value;
+            })
+          : await processBirth(pid);
         if (birth !== identity.birth) claimed.delete(pid);
         else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
+        else if (!freezing || !identity.stopped) {
+          try {
+            process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
+            identity.stopped = true;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        }
       }
       // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
       const exited = child.exitCode !== null || child.signalCode !== null;
@@ -278,24 +290,9 @@ async function stopMarkedProcesses(
           `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : "remained stable"}`,
         );
       if (deadline && !exited) throw new Error(`Child process exit could not be confirmed: ${group}`);
-      // Freeze every newly discovered member, then rescan before killing the frozen set.
-      const freezing = [...claimed.values()].some((identity) => !identity.stopped);
-      for (const [pid, identity] of claimed) {
-        if (freezing && identity.stopped) continue;
-        if ((await processBirth(pid)) !== identity.birth) {
-          claimed.delete(pid);
-          continue;
-        }
-        try {
-          process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
-          identity.stopped = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        }
-      }
       // Yield even for empty snapshots: spawn/exit notifications and a racing fork
       // must have an opportunity to arrive before we confirm shutdown.
-      if (claimed.size || !exited) await Bun.sleep(10);
+      if (!freezing && (claimed.size || !exited)) await Bun.sleep(10);
       else await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } catch (error) {

@@ -1321,11 +1321,17 @@ describe("process handling", () => {
         }
         return kill(pid, signal);
       });
-      const started = performance.now();
+      const elapsed = performance.now.bind(performance);
+      const started = elapsed();
+      let now = 0;
+      const clock = spyOn(performance, "now").mockImplementation(() => now);
       try {
         await processInspection.run(
           async (withEnvironment, marker) => {
-            if (withEnvironment) scans++;
+            if (withEnvironment) {
+              scans++;
+              now += 2500;
+            }
             return (
               writers
                 .slice(0, scans > 1 ? writers.length : 1)
@@ -1377,10 +1383,12 @@ describe("process handling", () => {
         expect(kills).toBeGreaterThan(1);
         expect(signals.slice(0, writers.length)).toEqual(writers.map(() => "SIGSTOP"));
         expect(signals[writers.length]).toBe("SIGKILL");
-        expect(performance.now() - started).toBeLessThan(15_000);
+        expect(elapsed() - started).toBeLessThan(15_000);
+        expect(now).toBe(10_000);
         expect(children.size).toBe(1);
         for (const writer of writers) expect(kill(writer.pid ?? 0, 0)).toBe(true);
       } finally {
+        clock.mockRestore();
         killSpy.mockRestore();
         await Promise.all(
           writers.map(async (writer) => {
@@ -1413,11 +1421,17 @@ describe("process handling", () => {
       }
       return kill(pid, signal);
     });
+    let now = 0;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
     try {
       await processInspection.run(
-        async (withEnvironment, marker) =>
-          `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n` +
-          `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+        async (withEnvironment, marker) => {
+          if (withEnvironment) now += 2500;
+          return (
+            `${writer.pid} ${process.getuid?.()} S writer${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}\n` +
+            `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`
+          );
+        },
         () =>
           processScope.run(
             { signal: new AbortController().signal, killGraceMs: 0, children, scratchDirs: new Set() },
@@ -1439,6 +1453,7 @@ describe("process handling", () => {
       expect(signals.filter((signal) => signal === "SIGKILL")).toHaveLength(1);
       expect(await closed).toBe("SIGKILL");
     } finally {
+      clock.mockRestore();
       killSpy.mockRestore();
       if (writer.exitCode === null && writer.signalCode === null) writer.kill("SIGKILL");
       await closed;
