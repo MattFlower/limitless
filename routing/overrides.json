@@ -26,5 +26,25 @@
   "review.large": {
     "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two. Astra was dropped from both review chains on 2026-10-04 (owner decision), leaving Opus in its place. Sonnet 5.5 replaced Sonnet 5 in the second group the same day (owner decision).",
     "decided": "2026-09-30"
+  },
+  "spec.default": {
+    "reason": "Sol 6.1 replaces Sol 6.0 (codex/sol) in the spec writer group (owner decision), as in implement and review. Otherwise the chain is the built-in default: Sonnet 5.5 or Sol 6.1 (Sol 5.6 as the other Codex alternative) at the catalog's medium effort, then Opus. No spec eval exists; this is an owner decision, not a generated update. See routing/EVIDENCE.md.",
+    "decided": "2026-10-15"
+  },
+  "spec.large": {
+    "reason": "Sol 6.1 replaces Sol 6.0 (codex/sol) in the spec writer group (owner decision), as in implement and review. Otherwise the chain is the built-in default: Opus first, then Sonnet 5.5 or Sol 6.1 (Sol 5.6 as the other Codex alternative) at the catalog's medium effort. No spec eval exists; this is an owner decision, not a generated update. See routing/EVIDENCE.md.",
+    "decided": "2026-10-15"
+  },
+  "holdout.default": {
+    "reason": "Sol 6.1 replaces Sol 6.0 (codex/sol) in the holdout author group (owner decision), as in spec, implement and review. Otherwise the chain is the built-in default: Sonnet 5.5 or Sol 6.1 (Sol 5.6 as the other Codex alternative) at the catalog's medium effort, then Opus. No holdout eval exists; this is an owner decision, not a generated update. See routing/EVIDENCE.md.",
+    "decided": "2026-10-15"
+  },
+  "verify.default": {
+    "reason": "Sol 6.1 replaces Sol 6.0 (codex/sol) in the verifier group (owner decision), as in spec, implement and review. Otherwise the chain is the built-in default: Sonnet 5.5 or Sol 6.1 (Sol 5.6 as the other Codex alternative) at the catalog's medium effort, then Opus. The verifier still avoids the implementer's vendor, so Sol-implemented runs keep a non-OpenAI verifier. No completed verify eval exists; this is an owner decision, not a generated update. See routing/EVIDENCE.md.",
+    "decided": "2026-10-15"
+  },
+  "verify.large": {
+    "reason": "Sol 6.1 replaces Sol 6.0 (codex/sol) in the verifier group (owner decision), as in spec, implement and review. Otherwise the chain is the built-in default: Opus first, then Sonnet 5.5 or Sol 6.1 (Sol 5.6 as the other Codex alternative) at the catalog's medium effort. The verifier still avoids the implementer's vendor. No completed verify eval exists; this is an owner decision, not a generated update. See routing/EVIDENCE.md.",
+    "decided": "2026-10-15"
   }
 }

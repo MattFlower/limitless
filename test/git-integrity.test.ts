@@ -23,7 +23,7 @@ import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
-import { recordWorktree, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
+import { recordWorktree, stageAll, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   addDetachedWorktree,
@@ -39,6 +39,7 @@ import {
   headSha,
   pushBranch,
   readFileAt,
+  rebaseOnto,
   removeWorktree,
   resetTo,
   sweepClassificationScratch,
@@ -211,6 +212,366 @@ test("committed nested repositories and changed gitlink commits block, but reque
   ).toBe(false);
 });
 
+test.each(["commitAll", "discardChanges", "diff"])(
+  "%s does not run a nested repository's clean filter",
+  async (operation) => {
+    const nested = join(work, "nested");
+    const file = join(nested, "file");
+    const marker = join(dir, "nested-filter-ran");
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(file, "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    writeFileSync(join(work, ".gitmodules"), '[submodule "nested=repo"]\n\tpath = nested\n\tignore = none\n');
+    if (operation !== "commitAll") await commitAll(work, "gitlink");
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    const dirtyMtime = (mtime = 1000) => utimesSync(file, mtime, mtime);
+    dirtyMtime();
+    if (operation === "commitAll") {
+      expect(await commitAll(work, "added gitlink")).not.toBeNull();
+      expect(existsSync(marker)).toBe(false);
+      expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
+        `160000 commit ${await headSha(nested)}\tnested`,
+      );
+      writeFileSync(join(work, "sample.test.ts"), edited);
+      dirtyMtime(1500);
+      expect(await commitAll(work, "parent edit with unchanged gitlink")).not.toBeNull();
+      expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe(edited);
+      expect(existsSync(marker)).toBe(false);
+      await git(nested, "-c", "filter.attack.clean=", "commit", "--allow-empty", "-qm", "advance nested");
+      dirtyMtime(2000);
+      expect(await commitAll(work, "changed gitlink")).not.toBeNull();
+      expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
+        `160000 commit ${await headSha(nested)}\tnested`,
+      );
+      rmSync(join(work, ".gitmodules"));
+      dirtyMtime(3000);
+      expect(await commitAll(work, "remove module settings")).not.toBeNull();
+    } else if (operation === "discardChanges") {
+      expect(await discardChanges(work)).toBe(false);
+      writeFileSync(join(work, "sample.test.ts"), edited);
+      dirtyMtime();
+      expect(await discardChanges(work)).toBe(true);
+      expect(readFileSync(join(work, "sample.test.ts"), "utf8")).toBe(original);
+    } else {
+      expect((await factory("diff", "--name-only")).stdout).toBe("");
+    }
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
+test.each(["empty", "include-only", "remapped", "missing", "untracked", "normal", "ignored-fixture"])(
+  "merge and rebase guard populated nested repositories with %s .gitmodules",
+  async (form) => {
+    const nested = join(work, "nested");
+    const marker = join(dir, "nested-filter-ran");
+    const ordinary = form === "normal" || form === "ignored-fixture";
+    if (form === "ignored-fixture") {
+      writeFileSync(join(work, ".gitignore"), "node_modules/\n");
+      const fixture = join(work, "node_modules/pkg/test/fixture");
+      mkdirSync(fixture, { recursive: true });
+      writeFileSync(join(fixture, ".git"), "ordinary fixture text\n");
+      await commitAll(work, "ignore dependencies");
+    }
+    if (!ordinary) {
+      mkdirSync(nested);
+      await git(nested, "init", "-qb", "main");
+      writeFileSync(join(nested, "file"), "base\n");
+      await git(nested, "add", ".");
+      await git(nested, "commit", "-qm", "nested base");
+    }
+    const modules = '[submodule "nested=repo"]\n\tpath = nested\n\tignore = none\n';
+    if (form !== "untracked" && !ordinary) {
+      writeFileSync(join(work, ".gitmodules"), modules);
+      await commitAll(work, "gitlink");
+    }
+    const common = await headSha(work);
+    await git(seed, "reset", "--hard", common);
+    writeFileSync(join(seed, "base-only.txt"), "from base\n");
+    await git(seed, "add", ".");
+    await git(seed, "commit", "-qm", "base advances");
+    const nextBase = await headSha(seed);
+    // Keep the untracked fixture out of commitAll's staging.
+    if (form === "untracked") renameSync(nested, join(dir, "parked"));
+    writeFileSync(join(work, "sample.test.ts"), edited);
+    await commitAll(work, "worker advances");
+    if (form === "untracked") renameSync(join(dir, "parked"), nested);
+    const head = await headSha(work);
+    if (!ordinary) {
+      await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+      writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+      utimesSync(join(nested, "file"), 1000, 1000);
+    }
+    if (form === "empty") writeFileSync(join(work, ".gitmodules"), "");
+    if (form === "include-only") {
+      writeFileSync(join(dir, "modules"), modules);
+      writeFileSync(join(work, ".gitmodules"), "[include]\n\tpath = ../modules\n");
+    }
+    if (form === "remapped")
+      writeFileSync(join(work, ".gitmodules"), modules.replace("path = nested", "path = elsewhere"));
+    if (form === "missing") rmSync(join(work, ".gitmodules"));
+    if (ordinary || form === "untracked") {
+      expect(await prepareMerge(work, head, nextBase)).toEqual([]);
+      await factory("merge", "--abort");
+      expect(await rebaseOnto(work, nextBase)).toBe("clean");
+      expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe(edited);
+      expect(await readFileAt(work, "HEAD", "base-only.txt")).toBe("from base\n");
+    } else {
+      await expect(prepareMerge(work, head, nextBase)).rejects.toThrow(
+        "Cannot run merge or rebase with a populated nested repository",
+      );
+      expect(existsSync(marker)).toBe(false);
+      await expect(rebaseOnto(work, nextBase)).rejects.toThrow(
+        "Cannot run merge or rebase with a populated nested repository",
+      );
+      expect(await headSha(work)).toBe(head);
+      expect(await factory("rev-parse", "-q", "--verify", "MERGE_HEAD").catch(() => null)).toBeNull();
+    }
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
+test.each(["index", "HEAD", "target", "nonempty directory"])(
+  "merge and rebase refuse a populated gitlink from %s before running its filter",
+  async (source) => {
+    const nested = join(work, "nested");
+    const marker = join(dir, "nested-filter-ran");
+    writeFileSync(join(work, "sample.test.ts"), edited);
+    await commitAll(work, "worker advances");
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(join(nested, "file"), "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    const nestedHead = await headSha(nested);
+    const modules = '[submodule "nested"]\n\tpath = nested\n\tignore = none\n';
+    if (source === "HEAD") {
+      writeFileSync(join(work, ".gitmodules"), modules);
+      await commitAll(work, "gitlink");
+      await factory("update-index", "--force-remove", "nested");
+    } else if (source !== "target") {
+      await factory("update-index", "--add", "--cacheinfo", `160000,${nestedHead},nested`);
+      writeFileSync(join(work, ".gitmodules"), modules);
+    }
+    writeFileSync(join(seed, "base-only.txt"), "from base\n");
+    if (source === "target") writeFileSync(join(seed, ".gitmodules"), modules);
+    await git(seed, "add", ".");
+    if (source === "target")
+      await git(seed, "update-index", "--add", "--cacheinfo", `160000,${nestedHead},nested`);
+    await git(seed, "commit", "-qm", "base advances");
+    const target = await headSha(seed);
+    const head = await headSha(work);
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    utimesSync(join(nested, "file"), 1000, 1000);
+    if (source === "nonempty directory") rmSync(join(nested, ".git"), { recursive: true });
+    for (const operation of [() => prepareMerge(work, head, target), () => rebaseOnto(work, target)]) {
+      await expect(operation()).rejects.toThrow(
+        "Cannot run merge or rebase with a populated nested repository",
+      );
+      expect(await headSha(work)).toBe(head);
+      expect(existsSync(marker)).toBe(false);
+    }
+  },
+);
+
+test.each(["merge", "rebase"])("%s reports invalid targets without changing HEAD", async (operation) => {
+  const result = await worktreeGit(["git", operation, "invalid-target"], {
+    cwd: work,
+    allowFail: true,
+  });
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr).toContain("invalid-target");
+  await expect(
+    operation === "merge" ? prepareMerge(work, base, "invalid-target") : rebaseOnto(work, "invalid-target"),
+  ).rejects.toThrow(operation === "merge" ? "Merge preparation failed" : "rebase failed");
+  expect(await headSha(work)).toBe(base);
+});
+
+test("merge and rebase report inspection errors without checkout paths", async () => {
+  await factory("update-index", "--add", "--cacheinfo", `160000,${base},blocked/nested`);
+  // A symlink loop gives a deterministic filesystem error even when run as root.
+  symlinkSync("blocked", join(work, "blocked"));
+  for (const operation of [() => factory("merge", base), () => rebaseOnto(work, base)]) {
+    const error = await operation().catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Cannot inspect the checkout for nested repositories");
+    expect((error as Error).message).not.toContain(work);
+    expect((error as Error).message).not.toContain("blocked");
+    expect(await headSha(work)).toBe(base);
+  }
+});
+
+test("merge and rebase refuse a gitlink whose name isn't valid UTF-8", async () => {
+  // Index names are bytes; decoded as UTF-8 they would name a different path than git inspects.
+  const entry = Buffer.concat([
+    Buffer.from(`160000 ${base} 0\tnest`),
+    Buffer.from([0xff]),
+    Buffer.from("\n"),
+  ]);
+  expect(Bun.spawnSync(["git", "update-index", "--index-info"], { cwd: work, stdin: entry }).exitCode).toBe(
+    0,
+  );
+  for (const operation of [() => factory("merge", base), () => rebaseOnto(work, base)]) {
+    const error = await operation().catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Cannot inspect the checkout for nested repositories");
+    expect(await headSha(work)).toBe(base);
+  }
+});
+
+test.each([false, true])(
+  "stageAll matches add -A for a file replaced by a repository (ignored: %s) without running filters",
+  async (ignored) => {
+    if (ignored) {
+      writeFileSync(join(work, ".gitignore"), "sample.test.ts\n");
+      await commitAll(work, "ignore replacement path");
+    }
+    const nested = join(work, "sample.test.ts");
+    const marker = join(dir, "nested-filter-ran");
+    rmSync(nested);
+    mkdirSync(nested);
+    await git(nested, "init", "-qb", "main");
+    writeFileSync(join(nested, "file"), "base\n");
+    await git(nested, "add", ".");
+    await git(nested, "commit", "-qm", "nested base");
+    // Compare native staging before planting the filter, then restore the original index.
+    await git(work, "add", "-A");
+    const native = (await git(work, "ls-files", "--stage", "sample.test.ts")).stdout;
+    const nestedHead = await headSha(nested);
+    expect(native).toBe(`160000 ${nestedHead} 0\tsample.test.ts\n`);
+    await factory("read-tree", "HEAD");
+    await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+    writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+    utimesSync(join(nested, "file"), 1000, 1000);
+    await stageAll({ cwd: work });
+    expect((await factory("ls-files", "--stage", "sample.test.ts")).stdout).toBe(native);
+    expect(existsSync(marker)).toBe(false);
+    expect(await commitAll(work, "replace file with gitlink")).not.toBeNull();
+    expect((await factory("ls-tree", "HEAD", "sample.test.ts")).stdout).toBe(
+      `160000 commit ${nestedHead}\tsample.test.ts\n`,
+    );
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
+test("completeMerge does not run an unchanged gitlink's filter with ignore=none", async () => {
+  const nested = join(work, "nested");
+  const marker = join(dir, "nested-filter-ran");
+  mkdirSync(nested);
+  await git(nested, "init", "-qb", "main");
+  writeFileSync(join(nested, "file"), "base\n");
+  await git(nested, "add", ".");
+  await git(nested, "commit", "-qm", "nested base");
+  const nestedHead = await headSha(nested);
+  writeFileSync(join(work, ".gitmodules"), '[submodule "nested=repo"]\n\tpath = nested\n\tignore = none\n');
+  const common = await commitAll(work, "gitlink");
+  if (!common) throw new Error("expected gitlink commit");
+  await git(seed, "reset", "--hard", common);
+  writeFileSync(join(seed, "base-only.txt"), "from base\n");
+  await git(seed, "add", ".");
+  await git(seed, "commit", "-qm", "base advances");
+  const nextBase = await headSha(seed);
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  const head = await commitAll(work, "worker advances");
+  if (!head) throw new Error("expected worker commit");
+  // Isolate completion's staging from preparation's internal stash check.
+  renameSync(nested, join(dir, "parked"));
+  expect(await prepareMerge(work, head, nextBase)).toEqual([]);
+  renameSync(join(dir, "parked"), nested);
+  await git(nested, "config", "filter.attack.clean", `touch '${marker}'; cat`);
+  writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+  utimesSync(join(nested, "file"), 1000, 1000);
+  writeFileSync(join(work, "flag.test.ts"), edited);
+  const merged = await completeMerge(work, head, nextBase);
+  expect((await factory("rev-list", "--parents", "-n", "1", "HEAD")).stdout.trim()).toBe(
+    `${merged} ${head} ${nextBase}`,
+  );
+  expect(await readFileAt(work, "HEAD", "flag.test.ts")).toBe(edited);
+  expect(await readFileAt(work, "HEAD", "base-only.txt")).toBe("from base\n");
+  expect((await factory("ls-tree", "HEAD", "nested")).stdout.trim()).toBe(
+    `160000 commit ${nestedHead}\tnested`,
+  );
+  expect(existsSync(marker)).toBe(false);
+});
+
+test.each(["file-to-directory", "directory-to-symlink"])(
+  "commitAll stages a %s replacement",
+  async (replacement) => {
+    if (replacement === "file-to-directory") {
+      rmSync(join(work, "sample.test.ts"));
+      mkdirSync(join(work, "sample.test.ts"));
+      writeFileSync(join(work, "sample.test.ts/inside"), "replacement\n");
+    } else {
+      mkdirSync(join(work, "folder"));
+      writeFileSync(join(work, "folder/sample.test.ts"), "original\n");
+      await commitAll(work, "directory base");
+      rmSync(join(work, "folder"), { recursive: true });
+      // Its target exists, so lstat on folder/sample.test.ts alone would miss the replacement.
+      symlinkSync(".", join(work, "folder"));
+    }
+    expect(await commitAll(work, "replacement")).not.toBeNull();
+    const path = replacement === "file-to-directory" ? "sample.test.ts" : "folder";
+    const tree = (await factory("ls-tree", "-r", "HEAD", "--", path)).stdout.trim();
+    if (replacement === "file-to-directory") {
+      expect(tree).toMatch(/^100644 blob [0-9a-f]+\tsample\.test\.ts\/inside$/);
+      expect(await readFileAt(work, "HEAD", "sample.test.ts/inside")).toBe("replacement\n");
+    } else {
+      expect(tree).toMatch(/^120000 blob [0-9a-f]+\tfolder$/);
+      expect(await readFileAt(work, "HEAD", "folder")).toBe(".");
+    }
+  },
+);
+
+test("stageAll preserves skip-worktree and assume-unchanged entries", async () => {
+  await factory("update-index", "--skip-worktree", "flag.test.ts");
+  await factory("update-index", "--assume-unchanged", "assume.test.ts");
+  for (const name of ["flag.test.ts", "assume.test.ts", "sample.test.ts"])
+    writeFileSync(join(work, name), edited);
+  await stageAll({ cwd: work });
+  expect((await factory("diff", "--cached", "--name-only")).stdout.trim()).toBe("sample.test.ts");
+  expect((await factory("ls-files", "-v")).stdout).toContain("S flag.test.ts");
+  expect((await factory("ls-files", "-v")).stdout).toContain("h assume.test.ts");
+  for (const name of ["flag.test.ts", "assume.test.ts"]) rmSync(join(work, name));
+  await stageAll({ cwd: work });
+  expect((await factory("diff", "--cached", "--name-only")).stdout.trim()).toBe("sample.test.ts");
+});
+
+test.each(["rebase", "merge conflicted", "merge missing", "merge malformed"])(
+  "%s abort cleans up with unparseable or missing .gitmodules",
+  async (operation) => {
+    const modules = (name: string) => `[submodule "${name}"]\n\tpath = nested\n`;
+    writeFileSync(join(work, ".gitmodules"), modules("original"));
+    const common = await commitAll(work, "module configuration");
+    if (!common) throw new Error("expected module configuration commit");
+    await git(seed, "reset", "--hard", common);
+    writeFileSync(join(seed, ".gitmodules"), modules("upstream"));
+    await git(seed, "add", ".");
+    await git(seed, "commit", "-qm", "upstream name");
+    writeFileSync(join(work, ".gitmodules"), modules("worker"));
+    await commitAll(work, "worker name");
+    const head = await headSha(work);
+    if (operation === "rebase") {
+      expect(await rebaseOnto(work, await headSha(seed))).toBe("conflict");
+    } else {
+      expect(await prepareMerge(work, head, await headSha(seed))).toEqual([".gitmodules"]);
+      expect(readFileSync(join(work, ".gitmodules"), "utf8")).toContain("<<<<<<<");
+      if (operation === "merge missing") rmSync(join(work, ".gitmodules"));
+      if (operation === "merge malformed") writeFileSync(join(work, ".gitmodules"), "[broken\n");
+      await factory("merge", "--abort");
+      expect(await factory("rev-parse", "-q", "--verify", "MERGE_HEAD").catch(() => null)).toBeNull();
+    }
+    expect(await headSha(work)).toBe(head);
+    expect(readFileSync(join(work, ".gitmodules"), "utf8")).toBe(modules("worker"));
+    for (const name of ["rebase-merge", "rebase-apply"])
+      expect(existsSync(resolve(work, (await factory("rev-parse", "--git-path", name)).stdout.trim()))).toBe(
+        false,
+      );
+  },
+);
+
 test("committed .gitmodules ignore=all cannot hide added or changed gitlinks", async () => {
   const nested = join(work, "nested");
   mkdirSync(nested);
@@ -243,8 +604,7 @@ test("committed .gitmodules ignore=all cannot hide added or changed gitlinks", a
   writeFileSync(join(nested, "hidden.test.ts"), `${edited}// next\n`);
   await git(nested, "add", "-A");
   await git(nested, "commit", "-qm", "advance ignored repository");
-  await git(work, "update-index", "--cacheinfo", `160000,${await headSha(nested)},nested`);
-  await git(work, "-c", "submodule.nested.ignore=none", "commit", "-qm", "advance ignored gitlink");
+  expect(await commitAll(work, "advance ignored gitlink")).not.toBeNull();
   await assertVisible(first);
 });
 
@@ -3083,10 +3443,19 @@ test("a rename that drops the executable bit is a mode transition of the origina
   expect(diff.binaryPaths?.sort()).toEqual(["renamed.com", "renamed.png"]);
 });
 
+test("factory Git source remains reviewable by the content audit", async () => {
+  const source = readFileSync(new URL("../src/git/repos.ts", import.meta.url), "utf8");
+  writeFileSync(join(work, "repos.ts"), source);
+  await commitAll(work, "add factory Git source");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths).toEqual([]);
+  expect(diff.binaryErrors ?? []).toEqual([]);
+});
+
 test("PDF and container formats cannot use the text-content exclusion", async () => {
   const files = {
-    "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
-    "disguised.txt": " \n%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "ascii.pdf": "\x25PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "disguised.txt": " \n\x25PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
     "plain.pdf": "ordinary text\n",
     "archive.txt": "Rar!\x1a\x07\x01opaque ASCII container",
     "ordinary.txt": "ordinary text\n",
@@ -3114,7 +3483,7 @@ test("whole-blob classification catches a valid V7 TAR with its first NUL at 972
   const tar = Buffer.concat([...Array.from({ length: 19 }, () => header), Buffer.alloc(1024)]);
   writeFileSync(join(work, "late.tar"), tar);
   writeFileSync(join(work, "late.txt"), Buffer.concat([Buffer.alloc(9728, 0x61), Buffer.from([0])]));
-  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}%PDF-1.4\n%%EOF\n`);
+  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}\x25PDF-1.4\n%%EOF\n`);
   await commitAll(work, "late binary bytes");
   const diff = await diffSince(work, base);
   expect(diff.binaryPaths?.sort()).toEqual(["late-signature.txt", "late.tar", "late.txt"]);
