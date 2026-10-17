@@ -2209,7 +2209,9 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   deleteOldDebugEvents(before: number): number {
-    return this.db.query("DELETE FROM events WHERE level = 'debug' AND ts < ?").run(before).changes;
+    this.db.query("DELETE FROM events WHERE level = 'debug' AND ts < ?").run(before);
+    // Bun's result.changes includes cascades; SQLite changes() counts only the events.
+    return (this.db.query("SELECT changes() AS n").get() as { n: number }).n;
   }
 
   // ---- baseline cache ------------------------------------------------------
