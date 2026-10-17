@@ -182,7 +182,8 @@ for (const failure of ["setup", "timeout"] as const)
     }
   });
 
-// #556 measurement (2026-10-16): alone 28.85 s, paired load 43.78 s; sixteen real-Git trials.
+// #556 measurement (2026-10-16): alone 21.21 s, paired load 26.07 s; sixteen real-Git trials.
+// An earlier paired run took 43.78 s, so retain a 90 s limit.
 test("baseline gates are shared across repetitions and providers per case within each run", async () => {
   const f = await fixture("sh count-gates.sh", (_, observe) => ({
     "count-gates.sh": `if test -f answer; then echo candidate >> '${observe}/gate-runs'; else echo baseline >> '${observe}/gate-runs'; fi\n`,

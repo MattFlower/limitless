@@ -1954,7 +1954,7 @@ for (const moved of [false, true])
     history(next, run.id);
   });
 
-// #556 (2026-10-16): resolution-start 9.19 s alone/8.71 s paired; implementation-committed 8.72 s/9.46 s.
+// #556 (2026-10-16): resolution-start 8.44 s alone/10.31 s paired; implementation-committed 9.00 s/10.11 s.
 // Prior loaded gates hit 30 s; retain headroom for real Git conflict resolution and restart.
 for (const checkpoint of ["resolution-start", "implementation-committed"] as const)
   test(`factory merge survives interruption at ${checkpoint} without losing parents or replaying completed work`, async () => {
@@ -2389,7 +2389,7 @@ for (const failures of [2, 3]) {
       await restore();
     }
   };
-  // #556 (2026-10-16), 3 failures: alone 4.13 s/paired 4.51 s; prior loaded barriers hit 25 s.
+  // #556 (2026-10-16), 3 failures: alone 4.36 s, paired load 5.12 s; prior loaded barriers hit 25 s.
   test(
     `delivery with ${failures} PR-create 502s ${failures < 3 ? "delivers" : "falls back as GitHub unavailable"}`,
     checkDelivery,

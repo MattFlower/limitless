@@ -155,7 +155,7 @@ test("eval API shares JSON, Origin and Cloudflare guards and validates before pe
   }
 });
 
-// #556 measurement (2026-10-16): alone 3.72 s, paired load 4.60 s; four real-Git review/verify trials.
+// #556 measurement (2026-10-16): alone 2.95 s, paired load 4.41 s; four real-Git review/verify trials.
 test("review and verify API reports preserve role grades and text/JSON metrics", async () => {
   const f = await evalFixture();
   try {

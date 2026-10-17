@@ -14,7 +14,10 @@ import { testWaits } from "./wait-support.ts";
 
 const prepareWaits = testWaits();
 const preparing = new Set<Promise<unknown>>();
+const barriers = new Set<() => void>();
 afterEach(async () => {
+  for (const release of barriers) release();
+  barriers.clear();
   await Promise.allSettled([...preparing]);
 });
 
@@ -118,7 +121,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
     });
 
-    // #556 measurement (2026-10-16): alone 7.30 s, paired load 15.88 s; multiple real-Git pipelines.
+    // #556 measurement (2026-10-16): alone 9.82 s, paired load 17.06 s; multiple real-Git pipelines.
     test("a flaky base that failed twice is not cached, so the next run blocks the regression", async () => {
       const count = join(home, "gate-runs");
       // Fails the first baseline and its retry; later it fails only once the change exists.
@@ -145,11 +148,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const f = start(quick);
       // Both callers enter the flight before the leader can finish, without a timed gate sleep.
       const ready = Promise.withResolvers<void>();
+      barriers.add(ready.resolve);
+      const signal = prepareWaits.signal;
       let callers = 0;
       const singleFlight = baselineCache.singleFlight;
       const flight = spyOn(baselineCache, "singleFlight").mockImplementation(async (...args) => {
         if (++callers === 2) ready.resolve();
         await ready.promise;
+        signal.throwIfAborted();
         return singleFlight(...args);
       });
       const [a, b] = await Promise.all([prepared(f), prepared(f)]).finally(() => {
@@ -193,11 +199,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
         gateSlots.setLimit(3);
         // All callers must reach the flight before the leader's immediate failure can finish.
         const ready = Promise.withResolvers<void>();
+        barriers.add(ready.resolve);
+        const signal = prepareWaits.signal;
         let callers = 0;
         const singleFlight = baselineCache.singleFlight;
         const synchronized: typeof singleFlight = async (...args) => {
           if (++callers === 3) ready.resolve();
           await ready.promise;
+          signal.throwIfAborted();
           return singleFlight(...args);
         };
         const flight = spyOn(baselineCache, "singleFlight").mockImplementation(synchronized);
@@ -295,7 +304,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
     });
 
-    // #556 measurement (2026-10-16): alone 11.92 s, paired load 9.34 s; multiple real-Git pipelines.
+    // #556 measurement (2026-10-16): alone 9.37 s, paired load 10.62 s; multiple real-Git pipelines.
     test("a timed-out or cancelled baseline is not cached", async () => {
       const count = join(home, "gate-runs");
       // The first execution outlasts its timeout; later ones pass.
@@ -315,7 +324,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         `[gates]\nchecks = [{ name = "check", run = "${check.replace("sleep 5", "sleep 10")}" }]\n`,
       );
       const cancelled = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-      await wait(() => existsSync(count), {
+      // Redirection creates the file before echo writes the counted attempt.
+      await wait(() => existsSync(count) && readFileSync(count, "utf8").includes("x\n"), {
         timeoutMs: 20_000,
         description: "baseline never started",
         subscribe(wake) {
@@ -330,9 +340,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(after.state?.baselineCached).toBe(false);
       // Cancelled baseline, then this run's baseline and post-implement gates.
       expect(lines(count)).toBe(3);
-    }, 45_000);
+    });
 
-    // #556 measurement (2026-10-16): alone 16.15 s, paired load 11.45 s; multiple real-Git pipelines.
+    // #556 measurement (2026-10-16): alone 12.15 s, paired load 14.11 s; multiple real-Git pipelines.
     test("a bypass run refreshes a passing entry and evicts it when the base fails", async () => {
       const count = join(home, "gate-runs");
       const broken = join(home, "broken");
@@ -367,7 +377,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const switchedOff = await finish(f);
       expect([lines(count) - before, switchedOff.state?.baselineCached]).toEqual([2, false]);
       expect(cacheRows(f).map((r) => r.run_id)).toEqual([switchedOff.run.id]);
-    }, 45_000);
+    });
 
     test("post-rebase gates execute when prepare reused the cached baseline", async () => {
       const count = join(home, "gate-runs");

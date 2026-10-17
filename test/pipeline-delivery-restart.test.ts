@@ -77,7 +77,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     await wait(
       () => f.store.listStages(run.id).findLast((stage) => stage.name === "deliver")?.status === "cancelled",
       {
-        timeoutMs: 25_000,
+        timeoutMs: 10_000,
         description: "delivery interruption timed out",
         pollMs: null,
         subscribe: (wake) => f.store.subscribe(wake),
@@ -204,7 +204,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       registerGithub(f, bare);
       const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "standard" });
       await wait(() => existsSync(marker), {
-        timeoutMs: 25_000,
+        timeoutMs: checkpoint === "conflict-committed" ? 25_000 : 10_000,
         description: "delivery gate never reached its barrier",
         subscribe(wake) {
           const watcher = watch(home, wake);
@@ -302,7 +302,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         checkpoint === "conflict-implement" ? 2 : 3,
       );
     };
-    // #556 (2026-10-16), conflict-committed: alone 9.06 s/paired 11.17 s; real Git and crash recovery.
+    // #556 (2026-10-16), conflict-committed: alone 6.85 s, paired load 8.41 s; Git and crash recovery.
     test(`delivery checkpoint ${checkpoint} never publishes unchecked work`, checkCheckpoint, timeout);
   }
 
