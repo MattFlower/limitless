@@ -495,7 +495,7 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
     async () => {
       for (const args of GATES()) await gate(args, args.includes("test") ? 1_800_000 : 600_000);
     },
-    lease,
+    { ...lease, priority: "ship" },
   );
   if (smoke) await gate(SMOKE, 900_000);
 }
