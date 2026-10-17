@@ -7,7 +7,7 @@ How the factory runs day to day, where to look when something breaks, and how ch
 | Component | Where | Managed by | Logs |
 |---|---|---|---|
 | Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `dev.limitless.daemon` | `~/.limitless/logs/dev.limitless.daemon.log` |
-| Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
+| Local model (Qwen3.8 Flash Next; Qwen3.8 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | the remote llama.cpp host, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on the remote llama.cpp host |
 | Public webhook tunnel | Cloudflare → `<public_url host>/webhooks/*` | launchd `dev.limitless.tunnel` (opt-in) | `~/.limitless/logs/dev.limitless.tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
@@ -126,8 +126,8 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 - **Mac (oMLX):** start the server with oMLX.app / `omlx start`; Limitless does not manage it.
   Put `OMLX_API_KEY` in `~/.config/limitless/secrets.env` (used by both inference transports and
-  health probes). The default is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
-  `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in and needs far more memory.
+  health probes). The default is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-oQ4e-mtp`);
+  `omlx/qwen-27b` (`Qwen3.8-27B-8bit`) is opt-in and needs far more memory.
   Limitless allows 4 concurrent requests by default; override with `[providers.omlx]` and
   `max_concurrent = 8` in `config.toml`. This does not tune oMLX's own scheduler.
   Use `omlx/qwen-flash@none` or `@high` for tool-free roles (thinking off/on); bare selections
