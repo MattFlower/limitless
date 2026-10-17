@@ -3,6 +3,13 @@ import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { RunContext, RunState } from "./context.ts";
+import {
+  markReportArtifacts,
+  type ReportArtifacts,
+  type ReportPart,
+  reportJoin,
+  reportText,
+} from "./report-privacy.ts";
 import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
 
@@ -10,16 +17,46 @@ function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
 }
 
-function escapeCell(s: string): string {
-  return s.replace(/\|/g, "\\|").replace(/\n+/g, " ").slice(0, 300);
+/** Every display cut retains the complete rendering for privacy matching. */
+function clipText(text: string, limit: number, atLine = false): { text: string; source?: string } {
+  if (text.length <= limit) return { text };
+  const line = atLine ? text.lastIndexOf("\n", limit) : -1;
+  const displayed = text.slice(0, line > 0 ? line : limit);
+  return { text: atLine ? displayed.trimEnd() : displayed, source: text };
 }
 
-function table(header: string[], rows: string[][]): string {
-  return [
-    `| ${header.join(" | ")} |`,
-    `|${header.map(() => "---").join("|")}|`,
-    ...rows.map((r) => `| ${r.join(" | ")} |`),
-  ].join("\n");
+// Line breaks stay visible as <br> so the change view can still join a wrapped quotation.
+function clipCell(s: string): { text: string; source?: string } {
+  return clipText(s.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>"), 300);
+}
+
+// Only private spans may discard a clipped source: the view always withholds them whole.
+function escapeCell(s: string): string {
+  return clipCell(s).text;
+}
+
+function cell(kind: "prose" | "verifier", text: string) {
+  const clipped = clipCell(text);
+  return reportText(kind, clipped.text, clipped.source);
+}
+
+function table(
+  header: string[],
+  rows: (string | ReturnType<typeof reportText>)[][],
+  privateRows: boolean[] = [],
+): ReportPart {
+  return reportJoin(
+    [
+      `| ${header.join(" | ")} |`,
+      `|${header.map(() => "---").join("|")}|`,
+      ...rows.map((row, index) =>
+        privateRows[index]
+          ? reportText("private", `| ${row.map((c) => (typeof c === "string" ? c : c.text)).join(" | ")} |`)
+          : ["| ", reportJoin(row, " | "), " |"],
+      ),
+    ],
+    "\n",
+  );
 }
 
 export interface ReportInput {
@@ -56,9 +93,13 @@ export interface ReportInput {
 
 /** Markdown evidence report used as the PR body. Each block is one markdown element. */
 export function renderReport(input: ReportInput): string {
+  return renderReportArtifacts(input).report;
+}
+
+export function renderReportArtifacts(input: ReportInput): ReportArtifacts {
   input = redactGateData(input);
   const { state } = input;
-  const blocks: string[] = [
+  const blocks: ReportPart[] = [
     input.success
       ? state.flow === "verify-change"
         ? "Verified by **Limitless** — checks below have no blocking regressions."
@@ -68,8 +109,8 @@ export function renderReport(input: ReportInput): string {
     ...(input.success && state.flow === "verify-change" && state.reviewedSha
       ? [`Verified commit: \`${state.reviewedSha}\``]
       : []),
-    ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
-    ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
+    ...(state.rebaseNote ? [reportText("prose", `> [!NOTE]\n> ${state.rebaseNote}`)] : []),
+    ...(state.terminalReason ? [reportText("verifier", `🚧 ${state.terminalReason}`)] : []),
     ...(input.verifiedFailure
       ? [
           "## Failed after verification",
@@ -78,10 +119,13 @@ export function renderReport(input: ReportInput): string {
       : []),
     ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),
     "## Request",
-    input.prompt
-      .split("\n")
-      .map((l) => `> ${l}`)
-      .join("\n"),
+    reportText(
+      "prose",
+      input.prompt
+        .split("\n")
+        .map((l) => `> ${l}`)
+        .join("\n"),
+    ),
   ];
 
   if (Object.keys(input.models ?? {}).length)
@@ -90,11 +134,14 @@ export function renderReport(input: ReportInput): string {
       ...Object.entries(input.models ?? {}).map(([role, chain]) => `- ${role}: \`${chain.join(", ")}\``),
     );
 
-  if (state.implementerReport)
-    blocks.push("## Implementer's summary", state.implementerReport.trim().slice(0, 5000));
+  if (state.implementerReport) {
+    const summary = clipText(state.implementerReport.trim(), 5000, true);
+    blocks.push("## Implementer's summary", reportText("implementer", summary.text, summary.source));
+  }
 
   if (state.spec) {
     const verify = state.lastVerify;
+    const privateRows: boolean[] = [];
     blocks.push(
       "## Acceptance criteria",
       table(
@@ -112,13 +159,25 @@ export function renderReport(input: ReportInput): string {
                 : v.status === "blocked"
                   ? "🚧 blocked"
                   : "❔";
-          return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
+          const isPrivate = rowKind(ac.id, state.spec ?? null, state.holdout) !== "public";
+          privateRows.push(isPrivate);
+          return isPrivate
+            ? [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")]
+            : [
+                reportText("prose", `${icon} ${ac.id}`),
+                cell("prose", ac.criterion),
+                cell("verifier", v?.evidence ?? "not verified"),
+              ];
         }),
+        privateRows,
       ),
     );
     if (verify) blocks.push(`Verified by \`${verify.modelId}\` in a separate session from the implementer.`);
     if (state.spec.assumptions.length) {
-      blocks.push("**Assumptions**", state.spec.assumptions.map((a) => `- ${a}`).join("\n"));
+      blocks.push(
+        "**Assumptions**",
+        reportText("prose", state.spec.assumptions.map((a) => `- ${a}`).join("\n")),
+      );
     }
   }
 
@@ -145,6 +204,7 @@ export function renderReport(input: ReportInput): string {
               : (result?.status ?? "unclear"),
           escapeCell(result?.evidence ?? "not verified"),
         ]),
+        results.map(() => true),
       ),
     );
     if (state.lastVerify)
@@ -152,12 +212,15 @@ export function renderReport(input: ReportInput): string {
     if (followUps.length)
       blocks.push(
         "**Holdout follow-ups** (not required by the request or spec; they did not trigger another round)",
-        followUps
-          .map(
-            ({ scenario, result }) =>
+        reportJoin(
+          followUps.map(({ scenario, result }) =>
+            reportText(
+              "private",
               `- ${scenario.id}: ${escapeCell(scenario.description)} — ${escapeCell(result?.evidence ?? "")}`,
-          )
-          .join("\n"),
+            ),
+          ),
+          "\n",
+        ),
       );
   }
 
@@ -177,7 +240,17 @@ export function renderReport(input: ReportInput): string {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
           const row = [g.name, `${icon} ${g.result.timedOut ? "timed out" : g.verdict.replace("_", " ")}`];
-          return commands ? [...row, `\`${escapeCell(g.result.command)}\``] : row;
+          const command = clipCell(g.result.command);
+          return commands
+            ? [
+                ...row,
+                reportText(
+                  "prose",
+                  `\`${command.text}\``,
+                  command.source === undefined ? undefined : `\`${command.source}\``,
+                ),
+              ]
+            : row;
         }),
       ),
     );
@@ -207,27 +280,33 @@ export function renderReport(input: ReportInput): string {
           : [],
     );
     if (schedule.length) blocks.push(schedule.join("\n"));
-    blocks.push(`**${r.verdict}** — ${r.summary}`);
+    blocks.push(reportText("prose", `**${r.verdict}** — ${r.summary}`));
     if (r.findings.length) {
       blocks.push(
-        r.findings
-          .map(
-            (f) =>
-              `- ${severity(f)}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
-          )
-          .join("\n"),
+        reportText(
+          "prose",
+          r.findings
+            .map(
+              (f) =>
+                `- ${severity(f)}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
+            )
+            .join("\n"),
+        ),
       );
     }
   }
   if (state.reviewFollowUps?.length) {
     blocks.push(
       "## Review follow-ups",
-      state.reviewFollowUps
-        .map(
-          (f) =>
-            `- ${severity(f)}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
-        )
-        .join("\n"),
+      reportText(
+        "prose",
+        state.reviewFollowUps
+          .map(
+            (f) =>
+              `- ${severity(f)}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
+          )
+          .join("\n"),
+      ),
     );
   }
 
@@ -235,7 +314,10 @@ export function renderReport(input: ReportInput): string {
   if (audit.length) {
     blocks.push(
       "## Audit flags",
-      audit.map((f) => `- ${f.severity} [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n"),
+      reportText(
+        "prose",
+        audit.map((f) => `- ${f.severity} [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n"),
+      ),
     );
   }
 
@@ -275,7 +357,7 @@ export function renderReport(input: ReportInput): string {
 
   if (input.closesIssue) blocks.push(`Closes #${input.closesIssue}`);
   blocks.push(`Run \`${input.runId}\` · ${input.runUrl}`, "🤖 Generated by Limitless");
-  return `${blocks.join("\n\n")}\n`;
+  return markReportArtifacts(blocks);
 }
 
 /**
@@ -292,8 +374,21 @@ export function buildReport(
   success: boolean,
   verifiedFailure?: ReportInput["verifiedFailure"],
 ): string {
+  return buildReportArtifacts(ctx, success, verifiedFailure).report;
+}
+
+export function saveReport(ctx: RunContext, rendered: ReportArtifacts): void {
+  ctx.artifact("report-sources.json", "report", JSON.stringify(rendered.sources));
+  ctx.artifact("report.md", "report", rendered.report);
+}
+
+export function buildReportArtifacts(
+  ctx: RunContext,
+  success: boolean,
+  verifiedFailure?: ReportInput["verifiedFailure"],
+): ReportArtifacts {
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
-  return renderReport({
+  return renderReportArtifacts({
     success,
     signalWarnings: ctx.store.countEvents(ctx.run.id, "signal_attempt"),
     runId: ctx.run.id,

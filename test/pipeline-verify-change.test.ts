@@ -7,6 +7,7 @@ import type { FakeReply } from "../src/harness/fake.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { reportStructure } from "../src/pipeline/report-privacy.ts";
 import { sh } from "../src/util/proc.ts";
 import { approve, type Handler, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
@@ -296,6 +297,12 @@ protected_paths = ["protected.txt"]
       );
       stopNotifier();
       const state = f.store.getRunState<RunState>(runId);
+      const report = f.store.getArtifact(runId, "report.md");
+      if (report !== null) {
+        const sources = f.store.getArtifact(runId, "report-sources.json");
+        expect(sources).not.toBeNull();
+        expect(JSON.parse(sources ?? "null").digest).toBe(reportStructure(report)?.digest ?? "");
+      }
       expect(state?.flow).toBe("verify-change");
       expect(f.store.getRunDetail(runId)?.run.flow).toBe("verify-change");
       const revisions = readFileSync(records, "utf8").trim().split("\n");
@@ -352,6 +359,8 @@ protected_paths = ["protected.txt"]
         expect(comments).toHaveLength(1);
         expect(comments[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
         expect(comments[0]?.at(-1)).not.toContain("generated.txt");
+        expect(comments[0]?.at(-1)).not.toContain("limitless-report:");
+        expect(f.store.getArtifact(runId, "report.md")).toContain("<!-- limitless-report:");
         expect(comments[0]?.at(-1)).toContain(`Verified commit: \`${head}\``);
         expect(f.store.getArtifact(runId, "report.md")).toContain(`Verified commit: \`${head}\``);
         expect(comments[0]?.at(-1)).toContain(`<!-- limitless-verification:${runId} -->`);

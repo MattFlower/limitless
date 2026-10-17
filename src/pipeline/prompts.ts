@@ -279,6 +279,15 @@ export function redactHoldoutText(
   return removed ? `${safe} [${removed} private details withheld]` : safe;
 }
 
+/** Exactly the private-row summary rendered in implementer feedback. */
+export function privateVerifySummary(summary: string, holdout?: Holdout, publicSources = ""): string {
+  const redacted = holdout ? redactHoldoutText(summary.trim(), holdout, publicSources, true) : "";
+  const behavior = redacted.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");
+  return /[\p{L}\p{N}]/u.test(behavior)
+    ? redacted
+    : `The verifier could not confirm this private scenario.${redacted.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
+}
+
 export function formatVerifyFeedback(
   verify: Verify,
   spec: Spec | null,
@@ -301,13 +310,7 @@ export function formatVerifyFeedback(
       const kind = rowKind(c.id, spec, holdout);
       if (kind === "unknown") return `- **unknown-${index + 1}** (${c.status}): Unknown criterion.`;
       const privateScenario = kind !== "public";
-      const summary = holdout
-        ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources, privateScenario)
-        : "";
-      const behavior = summary.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");
-      const safeSummary = /[\p{L}\p{N}]/u.test(behavior)
-        ? summary
-        : `The verifier could not confirm this private scenario.${summary.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
+      const safeSummary = privateVerifySummary(c.publicSummary, holdout, publicSources);
       if (!privateScenario)
         return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${holdout ? redactHoldoutText(c.evidence, holdout, publicSources, false) : c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
