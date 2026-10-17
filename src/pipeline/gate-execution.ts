@@ -41,6 +41,7 @@ export async function runGateExecution(
         headSha: sha,
         gates,
         skipGateSlot: hooks.skipGateSlot,
+        priority: stage === "prepare" ? "start" : "finish",
         checks: gates.checks.map((c) => c.name),
       },
       ctx.signal,
