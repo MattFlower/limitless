@@ -8,7 +8,9 @@ in their preload; subprocess tests pass that preload explicitly. Production read
 
 The existing hardening flags, hook/filter blanking, dirty-submodule suppression and populated-repository
 walk remain. A recorded linked worktree supplies the write roots; standalone repositories use their
-own administration directory. Scratch and TMPDIR are canonicalized too. Reads remain unrestricted.
+own administration directory. Explicit global `--git-dir` and `--work-tree` options take precedence
+over the environment, with the last option winning; filenames after the command cannot select write
+roots. Scratch and TMPDIR are canonicalized too. Reads remain unrestricted.
 
 ## Caller audit
 
@@ -41,7 +43,7 @@ The [Git configuration reference](https://git-scm.com/docs/git-config) and
 | `core.fsmonitor` | Direct profile probe; the wrapper also preserves `core.fsmonitor=false`. |
 | `gpg.program`, `commit.gpgSign` | Signing profile probe. A nested dirty check does not commit inside the nested repository. |
 | `core.askPass`, credential helpers, `core.sshCommand` | Authentication/transport paths; checkout operations do not request them. Confined operations have no network or shell transport. |
-| hooks | Existing hook tests; local delivery preserves hook blanking at both ends. |
+| hooks | Existing hook tests; bundle delivery plants pre-push, pre-receive, update and reference-transaction hooks at both ends and checks that none runs. Tags and notes remain absent at the destination. |
 | external diff / textconv | Existing hardening disables them on inspection. |
 | pager / editor / sequence editor / merge tools | Factory captures output and supplies commit messages, uses noninteractive rebase, and does not invoke external diff/merge tools. Any attempted execution is denied. |
 | shell aliases / remote helpers / upload-pack / receive-pack | Alias execution probe; local delivery and candidate-to-grader transfer use bundles. Remote transports remain outside this boundary. |
@@ -69,22 +71,30 @@ Conservative interpretation: matrix rows already protected by #539 remain regres
 Requiring every such row to execute a marker on main would contradict the requirement to preserve
 those protections. New empty-commit and race identity controls demonstrate the remaining gap.
 
-The implementation exceeds the approximate 150-line source budget (about 210 net source lines,
+The implementation exceeds the approximate 150-line source budget (about 220 net source lines,
 including the manual landing entry point and the additional eval transfer discovered in the audit).
 
 ## Checks run in the worker
 
-- `bun run lint`, `bun run typecheck`, `git diff --check`, and `bash -n scripts/land-pr.sh`: pass
-  (lint reports existing warnings).
-- `bun test test/land-pr.test.ts test/worktree-git-locks.test.ts`: 119 pass.
-- `bun test test/git-confinement.test.ts test/pipeline-local-clones.test.ts test/pipeline-merge-integrity.test.ts test/conflict-rounds.test.ts test/land-queue.test.ts test/mcp.test.ts`:
-  187 pass, 46 real-Seatbelt cases skipped.
-- `bun test test/git-confinement.test.ts`: 17 pass, 46 skipped, including all portable execution controls.
-- `bun test test/git-integrity.test.ts test/evals-implement-runner.test.ts`: initially 289 pass,
-  2 platform skips and 8 failures. Six scratch-count assertions now include bundle scratch and all
-  six pass on the cleanup rerun. The Git-version subprocess now explicitly preloads the fake backend
-  and passes its rerun. The config-cache probe also passes after making its sources explicit.
+The initial affected-suite run completed with 727 passes, 50 platform skips and one failure: the
+new directory-precedence regression, added before its fix. No existing test failed. That failure
+showed the old profile granting inherited paths instead of the explicit destinations.
 
-The config-cache assertion failed with the original hardening implementation restored too: Apple's
-Git reads an additional system config not named by `git var`. That probe now disables system config
-and inherited config parameters, retaining its single-listing and post-edit invalidation assertions.
+```sh
+bun test --parallel=4 test/git-confinement.test.ts test/git-integrity.test.ts test/land-queue.test.ts test/land-pr.test.ts test/conflict-rounds.test.ts test/pipeline-conflicts.test.ts test/pipeline-merge-integrity.test.ts test/pipeline-local-clones.test.ts test/evals-implement-runner.test.ts test/failure-injection.test.ts
+```
+
+After the fix, the regression passed on its own. The following batch also completed with 68 passes,
+48 real-Seatbelt skips and zero failures, including the strengthened hook/notes delivery assertions:
+
+```sh
+bun test --parallel=4 test/git-confinement.test.ts test/mcp.test.ts test/gc.test.ts test/worktree-git-locks.test.ts test/github-delivery.test.ts
+```
+
+The final `bun test test/git-confinement.test.ts` completed with 22 passes, 48 real-Seatbelt skips
+and zero failures. Across the two batches, all 774 distinct runnable tests in 14 affected files
+passed after the regression fix; 50 platform-specific tests skipped. Real Seatbelt verification
+remains outstanding and must happen outside this worker's sandbox.
+
+`bun run lint` (existing warnings), `bunx tsc --noEmit`, `bunx biome check` on changed TypeScript,
+`git diff --check`, and `bash -n scripts/land-pr.sh` pass.

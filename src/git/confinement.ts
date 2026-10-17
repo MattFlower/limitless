@@ -76,16 +76,25 @@ export function seatbeltGit(platform = process.platform, executable = sandbox, r
         installation.catch(() => installations.delete(git));
       }
       const { binaries, execPath } = await installation;
+      // Git's global directory options override the environment; the last option wins.
+      const globals: string[] = [];
+      for (let i = 1; cmd[i]?.startsWith("-"); i++) {
+        const arg = cmd[i] ?? "";
+        if (["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"].includes(arg)) i++;
+        else globals.push(arg);
+      }
       const admin =
+        globals.findLast((arg) => arg.startsWith("--git-dir="))?.slice(10) ??
         env.GIT_DIR ??
-        cmd.find((arg) => arg.startsWith("--git-dir="))?.slice(10) ??
         (lstatSync(join(opts.cwd, ".git"), { throwIfNoEntry: false })?.isDirectory()
           ? join(opts.cwd, ".git")
           : opts.cwd);
       const writes = [
         ...new Set(
           [
-            env.GIT_WORK_TREE ?? opts.cwd,
+            globals.findLast((arg) => arg.startsWith("--work-tree="))?.slice(12) ??
+              env.GIT_WORK_TREE ??
+              opts.cwd,
             admin,
             env.GIT_COMMON_DIR ?? admin,
             scratch,

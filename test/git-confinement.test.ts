@@ -237,8 +237,11 @@ for (const confined of [false, true])
       const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
       const marker = join(root, "hook");
       for (const repo of [cwd, work])
-        writeFileSync(join(repo, ".git/hooks/pre-push"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+        for (const hook of ["pre-push", "pre-receive", "update", "reference-transaction"])
+          writeFileSync(join(repo, ".git/hooks", hook), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
       await git(work, "tag", "unwanted");
+      await git(work, "notes", "add", "-m", "unwanted note");
+      rmSync(marker, { force: true });
 
       await gitConfinement.run(confined ? seatbeltGit() : fakeGitConfinement, () =>
         pushBranch(
@@ -258,6 +261,7 @@ for (const confined of [false, true])
       );
       expect((await git(cwd, "rev-parse", "refs/heads/delivered")).stdout.trim()).toBe(head);
       expect((await git(cwd, "tag", "--list")).stdout).toBe("");
+      expect((await git(cwd, "for-each-ref", "refs/notes")).stdout).toBe("");
       expect(existsSync(marker)).toBe(false);
     },
   );
@@ -397,6 +401,47 @@ test("runtime allowances pin the resolved git, exec directory and canonical writ
     expect(profile).toContain(`(subpath "${realpathSync(path)}")`);
   expect(profile).not.toContain("/untrusted");
   expect(wrapped).toContain(`--exec-path=${execPath}`);
+});
+
+test("write allowances follow Git's explicit directory options before inherited paths", async () => {
+  const inherited = join(root, "inherited");
+  const admin = join(root, "admin");
+  const common = join(root, "common");
+  const work = join(root, "work");
+  const scratch = join(root, "scratch");
+  for (const dir of [inherited, admin, common, work, scratch]) mkdirSync(dir);
+  const execPath = realpathSync((await git(cwd, "--exec-path")).stdout.trim());
+  const run: typeof sh = async (cmd) =>
+    cmd[0] === "/usr/bin/xcode-select"
+      ? sh(cmd, { cwd })
+      : { stdout: cmd.includes("--exec-path") ? execPath : "git version", stderr: "", exitCode: 0 };
+  const wrapped = await seatbeltGit("darwin", process.execPath, run).wrap(
+    [
+      "git",
+      `--git-dir=${inherited}`,
+      `--git-dir=${admin}`,
+      `--work-tree=${inherited}`,
+      `--work-tree=${work}`,
+      "status",
+      "--",
+      "--git-dir=filename",
+      "--work-tree=filename",
+    ],
+    {
+      cwd,
+      env: {
+        ...process.env,
+        GIT_DIR: inherited,
+        GIT_COMMON_DIR: common,
+        GIT_WORK_TREE: inherited,
+        TMPDIR: scratch,
+      },
+    },
+  );
+  const profile = wrapped[2] ?? "";
+  for (const dir of [admin, common, work, scratch])
+    expect(profile).toContain(`(subpath "${realpathSync(dir)}")`);
+  expect(profile).not.toContain(`(subpath "${realpathSync(inherited)}")`);
 });
 
 for (const confined of [false, true])
