@@ -9,6 +9,7 @@ import {
   type GateRun,
   runLocalGates,
 } from "./run.ts";
+import type { GatePriority } from "./slots.ts";
 
 export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
@@ -30,6 +31,7 @@ export type ExecutionEvent =
   | { type: "status"; text: string }
   | { type: "check"; phase: "setup" | "check"; result: GateResult };
 export interface GateRequest {
+  priority?: GatePriority;
   repo: string;
   cwd: string;
   baseSha: string;
@@ -117,6 +119,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
           onWait: slotHooks.onWait,
           holder: slotHooks.holder,
           skipGateSlot: req.skipGateSlot,
+          priority: req.priority,
           onResult(r, phase) {
             results.push({ type: "check", phase, result: r });
             notify();

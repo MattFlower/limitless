@@ -88,7 +88,14 @@ test("show and logs print originals beside public records, without credentials",
       { runId, invocationId, kind, text: `${text} ${credential}`, ...(kind === "event" ? { eventId } : {}) },
       "public",
     );
-  store.recordOwnerDiagnostic({ runId, kind: "run-error", text: "OWNER_RUN_ERROR_423" }, "public");
+  store.recordOwnerDiagnostic(
+    { runId, kind: "run-error", text: `OWNER_RUN_ERROR_423 gate \x1b[31m${credential}` },
+    "public",
+  );
+  expect(ownerDiagnostics(store.db, runId).at(-1)?.text).toBe("OWNER_RUN_ERROR_423 gate [redacted]");
+  store.db
+    .query("INSERT INTO owner_diagnostics (run_id, kind, text) VALUES (?, ?, ?)")
+    .run(runId, "run-error", "LEGACY_OWNER_ERROR_423 \x1b[31mgate\x1b[0m");
   for (const command of ["show", "logs"]) {
     const result = await cli([command, runId]);
     expect(result.exitCode).toBe(0);
@@ -99,10 +106,16 @@ test("show and logs print originals beside public records, without credentials",
       "--force 48231",
       "OWNER_EVENT_423",
       "OWNER_RUN_ERROR_423",
+      "LEGACY_OWNER_ERROR_423 gate",
       "[redacted]",
     ])
       expect(result.stdout).toContain(text);
     expect(result.stdout).not.toContain(credential);
+    const diagnosticTexts = [...result.stdout.matchAll(/\[owner diagnostic:[^\n]*\n([^\n]*)/g)].map(
+      (m) => m[1],
+    );
+    expect(diagnosticTexts).toHaveLength(5);
+    expect(diagnosticTexts.join("\n")).not.toContain("\x1b");
     expect(result.stdout).toContain(
       command === "show" ? "public error [private detail]" : "public result [private detail]",
     );

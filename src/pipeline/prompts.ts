@@ -3,7 +3,7 @@ import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { findGateCounterpart, redactGateData } from "../gates/output.ts";
+import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
   citationInSource,
@@ -12,12 +12,15 @@ import {
   type Review,
   renderSpec,
   requirementEntries,
-  requirementSource,
   rowKind,
   type Spec,
   type Verify,
 } from "./schemas.ts";
 import { specCriteriaRange } from "./spec-criteria.ts";
+
+/** Sanitize decoded values before JSON escapes can hide terminal-split credentials. */
+export const promptJson = (value: unknown, space?: number): string =>
+  JSON.stringify(redactGateData(value), null, space);
 
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
@@ -202,6 +205,7 @@ export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): str
 }
 
 export function formatAuditFeedback(findings: AuditFinding[]): string {
+  findings = redactGateData(findings);
   const block = findings.filter((f) => f.severity === "block");
   if (!block.length) return "";
   return `### Policy violations\n${block.map((f) => `- [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n")}`;
@@ -209,6 +213,7 @@ export function formatAuditFeedback(findings: AuditFinding[]): string {
 
 /** `panel`: a finding without a ruling blocks only because the verifier left it out (fail closed). */
 export function formatReviewFeedback(findings: Review["findings"], panel = false): string {
+  findings = redactGateData(findings);
   if (!findings.length) return "";
   return `### Code review findings (must fix)\n${findings
     .map(
@@ -323,7 +328,9 @@ export function formatVerifyFeedback(
     })
     .join("\n");
   // Printed once: repeating the public sources per holdout bloated feedback and the needs_human error.
-  return `### Checks not met\n${items}${unvalidated ? "\n\nUnvalidated attributions: check them against the original request and specification above." : ""}`;
+  return redactGateOutput(
+    `### Checks not met\n${items}${unvalidated ? "\n\nUnvalidated attributions: check them against the original request and specification above." : ""}`,
+  );
 }
 
 /**
@@ -339,13 +346,19 @@ function groundedCitation(
   holdout: Holdout | undefined,
   publicSources: string,
 ): string | null {
-  const quote = citedRequirement(citation, sourceText, requirementEntries(requirement, spec));
+  const quote = citedRequirement(
+    citation,
+    sourceText,
+    requirementEntries(requirement, spec).map(redactGateOutput),
+  );
   if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote) return null;
   return quote;
 }
 
 function publicSource(requirement: "request" | "spec", request: string, spec: Spec | null): string {
-  return requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
+  return requirement === "request"
+    ? redactGateOutput(request)
+    : requirementEntries("spec", spec).map(redactGateOutput).join("\n");
 }
 
 function gateTable(cmp: GateComparison[]): string {
@@ -481,12 +494,11 @@ ${sealedFence(input.firstParentPatch.slice(0, PATCH_LIMIT) || "(empty diff)")}
 Reviewed commit: ${input.previous.sha}. Current HEAD: ${input.headSha ?? "HEAD"}.
 Previous blocking findings (the only findings sent back for implementation):
 ${fence(
-  JSON.stringify(
+  promptJson(
     input.previous.findings.map((f, i) => ({
       id: `P${i + 1}`,
       ...brief(f, "unresolved at the previous review; recheck it against the fix diff"),
     })),
-    null,
     2,
   ),
 )}
@@ -494,9 +506,8 @@ ${
   fix && input.previous.resolved?.length
     ? `Earlier blocking findings already resolved (do not raise them again unless the fix diff reintroduces one, as a regression):
 ${fence(
-  JSON.stringify(
+  promptJson(
     input.previous.resolved.map((f) => brief(f, "resolved")),
-    null,
     2,
   ),
 )}
@@ -584,15 +595,15 @@ Previously reviewed: ${input.fix.sha}. Head: ${input.headSha ?? "HEAD"}. Inspect
 ${fence(input.stat.trim() || "(empty diff)")}
 
 # Prior blocking findings (status from this re-review's finders, not proof)
-${fence(JSON.stringify(input.fix.prior, null, 2))}
-${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(JSON.stringify(input.fix.resolved, null, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed, or asks you to recheck it when no finder repeated it: REFUTE it when the fix diff resolves it, else CONFIRM it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
+${fence(promptJson(input.fix.prior, 2))}
+${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(promptJson(input.fix.resolved, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed, or asks you to recheck it when no finder repeated it: REFUTE it when the fix diff resolves it, else CONFIRM it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
     : `# Change under review
 Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}`
 }
 
 # Candidates (claims to check, not facts)
-${fence(JSON.stringify(input.candidates, null, 2))}
+${fence(promptJson(input.candidates, 2))}
 
 # Verdicts
 - CONFIRMED: the code shows the failure happens.

@@ -408,6 +408,7 @@ export class LandQueue {
           baseSha,
           headSha: await headSha(cwd),
           gates: detectGates(base),
+          priority: "ship",
         },
         signal,
         {

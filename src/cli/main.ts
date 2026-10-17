@@ -78,7 +78,7 @@ Usage:
   limitless service uninstall|status
   limitless local up|down|status          Report oMLX health; manage configured remote llama.cpp ([local].remote_host)
                                          [local].remote_model_path / remote_llama_binary configure new units
-  limitless gate-slot [--name <holder>] [--max-wait <seconds>] -- <command...>
+  limitless gate-slot [--name <holder>] [--max-wait <seconds>] [--priority <ship|finish|start>] -- <command...>
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 

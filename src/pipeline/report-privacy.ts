@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { redactGateOutput } from "../gates/output.ts";
 
 const marker = "<!-- limitless-report:";
 const spanSchema = z.strictObject({
@@ -33,23 +34,24 @@ export function markReport(blocks: ReportPart[]): string {
   return markReportArtifacts(blocks).report;
 }
 
-/** Keep Markdown unchanged; only the separate sources artifact carries complete clipped text. */
+/** Sanitize before measuring spans and hashing so the artifact boundary preserves the manifest. */
 export function markReportArtifacts(blocks: ReportPart[]): ReportArtifacts {
   let body = "";
   const spans: Span[] = [];
   const sources: Record<string, string> = {};
   const append = (part: ReportPart): void => {
-    if (typeof part === "string") body += part;
+    if (typeof part === "string") body += redactGateOutput(part);
     else if (Array.isArray(part)) part.forEach(append);
     else {
-      if (part.source !== undefined) sources[spans.length] = part.source;
+      const text = redactGateOutput(part.text);
+      if (part.source !== undefined) sources[spans.length] = redactGateOutput(part.source);
       spans.push({
         kind: part.kind,
         start: body.length,
-        end: body.length + part.text.length,
+        end: body.length + text.length,
         ...(part.source !== undefined ? { clipped: true } : {}),
       });
-      body += part.text;
+      body += text;
     }
   };
   append(reportJoin(blocks, "\n\n"));

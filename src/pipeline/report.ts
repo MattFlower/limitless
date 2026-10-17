@@ -378,8 +378,8 @@ export function buildReport(
 }
 
 export function saveReport(ctx: RunContext, rendered: ReportArtifacts): void {
-  ctx.store.putArtifact(ctx.run.id, "report-sources.json", "report", JSON.stringify(rendered.sources));
-  ctx.store.putArtifact(ctx.run.id, "report.md", "report", rendered.report);
+  ctx.artifact("report-sources.json", "report", JSON.stringify(rendered.sources));
+  ctx.artifact("report.md", "report", rendered.report);
 }
 
 export function buildReportArtifacts(

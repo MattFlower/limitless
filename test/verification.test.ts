@@ -20,6 +20,7 @@ import {
   VerifySchema,
 } from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
 
 const spec: Spec = {
@@ -508,6 +509,29 @@ test("a complete short spec entry is grounded; a short partial quote is not", ()
     shortSpec,
   );
   expect(requestIssue).toBe("evidence does not cite the requirement");
+});
+
+test("short citations are grounded and explained against sanitized public text", () => {
+  const credential = "synthetic-short-citation-549";
+  registerCredential("SHORT_CITATION_TEST", credential);
+  const literal = `Run \x1b[31m${credential}`;
+  const storedSpec = { ...spec, requirements: [literal, "Keep logs"] };
+  const request = `- ${literal}\n- Keep logs`;
+  for (const requirement of ["request", "spec"] as const) {
+    const verify = unmetHoldout({
+      requirement,
+      requirementCitation: "Run [redacted]",
+      evidence: "The requirement Run [redacted] was not satisfied.",
+    });
+    const normalized = normalizeVerify(verify, storedSpec, holdout, request);
+    expect(normalized.notes).not.toContain("citation validation failed");
+    const feedback = formatVerifyFeedback(normalized, storedSpec, holdout, "", request);
+    expect(feedback).toContain(
+      `this requirement of the ${requirement === "request" ? "original request" : "specification"}: "Run [redacted]"`,
+    );
+    expect(feedback).not.toContain("citation was not found");
+  }
+  expect(storedSpec.requirements).toEqual([literal, "Keep logs"]);
 });
 
 test("a trivial citation blocks and is never repeated to the implementer", () => {

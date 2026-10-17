@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { redactGateOutput } from "../src/gates/output.ts";
 import { buildReportRedactor } from "../src/integrations/mcp-change.ts";
 import { renderReportArtifacts } from "../src/pipeline/report.ts";
 import {
@@ -8,6 +9,43 @@ import {
   reportText,
   stripReportManifest,
 } from "../src/pipeline/report-privacy.ts";
+import { registerCredential } from "../src/util/proc.ts";
+
+test.each(["terminal escapes", "registered credential"])(
+  "report parts and clipped sources sanitize %s before computing spans and digest",
+  (scenario) => {
+    const secret = "SYNTHETIC_REPORT_PART_CREDENTIAL_545";
+    const hasCredential = scenario === "registered credential";
+    if (hasCredential) registerCredential("report-part-test", secret);
+    const unsafe = hasCredential ? secret : "\x1b[31mpublic output\x1b[0m";
+    const sanitized = hasCredential ? "[redacted]" : "public output";
+    const { report, sources } = markReportArtifacts([
+      `Heading ${unsafe}`,
+      [
+        reportText("implementer", `Summary ${unsafe}`, `Summary ${unsafe} and tail ${unsafe}`),
+        reportText("verifier", `Evidence ${unsafe}`, `Evidence ${unsafe} and tail ${unsafe}`),
+      ],
+    ]);
+    for (const content of [report, JSON.stringify(sources), ...Object.values(sources.sources)]) {
+      expect(content).not.toContain(secret);
+      expect(content).not.toMatch(/[^\P{Cc}\n\r\t]/u);
+      expect(content).not.toContain("\\u001b");
+    }
+    expect(redactGateOutput(report)).toBe(report);
+    const structure = reportStructure(report);
+    if (!structure) throw new Error("Invalid report manifest");
+    expect(structure.digest).toBe(sources.digest);
+    expect(structure.body).toStartWith(`Heading ${sanitized}`);
+    expect(structure.spans.map(({ start, end }) => structure.body.slice(start, end))).toEqual([
+      `Summary ${sanitized}`,
+      `Evidence ${sanitized}`,
+    ]);
+    expect(sources.sources).toEqual({
+      0: `Summary ${sanitized} and tail ${sanitized}`,
+      1: `Evidence ${sanitized} and tail ${sanitized}`,
+    });
+  },
+);
 
 test.each([
   "red owl",

@@ -10,10 +10,15 @@ import * as gitCommand from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
-import { renderReport, renderReportArtifacts } from "../src/pipeline/report.ts";
-import { markReportArtifacts, reportText } from "../src/pipeline/report-privacy.ts";
+import {
+  buildReportArtifacts,
+  renderReport,
+  renderReportArtifacts,
+  saveReport,
+} from "../src/pipeline/report.ts";
+import { markReportArtifacts, reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import {
@@ -195,6 +200,96 @@ test("HTTP-backed change pages match direct MCP for the pinned code and report",
     await connections.close();
   }
 });
+
+test.each(["terminal escapes", "registered credential"])(
+  "saved report artifacts preserve the manifest and change-view privacy for %s",
+  async (scenario) => {
+    const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+    const secret = "SYNTHETIC_SAVED_REPORT_CREDENTIAL_545";
+    const hasCredential = scenario === "registered credential";
+    if (hasCredential) registerCredential("saved-report-test", secret);
+    const unsafe = hasCredential ? secret : "\x1b[31mpublic output\x1b[0m";
+    const sanitized = hasCredential ? "[redacted]" : "public output";
+    const repo = f.factory.store.getRepo(c.run.repoId);
+    if (!repo) throw new Error("Missing fixture repo");
+    const ctx = new RunContext(f.factory.deps, c.run, repo, new AbortController().signal);
+    ctx.state.implementerReport = `Public implementation summary ${unsafe}`;
+    ctx.state.spec = {
+      summary: "Public task",
+      assumptions: [],
+      requirements: [],
+      out_of_scope: [],
+      blocking_questions: [],
+      acceptance_criteria: [{ id: "AC-1", criterion: "Public criterion", how_to_verify: "Run checks" }],
+    };
+    ctx.state.lastVerify = {
+      modelId: "verifier",
+      overall: "pass",
+      notes: "",
+      criteria: [
+        {
+          id: "AC-1",
+          status: "met",
+          evidence: `Public verifier evidence ${unsafe} ${"checked ".repeat(50)}source tail ${unsafe}`,
+          publicSummary: "",
+        },
+      ],
+    };
+    f.factory.store.setRunState(c.run.id, ctx.state);
+    const artifact = spyOn(ctx, "artifact");
+    try {
+      const rendered = buildReportArtifacts(ctx, true);
+      saveReport(ctx, rendered);
+      expect(artifact).toHaveBeenCalledTimes(2);
+      expect(artifact).toHaveBeenCalledWith("report.md", "report", rendered.report);
+      expect(artifact).toHaveBeenCalledWith(
+        "report-sources.json",
+        "report",
+        JSON.stringify(rendered.sources),
+      );
+      const report = f.factory.store.getArtifact(c.run.id, "report.md");
+      const sources = f.factory.store.getArtifact(c.run.id, "report-sources.json");
+      if (!report || !sources) throw new Error("Missing saved report artifacts");
+      const savedSources = JSON.parse(sources);
+      for (const content of [report, sources, ...Object.values(savedSources.sources)]) {
+        expect(content).not.toContain(secret);
+        expect(content).not.toMatch(/[^\P{Cc}\n\r\t]/u);
+        expect(content).not.toContain("\\u001b");
+      }
+      expect(report).toContain(`Public implementation summary ${sanitized}`);
+      expect(report).toContain(`Public verifier evidence ${sanitized}`);
+      expect(sources).toContain(`source tail ${sanitized}`);
+      expect(report).toBe(rendered.report);
+      const structure = reportStructure(report);
+      if (!structure) throw new Error("Invalid saved report manifest");
+      expect(savedSources.digest).toBe(structure.digest);
+      const connections = await changeConnections();
+      try {
+        for (const conn of [connections.direct, connections.proxy]) {
+          const page = resultValue<ChangePage>(
+            await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
+          );
+          const text = page.reports[0]?.text ?? "";
+          expect(text).not.toContain("[withheld: invalid report structure]");
+          if (hasCredential) {
+            expect(text).toMatch(/^\[withheld: private text; \d+ lines\]$/u);
+            expect(text).not.toContain("Public implementation summary");
+            expect(text).not.toContain("Public verifier evidence");
+            expect(text).not.toContain("[redacted]");
+          } else {
+            expect(text).toContain("Public implementation summary public output");
+            expect(text).toContain("Public verifier evidence public output");
+            expect(text).not.toContain("[withheld:");
+          }
+        }
+      } finally {
+        await connections.close();
+      }
+    } finally {
+      artifact.mockRestore();
+    }
+  },
+);
 
 test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and report intact", async () => {
   const c = await changeFixture(f, {
