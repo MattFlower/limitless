@@ -1113,6 +1113,53 @@ export async function withGitBundle<T>(
   });
 }
 
+const BUNDLE_FETCH = [
+  ...["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch"],
+  ...["--no-tags", "--no-write-fetch-head", "--no-recurse-submodules"],
+];
+
+/**
+ * Remote transport never runs in the checkout, whose config could rewrite the URL to a helper. A
+ * recorded worktree's common directory is the factory cache and already holds its commits; any
+ * other checkout exports `sha` through a confined bundle into a fresh factory-owned repository.
+ */
+async function withTransportRepo<T>(
+  cwd: string,
+  sha: string | null,
+  signal: AbortSignal | undefined,
+  use: (transport: string) => Promise<T>,
+): Promise<T> {
+  const record = `${resolve(cwd)}.git-paths`;
+  if (existsSync(record)) {
+    const [, , common] = z
+      .tuple([z.string(), z.string(), z.string()])
+      .parse(JSON.parse(fs.readFileSync(record, "utf8")));
+    const present = ["git", "cat-file", "-e", `${sha}^{commit}`];
+    if (!sha || (await cacheGit(present, { cwd: common, signal, allowFail: true })).exitCode === 0)
+      return use(common);
+  }
+  const format = await worktreeGit(["git", "rev-parse", "--show-object-format"], { cwd, signal });
+  return withScratch(cwd, async (scratch) => {
+    const transport = join(scratch, "transport.git");
+    const init = ["git", "init", "-q", "--bare", "--template=", `--object-format=${format.stdout.trim()}`];
+    await cacheGit([...init, transport], { cwd: scratch, signal });
+    if (sha)
+      await withGitBundle(
+        cwd,
+        [sha],
+        signal,
+        (bundle) =>
+          cacheGit([...BUNDLE_FETCH, bundle, `${sha}:refs/heads/transfer`], {
+            cwd: transport,
+            signal,
+            timeoutMs: 300_000,
+          }),
+        transport,
+      );
+    return use(transport);
+  });
+}
+
 export async function pushBranch(
   repo: Repo,
   cwd: string,
@@ -1136,34 +1183,27 @@ export async function pushBranch(
       async (bundle) => {
         // Bundle transport is internal to git. Fetch refuses a checked-out destination branch,
         // and the branch-only refspec transfers neither tags nor notes.
-        await worktreeGit(
-          [
-            "git",
-            "-c",
-            "maintenance.auto=false",
-            "-c",
-            "gc.auto=0",
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--no-recurse-submodules",
-            bundle,
-            `${head}:refs/heads/${branch}`,
-          ],
-          { cwd: source, signal, timeoutMs: 300_000 },
-        );
+        await worktreeGit([...BUNDLE_FETCH, bundle, `${head}:refs/heads/${branch}`], {
+          cwd: source,
+          signal,
+          timeoutMs: 300_000,
+        });
       },
       source,
     );
     return;
   }
-  if (!repo.url) return;
-  await remoteSh([...BRANCH_PUSH, "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
-    cwd,
-    timeoutMs: 300_000,
-    signal,
-    budget,
-  });
+  const url = repo.url;
+  if (!url) return;
+  const head = (await worktreeGit(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
+  await withTransportRepo(cwd, head, signal, (transport) =>
+    remoteSh([...BRANCH_PUSH, "--force-with-lease", url, `${head}:refs/heads/${branch}`], {
+      cwd: transport,
+      timeoutMs: 300_000,
+      signal,
+      budget,
+    }),
+  );
 }
 
 export async function remoteBranchSha(
@@ -1173,12 +1213,11 @@ export async function remoteBranchSha(
   signal?: AbortSignal,
   budget?: GitHubBudget,
 ): Promise<string | null> {
-  if (repo.kind !== "github" || !repo.url) return null;
-  const remote = await remoteSh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], {
-    cwd,
-    signal,
-    budget,
-  });
+  const url = repo.url;
+  if (repo.kind !== "github" || !url) return null;
+  const remote = await withTransportRepo(cwd, null, signal, (transport) =>
+    remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], { cwd: transport, signal, budget }),
+  );
   return remote.stdout.split("\t")[0] || null;
 }
 
@@ -1192,23 +1231,27 @@ export async function pushExistingBranch(
   budget?: GitHubBudget,
   sha = "HEAD",
 ): Promise<void> {
-  if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
+  const url = repo.url;
+  if (repo.kind !== "github" || !url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
     throw new Error("invalid PR head branch");
   const ref = `refs/heads/${branch}`;
-  const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
-  if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, sha], {
-    cwd,
-    allowFail: true,
-    signal,
-  });
-  if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `${sha}:${ref}`], {
-    cwd,
-    timeoutMs: 300_000,
-    signal,
-    budget,
+  const head = (await worktreeGit(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
+  await withTransportRepo(cwd, head, signal, async (transport) => {
+    const remote = await remoteSh(["git", "ls-remote", url, ref], { cwd: transport, signal, budget });
+    if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
+    const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, head], {
+      cwd,
+      allowFail: true,
+      signal,
+    });
+    if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
+    await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, url, `${head}:${ref}`], {
+      cwd: transport,
+      timeoutMs: 300_000,
+      signal,
+      budget,
+    });
   });
 }
 
