@@ -214,6 +214,43 @@ test("boundary emphasis preserves distinct intraword identifiers on both matchin
   }
 });
 
+test.each([
+  ["red owl", "**red**\n**owl**", "**blue**\n**jay**"],
+  ["red owl", "_red_\n_owl_", "_blue_\n_jay_"],
+  [
+    "the amber lantern glows ultraviolet",
+    "the *amber*\n*lantern glows ultraviolet*",
+    "the *silver*\n*beacon shines brightly*",
+  ],
+])(
+  "wrapped emphasis uses the same projection for catalogue and report: %j",
+  (plain, emphasis, publicText) => {
+    if (!plain || !emphasis || !publicText) throw new Error("Missing quotation fixture");
+    const fromPlain = buildReportRedactor(new Set([plain]));
+    const fromEmphasis = buildReportRedactor(new Set([emphasis]));
+    expect(fromPlain(`${emphasis}\nPublic neighbor`)).toBe(
+      `${"[withheld: holdout result or quotation; 1 line]\n".repeat(2)}Public neighbor`,
+    );
+    expect(fromEmphasis(`${plain}\nPublic neighbor`)).toBe(
+      "[withheld: holdout result or quotation; 1 line]\nPublic neighbor",
+    );
+    expect(fromPlain(publicText)).toBe(publicText);
+    expect(fromEmphasis(publicText)).toBe(publicText);
+  },
+);
+
+test.each(["*red owl", "**red owl*", "*red _owl*", "red*\nowl", "red\n_owl", "red*_owl", "*red*owl*"])(
+  "unclassifiable emphasis withholds the whole span on either matching side: %j",
+  (ambiguous) => {
+    const filtered = buildReportRedactor(new Set(["red owl"]))(`Public neighbor\n${ambiguous}`);
+    expect(filtered).toStartWith("[withheld:");
+    expect(filtered).not.toMatch(/red|owl|Public neighbor/);
+    expect(buildReportRedactor(new Set([ambiguous]))("Ordinary line")).toBe(
+      "[withheld: private matching normalization unavailable]",
+    );
+  },
+);
+
 test.each(["secret_\ntoken", "secret\n_token", "secret_ \ntoken", "the secret_\ntoken leaked"])(
   "an intraword delimiter wrapped at a line break still matches: %j",
   (wrapped) => {
@@ -241,11 +278,13 @@ test.each([
   ["secret_ \n _token", "secret__token"],
   ["secret**\ntoken", "secret**token"],
   ["secret~\n~token", "secret~~token"],
-])("wrapped private identifiers match unwrapped quotations: %j", (wrapped, unwrapped) => {
+])("ambiguous wrapped catalogue delimiters withhold the whole span: %j", (wrapped, unwrapped) => {
   for (const details of [new Set([wrapped]), new Set([wrapped, "secret__"])]) {
     const redact = buildReportRedactor(details);
-    expect(redact(`Quoted: ${unwrapped}`)).toContain("[withheld:");
-    expect(redact("Changed secrettoken lookup.")).toBe("Changed secrettoken lookup.");
+    expect(redact(`Quoted: ${unwrapped}`)).toBe("[withheld: private matching normalization unavailable]");
+    expect(redact("Changed secrettoken lookup.")).toBe(
+      "[withheld: private matching normalization unavailable]",
+    );
   }
 });
 

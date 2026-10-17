@@ -536,6 +536,14 @@ const quotationForms = [
   ["link", "red owl", "[red owl](u)"],
   ["image", "red owl", "![red owl](u)"],
   ["emphasis", "red owl", "**red** _owl_"],
+  ["wrapped strong", "red owl", "**red**\n**owl**", "**blue**\n**jay**"],
+  ["wrapped underscores", "red owl", "_red_\n_owl_", "_blue_\n_jay_"],
+  [
+    "wrapped emphasis",
+    "the amber lantern glows ultraviolet",
+    "the *amber*\n*lantern glows ultraviolet*",
+    "the *silver*\n*beacon shines brightly*",
+  ],
   ["code", "red owl", "`red owl`"],
   ["blockquote", "red owl", "> red\n> owl"],
   ["list", "red owl", "- red\n- owl"],
@@ -553,9 +561,9 @@ const quotationForms = [
 
 test.each(quotationForms)(
   "author backstops withhold %s quotations in rendered reports",
-  async (_form, phrase = "", quotation = "") => {
+  async (_form, phrase = "", quotation = "", publicQuotation = "") => {
     const state = privateReportState(phrase);
-    state.implementerReport = `${quotation}\nUnrelated summary neighbor`;
+    state.implementerReport = `${quotation}\nUnrelated summary neighbor\n${publicQuotation}`;
     state.terminalReason = quotation;
     state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: quotation, publicSummary: "" });
     await renderedPages(state, (text) => {
@@ -564,6 +572,7 @@ test.each(quotationForms)(
       expect(text).not.toContain("🚧");
       expect(text).toContain("## Implementer's summary\n\n[withheld:");
       expect(text).toContain("Unrelated summary neighbor");
+      if (publicQuotation) expect(text).toContain(publicQuotation);
       expect(text).toContain("## Checks");
     });
   },

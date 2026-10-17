@@ -209,43 +209,37 @@ function markdownProjection(text: string, origins: LineRange[]) {
   replace(/!?\[([^\]]*)\]\([^)]*\)/gu, (match) => match[1] ?? "");
   replace(/^[ \t]*(?:>[ \t]*|(?:[-+*]|\d+[.)])[ \t]+)+/gmu, () => "");
   const emphasis: string[] = [];
+  let ambiguous = false;
   replace(/[*_~]+/gu, (match) => {
-    // A wrap can split an identifier beside or inside its delimiter run, on either side.
-    const neighbor = (index: number, direction: number): string => {
-      for (;;) {
-        let cursor = index;
-        let wrapped = false;
-        while (/\s/u.test(match.input[cursor] ?? "")) {
-          wrapped ||= /[\r\n]/u.test(match.input[cursor] ?? "");
-          cursor += direction;
-        }
-        if (!wrapped) return match.input[index] ?? "";
-        while (/[*_~]/u.test(match.input[cursor] ?? "")) cursor += direction;
-        index = cursor;
-      }
-    };
-    const before = neighbor(match.index - 1, -1);
-    const after = neighbor(match.index + match[0].length, 1);
+    // Delimiter flanking is local: a newline is whitespace, never an identifier neighbor.
+    const before = match.input[match.index - 1] ?? "";
+    const after = match.input[match.index + match[0].length] ?? "";
     const word = (character: string) => /[\p{L}\p{N}_]/u.test(character);
-    if (!word(before) && word(after)) emphasis.push(match[0]);
-    // A paired closing delimiter before a wrap still closes emphasis on that line.
-    else if (
-      word(before) &&
-      !word(match.input[match.index + match[0].length] ?? "") &&
-      emphasis.at(-1) === match[0]
-    ) {
-      emphasis.pop();
-      return "";
+    if ([...match[0]].some((character) => character !== match[0][0])) ambiguous = true;
+    if (word(before) && word(after)) {
+      if (emphasis.length) ambiguous = true;
+      return match[0];
     }
-    return word(before) && word(after) ? match[0] : "";
+    const space = (character: string) => !character || /\s/u.test(character);
+    const punctuation = (character: string) => /[\p{P}\p{S}]/u.test(character);
+    const opens = !space(after) && (!punctuation(after) || space(before) || punctuation(before));
+    const closes = !space(before) && (!punctuation(before) || space(after) || punctuation(after));
+    // Only a homogeneous run with a single role and an exact pair is confirmed formatting.
+    if (opens && closes) ambiguous = true;
+    else if (opens) emphasis.push(match[0]);
+    else if (closes) {
+      if (emphasis.pop() !== match[0]) ambiguous = true;
+    } else return match[0];
+    return "";
   });
+  if (ambiguous || emphasis.length) return null;
   replace(/[`|]/gu, () => "");
   replace(/\s+/gu, (match) => (/[\r\n]/u.test(match[0]) ? "\0" : " "));
   return { text, origins };
 }
 
-function normalizeMarkdown(text: string): string {
-  return markdownProjection(text, []).text.replace(/^[ \0]+|[ \0]+$/gu, "");
+function normalizeMarkdown(text: string): string | null {
+  return markdownProjection(text, [])?.text.replace(/^[ \0]+|[ \0]+$/gu, "") ?? null;
 }
 
 /** Match before paging, across wraps and at every offset, then withhold original lines. */
@@ -264,6 +258,7 @@ function redactMultiline(value: string, pattern: RegExp): string | null {
       for (let i = 0; i <= line.length; i++) origins.push({ first: index, last: index });
     }
     const projection = markdownProjection(text, origins);
+    if (!projection) return null;
     pattern.lastIndex = 0;
     for (const match of projection.text.matchAll(pattern)) {
       const end = match.index + (match[1] ?? match[0]).length;
@@ -489,7 +484,8 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
   let invalidCatalogue = false;
   const matchForm = (detail: string) => {
     const layers = normalizedLayers(decodeHTML(detail));
-    const normalized = normalizeWhitespace(normalizeMarkdown(layers?.at(-1) ?? ""));
+    const projected = normalizeMarkdown(layers?.at(-1) ?? "");
+    const normalized = normalizeWhitespace(projected ?? "");
     if (!layers || !normalized) invalidCatalogue = true;
     return normalized;
   };
