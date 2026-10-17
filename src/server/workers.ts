@@ -58,12 +58,19 @@ export async function startWorkerListener(
         do {
           if (closing.signal.aborted || req.signal.aborted) return json({ job: null });
           if (!workers.authenticate(token ?? "")) return json({ error: "Worker revoked" }, 401);
-          const cancelled = held.filter((id) => !workers.holds(id, worker.name));
+          workers.sweep();
+          const cancelled = workers.cancelledHeld(held, worker.name);
           if (cancelled.length) return json({ job: null, cancelled });
-          const job = workers.lease(worker.name);
+          const job = workers.lease(worker.name, false);
           if (job) {
             const request: GateRequest = JSON.parse(job.request);
-            return json({ job: { id: job.id, request: { ...request, cwd: "" } } });
+            return json({
+              job: {
+                id: job.id,
+                remainingMs: Math.max(0, (job.attempt_deadline_at ?? workers.now()) - workers.now()),
+                request: { ...request, cwd: "" },
+              },
+            });
           }
           await Bun.sleep(workers.times.tick);
         } while (performance.now() < end);

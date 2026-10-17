@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { cpus, hostname, release, totalmem } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -12,11 +12,12 @@ import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree, withRepoLock } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { agentEnv, registerCredential, sh } from "../util/proc.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
-import { requestedChecks } from "./validation.ts";
+import { attemptBudget, requestedChecks } from "./validation.ts";
 
 export async function pairWorker(
   coordinator: string,
@@ -91,7 +92,13 @@ const WireRequest = z.object({
   }),
 });
 const Lease = z.object({
-  job: z.object({ id: z.string().uuid(), request: WireRequest }).nullable(),
+  job: z
+    .object({
+      id: z.string().uuid(),
+      request: WireRequest,
+      remainingMs: z.number().finite().nonnegative().optional(),
+    })
+    .nullable(),
   cancelled: z.array(z.string()).default([]),
 });
 
@@ -116,6 +123,7 @@ export async function runWorker(
     machineState?: typeof machineState;
     request?: typeof workerRequest;
     retryMs?: number;
+    log?: (text: string) => void;
   } = {},
 ) {
   if (process.platform !== "darwin" && !options.confinement)
@@ -177,7 +185,10 @@ export async function runWorker(
         .parse((await call("/worker/heartbeat", body)).json());
       for (const id of reply.cancelled) jobs.get(id)?.controller.abort();
     };
-    const run = async (id: string, req: GateRequest, jobSignal: AbortSignal) => {
+    const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
+      const deadline = new AbortController();
+      const timer = setTimeout(() => deadline.abort(), Math.min(budget, 2_147_483_647));
+      const jobSignal = AbortSignal.any([cancelled, deadline.signal]);
       const root = mkdtempSync(join(cfg.paths.work, "worker-")),
         cwd = join(root, "checkout"),
         cache = join(cfg.paths.repos, `${encodeURIComponent(req.repo)}.git`);
@@ -199,12 +210,21 @@ export async function runWorker(
               { cwd: cache, signal: jobSignal },
             );
           }
-          await worktreeGit(["git", "bundle", "verify", bundle], { cwd: cache, signal: jobSignal });
-          await worktreeGit(
-            ["git", "fetch", "--no-tags", bundle, "+refs/limitless-bundles/*:refs/limitless-bundles/*"],
-            { cwd: cache, signal: jobSignal },
-          );
-          await addDetachedWorktree(cache, req.headSha, cwd, jobSignal);
+          const prefix = `refs/limitless-bundles/${id}/`;
+          try {
+            await worktreeGit(["git", "bundle", "verify", bundle], { cwd: cache, signal: jobSignal });
+            await worktreeGit(["git", "fetch", "--no-tags", bundle, `+${prefix}*:${prefix}*`], {
+              cwd: cache,
+              signal: jobSignal,
+            });
+            await addDetachedWorktree(cache, req.headSha, cwd, jobSignal);
+          } finally {
+            const refs = await worktreeGit(["git", "for-each-ref", "--format=%(refname)", prefix], {
+              cwd: cache,
+            });
+            for (const ref of refs.stdout.trim().split("\n").filter(Boolean))
+              await worktreeGit(["git", "update-ref", "-d", ref], { cwd: cache });
+          }
         });
         const sha = (
           await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal: jobSignal })
@@ -232,16 +252,41 @@ export async function runWorker(
         jobSignal.throwIfAborted();
         await call(`/worker/jobs/${id}/result`, redactGateData({ run, sha }), jobSignal);
       } catch (error) {
-        if (!jobSignal.aborted) await call(`/worker/jobs/${id}/failure`, {}).catch(() => {});
+        if (!jobSignal.aborted) await call(`/worker/jobs/${id}/failure`, {}, jobSignal).catch(() => {});
+        else if (deadline.signal.aborted && !combined.aborted) {
+          // One bounded, best-effort notification after expiry; store expiry remains authoritative.
+          await (options.request ?? workerRequest)(
+            coordinator,
+            `/worker/jobs/${id}/failure`,
+            {},
+            {
+              token: token.value,
+              pin: pin.value,
+              signal: AbortSignal.any([combined, AbortSignal.timeout(1000)]),
+              timeoutMs: 1000,
+            },
+          ).catch(() => {});
+        }
         if (combined.aborted) throw error;
       } finally {
+        clearTimeout(timer);
         const job = jobs.get(id);
         if (job) job.reported = false;
-        if (existsSync(cwd))
-          await withRepoLock(cache, () =>
-            worktreeGit(["git", "worktree", "remove", "--force", cwd], { cwd: cache }),
-          ).catch(() => {});
-        rmSync(root, { recursive: true, force: true });
+        const diagnostic = () => (options.log ?? console.error)("Worker checkout cleanup failed");
+        try {
+          if (existsSync(cwd))
+            await withRepoLock(cache, async () => {
+              restoreDirectoryPermissions(cwd);
+              await worktreeGit(["git", "worktree", "remove", "--force", cwd], { cwd: cache });
+            });
+        } catch {
+          diagnostic();
+        }
+        try {
+          removeScratch(root);
+        } catch {
+          diagnostic();
+        }
       }
     };
     let beats: Promise<void> | undefined;
@@ -258,11 +303,14 @@ export async function runWorker(
         const leased = Lease.parse((await call("/worker/lease", { jobs: heldJobs() })).json());
         for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
         if (!leased.job) continue;
-        const { id, request } = leased.job,
+        const { id, request, remainingMs } = leased.job,
           controller = new AbortController();
-        const task = run(id, request, AbortSignal.any([combined, controller.signal])).finally(() =>
-          jobs.delete(id),
-        );
+        const task = run(
+          id,
+          request,
+          AbortSignal.any([combined, controller.signal]),
+          remainingMs ?? attemptBudget(request),
+        ).finally(() => jobs.delete(id));
         jobs.set(id, { controller, task, reported: true });
         void task.catch(() => stop.abort());
       }

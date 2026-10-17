@@ -11,6 +11,7 @@ import {
   timing,
   type WorkerTiming,
 } from "../workers/protocol.ts";
+import { attemptBudget, credentialBearing } from "../workers/validation.ts";
 import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -34,6 +35,7 @@ export interface JobRow {
   worker: string | null;
   attempt: number;
   lease_expires_at: number | null;
+  attempt_deadline_at: number | null;
   result: string | null;
   failure_reason: string | null;
   excluded: string;
@@ -186,7 +188,7 @@ export class WorkerStore {
           .query(
             "UPDATE gate_jobs SET lease_expires_at=?,updated_at=? WHERE id=? AND state='leased' AND worker=?",
           )
-          .run(this.now() + this.times.lease, this.now(), id, w.name);
+          .run(Math.min(this.now() + this.times.lease, j.attempt_deadline_at ?? 0), this.now(), id, w.name);
     }
     return { cancelled };
   }
@@ -204,11 +206,12 @@ export class WorkerStore {
         "INSERT INTO gate_jobs (id,run_id,request,state,created_at,updated_at) VALUES (?,?,?,'queued',?,?)",
       )
       .run(id, req.runId ?? null, JSON.stringify(req), now, now);
+    this.keepLocal(this.job(id));
     return id;
   }
-  lease(name: string) {
+  lease(name: string, sweep = true) {
     return this.store.db.transaction(() => {
-      this.sweep();
+      if (sweep) this.sweep();
       const w = this.worker(name);
       if (!w || !this.available(w)) return null;
       const c: Capabilities = JSON.parse(w.capabilities ?? "{}");
@@ -218,13 +221,38 @@ export class WorkerStore {
         (job) => !(JSON.parse(job.excluded) as string[]).includes(name),
       );
       if (!j) return null;
+      const deadline = this.now() + attemptBudget(JSON.parse(j.request));
       const changed = this.store.db
         .query(
-          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,updated_at=? WHERE id=? AND state='queued'",
+          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=? WHERE id=? AND state='queued'",
         )
-        .run(name, this.now() + this.times.lease, this.now(), j.id);
+        .run(name, Math.min(this.now() + this.times.lease, deadline), deadline, this.now(), j.id);
       return changed.changes === 1 ? this.job(j.id) : null;
     })();
+  }
+  cancelledHeld(ids: string[], name: string) {
+    const owned = new Set(
+      this.store.db
+        .query<{ id: string }, [string, string]>(
+          "SELECT id FROM gate_jobs WHERE state='leased' AND worker=? AND id IN (SELECT value FROM json_each(?))",
+        )
+        .all(name, JSON.stringify(ids))
+        .map((j) => j.id),
+    );
+    return ids.filter((id) => !owned.has(id));
+  }
+  private keepLocal(j: JobRow | null) {
+    if (!j || !credentialBearing(JSON.parse(j.request))) return false;
+    this.event(j.id, {
+      type: "status",
+      text: "LAN gates executing locally: executable inputs contain a registered credential",
+    });
+    this.store.db
+      .query(
+        "UPDATE gate_jobs SET state='failed',worker=NULL,lease_expires_at=NULL WHERE id=? AND state IN ('queued','leased')",
+      )
+      .run(j.id);
+    return true;
   }
   holds(id: string, name: string) {
     this.sweep();
@@ -254,7 +282,7 @@ export class WorkerStore {
     if (j.worker) excluded.push(j.worker);
     this.store.db
       .query(
-        "UPDATE gate_jobs SET state=?,attempt=?,worker=NULL,lease_expires_at=NULL,failure_reason=?,excluded=?,updated_at=? WHERE id=? AND state IN ('queued','leased')",
+        "UPDATE gate_jobs SET state=?,attempt=?,worker=NULL,lease_expires_at=NULL,attempt_deadline_at=NULL,failure_reason=?,excluded=?,updated_at=? WHERE id=? AND state IN ('queued','leased')",
       )
       .run(
         j.attempt < 2 ? "queued" : "failed",
@@ -268,11 +296,21 @@ export class WorkerStore {
   sweep() {
     const now = this.now();
     for (const j of this.jobs("state IN ('queued','leased')")) {
+      if (this.keepLocal(j)) continue;
       if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
         this.fail(j.id, "No worker picked up job");
       else if (j.state === "leased") {
+        // Older leases acquire a deadline once, using their persisted last renewal.
+        const deadline = j.attempt_deadline_at ?? j.updated_at + attemptBudget(JSON.parse(j.request));
+        if (j.attempt_deadline_at === null)
+          this.store.db
+            .query(
+              "UPDATE gate_jobs SET attempt_deadline_at=?,lease_expires_at=min(lease_expires_at,?) WHERE id=?",
+            )
+            .run(deadline, deadline, j.id);
         const w = j.worker ? this.worker(j.worker) : null;
         if (w?.state !== "approved") this.fail(j.id, "Worker disconnected or revoked");
+        else if (deadline <= now) this.fail(j.id, "Attempt deadline expired");
         else if ((j.lease_expires_at ?? 0) <= now) this.fail(j.id, "Lease expired");
         else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh) this.fail(j.id, "Worker disconnected");
       }

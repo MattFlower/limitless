@@ -1,6 +1,17 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -23,6 +34,7 @@ import {
   retryRegressions,
   runLocalGates,
 } from "../src/gates/run.ts";
+import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { RunContext } from "../src/pipeline/context.ts";
@@ -35,7 +47,7 @@ import { redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, pairingCode } from "../src/workers/protocol.ts";
 import { certificate, workerRequest } from "../src/workers/tls.ts";
-import { validRun } from "../src/workers/validation.ts";
+import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
@@ -449,10 +461,14 @@ test("worker routes authenticate first and reject jobs without the caller's leas
   expect(store.db.query("SELECT COUNT(*) n FROM gate_jobs").get()).toEqual({ n: 0 });
 }, 30_000);
 
-async function loop(options: Parameters<typeof runWorker>[4] = {}) {
+async function loop(options: Parameters<typeof runWorker>[4] = {}, name = "loop-runner") {
   if (!listener) throw new Error("Missing listener");
-  const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
-  await pairWorker(listener.url.origin, join(remote.paths.home, "worker"), "loop-runner", (text) =>
+  const remote = loadConfig({
+    home: join(home, name === "loop-runner" ? "remote" : name),
+    configDir: cfg.paths.configDir,
+    raw: {},
+  });
+  await pairWorker(listener.url.origin, join(remote.paths.home, "worker"), name, (text) =>
     workers.approve(text.split(": ")[1] ?? ""),
   );
   const controller = new AbortController();
@@ -657,13 +673,21 @@ test("a worker runs real checks from the exact bundle head and returns the local
   const req = await request(true),
     secret = "worker-output-credential-513";
   registerCredential("WORKER_OUTPUT_TEST", secret);
-  req.gates.checks.push({ name: "privacy", run: `echo ${secret}` });
+  req.gates.checks.push({ name: "privacy", run: "cat output-credential" });
+  writeFileSync(join(req.cwd, "output-credential"), secret);
   const firstCheck = req.gates.checks[0];
   if (firstCheck) {
     firstCheck.name = "pass\x1b[31m";
     firstCheck.run = "cat tracked; git rev-parse HEAD";
   }
-  const worker = await loop();
+  const worker = await loop({
+    confinement: {
+      ...fakeConfinement,
+      async verify(_roots, opts) {
+        writeFileSync(join(opts.cwd, "output-credential"), secret);
+      },
+    },
+  });
   const signal = AbortSignal.timeout(150_000);
   try {
     const run = await executeGate(req, signal, {}, gateExecutorFor("lan", workers, [req.repo]));
@@ -1060,7 +1084,17 @@ test("a job that no worker picks up falls back and cannot pass a failing local c
   });
 }, 30_000);
 
-test.each(["sha", "extra", "missing", "schema", "duplicate", "alias", "command", "confinement"] as const)(
+test.each([
+  "sha",
+  "extra",
+  "missing",
+  "schema",
+  "duplicate",
+  "alias",
+  "command",
+  "confinement",
+  "reordered",
+] as const)(
   "invalid %s result fails infrastructure and preserves the failing local outcome",
   async (kind) => {
     workers = new WorkerStore(store, releaseSha, { poll: 0, tick: 1, pickup: 0 });
@@ -1081,6 +1115,11 @@ test.each(["sha", "extra", "missing", "schema", "duplicate", "alias", "command",
     if (kind === "duplicate" && run.checks[0]) run.checks[1] = { ...run.checks[0] };
     if (kind === "alias" && run.checks[0])
       run.checks[1] = { ...run.checks[0], name: `${run.checks[0].name}\x1b[31m` };
+    if (kind === "reordered") {
+      expect(validRun(req, good)).toBe(true);
+      expect(validRun(req, { ...good, checks: [...good.checks].reverse() })).toBe(false);
+      run.checks.reverse();
+    }
     if (kind === "command" && run.checks[0]) run.checks[0].command = "different";
     if (kind === "confinement" && run.checks[0]) run.checks[0].confinementError = true;
     const body =
@@ -1109,8 +1148,6 @@ test("streamed and final crafted output is validated and redacted at the coordin
     token = await paired();
   const credential = "coordinator-output-credential-513";
   registerCredential("COORDINATOR_OUTPUT_TEST", credential);
-  const command = req.gates.checks[0];
-  if (command) command.run = `echo ${credential}`;
   writeFileSync(join(cfg.paths.configDir, "private-strings.txt"), "synthetic-private-worker-host\n");
   await call("/worker/heartbeat", caps(), token);
   const id = workers.enqueue(req);
@@ -1306,3 +1343,438 @@ test.skipIf(seatbeltSkip !== null)(
   },
   60_000,
 );
+
+test("credential-bearing executable inputs stay local, including requests queued before registration", async () => {
+  const req = await request();
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const secret = "dispatch-credential-570";
+  const formatted = `${secret.slice(0, 9)}\x1b[31m${secret.slice(9)}`;
+  const original = `printf '%s' '${secret}' > preserved-command`;
+  const variants: GateRequest[] = [
+    { ...req, gates: { ...req.gates, setup: [original] } },
+    { ...req, gates: { ...req.gates, checks: [{ name: "secret", run: original }] } },
+    { ...req, gates: { ...req.gates, checks: [{ name: secret, run: "true" }] } },
+    { ...req, checks: [secret] },
+    { ...req, gates: { ...req.gates, retryFiles: `${secret} {files}` } },
+    { ...req, gates: { ...req.gates, setup: [`: '${formatted}'`] } },
+  ];
+  const queued = workers.enqueue(variants[0] ?? req);
+  expect(workers.job(queued)?.state).toBe("queued");
+  registerCredential("DISPATCH_TEST", secret);
+  expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null });
+  expect(workers.job(queued)?.state).toBe("failed");
+  await confinementScope.run(fakeConfinement, () =>
+    executeGate(
+      variants[0] ?? req,
+      AbortSignal.timeout(30_000),
+      {},
+      gateExecutorFor("lan", workers, [req.repo]),
+      { kind: "lan", id: queued, startedAt: Date.now() },
+    ),
+  );
+  expect(readFileSync(join(req.cwd, "preserved-command"), "utf8")).toBe(secret);
+  const executor = gateExecutorFor("lan", workers, [req.repo]);
+  for (const input of variants) {
+    expect(credentialBearing(input)).toBe(true);
+    const handle = await confinementScope.run(fakeConfinement, () =>
+      executor.start(input, new AbortController().signal),
+    );
+    expect(workers.job(handle.id)?.state).toBe("failed");
+    const reply = await call("/worker/lease", {}, token);
+    expect(reply.data.toString()).not.toContain(secret);
+    expect(reply.json()).toEqual({ job: null });
+    const preservesCommand =
+      input.gates.setup.includes(original) || input.gates.checks.some((c) => c.run === original);
+    if (preservesCommand) rmSync(join(req.cwd, "preserved-command"), { force: true });
+    const run = await confinementScope.run(fakeConfinement, () =>
+      executeGate(input, AbortSignal.timeout(30_000), {}, executor, handle),
+    );
+    expect(run.setupOk).toBe(true);
+    expect(workers.job(handle.id)?.state).toBe("done");
+    const events = workers.job(handle.id)?.events ?? "";
+    expect(events).toContain("executable inputs contain a registered credential");
+    expect(events).not.toContain(secret);
+    if (preservesCommand) expect(readFileSync(join(req.cwd, "preserved-command"), "utf8")).toBe(secret);
+  }
+  expect(
+    store
+      .listEvents(req.runId ?? "")
+      .map((e) => e.message)
+      .join("\n"),
+  ).not.toContain(secret);
+  // Formatting changes alone do not signal a credential replacement.
+  const safe = { ...req, gates: { ...req.gates, checks: [{ name: "safe\x1b[31m", run: "true" }] } };
+  expect(credentialBearing(safe)).toBe(false);
+  const handle = await executor.start(safe, new AbortController().signal);
+  expect((await call("/worker/lease", {}, token)).json()).toMatchObject({ job: { id: handle.id } });
+}, 60_000);
+
+test.each([1, 128])(
+  "one lease poll batches ownership of %d held jobs with one sweep",
+  async (count) => {
+    let now = Date.now();
+    workers = new WorkerStore(store, releaseSha, { poll: 0 }, () => now);
+    await listen();
+    const token = await paired(),
+      other = await paired("other");
+    await call("/worker/heartbeat", { ...caps(), freeSlots: 128 }, token);
+    await call("/worker/heartbeat", caps(), other);
+    const req: GateRequest = {
+      repo: "test/repo",
+      cwd: home,
+      headSha: releaseSha,
+      baseSha: releaseSha,
+      gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+    };
+    const ids = Array.from({ length: count }, () => workers.enqueue(req));
+    for (const id of ids) {
+      store.db
+        .query(
+          "UPDATE gate_jobs SET state='leased',worker='runner',lease_expires_at=?,attempt_deadline_at=? WHERE id=?",
+        )
+        .run(now + 60_000, now + 360_000, id);
+    }
+    const expired = ids[0] ?? "";
+    store.db.query("UPDATE gate_jobs SET lease_expires_at=? WHERE id=?").run(now, expired);
+    if (count > 1) {
+      store.db.query("UPDATE gate_jobs SET worker='other' WHERE id=?").run(ids[1] ?? "");
+      workers.cancel(ids[2] ?? "");
+    }
+    const sweep = spyOn(workers, "sweep"),
+      lookup = spyOn(workers, "cancelledHeld");
+    const query = spyOn(store.db, "query");
+    try {
+      const cancelled = (await call("/worker/lease", { jobs: ids }, token)).json();
+      expect(cancelled).toEqual({ job: null, cancelled: ids.slice(0, Math.min(count, 3)) });
+      expect(sweep).toHaveBeenCalledTimes(1);
+      expect(lookup).toHaveBeenCalledTimes(1);
+      expect(query.mock.calls.filter(([sql]) => sql.includes("json_each"))).toHaveLength(1);
+      expect(query.mock.calls.length).toBeLessThan(count + 20);
+    } finally {
+      sweep.mockRestore();
+      lookup.mockRestore();
+      query.mockRestore();
+    }
+    workers.revoke("other");
+    now += 1;
+    workers.sweep();
+    if (count > 1) expect(workers.job(ids[1] ?? "")?.failure_reason).toBe("Worker disconnected or revoked");
+  },
+  30_000,
+);
+
+test("fresh heartbeats cannot perpetuate bundle 503s, including across store restart", async () => {
+  let now = Date.now();
+  const times = { poll: 0, tick: 5 };
+  workers = new WorkerStore(store, releaseSha, times, () => now);
+  const req = await request();
+  req.gates.setup = [];
+  req.gates.checks = [{ name: "fail", run: "exit 7", timeoutSec: 1 }];
+  const server = await listen();
+  const address = `127.0.0.1:${server.url.port}`;
+  const executor = gateExecutorFor("lan", workers, [req.repo]);
+  const handle = await executor.start(req, new AbortController().signal);
+  const cancellations: string[] = [],
+    owners: string[] = [];
+  let deadline = 0,
+    renewed = 0,
+    restarted = false;
+  const blocked = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  const transport: NonNullable<Parameters<typeof runWorker>[4]>["request"] = async (...args) => {
+    const path = args[1];
+    if (path.endsWith("/bundle")) {
+      const data = Buffer.from("{}");
+      return { status: 503, data, fingerprint: server.tls.fingerprint, json: () => ({}) };
+    }
+    const held = (args[2] as { jobs?: string[] } | undefined)?.jobs ?? [];
+    if (path === "/worker/heartbeat" && held.includes(handle.id)) {
+      now += 20_000;
+      if (!restarted) {
+        restarted = true;
+        blocked.resolve();
+        await resume.promise;
+      }
+    }
+    const reply = await workerRequest(...args);
+    if (path === "/worker/lease") {
+      const job = (reply.json() as { job?: { id: string } }).job;
+      if (job) {
+        owners.push(workers.job(job.id)?.worker ?? "");
+        deadline = workers.job(job.id)?.attempt_deadline_at ?? 0;
+        expect(deadline).toBe(now + attemptBudget(req));
+      }
+    }
+    if (path === "/worker/heartbeat" && held.includes(handle.id)) {
+      const job = workers.job(handle.id);
+      if (job?.state === "leased") {
+        renewed++;
+        expect(job.attempt_deadline_at).toBe(deadline);
+        expect(job.lease_expires_at).toBeLessThanOrEqual(deadline);
+      }
+      cancellations.push(...(reply.json() as { cancelled: string[] }).cancelled);
+    }
+    return reply;
+  };
+  let first: Awaited<ReturnType<typeof loop>> | undefined;
+  let second: Awaited<ReturnType<typeof loop>> | undefined;
+  try {
+    first = await loop({ request: transport });
+    await blocked.promise;
+    const persisted = workers.job(handle.id)?.attempt_deadline_at;
+    await server.stop();
+    listener = undefined;
+    store.close();
+    store = new Store(cfg.paths.db);
+    workers = new WorkerStore(store, releaseSha, times, () => now);
+    await listen(address);
+    expect(workers.job(handle.id)?.attempt_deadline_at).toBe(persisted);
+    resume.resolve();
+    const waitState = async (state: string) => {
+      const end = Date.now() + 10_000;
+      while (workers.job(handle.id)?.state !== state || !cancellations.includes(handle.id)) {
+        if (Date.now() > end) throw new Error(`Job did not reach ${state}`);
+        await Bun.sleep(5);
+      }
+    };
+    await waitState("queued");
+    expect(workers.job(handle.id)).toMatchObject({ attempt: 2, failure_reason: "Attempt deadline expired" });
+    const token = readFileSync(join(first.remote.paths.home, "worker", "token"), "utf8");
+    for (const action of ["events", "result"])
+      expect((await call(`/worker/jobs/${handle.id}/${action}`, {}, token)).status).toBe(409);
+    cancellations.length = 0;
+    second = await loop({ request: transport }, "second-runner");
+    await waitState("failed");
+    expect(owners).toEqual(["loop-runner", "second-runner"]);
+    expect(renewed).toBeGreaterThan(2);
+    const result = await confinementScope.run(fakeConfinement, () =>
+      executeGate(req, AbortSignal.timeout(30_000), {}, gateExecutorFor("lan", workers, [req.repo]), handle),
+    );
+    expect(result.checks[0]).toMatchObject({ ok: false, exitCode: 7 });
+    expect(workers.job(handle.id)?.state).toBe("done");
+    expect(store.getRunState(req.runId ?? "")).toBeNull();
+    expect(store.listInvocations(req.runId ?? "")).toHaveLength(0);
+    const events = store.listEvents(req.runId ?? "").filter((e) => e.type === "gate");
+    expect(events.map((e) => e.message)).toEqual([
+      "LAN infrastructure failure: Attempt deadline expired",
+      "LAN infrastructure failure: Attempt deadline expired",
+      "LAN gates falling back to local execution",
+    ]);
+  } finally {
+    resume.resolve();
+    await first?.stop();
+    await second?.stop();
+  }
+}, 60_000);
+
+async function until(predicate: () => boolean) {
+  const end = Date.now() + 10_000;
+  while (!predicate()) {
+    if (Date.now() > end) throw new Error("Worker condition did not settle");
+    await Bun.sleep(5);
+  }
+}
+
+test("the worker's attempt deadline aborts retries and bounds an unavailable failure notification", async () => {
+  await listen();
+  const req = await request();
+  const id = workers.enqueue(req);
+  const notified = Promise.withResolvers<AbortSignal>();
+  let bundleSignal: AbortSignal | undefined;
+  const worker = await loop({
+    async request(...args) {
+      const path = args[1];
+      if (path.endsWith("/bundle")) {
+        bundleSignal = args[3]?.signal;
+        return { status: 503, data: Buffer.from("{}"), fingerprint: "", json: () => ({}) };
+      }
+      if (path.endsWith("/failure")) {
+        const signal = args[3]?.signal;
+        if (!signal) throw new Error("Missing bounded failure signal");
+        notified.resolve(signal);
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        throw new Error("Notification unavailable");
+      }
+      const reply = await workerRequest(...args);
+      if (path === "/worker/lease") {
+        const body = reply.json() as { job: { remainingMs?: number } | null };
+        if (body.job) body.job.remainingMs = 30;
+        return { ...reply, json: () => body };
+      }
+      return reply;
+    },
+  });
+  try {
+    const signal = await notified.promise;
+    expect(bundleSignal?.aborted).toBe(true);
+    await until(() => signal.aborted && readdirSync(worker.remote.paths.work).length === 0);
+    // The coordinator recovers independently when the best-effort notification is lost.
+    store.db.query("UPDATE gate_jobs SET attempt_deadline_at=0 WHERE id=?").run(id);
+    workers.sweep();
+    expect(workers.job(id)).toMatchObject({
+      state: "queued",
+      attempt: 2,
+      failure_reason: "Attempt deadline expired",
+    });
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker cleanup restores locked directories without following symlinks and survives a cleanup error", async () => {
+  await listen();
+  const req = await request(true);
+  req.gates.setup = [];
+  req.gates.checks = [{ name: "locked", run: "mkdir locked; touch locked/file; chmod 000 locked" }];
+  const outside = join(home, "outside");
+  mkdirSync(outside);
+  chmodSync(outside, 0o500);
+  const checkouts: string[] = [],
+    diagnostics: string[] = [];
+  const command = await import("../src/git/command.ts"),
+    original = command.worktreeGit;
+  let failRemoval = false;
+  const spy = spyOn(command, "worktreeGit").mockImplementation(async (args, options) => {
+    if (failRemoval && args[1] === "worktree" && args[2] === "remove") {
+      failRemoval = false;
+      throw new Error("cleanup-sensitive-diagnostic-570");
+    }
+    return original(args, options);
+  });
+  const worker = await loop({
+    log: (text) => diagnostics.push(text),
+    confinement: {
+      ...fakeConfinement,
+      async verify(_roots, opts) {
+        if (!checkouts.includes(opts.cwd)) {
+          checkouts.push(opts.cwd);
+          symlinkSync(outside, join(opts.cwd, "outside"));
+        }
+      },
+    },
+  });
+  try {
+    const execute = () =>
+      executeGate(req, AbortSignal.timeout(30_000), {}, gateExecutorFor("lan", workers, [req.repo]));
+    const first = await execute();
+    expect(first.checks[0]?.ok).toBe(true);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(statSync(outside).mode & 0o777).toBe(0o500);
+    expect(diagnostics).toEqual([]);
+    failRemoval = true;
+    const second = await execute();
+    expect(second.checks[0]?.ok).toBe(true);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(diagnostics).toEqual(["Worker checkout cleanup failed"]);
+    expect(diagnostics.join()).not.toContain("cleanup-sensitive-diagnostic-570");
+    req.gates.checks = [{ name: "after", run: "true" }];
+    expect((await execute()).checks[0]?.ok).toBe(true);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(checkouts).toHaveLength(3);
+    expect(checkouts.every((path) => !existsSync(path))).toBe(true);
+    expect(workers.jobs("1=1").every((j) => j.state === "done" && j.attempt === 1)).toBe(true);
+    expect(statSync(outside).mode & 0o777).toBe(0o500);
+  } finally {
+    await worker.stop();
+    spy.mockRestore();
+    chmodSync(outside, 0o700);
+  }
+}, 60_000);
+
+test.each(["failure", "cancellation"] as const)(
+  "temporary bundle refs are removed after success and checkout %s",
+  async (kind) => {
+    await listen();
+    const req = await request(true);
+    req.gates.setup = [];
+    req.gates.checks = [{ name: "pass", run: "true" }];
+    const worker = await loop();
+    const cache = join(worker.remote.paths.repos, `${encodeURIComponent(req.repo)}.git`);
+    const repos = await import("../src/git/repos.ts"),
+      original = repos.addDetachedWorktree;
+    let imported = false,
+      failedId = "";
+    const spy = spyOn(repos, "addDetachedWorktree").mockImplementation(async (...args) => {
+      if (!failedId) return original(...args);
+      const refs = await worktreeGit(
+        ["git", "for-each-ref", "--format=%(refname)", `refs/limitless-bundles/${failedId}/`],
+        { cwd: cache },
+      );
+      imported = refs.stdout.includes(failedId);
+      if (kind === "cancellation") {
+        workers.cancel(failedId);
+        const signal = args[3];
+        if (!signal) throw new Error("Missing checkout signal");
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
+      throw new Error("Injected checkout failure after import");
+    });
+    try {
+      const first = await executeGate(
+        req,
+        AbortSignal.timeout(30_000),
+        {},
+        gateExecutorFor("lan", workers, [req.repo]),
+      );
+      expect(first.checks[0]?.ok).toBe(true);
+      await until(() => readdirSync(worker.remote.paths.work).length === 0);
+      const refs = () =>
+        worktreeGit(["git", "for-each-ref", "--format=%(refname)", "refs/limitless-bundles/"], {
+          cwd: cache,
+        });
+      expect((await refs()).stdout).toBe("");
+      await withRepoLock(cache, () =>
+        worktreeGit(["git", "update-ref", "refs/limitless-bundles/unrelated/0", req.headSha], { cwd: cache }),
+      );
+      failedId = workers.enqueue(req);
+      await until(
+        () =>
+          imported &&
+          workers.job(failedId)?.state !== "leased" &&
+          readdirSync(worker.remote.paths.work).length === 0,
+      );
+      expect(workers.job(failedId)?.state).toBe(kind === "failure" ? "queued" : "cancelled");
+      expect((await refs()).stdout.trim()).toBe("refs/limitless-bundles/unrelated/0");
+    } finally {
+      await worker.stop();
+      spy.mockRestore();
+    }
+  },
+  60_000,
+);
+
+test("pre-deadline leases gain one durable deadline without extending it on later heartbeats", async () => {
+  let now = Date.now();
+  workers = new WorkerStore(store, releaseSha, {}, () => now);
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const req: GateRequest = {
+    repo: "test/repo",
+    cwd: home,
+    headSha: releaseSha,
+    baseSha: releaseSha,
+    gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+  };
+  const id = workers.enqueue(req);
+  await call("/worker/lease", {}, token);
+  store.db.query("UPDATE gate_jobs SET attempt_deadline_at=NULL WHERE id=?").run(id);
+  const expected = now + attemptBudget(req);
+  now += 20_000;
+  await call("/worker/heartbeat", caps([id]), token);
+  expect(workers.job(id)?.attempt_deadline_at).toBe(expected);
+  // Reconstruct the store wrapper without changing the persisted attempt.
+  const resumed = new WorkerStore(store, releaseSha, {}, () => now);
+  const w = resumed.authenticate(token);
+  if (!w) throw new Error("Missing worker");
+  now += 20_000;
+  resumed.heartbeat(w, caps([id]));
+  expect(resumed.job(id)?.attempt_deadline_at).toBe(expected);
+}, 30_000);

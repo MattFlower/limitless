@@ -1,11 +1,36 @@
+import { stripVTControlCharacters } from "node:util";
 import type { GateRequest } from "../gates/executor.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import type { GateResult, GateRun } from "../gates/run.ts";
 import { confinementFailed } from "../gates/run.ts";
+import { redactCredentials } from "../util/proc.ts";
 
 export function requestedChecks(req: GateRequest) {
   return req.gates.checks.filter((c) => !req.checks || req.checks.includes(c.name));
 }
+/** Commands must stay executable: refuse remote dispatch rather than redact their inputs. */
+export function credentialBearing(req: GateRequest) {
+  return [
+    ...req.gates.setup,
+    ...req.gates.checks.flatMap((c) => [c.name, c.run]),
+    ...(req.checks ?? []),
+    req.gates.retryFiles ?? "",
+  ].some((input) => {
+    const normalized = stripVTControlCharacters(input);
+    return redactCredentials(normalized) !== normalized;
+  });
+}
+
+/** Setup/check timeouts plus five minutes for transfer and one minute for posting/slot waits. */
+export function attemptBudget(req: GateRequest) {
+  return Math.min(
+    2_147_483_647,
+    360_000 +
+      req.gates.setup.length * 900_000 +
+      requestedChecks(req).reduce((ms, check) => ms + (check.timeoutSec ?? 900) * 1000, 0),
+  );
+}
+
 export function validCheck(req: GateRequest, r: GateResult, phase: "setup" | "check") {
   const commands =
     phase === "check"
@@ -43,7 +68,12 @@ export function validRun(req: GateRequest, run: GateRun) {
   return (
     run.checks.length === checks.length &&
     new Set(run.checks.map((r) => redactGateOutput(r.name))).size === checks.length &&
-    run.checks.every((r) => validCheck(req, r, "check")) &&
+    run.checks.every(
+      (r, i) =>
+        validCheck(req, r, "check") &&
+        redactGateOutput(r.name) === redactGateOutput(checks[i]?.name ?? "") &&
+        redactGateOutput(r.command) === redactGateOutput(checks[i]?.run ?? ""),
+    ) &&
     run.setup.length === req.gates.setup.length &&
     run.setup.every((r) => r.ok)
   );
