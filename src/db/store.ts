@@ -51,6 +51,7 @@ import {
   TERMINAL_STATUSES,
 } from "../core/types.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
+import { redactGateOutput } from "../gates/output.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
@@ -436,7 +437,7 @@ export class Store {
     },
     publicText: string,
   ): void {
-    const text = redactCredentials(diagnostic.text);
+    const text = redactGateOutput(diagnostic.text);
     if (text === publicText) return;
     this.db
       .query(
@@ -2209,7 +2210,9 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   deleteOldDebugEvents(before: number): number {
-    return this.db.query("DELETE FROM events WHERE level = 'debug' AND ts < ?").run(before).changes;
+    this.db.query("DELETE FROM events WHERE level = 'debug' AND ts < ?").run(before);
+    // Bun's result.changes includes cascades; SQLite changes() counts only the events.
+    return (this.db.query("SELECT changes() AS n").get() as { n: number }).n;
   }
 
   // ---- baseline cache ------------------------------------------------------

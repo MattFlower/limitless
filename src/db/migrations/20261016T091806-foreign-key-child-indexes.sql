@@ -1,0 +1,10 @@
+CREATE INDEX owner_diagnostics_event ON owner_diagnostics(event_id);
+CREATE INDEX owner_diagnostics_invocation ON owner_diagnostics(invocation_id);
+CREATE INDEX runs_repo ON runs(repo_id);
+CREATE INDEX invocations_stage ON invocations(stage_id);
+CREATE INDEX eval_run_requests_resumed_from ON eval_run_requests(resumed_from);
+CREATE INDEX eval_run_requests_resumed_by ON eval_run_requests(resumed_by);
+CREATE INDEX review_approvals_run ON review_approvals(run_id);
+CREATE INDEX conflict_triggers_land_entry ON conflict_triggers(land_entry_id);
+CREATE INDEX conflict_triggers_run ON conflict_triggers(run_id);
+CREATE INDEX ci_fix_triggers_run ON ci_fix_triggers(run_id);

@@ -779,7 +779,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       previewConfig: null,
       slottedCommands: [],
       holdoutStatus: "complete",
-      feedback: `Gate failed with credential ${secret}`,
+      feedback: `Gate failed with credential \x1b[31m${secret}`,
     } satisfies RunState);
 
     expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
@@ -790,7 +790,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(resumed?.error).not.toContain(secret);
     const events = JSON.stringify(f.store.listEvents(run.id));
     expect(events).toContain("Still failing after 5 implementation rounds");
+    expect(events).toContain("Gate failed with credential [redacted]");
     expect(events).not.toContain(secret);
+    expect(events).not.toContain("\\u001b");
   });
 });
 
