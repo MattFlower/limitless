@@ -659,7 +659,7 @@ exec '${realGit}' "$@"
         expect(f.store.listStages(id).find((s) => s.name === "gates")).toMatchObject({
           status: "failed",
           round: 0,
-          summary: expect.stringContaining("could not lstat"),
+          summary: expect.stringContaining("Command failed"),
         });
       }
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";

@@ -6,6 +6,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -13,8 +14,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { emptyTreeId, stageAll, worktreeGit } from "../src/git/command.ts";
 import { ConfinementError, gitConfinement, gitProfile, gitSh, seatbeltGit } from "../src/git/confinement.ts";
-import { commitAll, pushBranch, rebaseOnto } from "../src/git/repos.ts";
-import { CommandError, sh } from "../src/util/proc.ts";
+import {
+  blobPrivateEntries,
+  checkPrivateRange,
+  commitAll,
+  pushBranch,
+  rebaseOnto,
+} from "../src/git/repos.ts";
+import { CommandError, invocationScratch, sh } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { fakeGitConfinement } from "./git-preload.ts";
 import { seeded } from "./seeded.ts";
@@ -24,6 +31,8 @@ let root: string;
 let cwd: string;
 const git = (dir: string, ...args: string[]) => sh(["git", ...args], { cwd: dir });
 const real = <T>(run: () => T) => gitConfinement.run(seatbeltGit(), run);
+const wrap = (backend: ReturnType<typeof seatbeltGit>, cmd: string[], opts: Parameters<typeof sh>[1]) =>
+  invocationScratch.run(root, () => backend.wrap(cmd, opts));
 const fixture = seeded(async (dir) => {
   const source = join(dir, "source");
   mkdirSync(source);
@@ -125,10 +134,33 @@ const binaries = [
 ];
 for (const binary of binaries) {
   test.skipIf(seatbeltSkip !== null)(
+    `exec-path script interpreter is denied: ${binary} (${seatbeltSkip ?? "available"})`,
+    async () => {
+      const marker = join(root, "browser-marker");
+      const args = [
+        binary,
+        "-c",
+        "web.browser=attack",
+        "-c",
+        `browser.attack.cmd=printf pwn > '${marker}'; :`,
+        "web--browse",
+        "https://example.invalid",
+      ];
+      await sh(args, { cwd });
+      expect(existsSync(marker)).toBe(true);
+      rmSync(marker);
+      await real(async () => {
+        expect((await gitSh([binary, "rev-parse", "HEAD"], { cwd })).exitCode).toBe(0);
+        expect((await gitSh(args, { cwd, allowFail: true })).exitCode).not.toBe(0);
+      });
+      expect(existsSync(marker)).toBe(false);
+    },
+  );
+  test.skipIf(seatbeltSkip !== null)(
     `derived profile allows git and denies shell execution: ${binary} (${seatbeltSkip ?? "available"})`,
     async () => {
       const backend = seatbeltGit();
-      const wrapped = await backend.wrap([binary, "rev-parse", "HEAD"], { cwd });
+      const wrapped = await wrap(backend, [binary, "rev-parse", "HEAD"], { cwd });
       const profile = wrapped[2] ?? "";
       expect(profile).toContain(`(literal "${realpathSync(binary)}")`);
       const execPath = realpathSync((await sh([binary, "--exec-path"], { cwd })).stdout.trim());
@@ -370,7 +402,6 @@ for (const confined of [false, true]) {
 }
 
 test("runtime allowances pin the resolved git, exec directory and canonical write roots", async () => {
-  const { symlinkSync } = await import("node:fs");
   const binary = Bun.which("git");
   if (!binary) throw new Error("missing git");
   const execPath = realpathSync((await git(cwd, "--exec-path")).stdout.trim());
@@ -390,14 +421,14 @@ test("runtime allowances pin the resolved git, exec directory and canonical writ
       exitCode: 0,
     };
   };
-  const wrapped = await seatbeltGit("darwin", process.execPath, run).wrap(["git", "status"], {
+  const wrapped = await wrap(seatbeltGit("darwin", process.execPath, run), ["git", "status"], {
     cwd,
     env: { ...process.env, GIT_EXEC_PATH: "/untrusted" },
   });
   const profile = wrapped[2] ?? "";
   expect(profile).toContain(`(literal "${realpathSync(binary)}")`);
   expect(profile).toContain(`(subpath "${execPath}")`);
-  for (const path of [cwd, join(cwd, ".git"), tmpdir()])
+  for (const path of [cwd, join(cwd, ".git"), root])
     expect(profile).toContain(`(subpath "${realpathSync(path)}")`);
   expect(profile).not.toContain("/untrusted");
   expect(wrapped).toContain(`--exec-path=${execPath}`);
@@ -411,37 +442,45 @@ test("write allowances follow Git's explicit directory options before inherited 
   const scratch = join(root, "scratch");
   for (const dir of [inherited, admin, common, work, scratch]) mkdirSync(dir);
   const execPath = realpathSync((await git(cwd, "--exec-path")).stdout.trim());
+  const developer = join(root, "developer");
+  mkdirSync(join(developer, "usr/bin"), { recursive: true });
+  symlinkSync(realpathSync(Bun.which("git") ?? "git"), join(developer, "usr/bin/git"));
   const run: typeof sh = async (cmd) =>
     cmd[0] === "/usr/bin/xcode-select"
-      ? sh(cmd, { cwd })
+      ? { stdout: developer, stderr: "", exitCode: 0 }
       : { stdout: cmd.includes("--exec-path") ? execPath : "git version", stderr: "", exitCode: 0 };
-  const wrapped = await seatbeltGit("darwin", process.execPath, run).wrap(
-    [
-      "git",
-      `--git-dir=${inherited}`,
-      `--git-dir=${admin}`,
-      `--work-tree=${inherited}`,
-      `--work-tree=${work}`,
-      "status",
-      "--",
-      "--git-dir=filename",
-      "--work-tree=filename",
-    ],
-    {
-      cwd,
-      env: {
-        ...process.env,
-        GIT_DIR: inherited,
-        GIT_COMMON_DIR: common,
-        GIT_WORK_TREE: inherited,
-        TMPDIR: scratch,
+  const wrapped = await invocationScratch.run(scratch, () =>
+    seatbeltGit("darwin", process.execPath, run).wrap(
+      [
+        "git",
+        `--git-dir=${inherited}`,
+        `--git-dir=${admin}`,
+        `--work-tree=${inherited}`,
+        `--work-tree=${work}`,
+        "status",
+        "--",
+        "--git-dir=filename",
+        "--work-tree=filename",
+      ],
+      {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_DIR: inherited,
+          GIT_COMMON_DIR: common,
+          GIT_WORK_TREE: inherited,
+          TMPDIR: inherited,
+        },
       },
-    },
+    ),
   );
   const profile = wrapped[2] ?? "";
   for (const dir of [admin, common, work, scratch])
     expect(profile).toContain(`(subpath "${realpathSync(dir)}")`);
   expect(profile).not.toContain(`(subpath "${realpathSync(inherited)}")`);
+  expect(profile.split("\n").find((line) => line.startsWith("(allow file-write*"))).toBe(
+    `(allow file-write* ${[work, admin, common, scratch].map((dir) => `(subpath "${realpathSync(dir)}")`).join(" ")} (literal "/dev/null"))`,
+  );
 });
 
 for (const confined of [false, true])
@@ -454,7 +493,7 @@ for (const confined of [false, true])
       const global = join(root, "global-config");
       writeFileSync(
         global,
-        `[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = ${signer}\n[log]\n\tshowSignature = true\n`,
+        `[user]\n\tname = Test\n\temail = test@example.invalid\n[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = ${signer}\n[log]\n\tshowSignature = true\n`,
       );
       await git(cwd, "checkout", "-qb", "side");
       writeFileSync(join(cwd, "side"), "side\n");
@@ -515,8 +554,7 @@ test("every git process of a factory call, auxiliary ones included, runs through
     await worktreeGit(["git", "clean", "-ffdxq"], opts, true);
   });
   const calls = readFileSync(log, "utf8").trim().split("\n");
-  // Only the one-time version probe in worktreeGit may run outside the sandbox.
-  expect(calls.filter((line) => !line.startsWith("1\t") && line !== "0\t--version")).toEqual([]);
+  expect(calls.filter((line) => !line.startsWith("1\t"))).toEqual([]);
   for (const command of ["config", "rev-parse", "ls-files", "ls-tree", "update-index", "commit", "merge"])
     expect(calls.some((line) => line.includes(` ${command} `))).toBe(true);
   expect(calls.filter((line) => line.endsWith(" clean -ffdxq"))).toHaveLength(2);
@@ -580,3 +618,174 @@ test("the private-strings script launched without the test preload refuses uncon
   expect(refused.exitCode).not.toBe(0);
   expect(refused.stdout).toBe("");
 });
+
+test("private blob inspection and publication refuse configured promisor transports", async () => {
+  const marker = join(root, "promisor-marker");
+  const helper = join(root, "promisor-helper");
+  writeFileSync(helper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+  await git(cwd, "config", "remote.origin.promisor", "true");
+  await git(cwd, "config", "remote.origin.url", `ext::${helper}`);
+  await git(cwd, "config", "protocol.ext.allow", "always");
+  const missing = "1234567890".repeat(4);
+  await sh(["git", "cat-file", "--batch"], { cwd, stdin: `${missing}\n`, allowFail: true });
+  expect(existsSync(marker)).toBe(true);
+  rmSync(marker);
+  writeFileSync(join(cwd, "binary"), Buffer.from([0, 1, 2]));
+  await git(cwd, "add", "binary");
+  const calls: string[][] = [];
+  await gitConfinement.run(
+    {
+      wrap: async (cmd, opts) => {
+        if (cmd.includes("--batch")) {
+          calls.push(cmd);
+          expect(opts.stdin).toBeTruthy();
+          throw new ConfinementError("test refusal");
+        }
+        return cmd;
+      },
+    },
+    async () => {
+      await expect(blobPrivateEntries(cwd, undefined, [missing], [])).rejects.toBeInstanceOf(
+        ConfinementError,
+      );
+      await expect(checkPrivateRange(cwd, "HEAD", [], true)).rejects.toBeInstanceOf(ConfinementError);
+    },
+  );
+  expect(calls).toHaveLength(2);
+  expect(existsSync(marker)).toBe(false);
+});
+
+test("five identical wraps discover the exec directory once without an apply probe", async () => {
+  const calls: string[][] = [];
+  const run: typeof sh = async (cmd) => {
+    calls.push(cmd);
+    return { stdout: root, stderr: "", exitCode: 0 };
+  };
+  const backend = seatbeltGit("darwin", process.execPath, run);
+  for (let i = 0; i < 5; i++) await wrap(backend, [process.execPath, "status"], { cwd });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toContain("--exec-path");
+});
+
+for (const allowFail of [false, true]) {
+  for (const failure of ["apply", "apply-prefixed", "git", "same-code", "same-message"] as const) {
+    test(`actual confined launch classifies ${failure}, allowFail=${allowFail}`, async () => {
+      const executable = join(root, "sandbox-stand-in");
+      const apply = "sandbox_" + "apply: Operation not permitted";
+      const code = failure === "git" || failure === "same-message" ? 128 : 71;
+      const message =
+        failure === "apply-prefixed"
+          ? `sandbox-exec: ${apply}`
+          : failure === "apply" || failure === "same-message"
+            ? apply
+            : "git failure";
+      writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' '${message}' >&2\nexit ${code}\n`, {
+        mode: 0o755,
+      });
+      const run: typeof sh = async () => ({ stdout: root, stderr: "", exitCode: 0 });
+      const call = () =>
+        gitConfinement.run(seatbeltGit("darwin", executable, run), () =>
+          gitSh([process.execPath, "status"], { cwd, allowFail }),
+        );
+      if (failure.startsWith("apply") || !allowFail) {
+        const classification = await call().then(
+          () => "returned",
+          (error) =>
+            error instanceof ConfinementError
+              ? "confinement"
+              : error instanceof CommandError
+                ? "command"
+                : "other",
+        );
+        expect(classification).toBe(failure.startsWith("apply") ? "confinement" : "command");
+      } else expect((await call()).exitCode).toBe(code);
+    });
+  }
+}
+
+for (const failure of [false, true]) {
+  test(`private per-call scratch is removed after ${failure ? "failure" : "success"}`, async () => {
+    const inherited = join(root, "inherited-temp");
+    mkdirSync(inherited);
+    const executable = join(root, "sandbox-stand-in");
+    const captured = join(root, "scratch-path");
+    const profile = join(root, "profile");
+    writeFileSync(
+      executable,
+      `#!/bin/sh\nprintf '%s' "$TMPDIR" > '${captured}'\nprintf '%s' "$2" > '${profile}'\nexit ${failure ? 128 : 0}\n`,
+      { mode: 0o755 },
+    );
+    let canonicalScratch = "";
+    const run: typeof sh = async (_cmd, opts) => {
+      canonicalScratch = realpathSync(opts.env?.TMPDIR ?? "");
+      return { stdout: cwd, stderr: "", exitCode: 0 };
+    };
+    const call = () =>
+      gitConfinement.run(seatbeltGit("darwin", executable, run), () =>
+        gitSh([process.execPath, "status"], { cwd, env: { ...process.env, TMPDIR: inherited } }),
+      );
+    if (failure) await expect(call()).rejects.toBeInstanceOf(CommandError);
+    else await call();
+    const scratch = readFileSync(captured, "utf8");
+    expect(scratch).not.toBe(inherited);
+    expect(existsSync(scratch)).toBe(false);
+    const writes = readFileSync(profile, "utf8")
+      .split("\n")
+      .find((line) => line.startsWith("(allow file-write*"));
+    expect(writes).toContain(`(subpath "${canonicalScratch}")`);
+    expect(writes).not.toContain(`(subpath "${realpathSync(inherited)}")`);
+    expect(writes).not.toContain(`(subpath "${realpathSync(tmpdir())}")`);
+  });
+}
+
+for (const confined of [false, true]) {
+  for (const hasHistory of [false, true]) {
+    test.skipIf(confined && seatbeltSkip !== null)(
+      `shallow delivery ${hasHistory ? "excludes destination history" : "names missing history"}: ${confined ? "Seatbelt" : "fake"} (${seatbeltSkip ?? "available"})`,
+      async () => {
+        writeFileSync(join(cwd, "file"), "second\n");
+        await git(cwd, "commit", "-qam", "second");
+        const work = join(root, "shallow");
+        await git(root, "clone", "-q", "--depth=1", `file://${cwd}`, work);
+        writeFileSync(join(work, "file"), "new commit\n");
+        await git(work, "commit", "-qam", "new");
+        const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+        const destination = hasHistory ? cwd : join(root, "empty");
+        if (!hasHistory) await git(root, "init", "-q", destination);
+        const backend = confined ? seatbeltGit() : fakeGitConfinement;
+        const calls: string[][] = [];
+        const deliver = () =>
+          gitConfinement.run(
+            {
+              wrap: async (cmd, opts) => {
+                if (opts.cwd === work) calls.push(cmd);
+                return backend.wrap(cmd, opts);
+              },
+            },
+            () =>
+              pushBranch(
+                {
+                  id: "local",
+                  slug: "owner/repo",
+                  kind: "local",
+                  localPath: destination,
+                  url: null,
+                  defaultBranch: "main",
+                  mergePolicy: "pr",
+                  createdAt: 0,
+                },
+                work,
+                "delivered",
+              ),
+          );
+        if (hasHistory) {
+          await deliver();
+          expect((await git(destination, "rev-parse", "refs/heads/delivered")).stdout.trim()).toBe(head);
+          expect(calls.some((cmd) => cmd.includes("bundle"))).toBe(true);
+        } else await expect(deliver()).rejects.toThrow(`Cannot transfer shallow repository ${work}`);
+        expect(calls.some((cmd) => cmd.includes("rev-parse"))).toBe(true);
+        expect(calls.some((cmd) => cmd.includes("push") || cmd.includes("fetch"))).toBe(false);
+      },
+    );
+  }
+}

@@ -45,6 +45,7 @@ const HARDENING = [
 /** Recorded before candidate execution; the sidecar is outside the writable checkout. */
 export async function recordWorktree(cwd: string): Promise<void> {
   const cmd = ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"];
+  // Only the factory has written this repository; record paths before exposing it to an agent.
   const r = await sh(cmd, { cwd });
   const dirs = [cwd, ...r.stdout.trim().split("\n")].map((p) => realpathSync(p));
   writeFileSync(`${resolve(cwd)}.git-paths`, JSON.stringify(dirs));
@@ -126,13 +127,16 @@ async function runGit(
   opts.signal?.throwIfAborted();
   opts = { ...opts, env: trustedEnv(opts.cwd, opts.env ?? (process.env as Record<string, string>)) };
   // Not bound to the first caller's signal: an aborted first call must not fail every later one.
-  gitVersion ??= sh(["git", "--version"], { ...opts, signal: undefined, allowFail: false }).then(
-    ({ stdout }) => {
+  gitVersion ??= execute(["git", "--version"], { ...opts, signal: undefined, allowFail: false })
+    .then(({ stdout }) => {
       const version = stdout.match(/^git version (\d+)\.(\d+)/);
       if (!version || Number(version[1]) < 2 || (Number(version[1]) === 2 && Number(version[2]) < 40))
         throw new Error(`Limitless requires Git >= 2.40 for --attr-source; found ${stdout.trim()}`);
-    },
-  );
+    })
+    .catch((error) => {
+      gitVersion = undefined;
+      throw error;
+    });
   await gitVersion;
   let command = 1;
   // Leading global options stay before the injected ones: `-c key=value` pairs and single-token

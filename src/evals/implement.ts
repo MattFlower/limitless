@@ -24,7 +24,7 @@ import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
-import { agentEnv, sh } from "../util/proc.ts";
+import { agentEnv } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { prepareEvalGates } from "./prepare.ts";
 
@@ -105,7 +105,7 @@ async function untrackedState(cwd: string, env: Record<string, string>, since: b
       state.set(path, `${meta}:${createHash("sha256").update(body).digest("hex")}`);
     }
   };
-  const out = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
+  const out = await worktreeGit(["git", "ls-files", "-z", "-o"], { cwd, env });
   for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
   return state;
 }
@@ -212,7 +212,7 @@ export async function gradeImplement(
       ],
       { cwd, env, signal },
     );
-    const commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
+    const commit = (await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     evidence.commit = commit;
     before = await untrackedState(cwd, env, since);
     // Grade in a fresh repository outside the candidate's: hidden files never touch its checkout,

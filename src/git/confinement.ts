@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ConfinementError } from "../harness/read-policy.ts";
-import { invocationScratch, sh } from "../util/proc.ts";
+import { CommandError, invocationScratch, sh } from "../util/proc.ts";
 
 export { ConfinementError };
 
@@ -48,7 +48,9 @@ export function seatbeltGit(platform = process.platform, executable = sandbox, r
       const binary = Bun.which(cmd[0] ?? "git", { PATH: env.PATH ?? "/usr/bin:/bin", cwd: opts.cwd });
       if (!binary) throw new ConfinementError("Cannot resolve git for confinement");
       const git = realpathSync(binary);
-      const scratch = realpathSync(invocationScratch.getStore() ?? env.TMPDIR ?? tmpdir());
+      const privateScratch = invocationScratch.getStore();
+      if (!privateScratch) throw new ConfinementError("Missing private Git scratch");
+      const scratch = realpathSync(privateScratch);
       // Never let repository/environment configuration choose an executable allowance.
       delete env.GIT_EXEC_PATH;
       const check = async (profile: string, args: string[]) => {
@@ -98,26 +100,47 @@ export function seatbeltGit(platform = process.platform, executable = sandbox, r
             admin,
             env.GIT_COMMON_DIR ?? admin,
             scratch,
-            ...(env.TMPDIR ? [env.TMPDIR] : []),
           ].map((path) => realpathSync(resolve(opts.cwd, path))),
         ),
       ];
       const profile = gitProfile(binaries, execPath, writes);
-      // A separate repository-free probe distinguishes apply failures from git's own stderr/errors.
-      await check(profile, ["--version"]);
       return [executable, "-p", profile, git, `--exec-path=${execPath}`, ...cmd.slice(1)];
     },
   };
 }
 export const gitBackend = { default: seatbeltGit() };
+// Both are specific to sandbox-exec; Git's own failures must retain their normal classification.
+function checkApply(result: { exitCode: number | null; stderr: string }): void {
+  if (
+    result.exitCode === 71 &&
+    result.stderr.replace(/^sandbox-exec: /, "").startsWith("sandbox_" + "apply: Operation not permitted")
+  )
+    throw new ConfinementError("Cannot apply Git confinement");
+}
 export const gitSh: typeof sh = async (cmd, opts) => {
-  let wrapped: string[];
+  const inherited = invocationScratch.getStore();
+  const scratch = inherited ?? mkdtempSync(join(tmpdir(), "limitless-git-"));
   try {
-    wrapped = await (gitConfinement.getStore() ?? gitBackend.default).wrap(cmd, opts);
-  } catch (error) {
-    opts.signal?.throwIfAborted();
-    if (error instanceof ConfinementError) throw error;
-    throw new ConfinementError("Cannot prepare Git confinement");
+    return await invocationScratch.run(scratch, async () => {
+      opts = { ...opts, env: { ...(opts.env ?? process.env), TMPDIR: scratch } };
+      let wrapped: string[];
+      try {
+        wrapped = await (gitConfinement.getStore() ?? gitBackend.default).wrap(cmd, opts);
+      } catch (error) {
+        opts.signal?.throwIfAborted();
+        if (error instanceof ConfinementError) throw error;
+        throw new ConfinementError("Cannot prepare Git confinement");
+      }
+      try {
+        const result = await sh(wrapped, opts);
+        checkApply(result);
+        return result;
+      } catch (error) {
+        if (error instanceof CommandError) checkApply(error);
+        throw error;
+      }
+    });
+  } finally {
+    if (!inherited) rmSync(scratch, { recursive: true, force: true });
   }
-  return sh(wrapped, opts);
 };

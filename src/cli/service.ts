@@ -666,6 +666,7 @@ export async function status(port: number): Promise<void> {
   for (const { label } of await installedUnits())
     console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
   if (existsSync(join(appDir, ".git"))) {
+    // This release repository is written only by the user/deployer, never by an agent.
     const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
     console.log(`release: ${head}`);
   }
