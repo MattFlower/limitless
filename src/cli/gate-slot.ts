@@ -107,7 +107,7 @@ export interface LeaseOptions {
   signal?: AbortSignal;
   warn?: (s: string) => void;
   /** Agent wrappers fail on queue exhaustion and prove nested reuse and running recovery. */
-  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void };
+  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void; assertActive?: () => void };
 }
 export async function withGateLease<T>(
   name: string,
@@ -220,6 +220,7 @@ export async function withGateLease<T>(
           ? Math.max(1, Math.min(2000, lastReply + GATE_LEASE_EXPIRY_MS - clock.now() + 1))
           : deadline - clock.now();
       while (!state?.acquired) {
+        opts.agentTest?.assertActive?.();
         opts.signal?.throwIfAborted();
         if (!first) {
           if (remaining() <= 0) throw pastDeadline();
@@ -286,6 +287,7 @@ export async function withGateLease<T>(
       warn(e);
     }
     opts.signal?.throwIfAborted();
+    opts.agentTest?.assertActive?.();
     return await work();
   } finally {
     stopped = true;

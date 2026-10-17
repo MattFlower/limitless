@@ -206,14 +206,15 @@ function linuxMarkedProcesses(
 }
 
 /** Confirm identity and disappearance without relying on marker membership. */
-export async function processBirth(pid: number): Promise<string | null> {
+export async function processBirth(pid: number, name?: (value: string) => void): Promise<string | null> {
   if (inspectionPlatform === "darwin") {
     if (!darwin) throw new Error("Native process inspection is unavailable");
-    return darwin.darwinProcessBirth(pid);
+    return darwin.darwinProcessBirth(pid, name);
   }
   if (inspectionPlatform === "linux") {
     try {
       const row = await readFile(`/proc/${pid}/stat`, "utf8");
+      name?.(row.slice(row.indexOf("(") + 1, row.lastIndexOf(")")));
       const fields = row
         .slice(row.lastIndexOf(")") + 2)
         .trim()
@@ -228,6 +229,31 @@ export async function processBirth(pid: number): Promise<string | null> {
   throw new Error("Process birth time inspection is unsupported on this platform");
 }
 
+/** Scoped identity and matching birth-clock backend for shutdown tests. */
+export const processBirthInspection = new AsyncLocalStorage<{
+  read: typeof processBirth;
+  now: () => number;
+}>();
+
+function birthTime(birth: string): number {
+  return birth.split(":").reduce((time, field) => time * 1_000_000 + Number(field), 0);
+}
+
+export function linuxBirthClock(uptime: string, hz: bigint): number {
+  const [seconds, fraction = ""] = uptime.trim().split(/\s+/)[0]?.split(".") ?? [];
+  return Number((BigInt(`${seconds}${fraction}`) * hz) / 10n ** BigInt(fraction.length));
+}
+
+function birthClock(): number {
+  if (inspectionPlatform === "darwin") return Date.now() * 1000;
+  // Linux starttime uses boot-relative USER_HZ ticks. AT_CLKTCK supplies their rate.
+  const auxv = readFileSync("/proc/self/auxv");
+  for (let offset = 0; offset + 16 <= auxv.length; offset += 16)
+    if (auxv.readBigUInt64LE(offset) === 17n)
+      return linuxBirthClock(readFileSync("/proc/uptime", "utf8"), auxv.readBigUInt64LE(offset + 8));
+  throw new Error("Process birth clock could not be confirmed");
+}
+
 async function stopMarkedProcesses(
   marker: string,
   child: ChildProcess,
@@ -240,41 +266,94 @@ async function stopMarkedProcesses(
   if (group === undefined) return;
   const protectedPids = callerAncestors();
   const started = performance.now();
-  const claimed = new Map<number, { birth: string; termed: boolean }>();
+  const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
+  let bornAt: number | null | undefined;
+  const claimed = new Map<number, { birth: string; stopped: boolean; frozen: boolean }>();
+  let growing = false;
   let empty = false;
-  for (;;) {
-    const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
-    for (const pid of pids) {
-      if (protectedPids.has(pid) || claimed.has(pid)) continue;
-      const birth = await processBirth(pid);
-      if (birth !== null) claimed.set(pid, { birth, termed: false });
+  try {
+    for (;;) {
+      const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
+      for (const pid of pids) {
+        if (protectedPids.has(pid) || claimed.has(pid)) continue;
+        const birth = await readBirth(pid);
+        if (birth !== null) {
+          if (bornAt === undefined) {
+            try {
+              bornAt = (processBirthInspection.getStore()?.now ?? birthClock)();
+            } catch {
+              bornAt = null; // Growth is diagnostic only; ownership still comes from identity checks.
+            }
+          }
+          // Allow one clock quantum: milliseconds for macOS births, USER_HZ ticks for Linux.
+          growing ||= bornAt !== null && birthTime(birth) > bornAt + (birth.includes(":") ? 1000 : 1);
+          claimed.set(pid, { birth, stopped: false, frozen: false });
+        }
+      }
+      // An already-claimed descendant stays ours after reparenting or an environment
+      // change. A reused PID is no longer that process and must never be signalled.
+      const deadline = performance.now() - started >= graceMs + 10_000;
+      const names: string[] = [];
+      // Freeze every newly discovered member, then rescan before killing the frozen set.
+      const freezing = [...claimed.values()].some((identity) => !identity.stopped);
+      for (const [pid, identity] of claimed) {
+        let name = "unknown";
+        const birth = deadline
+          ? await readBirth(pid, (value) => {
+              name = value;
+            })
+          : await readBirth(pid);
+        if (birth !== identity.birth) claimed.delete(pid);
+        else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
+        else if (!freezing || !identity.stopped) {
+          try {
+            process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
+            identity.stopped = true;
+            identity.frozen = freezing;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+            identity.frozen = false;
+          }
+        }
+      }
+      // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
+      const exited = child.exitCode !== null || child.signalCode !== null;
+      if (!claimed.size && empty && exited) return;
+      empty = !claimed.size && exited;
+      if (deadline && claimed.size)
+        throw new Error(
+          `Marked processes still alive: ${names.length}: ${names.join(", ")}; set ${growing ? "kept growing" : bornAt === null ? "growth unknown" : "remained stable"}`,
+        );
+      if (deadline && !exited) throw new Error(`Child process exit could not be confirmed: ${group}`);
+      // Yield even for empty snapshots: spawn/exit notifications and a racing fork
+      // must have an opportunity to arrive before we confirm shutdown.
+      if (!freezing && (claimed.size || !exited)) await Bun.sleep(10);
+      else await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    // An already-claimed descendant stays ours after reparenting or an environment
-    // change. A reused PID is no longer that process and must never be signalled.
-    for (const [pid, identity] of claimed)
-      if ((await processBirth(pid)) !== identity.birth) claimed.delete(pid);
-    // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
-    const exited = child.exitCode !== null || child.signalCode !== null;
-    if (!claimed.size && empty && exited) return;
-    empty = !claimed.size && exited;
-    if (performance.now() - started >= graceMs + 10_000)
-      throw new Error(
-        `Marked processes still alive: ${[...new Set([...claimed.keys(), ...(!exited ? [group] : [])])].join(", ")}`,
-      );
+  } catch (error) {
+    const failures = [error];
     for (const [pid, identity] of claimed) {
-      const signal = identity.termed && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
-      if (signal === "SIGTERM" && identity.termed) continue;
+      if (protectedPids.has(pid)) continue;
+      let birth: string | null | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          birth = await readBirth(pid);
+          break;
+        } catch (inspectionError) {
+          if (attempt === 0) failures.push(inspectionError);
+          if (performance.now() - started >= graceMs + 10_000) break;
+        }
+      }
+      // Only a successfully frozen member cannot exit and have its PID reused while
+      // inspection is unavailable. A delivered KILL ends that exception as well.
+      if (birth !== identity.birth && !(birth === undefined && identity.frozen)) continue;
       try {
-        process.kill(pid, signal);
-        identity.termed = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        process.kill(pid, "SIGKILL");
+      } catch (signalError) {
+        failures.push(signalError);
       }
     }
-    // Yield even for empty snapshots: spawn/exit notifications and a racing fork
-    // must have an opportunity to arrive before we confirm shutdown.
-    if (claimed.size || !exited) await Bun.sleep(10);
-    else await new Promise<void>((resolve) => setImmediate(resolve));
+    throw new Error(redactCredentials(failures.map(String).join("; ")));
   }
 }
 
