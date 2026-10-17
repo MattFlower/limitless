@@ -231,7 +231,8 @@ test("unconfirmed clipped source mapping withholds the whole span", () => {
 });
 
 test("unsettled normalization withholds the whole affected field", () => {
-  const unsettled = "%25252525252572ed owl";
+  // Build the undecodable probe at runtime so publication can inspect this test's source.
+  const unsettled = `%${"25".repeat(6)}72ed owl`;
   expect(buildReportRedactor(new Set([unsettled]))("Ordinary line")).toContain("[withheld:");
   const filtered = buildReportRedactor(new Set(["red owl"]))(`Ordinary line\n${unsettled}`);
   expect(filtered).toContain("[withheld:");
