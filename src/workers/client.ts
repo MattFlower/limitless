@@ -77,6 +77,7 @@ const WireRequest = z.object({
   repo: z.string(),
   cwd: z.string(),
   runId: z.string().optional(),
+  priority: z.enum(["ship", "finish", "start"]).optional(),
   baseSha: z.union([z.literal(""), z.string().regex(/^[a-f0-9]{40,64}$/)]),
   headSha: z.string().regex(/^[a-f0-9]{40,64}$/),
   checks: z.array(z.string()).optional(),
@@ -235,6 +236,7 @@ export async function runWorker(
         const run = await readPolicyScope.run(cfg.readPolicy, () =>
           confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
             runLocalGates(cwd, gates, jobSignal, {
+              priority: req.priority,
               onResult(result, phase) {
                 posts = posts.then(async () => {
                   await call(

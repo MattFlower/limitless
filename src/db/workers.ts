@@ -242,14 +242,14 @@ export class WorkerStore {
     return ids.filter((id) => !owned.has(id));
   }
   private keepLocal(j: JobRow | null) {
-    if (!j || !credentialBearing(JSON.parse(j.request))) return false;
+    if (j?.state !== "queued" || !credentialBearing(JSON.parse(j.request))) return false;
     this.event(j.id, {
       type: "status",
       text: "LAN gates executing locally: executable inputs contain a registered credential",
     });
     this.store.db
       .query(
-        "UPDATE gate_jobs SET state='failed',worker=NULL,lease_expires_at=NULL WHERE id=? AND state IN ('queued','leased')",
+        "UPDATE gate_jobs SET state='failed',worker=NULL,lease_expires_at=NULL WHERE id=? AND state='queued'",
       )
       .run(j.id);
     return true;
@@ -296,7 +296,7 @@ export class WorkerStore {
   sweep() {
     const now = this.now();
     for (const j of this.jobs("state IN ('queued','leased')")) {
-      if (this.keepLocal(j)) continue;
+      if (j.state === "queued" && this.keepLocal(j)) continue;
       if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
         this.fail(j.id, "No worker picked up job");
       else if (j.state === "leased") {

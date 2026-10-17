@@ -34,6 +34,7 @@ import {
   retryRegressions,
   runLocalGates,
 } from "../src/gates/run.ts";
+import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -673,6 +674,7 @@ test("a worker runs real checks from the exact bundle head and returns the local
   const req = await request(true),
     secret = "worker-output-credential-513";
   registerCredential("WORKER_OUTPUT_TEST", secret);
+  req.priority = "start";
   req.gates.checks.push({ name: "privacy", run: "cat output-credential" });
   writeFileSync(join(req.cwd, "output-credential"), secret);
   const firstCheck = req.gates.checks[0];
@@ -689,8 +691,10 @@ test("a worker runs real checks from the exact bundle head and returns the local
     },
   });
   const signal = AbortSignal.timeout(150_000);
+  const acquisition = spyOn(gateSlots, "acquire");
   try {
     const run = await executeGate(req, signal, {}, gateExecutorFor("lan", workers, [req.repo]));
+    expect(acquisition.mock.calls[0]?.[4]).toBe("start");
     const local = await confinementScope.run(fakeConfinement, () =>
       executeGate(req, signal, {}, localExecutor()),
     );
@@ -709,6 +713,7 @@ test("a worker runs real checks from the exact bundle head and returns the local
       expect(statSync(join(worker.remote.paths.home, "worker", name)).mode & 0o777).toBe(0o600);
   } finally {
     await worker.stop();
+    acquisition.mockRestore();
   }
 }, 180_000);
 
@@ -1072,16 +1077,23 @@ test("expired leases retry once on a different worker then fall back locally wit
 
 test("a job that no worker picks up falls back and cannot pass a failing local check", async () => {
   const req = await request();
+  req.priority = "ship";
   workers = new WorkerStore(store, releaseSha, { pickup: 0, tick: 1 });
-  const result = await confinementScope.run(fakeConfinement, () =>
-    executeGate(req, new AbortController().signal, {}, gateExecutorFor("lan", workers, [req.repo])),
-  );
-  expect(result.checks[1]?.ok).toBe(false);
-  expect(workers.jobs("1=1")[0]).toMatchObject({
-    state: "done",
-    attempt: 2,
-    failure_reason: "No worker picked up job",
-  });
+  const acquisition = spyOn(gateSlots, "acquire");
+  try {
+    const result = await confinementScope.run(fakeConfinement, () =>
+      executeGate(req, new AbortController().signal, {}, gateExecutorFor("lan", workers, [req.repo])),
+    );
+    expect(acquisition.mock.calls[0]?.[4]).toBe("ship");
+    expect(result.checks[1]?.ok).toBe(false);
+    expect(workers.jobs("1=1")[0]).toMatchObject({
+      state: "done",
+      attempt: 2,
+      failure_reason: "No worker picked up job",
+    });
+  } finally {
+    acquisition.mockRestore();
+  }
 }, 30_000);
 
 test.each([
@@ -1343,6 +1355,54 @@ test.skipIf(seatbeltSkip !== null)(
   },
   60_000,
 );
+
+test("short registered credentials in executable inputs never reach a lease reply", async () => {
+  const req = await request();
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const secret = "p7x9k2v";
+  req.gates.checks = [{ name: "short-secret", run: `printf '%s' '${secret}'` }];
+  const queued = workers.enqueue(req);
+  expect(workers.job(queued)?.state).toBe("queued");
+  registerCredential("TEST_PASSWORD", secret);
+  expect(credentialBearing(req)).toBe(true);
+  const formatted = {
+    ...req,
+    gates: { ...req.gates, checks: [{ name: "short-secret", run: "printf '%s' 'p7x\x1b[31m9k2v'" }] },
+  };
+  expect(credentialBearing(formatted)).toBe(true);
+  const immediate = workers.enqueue(req);
+  expect(workers.job(immediate)?.state).toBe("failed");
+  const reply = await call("/worker/lease", {}, token);
+  expect(reply.json()).toEqual({ job: null });
+  expect(reply.data.toString()).not.toContain(secret);
+  expect(workers.job(queued)?.state).toBe("failed");
+}, 30_000);
+
+test("registering a credential after dispatch preserves the active lease and its normal lifecycle", async () => {
+  const req = await request();
+  const secret = "active-lease-credential-570";
+  req.gates.checks = [{ name: "check", run: `printf '%s' '${secret}'` }];
+  workers.pairingKey = "test-pairing-key";
+  const pending = workers.pair("runner", "a".repeat(64), "b".repeat(64));
+  workers.approve(pending.code);
+  const worker = workers.worker("runner");
+  if (!worker) throw new Error("Missing worker");
+  workers.heartbeat(worker, caps());
+  const id = workers.enqueue(req);
+  const leased = workers.lease(worker.name);
+  expect(leased).toMatchObject({ id, state: "leased", worker: worker.name });
+  registerCredential("ACTIVE_LEASE_TEST", secret);
+  workers.sweep();
+  expect(workers.job(id)).toEqual(leased);
+  expect(workers.heartbeat(worker, caps([id]))).toEqual({ cancelled: [] });
+  expect(workers.holds(id, worker.name)).toMatchObject({ state: "leased", attempt: 1 });
+  const run: GateRun = { setupOk: true, setup: [], checks: [] };
+  workers.complete(id, run);
+  expect(workers.job(id)).toMatchObject({ state: "done", worker: worker.name, attempt: 1 });
+  expect(JSON.parse(workers.job(id)?.result ?? "null")).toEqual(run);
+});
 
 test("credential-bearing executable inputs stay local, including requests queued before registration", async () => {
   const req = await request();

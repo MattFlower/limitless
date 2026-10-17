@@ -256,7 +256,7 @@ test("restart re-registers running work immediately, even above the cap, before 
         started.resolve();
         return done.promise;
       },
-      { ...f, clock },
+      { ...f, clock, priority: "ship" },
     );
     await started.promise;
     // Retire the old daemon's timers; the command itself remains running.
@@ -281,7 +281,7 @@ test("restart re-registers running work immediately, even above the cap, before 
       await f.time.advance(10_000);
       const holders = occupied ? ["new-run", "survivor"] : ["survivor"];
       expect(f.slots.snapshot()).toEqual({ occupied: holders.length, limit: 1, holders });
-      expect(f.calls).toContainEqual({ name: "survivor", running: true });
+      expect(f.calls).toContainEqual({ name: "survivor", running: true, priority: "ship" });
       const heartbeat = f.calls.find((body) => typeof body.id === "string" && !body.release);
       if (typeof heartbeat?.id === "string") oldSlots.heartbeat(heartbeat.id, true);
       second ??= queue();
@@ -651,9 +651,9 @@ test.each([60_000, 0])("expired ordinary reservations are replaced (maxWaitMs=%s
   expect(executions).toBe(0);
   await f.time.advance(250);
   expect(requests).toEqual([
-    { name: "deploy", immediate: false },
+    { name: "deploy", immediate: false, priority: "finish" },
     { id: "q" },
-    { name: "deploy", immediate: false },
+    { name: "deploy", immediate: false, priority: "finish" },
   ]);
   await f.time.advance(179_500);
   expect(executions).toBe(0);
@@ -962,6 +962,8 @@ test("CLI preserves arguments, environment, cwd and statuses; rejects invalid op
       ["--max-wait", "-1", "--", "true"],
       ["--max-wait", "1.5", "--", "true"],
       ["--bad", "--", "true"],
+      ["--priority", "urgent", "--", "true"],
+      ["--priority", "", "--", "true"],
     ]) {
       const f = rig();
       await expect(gateSlotCommand(args, f.client)).rejects.toThrow();
@@ -1173,3 +1175,35 @@ test("main dispatches gate-slot and warns on an injected connection refusal", as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// This rig deliberately ignores priority, like the previous daemon release.
+test.each([undefined, "ship", "finish", "start"])(
+  "CLI forwards priority %s and runs against a previous-release daemon",
+  async (priority) => {
+    const f = rig();
+    const dir = mkdtempSync(join(tmpdir(), "priority-cli-"));
+    const marker = join(dir, "ran");
+    try {
+      const args = priority === undefined ? [] : ["--priority", priority];
+      expect(
+        await gateSlotCommand(
+          [
+            ...args,
+            "--",
+            process.execPath,
+            "-e",
+            'require("fs").writeFileSync(process.argv[1], "ran")',
+            marker,
+          ],
+          f.client,
+        ),
+      ).toBe(0);
+      expect(readFileSync(marker, "utf8")).toBe("ran");
+      expect(f.calls[0]).toMatchObject({ priority: priority ?? "finish" });
+      expect(f.calls.at(-1)).toMatchObject({ release: true });
+      expect(f.slots.snapshot().occupied).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);

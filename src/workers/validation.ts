@@ -3,7 +3,7 @@ import type { GateRequest } from "../gates/executor.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import type { GateResult, GateRun } from "../gates/run.ts";
 import { confinementFailed } from "../gates/run.ts";
-import { redactCredentials } from "../util/proc.ts";
+import { redactCredentials, registeredCredentials } from "../util/proc.ts";
 
 export function requestedChecks(req: GateRequest) {
   return req.gates.checks.filter((c) => !req.checks || req.checks.includes(c.name));
@@ -17,7 +17,10 @@ export function credentialBearing(req: GateRequest) {
     req.gates.retryFiles ?? "",
   ].some((input) => {
     const normalized = stripVTControlCharacters(input);
-    return redactCredentials(normalized) !== normalized;
+    return (
+      registeredCredentials().some((secret) => normalized.includes(secret)) ||
+      redactCredentials(normalized) !== normalized
+    );
   });
 }
 
