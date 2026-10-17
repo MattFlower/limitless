@@ -223,8 +223,20 @@ test.each(["secret_\ntoken", "secret\n_token", "secret_ \ntoken", "the secret_\n
   },
 );
 
+test.each(["secret__\ntoken", "secret\n__token", "secret_\n_token", "the secret__ \ntoken leaked"])(
+  "an intraword delimiter run wrapped at a line break still matches: %j",
+  (wrapped) => {
+    const redacted = buildReportRedactor(new Set(["secret__token"]))(wrapped);
+    expect(redacted).toContain("[withheld:");
+    expect(redacted).not.toContain("token");
+  },
+);
+
 test("an intraword delimiter wrap point stays distinct from an unwrapped identifier", () => {
   expect(buildReportRedactor(new Set(["secret_token"]))("Changed secrettoken lookup.")).toBe(
+    "Changed secrettoken lookup.",
+  );
+  expect(buildReportRedactor(new Set(["secret__token"]))("Changed secrettoken lookup.")).toBe(
     "Changed secrettoken lookup.",
   );
 });

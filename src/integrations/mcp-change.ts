@@ -476,15 +476,15 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
           .map((detail) => {
             const normalized = matchForm(detail);
             const wrap = "\x00?";
-            const literal = [...normalized]
+            const literal = (normalized.match(/[*_~]+|[\s\S]/gu) ?? [])
               .map((character) =>
                 character === " "
                   ? "[ \x00]+"
                   : character === "\0"
                     ? "[ \x00]*"
-                    : // An intraword delimiter next to a wrap is stripped from the report.
-                      /[*_~]/u.test(character)
-                      ? `(?:[${character}]|\x00)`
+                    : // An intraword delimiter run next to a wrap is stripped whole from the report.
+                      /^[*_~]+$/u.test(character)
+                      ? `(?:${character.replace(/[*]/g, "\\*")}|\x00)`
                       : character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
               )
               .join(wrap);
