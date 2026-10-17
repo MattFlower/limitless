@@ -121,7 +121,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
     });
 
-    // #556 measurement (2026-10-16): alone 9.82 s, paired load 17.06 s; multiple real-Git pipelines.
+    // #556 (2026-10-17): alone 8.59 s, worst of 10 paired runs 6.56 s; multiple real-Git pipelines.
+    // Before cancellable event waits: alone 11.32 s, paired 13.85 s.
     test("a flaky base that failed twice is not cached, so the next run blocks the regression", async () => {
       const count = join(home, "gate-runs");
       // Fails the first baseline and its retry; later it fails only once the change exists.
@@ -304,7 +305,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
     });
 
-    // #556 measurement (2026-10-16): alone 9.37 s, paired load 10.62 s; multiple real-Git pipelines.
+    // #556 (2026-10-17): alone 7.01 s, worst of 10 paired runs 8.62 s; multiple real-Git pipelines.
+    // Before watching the gate marker: alone 9.59 s, paired 10.94 s.
     test("a timed-out or cancelled baseline is not cached", async () => {
       const count = join(home, "gate-runs");
       // The first execution outlasts its timeout; later ones pass.
@@ -342,7 +344,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(lines(count)).toBe(3);
     });
 
-    // #556 measurement (2026-10-16): alone 12.15 s, paired load 14.11 s; multiple real-Git pipelines.
+    // #556 (2026-10-17): alone 9.33 s, worst of 10 paired runs 13.62 s; multiple real-Git pipelines.
+    // Before cancellable event waits: alone 14.47 s, paired 16.45 s.
     test("a bypass run refreshes a passing entry and evicts it when the base fails", async () => {
       const count = join(home, "gate-runs");
       const broken = join(home, "broken");

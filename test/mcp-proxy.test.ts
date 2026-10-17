@@ -586,7 +586,8 @@ test.each(["maxWords", "cafe\u0301"])(
   },
 );
 
-// #556 (2026-10-16), 2/3-line cases: alone 2.74/2.41 s, paired 3.53/3.09 s; real Git per page.
+// #556 (2026-10-17), 2/3-line cases: alone 2.98/2.82 s; worst of 10 paired runs 1.92/1.98 s.
+// Before trimming page requests: alone 3.42/3.36 s, paired 4.21/4.08 s; real Git per page.
 test.each([2, 3])(
   "change pages expose %i-line PR prose but protect its holdout quotation in reports",
   async (length) => {
@@ -868,7 +869,8 @@ test("escaped multiline PR hunk annotations stay visible with Git ranges", async
   }
 });
 
-// #556 measurement (2026-10-16): alone 3.87 s, paired load 5.37 s; real Git and catalogue invalidations.
+// #556 (2026-10-17): alone 4.42 s, worst of 10 paired runs 3.25 s; Git and catalogue invalidations.
+// Before trimming the paged fixture: alone 3.77 s, paired 4.97 s.
 test("change pages reuse the catalogue and refresh diagnostics, holdouts and privacy inputs", async () => {
   const c = await changeFixture(
     f,
@@ -1856,7 +1858,8 @@ test.each([
   }
 });
 
-// #556 measurement (2026-10-16): alone 2.95 s, paired load 3.23 s; real Git and paged privacy scans.
+// #556 (2026-10-17): alone 3.00 s, worst of 10 paired runs 2.63 s; Git and paged privacy scans.
+// Before trimming the paged fixtures: alone 3.04 s, paired 3.69 s.
 test("change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";
   const c = await changeFixture(f, {
