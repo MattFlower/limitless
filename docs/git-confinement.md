@@ -53,6 +53,14 @@ The [Git configuration reference](https://git-scm.com/docs/git-config) and
 matrix, execution probes, delivery and a writer synchronized after the populated-repository check.
 The writer control reproduces filter execution with the identity backend.
 
+Two portable checks run without real Seatbelt. One drives the production Seatbelt backend through a
+stand-in `sandbox-exec` and a recording `git` on PATH, across status, diff, staging, commits, merge,
+the empty-tree lookup and the clean retry. It asserts that every git process except the one-time
+version probe started inside the stand-in. The other launches `worktreeGit` and
+`scripts/check-private-strings.ts` in subprocesses without the test preload, where Seatbelt is
+unavailable (nested inside a sandbox, or not macOS). Both refuse, and no nested filter runs. When
+Seatbelt is available, the same launch confines and succeeds.
+
 The factory worker is already sandboxed. Real Seatbelt tests therefore skip using `seatbeltSkip`;
 an unconfined macOS run, including both installed Git and `/usr/bin/git`, is still required before
 landing. This worker cannot certify the real profile or its identity-backend comparison.

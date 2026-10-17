@@ -1,8 +1,17 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { stageAll, worktreeGit } from "../src/git/command.ts";
+import { emptyTreeId, stageAll, worktreeGit } from "../src/git/command.ts";
 import { ConfinementError, gitConfinement, gitProfile, gitSh, seatbeltGit } from "../src/git/confinement.ts";
 import { commitAll, pushBranch, rebaseOnto } from "../src/git/repos.ts";
 import { CommandError, sh } from "../src/util/proc.ts";
@@ -428,3 +437,101 @@ for (const confined of [false, true])
       expect(existsSync(marker)).toBe(false);
     },
   );
+
+test("every git process of a factory call, auxiliary ones included, runs through sandbox-exec", async () => {
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const log = join(root, "git.log");
+  const failed = join(root, "clean-failed");
+  const realGit = realpathSync(Bun.which("git") ?? "git");
+  // Records which invocations reached git from inside the stand-in sandbox, failing the first clean.
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\nprintf '%s\\t%s\\n' "\${SANDBOXED:-0}" "$*" >> '${log}'\ncase "$*" in *" clean -ffdxq") [ -e '${failed}' ] || { : > '${failed}'; exit 1; } ;; esac\nexec '${realGit}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  const sandbox = join(root, "sandbox-exec");
+  writeFileSync(
+    sandbox,
+    `#!/bin/sh\n[ "$1" = -p ] || exit 71\ncase "$2" in *"(deny process-exec)"*) ;; *) exit 71 ;; esac\nshift 2\nSANDBOXED=1 exec "$@"\n`,
+    { mode: 0o755 },
+  );
+  const env = { ...(process.env as Record<string, string>), PATH: `${bin}:${process.env.PATH}` };
+  const opts = { cwd, env };
+  await gitConfinement.run(seatbeltGit("darwin", sandbox), async () => {
+    writeFileSync(join(cwd, "added"), "added\n");
+    await worktreeGit(["git", "status", "--porcelain"], opts);
+    await worktreeGit(["git", "diff"], opts);
+    await stageAll(opts);
+    await worktreeGit(["git", "commit", "-qm", "added"], opts);
+    await worktreeGit(["git", "commit", "-qm", "nothing staged"], { ...opts, allowFail: true });
+    await worktreeGit(["git", "merge", "HEAD"], opts);
+    await emptyTreeId(opts);
+    await worktreeGit(["git", "clean", "-ffdxq"], opts, true);
+  });
+  const calls = readFileSync(log, "utf8").trim().split("\n");
+  // Only the one-time version probe in worktreeGit may run outside the sandbox.
+  expect(calls.filter((line) => !line.startsWith("1\t") && line !== "0\t--version")).toEqual([]);
+  for (const command of ["config", "rev-parse", "ls-files", "ls-tree", "update-index", "commit", "merge"])
+    expect(calls.some((line) => line.includes(` ${command} `))).toBe(true);
+  expect(calls.filter((line) => line.endsWith(" clean -ffdxq"))).toHaveLength(2);
+});
+
+// Seatbelt can't nest, so running the child inside a sandbox makes confinement unavailable to it.
+const unavailable =
+  seatbeltSkip === null ? ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)"] : [];
+const launch = (code: string, dir: string) =>
+  sh([...unavailable, process.execPath, "--config=/dev/null", "--no-env-file", "-e", code], {
+    cwd: dir,
+    allowFail: true,
+  });
+const launchCode = (marker: string) => `
+  import { worktreeGit } from ${JSON.stringify(resolve("src/git/command.ts"))};
+  import { ConfinementError } from ${JSON.stringify(resolve("src/git/confinement.ts"))};
+  try {
+    await worktreeGit(["git", "commit", "-m", "empty"], { cwd: process.cwd(), allowFail: true });
+    console.log("ran");
+  } catch (error) {
+    console.log(error instanceof ConfinementError ? "refused" : "other");
+  }
+  console.log(require("node:fs").existsSync(${JSON.stringify(marker)}) ? "marker" : "clean");
+`;
+
+test("a launch without the test preload refuses worktreeGit when confinement is unavailable", async () => {
+  const marker = await nested("clean");
+  const result = await launch(launchCode(marker), cwd);
+  expect(result.stdout.trim().split("\n")).toEqual(["refused", "clean"]);
+  expect(existsSync(marker)).toBe(false);
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `a launch without the test preload confines worktreeGit (${seatbeltSkip ?? "available"})`,
+  async () => {
+    const marker = await nested("clean");
+    const result = await sh(
+      [process.execPath, "--config=/dev/null", "--no-env-file", "-e", launchCode(marker)],
+      {
+        cwd,
+      },
+    );
+    expect(result.stdout.trim().split("\n")).toEqual(["ran", "clean"]);
+  },
+);
+
+test("the private-strings script launched without the test preload refuses unconfined git", async () => {
+  const script = resolve("scripts/check-private-strings.ts");
+  const preloaded = await sh(
+    [process.execPath, `--preload=${resolve("test/git-preload.ts")}`, script, "--record"],
+    { cwd },
+  );
+  expect(preloaded.stdout.split("\n")[0]).toBe(realpathSync(cwd));
+  const refused = await sh(
+    [...unavailable, process.execPath, "--config=/dev/null", "--no-env-file", script, "--record"],
+    {
+      cwd,
+      allowFail: true,
+    },
+  );
+  expect(refused.exitCode).not.toBe(0);
+  expect(refused.stdout).toBe("");
+});
