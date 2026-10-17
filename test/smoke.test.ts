@@ -1238,7 +1238,7 @@ test.skipIf(stateSkip)(
 
 const processModes = ["SIGINT", "SIGTERM", "stubborn", "probe", "completed"] as const;
 const interruptModes = ["escaped-SIGINT", "escaped-SIGTERM", "second-SIGINT", "second-SIGTERM"] as const;
-// These wait out real timeouts and kill grace periods, each in its own directory and processes, so they overlap.
+// These wait out real timeouts, each in its own directory and processes, so they overlap.
 const timeoutModes: string[] = ["timeout", "budget", "escaped-timeout", "cli-timeout", "idle-timeout"];
 for (const mode of [...processModes, ...interruptModes, ...timeoutModes]) {
   const cleansGroups = async () => {
@@ -1354,9 +1354,24 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
           .trim()
           .split("\n")
           .map((line) => line.split(" "));
-        const sent = (signal: string) => Number(signals.find((parts) => parts[1] === signal)?.[2]);
-        expect(sent("SIGKILL") - sent("SIGTERM")).toBeGreaterThanOrEqual(4900);
-        expect(sent("SIGKILL") - sent("SIGTERM")).toBeLessThan(6500);
+        // Timeout cleanup freezes the entire tree before killing it, including the
+        // TERM-ignoring CLI. Confirm both processes receive that sequence.
+        for (const pid of pids()) {
+          const sent = signals.filter((parts) => parts[0] === String(pid));
+          expect(sent[0]?.[1]).toBe("SIGSTOP");
+          expect(sent.slice(1).map((parts) => parts[1])).toContain("SIGKILL");
+          expect(sent.slice(1).every((parts) => parts[1] === "SIGKILL")).toBe(true);
+          const elapsed = Number(sent.at(-1)?.[2]) - Number(sent[0]?.[2]);
+          expect(elapsed).toBeGreaterThanOrEqual(0);
+          expect(elapsed).toBeLessThan(6500);
+        }
+        const lastStop = Math.max(
+          ...signals.filter((parts) => parts[1] === "SIGSTOP").map((parts) => Number(parts[2])),
+        );
+        const firstKill = Math.min(
+          ...signals.filter((parts) => parts[1] === "SIGKILL").map((parts) => Number(parts[2])),
+        );
+        expect(firstKill).toBeGreaterThanOrEqual(lastStop);
       }
       if (mode === "completed") {
         expect(output).toMatch(/completed\s+PASS/);

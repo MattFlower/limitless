@@ -199,7 +199,9 @@ use the file first, then the environment.
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
-| `[gates] executor` | `"local"` | Gate execution backend; `local` is the only supported value for now. |
+| `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
+| `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
+| `[workers] repos` | `[]` | Repositories allowed to send gate code to paired workers, for example `["owner/name"]`. Requires `[gates] executor = "lan"`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
 | `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
@@ -224,6 +226,22 @@ credential stores above, but Claude's
 own CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
 macOS Keychain access through `security`, network egress and the loopback API (#484) remain separate
 gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
+
+To pair a macOS worker, run `limitless worker pair --coordinator https://<host>:7443`
+on that machine, then compare all 16 characters of its printed code with `limitless workers ls`
+on the coordinator and run `limitless workers approve <code>` with the complete code. Start it with
+`limitless worker --coordinator https://<host>:7443`; `limitless workers revoke <name>`
+immediately removes its access. `--name <name>` overrides the pairing name. Pair requests expire
+after ten minutes. The coordinator creates and reuses a self-signed certificate under
+`<data>/worker-tls/`; workers pin its fingerprint and keep credentials under `<data>/worker/`.
+Changing the coordinator's certificate requires pairing again. Keep both machines on the same
+release SHA and Bun version; mismatches show as `needs update`. Workers send heartbeats every
+ten seconds and show as offline after thirty seconds without a heartbeat. Opted-in gates run from
+git bundles at the requested commit, without GitHub credentials on the worker. Leases renew with
+heartbeats and expire after sixty seconds. Infrastructure failures retry once on another worker,
+then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
+restarts re-attach to the same job, while cancelling a run tells its worker to stop.
+Bonjour discovery, power/idle selection and Linux workers are not supported.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default
 branch:

@@ -374,3 +374,36 @@ Sorted by baseline cost. Values are sums of individual test durations; rounding 
 | `test/failure-injection.test.ts` | factory merge survives interruption at resolution-start without losing parents or replaying completed work | 3.079 | 2.967 |
 | `test/feed-cli.test.ts` | the CLI binary retries two 5xx responses and then prints items | 3.028 | 3.025 |
 | `test/evals-implement-runner.test.ts` | baseline gates are shared across repetitions and providers per case within each run | 3.000 | 2.717 |
+
+## Load-sensitive tests (#556)
+
+Measured 2026-10-17 on the factory's Mac while other work ran. *Alone* runs the test's file by itself. *Loaded* runs it with `bun test --parallel=4` paired with one other heavy file, the bounded load from #556. *After loaded* is the worst of the paired runs. A dash marks a loaded run that wasn't measured after the change; those tests are tracked in #556.
+
+| File | Test | Before alone | Before loaded | After alone | After loaded (worst) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `mcp-proxy` | change pages expose 2-line PR prose but protect its holdout quotation in reports | 3.42 s | 4.21 s | 2.98 s | 1.92 s |
+| `mcp-proxy` | change pages expose 3-line PR prose but protect its holdout quotation in reports | 3.36 s | 4.08 s | 2.82 s | 1.98 s |
+| `mcp-proxy` | change pages reuse the catalogue and refresh diagnostics, holdouts and privacy inputs | 3.77 s | 4.97 s | 4.42 s | 3.25 s |
+| `mcp-proxy` | change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends | 3.04 s | 3.69 s | 3.00 s | 2.63 s |
+| `pipeline-baseline-cache` | a second run on the same base reuses a passing baseline | 4.79 s | 6.33 s | 4.75 s | 3.34 s |
+| `pipeline-baseline-cache` | a flaky base that failed twice is not cached, so the next run blocks the regression | 11.32 s | 13.85 s | 8.59 s | 6.56 s |
+| `pipeline-baseline-cache` | concurrent runs on one base execute the baseline once | 5.90 s | 5.89 s | 1.58 s | 1.32 s |
+| `pipeline-baseline-cache` | with the kill switch, same-base runs execute their baselines concurrently | 6.62 s | 7.50 s | 2.51 s | 1.90 s |
+| `pipeline-baseline-cache` | a failing flight releases its waiters to run concurrently | 6.89 s | 8.10 s | 2.59 s | 2.10 s |
+| `pipeline-baseline-cache` | an unknown build SHA neither reads nor writes the cache | 5.78 s | 6.45 s | 5.18 s | 4.25 s |
+| `pipeline-baseline-cache` | a changed gate config or base commit misses | 8.96 s | 9.65 s | 6.07 s | 6.28 s |
+| `pipeline-baseline-cache` | a changed gate environment misses | 16.80 s | 20.59 s | 3.44 s | 3.72 s |
+| `pipeline-baseline-cache` | a changed nonsecret setting with a secret-looking name misses | 16.89 s | 18.05 s | 3.00 s | 3.31 s |
+| `pipeline-baseline-cache` | a timed-out or cancelled baseline is not cached | 9.59 s | 10.94 s | 7.01 s | 8.62 s |
+| `pipeline-baseline-cache` | a bypass run refreshes a passing entry and evicts it when the base fails | 14.47 s | 16.45 s | 9.33 s | 13.62 s |
+| `pipeline-baseline-cache` | post-rebase gates execute when prepare reused the cached baseline | 7.79 s | 7.33 s | 4.11 s | 6.91 s |
+| `evals-runner` | control and causal replay share candidates and a pinned verifier but grade and cache independently | 20.88 s | 22.48 s | 10.45 s | — |
+| `failure-injection` | factory merge survives interruption at resolution-start without losing parents or replaying completed work | 9.62 s | 8.80 s | 4.85 s | — |
+| `failure-injection` | factory merge survives interruption at implementation-committed without losing parents or replaying completed work | 8.99 s | 9.87 s | 5.69 s | — |
+| `failure-injection` | delivery with 3 PR-create 502s falls back as GitHub unavailable | 4.82 s | 5.10 s | 2.99 s | — |
+| `evals-http` | review and verify API reports preserve role grades and text/JSON metrics | 3.23 s | 2.06 s | 2.05 s | — |
+| `evals-implement-runner` | baseline gates are shared across repetitions and providers per case within each run | 23.47 s | 10.41 s | 10.71 s | — |
+| `pipeline-delivery-restart` | delivery checkpoint conflict-committed never publishes unchecked work | 8.38 s | 8.84 s | 3.84 s | — |
+| `evals-reading-runner` | review uses the pipeline prompt, recomputed audit, detached seeded HEAD and agent harness | 11.85 s | 12.00 s | 5.98 s | — |
+
+Each test's remedy is noted in the comment beside it: for example, cancellable event waits instead of polling, trimmed page requests and fixtures, or watching the gate marker instead of sleeping.
