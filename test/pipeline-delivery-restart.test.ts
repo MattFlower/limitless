@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -21,6 +21,7 @@ let repoDir: string;
 let factory: Factory | null = null;
 const {
   start,
+  wait,
   githubFixture,
   registerGithub,
   advanceBase,
@@ -73,12 +74,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
         ? { "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" } }
         : { "stage:deliver:before": { action: "kill" } };
     const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-    const deadline = Date.now() + 10_000;
-    while (f.store.listStages(run.id).findLast((stage) => stage.name === "deliver")?.status !== "cancelled") {
-      if (Date.now() > deadline)
-        throw new Error(`delivery interruption timed out: ${f.store.getRun(run.id)?.error}`);
-      await Bun.sleep(10);
-    }
+    await wait(
+      () => f.store.listStages(run.id).findLast((stage) => stage.name === "deliver")?.status === "cancelled",
+      {
+        timeoutMs: 10_000,
+        description: "delivery interruption timed out",
+        pollMs: null,
+        subscribe: (wake) => f.store.subscribe(wake),
+      },
+    );
     await f.stop();
     const state = f.store.getRunState<RunState>(run.id);
     if (!state?.worktreePath || !state.reviewedSha || !state.gateEvidence)
@@ -137,7 +141,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "conflict-implement",
     "conflict-committed",
   ] as const) {
-    test(`delivery checkpoint ${checkpoint} never publishes unchecked work`, async () => {
+    const timeout = checkpoint === "conflict-committed" ? 30_000 : undefined;
+    const checkCheckpoint = async () => {
       const conflict = checkpoint.startsWith("conflict-");
       const marker = join(home, "checking");
       const release = join(home, "release");
@@ -198,8 +203,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const f = start(handler);
       registerGithub(f, bare);
       const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "standard" });
-      const deadline = Date.now() + 10_000;
-      while (!existsSync(marker) && Date.now() < deadline) await Bun.sleep(10);
+      await wait(() => existsSync(marker), {
+        timeoutMs: checkpoint === "conflict-committed" ? 25_000 : 10_000,
+        description: "delivery gate never reached its barrier",
+        subscribe(wake) {
+          const watcher = watch(home, wake);
+          return () => watcher.close();
+        },
+      });
       expect(existsSync(marker)).toBe(true);
       if (checkpoint === "base-moved-during-gates") {
         await assertUnpublished(bare);
@@ -290,7 +301,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(resumed.store.listStages(run.id).filter((s) => s.name === "gates")).toHaveLength(
         checkpoint === "conflict-implement" ? 2 : 3,
       );
-    });
+    };
+    // #556 (2026-10-16), conflict-committed: alone 6.85 s, paired load 8.41 s; Git and crash recovery.
+    test(`delivery checkpoint ${checkpoint} never publishes unchecked work`, checkCheckpoint, timeout);
   }
 
   test.each([

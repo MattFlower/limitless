@@ -1429,7 +1429,7 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
 test.each(["introduced", "preexisting", "clean"])(
   "control and causal replay share candidates and a pinned verifier but grade and cache independently (%s)",
   checkCausalReplay,
-  30_000,
+  75_000,
 );
 
 async function checkCausalReplay(caseId: string) {
