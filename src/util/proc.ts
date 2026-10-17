@@ -353,7 +353,10 @@ async function stopMarkedProcesses(
         failures.push(signalError);
       }
     }
-    throw new Error(redactCredentials(failures.map(String).join("; ")));
+    // Messages only: String(error) would prefix "Error: " to the first failure.
+    throw new Error(
+      redactCredentials(failures.map((e) => (e instanceof Error ? e.message : String(e))).join("; ")),
+    );
   }
 }
 
