@@ -15,9 +15,10 @@ import { loadConfig } from "../src/config.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import { invokeGuard, type RunState } from "../src/pipeline/context.ts";
+import { invokeGuard, RunContext, type RunState } from "../src/pipeline/context.ts";
+import { shadowReview } from "../src/pipeline/review-shadow.ts";
 import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import {
@@ -120,6 +121,103 @@ describe("review shadow panel: single reviews decide, the panel only records", (
   };
   const shadowOf = (f: Factory, runId: string, round: number) =>
     JSON.parse(f.store.getArtifact(runId, `review-${round}.shadow.json`) ?? "null");
+
+  test("a restored shadow lens error reaches its artifact only as a sanitized diagnostic", async () => {
+    const secret = "synthetic-shadow-error-549";
+    registerCredential("shadow-error-test", secret);
+    const f = start(() => {
+      throw new Error("no model should be invoked");
+    });
+    await f.stop();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    ctx.state.shadowLenses = { error: `legacy shadow \x1b[31m${secret}` };
+    await ctx.save();
+    const restored = new RunContext(f.deps, run, repo, new AbortController().signal);
+    expect(restored.state.shadowLenses).toEqual({ error: "legacy shadow [redacted]" });
+    await shadowReview(
+      restored,
+      {
+        round: 0,
+        baseSha: "base",
+        reviewedSha: "head",
+        profile: "quick",
+        input: {
+          timeoutMs: 1,
+          prompt: {
+            prompt: run.prompt,
+            spec: null,
+            baseSha: "base",
+            stat: "",
+            gates: [],
+            audit: [],
+            implementerReport: "",
+          },
+        },
+      },
+      () => {
+        throw new Error("no review dependencies should be needed");
+      },
+      Promise.resolve(),
+    );
+    expect(shadowOf(f, run.id, 0)).toMatchObject({ status: "skipped", reason: "legacy shadow [redacted]" });
+    expect(f.store.listInvocations(run.id)).toEqual([]);
+  });
+
+  test("a completed shadow with a redacted range is preserved on resume", async () => {
+    const baseSha = "0123456789abcdef0123456789abcdef01234567";
+    registerCredential("shadow-range-test", baseSha);
+    const f = start(() => {
+      throw new Error("no model should be invoked");
+    });
+    await f.stop();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    ctx.artifact(
+      "review-0.shadow.json",
+      "review-shadow",
+      JSON.stringify({
+        status: "completed",
+        range: `${baseSha}..head`,
+        blocking: [],
+      }),
+    );
+    const before = f.store.getArtifact(run.id, "review-0.shadow.json");
+    expect(JSON.parse(before ?? "null").range).toBe("[redacted]..head");
+    const restored = new RunContext(f.deps, run, repo, new AbortController().signal);
+    await shadowReview(
+      restored,
+      {
+        round: 0,
+        baseSha,
+        reviewedSha: "head",
+        profile: "quick",
+        input: {
+          timeoutMs: 1,
+          prompt: {
+            prompt: run.prompt,
+            spec: null,
+            baseSha,
+            stat: "",
+            gates: [],
+            audit: [],
+            implementerReport: "",
+          },
+        },
+      },
+      () => {
+        throw new Error("no review dependencies should be needed");
+      },
+      Promise.resolve(),
+    );
+    expect(shadowOf(f, run.id, 0).status).toBe("completed");
+    expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBe(before);
+    expect(f.store.listInvocations(run.id)).toEqual([]);
+  });
 
   test("a pinned production reviewer leaves the shadow panel's targets unchanged", async () => {
     const calls = newCalls();

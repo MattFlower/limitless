@@ -9,7 +9,7 @@ import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
-import { agentTestSlots, gateSlots } from "../gates/slots.ts";
+import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
@@ -302,6 +302,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           payload.token !== capability
         )
           return error("agent-test capability does not match the request", 401);
+        const { name, id, release, immediate, running, lane, priority } = payload;
+        if (priority !== undefined && !isGatePriority(priority)) return error("invalid priority");
         if (payload.token !== undefined) {
           req.signal.throwIfAborted();
           const lease = await agentTestLease(payload);
@@ -309,7 +311,6 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           req.signal.throwIfAborted();
           return json(lease);
         }
-        const { name, id, release, immediate, running, lane } = payload;
         if (lane !== undefined && lane !== "gate") return error("invalid lane");
         const slots = gateSlots;
         if (id !== undefined) {
@@ -326,7 +327,15 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
         if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
         req.signal.throwIfAborted();
-        const lease = await slots.lease(name, immediate === true, undefined, undefined, running === true);
+        const lease = await slots.lease(
+          name,
+          immediate === true,
+          undefined,
+          undefined,
+          running === true,
+          undefined,
+          priority,
+        );
         if (req.signal.aborted) slots.heartbeat(lease, true);
         req.signal.throwIfAborted();
         const acquired = slots.heartbeat(lease) ?? false;

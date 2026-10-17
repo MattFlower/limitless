@@ -1,4 +1,5 @@
-import { redactHoldoutText } from "./prompts.ts";
+import { redactGateData, redactGateOutput } from "../gates/output.ts";
+import { promptJson, redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
 export function preDeliveryVerifyArtifact(
@@ -29,7 +30,7 @@ export function preDeliveryVerifyArtifact(
       ? `Factory gate ${redact(gate.check, criterion.id)} passed at ${gate.sha} (stage ${gate.stageId}); commands: ${redact(gate.command, criterion.id)}`
       : redactHoldoutText(criterion.evidence, holdout, publicSources, !publicRow);
   };
-  return JSON.stringify(
+  return promptJson(
     {
       ...published,
       notes: redactHoldoutText(verify.notes, holdout, publicSources),
@@ -52,7 +53,6 @@ export function preDeliveryVerifyArtifact(
             },
       ),
     },
-    null,
     2,
   );
 }
@@ -84,9 +84,12 @@ export function normalizeVerify(verify: Verify, spec: Spec, holdout: Holdout, re
   }
   const unique = new Set(criteria.map((c) => c.id)).size === criteria.length;
   let notes = verify.notes;
+  // Ground citations in the public text the verifier received, keeping stored identities literal.
+  const publicRequest = redactGateOutput(request);
+  const publicSpec = redactGateData(spec);
   for (const c of criteria) {
     if (c.status !== "unmet" || !scenarioIds.has(c.id)) continue;
-    const issue = requirementCitationIssue(c, request, spec);
+    const issue = requirementCitationIssue(c, publicRequest, publicSpec);
     const diagnostic = `${c.id}: requirement citation validation failed: ${issue}.`;
     if (issue && !notes.includes(diagnostic)) notes = [notes, diagnostic].filter(Boolean).join("\n");
   }

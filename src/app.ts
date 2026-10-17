@@ -173,7 +173,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
-      gateExecutor: opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor),
+      gateExecutor: opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos),
       confinement: opts.confinement ?? seatbeltForPort(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
@@ -331,7 +331,9 @@ export class Factory {
   }
 
   cancelRun(id: string, by = "user"): boolean {
-    return this.scheduler.cancel(id, by);
+    const cancelled = this.scheduler.cancel(id, by);
+    if (cancelled) for (const job of this.workers.jobs("run_id=?", id)) this.workers.cancel(job.id);
+    return cancelled;
   }
 
   async retryRun(id: string, models?: RunModels): Promise<Run> {

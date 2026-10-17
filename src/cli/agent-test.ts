@@ -208,6 +208,13 @@ export async function agentTestCommand(
       name: redactCredentials(argv.join(" ")),
       agentTest: {
         lane,
+        assertActive: () => {
+          try {
+            accessSync(config.directory);
+          } catch {
+            throw new LeaseRejected("agent-test invocation ended");
+          }
+        },
         parentId: process.env.LIMITLESS_AGENT_TEST_LEASE,
         onLease: (id) => {
           env.LIMITLESS_AGENT_TEST_LEASE = id;

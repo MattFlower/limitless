@@ -1424,6 +1424,7 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
   }
 }, 30_000);
 
+// #556 measurement (2026-10-16): alone 18.94 s, paired load 30.24 s; three cases plus replay, cache and resume use real Git.
 test("control and causal replay share candidates and a pinned verifier but grade and cache independently", async () => {
   const f = await evalFixture([verifierModel]);
   try {
@@ -1564,7 +1565,7 @@ test("control and causal replay share candidates and a pinned verifier but grade
   } finally {
     await f.close();
   }
-}, 30_000);
+}, 75_000);
 
 test("executed trials snapshot fast mode and cached trials retain it across toggles", async () => {
   const f = await evalFixture(

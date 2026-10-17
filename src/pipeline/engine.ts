@@ -97,6 +97,7 @@ import {
   formatVerifyFeedback,
   holdoutPrompt,
   implementPrompt,
+  promptJson,
   redactHoldoutText,
   specPrompt,
   triagePrompt,
@@ -256,7 +257,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   } catch (e) {
     const terminationError = processScope.getStore()?.terminationError;
     if (terminationError && ctx.state.needsHumanReason !== terminationError.message) {
-      ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
+      ctx.state.feedback = redactGateOutput(
+        `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`,
+      );
       ctx.state.needsHumanReason = terminationError.message;
       // Shutdown can re-queue this run. Persist the cleanup block even with an aborted
       // signal, so a fresh process scope on resume cannot start another round.
@@ -281,7 +284,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       deps.store.updateRun(runId, {
         status,
         finishedAt: shutdown ? null : Date.now(),
-        ...(reason ? { error: reason } : {}),
+        ...(reason ? { error: redactGateOutput(reason) } : {}),
       });
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;
@@ -304,7 +307,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       (!ctx.run.prUrl || !!ctx.state.needsHumanReason) &&
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
-    let message = (e as Error).message;
+    let message = redactGateOutput((e as Error).message);
     const failureStage =
       ctx.state.conflictRound !== undefined
         ? "conflict resolution"
@@ -343,7 +346,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
         )
           return "running";
-        if (err instanceof NeedsHumanError) message = err.message;
+        if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
@@ -370,7 +373,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           return "running";
         // Cancellation or shutdown during the draft must not be recorded as the original failure.
         if (err instanceof CancelledError || signal.aborted) return cancelled();
-        if (err instanceof NeedsHumanError) message = err.message;
+        if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -395,10 +398,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 
 function gateEvents(ctx: RunContext): Required<GateHooks> {
   return {
+    priority: "finish",
     skipGateSlot: false,
     holder: ctx.run.id,
     onResult: (r) =>
-      ctx.store.addEvent({
+      ctx.event({
         runId: ctx.run.id,
         type: "gate",
         level: r.ok ? "info" : "warn",
@@ -406,7 +410,7 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
         data: r,
       }),
     onWait: (slots) =>
-      ctx.store.addEvent({
+      ctx.event({
         runId: ctx.run.id,
         type: "gate",
         message: `Waiting for a gate slot (all ${slots} in use; limits.max_concurrent_gates)`,
@@ -538,7 +542,7 @@ async function prepare(ctx: RunContext): Promise<void> {
             ),
         );
         ctx.checkCancelled();
-        return redactGateData(retried);
+        return retried;
       });
       ctx.state.baselineCached = false;
       const buildSha = ctx.deps.buildSha;
@@ -548,6 +552,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       else {
         // Keyed by the commit actually checked out, so verify-change caches its PR base.
         const key = baselineCacheKey({
+          executor: cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local",
           repoId: ctx.repo.id,
           baseSha: await headSha(wt.path),
           gates,
@@ -573,7 +578,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           const fresh = await runBaseline();
           // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
           // and it contradicts any cached pass for this key, so that entry goes.
-          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, redactGateData(fresh), ctx.run.id);
           else store.deleteBaselineCache(key);
           return fresh;
         };
@@ -587,11 +592,11 @@ async function prepare(ctx: RunContext): Promise<void> {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
     }
-    const baseline = ctx.state.baseline;
+    const baseline = redactGateData(ctx.state.baseline);
     if (baseline) {
-      store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
+      ctx.artifact("baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
       for (const r of [...baseline.setup, ...baseline.checks]) {
-        store.addEvent({
+        ctx.event({
           runId: ctx.run.id,
           type: "gate",
           level: r.ok ? "info" : "warn",
@@ -601,7 +606,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       }
       for (const { firstAttempt, ...retry } of baseline.checks) {
         if (!firstAttempt) continue;
-        store.addEvent({
+        ctx.event({
           runId: ctx.run.id,
           type: "gate",
           level: "warn",
@@ -712,12 +717,7 @@ async function triage(ctx: RunContext): Promise<void> {
       complexity: t.complexity,
       resolvedProfile: profile,
     });
-    ctx.store.putArtifact(
-      ctx.run.id,
-      "triage.json",
-      "triage",
-      JSON.stringify({ ...t, model: target.modelId }, null, 2),
-    );
+    ctx.artifact("triage.json", "triage", JSON.stringify({ ...t, model: target.modelId }, null, 2));
     const verifying = ctx.state.flow === "verify-change";
     const questions = !verifying && profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
     if (questions.length) {
@@ -835,7 +835,7 @@ async function spec(ctx: RunContext): Promise<void> {
       }
       const feedback = [
         offending
-          ? `\n\nInvalid specification: this sentence restricts the task beyond the request: ${JSON.stringify(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`
+          ? `\n\nInvalid specification: this sentence restricts the task beyond the request: ${promptJson(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`
           : "",
         retryCriteria
           ? `\n\nInvalid acceptance criteria: ${flagged.map((a) => a.id).join(", ")} depend on something outside the run. Replace them with criteria verifiable in the run's checkout using repository commands and tests; move external concerns to assumptions or out_of_scope.`
@@ -852,7 +852,7 @@ async function spec(ctx: RunContext): Promise<void> {
       await discardChanges(ctx.state.worktreePath as string);
       s = SpecSchema.parse(result.structured);
     }
-    ctx.store.putArtifact(ctx.run.id, "spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
+    ctx.artifact("spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
     const unanswered = s.blocking_questions.filter(Boolean);
     if (unanswered.length && ctx.state.answers.length === 0) {
       for (const q of unanswered) ctx.store.askQuestion(ctx.run.id, q);
@@ -1078,12 +1078,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         )
           ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
         ctx.state.implementerReport = result.finalText;
-        ctx.store.putArtifact(
-          ctx.run.id,
-          `implement-${round}.md`,
-          "report",
-          result.finalText || "(no report)",
-        );
+        ctx.artifact(`implement-${round}.md`, "report", result.finalText || "(no report)");
         ctx.state.implementerIssue =
           result.status === "ok"
             ? null
@@ -1097,7 +1092,9 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       if (terminationError) {
         // An unkillable writer or failed inspection needs a human: retrying another
         // round alongside processes whose shutdown is unconfirmed is unsafe.
-        ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
+        ctx.state.feedback = redactGateOutput(
+          `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`,
+        );
         ctx.state.needsHumanReason = terminationError.message;
         await ctx.save();
         throw new NeedsHumanError(`Implement round ${round} failed: ${terminationError.message}`);
@@ -1221,12 +1218,7 @@ async function oneRound(
           const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
           if (timeoutOnly && !baseTimeout) {
             const first = after;
-            ctx.store.putArtifact(
-              ctx.run.id,
-              `gates-timeout-${round}.json`,
-              "gates",
-              JSON.stringify(redactGateData(first)),
-            );
+            ctx.artifact(`gates-timeout-${round}.json`, "gates", JSON.stringify(redactGateData(first)));
             ctx.log(
               `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + 1})`,
               "warn",
@@ -1280,9 +1272,8 @@ async function oneRound(
             throw error;
           });
         }
-        cmp = redactGateData(cmp);
         for (const c of cmp.filter((c) => c.firstAttempt)) {
-          ctx.store.addEvent({
+          ctx.event({
             runId: ctx.run.id,
             type: "gate",
             level: "warn",
@@ -1303,7 +1294,7 @@ async function oneRound(
                 })),
               }
             : undefined;
-        ctx.store.putArtifact(ctx.run.id, `gates-${round}.json`, "gates", JSON.stringify(cmp, null, 2));
+        ctx.artifact(`gates-${round}.json`, "gates", JSON.stringify(redactGateData(cmp), null, 2));
         if (baseTimeout) {
           await ctx.save();
           throw new NeedsHumanError("gate timed out on the base revision too");
@@ -1323,7 +1314,9 @@ async function oneRound(
     ctx.checkCancelled();
     if (!(error instanceof WorktreeCleanError) || !ctx.state.implementerIssue) throw error;
     ctx.state.feedback = redactPrivate(
-      `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`,
+      redactGateOutput(
+        `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`,
+      ),
       privateStrings(),
     );
     ctx.log(ctx.state.feedback, "warn");
@@ -1384,7 +1377,7 @@ async function oneRound(
       }
       ctx.state.lastAudit = findings;
       for (const f of findings) {
-        ctx.store.addEvent({
+        ctx.event({
           runId: ctx.run.id,
           type: "audit",
           level: f.severity === "block" ? "error" : "warn",
@@ -1392,7 +1385,7 @@ async function oneRound(
           data: f,
         });
       }
-      ctx.store.putArtifact(ctx.run.id, "diff.patch", "diff", diff.patch);
+      ctx.artifact("diff.patch", "diff", diff.patch);
       const blocks = findings.filter((f) => f.severity === "block").length;
       return {
         summary: `+${diff.added}/-${diff.removed} in ${diff.files.length} files; ${blocks} blocking, ${findings.length - blocks} warnings`,
@@ -1410,7 +1403,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
-    ctx.state.feedback = redactPrivate(ctx.state.feedback, privateStrings());
+    ctx.state.feedback = redactPrivate(redactGateOutput(ctx.state.feedback), privateStrings());
     await ctx.save();
     ctx.log(
       comparison.some((c) => c.blocking && c.result.timedOut)
@@ -1621,8 +1614,7 @@ async function oneRound(
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();
       // Panel artifacts are numbered by review (R1-R3), single ones by implementation round.
-      ctx.store.putArtifact(
-        ctx.run.id,
+      ctx.artifact(
         scope?.kind === "resolution" ? "review-resolution.json" : `review-${panelReview ?? round}.json`,
         "review",
         JSON.stringify(
@@ -1659,7 +1651,9 @@ async function oneRound(
         )
       : "";
   if (review.verdict === "request_changes") {
-    ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
+    ctx.state.feedback = redactGateOutput(
+      reviewFeedback || `### Code review requested changes\n${review.summary}`,
+    );
     await ctx.save();
     // Never a fourth panel review: what still blocks goes to a human with a draft PR.
     if (panelReview && panelReview >= PANEL_REVIEWS)
@@ -1756,8 +1750,7 @@ async function oneRound(
           ];
           await ctx.save();
           const publicSources = await ctx.publicHoldoutSources();
-          ctx.store.putArtifact(
-            ctx.run.id,
+          ctx.artifact(
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
             preDeliveryVerifyArtifact(
@@ -1786,8 +1779,7 @@ async function oneRound(
       Object.assign(recorded, verify);
       ctx.state.lastVerify = { ...verify, modelId: recorded.modelId };
       await ctx.save();
-      ctx.store.putArtifact(
-        ctx.run.id,
+      ctx.artifact(
         recorded.attempt === 1 ? `verify-${round}-retry.json` : `verify-${round}.json`,
         "verify",
         preDeliveryVerifyArtifact(
@@ -2004,7 +1996,7 @@ async function deliverVerifiedDraft(
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
   const report = buildReport(ctx, false, { sha, stage, reason, base });
-  ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+  ctx.artifact("report.md", "report", report);
   ctx.checkCancelled();
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
   // keep the draft below from finding it.
@@ -2109,11 +2101,11 @@ async function deliverReviewRound(
       if (!comments?.some((comment) => comment.body?.includes(marker))) {
         const failure = ctx.store.ciFixFailure(ctx.run.id);
         if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
-        let text = redactCredentials(
+        let text = redactGateOutput(
           review.kind === "ci"
-            ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${JSON.stringify(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
+            ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${promptJson(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
             : review.kind === "conflict"
-              ? `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${JSON.stringify(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`
+              ? `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${promptJson(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`
               : `${marker}\nRound ${review.round} published at ${head}.`,
         );
         if (blocked) {
@@ -2123,13 +2115,13 @@ async function deliverReviewRound(
             .map((c, index) => {
               if (rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown")
                 return `🚧 blocked unknown-${index + 1}: private evidence withheld`;
-              const evidence = redactCredentials(
+              const evidence = redactGateOutput(
                 redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources),
               ).slice(0, 300);
               return `🚧 blocked ${c.id}: ${evidence}`;
             });
           // Keep checked-head evidence ahead of quoted requests; the full report is a run artifact.
-          text = redactCredentials(
+          text = redactGateOutput(
             `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
           ).slice(0, 60_000);
         }
@@ -2138,7 +2130,7 @@ async function deliverReviewRound(
       }
       return;
     }
-    const { marker, text } = roundSection(ctx.run.id, review.round, review.findings);
+    const { marker, text } = roundSection(ctx.run.id, review.round, redactGateData(review.findings));
     if (!pr.body.includes(marker))
       await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, pr.body + text);
   });
@@ -2189,7 +2181,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
         ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
-        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, true));
+        ctx.artifact("report.md", "report", buildReport(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `PR ${pr.url} — merged`, value: undefined };
@@ -2205,7 +2197,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.state.verification) {
       await discardChanges(cwd);
       if (!success) {
-        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+        ctx.artifact("report.md", "report", buildReport(ctx, false));
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
@@ -2273,7 +2265,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.state.needsHumanReason = undefined;
-                ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+                ctx.artifact("report.md", "report", buildReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
@@ -2290,7 +2282,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;
-            ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+            ctx.artifact("report.md", "report", buildReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
           });
@@ -2298,7 +2290,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");
         }
-        ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+        ctx.artifact("report.md", "report", report);
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
@@ -2320,7 +2312,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       const recorded = ctx.run.baseSha as string;
       const note = (why: string) => {
         ctx.state.rebaseNote = `Not merged with the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
-        ctx.store.addEvent({
+        ctx.event({
           runId: ctx.run.id,
           type: "status",
           level: "warn",
@@ -2347,17 +2339,11 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
     const publish = () => {
-      ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+      ctx.artifact("report.md", "report", report);
       if (ctx.state.holdout) {
-        ctx.store.putArtifact(
-          ctx.run.id,
-          "holdout-scenarios.json",
-          "holdout",
-          JSON.stringify(ctx.state.holdout, null, 2),
-        );
+        ctx.artifact("holdout-scenarios.json", "holdout", JSON.stringify(ctx.state.holdout, null, 2));
         for (const result of ctx.state.verifyResults ?? [])
-          ctx.store.putArtifact(
-            ctx.run.id,
+          ctx.artifact(
             result.attempt === 1 ? `verify-${result.round}-retry.json` : `verify-${result.round}.json`,
             "verify",
             JSON.stringify({ ...result, modelOutput: undefined }, null, 2),
@@ -2492,7 +2478,9 @@ async function mergeForDelivery(
     ctx.state.conflictRound = ctx.state.round;
     ctx.state.completedChecks = undefined;
     ctx.state.implementationReadyRound = undefined;
-    ctx.state.feedback = `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`;
+    ctx.state.feedback = redactGateOutput(
+      `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`,
+    );
     ctx.state.phase = "loop";
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
@@ -2524,10 +2512,9 @@ async function mergeForDelivery(
             : (ctx.state.baseline ?? null),
           after,
         );
-        ctx.state.lastGates = redactGateData(comparison);
+        ctx.state.lastGates = comparison;
         await ctx.save();
-        ctx.store.putArtifact(
-          ctx.run.id,
+        ctx.artifact(
           `gates-rebase-${ctx.state.round}.json`,
           "gates",
           JSON.stringify(redactGateData(comparison), null, 2),

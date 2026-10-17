@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import * as baselineCache from "../src/gates/cache.ts";
@@ -7,13 +7,24 @@ import { gateSlots } from "../src/gates/slots.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import { sh } from "../src/util/proc.ts";
 import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { testWaits } from "./wait-support.ts";
+
+const prepareWaits = testWaits();
+const preparing = new Set<Promise<unknown>>();
+const barriers = new Set<() => void>();
+afterEach(async () => {
+  for (const release of barriers) release();
+  barriers.clear();
+  await Promise.allSettled([...preparing]);
+});
 
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup({
+const { start, githubFixture, registerGithub, advanceBase, wait } = pipelineSetup({
   get home() {
     return home;
   },
@@ -63,6 +74,28 @@ describe("pipeline (fake agents, real git + gates)", () => {
       return { run, state: f.store.getRunState<RunState>(run.id) };
     }
 
+    // Cache identity and single-flight cases need prepare, not an implementation and delivery per lookup.
+    // Keep full pipelines below wherever assertions depend on post-implement gates or delivery.
+    function prepared(f: Factory) {
+      const signal = prepareWaits.signal;
+      const task = (async () => {
+        signal.throwIfAborted();
+        await f.scheduler.stop();
+        signal.throwIfAborted();
+        const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+        signal.throwIfAborted();
+        await executeRun(
+          { ...f.deps, faults: { "stage:triage:before": { action: "kill" } } },
+          run.id,
+          signal,
+        );
+        signal.throwIfAborted();
+        return { run, state: f.store.getRunState<RunState>(run.id) };
+      })();
+      preparing.add(task);
+      return task.finally(() => preparing.delete(task));
+    }
+
     test("a second run on the same base reuses a passing baseline", async () => {
       const count = join(home, "gate-runs");
       await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
@@ -88,6 +121,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
     });
 
+    // #556 (2026-10-17): alone 8.59 s, worst of 10 paired runs 6.56 s; multiple real-Git pipelines.
+    // Before cancellable event waits: alone 11.32 s, paired 13.85 s.
     test("a flaky base that failed twice is not cached, so the next run blocks the regression", async () => {
       const count = join(home, "gate-runs");
       // Fails the first baseline and its retry; later it fails only once the change exists.
@@ -105,14 +140,29 @@ describe("pipeline (fake agents, real git + gates)", () => {
         ["check", "regressed", true],
       ]);
       expect(f.store.getRun(second.run.id)?.status).not.toBe("succeeded");
-    });
+    }, 45_000);
 
     test("concurrent runs on one base execute the baseline once", async () => {
       const count = join(home, "gate-runs");
-      const check = `test -f farewell.txt && exit 0; echo base >> '${count}'; sleep 1`;
+      const check = `test -f farewell.txt && exit 0; echo base >> '${count}'`;
       await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
       const f = start(quick);
-      const [a, b] = await Promise.all([finish(f), finish(f)]);
+      // Both callers enter the flight before the leader can finish, without a timed gate sleep.
+      const ready = Promise.withResolvers<void>();
+      barriers.add(ready.resolve);
+      const signal = prepareWaits.signal;
+      let callers = 0;
+      const singleFlight = baselineCache.singleFlight;
+      const flight = spyOn(baselineCache, "singleFlight").mockImplementation(async (...args) => {
+        if (++callers === 2) ready.resolve();
+        await ready.promise;
+        signal.throwIfAborted();
+        return singleFlight(...args);
+      });
+      const [a, b] = await Promise.all([prepared(f), prepared(f)]).finally(() => {
+        ready.resolve();
+        flight.mockRestore();
+      });
       expect(lines(count)).toBe(1);
       expect([a.state?.baselineCached, b.state?.baselineCached].sort()).toEqual([false, true]);
       expect(cacheRows(f)).toHaveLength(1);
@@ -138,7 +188,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         const f = start(quick);
         f.cfg.baselineCache = false;
         gateSlots.setLimit(3);
-        const runs = await Promise.all([finish(f), finish(f), finish(f)]);
+        const runs = await Promise.all([prepared(f), prepared(f), prepared(f)]);
         expect(runs.map((r) => r.state?.baselineCached)).toEqual([false, false, false]);
         expect(readFileSync(log, "utf8").split("\n").slice(0, 3)).toEqual(["start", "start", "start"]);
       });
@@ -150,15 +200,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
         gateSlots.setLimit(3);
         // All callers must reach the flight before the leader's immediate failure can finish.
         const ready = Promise.withResolvers<void>();
+        barriers.add(ready.resolve);
+        const signal = prepareWaits.signal;
         let callers = 0;
         const singleFlight = baselineCache.singleFlight;
         const synchronized: typeof singleFlight = async (...args) => {
           if (++callers === 3) ready.resolve();
           await ready.promise;
+          signal.throwIfAborted();
           return singleFlight(...args);
         };
         const flight = spyOn(baselineCache, "singleFlight").mockImplementation(synchronized);
-        const runs = await Promise.all([finish(f), finish(f), finish(f)]).finally(() => {
+        const runs = await Promise.all([prepared(f), prepared(f), prepared(f)]).finally(() => {
           ready.resolve();
           flight.mockRestore();
         });
@@ -209,18 +262,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
         process.env.npm_config_ignore_scripts = "false";
         process.env.MY_GATE_FLAG = "a";
         const f = start(quick);
-        await finish(f);
-        expect((await finish(f)).state?.baselineCached).toBe(true);
+        await prepared(f);
+        expect((await prepared(f)).state?.baselineCached).toBe(true);
         process.env.npm_config_ignore_scripts = "true";
-        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await prepared(f)).state?.baselineCached).toBe(false);
         // Undeclared variables don't key the cache; declared ones do.
         process.env.MY_GATE_FLAG = "b";
-        expect((await finish(f)).state?.baselineCached).toBe(true);
+        expect((await prepared(f)).state?.baselineCached).toBe(true);
         f.cfg.baselineEnv = ["MY_GATE_FLAG"];
-        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await prepared(f)).state?.baselineCached).toBe(false);
         process.env.MY_GATE_FLAG = "c";
-        expect((await finish(f)).state?.baselineCached).toBe(false);
-        expect((await finish(f)).state?.baselineCached).toBe(true);
+        expect((await prepared(f)).state?.baselineCached).toBe(false);
+        expect((await prepared(f)).state?.baselineCached).toBe(true);
       } finally {
         restore("npm_config_ignore_scripts", saved.npm);
         restore("MY_GATE_FLAG", saved.flag);
@@ -240,11 +293,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         process.env.GOPRIVATE = "example.com/*";
         process.env.NODE_TLS_REJECT_UNAUTHORIZED = "1";
         const f = start(quick);
-        await finish(f);
-        expect((await finish(f)).state?.baselineCached).toBe(true);
+        await prepared(f);
+        expect((await prepared(f)).state?.baselineCached).toBe(true);
         process.env[name] = changed;
-        expect((await finish(f)).state?.baselineCached).toBe(false);
-        expect((await finish(f)).state?.baselineCached).toBe(true);
+        expect((await prepared(f)).state?.baselineCached).toBe(false);
+        expect((await prepared(f)).state?.baselineCached).toBe(true);
       } finally {
         for (const k of names) {
           if (saved[k] === undefined) delete process.env[k];
@@ -253,6 +306,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
     });
 
+    // #556 (2026-10-17): alone 7.01 s, worst of 10 paired runs 8.62 s; multiple real-Git pipelines.
+    // Before watching the gate marker: alone 9.59 s, paired 10.94 s.
     test("a timed-out or cancelled baseline is not cached", async () => {
       const count = join(home, "gate-runs");
       // The first execution outlasts its timeout; later ones pass.
@@ -272,11 +327,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
         `[gates]\nchecks = [{ name = "check", run = "${check.replace("sleep 5", "sleep 10")}" }]\n`,
       );
       const cancelled = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-      const deadline = Date.now() + 10_000;
-      while (!existsSync(count)) {
-        if (Date.now() > deadline) throw new Error("baseline never started");
-        await Bun.sleep(10);
-      }
+      // Redirection creates the file before echo writes the counted attempt.
+      await wait(() => existsSync(count) && readFileSync(count, "utf8").includes("x\n"), {
+        timeoutMs: 20_000,
+        description: "baseline never started",
+        subscribe(wake) {
+          const watcher = watch(home, wake);
+          return () => watcher.close();
+        },
+      });
       f.cancelRun(cancelled.id);
       expect(await waitFor(f, cancelled.id, ["cancelled", "failed"])).toBe("cancelled");
       expect(cacheRows(f)).toHaveLength(1);
@@ -286,6 +345,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(lines(count)).toBe(3);
     });
 
+    // #556 (2026-10-17): alone 9.33 s, worst of 10 paired runs 13.62 s; multiple real-Git pipelines.
+    // Before cancellable event waits: alone 14.47 s, paired 16.45 s.
     test("a bypass run refreshes a passing entry and evicts it when the base fails", async () => {
       const count = join(home, "gate-runs");
       const broken = join(home, "broken");

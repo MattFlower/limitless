@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { parseArgs } from "node:util";
-import { GATE_LEASE_EXPIRY_MS } from "../gates/slots.ts";
+import { GATE_LEASE_EXPIRY_MS, type GatePriority, isGatePriority } from "../gates/slots.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 import { resolveClientPort } from "./client-port.ts";
@@ -100,13 +100,14 @@ export const localLeaseClient =
   };
 
 export interface LeaseOptions {
+  priority?: GatePriority;
   client?: LeaseClient;
   clock?: DeployClock;
   maxWaitMs?: number;
   signal?: AbortSignal;
   warn?: (s: string) => void;
   /** Agent wrappers fail on queue exhaustion and prove nested reuse and running recovery. */
-  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void };
+  agentTest?: { lane: string; parentId?: string; onLease: (id: string) => void; assertActive?: () => void };
 }
 export async function withGateLease<T>(
   name: string,
@@ -150,6 +151,7 @@ export async function withGateLease<T>(
     }, ms);
   };
   const request = async (body: Record<string, unknown>, ms = 2000) => {
+    if (body.name) body = { ...body, priority: opts.priority ?? "finish" };
     let failure: unknown;
     try {
       return await bounded(
@@ -218,6 +220,7 @@ export async function withGateLease<T>(
           ? Math.max(1, Math.min(2000, lastReply + GATE_LEASE_EXPIRY_MS - clock.now() + 1))
           : deadline - clock.now();
       while (!state?.acquired) {
+        opts.agentTest?.assertActive?.();
         opts.signal?.throwIfAborted();
         if (!first) {
           if (remaining() <= 0) throw pastDeadline();
@@ -284,6 +287,7 @@ export async function withGateLease<T>(
       warn(e);
     }
     opts.signal?.throwIfAborted();
+    opts.agentTest?.assertActive?.();
     return await work();
   } finally {
     stopped = true;
@@ -297,13 +301,18 @@ export async function gateSlotCommand(args: string[], client?: LeaseClient): Pro
     command = args.slice(split + 1);
   const { values } = parseArgs({
     args: args.slice(0, split < 0 ? args.length : split),
-    options: { name: { type: "string" }, "max-wait": { type: "string" } },
+    options: { name: { type: "string" }, "max-wait": { type: "string" }, priority: { type: "string" } },
   });
   const executable = command[0],
     maxWaitMs = parseMaxWait(values["max-wait"] ?? "1800");
+  const priority = values.priority ?? "finish";
+  if (!isGatePriority(priority))
+    throw new Error("invalid gate-slot priority: expected ship, finish or start");
   if (split < 0 || !executable)
-    throw new Error("usage: limitless gate-slot [--name holder] [--max-wait seconds] -- command...");
-  return runLeasedCommand(command, { client, name: values.name ?? executable, maxWaitMs });
+    throw new Error(
+      "usage: limitless gate-slot [--name holder] [--max-wait seconds] [--priority ship|finish|start] -- command...",
+    );
+  return runLeasedCommand(command, { client, name: values.name ?? executable, priority, maxWaitMs });
 }
 
 /** The wrapper and gate-slot CLI share process-group signal and exit-code handling. */
