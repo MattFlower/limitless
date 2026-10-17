@@ -53,6 +53,7 @@ test.each([
   "![red owl](u)",
   "**red** _owl_",
   "`red owl`",
+  "`red<br>owl`",
   "> red\n> owl",
   "| red owl |",
   "&#114;ed owl",
@@ -367,5 +368,52 @@ test.each(["red <e\u200bm>owl</em>", "red <!--x\ny-->owl"])(
     expect(filtered).not.toContain("red");
     expect(filtered).not.toContain("owl");
     expect(filtered).toContain("Public neighbor");
+  },
+);
+
+test("catalogue terminal formatting uses the report storage sanitizer", () => {
+  const privateText = "red \x1b[31mowl\x1b[0m";
+  const { report } = markReportArtifacts([reportText("verifier", privateText)]);
+  const structure = reportStructure(report);
+  if (!structure) throw new Error("Invalid report manifest");
+  expect(structure.body).toBe("red owl\n");
+  expect(buildReportRedactor(new Set([privateText]))(structure.body)).toContain("[withheld:");
+});
+
+test.each([
+  "red <wbr>owl",
+  'red <span class="x">owl</span>',
+  'red <span title=">">owl</span>',
+  '<em title="red\nowl">Public text</em>',
+  "red <!--unfinished owl",
+])("unparsed markup withholds the whole span on either matching side: %j", (markup) => {
+  expect(buildReportRedactor(new Set(["red owl"]))(`Public neighbor\n${markup}`)).toMatch(
+    /^\[withheld:[^\n]+\]$/u,
+  );
+  expect(buildReportRedactor(new Set([markup]))("Public neighbor")).toBe(
+    "[withheld: private matching normalization unavailable]",
+  );
+});
+
+test.each(["`a * b`", "`_name`", "`*` and `_`", "``a ` * b``"])(
+  "public inline code is classified before emphasis: %j",
+  (code) => {
+    const redact = buildReportRedactor(new Set(["red owl"]));
+    expect(redact(`Public calculation: ${code}\nPublic neighbor`)).toBe(
+      `Public calculation: ${code}\nPublic neighbor`,
+    );
+    expect(buildReportRedactor(new Set([code]))(`Private calculation: ${code}`)).toContain("[withheld:");
+  },
+);
+
+test.each(["``red *owl```", "`red *owl``", "``red *owl`"])(
+  "unmatched code delimiter runs withhold the whole span: %j",
+  (ambiguous) => {
+    expect(buildReportRedactor(new Set(["red owl"]))(`Public neighbor\n${ambiguous}`)).toMatch(
+      /^\[withheld:[^\n]+\]$/u,
+    );
+    expect(buildReportRedactor(new Set([ambiguous]))("Public neighbor")).toBe(
+      "[withheld: private matching normalization unavailable]",
+    );
   },
 );

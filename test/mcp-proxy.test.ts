@@ -72,6 +72,11 @@ async function changeConnections() {
   };
 }
 
+// Synthetic reports still declare who authored their text, just as the renderer does.
+function authoredReport(text: string, kind: "prose" | "verifier" = "verifier"): string {
+  return markReportArtifacts([reportText(kind, text)]).report;
+}
+
 test("MCP approvals retain optional normalized consumer provenance on both backends", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" }, true);
   f.factory.deps.gh = async () =>
@@ -343,7 +348,7 @@ test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and rep
       ],
     },
   });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", report);
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", authoredReport(report, "prose"));
   const connections = await changeConnections();
   try {
     for (const conn of [connections.direct, connections.proxy]) {
@@ -362,7 +367,7 @@ test("an ordinary holdout unrelated to the diff leaves code, hunk ranges and rep
       // "2" is a private holdout literal, yet Git's hunk range and the code stay readable.
       expect(first.diff.text).toContain("@@ -1 +1,2 @@\n hello\n+new greeting\n");
       expect((await read(1)).diff.text).toContain("+export const publicCounterName = 3;\n");
-      expect(first.reports[0]?.text).toBe(report);
+      expect(first.reports[0]?.text).toBe(`${report}\n`);
       for (const text of [first.diff.text, (await read(1)).diff.text, first.reports[0]?.text])
         expect(text).not.toMatch(/private detail|withheld/);
     }
@@ -402,18 +407,20 @@ test("shared holdout words leave PR code visible while holdout-only reports stay
     c.run.id,
     "report.md",
     "report",
-    [
-      "Unrelated implementation summary.",
-      `Quoted hidden test: ${hidden}`,
-      "Observed holdoutResultOnlySentinel.",
-      "Quoted result: Verifier saw the amber lantern glow.",
-      "H-1 met outside the section.",
-      "## Holdout scenarios",
-      "H-1 met: clipped private output",
-      "",
-      "## Checks",
-      "Public checks passed.",
-    ].join("\n"),
+    authoredReport(
+      [
+        "Unrelated implementation summary.",
+        `Quoted hidden test: ${hidden}`,
+        "Observed holdoutResultOnlySentinel.",
+        "Quoted result: Verifier saw the amber lantern glow.",
+        "H-1 met outside the section.",
+        "## Holdout scenarios",
+        "H-1 met: clipped private output",
+        "",
+        "## Checks",
+        "Public checks passed.",
+      ].join("\n"),
+    ),
   );
   const connections = await changeConnections();
   try {
@@ -484,7 +491,7 @@ test.each([
     c.run.id,
     "report.md",
     "report",
-    `Quoted result: the amber lantern${separator}glows\nPublic checks passed.`,
+    authoredReport(`Quoted result: the amber lantern${separator}glows\nPublic checks passed.`),
   );
   const connections = await changeConnections();
   try {
@@ -494,7 +501,7 @@ test.each([
       );
       const withheld = "[withheld: holdout result or quotation; 1 line]\n";
       expect(page.reports[0]?.text).toBe(
-        `${withheld.repeat(separator === "\n" ? 2 : 1)}Public checks passed.`,
+        `${withheld.repeat(separator === "\n" ? 2 : 1)}Public checks passed.\n`,
       );
     }
   } finally {
@@ -523,7 +530,9 @@ test.each(["\n", "\r\n", "\\n", "\\r\\n", "\\u000a"])(
       c.run.id,
       "report.md",
       "report",
-      `amber${separator}lantern${separator}glows ultraviolet\nPublic neighbor\nthe amber lan${separator}tern glows\nPublic ending`,
+      authoredReport(
+        `amber${separator}lantern${separator}glows ultraviolet\nPublic neighbor\nthe amber lan${separator}tern glows\nPublic ending`,
+      ),
     );
     const connections = await changeConnections();
     try {
@@ -697,6 +706,82 @@ test.each(["missing", "mismatch", "malformed", "missing entry"] as const)(
   },
 );
 
+test("sanitized catalogue entries protect stored verifier evidence on both backends", async () => {
+  const phrase = "red \x1b[31mowl\x1b[0m";
+  const state = privateReportState(phrase);
+  state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: phrase, publicSummary: "" });
+  await renderedPages(state, (text) => {
+    expect(text).not.toContain("red owl");
+    expect(text).not.toContain("AC-1");
+    expect(text).toContain("[withheld:");
+    expect(text).toContain("## Checks");
+  });
+});
+
+test("unparsed markup withholds the complete authored span on both backends", async () => {
+  const state = privateReportState('"red owl"');
+  state.implementerReport = "Unconfirmed neighbor\nred <wbr>owl";
+  await renderedPages(state, (text) => {
+    expect(text).not.toContain("Unconfirmed neighbor");
+    expect(text).not.toContain("<wbr>");
+    expect(text).toContain("## Implementer's summary\n\n[withheld:");
+    expect(text).toContain("## Checks");
+  });
+});
+
+test("legacy reports without provenance withhold verifier text on both backends", async () => {
+  const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
+  const state = privateReportState("All checks passed.");
+  if (!state.lastVerify) throw new Error("Missing verifier");
+  state.lastVerify.notes = "Generic private notes";
+  state.lastVerify.criteria[0] = {
+    id: "H-1",
+    status: "met",
+    evidence: "All checks passed.",
+    publicSummary: "",
+  };
+  f.factory.store.setRunState(c.run.id, state);
+  f.factory.store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    [
+      "Built by **Limitless** — every gate below passed.",
+      "## Acceptance criteria",
+      "| ✅ AC-1 | Public criterion | All checks passed. |",
+      "## Verifier notes",
+      "Generic private notes",
+      "## Checks",
+      "Public checks passed.",
+    ].join("\n"),
+  );
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const page = resultValue<ChangePage>(
+        await conn.client.callTool({
+          name: "limitless_get_change",
+          arguments: { run: c.run.id },
+        }),
+      );
+      expect(page.reports[0]?.text).toBe("[withheld: report without structural provenance]");
+    }
+  } finally {
+    await connections.close();
+  }
+});
+
+test("public inline code stays visible and private code is matched on both backends", async () => {
+  const state = privateReportState('"red owl"');
+  state.implementerReport = "Public calculation: `_name`\nPrivate quotation: `red owl`\nPublic neighbor";
+  await renderedPages(state, (text) => {
+    expect(text).toContain("Public calculation: `_name`");
+    expect(text).toContain("Public neighbor");
+    expect(text).not.toContain("Private quotation");
+    expect(text).toContain("[withheld:");
+  });
+});
+
 test("report sources refresh between reads and invalidate an in-flight view", async () => {
   const c = await changeFixture(f, { "hello.txt": "new greeting\n" });
   const { store } = f.factory;
@@ -759,14 +844,14 @@ test.each([
   "red <em>owl</em>",
   "red <b>owl</b>",
   "red <code>owl</code>",
-  'red <span class="x">owl</span>',
+  "red <span>owl</span>",
   "red <!--x-->owl",
   "r\u200bed owl",
   "red o\u2060wl",
 ])("author backstops see through inline wrappers and format characters: %j", async (quotation) => {
   const state = privateReportState('"red owl"');
   if (!state.spec) throw new Error("Missing spec");
-  state.spec.assumptions = [quotation, "Returns Array<string> owl"];
+  state.spec.assumptions = [quotation, "Returns `Array<string>` owl"];
   state.implementerReport = `${quotation}\nUnrelated summary neighbor`;
   state.lastReview = { modelId: "reviewer", verdict: "approve", summary: quotation, findings: [] };
   state.terminalReason = quotation;
@@ -776,7 +861,7 @@ test.each([
     expect(text).not.toContain(quotation);
     expect(text).not.toContain("AC-1");
     expect(text).not.toContain("🚧");
-    expect(text).toContain("Returns Array<string> owl");
+    expect(text).toContain("Returns `Array<string>` owl");
     expect(text).toContain("Unrelated summary neighbor");
     expect(text).toContain("[withheld:");
   });
@@ -1130,8 +1215,11 @@ test.each(["red owl", "All checks passed."])(
           expect(text).not.toContain("red owl");
           expect(text).not.toContain("Private behavior");
           expect(text).toContain("withheld");
-          if (damaged.includes("limitless-report:"))
-            expect(text).toBe("[withheld: invalid report structure]");
+          expect(text).toBe(
+            damaged.includes("limitless-report:")
+              ? "[withheld: invalid report structure]"
+              : "[withheld: report without structural provenance]",
+          );
         }
       }
     } finally {
@@ -1310,7 +1398,10 @@ test("malformed criterion IDs and generic evidence leave unrelated report lines 
     c.run.id,
     "report.md",
     "report",
-    `${publicLines}\nH-1 met\nthe amber lantern glows\nthe violet beacon shines`,
+    markReportArtifacts([
+      reportText("prose", publicLines),
+      reportText("verifier", "H-1 met\nthe amber lantern glows\nthe violet beacon shines"),
+    ]).report,
   );
   const connections = await changeConnections();
   try {
@@ -1319,7 +1410,7 @@ test("malformed criterion IDs and generic evidence leave unrelated report lines 
         await conn.client.callTool({ name: "limitless_get_change", arguments: { run: c.run.id } }),
       );
       expect(page.reports[0]?.text).toBe(
-        publicLines + "\n[withheld: holdout result or quotation; 1 line]".repeat(3),
+        `${publicLines}\n\n${"[withheld: holdout result or quotation; 1 line]\n".repeat(3)}`,
       );
     }
   } finally {
@@ -1344,7 +1435,7 @@ test("short literals in multiline holdout fields stay private in reports and vis
       ],
     },
   });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", content);
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", authoredReport(content));
   const connections = await changeConnections();
   try {
     for (const conn of [connections.direct, connections.proxy]) {
@@ -1435,7 +1526,12 @@ test.each(["maxWords", "cafe\u0301"])(
         ],
       },
     });
-    f.factory.store.putArtifact(c.run.id, "report.md", "report", `Saw ${unicode} and ${percent}.`);
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      authoredReport(`Saw ${unicode} and ${percent}.`),
+    );
     const connections = await changeConnections();
     const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
     try {
@@ -1453,7 +1549,7 @@ test.each(["maxWords", "cafe\u0301"])(
         const report = first.reports[0]?.text ?? "";
         for (const secret of [percent, unicode, literal, literal.normalize("NFKC")])
           expect(report).not.toContain(secret);
-        expect(report).toBe("[withheld: holdout result or quotation; 1 line]");
+        expect(report).toBe("[withheld: holdout result or quotation; 1 line]\n");
       }
     } finally {
       await connections.close();
@@ -1476,7 +1572,12 @@ test.each([2, 3])(
     const c = await changeFixture(f, {
       "hello.txt": `${"unrelated readable line\n".repeat(800)}${prose.join("\n")}\nmore readable code\n`,
     });
-    f.factory.store.putArtifact(c.run.id, "report.md", "report", `${prose.join("\n")}\npublic report ending`);
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      authoredReport(`${prose.join("\n")}\npublic report ending`),
+    );
     const connections = await changeConnections();
     try {
       for (const field of ["description", "steps", "expected"] as const) {
@@ -1554,7 +1655,7 @@ test.each(["\\n", "\\r", "\\r\\n", "\\t", "\\u000a", "\\u000d", "\\u0009"])(
       c.run.id,
       "report.md",
       "report",
-      `${"readable report\n".repeat(600)}"${escaped}"\nreport ending`,
+      authoredReport(`${"readable report\n".repeat(600)}"${escaped}"\nreport ending`),
     );
     const conn = await connect(factoryBackend(f.factory));
     const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
@@ -1635,7 +1736,9 @@ test("multiline PR hunks stay visible while complete report quotations stay priv
     c.run.id,
     "report.md",
     "report",
-    "}\nreturn true;\nexpect(x).toBe(1)\nindependent assertion\nreturn true;\nconst counter = 1;",
+    authoredReport(
+      "}\nreturn true;\nexpect(x).toBe(1)\nindependent assertion\nreturn true;\nconst counter = 7;",
+    ),
   );
   const conn = await connect(factoryBackend(f.factory));
   try {
@@ -1670,7 +1773,7 @@ test("multiline PR hunks stay visible while complete report quotations stay priv
         }),
       ).reports[0]?.text;
       expect(report).toStartWith("[withheld: holdout result or quotation; 1 line]\n".repeat(3));
-      expect(report).toContain("independent assertion\nreturn true;\nconst counter = 1;");
+      expect(report).toContain("independent assertion\nreturn true;\nconst counter = 7;");
     }
   } finally {
     await conn.close();
@@ -1694,7 +1797,7 @@ test("multiline whitespace matching stays bounded and hides positive matches bef
       ],
     },
   });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", content);
+  f.factory.store.putArtifact(c.run.id, "report.md", "report", authoredReport(content));
   const started = performance.now();
   const page = (await getChange(f.factory, {
     run: c.run.id,
@@ -1787,7 +1890,7 @@ test("change pages reuse the catalogue and refresh diagnostics, holdouts and pri
     c.run.id,
     "report.md",
     "report",
-    "diagnosticSecret\nholdoutSecret\nroundSecret\nreadable line",
+    authoredReport("diagnosticSecret\nholdoutSecret\nroundSecret\nreadable line"),
   );
   const reads = spyOn(diagnosticCatalogue, "ownerDiagnostics");
   const conn = await connect(factoryBackend(f.factory));
@@ -1953,7 +2056,7 @@ test("change pages protect verifier quotations while returning implementer-visib
     c.run.id,
     "report.md",
     "report",
-    `${"readable report\n".repeat(600)}${hidden}\n${diagnosticOnly}\n${plainObserved}`,
+    authoredReport(`${"readable report\n".repeat(600)}${hidden}\n${diagnosticOnly}\n${plainObserved}`),
   );
   const connections = await changeConnections();
   try {
@@ -2074,7 +2177,7 @@ test.each([true, false])(
       c.run.id,
       "report.md",
       "report",
-      `${publicReport}\nsrc/count.ts:7 returns 123; runtimeProbeSecret`,
+      authoredReport(`${publicReport}\nsrc/count.ts:7 returns 123; runtimeProbeSecret`, "prose"),
     );
     const connections = await changeConnections();
     try {
@@ -2089,7 +2192,7 @@ test.each([true, false])(
         );
         expect(page.diff.text).toContain("+runtimeProbeSecret");
         expect(page.reports[0]?.text).toBe(
-          `${publicReport}\n[withheld: holdout result or quotation; 1 line]`,
+          `${publicReport}\n[withheld: holdout result or quotation; 1 line]\n`,
         );
         expect(JSON.stringify(page)).not.toMatch(/Observed '|invocationId|owner_diagnostics/);
       }
@@ -2761,7 +2864,12 @@ test("change view preserves PR text and withholds private paths, patch lines, re
       ],
     },
   });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", `${hidden}\n${privacyTexts.join("\n")}`);
+  f.factory.store.putArtifact(
+    c.run.id,
+    "report.md",
+    "report",
+    authoredReport(`${hidden}\n${privacyTexts.join("\n")}`),
+  );
   const connections = await changeConnections();
   const pin = { run: c.run.id, headSha: c.headSha, baseSha: c.baseSha };
   try {
@@ -2833,7 +2941,12 @@ test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [in
         scenarios: [{ id: "H-1", description: hidden, steps: hidden, expected: hidden, edge_case: false }],
       },
     });
-    f.factory.store.putArtifact(c.run.id, "report.md", "report", `${"safe line\n".repeat(1000)}${report}`);
+    f.factory.store.putArtifact(
+      c.run.id,
+      "report.md",
+      "report",
+      authoredReport(`${"safe line\n".repeat(1000)}${report}`),
+    );
     const connections = await changeConnections();
     try {
       for (const conn of [connections.direct, connections.proxy]) {
@@ -2852,7 +2965,7 @@ test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [in
             }),
           );
           expect(tail.reports[0]?.text).toEndWith(
-            "safe line\n[withheld: holdout result or quotation; 1 line]",
+            "safe line\n[withheld: holdout result or quotation; 1 line]\n",
           );
           continue;
         }
@@ -2945,7 +3058,12 @@ test("original-run status follows in-flight, failed and delivered rounds and rev
           },
           lastVerify: { criteria: [{ id: "H-1", evidence: "Observed 'roundRuntimeSecret'." }] },
         });
-        store.putArtifact(created.run.id, "report.md", "report", "Round report\nroundRuntimeSecret");
+        store.putArtifact(
+          created.run.id,
+          "report.md",
+          "report",
+          authoredReport("Round report\nroundRuntimeSecret"),
+        );
       }
       for (const conn of [connections.direct, connections.proxy]) {
         const value = resultValue<{ state: string; nextAction: string }>(
@@ -2984,7 +3102,7 @@ test("original-run status follows in-flight, failed and delivered rounds and rev
     expect(view.headSha).toBe(c.headSha);
     expect(view.diff.text).toContain("new greeting");
     expect(view.diff.text).toContain("roundRuntimeSecret");
-    expect(view.reports[1]?.text).toBe("Round report\n[withheld: holdout result or quotation; 1 line]");
+    expect(view.reports[1]?.text).toBe("Round report\n[withheld: holdout result or quotation; 1 line]\n");
   } finally {
     await connections.close();
   }

@@ -4,6 +4,7 @@ import { decodeHTML } from "entities";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
+import { redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
@@ -127,7 +128,7 @@ function withoutHoldoutSection(report: string, redact: HoldoutRedactor) {
 function redactReport(report: string, catalogue: Catalogue, sourcesArtifact: string | null): string {
   const structure = reportStructure(report);
   if (structure === null) return "[withheld: invalid report structure]";
-  if (!structure) return withoutHoldoutSection(report, catalogue.redact);
+  if (!structure) return "[withheld: report without structural provenance]";
   const { body, spans } = structure;
   let sources: Record<string, string> = {};
   try {
@@ -201,10 +202,26 @@ function markdownProjection(text: string, origins: LineRange[]) {
   );
   replace(/\\+(?:r\\+n|[nrt])/gu, (match) => (match[0].endsWith("t") ? "\t" : "\n"));
   replace(/[\p{Cf}\u00ad]/gu, () => "");
-  // Report table cells render line breaks as <br>.
+  // Table cell line breaks are factory rendering, including within code spans.
   replace(/<br\s*\/?>/giu, () => "\n");
+  // Protect code contents before classifying markup or emphasis; restore them for private matching.
+  let codeMarker = "\ue000";
+  while (text.includes(codeMarker)) codeMarker += "\ue000";
+  const code = new Map<string, string>();
+  replace(/(?<!`)(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)/gu, (match) => {
+    const token = `${codeMarker}${code.size}\ue001`;
+    code.set(token, match[2] ?? "");
+    return token;
+  });
+  if (text.includes("`")) return null;
+  let unparsedMarkup = false;
   replace(/<!--[\s\S]*?-->/gu, () => "");
-  replace(/<\/?(?:em|strong|b|i|u|s|code|span|sub|sup|mark|kbd|a|del|ins|small)\b[^>]*>/giu, () => "");
+  replace(/<\/?(?:em|strong|b|i|u|s|code|span|sub|sup|mark|kbd|a|del|ins|small)\b[^>]*>/giu, (match) => {
+    // Attributes are outside the confirmed projection; do not guess where their values end.
+    if (!/^<\/?[a-z]+\s*\/?>$/iu.test(match[0])) unparsedMarkup = true;
+    return "";
+  });
+  if (unparsedMarkup || text.includes("<")) return null;
   replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/gu, (match) => match[1] ?? "");
   replace(/!?\[([^\]]*)\]\([^)]*\)/gu, (match) => match[1] ?? "");
   replace(/^[ \t]*(?:>[ \t]*|(?:[-+*]|\d+[.)])[ \t]+)+/gmu, () => "");
@@ -233,7 +250,8 @@ function markdownProjection(text: string, origins: LineRange[]) {
     return "";
   });
   if (ambiguous || emphasis.length) return null;
-  replace(/[`|]/gu, () => "");
+  replace(/\|/gu, () => "");
+  for (const [token, content] of code) replace(new RegExp(token, "gu"), () => content);
   replace(/\s+/gu, (match) => (/[\r\n]/u.test(match[0]) ? "\0" : " "));
   return { text, origins };
 }
@@ -457,6 +475,8 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
 }
 
 export function buildReportRedactor(details: Set<string>, privateRows = new Set<string>()): HoldoutRedactor {
+  // Match the exact sanitizer used before report spans and clipped sources are stored.
+  details = new Set([...details].map(redactGateOutput));
   const pattern = details.size
     ? new RegExp(
         [...details]

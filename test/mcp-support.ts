@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { createMcpServer, type McpBackend } from "../src/integrations/mcp.ts";
+import { markReportArtifacts, reportText } from "../src/pipeline/report-privacy.ts";
 import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
@@ -165,7 +166,12 @@ export async function changeFixture(
   };
   observe(headSha);
   const report = `Factory report\n${"Reviewed locally.\n".repeat(400)}`;
-  f.factory.store.putArtifact(run.id, "report.md", "report", report);
+  f.factory.store.putArtifact(
+    run.id,
+    "report.md",
+    "report",
+    markReportArtifacts([reportText("prose", report)]).report,
+  );
   return { run, repo, prUrl, baseSha, headSha, report, observe };
 }
 
