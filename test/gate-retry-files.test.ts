@@ -6,7 +6,7 @@ import { detectGates, readRetryFiles } from "../src/gates/detect.ts";
 import { executeGate, type GateRunner } from "../src/gates/executor.ts";
 import { extractFailures } from "../src/gates/failures.ts";
 import { MAX_RETRY_FILES, parseJUnit, readJUnit } from "../src/gates/junit.ts";
-import { type GateResult, retryRegressions, runGates } from "../src/gates/run.ts";
+import { type GateResult, retryFailures, retryRegressions, runGates } from "../src/gates/run.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { sh } from "../src/util/proc.ts";
@@ -403,3 +403,64 @@ test.each(["small", "six files", "over duration", "unknown duration"])(
     }
   },
 );
+
+test.each([
+  { label: "five files totaling 60 seconds", count: 5, time: 12, skip: true, timeout: 120 },
+  { label: "short original timeout", count: 1, time: 0, skip: true, timeout: 37, originalTimeout: 37 },
+  {
+    label: "default original timeout",
+    count: 1,
+    time: 1,
+    skip: true,
+    timeout: 120,
+    originalTimeout: undefined,
+  },
+  { label: "six files", count: 6, time: 1, skip: false, timeout: 300 },
+  { label: "over 60 seconds", count: 5, time: 13, skip: false, timeout: 300 },
+  { label: "unknown duration", count: 1, time: undefined, skip: false, timeout: 300 },
+  { label: "negative duration", count: 1, time: -1, skip: false, timeout: 300 },
+  { label: "infinite duration", count: 1, time: Infinity, skip: false, timeout: 300 },
+  { label: "NaN duration", count: 1, time: NaN, skip: false, timeout: 300 },
+])("targeted-only retries preserve bounds: $label", async (row) => {
+  const f = fixture();
+  try {
+    const files = Array.from({ length: row.count }, (_, i) => `test/${i}.test.ts`);
+    for (const file of files) writeFileSync(join(f.cwd, file), "");
+    const result: GateResult = {
+      ...failed,
+      failedFiles: files,
+      failedFileTimes:
+        row.time === undefined ? {} : Object.fromEntries(files.map((file) => [file, row.time])),
+    };
+    const check = {
+      name: "test",
+      run: "full-test",
+      timeoutSec: "originalTimeout" in row ? row.originalTimeout : 300,
+    };
+    let calls = 0;
+    const results = await retryFailures(
+      [{ check, original: result }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async (cfg, options) => {
+        calls++;
+        expect(options).toEqual({ targeted: true, skipGateSlot: row.skip });
+        expect(cfg.setup).toEqual([]);
+        expect(cfg.checks[0]?.timeoutSec).toBe(row.timeout);
+        expect(cfg.checks[0]?.run).toBe(`bun test ${files.map((file) => `'./${file}'`).join(" ")}`);
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toBe(1);
+    expect(results.get(result)).toMatchObject({
+      ok: true,
+      firstAttempt: result,
+      targetedRetry: { ok: true },
+    });
+  } finally {
+    f.close();
+  }
+});

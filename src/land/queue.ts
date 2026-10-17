@@ -10,7 +10,9 @@ import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
 import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
+import { findGateCounterpart } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
+import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
 import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
@@ -376,7 +378,12 @@ export class LandQueue {
     const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
     this.store.transaction(() => {
       const current = this.store.getLandEntry(entry.id);
-      if (current && this.isActive(current)) this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+      if (current && this.isActive(current))
+        this.finish(
+          entry.id,
+          "landed",
+          `${current.reason?.startsWith("flaky:") ? `${current.reason}; ` : ""}merged ${sha.slice(0, 12)}`,
+        );
       this.store.resolveMergedPr(run.repoId, entry.prUrl, mergedBy, mergedAt, this.now());
     });
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
@@ -400,26 +407,67 @@ export class LandQueue {
       mkdirSync(dirname(log), { recursive: true });
       writeFileSync(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
       await exportCommit(cwd, baseSha, base, signal);
-      const run = await executeGate(
-        {
-          repo: entry.repo,
-          cwd,
-          baseSha,
-          headSha: await headSha(cwd),
-          gates: detectGates(base),
-          priority: "ship",
-        },
-        signal,
-        {
-          holder: "land",
-          onResult: (r) =>
-            appendFileSync(log, `\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
-        },
-        this.deps.gateExecutor,
-      );
+      const gates = detectGates(base);
+      const request = {
+        repo: entry.repo,
+        cwd,
+        baseSha,
+        headSha: await headSha(cwd),
+        gates,
+        priority: "ship" as const,
+      };
+      const hooks = {
+        holder: "land",
+        onResult: (r: GateResult) =>
+          appendFileSync(
+            log,
+            redactCredentials(`\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
+          ),
+      };
+      const run = await executeGate(request, signal, hooks, this.deps.gateExecutor);
+      signal.throwIfAborted();
       this.store.updateLandEntry(entry.id, { logPath: log });
-      const failed = run.setupOk ? run.checks.filter((c) => !c.ok) : run.setup.filter((c) => !c.ok);
+      const selected = run.setupOk
+        ? run.checks.flatMap((original) => {
+            const check = findGateCounterpart(original, run.checks, gates.checks);
+            return check?.run === original.command ? [{ check, original }] : [];
+          })
+        : [];
+      const retries = await retryFailures(
+        selected,
+        cwd,
+        gates,
+        signal,
+        undefined,
+        (retry, options) => {
+          appendFileSync(log, "\n# targeted retry\n");
+          return executeGate(
+            { ...request, gates: retry, skipGateSlot: options?.skipGateSlot },
+            signal,
+            hooks,
+            this.deps.gateExecutor,
+          );
+        },
+        true,
+      );
+      signal.throwIfAborted();
+      const failed = [...run.setup, ...run.checks].filter((c) => {
+        const result = retries.get(c) ?? c;
+        return !result.ok || result.timedOut || confinementFailed(result);
+      });
       if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
+      if (retries.size) {
+        const reason = redactCredentials(
+          `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
+        );
+        this.store.updateLandEntry(entry.id, { reason });
+        this.store.addEvent({
+          runId: entry.runId,
+          type: "gate",
+          level: "warn",
+          message: `Land ${entry.id} ${reason}`,
+        });
+      }
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

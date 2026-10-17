@@ -13,6 +13,8 @@ import { join } from "node:path";
 import type { Paths } from "../src/config.ts";
 import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import type { GateExecutor, GateRequest } from "../src/gates/executor.ts";
+import type { GateResult, GateRun } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
 import * as repos from "../src/git/repos.ts";
@@ -269,6 +271,7 @@ function queue(
     ciPollMs?: number;
     ciTimeoutMs?: number;
     start?: boolean;
+    gateExecutor?: GateExecutor;
   } = {},
 ): LandQueue {
   const q = new LandQueue({
@@ -338,6 +341,256 @@ const ghCalls = (verb: string) =>
 
 const gateLog = () =>
   existsSync(gateLogPath()) ? readFileSync(gateLogPath(), "utf8").trim().split("\n") : [];
+
+const retryFile = "space ' quote.test.ts";
+const retryCommand = "base-retry './space '\\'' quote.test.ts'";
+
+async function retryLandFixture(retryFiles: unknown = "base-retry {files}") {
+  writeFileSync(join(seed, retryFile), "test fixture\n");
+  writeFileSync(
+    join(seed, ".limitless.toml"),
+    `[gates]
+setup = ["prepare"]
+checks = [{ name = "test", run = "full-test", timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
+${retryFiles === null ? "" : `retry_files = ${JSON.stringify(retryFiles)}`}
+`,
+  );
+  await sh(["git", "add", "."], { cwd: seed });
+  await sh(["git", "commit", "-qm", "base retry configuration"], { cwd: seed });
+  await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", ".limitless.toml", '[gates]\nretry_files = "untrusted {files}"\n');
+  observe(1, head);
+  approve(1, head);
+  return { pr, head };
+}
+
+function gateResult(name: string, command: string, overrides: Partial<GateResult> = {}): GateResult {
+  return { name, command, ok: true, exitCode: 0, durationMs: 1, output: "passed", ...overrides };
+}
+
+function retryRun(req: GateRequest, failures: Record<string, Partial<GateResult>> = {}): GateRun {
+  return {
+    setupOk: true,
+    setup: req.gates.setup.map((command) => gateResult("setup", command)),
+    checks: req.gates.checks.map((c) => gateResult(c.name, c.run, failures[c.name])),
+  };
+}
+
+const testFailure: Partial<GateResult> = {
+  ok: false,
+  exitCode: 1,
+  output: "initial test failure",
+  failedFiles: [retryFile],
+  failedFileTimes: { [retryFile]: 2 },
+};
+
+function fakeLandGates(
+  run: (req: GateRequest, attempt: number, signal: AbortSignal) => GateRun | Promise<GateRun>,
+) {
+  const requests: GateRequest[] = [];
+  const executor: GateExecutor = {
+    kind: "lan",
+    async start(req) {
+      requests.push(req);
+      return { kind: "lan", id: String(requests.length), startedAt: 0 };
+    },
+    attach(handle, signal, req) {
+      if (!req) throw new Error("Missing fake request");
+      const result = Promise.resolve(run(req, Number(handle.id), signal));
+      return {
+        result,
+        events: {
+          async *[Symbol.asyncIterator]() {
+            const completed = await result;
+            for (const r of completed.setup)
+              yield { type: "check" as const, phase: "setup" as const, result: r };
+            for (const r of completed.checks)
+              yield { type: "check" as const, phase: "check" as const, result: r };
+          },
+        },
+        async cancel() {},
+      };
+    },
+  };
+  return { executor, requests };
+}
+
+test.each([false, true])("targeted land retries record flakes through CI (restart: %s)", async (restart) => {
+  const { pr, head } = await retryLandFixture();
+  const credential = "synthetic-targeted-land-secret";
+  registerCredential("TARGETED_LAND_SECRET", credential);
+  const fake = fakeLandGates((req, attempt) =>
+    retryRun(
+      req,
+      attempt === 1
+        ? {
+            test: { ...testFailure, output: `initial test failure ${credential}` },
+            other: { ...testFailure, failedFiles: ["README.md"], failedFileTimes: undefined },
+          }
+        : { [req.gates.checks[0]?.name ?? ""]: { output: `targeted pass ${credential}` } },
+    ),
+  );
+  ci = () => null;
+  const q = queue({ gateExecutor: fake.executor });
+  const entry = await q.request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const summary = `flaky: test (${retryFile}); other (README.md)`;
+  expect(store.getLandEntry(entry.id)?.reason).toBe(summary);
+  expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
+    ["full-test", "full-other", "lint"],
+    [retryCommand],
+    ["base-retry './README.md'"],
+  ]);
+  expect(fake.requests.map((r) => r.gates.setup)).toEqual([["prepare"], [], []]);
+  expect(fake.requests.map((r) => r.priority)).toEqual(["ship", "ship", "ship"]);
+  expect(fake.requests.slice(1).map((r) => [r.skipGateSlot, r.gates.checks[0]?.timeoutSec])).toEqual([
+    [true, 120],
+    [false, 90],
+  ]);
+  expect(store.listEvents(pr.run.id).filter((e) => e.level === "warn")).toMatchObject([
+    { type: "gate", message: `Land ${entry.id} ${summary}` },
+  ]);
+  const log = readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8");
+  expect(log).toContain("$ full-test\ninitial test failure [redacted]");
+  expect(log).toContain(`# targeted retry\n\n$ ${retryCommand}\ntargeted pass [redacted]`);
+  expect(log).not.toContain(credential);
+  if (restart) {
+    await q.stop();
+    queue({ gateExecutor: fake.executor });
+  }
+  ci = () => ({ ci: "SUCCESS" });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "landed",
+    reason: `${summary}; merged ${head.slice(0, 12)}`,
+  });
+  expect(fake.requests).toHaveLength(3);
+  expect(ghCalls("pr merge")).toHaveLength(1);
+});
+
+test.each([
+  ["fails", testFailure, false],
+  ["times out", { ok: false, exitCode: null, timedOut: true }, false],
+  ["confinement", { confinementError: true }, false],
+  ["retained confinement", { firstAttempt: gateResult("test", "retry", { confinementError: true }) }, false],
+  ["another check", {}, true],
+] satisfies [string, Partial<GateResult>, boolean][])(
+  "a targeted retry %s blocks without a fallback",
+  async (_kind, retry, unresolved) => {
+    const { pr, head } = await retryLandFixture();
+    const fake = fakeLandGates((req, attempt) =>
+      retryRun(
+        req,
+        attempt === 1
+          ? {
+              test: testFailure,
+              ...(unresolved ? { lint: { ok: false, exitCode: 1 } } : {}),
+            }
+          : { test: retry },
+      ),
+    );
+    const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+    await settle();
+    const blocked = store.getLandEntry(entry.id);
+    expect(blocked).toMatchObject({
+      state: "blocked",
+      pushedSha: null,
+      reason: `${unresolved ? "lint" : "test"} failed (${blocked?.logPath})`,
+    });
+    expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
+      ["full-test", "full-other", "lint"],
+      [retryCommand],
+    ]);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+  },
+);
+
+const ineligibleRetries: { label: string; result?: Partial<GateResult>; template?: string | null }[] = [
+  { label: "setup" },
+  { label: "no files", result: { failedFiles: undefined } },
+  { label: "empty files", result: { failedFiles: [] } },
+  { label: "null exit", result: { exitCode: null } },
+  { label: "zero exit", result: { exitCode: 0 } },
+  { label: "timeout", result: { timedOut: true } },
+  { label: "confinement", result: { confinementError: true } },
+  {
+    label: "retained confinement",
+    result: { targetedRetry: gateResult("test", "earlier", { confinementError: true }) },
+  },
+  { label: "missing template", template: null },
+  { label: "malformed template", template: "base-retry" },
+  { label: "duplicate placeholder", template: "base-retry {files} {files}" },
+  { label: "invalid files", result: { failedFiles: ["../escape.ts"] } },
+];
+test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $label", async (row) => {
+  const { pr, head } = await retryLandFixture(row.template);
+  const fake = fakeLandGates((req) =>
+    row.label === "setup"
+      ? { setupOk: false, setup: [gateResult("setup", "prepare", testFailure)], checks: [] }
+      : retryRun(req, { test: { ...testFailure, ...row.result } }),
+  );
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const blocked = store.getLandEntry(entry.id);
+  expect(blocked).toMatchObject({
+    state: "blocked",
+    pushedSha: null,
+    reason: `${row.label === "setup" ? "setup" : "test"} failed (${blocked?.logPath})`,
+  });
+  expect(fake.requests).toHaveLength(1);
+  expect(await remoteHead("pr-1")).toBe(head);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test.each(["stop", "cancel"])("a %s during a targeted retry cannot authorize landing", async (action) => {
+  const { pr, head } = await retryLandFixture();
+  await advanceBase(); // A merge commit would have to be pushed after completed checks.
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<GateRun>();
+  const fake = fakeLandGates((req, attempt, signal) => {
+    if (attempt !== 2) return retryRun(req, { test: testFailure });
+    entered.resolve();
+    if (action === "stop")
+      signal.addEventListener("abort", () => response.resolve(retryRun(req)), { once: true });
+    return response.promise;
+  });
+  const q = queue({ gateExecutor: fake.executor });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await entered.promise;
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: null, reason: null });
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+    if (action === "cancel") {
+      expect(q.cancel(entry.id)).toBe(true);
+      const pending = fake.requests[1];
+      if (!pending) throw new Error("Missing targeted retry");
+      response.resolve(retryRun(pending));
+    }
+    await q.stop();
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: action === "stop" ? "checking" : "cancelled",
+      pushedSha: null,
+    });
+    const fresh = fakeLandGates((req) => retryRun(req, { test: { ...testFailure, failedFiles: undefined } }));
+    queue({ gateExecutor: fresh.executor });
+    await settle();
+    expect(fresh.requests).toHaveLength(action === "stop" ? 1 : 0);
+    if (action === "stop") {
+      expect(fresh.requests[0]?.gates.setup).toEqual(["prepare"]);
+      expect(fresh.requests[0]?.gates.checks.map((c) => c.run)).toEqual(["full-test", "full-other", "lint"]);
+      expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+    }
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(store.listEvents(pr.run.id).filter((e) => e.level === "warn")).toEqual([]);
+  } finally {
+    response.resolve({ setupOk: true, setup: [], checks: [] });
+    await q.stop();
+  }
+});
 
 test("two approved entries on one repository land in order, never checking at once", async () => {
   const first = delivered(1, "pr-1");
