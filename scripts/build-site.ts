@@ -6,6 +6,21 @@ const docs = ["README.md", "docs/GUIDE.md", "docs/OPERATIONS.md", "docs/ARCHITEC
 const pageFor = (source: string) => `docs/${source.split("/").at(-1)?.replace(".md", ".html").toLowerCase()}`;
 const escapeHtml = (s: string) => Bun.escapeHTML(s);
 const external = (url: string) => /^[a-z][a-z\d+.-]*:|^\/\//i.test(url);
+const markdownOptions = { noHtmlBlocks: true, noHtmlSpans: true };
+const github = "https://github.com/MattFlower/limitless";
+
+// Use the Markdown parser's entity decoder, once, just as an HTML attribute consumer does.
+const decodeEntities = (url: string) =>
+  url.replace(/&(?:#x[\da-f]+|#\d+|[a-z][a-z\d]*);?/gi, (entity) => Bun.markdown.render(entity));
+
+function destination(source: string, original: string) {
+  const url = decodeEntities(original);
+  const parsed = URL.parse(url, `https://repo.invalid/${source}`);
+  if (!parsed) throw new Error(`${source}: invalid destination ${original}`);
+  if (!["http:", "https:", "mailto:"].includes(parsed.protocol))
+    throw new Error(`${source}: unsafe destination ${original}`);
+  return { url, parsed };
+}
 
 /** A fresh slugger per document; reserve suffixed ids too ("Foo", "Foo-1", "Foo"). */
 export function githubSlugger() {
@@ -68,8 +83,9 @@ export async function validateSite(outDir: string) {
     }
 }
 
-export async function buildSite(outDir: string, opts: { siteDir?: string } = {}) {
+export async function buildSite(outDir: string, opts: { siteDir?: string; sourceRoot?: string } = {}) {
   outDir = resolve(outDir);
+  const sourceRoot = resolve(opts.sourceRoot ?? root);
   const site = opts.siteDir ?? join(root, "site");
   const landing = await readFile(join(site, "index.html"), "utf8");
   // Check before copying so a missing asset is reported as a landing-page error.
@@ -85,33 +101,62 @@ export async function buildSite(outDir: string, opts: { siteDir?: string } = {})
       await copyFile(join(site, "screenshots", name), join(outDir, "screenshots", name));
   const template = await readFile(join(site, "template.html"), "utf8");
   for (const source of docs) {
-    const markdown = await readFile(join(root, source), "utf8");
+    const markdown = await readFile(join(sourceRoot, source), "utf8");
     const slug = githubSlugger(),
-      headings: { level: number; text: string; id: string }[] = [];
-    Bun.markdown.render(markdown, {
-      heading(text, { level }) {
-        headings.push({ level, text, id: slug(text) });
-        return "";
+      headings: { level: number; text: string; id: string }[] = [],
+      diagrams: { text: string; section: string }[] = [];
+    const originals = new Map<string, string>();
+    Bun.markdown.render(
+      markdown,
+      {
+        heading(text, { level }) {
+          headings.push({ level, text, id: slug(text) });
+          return "";
+        },
+        code(text, meta) {
+          if (meta?.language === "mermaid") diagrams.push({ text, section: headings.at(-1)?.id ?? "" });
+          return "";
+        },
+        link(text, { href }) {
+          originals.set(destination(source, href).parsed.href, href);
+          return text;
+        },
+        image(text, { src }) {
+          originals.set(destination(source, src).parsed.href, src);
+          return text;
+        },
       },
-    });
+      markdownOptions,
+    );
     let i = 0;
-    let content = Bun.markdown.html(markdown, { tagFilter: true }).replace(/<h([1-6])>/g, (tag) => {
+    let content = Bun.markdown.html(markdown, markdownOptions).replace(/<h([1-6])>/g, (tag) => {
       const heading = headings[i++];
       if (!heading) throw new Error(`${source}: inconsistent heading rendering`);
       return tag.replace(">", ` id="${escapeHtml(heading.id)}">`);
     });
+    let diagramIndex = 0;
+    content = content.replace(/<pre><code class="language-mermaid">[\s\S]*?<\/code><\/pre>/g, () => {
+      const diagram = diagrams[diagramIndex++];
+      if (!diagram) throw new Error(`${source}: inconsistent Mermaid rendering`);
+      const href = `${github}/blob/main/${source}${diagram.section ? `#${diagram.section}` : ""}`;
+      return `<p>View the diagram <a href="${escapeHtml(href)}">on GitHub</a>.</p><details><summary>Mermaid source</summary><pre><code class="language-mermaid">${escapeHtml(diagram.text)}</code></pre></details>`;
+    });
     const links = new Map<string, string>();
-    for (const url of htmlReferences(content).urls) {
+    for (const original of htmlReferences(content).urls) {
+      const { url, parsed } = destination(source, original);
       if (!url || url.startsWith("#") || external(url)) continue;
-      const parsed = new URL(url, `https://repo.invalid/${source}`);
       const path = decodeURIComponent(parsed.pathname.slice(1));
+      const local = resolve(sourceRoot, path);
+      const within = relative(sourceRoot, local);
+      const target = within === ".." || within.startsWith("../") ? null : await stat(local).catch(() => null);
+      if (!target || (!target.isFile() && !target.isDirectory()))
+        throw new Error(`${source}: missing repository target ${originals.get(parsed.href) ?? url}`);
       const doc = docs.find((d) => d === path);
-      const directory = !doc && (await stat(join(root, path)).catch(() => null))?.isDirectory();
       links.set(
-        url,
+        original,
         doc
           ? `${relative(dirname(pageFor(source)), pageFor(doc))}${parsed.search}${parsed.hash}`
-          : `https://github.com/MattFlower/limitless/${directory ? "tree" : "blob"}/main/${path}${parsed.search}${parsed.hash}`,
+          : `${github}/${target.isDirectory() ? "tree" : "blob"}/main/${parsed.pathname.slice(1)}${parsed.search}${parsed.hash}`,
       );
     }
     content = new HTMLRewriter()
@@ -120,7 +165,7 @@ export async function buildSite(outDir: string, opts: { siteDir?: string } = {})
           for (const attr of ["href", "src"]) {
             const url = el.getAttribute(attr),
               rewritten = url === null ? undefined : links.get(url);
-            if (rewritten) el.setAttribute(attr, rewritten);
+            if (rewritten) el.setAttribute(attr, escapeHtml(rewritten));
           }
         },
       })

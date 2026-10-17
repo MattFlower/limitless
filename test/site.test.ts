@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { buildSite, githubSlugger, outputFiles, validateSite } from "../scripts/build-site.ts";
@@ -17,6 +17,22 @@ afterAll(async () => {
   if (scratch) await rm(scratch, { recursive: true, force: true });
 });
 const html = (page: string) => readFile(join(out, page), "utf8");
+async function fixture(markdown: string) {
+  const sourceRoot = await mkdtemp(join(scratch, "source-"));
+  await mkdir(join(sourceRoot, "docs/research"), { recursive: true });
+  await mkdir(join(sourceRoot, "src"));
+  const siteDir = join(sourceRoot, "site");
+  await mkdir(join(siteDir, "screenshots"), { recursive: true });
+  await writeFile(join(siteDir, "index.html"), '<a href="docs/readme.html">Docs</a>');
+  await writeFile(join(siteDir, "style.css"), "");
+  await cp(join(root, "site/template.html"), join(siteDir, "template.html"));
+  await writeFile(join(sourceRoot, "README.md"), `# Fixture\n\n${markdown}`);
+  for (const name of ["GUIDE", "OPERATIONS", "ARCHITECTURE", "EVALS", "PLAN"])
+    await writeFile(join(sourceRoot, `docs/${name}.md`), `# ${name}\n\n## Target\n`);
+  await writeFile(join(sourceRoot, "src/example.ts"), "export {};\n");
+  const output = join(sourceRoot, "output");
+  return { sourceRoot, output, build: () => buildSite(output, { sourceRoot, siteDir }) };
+}
 // Independently inspect rendered HTML, including same-page anchors and image sources.
 function inspect(source: string) {
   const ids: string[] = [],
@@ -102,6 +118,123 @@ test("doc and source-tree links resolve relative to Markdown location", async ()
   ).toBe(true);
   // The current guide links directly to queue.ts; architecture links into that guide section.
   expect(guide).toContain("https://github.com/MattFlower/limitless/blob/main/src/land/queue.ts");
+});
+
+test("raw HTML becomes text while Markdown and fenced HTML remain intact", async () => {
+  const raw =
+    '<img src="https://example.com/missing.png" onerror="alert(document.domain)"><a href="javascript:alert(1)">unsafe</a>';
+  const source = await fixture(`${raw}\n\n**Bold** and *italic*.\n\n\`\`\`html\n${raw}\n\`\`\``);
+  await source.build();
+  const rendered = await readFile(join(source.output, "docs/readme.html"), "utf8");
+  const active: string[] = [];
+  new HTMLRewriter()
+    .on("img, [onerror], a[href^='javascript:']", {
+      element(el) {
+        active.push(el.tagName);
+      },
+    })
+    .transform(rendered);
+  expect(active).toEqual([]);
+  expect(rendered).toContain(`<p>${Bun.escapeHTML(raw)}</p>`);
+  expect(rendered).toContain(`<pre><code class="language-html">${Bun.escapeHTML(raw)}\n</code></pre>`);
+  expect(rendered).toContain("<strong>Bold</strong> and <em>italic</em>");
+});
+
+test.each([
+  "javascript:alert(1)",
+  "data:text/html,unsafe",
+  "vbscript:unsafe",
+  "ftp://example.com/file",
+  "jav&#x61;script&colon;alert(1)",
+  "&#106;avascript&#58;alert(1)",
+  "java&Tab;script:alert(1)",
+  "java&#10;script:alert(1)",
+  "javascript\\:alert(1)",
+])("rejects unsafe link and image destination %s with document diagnostics", async (url) => {
+  for (const prefix of ["", "!"]) {
+    const source = await fixture(`${prefix}[unsafe](${url})`);
+    await expect(source.build()).rejects.toThrow(`README.md: unsafe destination ${url.replace("\\:", ":")}`);
+  }
+});
+
+test("safe destinations and existing repository targets preserve queries and fragments", async () => {
+  const source = await fixture(`
+[http](http://example.com/)
+[https](https://example.com/?a=1&b=2)
+[mail](mailto:demo@example.com)
+![safe image](https://example.com/image.png)
+[guide](docs/GUIDE.md?mode=print&view=all#target)
+[literal entity in query](docs/GUIDE.md?name=one&amp;copy;two#target)
+[source](src/example.ts?plain=1#L1)
+[directory](docs/research/?view=all#readme)
+[excluded](docs/PLAN.md#target)
+[self](#fixture)
+`);
+  await source.build();
+  const rendered = await readFile(join(source.output, "docs/readme.html"), "utf8");
+  // HTMLRewriter exposes encoded attributes; the browser decodes the ampersand once.
+  expect(inspect(rendered).urls).toEqual(
+    expect.arrayContaining([
+      "http://example.com/",
+      "https://example.com/?a=1&amp;b=2",
+      "mailto:demo@example.com",
+      "https://example.com/image.png",
+      "guide.html?mode=print&amp;view=all#target",
+      "guide.html?name=one&amp;copy;two#target",
+      "https://github.com/MattFlower/limitless/blob/main/src/example.ts?plain=1#L1",
+      "https://github.com/MattFlower/limitless/tree/main/docs/research/?view=all#readme",
+      "https://github.com/MattFlower/limitless/blob/main/docs/PLAN.md#target",
+      "#fixture",
+    ]),
+  );
+});
+
+test.each(["docs/OPERATI0NS.md", "src/missing.ts?plain=1#L2", "src/missing.ts?a=1&amp;b=2"])(
+  "missing repository reference %s fails before becoming an external URL",
+  async (url) => {
+    for (const prefix of ["", "!"]) {
+      const source = await fixture(`${prefix}[missing](${url})`);
+      await expect(source.build()).rejects.toThrow(`README.md: missing repository target ${url}`);
+    }
+  },
+);
+
+test("a rendered-doc target must exist before its URL is rewritten", async () => {
+  const source = await fixture("[operations](docs/OPERATIONS.md#target)");
+  await rm(join(source.sourceRoot, "docs/OPERATIONS.md"));
+  await expect(source.build()).rejects.toThrow(
+    "README.md: missing repository target docs/OPERATIONS.md#target",
+  );
+});
+
+test("Mermaid links to its enclosing GitHub section and keeps escaped, collapsed source", async () => {
+  const guide = await html("docs/guide.html");
+  expect(inspect(guide).urls).toContain(
+    "https://github.com/MattFlower/limitless/blob/main/docs/GUIDE.md#the-pipeline",
+  );
+  expect(guide).toContain(
+    '<details><summary>Mermaid source</summary><pre><code class="language-mermaid">flowchart LR',
+  );
+  expect(guide).toContain("prepare[&quot;prepare&lt;br/&gt;worktree + baseline checks&quot;]");
+  const source = await fixture('## Stage\n\n## Stage\n\n```mermaid\nA --> B["<img onerror=alert(1)>"]\n```');
+  await source.build();
+  const rendered = await readFile(join(source.output, "docs/readme.html"), "utf8");
+  expect(inspect(rendered).urls).toContain(
+    "https://github.com/MattFlower/limitless/blob/main/README.md#stage-1",
+  );
+  let details = 0;
+  for (const page of [guide, rendered])
+    new HTMLRewriter()
+      .on("main details", {
+        element(el) {
+          details++;
+          expect(el.hasAttribute("open")).toBe(false);
+        },
+      })
+      .transform(page);
+  expect(details).toBe(2);
+  expect(inspect(rendered).images).toEqual([]);
+  expect(rendered).toContain("&lt;img onerror=alert(1)&gt;");
 });
 
 test("GitHub slugs preserve adjacent hyphens and reserve duplicate suffixes", () => {
