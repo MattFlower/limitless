@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { detectGates, readRetryFiles } from "../src/gates/detect.ts";
 import { executeGate, type GateRunner } from "../src/gates/executor.ts";
 import { extractFailures } from "../src/gates/failures.ts";
@@ -25,17 +26,20 @@ const suite = (file = "test/a.test.ts", attrs = 'failures="1" time="2"', body = 
 
 describe("JUnit failure files", () => {
   test.each([
-    ["suite failures", suite()],
-    ["suite errors", suite("test/a.test.ts", 'errors="1" time="2"')],
-    ["testcase failure", suite("test/a.test.ts", 'time="2"', "<testcase><failure/></testcase>")],
-    ["testcase error", suite("test/a.test.ts", 'time="2"', "<testcase><error/></testcase>")],
-    ["nested suites", `<testsuites><testsuite>${suite()}</testsuite></testsuites>`],
-  ])("parses %s", (_kind, xml) => {
+    ["suite failures", suite(), undefined],
+    ["suite errors", suite("test/a.test.ts", 'errors="1" time="2"'), undefined],
+    ["testcase failure", suite("test/a.test.ts", 'time="2"', "<testcase><failure/></testcase>"), 0],
+    ["testcase error", suite("test/a.test.ts", 'time="2"', "<testcase><error/></testcase>"), 1],
+    ["nested suites", `<testsuites><testsuite>${suite()}</testsuite></testsuites>`, undefined],
+  ])("parses %s", (_kind, xml, errors) => {
     const f = fixture();
     try {
       expect(parseJUnit(xml, f.cwd)).toEqual({
         failedFiles: ["test/a.test.ts"],
         failedFileTimes: { "test/a.test.ts": 2 },
+        ...(errors !== undefined
+          ? { attributedCounts: { tests: 1, failures: 1 - errors, errors, skipped: 0 } }
+          : {}),
       });
     } finally {
       f.close();
@@ -53,6 +57,7 @@ describe("JUnit failure files", () => {
       ).toEqual({
         failedFiles: ["test/space ' quote.test.ts"],
         failedFileTimes: { "test/space ' quote.test.ts": 7 },
+        attributedCounts: { tests: 2, failures: 1, errors: 0, skipped: 0 },
       });
       expect(parseJUnit(`<testsuites>${suite()}${suite()}</testsuites>`, f.cwd)).toEqual({
         failedFiles: ["test/a.test.ts"],
@@ -121,6 +126,7 @@ describe("JUnit failure files", () => {
       ).toEqual({
         failedFiles: ["test/a.test.ts"],
         failedFileTimes: {},
+        attributedCounts: { tests: 1, failures: 1, errors: 0, skipped: 0 },
       });
     } finally {
       f.close();
@@ -142,9 +148,10 @@ describe("JUnit failure files", () => {
 });
 
 const signal = new AbortController().signal;
+const testCheck = { name: "test", run: "full-test", timeoutSec: 37 };
 const config = {
   setup: [],
-  checks: [{ name: "test", run: "full-test", timeoutSec: 37 }],
+  checks: [testCheck],
   source: "none" as const,
   protectedPaths: [],
   retryFiles: "bun test {files}",
@@ -157,6 +164,181 @@ const failed: GateResult = {
   output: "failed",
   durationMs: 10,
 };
+
+const attributedSuite = suite(
+  "test/a.test.ts",
+  'tests="1" failures="1" errors="0"',
+  "<testcase><failure/></testcase>",
+);
+const runnerSummary = "0 pass\n1 fail\nRan 1 test across 1 file.";
+
+test.each([
+  { label: "matching cases", xml: attributedSuite, complete: true },
+  {
+    label: "multiple diagnostics in one failing case",
+    xml: attributedSuite.replace("<failure/>", "<failure/><failure/>"),
+    complete: true,
+  },
+  {
+    label: "matching root and nested inclusive counters",
+    xml: `<testsuites tests="1" failures="1" errors="0"><testsuite failures="1">${attributedSuite}</testsuite></testsuites>`,
+    complete: true,
+  },
+  {
+    label: "attributed testcase error",
+    xml: suite("test/a.test.ts", 'errors="1"', "<testcase><error/></testcase>"),
+    complete: true,
+  },
+  {
+    label: "inclusive mixed outcomes across files",
+    xml: `<testsuites tests="4" failures="1" errors="1" skipped="1"><testsuite failures="1" errors="1">${attributedSuite}${suite("test/b.test.ts", 'tests="3" failures="0" errors="1" skipped="1"', "<testcase><error/></testcase><testcase/><testcase><skipped/></testcase>")}</testsuite></testsuites>`,
+    output: "1 pass\n2 fail\n1 skip\nRan 4 tests across 2 files.",
+    complete: true,
+  },
+  { label: "missing report", xml: "", complete: false },
+  { label: "malformed report", xml: "<testsuite>", complete: false },
+  {
+    label: "root error and suite counter without a case",
+    xml: '<testsuites errors="1"><testsuite file="test/a.test.ts" failures="1" errors="0"/></testsuites>',
+    complete: false,
+  },
+  { label: "suite counter without cases", xml: suite(), complete: false },
+  {
+    label: "unmatched root errors",
+    xml: `<testsuites errors="1">${attributedSuite}</testsuites>`,
+    complete: false,
+  },
+  {
+    label: "unmatched parent errors",
+    xml: `<testsuites><testsuite errors="1">${attributedSuite}</testsuite></testsuites>`,
+    complete: false,
+  },
+  {
+    label: "root failure count too large",
+    xml: `<testsuites failures="2">${attributedSuite}</testsuites>`,
+    complete: false,
+  },
+  {
+    label: "counter contradicts failure cases",
+    xml: attributedSuite.replace('failures="1"', 'failures="0"'),
+    complete: false,
+  },
+  {
+    label: "malformed counter",
+    xml: attributedSuite.replace('errors="0"', 'errors="unknown"'),
+    complete: false,
+  },
+  {
+    label: "unattributed root testcase",
+    xml: `<testsuites>${attributedSuite}<testcase><failure/></testcase></testsuites>`,
+    output: "0 pass\n2 fail",
+    complete: false,
+  },
+  { label: "summary reveals an omitted case", output: "0 pass\n2 fail", complete: false },
+  { label: "contradictory pass summary", output: "1 pass\n1 fail", complete: false },
+  { label: "contradictory total", output: "0 pass\n1 fail\nRan 2 tests across 1 file.", complete: false },
+  { label: "missing summary", output: "(fail) one test", complete: false },
+  { label: "malformed summary", output: "0 pass\none fail", complete: false },
+  { label: "duplicate summary", output: `${runnerSummary}\n1 fail`, complete: false },
+  { label: "unhandled error", output: `# Unhandled error between tests\n${runnerSummary}`, complete: false },
+  { label: "load error", output: `other.test.ts: load error\n${runnerSummary}`, complete: false },
+  {
+    label: "prefixed load error",
+    output: `error: other.test.ts: load error\n${runnerSummary}`,
+    complete: false,
+  },
+  {
+    label: "module load error",
+    output: `error: Cannot find module './missing'\n${runnerSummary}`,
+    complete: false,
+  },
+  {
+    label: "test name mentions unhandled and load errors",
+    output: `(fail) handles unhandled errors and load errors: load error\n${runnerSummary}`,
+    complete: true,
+  },
+  { label: "extra error count", output: `${runnerSummary}\n1 error`, complete: false },
+  { label: "malformed error count", output: `${runnerSummary}\nNaN errors`, complete: false },
+  { label: "zero errors", output: `${runnerSummary}\n0 errors`, complete: true },
+  {
+    label: "error before output tail",
+    output: `# Unhandled error between tests\n${"noise\n".repeat(2_000)}${runnerSummary}`,
+    complete: false,
+  },
+])("land failure evidence: $label", async (row) => {
+  const f = fixture();
+  try {
+    const junit = parseJUnit(row.xml ?? attributedSuite, f.cwd);
+    const evidence = new RunnerFailureEvidence();
+    for (const line of (row.output ?? runnerSummary).split("\n")) evidence.observe(line);
+    const complete = evidence.agrees(junit?.attributedCounts);
+    expect(complete).toBe(row.complete);
+    let calls = 0;
+    const results = await retryFailures(
+      [{ check: testCheck, original: { ...failed, ...junit, failureAttributionComplete: complete } }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toBe(row.complete ? 1 : 0);
+    expect(results.size).toBe(calls);
+  } finally {
+    f.close();
+  }
+});
+
+test("incomplete land evidence preserves factory targeted and full retries", async () => {
+  const f = fixture();
+  try {
+    const original = { ...failed, ...parseJUnit(suite(), f.cwd), failureAttributionComplete: false };
+    const calls: boolean[] = [];
+    const runner: GateRunner = async (_cfg, options) => {
+      calls.push(options?.targeted ?? false);
+      return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+    };
+    const selected = [{ check: testCheck, original }];
+    expect((await retryFailures(selected, f.cwd, config, signal, undefined, runner, true)).size).toBe(0);
+    expect(calls).toEqual([]);
+    expect((await retryFailures(selected, f.cwd, config, signal, undefined, runner)).get(original)?.ok).toBe(
+      true,
+    );
+    expect(calls).toEqual([true, false]);
+  } finally {
+    f.close();
+  }
+});
+
+test("gate capture retains runner errors before the diagnostic tail", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(
+      join(f.cwd, "runner.ts"),
+      `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(attributedSuite)});
+console.error("# Unhandled error between tests");
+console.error("noise\\n".repeat(2000));
+console.error(${JSON.stringify(runnerSummary)});
+process.exit(1);`,
+    );
+    const run = await confinementScope.run(fakeConfinement, () =>
+      runGates(
+        f.cwd,
+        { ...config, checks: [{ name: "test", run: `'${process.execPath}' ./runner.ts` }] },
+        signal,
+      ),
+    );
+    expect(run.checks[0]?.output).not.toContain("Unhandled error");
+    expect(run.checks[0]?.failedFiles).toEqual(["test/a.test.ts"]);
+    expect(run.checks[0]?.failureAttributionComplete).toBe(false);
+  } finally {
+    f.close();
+  }
+});
 
 test.each([undefined, 123, "bun test", "bun test {files} {files}", "bun test {files}"])(
   "retry_files validation: %s",
@@ -316,6 +498,7 @@ test("real Bun JUnit capture keeps failing files, console excerpts and coverage"
     expect(gates.checks[0]?.failedFiles).toEqual(["test/b.test.ts"]);
     expect(gates.checks[0]?.failures).toContain("(fail) fails");
     expect(gates.checks[0]?.testCoverage?.summary).toBeTruthy();
+    expect(gates.checks[0]?.failureAttributionComplete).toBe(true);
   } finally {
     f.close();
   }
@@ -428,6 +611,7 @@ test.each([
     for (const file of files) writeFileSync(join(f.cwd, file), "");
     const result: GateResult = {
       ...failed,
+      failureAttributionComplete: true,
       failedFiles: files,
       failedFileTimes:
         row.time === undefined ? {} : Object.fromEntries(files.map((file) => [file, row.time])),

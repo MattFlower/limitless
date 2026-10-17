@@ -3,6 +3,7 @@ import { basename, join } from "node:path";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
+import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
@@ -33,6 +34,8 @@ export interface GateResult {
   testCoverage?: TestCoverage;
   failedFiles?: string[];
   failedFileTimes?: FailedTestFiles["failedFileTimes"];
+  /** Affirmative whole-stream and JUnit evidence, required only for targeted-only retries. */
+  failureAttributionComplete?: boolean;
   targetedRetry?: GateResult;
 }
 
@@ -93,7 +96,9 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
+  const evidence = new RunnerFailureEvidence();
   const observe = (line: string) => {
+    evidence.observe(line);
     line = redactGateOutput(line);
     coverage.observe(line);
     excerpts.observe(line);
@@ -118,6 +123,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
+  const { attributedCounts, ...failedFiles } = readJUnit(report, cwd) ?? {};
   return {
     name: cmd.name,
     command: cmd.run,
@@ -125,7 +131,8 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
-    ...readJUnit(report, cwd),
+    ...failedFiles,
+    failureAttributionComplete: evidence.agrees(attributedCounts),
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
@@ -248,6 +255,7 @@ export async function retryFailures(
     if (
       targetedOnly &&
       (original.ok ||
+        original.failureAttributionComplete !== true ||
         original.exitCode === null ||
         original.exitCode === 0 ||
         original.timedOut ||

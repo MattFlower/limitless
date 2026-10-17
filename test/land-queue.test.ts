@@ -13,7 +13,9 @@ import { join } from "node:path";
 import type { Paths } from "../src/config.ts";
 import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import type { GateExecutor, GateRequest } from "../src/gates/executor.ts";
+import { parseJUnit } from "../src/gates/junit.ts";
 import type { GateResult, GateRun } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
@@ -345,13 +347,13 @@ const gateLog = () =>
 const retryFile = "space ' quote.test.ts";
 const retryCommand = "base-retry './space '\\'' quote.test.ts'";
 
-async function retryLandFixture(retryFiles: unknown = "base-retry {files}") {
+async function retryLandFixture(retryFiles: unknown = "base-retry {files}", checkName = "test") {
   writeFileSync(join(seed, retryFile), "test fixture\n");
   writeFileSync(
     join(seed, ".limitless.toml"),
     `[gates]
 setup = ["prepare"]
-checks = [{ name = "test", run = "full-test", timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
+checks = [{ name = ${JSON.stringify(checkName)}, run = "full-test", timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
 ${retryFiles === null ? "" : `retry_files = ${JSON.stringify(retryFiles)}`}
 `,
   );
@@ -383,6 +385,7 @@ const testFailure: Partial<GateResult> = {
   output: "initial test failure",
   failedFiles: [retryFile],
   failedFileTimes: { [retryFile]: 2 },
+  failureAttributionComplete: true,
 };
 
 function fakeLandGates(
@@ -509,6 +512,8 @@ test.each([
 
 const ineligibleRetries: { label: string; result?: Partial<GateResult>; template?: string | null }[] = [
   { label: "setup" },
+  { label: "legacy evidence", result: { failureAttributionComplete: undefined } },
+  { label: "incomplete evidence", result: { failureAttributionComplete: false } },
   { label: "no files", result: { failedFiles: undefined } },
   { label: "empty files", result: { failedFiles: [] } },
   { label: "null exit", result: { exitCode: null } },
@@ -542,6 +547,73 @@ test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $
   expect(fake.requests).toHaveLength(1);
   expect(await remoteHead("pr-1")).toBe(head);
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test.each(["root error", "unhandled error"])(
+  "incomplete captured evidence blocks land without retry: %s",
+  async (kind) => {
+    const { pr, head } = await retryLandFixture();
+    const fake = fakeLandGates((req, attempt) => {
+      if (attempt > 1) return retryRun(req); // A passing partial retry must never authorize this land.
+      const xml =
+        kind === "root error"
+          ? '<testsuites errors="1"><testsuite file="README.md" failures="1" errors="0"/></testsuites>'
+          : '<testsuites failures="1"><testsuite file="README.md" failures="1"><testcase><failure/></testcase></testsuite></testsuites>';
+      const evidence = new RunnerFailureEvidence();
+      const output = `${kind === "unhandled error" ? "# Unhandled error between tests\n" : ""}0 pass\n1 fail`;
+      for (const line of output.split("\n")) evidence.observe(line);
+      const junit = parseJUnit(xml, req.cwd);
+      expect(junit?.failedFiles).toEqual(["README.md"]);
+      return retryRun(req, {
+        test: {
+          ...testFailure,
+          ...junit,
+          output,
+          failureAttributionComplete: evidence.agrees(junit?.attributedCounts),
+        },
+      });
+    });
+    const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+    await settle();
+    const blocked = store.getLandEntry(entry.id);
+    expect(blocked).toMatchObject({
+      state: "blocked",
+      reason: `test failed (${blocked?.logPath})`,
+      pushedSha: null,
+    });
+    expect(fake.requests).toHaveLength(1);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+  },
+);
+
+test("flaky land diagnostics strip formatting before credential redaction", async () => {
+  const credential = "synthetic-color-gate-secret";
+  const colored = "synthetic-color-\u001b[31mgate-secret\u001b[0m";
+  registerCredential("COLOR_GATE_SECRET", credential);
+  const { pr, head } = await retryLandFixture("base-retry {files}", colored);
+  const fake = fakeLandGates((req, attempt) =>
+    retryRun(req, {
+      [colored]:
+        attempt === 1 ? { ...testFailure, output: `initial ${colored}` } : { output: `targeted ${colored}` },
+    }),
+  );
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const landed = store.getLandEntry(entry.id);
+  const reason = `flaky: [redacted] (${retryFile})`;
+  expect(landed).toMatchObject({ state: "landed", reason: `${reason}; merged ${head.slice(0, 12)}` });
+  const warnings = store.listEvents(pr.run.id).filter((e) => e.level === "warn");
+  expect(warnings).toMatchObject([{ message: `Land ${entry.id} ${reason}` }]);
+  const log = readFileSync(landed?.logPath ?? "", "utf8");
+  expect(log).toContain("initial [redacted]");
+  expect(log).toContain("targeted [redacted]");
+  for (const text of [landed?.reason ?? "", JSON.stringify(warnings), log]) {
+    expect(text).not.toContain(credential);
+    expect(text).not.toContain(colored);
+    expect(text).not.toContain("\u001b");
+    expect(text).not.toContain("\\u001b");
+  }
 });
 
 test.each(["stop", "cancel"])("a %s during a targeted retry cannot authorize landing", async (action) => {

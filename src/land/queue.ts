@@ -10,7 +10,7 @@ import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
 import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { findGateCounterpart } from "../gates/output.ts";
+import { findGateCounterpart, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
 import { worktreeGit, worktreeGitScope } from "../git/command.ts";
@@ -421,7 +421,7 @@ export class LandQueue {
         onResult: (r: GateResult) =>
           appendFileSync(
             log,
-            redactCredentials(`\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
+            redactGateOutput(`\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
           ),
       };
       const run = await executeGate(request, signal, hooks, this.deps.gateExecutor);
@@ -457,7 +457,7 @@ export class LandQueue {
       });
       if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
       if (retries.size) {
-        const reason = redactCredentials(
+        const reason = redactGateOutput(
           `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
         );
         this.store.updateLandEntry(entry.id, { reason });
@@ -465,7 +465,7 @@ export class LandQueue {
           runId: entry.runId,
           type: "gate",
           level: "warn",
-          message: `Land ${entry.id} ${reason}`,
+          message: redactGateOutput(`Land ${entry.id} ${reason}`),
         });
       }
     } finally {
