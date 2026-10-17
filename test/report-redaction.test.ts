@@ -232,6 +232,23 @@ test.each(["secret__\ntoken", "secret\n__token", "secret_\n_token", "the secret_
   },
 );
 
+test.each([
+  ["secret_\ntoken", "secret_token"],
+  ["secret\n_token", "secret_token"],
+  ["secret__\ntoken", "secret__token"],
+  ["secret\n__token", "secret__token"],
+  ["secret_\n_token", "secret__token"],
+  ["secret_ \n _token", "secret__token"],
+  ["secret**\ntoken", "secret**token"],
+  ["secret~\n~token", "secret~~token"],
+])("wrapped private identifiers match unwrapped quotations: %j", (wrapped, unwrapped) => {
+  for (const details of [new Set([wrapped]), new Set([wrapped, "secret__"])]) {
+    const redact = buildReportRedactor(details);
+    expect(redact(`Quoted: ${unwrapped}`)).toContain("[withheld:");
+    expect(redact("Changed secrettoken lookup.")).toBe("Changed secrettoken lookup.");
+  }
+});
+
 test("an intraword delimiter wrap point stays distinct from an unwrapped identifier", () => {
   expect(buildReportRedactor(new Set(["secret_token"]))("Changed secrettoken lookup.")).toBe(
     "Changed secrettoken lookup.",

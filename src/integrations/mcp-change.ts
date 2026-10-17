@@ -208,10 +208,36 @@ function markdownProjection(text: string, origins: LineRange[]) {
   replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/gu, (match) => match[1] ?? "");
   replace(/!?\[([^\]]*)\]\([^)]*\)/gu, (match) => match[1] ?? "");
   replace(/^[ \t]*(?:>[ \t]*|(?:[-+*]|\d+[.)])[ \t]+)+/gmu, () => "");
+  const emphasis: string[] = [];
   replace(/[*_~]+/gu, (match) => {
-    const before = match.input[match.index - 1] ?? "";
-    const after = match.input[match.index + match[0].length] ?? "";
-    return /[\p{L}\p{N}_]/u.test(before) && /[\p{L}\p{N}_]/u.test(after) ? match[0] : "";
+    // A wrap can split an identifier beside or inside its delimiter run, on either side.
+    const neighbor = (index: number, direction: number): string => {
+      for (;;) {
+        let cursor = index;
+        let wrapped = false;
+        while (/\s/u.test(match.input[cursor] ?? "")) {
+          wrapped ||= /[\r\n]/u.test(match.input[cursor] ?? "");
+          cursor += direction;
+        }
+        if (!wrapped) return match.input[index] ?? "";
+        while (/[*_~]/u.test(match.input[cursor] ?? "")) cursor += direction;
+        index = cursor;
+      }
+    };
+    const before = neighbor(match.index - 1, -1);
+    const after = neighbor(match.index + match[0].length, 1);
+    const word = (character: string) => /[\p{L}\p{N}_]/u.test(character);
+    if (!word(before) && word(after)) emphasis.push(match[0]);
+    // A paired closing delimiter before a wrap still closes emphasis on that line.
+    else if (
+      word(before) &&
+      !word(match.input[match.index + match[0].length] ?? "") &&
+      emphasis.at(-1) === match[0]
+    ) {
+      emphasis.pop();
+      return "";
+    }
+    return word(before) && word(after) ? match[0] : "";
   });
   replace(/[`|]/gu, () => "");
   replace(/\s+/gu, (match) => (/[\r\n]/u.test(match[0]) ? "\0" : " "));
@@ -476,16 +502,13 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
           .map((detail) => {
             const normalized = matchForm(detail);
             const wrap = "\x00?";
-            const literal = (normalized.match(/[*_~]+|[\s\S]/gu) ?? [])
+            const literal = [...normalized]
               .map((character) =>
                 character === " "
                   ? "[ \x00]+"
                   : character === "\0"
                     ? "[ \x00]*"
-                    : // An intraword delimiter run next to a wrap is stripped whole from the report.
-                      /^[*_~]+$/u.test(character)
-                      ? `(?:${character.replace(/[*]/g, "\\*")}|\x00)`
-                      : character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+                    : character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
               )
               .join(wrap);
             return detail.length >= DISTINCTIVE_LENGTH
