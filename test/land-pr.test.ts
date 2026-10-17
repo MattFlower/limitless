@@ -951,7 +951,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     expect(lines[0]).toEndWith("check-private-strings.ts --record");
     // The check runs through the checkout's own CLI in a named gate slot; `limitless` need not be on PATH.
     const check = lines.findIndex((line) =>
-      line.endsWith("/src/cli/main.ts gate-slot --name land-pr #123 -- bun run check"),
+      line.endsWith("/src/cli/main.ts gate-slot --priority ship --name land-pr #123 -- bun run check"),
     );
     expect(check).toBeGreaterThan(0);
   } finally {

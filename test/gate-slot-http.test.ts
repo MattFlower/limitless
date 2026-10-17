@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
 import { Factory } from "../src/app.ts";
+import type { DeployClock } from "../src/cli/deploy-wait.ts";
+import { type LeaseClient, withGateLease } from "../src/cli/gate-slot.ts";
 import { loadConfig } from "../src/config.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { AgentTestSession, type TestWait } from "../src/gates/agent-tests.ts";
 import { agentTestSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -190,6 +193,89 @@ test("gate leases share health occupancy and admin mutation protections", async 
   }
 });
 
+test("ordinary busy replies supply redacted current holders to waiting progress", async () => {
+  const f = await fixture("lease-holder-test");
+  const limit = gateSlots.limit;
+  gateSlots.setLimit(1);
+  registerCredential("gate-slot-http-test", "http-holder-secret");
+  const release = await gateSlots.acquire(
+    new AbortController().signal,
+    undefined,
+    "pipeline http-holder-secret",
+  );
+  const next = gateSlots.acquire(new AbortController().signal, undefined, "pipeline next-holder");
+  const time = waitClock();
+  const clock: DeployClock = {
+    now: time.now,
+    sleep: (ms) => new Promise((resolve) => time.timer.set(resolve, ms)),
+    timeout: (fn, ms) => {
+      const id = time.timer.set(fn, ms);
+      return () => time.timer.clear(id);
+    },
+  };
+  const output: string[] = [];
+  const replies: Awaited<ReturnType<LeaseClient>>[] = [];
+  const initial = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  let executions = 0;
+  const route = (createHttpRoutes(f.factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+  const work = withGateLease("deploy", async () => ++executions, {
+    clock,
+    maxWaitMs: 60_000,
+    signal: controller.signal,
+    warn: (s) => output.push(s),
+    client: async (body) => {
+      const response = await route(
+        requestWithParams("http://localhost:7400/api/admin/gate-slot", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        localServer,
+      );
+      expect(response.status).toBe(200);
+      const reply = (await response.json()) as Awaited<ReturnType<LeaseClient>>;
+      replies.push(reply);
+      initial.resolve();
+      return reply;
+    },
+  });
+  try {
+    await initial.promise;
+    await time.flush();
+    expect(replies[0]).toMatchObject({ acquired: false, holder: "pipeline [redacted]" });
+    await time.advance(180_000);
+    expect(executions).toBe(0);
+    expect(replies[1]).toMatchObject({ acquired: false, holder: "pipeline [redacted]" });
+    expect(output).toEqual(["gate-slot: waiting 180s; holder: pipeline [redacted]"]);
+    release();
+    const releaseNext = await next;
+    await time.advance(180_000);
+    expect(executions).toBe(0);
+    expect(replies[2]).toMatchObject({ acquired: false, holder: "pipeline next-holder" });
+    expect(output).toEqual([
+      "gate-slot: waiting 180s; holder: pipeline [redacted]",
+      "gate-slot: waiting 360s; holder: pipeline next-holder",
+    ]);
+    expect(JSON.stringify(replies)).not.toContain("http-holder-secret");
+    releaseNext();
+    await time.flush();
+    await time.advance(250);
+    expect(await work).toBe(1);
+    expect(executions).toBe(1);
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    release();
+    (await next)();
+    await time.advance(250);
+    await work.catch(() => {});
+    gateSlots.setLimit(limit);
+    await f.close();
+  }
+  expect(time.pending).toBe(0);
+});
+
 test("the gate-slot route counts running registrations above the cap and rejects invalid flags", async () => {
   const f = await fixture("lease-recovery-test"),
     time = waitClock(),
@@ -289,6 +375,61 @@ test("capability-bearing command names are redacted in events and HTTP errors", 
     release();
     release2();
     session.close();
+    await f.close();
+  }
+});
+
+test("HTTP leases validate priority and schedule ship, finish (including omission), then start", async () => {
+  const f = await fixture("lease-priority-test");
+  const limit = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const release = await gateSlots.acquire(new AbortController().signal, undefined, "held");
+  const ids = new Map<string, string>();
+  const route = (createHttpRoutes(f.factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+  const request = (payload: unknown) =>
+    route(
+      requestWithParams("http://localhost/api/admin/gate-slot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+      localServer,
+    );
+  const leaseSpy = spyOn(gateSlots, "lease");
+  try {
+    for (const priority of ["unknown", "", null, 1, true, [], {}]) {
+      expect((await request({ name: "invalid", priority })).status).toBe(400);
+    }
+    expect(leaseSpy).not.toHaveBeenCalled();
+    for (const [name, priority] of [
+      ["start", "start"],
+      ["old-client", undefined],
+      ["finish", "finish"],
+      ["ship-1", "ship"],
+      ["ship-2", "ship"],
+    ]) {
+      const response = await request({ name, priority });
+      expect(response.status).toBe(200);
+      const lease = (await response.json()) as { id: string; acquired: boolean };
+      expect(lease.acquired).toBe(false);
+      ids.set(String(name), lease.id);
+    }
+    expect(gateSlots.snapshot().holders).toEqual(["held"]);
+    release();
+    for (const name of ["ship-1", "ship-2", "old-client", "finish", "start"]) {
+      for (const [queuedName, id] of ids) {
+        expect(await (await request({ id })).json()).toMatchObject({ acquired: queuedName === name });
+      }
+      expect(gateSlots.snapshot().holders).toEqual([name]);
+      await request({ id: ids.get(name), release: true });
+      ids.delete(name);
+    }
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    leaseSpy.mockRestore();
+    release();
+    for (const id of ids.values()) gateSlots.heartbeat(id, true);
+    gateSlots.setLimit(limit);
     await f.close();
   }
 });
