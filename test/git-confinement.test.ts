@@ -156,6 +156,32 @@ for (const binary of binaries) {
       expect(existsSync(marker)).toBe(false);
     },
   );
+  // Runs without Seatbelt: the derived profile admits web--browse itself but not its interpreter.
+  test(`derived profile excludes the exec-path script interpreter: ${binary}`, async () => {
+    const execPath = realpathSync((await sh([binary, "--exec-path"], { cwd })).stdout.trim());
+    const script = join(execPath, "git-web--browse");
+    if (!existsSync(script)) return;
+    const interpreter = /^#!\s*(\S+)/.exec(readFileSync(script, "utf8"))?.[1] ?? "";
+    expect(interpreter).not.toBe("");
+    const developer = join(root, "developer");
+    mkdirSync(join(developer, "usr/bin"), { recursive: true });
+    symlinkSync(realpathSync(binary), join(developer, "usr/bin/git"));
+    const run: typeof sh = async (cmd) => ({
+      stdout: cmd[0] === "/usr/bin/xcode-select" ? developer : execPath,
+      stderr: "",
+      exitCode: 0,
+    });
+    const wrapped = await wrap(seatbeltGit("darwin", process.execPath, run), [binary, "web--browse"], {
+      cwd,
+    });
+    const allowed = /\(allow process-exec ([^\n]*)\)/.exec(wrapped[2] ?? "")?.[1] ?? "";
+    const rules = [...allowed.matchAll(/\((literal|subpath) "([^"]+)"\)/g)].map((m) => [m[1], m[2]] as const);
+    const admits = (path: string) =>
+      rules.some(([kind, rule]) => (kind === "literal" ? path === rule : path.startsWith(`${rule}/`)));
+    expect(admits(script)).toBe(true);
+    for (const shell of [interpreter, realpathSync(interpreter), "/bin/sh", "/bin/bash", "/bin/zsh"])
+      expect(admits(shell)).toBe(false);
+  });
   test.skipIf(seatbeltSkip !== null)(
     `derived profile allows git and denies shell execution: ${binary} (${seatbeltSkip ?? "available"})`,
     async () => {
