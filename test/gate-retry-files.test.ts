@@ -238,6 +238,12 @@ test.each([
   { label: "contradictory pass summary", output: "1 pass\n1 fail", complete: false },
   { label: "contradictory total", output: "0 pass\n1 fail\nRan 2 tests across 1 file.", complete: false },
   { label: "missing summary", output: "(fail) one test", complete: false },
+  { label: "missing completion summary", output: "0 pass\n1 fail", complete: false },
+  {
+    label: "malformed completion summary",
+    output: "0 pass\n1 fail\nRan unknown tests across 1 file.",
+    complete: false,
+  },
   { label: "malformed summary", output: "0 pass\none fail", complete: false },
   { label: "duplicate summary", output: `${runnerSummary}\n1 fail`, complete: false },
   { label: "unhandled error", output: `# Unhandled error between tests\n${runnerSummary}`, complete: false },

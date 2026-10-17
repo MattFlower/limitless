@@ -90,7 +90,7 @@ export class RunnerFailureEvidence {
       this.counts.get("fail") === counts.failures + counts.errors &&
       this.counts.get("pass") === counts.tests - counts.failures - counts.errors - counts.skipped &&
       (this.counts.get("skip") ?? 0) + (this.counts.get("todo") ?? 0) === counts.skipped &&
-      (!this.counts.has("tests") || this.counts.get("tests") === counts.tests)
+      this.counts.get("tests") === counts.tests
     );
   }
 }
