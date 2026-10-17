@@ -69,13 +69,16 @@ Usage:
   limitless auth sessions [revoke <id>|revoke --all]  List or revoke UI sign-in sessions
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
   limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
+  limitless worker pair --coordinator https://<host>:<port> [--name <name>]
+  limitless worker --coordinator https://<host>:<port>  Send paired macOS worker heartbeats
+  limitless workers ls|approve <code>|revoke <name>
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
   limitless service uninstall|status
   limitless local up|down|status          Report oMLX health; manage configured remote llama.cpp ([local].remote_host)
                                          [local].remote_model_path / remote_llama_binary configure new units
-  limitless gate-slot [--name <holder>] [--max-wait <seconds>] -- <command...>
+  limitless gate-slot [--name <holder>] [--max-wait <seconds>] [--priority <ship|finish|start>] -- <command...>
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
@@ -263,6 +266,8 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     allowPositionals: true,
     options: {
+      coordinator: { type: "string" },
+      name: { type: "string" },
       evals: { type: "string" },
       models: { type: "string" },
       origin: { type: "string" },
@@ -325,6 +330,48 @@ async function main(): Promise<void> {
     return;
   }
   switch (cmd) {
+    case "workers": {
+      if (rest[0] === "ls") {
+        const rows = await api<{ name: string; state: string; code?: string }[]>("/api/workers");
+        for (const w of rows) console.log(`${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}`);
+        return;
+      }
+      if (rest[0] === "approve" && rest[1]) {
+        console.log(
+          await api("/api/workers/approve", { method: "POST", body: JSON.stringify({ code: rest[1] }) }),
+        );
+        return;
+      }
+      if (rest[0] === "revoke" && rest[1]) {
+        await api(`/api/workers/${encodeURIComponent(rest[1])}/revoke`, { method: "POST", body: "{}" });
+        return;
+      }
+      throw new Error("Usage: limitless workers ls|approve <code>|revoke <name>");
+    }
+    case "worker": {
+      if (!values.coordinator) throw new Error("--coordinator HTTPS URL required");
+      const { loadConfig } = await import("../config.ts");
+      const { pairWorker, runWorker } = await import("../workers/client.ts");
+      const cfg = loadConfig(),
+        controller = new AbortController();
+      process.once("SIGINT", () => controller.abort());
+      process.once("SIGTERM", () => controller.abort());
+      if (rest[0] === "pair")
+        return pairWorker(
+          values.coordinator,
+          join(cfg.paths.home, "worker"),
+          values.name,
+          console.log,
+          controller.signal,
+        );
+      if (rest.length) throw new Error("Usage: limitless worker [pair] --coordinator <url>");
+      const { resolveBootSha } = await import("./boot-sha.ts");
+      const sha = await resolveBootSha(join(import.meta.dir, "../.."));
+      if (!sha) throw new Error("Cannot determine worker release SHA");
+      const { gateSlots } = await import("../gates/slots.ts");
+      gateSlots.setLimit(cfg.maxConcurrentGates);
+      return runWorker(values.coordinator, cfg, sha, controller.signal);
+    }
     case "eval": {
       const { evalCommand } = await import("./eval.ts");
       return evalCommand(rest, values, { api, print: console.log, wait: (ms) => Bun.sleep(ms) });

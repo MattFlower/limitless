@@ -9,7 +9,7 @@ import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
-import { agentTestSlots, gateSlots } from "../gates/slots.ts";
+import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
@@ -141,7 +141,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     (req.method === "GET" && (path === "/api/health" || path === "/api/auth/session")) ||
     (req.method === "POST" && path === "/api/auth/logout");
   const protectedRequest = (req: Request, path: string) =>
-    !tokenExempt(req, path) && (factory.cfg.requireApiToken || path === "/api/auth/logout-all");
+    !tokenExempt(req, path) &&
+    (factory.cfg.requireApiToken || path === "/api/auth/logout-all" || path.startsWith("/api/workers"));
   const handle =
     (
       fn: (
@@ -153,6 +154,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     async (req: Request & { params: Record<string, string> }, server: Server<undefined>) => {
       const url = new URL(req.url);
       const path = url.pathname;
+      if (path.startsWith("/worker/")) return new Response(null, { status: 404 });
       const access = classifyRequest(
         server.requestIP(req)?.address ?? null,
         req.headers,
@@ -273,6 +275,20 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     return id;
   };
   const routes: Record<string, unknown> = {
+    "/api/workers": handle(() => json(factory.workers.list())),
+    "/api/workers/approve": {
+      POST: handle(async (req) => {
+        const input = await body<{ code: string }>(req);
+        if (typeof input.code !== "string") return error("Pairing code required");
+        return json(factory.workers.approve(input.code));
+      }),
+    },
+    "/api/workers/:name/revoke": {
+      POST: handle((req) => {
+        factory.workers.revoke(req.params.name ?? "");
+        return json({ ok: true });
+      }),
+    },
     "/api/admin/gate-slot": {
       POST: handle(async (req) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);
@@ -286,6 +302,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           payload.token !== capability
         )
           return error("agent-test capability does not match the request", 401);
+        const { name, id, release, immediate, running, lane, priority } = payload;
+        if (priority !== undefined && !isGatePriority(priority)) return error("invalid priority");
         if (payload.token !== undefined) {
           req.signal.throwIfAborted();
           const lease = await agentTestLease(payload);
@@ -293,22 +311,39 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           req.signal.throwIfAborted();
           return json(lease);
         }
-        const { name, id, release, immediate, running, lane } = payload;
         if (lane !== undefined && lane !== "gate") return error("invalid lane");
         const slots = gateSlots;
         if (id !== undefined) {
           if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
             return error("invalid lease");
           const acquired = slots.heartbeat(id, release === true);
-          return json({ id, acquired: acquired ?? false, expired: acquired === undefined });
+          return json({
+            id,
+            acquired: acquired ?? false,
+            expired: acquired === undefined,
+            holder: acquired ? undefined : slots.snapshot().holders.join(", ") || undefined,
+          });
         }
         if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
         if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
         req.signal.throwIfAborted();
-        const lease = await slots.lease(name, immediate === true, undefined, undefined, running === true);
+        const lease = await slots.lease(
+          name,
+          immediate === true,
+          undefined,
+          undefined,
+          running === true,
+          undefined,
+          priority,
+        );
         if (req.signal.aborted) slots.heartbeat(lease, true);
         req.signal.throwIfAborted();
-        return json({ id: lease, acquired: slots.heartbeat(lease) ?? false });
+        const acquired = slots.heartbeat(lease) ?? false;
+        return json({
+          id: lease,
+          acquired,
+          holder: acquired ? undefined : slots.snapshot().holders.join(", ") || undefined,
+        });
       }, true),
     },
     "/api/admin/drain": admin("drain"),
