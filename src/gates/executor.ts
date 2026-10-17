@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import type { WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "./detect.ts";
+import { lanExecutor } from "./lan.ts";
 import { redactGateData } from "./output.ts";
 import {
   type GateHooks,
@@ -15,6 +17,7 @@ export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
   start(req: Req, signal: AbortSignal): Promise<ExecutionHandle>;
   attach(handle: ExecutionHandle, signal: AbortSignal, req?: Req, hooks?: GateHooks): Execution<Res>;
+  discard?(handle: ExecutionHandle): void;
 }
 export interface ExecutionHandle {
   kind: Executor<unknown, unknown>["kind"];
@@ -25,12 +28,13 @@ export interface ExecutionHandle {
 export interface Execution<Res> {
   events: AsyncIterable<ExecutionEvent>;
   result: Promise<Res>;
-  cancel(): Promise<void>;
+  cancel(reason?: unknown): Promise<void>;
 }
 export type ExecutionEvent =
   | { type: "status"; text: string }
   | { type: "check"; phase: "setup" | "check"; result: GateResult };
 export interface GateRequest {
+  runId?: string;
   priority?: GatePriority;
   repo: string;
   cwd: string;
@@ -43,6 +47,10 @@ export interface GateRequest {
 export type GateExecutor = Executor<GateRequest, GateRun>;
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
 
+/** Shutdown detaches durable jobs; owner cancellation discards them. */
+export const gateShutdown = (signal: AbortSignal): boolean =>
+  signal.aborted && signal.reason instanceof Error && signal.reason.message === "shutdown";
+
 const liveExecutions = new WeakMap<GateExecutor, Map<string, Execution<GateRun>>>();
 
 /** Discard only work still owned by this process; never replay an old handle to cancel it. */
@@ -51,13 +59,20 @@ export async function cancelGateExecution(handle: ExecutionHandle, executor?: Ga
   if (execution) {
     await execution.cancel();
     await execution.result.catch(() => {});
-  }
+  } else if (executor?.kind === handle.kind) executor.discard?.(handle);
 }
 
-export function gateExecutorFor(kind: "local"): GateExecutor {
+export function gateExecutorFor(
+  kind: "local" | "lan",
+  workers?: WorkerStore,
+  repos: readonly string[] = [],
+): GateExecutor {
   switch (kind) {
     case "local":
       return localExecutor();
+    case "lan":
+      if (!workers) throw new Error("LAN executor requires a worker store");
+      return lanExecutor(workers, repos);
   }
 }
 
@@ -190,7 +205,7 @@ export async function executeGate(
   live.set(handle.id, execution);
   let cancellation: Promise<void> | undefined;
   const abort = () => {
-    cancellation ??= execution.cancel();
+    cancellation ??= execution.cancel(signal.reason);
   };
   signal.addEventListener("abort", abort, { once: true });
   if (signal.aborted) abort();
