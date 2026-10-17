@@ -69,16 +69,17 @@ export function removeScratch(scratchDir: string): void {
   try {
     remove();
   } catch {
-    // Candidate code can leave read-only directories. Never chmod through symlinks.
-    const writable = (path: string) => {
-      const stat = lstatSync(path, { throwIfNoEntry: false });
-      if (!stat?.isDirectory()) return;
-      chmodSync(path, stat.mode | 0o700);
-      for (const entry of readdirSync(path)) writable(join(path, entry));
-    };
-    writable(root);
+    restoreDirectoryPermissions(root);
     remove();
   }
+}
+
+/** Candidate code can leave read-only directories. Never chmod through symlinks. */
+export function restoreDirectoryPermissions(path: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat?.isDirectory()) return;
+  chmodSync(path, stat.mode | 0o700);
+  for (const entry of readdirSync(path)) restoreDirectoryPermissions(join(path, entry));
 }
 
 export function scratchEnv({ scratchDir }: Pick<AgentSpec, "scratchDir">): Record<string, string> {

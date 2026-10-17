@@ -71,7 +71,7 @@ fi
 # The suite (and install scripts) can run this script; an inherited LAND_PR_LOG would write over this log.
 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE -u LAND_PR_LOG bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
-if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE -u LAND_PR_LOG bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
+if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE -u LAND_PR_LOG bun "$cli" gate-slot --priority ship --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
   echo "bun run check failed; see $log" >&2
   exit 1
 fi
@@ -114,7 +114,7 @@ export LIMITLESS_LAND_SOURCE_DIR="$clone" LIMITLESS_LAND_SOURCE_COMMON_DIR="$com
 check_private "$pr" "$repo" "$subject"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
-if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
+if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --ignore-submodules=dirty --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
   echo "Cannot inspect worktree; refusing to land" >&2
   exit 1
 fi

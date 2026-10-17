@@ -1,5 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
 import { redactCredentials } from "../util/proc.ts";
+import type { GateResult } from "./run.ts";
 
 const LAUNCH_FAILURE = "sandbox_apply: Operation not permitted";
 export const launchFailure = (output: string) => output.includes(LAUNCH_FAILURE);
@@ -41,7 +42,11 @@ export const redactGateData = <T>(value: T): T =>
   value === undefined
     ? value
     : JSON.parse(
-        JSON.stringify(value, (_key, v: unknown) => {
+        JSON.stringify(value, (key, v: unknown) => {
+          if (key === "failedFileTimes" && v && typeof v === "object")
+            return Object.fromEntries(
+              Object.entries(v).map(([file, time]) => [redactGateOutput(file), time]),
+            );
           if (typeof v === "string") return redactGateOutput(v);
           if (v && typeof v === "object" && "ok" in v && "output" in v && typeof v.output === "string") {
             if ("confinementError" in v && v.confinementError != null) return v;
@@ -50,6 +55,15 @@ export const redactGateData = <T>(value: T): T =>
           return v;
         }),
       );
+
+/** Reload a known gate result without rewriting executable inputs or comparison identities. */
+export const redactGateDiagnostics = <T extends GateResult>(result: T): T => ({
+  ...result,
+  confinementError: result.confinementError ?? launchFailure(result.output),
+  output: redactGateOutput(result.output),
+  ...(result.failures !== undefined ? { failures: redactGateOutput(result.failures) } : {}),
+  ...(result.firstAttempt ? { firstAttempt: redactGateDiagnostics(result.firstAttempt) } : {}),
+});
 
 /** Runner redaction covers accidental disclosure before framing or cuts. Deliberate cross-stream
  * splitting, interleaving or encoding requires keeping credentials out of gates' reach (#335). */

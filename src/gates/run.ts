@@ -1,10 +1,12 @@
-import { basename } from "node:path";
+import { randomUUID } from "node:crypto";
+import { basename, join } from "node:path";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
-import { agentEnv } from "../util/proc.ts";
+import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
+import { type FailedTestFiles, readJUnit, validRetryFiles } from "./junit.ts";
 import {
   findGateCounterpart,
   launchFailure,
@@ -12,7 +14,7 @@ import {
   redactGateOutput,
   redactGateStreams,
 } from "./output.ts";
-import { gateSlots } from "./slots.ts";
+import { agentTestSlots, type GatePriority, gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
@@ -26,9 +28,12 @@ export interface GateResult {
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
   confinementError?: boolean;
-  /** The first attempt of a check that was re-run; this result is the re-run. */
+  /** The first attempt of a check that was re-run; targeted evidence is kept separately. */
   firstAttempt?: GateResult;
   testCoverage?: TestCoverage;
+  failedFiles?: string[];
+  failedFileTimes?: FailedTestFiles["failedFileTimes"];
+  targetedRetry?: GateResult;
 }
 
 export interface GateRun {
@@ -53,12 +58,15 @@ export interface GateComparison {
   verdict: GateVerdict;
   blocking: boolean;
   result: GateResult;
-  /** The failing run that triggered a retry; `result` is then the retry. */
+  /** The failing run that triggered a retry. */
   firstAttempt?: GateResult;
 }
 
 export interface GateHooks {
+  priority?: GatePriority;
   holder?: string;
+  /** Only bounded targeted retries may bypass the full-suite queue. */
+  skipGateSlot?: boolean;
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
   /** Fires once when every gate slot is busy and this call has to queue. */
   onWait?: (slots: number) => void;
@@ -66,7 +74,10 @@ export interface GateHooks {
 
 const OUTPUT_TAIL = 6_000;
 export const confinementFailed = (r?: GateResult): boolean =>
-  !!r && ((r.confinementError ?? launchFailure(r.output)) || confinementFailed(r.firstAttempt));
+  !!r &&
+  ((r.confinementError ?? launchFailure(r.output)) ||
+    confinementFailed(r.firstAttempt) ||
+    confinementFailed(r.targetedRetry));
 
 /** Gates execute code the agent wrote; give them the same scrubbed environment as agents. */
 export const gateEnv = (): Record<string, string> =>
@@ -87,10 +98,13 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     coverage.observe(line);
     excerpts.observe(line);
   };
+  const scratch = invocationScratch.getStore();
+  if (!scratch) throw new Error("Missing gate command scratch");
+  const report = join(scratch, `gate-report-${randomUUID()}.xml`);
   const res = await runConfined({
     command: cmd.run,
     cwd,
-    env: gateEnv(),
+    env: { ...gateEnv(), LIMITLESS_GATE_REPORT: report },
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
     redactOutput: true,
@@ -111,6 +125,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
+    ...readJUnit(report, cwd),
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
@@ -128,7 +143,13 @@ export async function runLocalGates(
   signal: AbortSignal,
   hooks: GateHooks = {},
 ): Promise<GateRun> {
-  const release = await gateSlots.acquire(signal, hooks.onWait, hooks.holder ?? basename(cwd));
+  const release = await (hooks.skipGateSlot ? agentTestSlots : gateSlots).acquire(
+    signal,
+    hooks.skipGateSlot ? undefined : hooks.onWait,
+    hooks.holder ?? basename(cwd),
+    false,
+    hooks.skipGateSlot ? undefined : hooks.priority,
+  );
   try {
     return await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
   } finally {
@@ -143,7 +164,11 @@ export function runGates(
   signal: AbortSignal,
   hooks: GateHooks = {},
 ): Promise<GateRun> {
-  return executeGate({ repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg }, signal, hooks);
+  return executeGate(
+    { repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg, priority: hooks.priority },
+    signal,
+    hooks,
+  );
 }
 
 async function runAll(
@@ -176,9 +201,14 @@ async function retryChecks(
   signal: AbortSignal,
   onWait: GateHooks["onWait"],
   runner?: GateRunner,
+  options: GateRetryOptions = { targeted: false, skipGateSlot: false },
 ): Promise<GateRun> {
-  if (runner) return runner(cfg);
-  const release = await gateSlots.acquire(signal, onWait, basename(cwd));
+  if (runner) return runner(cfg, options);
+  const release = await (options.skipGateSlot ? agentTestSlots : gateSlots).acquire(
+    signal,
+    options.skipGateSlot ? undefined : onWait,
+    basename(cwd),
+  );
   try {
     const checks: GateResult[] = [];
     for (const check of cfg.checks) {
@@ -191,11 +221,78 @@ async function retryChecks(
   }
 }
 
-/**
- * Re-run once, inside a slot, each baseline check that failed without timing out. A check that
- * fails on base never blocks later, so a flaky baseline failure would hide a real regression.
- * The re-run becomes the result, with the failure kept as `firstAttempt`; only a pass changes the outcome.
- */
+export interface GateRetryOptions {
+  targeted: boolean;
+  skipGateSlot: boolean;
+}
+
+export const UNSLOTTED_RETRY_MAX_FILES = 5;
+export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
+
+/** First confirm known failing files; a pass alone still needs a full-suite retry. */
+async function retryFailures(
+  failures: { check: GateCommand; original: GateResult }[],
+  cwd: string,
+  cfg: GateConfig,
+  signal: AbortSignal,
+  onWait?: GateHooks["onWait"],
+  runner?: GateRunner,
+): Promise<Map<GateResult, GateResult>> {
+  const results = new Map<GateResult, GateResult>();
+  const targets = new Map<GateResult, GateResult>();
+  const full: typeof failures = [];
+  for (const entry of failures) {
+    if (signal.aborted) break;
+    const { check, original } = entry;
+    const files = original.failedFiles;
+    if (cfg.retryFiles?.split("{files}").length === 2 && files && validRetryFiles(files, cwd)) {
+      const times = files.map((file) => original.failedFileTimes?.[file]);
+      const skipGateSlot =
+        files.length <= UNSLOTTED_RETRY_MAX_FILES &&
+        times.every((time) => time !== undefined && Number.isFinite(time) && time >= 0) &&
+        times.reduce<number>((total, time) => total + (time ?? 0), 0) <= UNSLOTTED_RETRY_MAX_SECONDS;
+      const quoted = files.map((file) => `'./${file.replaceAll("'", "'\\''")}'`).join(" ");
+      const run = cfg.retryFiles.replace("{files}", () => quoted);
+      const timeoutSec = skipGateSlot
+        ? Math.min(check.timeoutSec ?? 900, 2 * UNSLOTTED_RETRY_MAX_SECONDS)
+        : check.timeoutSec;
+      const attempt = (
+        await retryChecks(
+          cwd,
+          { ...cfg, setup: [], checks: [{ ...check, run, timeoutSec }] },
+          signal,
+          onWait,
+          runner,
+          { targeted: true, skipGateSlot },
+        )
+      ).checks[0];
+      if (!attempt) continue;
+      targets.set(original, attempt);
+      if (confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
+        results.set(original, { ...original, firstAttempt: original, targetedRetry: attempt });
+        continue;
+      }
+    }
+    full.push(entry);
+  }
+  if (full.length && !signal.aborted) {
+    const retried = await retryChecks(
+      cwd,
+      { ...cfg, setup: [], checks: full.map((entry) => entry.check) },
+      signal,
+      onWait,
+      runner,
+    );
+    for (const [index, { original }] of full.entries()) {
+      const result = retried.checks[index];
+      if (result)
+        results.set(original, { ...result, firstAttempt: original, targetedRetry: targets.get(original) });
+    }
+  }
+  return results;
+}
+
+/** Retry baseline failures before comparison, retaining the original failure and every attempt. */
 export async function retryBaselineFailures(
   run: GateRun,
   cwd: string,
@@ -204,25 +301,14 @@ export async function retryBaselineFailures(
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
 ): Promise<GateRun> {
-  const retryable = (r: GateResult) => {
-    if (r.ok || r.timedOut || confinementFailed(r)) return undefined;
-    const check = findGateCounterpart(r, run.checks, cfg.checks);
-    return check?.run === r.command ? check : undefined;
-  };
-  if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
-  const selected = run.checks.flatMap((r) => {
-    const check = retryable(r);
-    return check ? [check] : [];
+  const selected = run.checks.flatMap((original) => {
+    if (original.ok || original.timedOut || confinementFailed(original)) return [];
+    const check = findGateCounterpart(original, run.checks, cfg.checks);
+    return check?.run === original.command ? [{ check, original }] : [];
   });
-  const retry = await retryChecks(cwd, { ...cfg, setup: [], checks: selected }, signal, onWait, runner);
-  let index = 0;
-  return {
-    ...run,
-    checks: run.checks.map((r) => {
-      const result = retryable(r) ? retry.checks[index++] : undefined;
-      return result ? { ...result, firstAttempt: r } : r;
-    }),
-  };
+  if (!run.setupOk || signal.aborted || !selected.length) return run;
+  const results = await retryFailures(selected, cwd, cfg, signal, onWait, runner);
+  return { ...run, checks: run.checks.map((r) => results.get(r) ?? r) };
 }
 
 /** Compare post-change gates with the baseline taken on the untouched base branch. */
@@ -297,29 +383,29 @@ export async function retryRegressions(
   runner?: GateRunner,
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
-  const retryable = (c: GateComparison) => {
-    if (c.verdict !== "regressed" || c.result.timedOut || pointsAt(c.result.output, changed))
-      return undefined;
-    const check = findGateCounterpart(c, cmp, cfg.checks);
-    return check?.run === c.result.command ? check : undefined;
-  };
-  if (!cmp.some(retryable)) return cmp;
   const selected = cmp.flatMap((c) => {
-    const check = retryable(c);
-    return check ? [check] : [];
+    if (
+      c.verdict !== "regressed" ||
+      c.result.timedOut ||
+      confinementFailed(c.result) ||
+      pointsAt(c.result.output, changed)
+    )
+      return [];
+    const check = findGateCounterpart(c, cmp, cfg.checks);
+    return check?.run === c.result.command ? [{ check, original: c.result }] : [];
   });
-  const retried = await retryChecks(cwd, { ...cfg, setup: [], checks: selected }, signal, onWait, runner);
-  let index = 0;
+  if (!selected.length || signal.aborted) return cmp;
+  const results = await retryFailures(selected, cwd, cfg, signal, onWait, runner);
   return cmp.map((c) => {
-    const retry = retryable(c) ? retried.checks[index++] : undefined;
-    return retry
-      ? {
-          ...c,
-          verdict: confinementFailed(retry) ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
-          blocking: !retry.ok,
-          result: retry,
-          firstAttempt: c.result,
-        }
-      : c;
+    const retry = results.get(c.result);
+    if (!retry) return c;
+    const confinementError = confinementFailed(retry);
+    return {
+      ...c,
+      verdict: confinementError ? "confinement_error" : retry.ok ? "flaky" : "regressed",
+      blocking: confinementError || !retry.ok,
+      result: retry,
+      firstAttempt: c.result,
+    };
   });
 }

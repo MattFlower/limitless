@@ -1041,12 +1041,46 @@ test("native aliases inherit both reserve windows, retain identity and honor exp
   }
 });
 
-test.each([undefined, '"local"', '"lan"', "3"])("gate executor config: %s", (value) => {
+test.each([undefined, '"local"', '"lan"', '"remote"', "3"])("gate executor config: %s", (value) => {
   const fixture = providerFixture();
   try {
     writeFileSync(fixture.file, value === undefined ? "" : `[gates]\nexecutor = ${value}\n`);
     if (value === undefined || value === '"local"') expect(fixture.load().gateExecutor).toBe("local");
-    else expect(() => fixture.load()).toThrow(/gates\.executor.*local/);
+    else if (value === '"lan"') expect(fixture.load().gateExecutor).toBe("lan");
+    else expect(() => fixture.load()).toThrow('gates.executor must be "local" or "lan"');
+  } finally {
+    fixture.close();
+  }
+});
+
+test.each([
+  ['listen = "127.0.0.1:7443"', true],
+  ['listen = "[::1]:7443"', true],
+  ['listen = "missing-port"', false],
+  ['listen = "127.0.0.1:99999"', false],
+  ["listen = 12", false],
+] as const)("worker config validates listener: %s", (toml, valid) => {
+  const fixture = providerFixture();
+  try {
+    writeFileSync(fixture.file, `[workers]\n${toml}\n`);
+    if (valid) expect(fixture.load().workers.listen).toContain(":7443");
+    else expect(() => fixture.load()).toThrow(/workers\./);
+  } finally {
+    fixture.close();
+  }
+});
+
+test.each(
+  [undefined, [], ["owner/repo"], "owner/repo", [1], ["bad"], ["../repo"], ["a/b/c"]].map((repos) => ({
+    repos,
+  })),
+)("worker repository opt-in: %j", ({ repos }) => {
+  const fixture = providerFixture();
+  try {
+    writeFileSync(fixture.file, repos === undefined ? "" : `[workers]\nrepos = ${JSON.stringify(repos)}\n`);
+    if (repos === undefined || (Array.isArray(repos) && (repos.length === 0 || repos[0] === "owner/repo")))
+      expect(fixture.load().workers.repos).toEqual(repos?.length ? ["owner/repo"] : []);
+    else expect(() => fixture.load()).toThrow("workers.repos must be an array of owner/name strings");
   } finally {
     fixture.close();
   }

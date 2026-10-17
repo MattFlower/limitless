@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Repo, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import { redactGateData } from "../src/gates/output.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import {
   changedLines,
@@ -13,6 +14,7 @@ import {
   type ShadowRow,
   shadowReport,
 } from "../src/pipeline/shadow-report.ts";
+import { registerCredential } from "../src/util/proc.ts";
 
 let dir: string;
 let store: Store;
@@ -680,4 +682,23 @@ test("a commit's files beyond GitHub's first page of 300 are read; a truncated o
   ]);
   expect(failed?.history).toBe(false);
   expect(outcomes(failed)).toEqual({ "src/x.ts:40: Deep in a big commit": ["unknown", []] });
+});
+
+test("redacted shadow paths match literal later changes and report only sanitized evidence", async () => {
+  const secret = "synthetic-shadow-path-549";
+  registerCredential("shadow-path-test", secret);
+  at(0);
+  const run = store.createRun(repoOf("owner/a"), { repo: "owner/a", prompt: "work" });
+  store.updateRun(run.id, { status: "succeeded", prUrl: PR });
+  at(2);
+  put(run, "review-0.json", review([]));
+  put(run, "review-0.shadow.json", redactGateData(shadow([finding(`${secret}.ts`, 1, "Bug")])));
+  const history = [commit("head", 2), commit(`fix-${secret}`, 3, [[`${secret}.ts`, add(1)]])];
+  const report = await shadowReport(store, async () => history);
+  expect(outcomes(report.rows[0])).toEqual({
+    "[redacted].ts:1: Bug": ["fixed", ["commit fix-[redacted]"]],
+  });
+  expect(JSON.stringify(report)).not.toContain(secret);
+  expect(formatShadowReport(report)).toContain("[redacted].ts:1: Bug: fixed");
+  expect(formatShadowReport(report)).not.toContain(secret);
 });

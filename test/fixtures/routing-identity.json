@@ -150,13 +150,13 @@
       {
         "id": "omlx/qwen-flash",
         "provider": "omlx",
-        "model": "Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+        "model": "Qwen3.8-Flash-Next-oQ4e-mtp",
         "checkpoint": "omlx/qwen-flash"
       },
       {
         "id": "omlx/qwen-27b",
         "provider": "omlx",
-        "model": "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+        "model": "Qwen3.8-27B-8bit",
         "checkpoint": "qwen3.8-27b"
       },
       {
@@ -34129,7 +34129,7 @@
       "targetId": "omlx/qwen-flash",
       "provider": "omlx",
       "harness": "claude",
-      "model": "Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+      "model": "Qwen3.8-Flash-Next-oQ4e-mtp",
       "vendor": "qwen",
       "tier": 2,
       "billing": "free",
@@ -34205,7 +34205,7 @@
       "targetId": "omlx/qwen-27b",
       "provider": "omlx",
       "harness": "claude",
-      "model": "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+      "model": "Qwen3.8-27B-8bit",
       "vendor": "qwen",
       "tier": 2,
       "billing": "free",
@@ -34729,7 +34729,7 @@
       "targetId": "omlx/qwen-flash@none",
       "provider": "omlx",
       "harness": "claude",
-      "model": "Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+      "model": "Qwen3.8-Flash-Next-oQ4e-mtp",
       "vendor": "qwen",
       "tier": 2,
       "billing": "free",

@@ -3,10 +3,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BaselineCacheKey } from "../db/store.ts";
 import type { GateConfig } from "./detect.ts";
+import { redactGateOutput } from "./output.ts";
 import type { GateResult, GateRun } from "./run.ts";
 
 /** Bump whenever how gates execute changes (environment, retries, result shape): old entries then miss. */
-export const GATE_ENV_VERSION = 2;
+export const GATE_ENV_VERSION = 3;
 export const BASELINE_CACHE_TTL_MS = 7 * 86_400_000;
 
 const LOCKFILES = [
@@ -118,6 +119,7 @@ export function gateEnvDigest(env: Record<string, string>, extra: readonly strin
 }
 
 export interface BaselineKeyInputs {
+  executor?: "local" | "lan";
   repoId: string;
   baseSha: string;
   gates: GateConfig;
@@ -135,7 +137,9 @@ export function baselineCacheKey(i: BaselineKeyInputs): BaselineCacheKey {
     repoId,
     baseSha,
     gatesHash: gatesHash(gates),
-    envHash: sha256(JSON.stringify(stable({ ...env, version: GATE_ENV_VERSION }))),
+    envHash: sha256(
+      JSON.stringify(stable({ ...env, executor: i.executor ?? "local", version: GATE_ENV_VERSION })),
+    ),
   };
 }
 
@@ -155,7 +159,15 @@ export function cacheableBaseline(run: GateRun, cfg: GateConfig): boolean {
     run.setupOk &&
     run.setup.length === cfg.setup.length &&
     run.checks.length === cfg.checks.length &&
-    run.checks.every((c, i) => c.name === cfg.checks[i]?.name && c.command === cfg.checks[i]?.run) &&
+    // Cached identities are redacted; the cache key still hashes the literal configuration.
+    run.checks.every((c, i) => {
+      const check = cfg.checks[i];
+      return (
+        check &&
+        redactGateOutput(c.name) === redactGateOutput(check.name) &&
+        redactGateOutput(c.command) === redactGateOutput(check.run)
+      );
+    }) &&
     [...run.setup, ...run.checks].every((r) => r.ok && finished(r))
   );
 }

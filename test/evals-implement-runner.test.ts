@@ -11,6 +11,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -181,6 +182,8 @@ for (const failure of ["setup", "timeout"] as const)
     }
   });
 
+// #556 measurement (2026-10-16): alone 21.21 s, paired load 26.07 s; sixteen real-Git trials.
+// An earlier paired run took 43.78 s, so retain a 90 s limit.
 test("baseline gates are shared across repetitions and providers per case within each run", async () => {
   const f = await fixture("sh count-gates.sh", (_, observe) => ({
     "count-gates.sh": `if test -f answer; then echo candidate >> '${observe}/gate-runs'; else echo baseline >> '${observe}/gate-runs'; fi\n`,
@@ -200,7 +203,7 @@ test("baseline gates are shared across repetitions and providers per case within
   } finally {
     await f.close();
   }
-});
+}, 90_000);
 
 for (const role of ["triage", "review", "verify", "implement"])
   test(`implement contamination checks scope ${role} labels in base history`, async () => {
@@ -550,6 +553,40 @@ test("candidate-configured git filters never run in the factory's git", async ()
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
     else process.env.LIMITLESS_EVAL_SECRET = previous;
+    await f.close();
+  }
+});
+
+test("eval staging never runs an unchanged gitlink's filter with ignore=none", async () => {
+  const f = await fixture();
+  const marker = join(f.home, "nested-filter-ran");
+  f.item.prompt += "\nAllow: submodules";
+  f.item.hidden.command += `; result=$?; git ls-tree HEAD nested > '${f.observe}/gitlink'; exit "$result"`;
+  f.save();
+  let nestedHead = "";
+  try {
+    f.respond(async (s) => {
+      const nested = join(s.cwd, "nested");
+      await sh(["git", "init", "-q", nested], { cwd: s.cwd });
+      writeFileSync(join(nested, "file"), "base\n");
+      await sh([...commitAs, "add", "."], { cwd: nested });
+      await sh([...commitAs, "commit", "-qm", "nested base"], { cwd: nested });
+      nestedHead = (await sh(["git", "rev-parse", "HEAD"], { cwd: nested })).stdout.trim();
+      writeFileSync(join(s.cwd, ".gitmodules"), '[submodule "nested"]\n\tpath = nested\n\tignore = none\n');
+      await sh([...commitAs, "add", "-A"], { cwd: s.cwd });
+      await sh([...commitAs, "commit", "-qm", "gitlink"], { cwd: s.cwd });
+      await sh(["git", "config", "filter.attack.clean", `touch '${marker}'; cat`], { cwd: nested });
+      writeFileSync(join(nested, ".git/info/attributes"), "* filter=attack\n");
+      utimesSync(join(nested, "file"), 1000, 1000);
+      return { files: { answer: "correct" } };
+    });
+    const trial = (await f.run()).trials[0];
+    expect(trial?.pass).toBe(true);
+    expect(readFileSync(join(f.observe, "gitlink"), "utf8").trim()).toBe(
+      `160000 commit ${nestedHead}\tnested`,
+    );
+    expect(existsSync(marker)).toBe(false);
+  } finally {
     await f.close();
   }
 });

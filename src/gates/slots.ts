@@ -1,13 +1,16 @@
 import { availableParallelism } from "node:os";
 
 export const GATE_LEASE_EXPIRY_MS = 30_000;
+export type GatePriority = "ship" | "finish" | "start";
+export const isGatePriority = (value: unknown): value is GatePriority =>
+  value === "ship" || value === "finish" || value === "start";
 
 /** A full gate suite is CPU-heavy, so by default one suite runs per four cores. */
 export function defaultGateSlots(cores = availableParallelism()): number {
   return Math.max(1, Math.floor(cores / 4));
 }
 
-/** FIFO counting semaphore; a slot is handed straight to the next waiter on release. */
+/** Priority counting semaphore, FIFO within each class; held slots are never interrupted. */
 export class Semaphore {
   private max = 1;
   private active = 0;
@@ -17,7 +20,7 @@ export class Semaphore {
   snapshot() {
     return { occupied: this.holders.size, limit: this.max, holders: [...this.holders.values()] };
   }
-  private readonly waiters: (() => void)[] = [];
+  private readonly waiters: Record<GatePriority, (() => void)[]> = { ship: [], finish: [], start: [] };
 
   constructor(limit: number) {
     this.setLimit(limit);
@@ -38,23 +41,25 @@ export class Semaphore {
     onWait?: (limit: number) => void,
     holder = "gate",
     running = false,
+    priority: GatePriority = "finish",
   ): Promise<() => void> {
     signal.throwIfAborted();
-    if (running || (this.active < this.max && !this.waiters.length)) this.active++;
+    if (running || this.active < this.max) this.active++;
     else {
       onWait?.(this.max);
       signal.throwIfAborted();
       await new Promise<void>((resolve, reject) => {
+        const queue = this.waiters[priority];
         const wake = () => {
           signal.removeEventListener("abort", abort);
           resolve();
         };
         const abort = () => {
-          const i = this.waiters.indexOf(wake);
-          if (i >= 0) this.waiters.splice(i, 1);
+          const i = queue.indexOf(wake);
+          if (i >= 0) queue.splice(i, 1);
           reject(signal.reason);
         };
-        this.waiters.push(wake);
+        queue.push(wake);
         signal.addEventListener("abort", abort, { once: true });
       });
     }
@@ -79,6 +84,7 @@ export class Semaphore {
     clear = clearTimeout,
     running = false,
     observe?: { onWait: () => void; onAcquired: () => void },
+    priority: GatePriority = "finish",
   ): Promise<string> {
     const id = crypto.randomUUID(),
       controller = new AbortController();
@@ -94,7 +100,7 @@ export class Semaphore {
     };
     this.leases.set(id, touch);
     touch(false);
-    void this.acquire(controller.signal, observe?.onWait, name, running).then(
+    void this.acquire(controller.signal, observe?.onWait, name, running, priority).then(
       (free) => {
         release = free;
         if (controller.signal.aborted) touch(true);
@@ -113,7 +119,7 @@ export class Semaphore {
 
   private drain(): void {
     while (this.active < this.max) {
-      const next = this.waiters.shift();
+      const next = this.waiters.ship.shift() ?? this.waiters.finish.shift() ?? this.waiters.start.shift();
       if (!next) return;
       this.active++;
       next();

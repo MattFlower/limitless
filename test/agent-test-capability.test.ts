@@ -1,9 +1,11 @@
 import { afterEach, expect } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import type { WrapperConfig } from "../src/cli/agent-test.ts";
 import { agentTestLease } from "../src/gates/agent-tests.ts";
+import { gateSlots } from "../src/gates/slots.ts";
 import { buildClaudeArgs } from "../src/harness/claude.ts";
 import { buildCodexArgs } from "../src/harness/codex.ts";
 import { SANDBOX_EXEC, seatbeltProfile } from "../src/harness/sandbox.ts";
@@ -224,6 +226,71 @@ test("a capability presented to another invocation's socket is refused, and dies
     "capability",
   );
 });
+
+test("a test waiting for a slot exits when its invocation ends and retires its reservation", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "agent-wait-end-")));
+  cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+  const own = invocation(root, "own");
+  const marker = join(own.cwd, "started");
+  const limit = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const release = await gateSlots.acquire(new AbortController().signal, undefined, "occupied");
+  const waiting = Promise.withResolvers<void>();
+  let child: ReturnType<typeof spawn> | undefined;
+  let exited: Promise<number | null> | undefined;
+  let stderr = "";
+  const timeout = setTimeout(() => child?.kill("SIGKILL"), 10_000);
+  try {
+    await withSlottedCommands(
+      [["sh"]],
+      own.cwd,
+      own.scratch,
+      1,
+      (event) => {
+        if (event.phase === "wait") waiting.resolve();
+      },
+      async (path) => {
+        child = spawn(
+          join(path?.split(delimiter)[0] ?? "", "sh"),
+          ["-c", 'printf started > "$1"', "sh", marker],
+          {
+            cwd: own.cwd,
+            env: agentEnv(),
+            stdio: ["ignore", "ignore", "pipe"],
+          },
+        );
+        exited = new Promise((resolve, reject) => {
+          child?.once("exit", resolve);
+          child?.once("error", reject);
+        });
+        child.stderr?.on("data", (data) => {
+          stderr += data;
+        });
+        await Promise.race([
+          waiting.promise,
+          exited.then((code) => {
+            throw new Error(`wrapper exited ${code}: ${stderr}`);
+          }),
+        ]);
+      },
+    );
+    // Both coordination endpoints are now unavailable. A closed invocation must not
+    // take the wrapper's initial offline fallback, even before its first lease reply.
+    const code = await exited;
+    expect(code).not.toBeNull();
+    expect(code).not.toBe(0);
+    release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(gateSlots.snapshot().occupied).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    clearTimeout(timeout);
+    release();
+    gateSlots.setLimit(limit);
+    child?.kill("SIGKILL");
+    await exited;
+  }
+}, 15_000);
 
 test.skipIf(seatbeltSkip !== null)(
   `a confined invocation reads its own capability but cannot discover or read another's (${seatbeltSkip ?? "available"})`,

@@ -12,6 +12,143 @@ import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { Store } from "../src/db/store.ts";
 import { customModel } from "./provider-config-support.ts";
 
+const childKeyMigration = "20261016T091806-foreign-key-child-indexes.sql";
+
+function uncoveredForeignKeys(db: Database): string[] {
+  const uncovered: string[] = [];
+  for (const { name: table } of db
+    .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all()) {
+    const keys = new Map<number, string[]>();
+    for (const fk of db
+      .query<{ id: number; from: string }, [string]>(
+        'SELECT id, "from" FROM pragma_foreign_key_list(?) ORDER BY id, seq',
+      )
+      .all(table)) {
+      const columns = keys.get(fk.id) ?? [];
+      columns.push(fk.from);
+      keys.set(fk.id, columns);
+    }
+    const indexes = db
+      .query<{ name: string }, [string]>("SELECT name FROM pragma_index_list(?) WHERE partial = 0")
+      .all(table)
+      .map(({ name }) =>
+        db
+          .query<{ name: string | null }, [string]>("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+          .all(name)
+          .map((column) => column.name),
+      );
+    indexes.push(
+      db
+        .query<{ name: string }, [string]>("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk")
+        .all(table)
+        .map((column) => column.name),
+    );
+    for (const columns of keys.values()) {
+      if (!indexes.some((index) => columns.every((column, i) => index[i] === column)))
+        uncovered.push(`${table}(${columns.join(", ")})`);
+    }
+  }
+  return uncovered.sort();
+}
+
+test("every foreign key has a nonpartial index with its child columns first", () => {
+  const store = new Store(":memory:");
+  try {
+    expect(uncoveredForeignKeys(store.db)).toEqual([]);
+    for (const column of ["event", "invocation"])
+      expect(
+        store.db
+          .query("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+          .all(`owner_diagnostics_${column}`),
+      ).toEqual([{ name: `${column}_id` }]);
+  } finally {
+    store.close();
+  }
+});
+
+test("child-key indexes upgrade populated databases once and permit previous-release writes", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith(childKeyMigration),
+    });
+    let store = new Store(path, before);
+    const repo = store.upsertRepo({
+      slug: "local/index-upgrade",
+      kind: "local",
+      localPath: directory,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const populate = () => {
+      const run = store.createRun(repo, { repo: repo.slug, prompt: "index upgrade" });
+      const invocation = store.createInvocation({
+        runId: run.id,
+        stageId: store.startStage(run.id, "implement").id,
+        role: "implement",
+        harness: "fake",
+        provider: "fake",
+        model: "fake",
+        modelId: "fake/m",
+      });
+      const event = store.addEvent({
+        runId: run.id,
+        invocationId: invocation.id,
+        type: "log",
+        message: "public",
+      });
+      store.recordOwnerDiagnostic(
+        { runId: run.id, invocationId: invocation.id, eventId: event.id, kind: "event", text: "owner" },
+        "public",
+      );
+      return run.id;
+    };
+    const runId = populate();
+    const tables = ["repos", "runs", "stages", "invocations", "events", "owner_diagnostics"];
+    const snapshot = () => tables.map((table) => store.db.query(`SELECT * FROM ${table}`).all());
+    const rows = snapshot();
+    const applied = fileNames(store.db);
+    expect(uncoveredForeignKeys(store.db)).toEqual([
+      "ci_fix_triggers(run_id)",
+      "conflict_triggers(land_entry_id)",
+      "conflict_triggers(run_id)",
+      "eval_run_requests(resumed_by)",
+      "eval_run_requests(resumed_from)",
+      "invocations(stage_id)",
+      "owner_diagnostics(event_id)",
+      "owner_diagnostics(invocation_id)",
+      "review_approvals(run_id)",
+      "runs(repo_id)",
+    ]);
+    store.close();
+    store = new Store(path);
+    expect(snapshot()).toEqual(rows);
+    expect(uncoveredForeignKeys(store.db)).toEqual([]);
+    expect(fileNames(store.db)).toEqual([...applied, childKeyMigration]);
+    const records = store.db.query("SELECT * FROM applied_migrations ORDER BY name").all();
+    store.close();
+    store = new Store(path);
+    expect(store.db.query("SELECT * FROM applied_migrations ORDER BY name").all()).toEqual(records);
+    store.close();
+    store = new Store(path, before);
+    expect(store.getRun(runId)?.prompt).toBe("index upgrade");
+    const rollbackRunId = populate();
+    store.close();
+    store = new Store(path);
+    try {
+      expect(store.listInvocations(rollbackRunId)).toHaveLength(1);
+      expect(ownerDiagnostics(store.db, rollbackRunId)).toMatchObject([{ text: "owner" }]);
+      expect(uncoveredForeignKeys(store.db)).toEqual([]);
+      expect(store.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
 test("runtime catalog and discovery upgrade legacy databases and restore before operator policy", () => {
   temporary((directory, path) => {
     legacyDatabase(path);
@@ -82,7 +219,7 @@ test("pre-diagnostics runs open and previous-release writes survive the additive
     const before = join(directory, "before");
     cpSync(MIGRATION_DIR, before, {
       recursive: true,
-      filter: (src) => !src.endsWith("-owner-diagnostics.sql"),
+      filter: (src) => !src.endsWith("-owner-diagnostics.sql") && !src.endsWith(childKeyMigration),
     });
     let store = new Store(path, before);
     const repo = store.upsertRepo({
