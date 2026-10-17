@@ -410,3 +410,18 @@ that authenticate at the proxy: no Limitless sign-in is required. With enforceme
 proxied browsers also sign in to Limitless over an HTTPS public origin. Keep basic
 authentication on the Access List, with NPM's “Satisfy Any”
 disabled so both the source and the credentials are required.
+
+## Website
+
+Build the static website with `bun scripts/build-site.ts`, then serve `site-dist/` with
+any static file server to preview it locally. Documentation is rendered from the repository
+Markdown at build time.
+
+Regenerate demo screenshots with `bun scripts/site-screenshots.ts` on macOS or another machine
+with the Playwright headless shell installed (`bun install`). The script creates a temporary
+home and config, uses the fake harness and disables scheduling. Never point it at the live
+daemon; unset inherited `LIMITLESS_HOME` and `LIMITLESS_CONFIG_DIR` if they name the default
+installation. It refuses the default daemon port and default home/config directories.
+
+In the repository's Pages settings, set the source to **GitHub Actions**. The Pages workflow
+builds and deploys on relevant pushes to main, or through a manual workflow dispatch.
