@@ -6,8 +6,16 @@ import * as commands from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
+import { reportText } from "../src/pipeline/report-privacy.ts";
 import { sh } from "../src/util/proc.ts";
-import { type ChangePage, changeFixture, connect, fixture, resultValue } from "./mcp-support.ts";
+import {
+  type ChangePage,
+  changeFixture,
+  connect,
+  fixture,
+  resultValue,
+  saveReportFixture,
+} from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let connection: Awaited<ReturnType<typeof connect>>;
@@ -168,7 +176,7 @@ test("change view refuses a diagnostic race when the catalogue key cannot be com
       ],
     },
   });
-  store.putArtifact(c.run.id, "report.md", "report", "Observed fallbackRaceSecret.");
+  saveReportFixture(f, c.run.id, [reportText("verifier", "Observed fallbackRaceSecret.")]);
   const invocation = store.createInvocation({
     runId: c.run.id,
     stageId: null,
