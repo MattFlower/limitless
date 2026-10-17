@@ -108,7 +108,7 @@ export function hiddenDarwinProcessMember(
   );
 }
 
-export function darwinProcessBirth(pid: number): string | null {
+export function darwinProcessBirth(pid: number, name?: (value: string) => void): string | null {
   const bsd = new Uint8Array(136);
   if (symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength) {
     const address = symbols.__error();
@@ -117,6 +117,7 @@ export function darwinProcessBirth(pid: number): string | null {
     throw new Error(`Process birth time inspection failed for ${pid} (errno ${errno})`);
   }
   const view = new DataView(bsd.buffer);
+  name?.(Buffer.from(bsd.subarray(48, 64)).toString("utf8").split("\0")[0] ?? "unknown");
   return `${view.getBigUint64(120, true)}:${view.getBigUint64(128, true)}`;
 }
 
