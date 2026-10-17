@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { stageAll, worktreeGit } from "../src/git/command.ts";
 import { ConfinementError, gitConfinement, gitProfile, gitSh, seatbeltGit } from "../src/git/confinement.ts";
-import { pushBranch } from "../src/git/repos.ts";
+import { commitAll, pushBranch, rebaseOnto } from "../src/git/repos.ts";
 import { CommandError, sh } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { fakeGitConfinement } from "./git-preload.ts";
@@ -389,3 +389,42 @@ test("runtime allowances pin the resolved git, exec directory and canonical writ
   expect(profile).not.toContain("/untrusted");
   expect(wrapped).toContain(`--exec-path=${execPath}`);
 });
+
+for (const confined of [false, true])
+  test.skipIf(confined && seatbeltSkip !== null)(
+    `factory commits and rebases succeed with global signing configured: ${confined ? "Seatbelt" : "fake"} (${seatbeltSkip ?? "available"})`,
+    async () => {
+      const marker = join(root, "signed");
+      const signer = join(root, "signer");
+      writeFileSync(signer, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+      const global = join(root, "global-config");
+      writeFileSync(
+        global,
+        `[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = ${signer}\n[log]\n\tshowSignature = true\n`,
+      );
+      await git(cwd, "checkout", "-qb", "side");
+      writeFileSync(join(cwd, "side"), "side\n");
+      await git(cwd, "add", "side");
+      await git(cwd, "commit", "-qm", "side");
+      const base = (await git(cwd, "rev-parse", "main")).stdout.trim();
+      const previous = process.env.GIT_CONFIG_GLOBAL;
+      process.env.GIT_CONFIG_GLOBAL = global;
+      try {
+        await gitConfinement.run(confined ? seatbeltGit() : fakeGitConfinement, async () => {
+          writeFileSync(join(cwd, "file"), "signed?\n");
+          expect(await commitAll(cwd, "factory commit")).toMatch(/^[a-f0-9]{40}$/);
+          await git(cwd, "checkout", "-q", "main");
+          writeFileSync(join(cwd, "main"), "main\n");
+          expect(await commitAll(cwd, "advance main")).toMatch(/^[a-f0-9]{40}$/);
+          await git(cwd, "checkout", "-q", "side");
+          expect(await rebaseOnto(cwd, "main")).toBe("clean");
+          const log = await worktreeGit(["git", "log", "--format=%H", `${base}..HEAD`], { cwd });
+          expect(log.stdout.trim().split("\n")).toHaveLength(3);
+        });
+      } finally {
+        if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+        else process.env.GIT_CONFIG_GLOBAL = previous;
+      }
+      expect(existsSync(marker)).toBe(false);
+    },
+  );

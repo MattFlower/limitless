@@ -146,6 +146,8 @@ async function runGit(
   // Discover includes, worktree, global, system and environment config with the same options.
   const { hooks, emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts, execute), execute);
   prefix.push(...hookFlags(hooks));
+  // Signing and signature display run gpg or ssh-keygen, which the confinement profile denies.
+  prefix.push("-c", "commit.gpgSign=false", "-c", "log.showSignature=false");
   const env = {
     ...(opts.env ?? (process.env as Record<string, string>)),
     LIMITLESS_GIT_EMPTY_HOOK: "",
