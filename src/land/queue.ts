@@ -11,7 +11,7 @@ import { detectGates } from "../gates/detect.ts";
 import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
-import { worktreeGit, worktreeGitScope } from "../git/command.ts";
+import { cacheGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
   addDetachedWorktree,
@@ -712,7 +712,7 @@ export class LandQueue {
       // A crashed attempt leaves the cache's registration behind; prune it and try once more.
       signal.throwIfAborted();
       this.log(`[land] retrying checkout of ${sha.slice(0, 12)} after ${String(error)}`);
-      await worktreeGit(["git", "worktree", "prune"], { cwd: cache, allowFail: true });
+      await cacheGit(["git", "worktree", "prune"], { cwd: cache, allowFail: true });
       await addDetachedWorktree(cache, sha, path, signal);
     }
     return path;

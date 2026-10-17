@@ -575,7 +575,7 @@ describe("local factory clones", () => {
     expect(await git(source, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
   });
 
-  test("delivery push runs no maintenance or gc in the source repository", async () => {
+  test("bundle delivery runs no maintenance or gc in the source repository", async () => {
     const f = start(reply);
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
@@ -586,8 +586,9 @@ describe("local factory clones", () => {
     const trace = join(home, "push.trace");
     await withEnv("GIT_TRACE", trace, () => pushBranch(repo, work, "traced"));
     const log = readFileSync(trace, "utf8");
-    expect(log).toContain("receive-pack");
-    expect(log).not.toMatch(/\b(maintenance|gc)\b/);
+    expect(log).toContain("bundle create");
+    expect(log).not.toContain("receive-pack");
+    expect(log).not.toMatch(/\b(maintenance|gc) (run|--auto|--quiet)\b/);
     expect(await git(repoDir, "rev-parse", "refs/heads/traced")).toBe(await git(work, "rev-parse", "HEAD"));
   });
 
@@ -599,7 +600,7 @@ describe("local factory clones", () => {
     if (!repo) throw new Error("missing repo");
     const work = join(f.cfg.paths.work, run.id);
     const marker = join(home, "config-hook-ran");
-    // Only the source sees these; the quote and '=' exercise the receive-pack shell quoting.
+    // Only the source sees these; unusual hook names must still be blanked on fetch.
     const name = "hook.source's x=y";
     await git(repoDir, "config", `${name}.command`, `touch '${marker}'`);
     for (const event of ["pre-receive", "update", "reference-transaction", "post-receive", "post-update"])

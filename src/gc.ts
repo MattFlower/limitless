@@ -5,7 +5,7 @@ import type { Repo, Run } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
 import { FEED_RETENTION_DAYS } from "./feed.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
-import { worktreeGit } from "./git/command.ts";
+import { cacheGit } from "./git/command.ts";
 import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
 
@@ -100,7 +100,7 @@ export async function collectGarbage(
       const path = child(workRoot, run.id);
       const cache =
         repo.kind === "local" && existsSync(path) ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
-      const git = repo.kind === "github" ? worktreeGit : sh;
+      const git = repo.kind === "github" ? cacheGit : sh;
       if (repo.kind === "github" && !resolve(cache).startsWith(resolve(cfg.paths.repos) + sep)) {
         throw new Error(`repository cache outside ${cfg.paths.repos}`);
       }
@@ -149,7 +149,7 @@ export async function collectGarbage(
       .map((cache) => ({ repo, cache })),
   );
   for (const { repo, cache } of caches) {
-    const git = repo.kind === "github" ? worktreeGit : sh;
+    const git = repo.kind === "github" ? cacheGit : sh;
     try {
       await withRepoLock(cache, async () => {
         const eligible = new Set(

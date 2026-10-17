@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,9 +11,10 @@ import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } f
 import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
+import { withScratch } from "../harness/scratch.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import {
-  emptyHookFlags,
+  cacheGit,
   emptyTreeId,
   NO_BIG_FILES,
   recordWorktree,
@@ -108,7 +110,7 @@ type RemoteOpts = {
   budget?: GitHubBudget;
 };
 const remoteSh = (cmd: string[], opts: RemoteOpts) =>
-  withGitHubRetry(() => (cmd[0] === "git" ? worktreeGit(cmd, opts) : sh(cmd, opts)), opts);
+  withGitHubRetry(() => (cmd[0] === "git" ? cacheGit(cmd, opts) : sh(cmd, opts)), opts);
 
 export function slugify(text: string, max = 40): string {
   return (
@@ -225,22 +227,22 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
           cwd: repo.localPath as string,
           signal,
         });
-        await worktreeGit(
+        await cacheGit(
           ["git", "init", "-q", "--bare", "--template=", `--object-format=${format.stdout.trim()}`],
           { cwd: tmp, signal },
         );
-        await worktreeGit(["git", "config", "remote.origin.url", repo.localPath as string], {
+        await cacheGit(["git", "config", "remote.origin.url", repo.localPath as string], {
           cwd: tmp,
           signal,
         });
       } else {
-        await worktreeGit(["git", "clone", "--bare", repo.url as string, tmp], {
+        await cacheGit(["git", "clone", "--bare", repo.url as string, tmp], {
           cwd: paths.repos,
           timeoutMs: 600_000,
           signal,
         });
       }
-      await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+      await cacheGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
         cwd: tmp,
         signal,
       });
@@ -250,14 +252,14 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
     }
   }
   if (repo.kind === "local") {
-    await worktreeGit(["git", "config", "user.name", "Limitless"], { cwd: cache });
-    await worktreeGit(["git", "config", "user.email", "limitless@localhost"], { cwd: cache });
+    await cacheGit(["git", "config", "user.name", "Limitless"], { cwd: cache });
+    await cacheGit(["git", "config", "user.email", "limitless@localhost"], { cwd: cache });
   }
   // Agents run inside worktrees of this repo; make any push attempt from them fail.
-  await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+  await cacheGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
   // Local clones mirror the source's tags, including deleted and moved ones.
   const tags = repo.kind === "local" ? ["--prune-tags", "--force"] : [];
-  await worktreeGit(["git", "fetch", "origin", "--prune", ...tags], {
+  await cacheGit(["git", "fetch", "origin", "--prune", ...tags], {
     cwd: cache,
     timeoutMs: 300_000,
     signal,
@@ -265,10 +267,11 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
   if (repo.kind === "local") {
     // Keep bare HEAD usable without retaining copied source branches. Best-effort: the recorded
     // default branch may be gone from the source while a run's explicit base branch still exists.
-    await worktreeGit(
-      ["git", "update-ref", "--no-deref", "HEAD", `refs/remotes/origin/${repo.defaultBranch}`],
-      { cwd: cache, signal, allowFail: true },
-    );
+    await cacheGit(["git", "update-ref", "--no-deref", "HEAD", `refs/remotes/origin/${repo.defaultBranch}`], {
+      cwd: cache,
+      signal,
+      allowFail: true,
+    });
   }
   return cache;
 }
@@ -313,7 +316,7 @@ export async function createWorktree(
     // Hooks are blanked where a command runs. `worktree add` would check out inside the new
     // worktree, where includes conditional on its branch or git directory can first activate
     // hooks; checking out from there instead lets the wrapper see exactly those.
-    await worktreeGit(["git", "worktree", "add", "--no-checkout", "-b", branch, path, base.stdout.trim()], {
+    await cacheGit(["git", "worktree", "add", "--no-checkout", "-b", branch, path, base.stdout.trim()], {
       cwd: cache,
     });
     await recordWorktree(path);
@@ -324,7 +327,7 @@ export async function createWorktree(
 
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
   if (!existsSync(path)) return;
-  const git = repo.kind === "github" ? worktreeGit : sh;
+  const git = repo.kind === "github" ? cacheGit : sh;
   const cache = repo.kind === "local" ? await worktreeOwner(path) : cachePath(paths, repo);
   await withRepoLock(cache, () =>
     git(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true }),
@@ -378,9 +381,12 @@ export async function exportCommit(
 ): Promise<void> {
   // `git archive` honours export-ignore and would drop committed files; a private index checks out
   // exactly the commit's tracked files without touching the worktree's own index.
-  const index = `${dest}.index`;
-  const env = { ...(process.env as Record<string, string>), GIT_INDEX_FILE: index };
-  try {
+  await withScratch(cwd, async (scratch) => {
+    const env = {
+      ...(process.env as Record<string, string>),
+      GIT_INDEX_FILE: join(scratch, "index"),
+      TMPDIR: dest,
+    };
     await worktreeGit(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
     await worktreeGit(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
@@ -388,15 +394,18 @@ export async function exportCommit(
       signal,
       timeoutMs: 300_000,
     });
-  } finally {
-    rmSync(index, { force: true });
-  }
+  });
 }
 
 /** A detached checkout of `sha` at `dest` sharing `cwd`'s repository, for readers kept off the worktree. */
 export async function addDetachedWorktree(cwd: string, sha: string, dest: string, signal?: AbortSignal) {
-  await worktreeGit(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
+  await cacheGit(["git", "worktree", "add", "--no-checkout", "--detach", dest, sha], {
+    cwd: await worktreeOwner(cwd),
+    signal,
+    timeoutMs: 300_000,
+  });
   await recordWorktree(dest);
+  await worktreeGit(["git", "reset", "--hard", "-q", sha], { cwd: dest, signal });
 }
 
 export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {
@@ -1048,6 +1057,27 @@ export function parseNameStatus(text: string): DiffFile[] {
     });
 }
 
+/** Export exact commits without executing a transport in the candidate repository. */
+export async function withGitBundle<T>(
+  cwd: string,
+  revisions: string[],
+  signal: AbortSignal | undefined,
+  use: (bundle: string) => Promise<T>,
+): Promise<T> {
+  return withScratch(cwd, async (scratch) => {
+    const refs = revisions.map(() => `refs/limitless-transfer/${randomUUID()}`);
+    try {
+      for (const [i, ref] of refs.entries())
+        await worktreeGit(["git", "update-ref", ref, revisions[i] ?? ""], { cwd, signal });
+      const bundle = join(scratch, "transfer.bundle");
+      await worktreeGit(["git", "bundle", "create", bundle, ...refs], { cwd, signal, timeoutMs: 300_000 });
+      return await use(bundle);
+    } finally {
+      for (const ref of refs) await worktreeGit(["git", "update-ref", "-d", ref], { cwd });
+    }
+  });
+}
+
 export async function pushBranch(
   repo: Repo,
   cwd: string,
@@ -1063,32 +1093,27 @@ export async function pushBranch(
     // An earlier push may have landed before its delivery was recorded; the user may have built on it.
     const head = (await worktreeGit(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
     if (await isAncestor(repo.localPath, head, `refs/heads/${branch}`)) return;
-    // core.hooksPath doesn't cover config-defined hooks; blank the ones the source repository sees.
-    const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
-    const receiveHooks = (await emptyHookFlags(["git"], { cwd: repo.localPath, signal }))
-      .map(quote)
-      .join(" ");
-    await worktreeGit(
-      [
-        "git",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "push",
-        "--no-verify",
-        // An explicit refspec doesn't disable push.followTags; deleted source tags must stay deleted.
-        "--no-follow-tags",
-        `--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse -c receive.autogc=false ${receiveHooks} receive-pack`,
-        repo.localPath,
-        // Branch-only refspecs exclude git notes.
-        `${sha}:refs/heads/${branch}`,
-      ],
-      {
-        cwd,
-        timeoutMs: 300_000,
-        signal,
-        env: { ...(process.env as Record<string, string>), LIMITLESS_GIT_EMPTY_HOOK: "" },
-      },
-    );
+    const source = repo.localPath;
+    await withGitBundle(cwd, [head], signal, async (bundle) => {
+      // Bundle transport is internal to git. Fetch refuses a checked-out destination branch,
+      // and the branch-only refspec transfers neither tags nor notes.
+      await worktreeGit(
+        [
+          "git",
+          "-c",
+          "maintenance.auto=false",
+          "-c",
+          "gc.auto=0",
+          "fetch",
+          "--no-tags",
+          "--no-write-fetch-head",
+          "--no-recurse-submodules",
+          bundle,
+          `${head}:refs/heads/${branch}`,
+        ],
+        { cwd: source, signal, timeoutMs: 300_000 },
+      );
+    });
     return;
   }
   if (!repo.url) return;

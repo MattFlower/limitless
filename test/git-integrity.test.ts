@@ -945,7 +945,7 @@ test("Git version is checked once and unsupported versions fail before repositor
       `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\ncase "$*" in\n--version) printf 'git version ${version}\\n';;\n*--get-regexp*) exit 1;;\nesac\n`,
       { mode: 0o755 },
     );
-    const result = await sh([process.execPath, "-e", script], {
+    const result = await sh([process.execPath, `--preload=${resolve("test/git-preload.ts")}`, "-e", script], {
       cwd: work,
       env: { ...(process.env as Record<string, string>), PATH: bin },
       allowFail: true,
@@ -1361,7 +1361,14 @@ test("hooks that arrive between cached factory commands are still blanked", asyn
 
 test("an unchanged worktree lists its config once and never hashes the empty tree", async () => {
   const shim = gitShim();
-  const run = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work, env: shim.env });
+  // This single-listing probe controls its sources; inherited includes need an initial discovery pass.
+  const env = {
+    ...shim.env,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "0",
+    GIT_CONFIG_PARAMETERS: "",
+  };
+  const run = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work, env });
   for (let i = 0; i < 3; i++) {
     await run("status", "--porcelain");
     await run("diff", base);
