@@ -214,6 +214,21 @@ test("boundary emphasis preserves distinct intraword identifiers on both matchin
   }
 });
 
+test.each(["secret_\ntoken", "secret\n_token", "secret_ \ntoken", "the secret_\ntoken leaked"])(
+  "an intraword delimiter wrapped at a line break still matches: %j",
+  (wrapped) => {
+    const redacted = buildReportRedactor(new Set(["secret_token"]))(wrapped);
+    expect(redacted).toContain("[withheld:");
+    expect(redacted).not.toContain("token");
+  },
+);
+
+test("an intraword delimiter wrap point stays distinct from an unwrapped identifier", () => {
+  expect(buildReportRedactor(new Set(["secret_token"]))("Changed secrettoken lookup.")).toBe(
+    "Changed secrettoken lookup.",
+  );
+});
+
 test.each(["r\u200bed owl", "red o\u2060wl", "red\u00ad owl"])(
   "format characters normalize on both matching sides: %j",
   (phrase) => {

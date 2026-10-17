@@ -482,7 +482,10 @@ export function buildReportRedactor(details: Set<string>, privateRows = new Set<
                   ? "[ \x00]+"
                   : character === "\0"
                     ? "[ \x00]*"
-                    : character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+                    : // An intraword delimiter next to a wrap is stripped from the report.
+                      /[*_~]/u.test(character)
+                      ? `(?:[${character}]|\x00)`
+                      : character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
               )
               .join(wrap);
             return detail.length >= DISTINCTIVE_LENGTH
