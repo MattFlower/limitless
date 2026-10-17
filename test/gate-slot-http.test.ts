@@ -378,3 +378,58 @@ test("capability-bearing command names are redacted in events and HTTP errors", 
     await f.close();
   }
 });
+
+test("HTTP leases validate priority and schedule ship, finish (including omission), then start", async () => {
+  const f = await fixture("lease-priority-test");
+  const limit = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const release = await gateSlots.acquire(new AbortController().signal, undefined, "held");
+  const ids = new Map<string, string>();
+  const route = (createHttpRoutes(f.factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+  const request = (payload: unknown) =>
+    route(
+      requestWithParams("http://localhost/api/admin/gate-slot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+      localServer,
+    );
+  const leaseSpy = spyOn(gateSlots, "lease");
+  try {
+    for (const priority of ["unknown", "", null, 1, true, [], {}]) {
+      expect((await request({ name: "invalid", priority })).status).toBe(400);
+    }
+    expect(leaseSpy).not.toHaveBeenCalled();
+    for (const [name, priority] of [
+      ["start", "start"],
+      ["old-client", undefined],
+      ["finish", "finish"],
+      ["ship-1", "ship"],
+      ["ship-2", "ship"],
+    ]) {
+      const response = await request({ name, priority });
+      expect(response.status).toBe(200);
+      const lease = (await response.json()) as { id: string; acquired: boolean };
+      expect(lease.acquired).toBe(false);
+      ids.set(String(name), lease.id);
+    }
+    expect(gateSlots.snapshot().holders).toEqual(["held"]);
+    release();
+    for (const name of ["ship-1", "ship-2", "old-client", "finish", "start"]) {
+      for (const [queuedName, id] of ids) {
+        expect(await (await request({ id })).json()).toMatchObject({ acquired: queuedName === name });
+      }
+      expect(gateSlots.snapshot().holders).toEqual([name]);
+      await request({ id: ids.get(name), release: true });
+      ids.delete(name);
+    }
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    leaseSpy.mockRestore();
+    release();
+    for (const id of ids.values()) gateSlots.heartbeat(id, true);
+    gateSlots.setLimit(limit);
+    await f.close();
+  }
+});

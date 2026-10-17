@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { RunContext } from "../src/pipeline/context.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { verifierPrompt } from "../src/pipeline/prompts.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { customProvider, providerFixture } from "./provider-config-support.ts";
 
 test("shared invocation recording redacts configured credentials including thrown errors and structured events", async () => {
@@ -20,6 +22,8 @@ test("shared invocation recording redacts configured credentials including throw
     store,
     harnesses: {
       claude: fakeHarness((spec) => {
+        expect(spec.prompt).toBe("legacy state [redacted]");
+        expect(spec.systemAppend).toStartWith("legacy context [redacted]");
         spec.onEvent({ type: "stderr", text: `ordinary diagnostic ${secret}` });
         spec.onEvent({
           type: "tool_call",
@@ -47,7 +51,8 @@ test("shared invocation recording redacts configured credentials including throw
     const outcome = await context.invoke({
       role: "triage",
       stage,
-      prompt: "test",
+      prompt: `legacy state \x1b[31m${secret}`,
+      systemAppend: `legacy context \x1b[31m${secret}`,
       mode: "readonly",
       complexity: "small",
       constraints: { only: "claude/haiku" },
@@ -61,6 +66,268 @@ test("shared invocation recording redacts configured credentials including throw
     expect(readFileSync(join(cfg.paths.runs, run.id, `inv-${invocations[0]?.id}.log`), "utf8")).toBe(
       "ordinary diagnostic [redacted]",
     );
+  } finally {
+    await factory.stop();
+    store.close();
+    fixture.close();
+  }
+});
+
+test("reload sanitizes legacy diagnostics while preserving executable and comparison state", async () => {
+  const secret = "SYNTHETIC_RELOAD_CREDENTIAL_494";
+  const literal = `\x1b[31m${secret}`;
+  const fixture = providerFixture(
+    [{ ...customProvider, api_key_env: "RELOAD_TEST_KEY" }],
+    `RELOAD_TEST_KEY=${secret}\n`,
+  );
+  const store = new Store(":memory:");
+  const factory = new Factory(fixture.load(), { store });
+  try {
+    const repo = store.upsertRepo({
+      slug: "fixture/repo",
+      kind: "local",
+      localPath: fixture.root,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const initial = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    const result = {
+      name: literal,
+      command: literal,
+      ok: false,
+      exitCode: 1,
+      durationMs: 1,
+      output: literal,
+      failures: literal,
+    };
+    const comparison = {
+      name: literal,
+      verdict: "still_failing" as const,
+      blocking: false,
+      result: { ...result, firstAttempt: result },
+      firstAttempt: result,
+    };
+    const state = {
+      ...initial.state,
+      phase: "loop" as const,
+      gatesConfig: {
+        setup: [literal],
+        checks: [{ name: literal, run: literal }],
+        source: "detected" as const,
+        protectedPaths: [literal],
+      },
+      baselineScripts: { ok: "true", output: literal },
+      shadowLenses: { error: literal },
+      previewConfig: {
+        paths: [literal],
+        build: literal,
+        seed: literal,
+        serve: literal,
+        ready: literal,
+        env: { VALUE: literal },
+      },
+      worktreePath: literal,
+      conflictFiles: [literal],
+      reviewBaseSha: literal,
+      pendingRebaseSha: literal,
+      preRebaseHead: literal,
+      lastVerifiedSha: literal,
+      reviewedSha: literal,
+      verification: { baseSha: literal, headSha: literal },
+      implementer: { modelId: literal, vendor: literal, tier: 4 },
+      triedImplementers: [literal],
+      specAuthorVendor: literal,
+      holdoutModelId: literal,
+      reviewLenses: [{ name: literal, focus: literal, profiles: ["deep"] }],
+      spec: {
+        summary: literal,
+        assumptions: [],
+        requirements: [],
+        acceptance_criteria: [{ id: literal, criterion: literal, how_to_verify: literal }],
+        out_of_scope: [],
+        blocking_questions: [],
+      },
+      holdout: {
+        scenarios: [
+          { id: literal, description: literal, steps: literal, expected: literal, edge_case: false },
+        ],
+      },
+      baseline: { setupOk: true, setup: [result], checks: [{ ...result, firstAttempt: result }] },
+      lastGates: [comparison],
+      lastVerifiedEvidence: { lastGates: [comparison] },
+      preRebaseGates: [comparison],
+      gateEvidence: { stageId: 1, sha: literal, checks: [{ ...comparison, testCommand: literal }] },
+      completedChecks: {
+        round: 0,
+        sha: literal,
+        values: { gates: [comparison], audit: [{ id: literal, detail: literal, ok: true, output: literal }] },
+      },
+      feedback: literal,
+      terminalReason: literal,
+      needsHumanReason: literal,
+      implementerReport: literal,
+      implementerIssue: literal,
+      rebaseNote: literal,
+    } satisfies RunState;
+    store.setRunState(run.id, state);
+    registerCredential("reload-phase-test", "loop");
+    registerCredential("reload-flow-test", "build");
+    const loaded = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    const diagnostic = { output: "[redacted]", failures: "[redacted]", confinementError: false };
+    const cleanResult = { ...result, ...diagnostic };
+    const cleanComparison = {
+      ...comparison,
+      result: { ...cleanResult, firstAttempt: cleanResult },
+      firstAttempt: cleanResult,
+    };
+    expect(loaded.state).toEqual({
+      ...state,
+      feedback: "[redacted]",
+      terminalReason: "[redacted]",
+      needsHumanReason: "[redacted]",
+      implementerReport: "[redacted]",
+      implementerIssue: "[redacted]",
+      rebaseNote: "[redacted]",
+      shadowLenses: { error: "[redacted]" },
+      baseline: {
+        setupOk: true,
+        setup: [cleanResult],
+        checks: [{ ...cleanResult, firstAttempt: cleanResult }],
+      },
+      lastGates: [cleanComparison],
+      lastVerifiedEvidence: { lastGates: [cleanComparison] },
+      preRebaseGates: [cleanComparison],
+      gateEvidence: { ...state.gateEvidence, checks: [{ ...cleanComparison, testCommand: literal }] },
+      completedChecks: {
+        ...state.completedChecks,
+        values: { ...state.completedChecks.values, gates: [cleanComparison] },
+      },
+    });
+    loaded.state.shadowLenses = [{ name: literal, focus: literal, profiles: ["deep"] }];
+    const confinement = "sandbox_" + "apply: Operation not permitted";
+    registerCredential("reload-confinement-test", confinement);
+    loaded.state.baseline = {
+      setupOk: false,
+      setup: [{ ...result, output: confinement }],
+      checks: [
+        { ...result, output: confinement, confinementError: false },
+        { ...result, output: literal, confinementError: true },
+      ],
+    };
+    await loaded.save();
+    const reloaded = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    expect(reloaded.state.shadowLenses).toEqual(loaded.state.shadowLenses);
+    expect(reloaded.state.baseline?.setup[0]).toMatchObject({ output: "[redacted]", confinementError: true });
+    expect(reloaded.state.baseline?.checks.map((r) => r.confinementError)).toEqual([false, true]);
+    loaded.artifact("decoded.json", "test", JSON.stringify({ nested: [literal] }));
+    loaded.artifact("diagnostic.txt", "test", literal);
+    expect(JSON.parse(store.getArtifact(run.id, "decoded.json") ?? "null")).toEqual({
+      nested: ["[redacted]"],
+    });
+    expect(store.getArtifact(run.id, "diagnostic.txt")).toBe("[redacted]");
+    expect(store.getRunState<RunState>(run.id)).toEqual(loaded.state);
+    loaded.log(literal, "warn", { gate: result });
+    expect(store.listEvents(run.id)).toMatchObject([
+      {
+        message: "[redacted]",
+        data: { gate: { name: "[redacted]", command: "[redacted]", output: "[redacted]" } },
+      },
+    ]);
+    expect(loaded.state.gatesConfig?.checks[0]?.name).toBe(literal);
+    loaded.state.worktreePath = undefined;
+    loaded.state.completedChecks = {
+      ...state.completedChecks,
+      sha: undefined,
+      values: { gates: [cleanComparison] },
+    };
+    const cached = await loaded.stage(
+      "gates",
+      async () => {
+        throw new Error("must reuse cached checks");
+      },
+      0,
+    );
+    expect(cached).toEqual([cleanComparison]);
+  } finally {
+    await factory.stop();
+    store.close();
+    fixture.close();
+  }
+});
+
+test("stored escape-split findings are sanitized before encoding verifier model input", async () => {
+  const secret = "synthetic-panel-credential-549";
+  registerCredential("panel-prompt-test", secret);
+  const title = "leak synthetic-panel\x1b[31m-credential-549 here";
+  const fixture = providerFixture([customProvider]);
+  const store = new Store(":memory:");
+  let calls = 0;
+  const factory = new Factory(fixture.load(), {
+    store,
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        calls++;
+        expect(spec.prompt.match(/"title": "leak \[redacted\] here"/g)).toHaveLength(3);
+        expect(spec.prompt).not.toContain("synthetic-panel");
+        expect(spec.prompt).not.toContain("credential-549");
+        expect(spec.prompt).not.toContain("\\u001b");
+        return { structured: { results: [] } };
+      }),
+    },
+  });
+  try {
+    const repo = store.upsertRepo({
+      slug: "fixture/repo",
+      kind: "local",
+      localPath: fixture.root,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const initial = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    initial.state.lastReview = {
+      verdict: "request_changes",
+      summary: "Check this",
+      modelId: "claude/haiku",
+      findings: [
+        {
+          severity: "major",
+          security: false,
+          file: "file.ts",
+          line: 1,
+          title,
+          detail: "Bug",
+          suggestion: "Fix",
+        },
+      ],
+    };
+    await initial.save();
+    const restored = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    const finding = restored.state.lastReview?.findings[0];
+    if (!finding) throw new Error("missing stored finding");
+    expect(finding.title).toBe(title);
+    const prior = { ...finding, id: "P1", status: "unaddressed" };
+    const outcome = await restored.invoke({
+      role: "review",
+      stage: store.startStage(run.id, "review", 0),
+      prompt: verifierPrompt({
+        prompt: run.prompt,
+        spec: null,
+        baseSha: "base",
+        stat: "",
+        candidates: [{ ...finding, id: "C1", failure_scenario: "Bug" }],
+        fix: { review: 2, sha: "previous", prior: [prior], resolved: [prior] },
+      }),
+      mode: "readonly",
+      complexity: "small",
+      constraints: { only: "claude/haiku" },
+    });
+    expect(outcome.result.status).toBe("ok");
+    expect(calls).toBe(1);
+    expect(restored.state.lastReview?.findings[0]?.title).toBe(title);
   } finally {
     await factory.stop();
     store.close();

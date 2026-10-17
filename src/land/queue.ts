@@ -408,7 +408,14 @@ export class LandQueue {
       writeFileSync(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
       await exportCommit(cwd, baseSha, base, signal);
       const gates = detectGates(base);
-      const request = { repo: entry.repo, cwd, baseSha, headSha: await headSha(cwd), gates };
+      const request = {
+        repo: entry.repo,
+        cwd,
+        baseSha,
+        headSha: await headSha(cwd),
+        gates,
+        priority: "ship" as const,
+      };
       const hooks = {
         holder: "land",
         onResult: (r: GateResult) =>

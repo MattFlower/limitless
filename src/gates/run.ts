@@ -14,7 +14,7 @@ import {
   redactGateOutput,
   redactGateStreams,
 } from "./output.ts";
-import { agentTestSlots, gateSlots } from "./slots.ts";
+import { agentTestSlots, type GatePriority, gateSlots } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
@@ -63,6 +63,7 @@ export interface GateComparison {
 }
 
 export interface GateHooks {
+  priority?: GatePriority;
   holder?: string;
   /** Only bounded targeted retries may bypass the full-suite queue. */
   skipGateSlot?: boolean;
@@ -146,6 +147,8 @@ export async function runLocalGates(
     signal,
     hooks.skipGateSlot ? undefined : hooks.onWait,
     hooks.holder ?? basename(cwd),
+    false,
+    hooks.skipGateSlot ? undefined : hooks.priority,
   );
   try {
     return await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
@@ -161,7 +164,11 @@ export function runGates(
   signal: AbortSignal,
   hooks: GateHooks = {},
 ): Promise<GateRun> {
-  return executeGate({ repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg }, signal, hooks);
+  return executeGate(
+    { repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg, priority: hooks.priority },
+    signal,
+    hooks,
+  );
 }
 
 async function runAll(

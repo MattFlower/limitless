@@ -1145,6 +1145,7 @@ test("deploy leases the entire suite, including already-deployed smoke, and rele
         leaseClient: async (body) => {
           if (body.name) {
             expect(body.name).toBe("deploy");
+            expect(body.priority).toBe("ship");
             held = true;
             order.push("acquire");
           }

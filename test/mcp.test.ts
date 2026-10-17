@@ -470,6 +470,21 @@ test("active cancellation reaches the fake harness, without claiming it already 
   });
 });
 
+test("MCP inspection strips terminal escapes from legacy event copies", async () => {
+  const run = await create();
+  f.factory.store.addEvent({
+    runId: run.id,
+    type: "log",
+    message: "legacy \x1b[31mfeedback",
+    data: { name: "check\x1b[31m" },
+  });
+  const detail = resultValue<{ events: RunEvent[] }>(await call("get_run", { id: run.id, full: true }));
+  expect(detail.events).toContainEqual(
+    expect.objectContaining({ message: "legacy feedback", data: { name: "check" } }),
+  );
+  expect(f.factory.store.listEvents(run.id).at(-1)?.data).toEqual({ name: "check\x1b[31m" });
+});
+
 test("inspection selects latest qualifying events beyond 5000, with costs and open questions", async () => {
   const run = await create();
   const other = await create();

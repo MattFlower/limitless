@@ -32,7 +32,7 @@ import {
   runGates as productionGates,
   retryRegressions as productionRetry,
 } from "../src/gates/run.ts";
-import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
+import { defaultGateSlots, type GatePriority, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
@@ -804,14 +804,67 @@ describe("gate slots and flaky retry", () => {
     expect(defaultGateSlots(16)).toBe(4);
   });
 
-  test("a queued slot request gives up on cancel without taking a slot", async () => {
+  test.each([
+    ["start", "finish", "ship", "start", "ship", "finish"],
+    ["ship", "start", "finish", "finish", "start", "ship"],
+  ] as GatePriority[][])("slots order classes and preserve FIFO: %j", async (...priorities) => {
+    const slots = new Semaphore(1);
+    const release = await slots.acquire(signal, undefined, "held");
+    const admitted: number[] = [];
+    const waiting = priorities.map((priority, i) =>
+      slots.acquire(signal, undefined, String(i), false, priority).then((free) => {
+        admitted.push(i);
+        return free;
+      }),
+    );
+    expect(slots.snapshot().holders).toEqual(["held"]);
+    slots.setLimit(3);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const expected = ["ship", "finish", "start"].flatMap((p) =>
+      priorities.flatMap((priority, i) => (priority === p ? [i] : [])),
+    );
+    expect(admitted).toEqual(expected.slice(0, 2));
+    const releases: (() => void)[] = [];
+    for (const i of expected.slice(0, 2)) {
+      const pending = waiting[i];
+      if (!pending) throw new Error("missing queued waiter");
+      releases.push(await pending);
+    }
+    slots.setLimit(1);
+    for (const free of releases) free();
+    expect(slots.snapshot().holders).toEqual(["held"]);
+    release();
+    release();
+    for (const i of expected.slice(2)) {
+      const pending = waiting[i];
+      if (!pending) throw new Error("missing queued waiter");
+      (await pending)();
+    }
+    expect(admitted).toEqual(expected);
+    expect(slots.snapshot().occupied).toBe(0);
+  });
+
+  test.each(["ship", "finish", "start"] as const)("cancel removes a queued %s waiter", async (priority) => {
     const slots = new Semaphore(1);
     const release = await slots.acquire(signal);
     const cancel = new AbortController();
-    const queued = slots.acquire(cancel.signal);
+    const queued = slots.acquire(cancel.signal, undefined, "cancelled", false, priority);
+    const start = slots.acquire(signal, undefined, "start", false, "start");
+    const finish = slots.acquire(signal, undefined, "finish", false, "finish");
+    const ship = slots.acquire(signal, undefined, "ship", false, "ship");
     cancel.abort();
     await expect(queued).rejects.toThrow();
     release();
+    for (const [name, pending] of [
+      ["ship", ship],
+      ["finish", finish],
+      ["start", start],
+    ] as const) {
+      const free = await pending;
+      expect(slots.snapshot().holders).toEqual([name]);
+      free();
+    }
+    expect(slots.snapshot().occupied).toBe(0);
     let waited = false;
     (await slots.acquire(signal, () => (waited = true)))();
     expect(waited).toBe(false);

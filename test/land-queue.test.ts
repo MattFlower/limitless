@@ -426,7 +426,7 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
       attempt === 1
         ? {
             test: { ...testFailure, output: `initial test failure ${credential}` },
-            other: { ...testFailure, failedFiles: ["README.md"], failedFileTimes: { "README.md": 3 } },
+            other: { ...testFailure, failedFiles: ["README.md"], failedFileTimes: undefined },
           }
         : { [req.gates.checks[0]?.name ?? ""]: { output: `targeted pass ${credential}` } },
     ),
@@ -443,9 +443,10 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
     ["base-retry './README.md'"],
   ]);
   expect(fake.requests.map((r) => r.gates.setup)).toEqual([["prepare"], [], []]);
+  expect(fake.requests.map((r) => r.priority)).toEqual(["ship", "ship", "ship"]);
   expect(fake.requests.slice(1).map((r) => [r.skipGateSlot, r.gates.checks[0]?.timeoutSec])).toEqual([
     [true, 120],
-    [true, 90],
+    [false, 90],
   ]);
   expect(store.listEvents(pr.run.id).filter((e) => e.level === "warn")).toMatchObject([
     { type: "gate", message: `Land ${entry.id} ${summary}` },
