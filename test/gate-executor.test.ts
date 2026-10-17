@@ -7,6 +7,7 @@ import { cacheableBaseline } from "../src/gates/cache.ts";
 import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
+import { redactGateData } from "../src/gates/output.ts";
 import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
@@ -368,6 +369,7 @@ test.each([
   const state = finished.store.getRunState<RunState>(run.id);
   expect(state?.gatesConfig?.checks[0]?.run).toBe(command);
   expect(state?.baselineScripts?.check).toBe(script);
+  expect(state?.lastGates?.[0]?.result.command).toBe(command);
   expect(state?.lastGates?.[0]).toMatchObject({ verdict: "pass", blocking: false });
   expect(state?.lastAudit?.some((f) => f.rule === "gate-script-changed")).toBe(false);
   const row = finished.store.db.query("SELECT gate_run FROM passing_baselines").get() as {
@@ -378,7 +380,7 @@ test.each([
     cacheableBaseline(JSON.parse(row.gate_run), { ...gates, checks: [{ name: "check", run: command }] }),
   ).toBe(true);
   const observable = JSON.stringify([
-    state?.lastGates,
+    finished.store.getArtifact(run.id, "gates-0.json"),
     finished.store.listEvents(run.id),
     finished.store.getArtifact(run.id, "baseline-gates.json"),
   ]);
@@ -645,7 +647,7 @@ test("formatted gate identities keep baseline verdicts after gate-started restar
   await interrupted.promise;
   await f.stop();
   expect(f.store.getRunState<RunState>(run.id)?.baseline?.checks[0]).toMatchObject({
-    name: "colored",
+    name,
     ok: false,
   });
   f.store.close();
@@ -655,10 +657,17 @@ test("formatted gate identities keep baseline verdicts after gate-started restar
   const state = resumed.store.getRunState<RunState>(run.id);
   expect(state?.gatesConfig?.checks[0]?.name).toBe(name);
   expect(state?.lastGates?.[0]).toMatchObject({
-    name: "colored",
+    name,
     verdict: "still_failing",
     blocking: false,
   });
+  const outward = JSON.stringify([
+    resumed.store.listEvents(run.id),
+    resumed.store.getArtifact(run.id, "baseline-gates.json"),
+    resumed.store.getArtifact(run.id, "gates-0.json"),
+  ]);
+  expect(outward).toContain("colored");
+  expect(outward).not.toContain("\\u001b");
   expect(resumed.store.getRun(run.id)?.status).toBe("succeeded");
   const cfg = { ...gates, checks: [{ name, run: "false", timeoutSec: 37 }] };
   const baseline = state?.baseline;
@@ -684,7 +693,7 @@ test("formatted gate identities keep baseline verdicts after gate-started restar
   ).toContain("timed out after 37 s");
 });
 
-test("saving preserves literal state while loading redacts credentials and terminal formatting", async () => {
+test("reload preserves literal control state while redacting legacy feedback", async () => {
   const literal = "synthetic-state-credential-486\x1b[31m";
   registerCredential("gate-state-test", "synthetic-state-credential-486");
   const { f, ctx, restore } = await context();
@@ -715,20 +724,10 @@ test("saving preserves literal state while loading redacts credentials and termi
     baselineScripts: { check: literal },
   });
   const resumed = restore();
-  expect(resumed.state.spec).toEqual({ ...spec, summary: "[redacted]" });
-  expect(resumed.state.holdout).toEqual({
-    scenarios: [
-      {
-        id: "H-1",
-        description: "[redacted]",
-        steps: "[redacted]",
-        expected: "[redacted]",
-        edge_case: false,
-      },
-    ],
-  });
+  expect(resumed.state.spec).toEqual(ctx.state.spec);
+  expect(resumed.state.holdout).toEqual(ctx.state.holdout);
   expect(resumed.state.feedback).toBe("[redacted]");
-  expect(resumed.state.answers).toEqual(["[redacted]"]);
+  expect(resumed.state.answers).toEqual([literal]);
   expect(resumed.state.gatesConfig?.checks[0]?.run).toBe(literal);
   expect(resumed.state.baselineScripts?.check).toBe(literal);
 });
@@ -1282,23 +1281,23 @@ test.each([false, true])("baseline targeted evidence is redacted before caching 
     ok: pass,
     firstAttempt: {
       ok: false,
-      failedFiles: ["[redacted].test.ts"],
-      failedFileTimes: { "[redacted].test.ts": 1 },
+      failedFiles: [file],
+      failedFileTimes: { [file]: 1 },
     },
-    targetedRetry: { ok: pass, command: "base-target './[redacted].test.ts'" },
+    targetedRetry: { ok: pass, command: `base-target './${file}'` },
   });
   const row = f.store.db.query("SELECT gate_run FROM passing_baselines").get() as {
     gate_run: string;
   } | null;
   if (pass) {
     if (!row) throw new Error("missing baseline cache");
-    expect(JSON.parse(row.gate_run)).toEqual(state?.baseline);
+    expect(JSON.parse(row.gate_run)).toEqual(redactGateData(state?.baseline));
     expect(row.gate_run).not.toContain(secret);
   } else expect(row).toBeNull();
   const artifact = f.store.getArtifact(run.id, "baseline-gates.json");
   if (!artifact) throw new Error("missing baseline artifact");
-  expect(JSON.parse(artifact)).toEqual(state?.baseline);
-  for (const persisted of [JSON.stringify(state), artifact, JSON.stringify(f.store.listEvents(run.id))])
+  expect(JSON.parse(artifact)).toEqual(redactGateData(state?.baseline));
+  for (const persisted of [artifact, JSON.stringify(f.store.listEvents(run.id))])
     expect(persisted).not.toContain(secret);
   expect(
     f.store

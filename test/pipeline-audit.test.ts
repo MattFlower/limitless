@@ -6,7 +6,7 @@ import type { CreateRunRequest } from "../src/core/types.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { mapGitHubEvent } from "../src/integrations/github.ts";
 import type { RunState } from "../src/pipeline/context.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { recordingConfinement } from "./confinement.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
@@ -36,6 +36,45 @@ const { start } = pipelineSetup({
 });
 
 describe("audit allowances (fake agents, real git)", () => {
+  test("quoted gate scripts redact credentials and escapes in audit events and retry feedback", async () => {
+    const secret = "synthetic-audit-script-credential-494";
+    registerCredential("audit-script-test", secret);
+    const script = `true # \x1b[31m${secret}`;
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { check: script } }));
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "check", run = "bun run check" }]\n',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "quoted gate script"], {
+      cwd: repoDir,
+    });
+    const prompts: string[] = [];
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      prompts.push(s.prompt);
+      return { files: { "package.json": JSON.stringify({ scripts: { check: "true" } }) } };
+    });
+    f.cfg.maxRounds = 1;
+    const run = await f.createRun({ repo: repoDir, prompt: "Update check script", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    const events = f.store.listEvents(run.id).filter((event) => event.type === "audit");
+    expect(events.some((event) => event.message.includes("gate-script-changed"))).toBe(true);
+    const state = f.store.getRunState<RunState>(run.id);
+    for (const output of [
+      JSON.stringify(events),
+      state?.feedback,
+      prompts[1],
+      f.store.getRun(run.id)?.error,
+    ]) {
+      expect(output).toContain("true # [redacted]");
+      expect(output).not.toContain(secret);
+      expect(output).not.toContain("\x1b");
+      expect(output).not.toContain("\\u001b");
+    }
+  });
+
   test("private-string audit events and retry feedback redact filenames and values", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),
