@@ -328,6 +328,7 @@ export async function createWorktree(
 
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
   if (!existsSync(path)) return;
+  // The common repository is factory/user-owned; agents write only the linked checkout.
   const git = repo.kind === "github" ? cacheGit : sh;
   const cache = repo.kind === "local" ? await worktreeOwner(path) : cachePath(paths, repo);
   await withRepoLock(cache, () =>

@@ -100,6 +100,7 @@ export async function collectGarbage(
       const path = child(workRoot, run.id);
       const cache =
         repo.kind === "local" && existsSync(path) ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
+      // The common repository is factory/user-owned; agents write only the linked checkout.
       const git = repo.kind === "github" ? cacheGit : sh;
       if (repo.kind === "github" && !resolve(cache).startsWith(resolve(cfg.paths.repos) + sep)) {
         throw new Error(`repository cache outside ${cfg.paths.repos}`);
@@ -149,6 +150,7 @@ export async function collectGarbage(
       .map((cache) => ({ repo, cache })),
   );
   for (const { repo, cache } of caches) {
+    // These caches and registration sources are factory/user-owned, never agent-written.
     const git = repo.kind === "github" ? cacheGit : sh;
     try {
       await withRepoLock(cache, async () => {
