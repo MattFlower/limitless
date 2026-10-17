@@ -1,4 +1,4 @@
-import { expect } from "bun:test";
+import { expect, spyOn } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
@@ -217,6 +217,7 @@ test.each([
   expect(fresh.starts).toHaveLength(1);
   expect(fresh.attaches).toEqual(fresh.starts);
   expect(fresh.requests.get("1")?.headSha).toBe(moved);
+  expect(fresh.requests.get("1")?.priority).toBe("finish");
   if (purpose === "initial")
     expect(resumed.store.getRunState<RunState>(run.id)?.gateEvidence?.sha).toBe(moved);
   else expect(resumed.store.getRunState<RunState>(run.id)?.lastGates?.[0]?.result.output).toBe(moved);
@@ -878,7 +879,9 @@ test.each(["initial", "regression-retry", "timeout", "baseline-retry"])(
     const handle = state?.gateExecution?.handle;
     expect(handle).toBeDefined();
     f.store.close();
+    const priorities: string[] = [];
     const fresh = fake(async (h, req) => {
+      priorities.push(req.priority ?? "missing");
       const run = result(req);
       if ((purpose === "regression-retry" || purpose === "timeout") && h.id === "1") {
         for (const c of run.checks) {
@@ -891,6 +894,14 @@ test.each(["initial", "regression-retry", "timeout", "baseline-retry"])(
     });
     const resumed = start(handler, false, false, { gateExecutor: fresh.executor });
     expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const originalPriorities: GateRequest["priority"][] =
+      purpose === "baseline-retry"
+        ? ["start", "start"]
+        : ["start", "finish", ...(purpose === "initial" ? [] : ["finish" as const])];
+    expect([...scripted.requests.values()].map((req) => req.priority)).toEqual(originalPriorities);
+    expect(priorities).toEqual(
+      purpose === "baseline-retry" ? ["start", "finish"] : Array(fresh.attaches.length).fill("finish"),
+    );
     if (purpose === "initial") {
       expect(fresh.attaches[0]).toEqual(handle);
       expect(fresh.starts).toHaveLength(0);
@@ -1065,6 +1076,7 @@ test.each(["injected", "local"])("landing checks log setup and check events once
     prUrl,
   });
   f.store.recordApproval(run.id, prUrl, sha, "test");
+  const acquisition = spyOn(gateSlots, "acquire");
   const blocked = deferred<void>();
   const scripted = fake(async (_h, req) => ({
     ...result(req, false),
@@ -1116,10 +1128,18 @@ test.each(["injected", "local"])("landing checks log setup and check events once
     if (kind === "injected") {
       expect(scripted.starts).toHaveLength(1);
       expect(scripted.attaches).toEqual(scripted.starts);
-      expect(scripted.requests.get("1")).toMatchObject({ repo: repo.slug, baseSha: sha, headSha: sha });
+      expect(scripted.requests.get("1")).toMatchObject({
+        repo: repo.slug,
+        baseSha: sha,
+        headSha: sha,
+        priority: "ship",
+      });
+    } else {
+      expect(acquisition.mock.calls[0]?.[4]).toBe("ship");
     }
   } finally {
     await queue.stop();
+    acquisition.mockRestore();
   }
 });
 
@@ -1197,6 +1217,9 @@ test.each([false, true])(
         ? ["baseline", "initial", "regression-retry-targeted", "regression-retry"]
         : ["baseline", "initial", "regression-retry"],
     );
+    expect(requests.map((req) => req.priority)).toEqual(
+      enabled ? ["start", "finish", "finish", "finish"] : ["start", "finish", "finish"],
+    );
     expect(requests[2]?.skipGateSlot).toBe(enabled);
     const comparison = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
     expect(comparison?.verdict).toBe("flaky");
@@ -1242,6 +1265,9 @@ test.each([false, true])("baseline targeted evidence is redacted before caching 
     pass
       ? ["baseline", "baseline-retry-targeted", "baseline-retry", "initial"]
       : ["baseline", "baseline-retry-targeted", "initial"],
+  );
+  expect([...scripted.requests.values()].map((req) => req.priority)).toEqual(
+    pass ? ["start", "start", "start", "finish"] : ["start", "start", "finish"],
   );
   expect([...scripted.requests.values()].map((req) => req.gates.checks[0]?.run)).toEqual([
     "full-check",
