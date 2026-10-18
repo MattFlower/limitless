@@ -30,7 +30,7 @@ import { resolveTestWorkers } from "../src/util/test-workers.ts";
 const dirs: string[] = [];
 const originalWorkers = process.env.LIMITLESS_TEST_WORKERS;
 // The default follows the machine's cores; pin it so gate commands read the same everywhere.
-const defaultWorkers = resolveTestWorkers(undefined);
+const defaultWorkers = resolveTestWorkers("");
 beforeEach(() => {
   process.env.LIMITLESS_TEST_WORKERS = "4";
 });

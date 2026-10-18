@@ -445,7 +445,7 @@ describe("runGates / compareGates", () => {
 
   test.each([
     ["2", "2"],
-    ["invalid", String(resolveTestWorkers(undefined))],
+    ["invalid", String(resolveTestWorkers(""))],
   ])("gate command receives validated test workers: %s", async (value, expected) => {
     const previous = process.env.LIMITLESS_TEST_WORKERS;
     const secret = process.env.LIMITLESS_TEST_SECRET;

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { resolveTestWorkers } from "../src/util/test-workers.ts";
 
 test("suite workers default to a third of the cores, from 4 to 8, unless overridden", () => {
-  expect([1, 4, 12, 14, 15, 18, 24, 26, 64].map((cores) => resolveTestWorkers(undefined, cores))).toEqual([
+  expect([1, 4, 12, 14, 15, 18, 24, 26, 64].map((cores) => resolveTestWorkers("", cores))).toEqual([
     4, 4, 4, 4, 5, 6, 8, 8, 8,
   ]);
   expect(resolveTestWorkers("2", 18)).toBe(2);
