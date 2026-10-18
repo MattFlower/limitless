@@ -686,7 +686,7 @@ export async function checkPrivatePublication(
     });
     const fields = ["author name", "author email", "committer name", "committer email"];
     identities.stdout.split("\0").forEach((value, i) => {
-      privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
+      checkPublicationText(value, `Published commit ${fields[i % 4]}`, entries);
     });
     const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
     for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
@@ -703,7 +703,7 @@ export async function checkPrivatePublication(
       const headers = text.slice(0, text.indexOf("\n\n"));
       if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
         throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
-      privacy.checkPrivateText(text, "Published commit object", entries);
+      checkPublicationText(text, "Published commit object", entries);
     }
   }
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
@@ -714,7 +714,7 @@ export async function checkPrivatePublication(
     ...(staged ? [["git", "diff", "--cached"]] : []),
   ]) {
     const { stdout } = await worktreeGit([...args, ...flags], { cwd });
-    privacy.checkPrivateText(stdout, "Published content", entries);
+    checkPublicationText(stdout, "Published content", entries);
     for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
   }
   const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];

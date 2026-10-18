@@ -21,7 +21,7 @@ import {
   readRetryFiles,
 } from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
-import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
+import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import {
   compareGates,
@@ -1960,10 +1960,10 @@ async function checkPublication(
     const entries = privateEntries(ctx, cwd);
     checkPublicationText(body, location, entries);
     if (!pr) return;
-    checkPrivateText(pr.title, "PR title", entries);
+    checkPublicationText(pr.title, "PR title", entries);
     const branch =
       pr.branch ?? reviewRound(ctx)?.grant.owner.branch ?? ctx.run.deliveryBranch ?? ctx.run.branch;
-    checkPrivateText(branch ?? "", "Branch name", entries);
+    checkPublicationText(branch ?? "", "Branch name", entries);
     if (!branch || !ctx.run.baseSha) throw new Error("Missing publication branch or base");
     const range = await deliveryPublicationRange(
       ctx.repo,

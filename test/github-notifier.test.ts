@@ -967,6 +967,48 @@ test("a stale snapshot never hides an untracked PR from the fallback; a merged o
   }
 });
 
+test.each(["issue", "pull_request"] as const)(
+  "blocks a factory %s terminal comment containing a whitespace-folded private phrase",
+  async (kind) => {
+    const phrase = ["PR:", "none", "Cost:"].join(" ");
+    writeFileSync(join(dir, "private-strings.txt"), phrase);
+    const calls: string[][] = [];
+    const logs: string[] = [];
+    const stop = startGitHubNotifier(
+      store,
+      async (args) => {
+        calls.push(args);
+      },
+      (message) => logs.push(message),
+      async () => null,
+      dir,
+    );
+    try {
+      const repo = store.upsertRepo({
+        slug: "fake/repo",
+        kind: "github",
+        url: "unused",
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const run = store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "fix",
+        source: "github",
+        sourceRef: { kind, repo: repo.slug, number: 1 },
+      });
+      expect(calls.map((args) => args.at(-1))).toEqual([`Limitless run created: ${run.id}`]);
+      calls.length = 0;
+      store.updateRun(run.id, { status: "failed" });
+      expect(calls).toEqual([]);
+      expect(logs).toEqual(["Factory comment blocked by private-string policy"]);
+    } finally {
+      await stop();
+    }
+  },
+);
+
 for (const kind of ["issue", "pull_request"] as const) {
   test.each([
     "matching",
