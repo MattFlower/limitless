@@ -2,6 +2,7 @@ import { lstatSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import * as privacy from "../src/gates/private.ts";
+import { checkPublicationText } from "../src/gates/publication.ts";
 import { recordWorktree, worktreeGit } from "../src/git/command.ts";
 import { checkPrivatePublication, publicationRange, squashTitle } from "../src/git/repos.ts";
 import { processScope, sh } from "../src/util/proc.ts";
@@ -56,15 +57,15 @@ try {
   } else {
     const [pr = "", repo = "", subject = ""] = process.argv.slice(2);
     const opts = { cwd: process.cwd() };
-    privacy.checkPrivateText(subject, "Squash subject", entries);
-    privacy.checkPrivateText(process.argv[5] ?? "", "Destination branch", entries);
+    checkPublicationText(subject, "Squash subject", entries);
+    checkPublicationText(process.argv[5] ?? "", "Destination branch", entries);
     const fields = "baseRefOid,body,headRefName,headRefOid";
     const { stdout } = await sh(["gh", "pr", "view", pr, "-R", repo, "--json", fields], opts);
     const sha = z.string().regex(/^[a-f0-9]{40,64}$/i);
     const data = z
       .object({ body: z.string(), baseRefOid: sha, headRefName: z.string(), headRefOid: sha })
       .parse(JSON.parse(stdout));
-    privacy.checkPrivateText(data.headRefName, "Branch name", entries);
+    checkPublicationText(data.headRefName, "Branch name", entries);
     if (data.headRefOid) {
       const object = await worktreeGit(["git", "cat-file", "-e", `${data.headRefOid}^{commit}`], {
         ...opts,
