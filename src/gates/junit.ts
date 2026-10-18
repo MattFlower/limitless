@@ -89,7 +89,22 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
     else for (const suite of elements(root).filter((child) => child.name === "testsuite")) visit(suite);
     const failedFiles = [...failed];
     if (!validRetryFiles(failedFiles, cwd)) return undefined;
-    const attributedCounts = attributedJUnitCounts(root, failed);
+    const checkout = realpathSync(cwd);
+    const attributedCounts = attributedJUnitCounts(root, failed, (file) => {
+      try {
+        if (file.split(/[\\/]/).includes("node_modules")) return undefined;
+        const rel = relative(checkout, realpathSync(resolve(checkout, file)));
+        return rel &&
+          !isAbsolute(rel) &&
+          rel !== ".." &&
+          !rel.startsWith(`..${sep}`) &&
+          !rel.split(sep).includes("node_modules")
+          ? rel
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    });
     return {
       failedFiles,
       ...(attributedCounts ? { attributedCounts } : {}),

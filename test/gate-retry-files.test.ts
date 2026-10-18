@@ -246,6 +246,13 @@ test.each([
   },
   { label: "malformed summary", output: "0 pass\none fail", complete: false },
   { label: "duplicate summary", output: `${runnerSummary}\n1 fail`, complete: false },
+  { label: "bailed out", output: `Bailed out after 1 failure\n${runnerSummary}`, complete: false },
+  {
+    label: "bail before diagnostic tail",
+    output: `Bailed out after 2 failures\n${"noise\n".repeat(2_000)}${runnerSummary}`,
+    complete: false,
+  },
+  { label: "test named bail", output: `(fail) Bailed out after 1 failure\n${runnerSummary}`, complete: true },
   { label: "unhandled error", output: `# Unhandled error between tests\n${runnerSummary}`, complete: false },
   { label: "load error", output: `other.test.ts: load error\n${runnerSummary}`, complete: false },
   {
@@ -294,6 +301,67 @@ test.each([
     );
     expect(calls).toBe(row.complete ? 1 : 0);
     expect(results.size).toBe(calls);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  ["relative foreign frame", "at test/b.test.ts:3:92", "test/b.test.ts", false],
+  ["parenthesized location", "at (test/b.test.ts:3:92)", "test/b.test.ts", false],
+  ["absolute parenthesized frame", "at leaked ($CWD/test/b.test.ts:3:92)", "test/b.test.ts", false],
+  ["absolute membership", "at test/b.test.ts:3:92", "$CWD/test/b.test.ts", false],
+  ["canonical alias", "at $CWD/test/./b.test.ts:3:92", "./test/b.test.ts", false],
+  ["symlink identity", "at test/alias.test.ts:3:92", "test/b.test.ts", false],
+  [
+    "decoded XML and testcase file",
+    "at leaked (test/space &apos; quote.test.ts:3:92)",
+    "test/space &apos; quote.test.ts",
+    false,
+  ],
+  ["same file", "at test/a.test.ts:3:92", "test/b.test.ts", true],
+  ["absolute same file", "at leaked ($CWD/test/a.test.ts:3:92)", "test/b.test.ts", true],
+  ["non-test module", "at helper.ts:3:92", "test/b.test.ts", true],
+  ["node_modules", "at node_modules/pkg/test.ts:3:92", "node_modules/pkg/test.ts", true],
+  ["node_modules symlink", "at node_modules/pkg/alias.ts:3:92", "test/b.test.ts", true],
+] as const)("JUnit stack attribution: %s", async (_label, frame, passingFile, complete) => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.cwd, "helper.ts"), "");
+    mkdirSync(join(f.cwd, "node_modules/pkg"), { recursive: true });
+    writeFileSync(join(f.cwd, "node_modules/pkg/test.ts"), "");
+    symlinkSync(join(f.cwd, "test/b.test.ts"), join(f.cwd, "test/alias.test.ts"));
+    symlinkSync(join(f.cwd, "test/b.test.ts"), join(f.cwd, "node_modules/pkg/alias.ts"));
+    // Passing membership comes after the failure and may live on the testcase itself.
+    const xml = `<testsuites>${suite("test/a.test.ts", 'errors="1"', `<testcase><error>Error: leak&#10;    ${frame}&#10;</error></testcase>`)}<testsuite><testcase file="${passingFile}"/></testsuite></testsuites>`;
+    const junit = parseJUnit(xml.replaceAll("$CWD", f.cwd), f.cwd);
+    expect(junit?.failedFiles).toEqual(["test/a.test.ts"]);
+    const evidence = new RunnerFailureEvidence();
+    for (const line of "1 pass\n1 fail\nRan 2 tests across 2 files.".split("\n")) evidence.observe(line);
+    expect(evidence.agrees(junit?.attributedCounts)).toBe(complete);
+    let calls = 0;
+    await retryFailures(
+      [
+        {
+          check: testCheck,
+          original: {
+            ...failed,
+            ...junit,
+            failureAttributionComplete: evidence.agrees(junit?.attributedCounts),
+          },
+        },
+      ],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toBe(complete ? 1 : 0);
   } finally {
     f.close();
   }
@@ -465,6 +533,160 @@ test("the repository retry template isolates globals across reported files befor
     f.close();
   }
 });
+
+test("real Bun bail blocks targeted land retry despite matching counters", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(
+      join(f.cwd, "test/a.test.ts"),
+      `import { test, expect } from "bun:test";
+import { existsSync, writeFileSync } from "node:fs";
+test("fails once", () => { const seen = existsSync("marker"); writeFileSync("marker", ""); expect(seen).toBe(true); });`,
+    );
+    writeFileSync(
+      join(f.cwd, "test/b.test.ts"),
+      'import { test } from "bun:test"; test("pending pass", async () => { await Bun.sleep(300); });',
+    );
+    writeFileSync(
+      join(f.cwd, "test/c.test.ts"),
+      'import { test, expect } from "bun:test"; test("permanent failure", () => expect(1).toBe(2));',
+    );
+    const check = {
+      name: "test",
+      run: `'${process.execPath}' test --parallel=2 --bail --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts ./test/b.test.ts ./test/c.test.ts`,
+    };
+    const run = await confinementScope.run(fakeConfinement, () =>
+      runGates(f.cwd, { ...config, checks: [check] }, signal),
+    );
+    const original = run.checks[0];
+    if (!original) throw new Error("Missing check");
+    expect(original.output).toContain("Bailed out after 1 failure");
+    expect(original.output).toContain("Ran 1 test across 1 file.");
+    expect(original.failedFiles).toEqual(["test/a.test.ts"]);
+    expect(original.failureAttributionComplete).toBe(false);
+    let calls = 0;
+    const retries = await retryFailures(
+      [{ check, original }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...original, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toBe(0);
+    expect(retries.size).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("real Bun asynchronous failure in a passing file blocks targeted land retry", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(
+      join(f.cwd, "test/a.test.ts"),
+      `import { test } from "bun:test";
+test("arms leak", () => {
+  const poll = () => {
+    if (globalThis.active) { Promise.reject(new Error("leaked from a")); return; }
+    setTimeout(poll, 1).unref();
+  };
+  setTimeout(poll, 1).unref();
+});`,
+    );
+    writeFileSync(
+      join(f.cwd, "test/b.test.ts"),
+      'import { test } from "bun:test"; test("receives leak", async () => { globalThis.active = true; await Bun.sleep(100); });',
+    );
+    const check = {
+      name: "test",
+      run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts ./test/b.test.ts`,
+    };
+    const run = await confinementScope.run(fakeConfinement, () =>
+      runGates(f.cwd, { ...config, checks: [check] }, signal),
+    );
+    const original = run.checks[0];
+    if (!original) throw new Error("Missing check");
+    expect(original.output).toContain("leaked from a");
+    expect(original.output).toContain("1 pass");
+    expect(original.output).toContain("1 fail");
+    expect(original.failedFiles).toEqual(["test/b.test.ts"]);
+    expect(original.failureAttributionComplete).toBe(false);
+    let calls = 0;
+    const retries = await retryFailures(
+      [{ check, original }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...original, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toBe(0);
+    expect(retries.size).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([false, true])(
+  "real Bun own-file failure with helper=%s permits one targeted land retry",
+  async (helper) => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.cwd, "helper.ts"), 'export function fail() { throw new Error("own failure"); }');
+      writeFileSync(
+        join(f.cwd, "test/a.test.ts"),
+        `import { test } from "bun:test";
+import { existsSync, writeFileSync } from "node:fs";
+import { fail } from "../helper.ts";
+test("fails once", () => {
+  if (existsSync("marker")) return;
+  writeFileSync("marker", "");
+  ${helper ? "fail();" : 'throw new Error("own failure");'}
+});`,
+      );
+      const check = {
+        name: "test",
+        run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts`,
+      };
+      const cfg = { ...config, checks: [check], retryFiles: `'${process.execPath}' test {files}` };
+      await confinementScope.run(fakeConfinement, async () => {
+        const run = await runGates(f.cwd, cfg, signal);
+        const original = run.checks[0];
+        if (!original) throw new Error("Missing check");
+        expect(original.failureAttributionComplete).toBe(true);
+        expect(original.failedFiles).toEqual(["test/a.test.ts"]);
+        const calls: string[] = [];
+        const retries = await retryFailures(
+          [{ check, original }],
+          f.cwd,
+          cfg,
+          signal,
+          undefined,
+          async (retry, options) => {
+            expect(options?.targeted).toBe(true);
+            calls.push(...retry.checks.map((c) => c.run));
+            return runGates(f.cwd, retry, signal);
+          },
+          true,
+        );
+        expect(calls).toEqual([`'${process.execPath}' test './test/a.test.ts'`]);
+        expect(retries.get(original)?.ok).toBe(true);
+        expect(retries.size).toBe(1);
+      });
+    } finally {
+      f.close();
+    }
+  },
+);
 
 test("real Bun JUnit capture keeps failing files, console excerpts and coverage", async () => {
   const f = fixture();

@@ -11,7 +11,15 @@ export interface AttributedTestCounts {
 export function attributedJUnitCounts(
   root: Bun.XML.Node,
   files: ReadonlySet<string>,
+  canonicalFile: (file: string) => string | undefined,
 ): AttributedTestCounts | undefined {
+  const reportFiles = new Set<string>();
+  const collect = (node: Bun.XML.Node) => {
+    const file = node.attributes.file && canonicalFile(node.attributes.file);
+    if (file) reportFiles.add(file);
+    for (const child of node.children) if (typeof child === "object" && "name" in child) collect(child);
+  };
+  collect(root);
   const visit = (node: Bun.XML.Node, inheritedFile?: string): AttributedTestCounts => {
     const file = node.attributes.file ?? inheritedFile;
     const counts = { tests: 0, failures: 0, errors: 0, skipped: 0 };
@@ -26,6 +34,14 @@ export function attributedJUnitCounts(
         else if (child.name === "skipped") counts.skipped = 1;
         else if (child.name !== "system-out" && child.name !== "system-err" && child.name !== "properties")
           throw new Error("Unknown testcase evidence");
+        if (child.name === "failure" || child.name === "error") {
+          const text = child.children.filter((part) => typeof part === "string").join("");
+          for (const frame of text.matchAll(/^\s*at (?:.* \(|\()?(.+?):\d+:\d+\)?\s*$/gm)) {
+            const location = frame[1] && canonicalFile(frame[1]);
+            if (location && reportFiles.has(location) && location !== (file && canonicalFile(file)))
+              throw new Error("Cross-file testcase failure");
+          }
+        }
       }
       if (counts.failures + counts.errors + counts.skipped > 1) throw new Error("Ambiguous testcase");
       if (counts.failures + counts.errors > 0 && (!file || !files.has(file)))
@@ -63,7 +79,7 @@ export class RunnerFailureEvidence {
     const line = stripVTControlCharacters(raw).trim();
     if (/^(?:\((?:pass|fail|skip|todo)\)|[✓✗»])(?:\s|$)/.test(line)) return;
     if (
-      /^(?:#\s*)?unhandled (?:errors?|rejections?)\b|(?:^|:\s*)load(?:ing)?[- ]errors?\b|^(?:error:\s*)?(?:cannot|failed to|unable to) (?:load|import|resolve|find module)\b/i.test(
+      /^Bailed out after \d+ failures?\.?$|^(?:#\s*)?unhandled (?:errors?|rejections?)\b|(?:^|:\s*)load(?:ing)?[- ]errors?\b|^(?:error:\s*)?(?:cannot|failed to|unable to) (?:load|import|resolve|find module)\b/i.test(
         line,
       )
     )
