@@ -3,6 +3,7 @@ import type { FeedPage, Run } from "../src/core/types.ts";
 import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { httpBackend } from "../src/integrations/mcp.ts";
 import { mountMcp } from "../src/integrations/mcp-http.ts";
+import { reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import {
@@ -13,6 +14,7 @@ import {
   type Route,
   requestWithParams,
   resultValue,
+  saveReportFixture,
 } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -47,7 +49,7 @@ test("mounted MCP exposes PR code while protecting holdout-only report material"
       scenarios: [{ id: "H-1", description: hidden, steps: hidden, expected: reportOnly, edge_case: false }],
     },
   });
-  f.factory.store.putArtifact(c.run.id, "report.md", "report", `${hidden}\n${reportOnly}`);
+  saveReportFixture(f, c.run.id, [reportText("verifier", `${hidden}\n${reportOnly}`)]);
   const response = await route(
     rpc("tools/call", { name: "limitless_get_change", arguments: { run: c.run.id } }),
     localServer,
@@ -61,7 +63,7 @@ test("mounted MCP exposes PR code while protecting holdout-only report material"
     diff: { text: expect.stringContaining(` hello\n+${hidden}\n`) },
     reports: [
       {
-        text: "[withheld: holdout result or quotation; 1 line]\n[withheld: holdout result or quotation; 1 line]",
+        text: "[withheld: holdout result or quotation; 1 line]\n[withheld: holdout result or quotation; 1 line]\n",
       },
     ],
   });
