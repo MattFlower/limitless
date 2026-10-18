@@ -7,7 +7,9 @@ import { sep } from "node:path";
 const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
   __error: { args: [], returns: FFIType.ptr },
   getsid: { args: [FFIType.i32], returns: FFIType.i32 },
+  mach_absolute_time: { args: [], returns: FFIType.u64 },
   proc_listpids: { args: [FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+  proc_pid_rusage: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
   proc_pidinfo: {
     args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32],
     returns: FFIType.i32,
@@ -144,6 +146,11 @@ export function captureDarwinInvocationLeader(pid: number): DarwinInvocationLead
   return { pid, birth, session, group: info[2] ?? 0 };
 }
 
+/** Monotonic, in the units of a process's start time from proc_pid_rusage; read it before spawning. */
+export function darwinClock(): bigint {
+  return BigInt(symbols.mach_absolute_time());
+}
+
 export function darwinCallerAncestors(): Set<number> {
   const protectedPids = new Set([1, process.pid, process.ppid]);
   const info = new Uint32Array(16);
@@ -171,6 +178,8 @@ export function markedDarwinProcesses(
   directories: readonly string[],
   leader: DarwinInvocationLeader | null = null,
   protectedPids: ReadonlySet<number> = darwinCallerAncestors(),
+  /** `darwinClock()` before the invocation spawned; 0n inspects every process. */
+  spawnedAt = 0n,
 ): number[] {
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
@@ -196,6 +205,19 @@ export function markedDarwinProcesses(
   const hidden = new Set<number>();
   const bsd = new Uint8Array(136); // proc_bsdinfo includes the process birth time
   const vnode = new Uint8Array(2352); // proc_vnodepathinfo: two vnode_info_path structs
+  const usage = new BigUint64Array(12); // rusage_info_v0: ri_proc_start_abstime is the 11th word
+  // A process forked before the spawn cannot descend from it: orphans reparent to launchd, and
+  // the child's new session and group admit only its descendants. Only the random marker could
+  // still match it, and it was not started by this invocation (hiddenDarwinProcessMember drops
+  // orphans born before `started` for the same reason). Reading argv is most of a scan's cost,
+  // and almost every process predates the spawn. An unreadable or unset (zero) start time is
+  // inspected as before.
+  const predatesSpawn = (pid: number) => {
+    if (spawnedAt <= 0n || symbols.proc_pid_rusage(pid, 0 /* RUSAGE_INFO_V0 */, ptr(usage)) !== 0)
+      return false;
+    const start = usage[10] ?? 0n;
+    return start > 0n && start < spawnedAt;
+  };
   const errno = () => {
     const address = symbols.__error();
     return address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);
@@ -215,6 +237,7 @@ export function markedDarwinProcesses(
     }
     if (info[9] !== uid || info[3] === 5 /* SZOMB */) continue;
     parents.set(pid, info[1] ?? 0);
+    if (predatesSpawn(pid)) continue;
     const processGroup = info[2];
     const session = symbols.getsid(pid);
     if (session < 0) {

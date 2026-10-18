@@ -37,7 +37,7 @@ const fixture: { home: string; repoDir: string; factory: Factory | null } = {
   repoDir: "",
   factory: null,
 };
-const { start, githubFixture, registerGithub, advanceBase, assertUnpublished } = pipelineSetup(fixture);
+const { start, githubFixture, registerGithub, advanceBase, assertUnpublished, wait } = pipelineSetup(fixture);
 const handler: Handler = (s) => {
   const role = roleOf(s);
   if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
@@ -714,6 +714,24 @@ test("reload preserves literal control state while redacting legacy feedback", a
   ctx.state.answers = [literal];
   ctx.state.gatesConfig = { ...gates, checks: [{ name: "check", run: literal }] };
   ctx.state.baselineScripts = { check: literal };
+  // Baseline identities decide verdicts after a resume; retry history keeps a check uncitable.
+  const name = "\x1b[31mcheck";
+  const passing = { name, command: "true", ok: true, exitCode: 0, durationMs: 1, output: "pass" };
+  ctx.state.baseline = { setupOk: true, setup: [], checks: [passing] };
+  ctx.state.gateEvidence = {
+    stageId: 1,
+    sha: "a".repeat(40),
+    checks: [
+      {
+        name,
+        verdict: "pass",
+        blocking: false,
+        testCommand: "bun test",
+        result: passing,
+        firstAttempt: { ...passing, ok: false, exitCode: 1 },
+      },
+    ],
+  };
   await ctx.save();
   expect(f.store.getRunState<RunState>(ctx.run.id)).toMatchObject({
     spec: { summary: literal },
@@ -730,6 +748,8 @@ test("reload preserves literal control state while redacting legacy feedback", a
   expect(resumed.state.answers).toEqual([literal]);
   expect(resumed.state.gatesConfig?.checks[0]?.run).toBe(literal);
   expect(resumed.state.baselineScripts?.check).toBe(literal);
+  expect(resumed.state.baseline?.checks[0]?.name).toBe(name);
+  expect(resumed.state.gateEvidence?.checks[0]).toMatchObject({ name, firstAttempt: { ok: false } });
 });
 
 test.each(["hook", "purpose", "sha"] as const)(
@@ -1151,7 +1171,7 @@ test("local check events stream before completion and the start signal cancels r
     ...gates,
     checks: [
       { name: "first", run: "true" },
-      { name: "pending", run: "sleep 900" },
+      { name: "pending", run: "touch pending-started; sleep 900" },
     ],
   };
   await confinementScope.run(fakeConfinement, async () => {
@@ -1160,12 +1180,19 @@ test("local check events stream before completion and the start signal cancels r
     try {
       const event = await execution.events[Symbol.asyncIterator]().next();
       expect(event.value).toMatchObject({ type: "check", result: { name: "first", ok: true } });
+      // Cancel the second check once it runs, not while its sandbox is still starting.
+      await wait(() => existsSync(join(fixture.repoDir, "pending-started")), {
+        timeoutMs: 10_000,
+        description: "pending check did not start",
+      });
     } finally {
       controller.abort();
     }
     const completed = await execution.result;
-    expect(completed.checks.length).toBeLessThanOrEqual(2);
-    expect(completed.checks.find((c) => c.name === "pending")?.ok ?? false).toBe(false);
+    expect(completed.checks.map((c) => [c.name, c.ok])).toEqual([
+      ["first", true],
+      ["pending", false],
+    ]);
     await execution.cancel();
   });
 });

@@ -46,10 +46,11 @@ and extend the closest case when it already exercises that behavior.
 - Do not delete security, isolation, cancellation, crash-resume, or delivery tests just because
   they are slow. Identify the unique failure they catch and any replacement coverage first.
 - Measure proposed speed changes with the complete default suite. Do not obtain a faster result
-  by skipping tests or weakening assertions. The suite runs process-isolated files with
-  `--parallel`; `LIMITLESS_TEST_WORKERS` overrides the fixed worker count. Blanket in-process
-  concurrency (`--concurrent`), including concurrency over shared globals such as `process.env`,
-  spies, timers, and gate slots, is still forbidden. Follow the root `AGENTS.md` for final checks.
+  by skipping tests or weakening assertions. The suite runs process-isolated files on `--parallel`
+  workers (a third of the cores, 4 to 8); `LIMITLESS_TEST_WORKERS` overrides the count. Blanket
+  in-process concurrency (`--concurrent`), including concurrency over shared globals such as
+  `process.env`, spies, timers, and gate slots, is still forbidden. Follow the root `AGENTS.md` for
+  final checks.
 
 ## Tests that hold on every machine
 

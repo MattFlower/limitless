@@ -122,19 +122,12 @@ describe("audit allowances (fake agents, real git)", () => {
       .filter((event) => event.type === "audit" && event.level === "error")
       .map((event) => event.message);
 
-  for (const [name, request, skip, blocked] of [
-    ["no opt-in", {}, false, ["gitlink", "gitattributes"]],
-    [
-      "inline mention",
-      { prompt: "Vendor the parser; do not use git submodules or gitattributes" },
-      false,
-      ["gitlink", "gitattributes"],
-    ],
-    ["submodules only", { prompt: "Vendor the parser\nAllow: submodules" }, false, ["gitattributes"]],
-    ["gitattributes option only", { allow: ["gitattributes"] }, false, ["gitlink"]],
-    ["both", { prompt: "Vendor the parser\r\nallow: SUBMODULES", allow: ["gitattributes"] }, false, []],
-    ["both with a skipped test", { allow: ["submodules", "gitattributes"] }, true, ["test-skipped"]],
-  ] as [string, Partial<CreateRunRequest>, boolean, string[]][]) {
+  // Allow-line parsing and the per-kind allowance matrix are unit-tested in gates.test.ts.
+  for (const [name, request, blocked] of [
+    ["no opt-in", {}, ["gitlink", "gitattributes"]],
+    ["submodules only", { prompt: "Vendor the parser\nAllow: submodules" }, ["gitattributes"]],
+    ["both", { prompt: "Vendor the parser\r\nallow: SUBMODULES", allow: ["gitattributes"] }, []],
+  ] as [string, Partial<CreateRunRequest>, string[]][]) {
     test(`engine audit honors persisted allowances: ${name}`, async () => {
       const prompts: string[] = [];
       const f = start(async (s): Promise<FakeReply> => {
@@ -147,7 +140,6 @@ describe("audit allowances (fake agents, real git)", () => {
           files: {
             ".gitattributes": "*.txt -diff\n",
             "greeting.txt": `vendored ${prompts.length}\n`,
-            ...(skip ? { "a.test.ts": 'test.skip("hidden", () => {});\n' } : {}),
           },
         };
       });

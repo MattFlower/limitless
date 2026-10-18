@@ -144,6 +144,10 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   refs, commit graphs and pack bitmaps; for `diff` and `log` it also suppresses external diff,
   textconv and repository attributes. A plain `sh(["git", …])` is only for repositories that only
   the factory writes.
+- **Process scans scale with the machine.** Every `runProcess` shutdown on macOS enumerates the
+  user's processes (about 650 on the factory's Mac). Reading one's arguments and environment
+  (`KERN_PROCARGS2`) costs about 11 µs, so a per-process read in that loop costs milliseconds per
+  command and grows with whatever else is running. Filter on cheap fields (start time, uid) first.
 - **macOS hides the environment of platform binaries.** SIP strips it from `KERN_PROCARGS2` for
   `/bin/sh`, `/bin/sleep` and every launchd-spawned system agent, so an environment marker can't
   identify such a process. Dozens of hidden-environment system agents start in any hour, so a rule
@@ -249,5 +253,8 @@ finish.
   apply a modifier: with `sha=abc`, `$sha:refs/heads/x` expands to `abcefs/heads/x`, and
   `$rev:src/a` fails with `bad substitution` (redirected output is then just empty). Write
   `"${var}:..."`.
+- launchd starts the daemon without `LANG` or `LC_*`. Homebrew git then asks macOS for the preferred
+  language on every start, which doubles its cost, and its messages follow the owner's macOS
+  language. `test/setup.ts` sets `LANG=C.UTF-8` when no locale is set.
 - Biome also formats JSON. Run `bunx biome check --write <files>` on anything generated or edited by
   a script.

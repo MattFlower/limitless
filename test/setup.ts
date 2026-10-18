@@ -1,3 +1,4 @@
+import "./git-preload.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,10 @@ const dir = mkdtempSync(join(tmpdir(), "limitless-test-git-"));
 const config = join(dir, "config");
 writeFileSync(config, "[user]\n\tname = Test\n\temail = test@example.invalid\n");
 process.env.GIT_CONFIG_GLOBAL = config;
+// With no locale set (a launchd daemon's gates, the desktop app), Homebrew git's gettext asks macOS
+// for the preferred language on every start, about doubling each git process's cost. Use CI's locale
+// so messages also don't follow the developer's language.
+if (!process.env.LC_ALL && !process.env.LC_MESSAGES && !process.env.LANG) process.env.LANG = "C.UTF-8";
 // The owner's factory state stays out of reach for the same reason. A CLI spawned against a test
 // daemon would otherwise send the live daemon's API token from ~/.limitless/api-token and be
 // refused, and loadConfig() without a configDir would read the owner's config.toml.
