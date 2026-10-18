@@ -31,8 +31,9 @@ now sets CI's `LANG=C.UTF-8` when no locale is set.
 | with the scan change | 4 | 653 s | 1,054 s | 1,554 s | 8.6 / 10.0 |
 | with the scan change and locale | 4 | 486 s | 914 s | 1,220 s | 11.5 / 21.9 |
 | with the scan change and locale | 6 | 301 s | 825 s | 1,095 s | 10.2 / 12.4 |
+| `bun run check`, default workers | 6 | 294 s | 817 s | 1,068 s | 9.6 / 10.1 |
 
-Each row is one whole-suite run (4,216–4,218 tests, the two added here included) while other work
+Each row is one whole-suite run (4,216–4,219 tests, the three added here included) while other work
 ran, so load differs between rows. Alternating runs of `pipeline-spec.test.ts` alone at load 4 give
 a cleaner comparison: 42.3 s and 42.6 s on `190fe64`, 17.0 s and 17.1 s with both changes (CPU 49 s
 against 22 s).
@@ -42,6 +43,18 @@ workers can't go below about 450 s; `land-pr.test.ts` (189 s) is the longest fil
 removed or skipped, and no assertion was weakened. The gate executor's cancellation test assumed its
 second check was already running when it cancelled; faster commands let the cancellation land while
 that check's sandbox was still starting, so the test now waits until the check runs.
+
+**Workers follow the machine.** The suite's default worker count was a fixed 4. With each suite now
+needing about 1,900 CPU-seconds instead of 4,800, the default is a third of the cores, clamped to
+4–8: 6 on this Mac, still 4 on CI's 4-vCPU runner and smaller machines. `LIMITLESS_TEST_WORKERS`
+still overrides it.
+
+**Overlapping tests.** A read-only review of the costliest files found about 220 s of the 1,790 s
+(12%) in rows that repeat another row's guard and outcome, or input variants that the responsible
+function's unit tests already cover. The largest single case is `land-pr.test.ts`'s 28 planted-key
+rows. The fake git sends every permitted push to a local path, so the transport keys they plant are
+never read, and one row per plant point would catch the same failures. None of this is removed
+here: each removal needs the mutation evidence that `test/AGENTS.md` asks for.
 
 ## Git wrapper caching (#319)
 
