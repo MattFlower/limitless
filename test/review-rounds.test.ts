@@ -700,16 +700,25 @@ test("a round that changes nothing ends needs_human without touching the PR", as
   expect(factory.store.reviewRounds(PR_URL)).toMatchObject([{ deliveredSha: null }]);
 });
 
-test("a base that conflicts with the PR ends the round needs_human without pushing", async () => {
-  const original = await delivered();
-  const reviewed = await remoteHead();
-  await push("main", "feature.txt", "conflicting base\n");
-  const round = await settle((await changes(original.id)).body.round?.id as string);
-  expect(round.status).toBe("needs_human");
-  expect(round.error).toContain("The PR branch conflicts with main in feature.txt");
-  expect(factory.store.listInvocations(round.id)).toHaveLength(0);
-  expect(await remoteHead()).toBe(reviewed);
-});
+test.each([false, true])(
+  "a base that conflicts with the PR ends the round needs_human without pushing (denylist: %s)",
+  async (denylist) => {
+    const original = await delivered();
+    const reviewed = await remoteHead();
+    if (denylist) {
+      mkdirSync(factory.cfg.paths.configDir, { recursive: true });
+      writeFileSync(join(factory.cfg.paths.configDir, "private-strings.txt"), ["private", "value"].join("-"));
+    }
+    await push("main", "feature.txt", "conflicting base\n");
+    const round = await settle((await changes(original.id)).body.round?.id as string);
+    expect(round.status).toBe("needs_human");
+    expect(round.error).toContain("The PR branch conflicts with main in feature.txt");
+    expect(factory.store.listInvocations(round.id)).toHaveLength(0);
+    expect(await remoteHead()).toBe(reviewed);
+    expect(pr.body).toBe("Factory report");
+    expect(pr.calls.some((args) => ["edit", "comment"].includes(args[1] ?? ""))).toBe(false);
+  },
+);
 
 test("at most one round in flight, and the fourth changes verdict leaves the run needs_human", async () => {
   const original = await delivered();

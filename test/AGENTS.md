@@ -94,3 +94,6 @@ and extend the closest case when it already exercises that behavior.
 - **"Flaky" needs evidence.** Before calling a failure flaky, rerun it alone and read its raw
   output. Deterministic bugs (a matcher that missed a changed CLI path, a test race exposed by a
   faster code path) have been dismissed as flakes and cost hours.
+
+- Build deliberately undecodable or private-looking fixtures at runtime rather than embedding
+  literals: published text is scanned, and undecodable text blocks publication.
