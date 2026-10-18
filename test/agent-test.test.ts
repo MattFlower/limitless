@@ -836,8 +836,9 @@ test("a sandbox that refuses both connections runs the test at once instead of w
   // Claude's reader sandbox denies loopback and Unix-socket connects; Bun reports this shape (#586).
   const f = fixture(),
     { clock } = fakeClock();
+  f.config.token = crypto.randomUUID();
   const denied = (transport: string) =>
-    Object.assign(new TypeError(`${transport} EPERM: Was there a typo in the url or port?`), {
+    Object.assign(new TypeError(`${transport} EPERM: ${f.config.token}`), {
       code: "EPERM",
     });
   const requests: string[] = [];
@@ -863,6 +864,8 @@ test("a sandbox that refuses both connections runs the test at once instead of w
   const stderr = warn.mock.calls.flat().join();
   expect(stderr).toContain("coordination unavailable");
   expect(stderr).toContain("EPERM");
+  expect(stderr).toContain("[redacted]");
+  expect(stderr).not.toContain(f.config.token);
 });
 
 test("an answering endpoint rejection never falls back, and socket failure rechecks HTTP", async () => {

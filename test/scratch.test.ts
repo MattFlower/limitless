@@ -263,9 +263,9 @@ function confinedFixture() {
   };
 }
 
-test("Claude verifier grants only Bun's executable through private roots and rejects credential overlaps", () => {
+test("Claude confined reader grants only Bun's executable through private roots and rejects credential overlaps", () => {
   const { spec, cleanup } = confinedFixture();
-  const home = mkdtempSync(join(tmpdir(), "verifier-home-"));
+  const home = mkdtempSync(join(tmpdir(), "reader-home-"));
   const executable = join(home, ".bun", "bin", "bun");
   const alias = join(home, "bun-alias");
   const credential = join(home, ".bun", "bin", "login");
@@ -275,7 +275,7 @@ test("Claude verifier grants only Bun's executable through private roots and rej
   try {
     readPolicyScope.run({ home, environment: { NPM_CONFIG_USERCONFIG: credential } }, () => {
       const args = buildClaudeArgs(spec, "session", undefined, alias);
-      for (const path of [alias, executable]) expect(claudeSandboxReads(args, path)).toBe(true);
+      for (const path of [alias, realpathSync(executable)]) expect(claudeSandboxReads(args, path)).toBe(true);
       for (const path of [
         dirname(executable),
         credential,
@@ -304,7 +304,33 @@ test("Claude verifier grants only Bun's executable through private roots and rej
   }
 });
 
-test("Claude verifier runner keeps scratch environment, checkout denial and wrapper isolation across invocations", async () => {
+test.each(["*", "?", "[", "]", "{", "}", "\\"])(
+  "Claude confined reader refuses executable pattern syntax %s, including symlink targets",
+  (pattern) => {
+    const { spec, cleanup } = confinedFixture();
+    const home = mkdtempSync(join(tmpdir(), "reader-pattern-home-"));
+    const executable = join(home, pattern, "credentials");
+    const alias = join(home, "bun-alias");
+    const credential = join(home, ".aws", "credentials");
+    try {
+      for (const file of [executable, credential]) {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, "synthetic credential or executable");
+      }
+      symlinkSync(executable, alias);
+      readPolicyScope.run({ home, environment: {} }, () => {
+        // In particular H/*/credentials would match H/.aws/credentials after its deny rule.
+        for (const path of [executable, alias, `${home}/${pattern}/../bun`])
+          expect(() => buildClaudeArgs(spec, "s", undefined, path)).toThrow(ConfinementError);
+      });
+    } finally {
+      cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test("Claude confined reader runner keeps scratch environment, checkout denial and wrapper isolation across invocations", async () => {
   const a = confinedFixture(),
     b = confinedFixture();
   const wrappers: string[] = [];

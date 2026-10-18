@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import {
   backendChecks,
   bunVerifierCheck,
@@ -845,9 +845,22 @@ test("deploy restores the previous checkout when injected smoke fails before res
   }
 });
 
+// A factory worker may itself inherit wrappers. Model the daemon's PATH behind the probe's own
+// wrapper so the local lease integration never calls an unrelated invocation's capabilities.
+async function isolatedBunVerifierCheck(...args: Parameters<typeof bunVerifierCheck>) {
+  const path = process.env.PATH;
+  try {
+    process.env.PATH = [dirname(process.execPath), path].join(delimiter);
+    return await bunVerifierCheck(...args);
+  } finally {
+    process.env.PATH = path;
+  }
+}
+
 for (const outcome of [
   "pass",
   "failed-test",
+  "fabricated",
   "missing",
   "claim",
   "wrong-command",
@@ -869,13 +882,17 @@ for (const outcome of [
     const paths: string[] = [];
     const controller = new AbortController();
     const check = () =>
-      bunVerifierCheck(
+      isolatedBunVerifierCheck(
         async (spec) => {
           paths.push(spec.cwd, spec.scratchDir ?? "");
           expect(spec.mode).toBe("readonly");
-          expect(spec.confineReads).toBe(true);
+          expect(spec.confineReads).not.toBe(true);
           expect(spec.noTools).not.toBe(true);
-          expect(spec.commandPath).toBeUndefined();
+          const wrapper = spec.commandPath?.split(delimiter)[0] ?? "";
+          const config = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+          expect(config.commands).toEqual([["bun", "test"]]);
+          expect(Bun.which("bun", { PATH: spec.commandPath })).toBe(join(wrapper, "bun"));
+          paths.push(wrapper, config.unix, dirname(spec.scratchDir ?? ""));
           expect(spec.timeoutMs).toBe(90_000);
           const scratch = spec.scratchDir ?? "";
           const entry = readFileSync(join(scratch, "probe.ts"), "utf8");
@@ -887,23 +904,34 @@ for (const outcome of [
           if (outcome === "throw") throw new Error("fake harness failure");
           if (outcome === "failed-test")
             writeFileSync(join(scratch, "probe.test.ts"), source.replace("toBe(1)", "toBe(2)"));
+          // A lease environment value is emitted only after traversing the real wrapper.
+          if (outcome === "pass")
+            writeFileSync(
+              join(scratch, "probe.test.ts"),
+              `${source}console.log("WRAPPER_LEASE", process.env.LIMITLESS_AGENT_TEST_LEASE);`,
+            );
           let output = marker,
             isError = false;
           if (outcome === "pass" || outcome === "failed-test") {
             const run = await runProcess({
               cmd: ["/bin/sh", "-c", command],
               cwd: spec.cwd,
-              // Confined readers receive no command wrappers.
-              env: agentEnv({
-                TMPDIR: scratch,
-                PATH: dirname(process.execPath),
-              }),
+              env: agentEnv({ TMPDIR: scratch, PATH: spec.commandPath ?? "" }),
               signal: spec.signal,
               timeoutMs: 15_000,
             });
             output = run.stdout + run.stderr;
             isError = run.exitCode !== 0;
+            expect(run.timedOut).toBe(false);
+            if (outcome === "pass") {
+              expect(run.exitCode).toBe(0);
+              expect(output).toMatch(/WRAPPER_LEASE [a-zA-Z0-9-]+/);
+              expect(output).not.toContain("WRAPPER_LEASE undefined");
+              expect(output).toContain("1 pass");
+              expect(output).toContain("0 fail");
+            }
           }
+          if (!["pass", "failed-test", "fabricated"].includes(outcome)) output += "\n1 pass\n0 fail\n";
           if (outcome === "cancelled") controller.abort();
           if (outcome === "claim") spec.onEvent({ type: "text", text: output });
           else {
@@ -939,11 +967,15 @@ for (const outcome of [
 for (const stop of ["cancelled", "deadline"] as const) {
   test(`Claude's Bun smoke ${stop} stops its owned subprocess before removing scratch`, async () => {
     const controller = new AbortController();
+    const resources: string[] = [];
     let scratch = "",
       pid = 0;
-    const check = await bunVerifierCheck(
+    const check = await isolatedBunVerifierCheck(
       async (spec) => {
         scratch = spec.scratchDir ?? "";
+        const wrapper = spec.commandPath?.split(delimiter)[0] ?? "";
+        const config = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+        resources.push(spec.cwd, dirname(scratch), wrapper, config.unix);
         const test = join(scratch, "probe.test.ts");
         writeFileSync(
           test,
@@ -953,11 +985,7 @@ for (const stop of ["cancelled", "deadline"] as const) {
         const run = await runProcess({
           cmd: ["/bin/sh", "-c", command],
           cwd: spec.cwd,
-          // Confined readers receive no command wrappers.
-          env: agentEnv({
-            TMPDIR: scratch,
-            PATH: dirname(process.execPath),
-          }),
+          env: agentEnv({ TMPDIR: scratch, PATH: spec.commandPath ?? "" }),
           signal: spec.signal,
           timeoutMs: 20_000,
           onStdoutLine: (line) => {
@@ -992,6 +1020,7 @@ for (const stop of ["cancelled", "deadline"] as const) {
     );
     expect(check.status).toBe("fail");
     expect(existsSync(scratch)).toBe(false);
+    for (const path of resources) expect(existsSync(path)).toBe(false);
     expect(pid).toBeGreaterThan(0);
     expect(() => process.kill(pid, 0)).toThrow();
   }, 25_000);

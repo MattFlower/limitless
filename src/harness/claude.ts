@@ -223,6 +223,9 @@ export function buildClaudeArgs(
       // The home-wide read deny also blocks Bun itself. Grant the executable alone, never its
       // parent (which could contain credentials or other invocations' command capabilities).
       const bun = confined ? spellings([bunExecutable]) : [];
+      // Sandbox allowance strings are patterns; even a symlink target must be literal.
+      if (confined && [bunExecutable, ...bun].some((p) => /[*?[\]{}\\]/.test(p)))
+        throw new ConfinementError("Bun executable path contains sandbox pattern syntax");
       const credentials = confined ? homeReadPolicy([], false, [...explicit, ...commands.root]).denyRead : [];
       for (const allow of bun)
         for (const deny of credentials)

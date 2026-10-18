@@ -11,7 +11,8 @@ import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
-import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
+import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveCatalog } from "../src/router/config-catalog.ts";
 import { discoversModels, servedIds } from "../src/router/discovery.ts";
@@ -721,7 +722,7 @@ for label, path in [${Object.entries({ ...canaries, config: configCanary })
   }
 }
 
-/** Exercise the confined Claude verifier, with a separate ten-second Bun deadline (#586). */
+/** Exercise production readonly verifiers through their wrappers, with a ten-second test deadline. */
 export async function bunVerifierCheck(
   harness: Harness,
   target: ModelTarget,
@@ -741,7 +742,7 @@ export async function bunVerifierCheck(
       writeFileSync(
         entry,
         `import { runProcess } from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
-const r = await runProcess({cmd: [${JSON.stringify(process.execPath)}, "test", ${JSON.stringify(test)}], cwd: ${JSON.stringify(scratchDir)}, env: process.env, timeoutMs: 10_000, onStdoutLine: (line) => console.log(line)});
+const r = await runProcess({cmd: ["bun", "test", ${JSON.stringify(test)}], cwd: ${JSON.stringify(scratchDir)}, env: process.env, timeoutMs: 10_000, onStdoutLine: (line) => console.log(line)});
 process.stdout.write(r.stdout); process.stderr.write(r.stderr);
 if (r.exitCode === 0 && !r.timedOut && !r.cancelled && /1 pass/.test(r.stdout + r.stderr) && /0 fail/.test(r.stdout + r.stderr)) console.log("${token}:bun-test-passed");
 else process.exitCode = 1;
@@ -753,12 +754,11 @@ else process.exitCode = 1;
       writeFileSync(probe, await bundle.outputs[0].text());
       const quote = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
       const command = `${quote(process.execPath)} ${quote(probe)}`;
-      const result = await harness({
+      const spec: AgentSpec = {
         cwd,
         scratchDir,
         target,
         mode: "readonly",
-        confineReads: true,
         prompt: `Execute exactly this Bash command and report its output:\n${command}`,
         timeoutMs: 90_000,
         idleTimeoutMs: 30_000,
@@ -766,10 +766,22 @@ else process.exitCode = 1;
         signal,
         logPath: join(cwd, "stream.log"),
         onEvent: (event) => events.push(event),
-      });
+      };
+      // Port zero uses the invocation's Unix lease server without depending on a running daemon.
+      const result = await withSlottedCommands(
+        [["bun", "test"]],
+        cwd,
+        scratchDir,
+        0,
+        () => {},
+        (commandPath) => harness({ ...spec, commandPath }),
+      );
       if (signal.aborted) return fail("Bun verifier probe cancelled");
       if (result.status !== "ok") return status(result);
-      return verifyProbeEvidence(events, command, token, ["bun-test-passed"])
+      const evidence = events.filter(
+        (e) => e.type !== "tool_result" || (/\b1 pass\b/.test(e.output) && /\b0 fail\b/.test(e.output)),
+      );
+      return verifyProbeEvidence(evidence, command, token, ["bun-test-passed"])
         ? { status: "pass" }
         : fail("missing successful Bun test command evidence");
     });
