@@ -1,6 +1,7 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ResolvedProfile, ReviewSystem } from "../core/types.ts";
+import { redactGateOutput } from "../gates/output.ts";
 import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree } from "../git/repos.ts";
 import { type InvokeOutcome, invokeGuard, NoCapacityError, type RunContext } from "./context.ts";
@@ -24,7 +25,7 @@ export async function shadowReview(
   const range = `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`;
   const name = `review-${round}.shadow.json`;
   const prior = parseArtifact(ctx.store.getArtifact(ctx.run.id, name));
-  if (prior?.status === "completed" && prior.range === range) return;
+  if (prior?.status === "completed" && prior.range === redactGateOutput(range)) return;
   const { tracker, router, store, cfg } = ctx.deps;
   // Checked before starting and after acquiring each provider slot.
   const stop = (id: string) =>
@@ -103,5 +104,5 @@ export async function shadowReview(
   // A call still running past the settle wait may yet add spend the artifact never sees.
   if (spent.some((i) => i.status === "running")) Object.assign(usage, { partial: true });
   const artifact = { round, system: system?.name, baseSha, reviewedSha, range, ...record, usage };
-  ctx.store.putArtifact(ctx.run.id, name, "review-shadow", JSON.stringify(artifact, null, 2));
+  ctx.artifact(name, "review-shadow", JSON.stringify(artifact, null, 2));
 }

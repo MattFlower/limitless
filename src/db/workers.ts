@@ -1,4 +1,5 @@
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registerCredential } from "../util/proc.ts";
@@ -10,6 +11,7 @@ import {
   timing,
   type WorkerTiming,
 } from "../workers/protocol.ts";
+import { attemptBudget, credentialBearing } from "../workers/validation.ts";
 import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -25,6 +27,23 @@ export interface WorkerRow {
   last_heartbeat_at: number | null;
   capabilities: string | null;
 }
+export interface JobRow {
+  id: string;
+  run_id: string | null;
+  request: string;
+  state: "queued" | "leased" | "done" | "failed" | "cancelled";
+  worker: string | null;
+  attempt: number;
+  lease_expires_at: number | null;
+  attempt_deadline_at: number | null;
+  result: string | null;
+  failure_reason: string | null;
+  excluded: string;
+  events: string;
+  created_at: number;
+  updated_at: number;
+}
+
 /** All worker transitions are synchronous SQLite transactions; no observation crosses an await. */
 export class WorkerStore {
   pairingKey?: string;
@@ -156,9 +175,157 @@ export class WorkerStore {
       });
   }
   heartbeat(w: WorkerRow, c: Capabilities) {
+    this.sweep();
     this.store.db
       .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
       .run(this.now(), JSON.stringify(c), w.name);
-    return { cancelled: c.jobs };
+    const cancelled: string[] = [];
+    for (const id of c.jobs) {
+      const j = this.job(id);
+      if (j?.state !== "leased" || j.worker !== w.name) cancelled.push(id);
+      else
+        this.store.db
+          .query(
+            "UPDATE gate_jobs SET lease_expires_at=?,updated_at=? WHERE id=? AND state='leased' AND worker=?",
+          )
+          .run(Math.min(this.now() + this.times.lease, j.attempt_deadline_at ?? 0), this.now(), id, w.name);
+    }
+    return { cancelled };
+  }
+  jobs(where: string, ...args: string[]) {
+    return this.store.db.query<JobRow, string[]>(`SELECT * FROM gate_jobs WHERE ${where}`).all(...args);
+  }
+  job(id: string) {
+    return this.store.db.query<JobRow, [string]>("SELECT * FROM gate_jobs WHERE id=?").get(id);
+  }
+  enqueue(req: GateRequest) {
+    const id = randomUUID(),
+      now = this.now();
+    this.store.db
+      .query(
+        "INSERT INTO gate_jobs (id,run_id,request,state,created_at,updated_at) VALUES (?,?,?,'queued',?,?)",
+      )
+      .run(id, req.runId ?? null, JSON.stringify(req), now, now);
+    this.keepLocal(this.job(id));
+    return id;
+  }
+  lease(name: string, sweep = true) {
+    return this.store.db.transaction(() => {
+      if (sweep) this.sweep();
+      const w = this.worker(name);
+      if (!w || !this.available(w)) return null;
+      const c: Capabilities = JSON.parse(w.capabilities ?? "{}");
+      const unreported = this.jobs("state='leased' AND worker=?", name).filter((j) => !c.jobs.includes(j.id));
+      if (unreported.length >= c.freeSlots) return null;
+      const j = this.jobs("state='queued'").find(
+        (job) => !(JSON.parse(job.excluded) as string[]).includes(name),
+      );
+      if (!j) return null;
+      const deadline = this.now() + attemptBudget(JSON.parse(j.request));
+      const changed = this.store.db
+        .query(
+          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=? WHERE id=? AND state='queued'",
+        )
+        .run(name, Math.min(this.now() + this.times.lease, deadline), deadline, this.now(), j.id);
+      return changed.changes === 1 ? this.job(j.id) : null;
+    })();
+  }
+  cancelledHeld(ids: string[], name: string) {
+    const owned = new Set(
+      this.store.db
+        .query<{ id: string }, [string, string]>(
+          "SELECT id FROM gate_jobs WHERE state='leased' AND worker=? AND id IN (SELECT value FROM json_each(?))",
+        )
+        .all(name, JSON.stringify(ids))
+        .map((j) => j.id),
+    );
+    return ids.filter((id) => !owned.has(id));
+  }
+  private keepLocal(j: JobRow | null) {
+    if (j?.state !== "queued" || !credentialBearing(JSON.parse(j.request))) return false;
+    this.event(j.id, {
+      type: "status",
+      text: "LAN gates executing locally: executable inputs contain a registered credential",
+    });
+    this.store.db
+      .query(
+        "UPDATE gate_jobs SET state='failed',worker=NULL,lease_expires_at=NULL WHERE id=? AND state='queued'",
+      )
+      .run(j.id);
+    return true;
+  }
+  holds(id: string, name: string) {
+    this.sweep();
+    const j = this.job(id);
+    return j?.state === "leased" && j.worker === name ? j : null;
+  }
+  event(id: string, event: ExecutionEvent) {
+    const j = this.job(id);
+    if (!j || !["queued", "leased", "failed"].includes(j.state)) return;
+    const events: ExecutionEvent[] = JSON.parse(j.events);
+    events.push(this.sanitize(event));
+    this.store.db.query("UPDATE gate_jobs SET events=? WHERE id=?").run(JSON.stringify(events), id);
+    if (event.type === "status" && j.run_id)
+      this.store.addEvent({
+        runId: j.run_id,
+        type: "gate",
+        level: "warn",
+        message: this.sanitize(event.text),
+      });
+  }
+  fail(id: string, reason: string) {
+    const j = this.job(id);
+    if (!j || !["queued", "leased"].includes(j.state)) return;
+    reason = this.sanitize(reason);
+    this.event(id, { type: "status", text: `LAN infrastructure failure: ${reason}` });
+    const excluded: string[] = JSON.parse(j.excluded);
+    if (j.worker) excluded.push(j.worker);
+    this.store.db
+      .query(
+        "UPDATE gate_jobs SET state=?,attempt=?,worker=NULL,lease_expires_at=NULL,attempt_deadline_at=NULL,failure_reason=?,excluded=?,updated_at=? WHERE id=? AND state IN ('queued','leased')",
+      )
+      .run(
+        j.attempt < 2 ? "queued" : "failed",
+        Math.min(2, j.attempt + 1),
+        reason,
+        JSON.stringify(excluded),
+        this.now(),
+        id,
+      );
+  }
+  sweep() {
+    const now = this.now();
+    for (const j of this.jobs("state IN ('queued','leased')")) {
+      if (j.state === "queued" && this.keepLocal(j)) continue;
+      if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
+        this.fail(j.id, "No worker picked up job");
+      else if (j.state === "leased") {
+        // Older leases acquire a deadline once, using their persisted last renewal.
+        const deadline = j.attempt_deadline_at ?? j.updated_at + attemptBudget(JSON.parse(j.request));
+        if (j.attempt_deadline_at === null)
+          this.store.db
+            .query(
+              "UPDATE gate_jobs SET attempt_deadline_at=?,lease_expires_at=min(lease_expires_at,?) WHERE id=?",
+            )
+            .run(deadline, deadline, j.id);
+        const w = j.worker ? this.worker(j.worker) : null;
+        if (w?.state !== "approved") this.fail(j.id, "Worker disconnected or revoked");
+        else if (deadline <= now) this.fail(j.id, "Attempt deadline expired");
+        else if ((j.lease_expires_at ?? 0) <= now) this.fail(j.id, "Lease expired");
+        else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh) this.fail(j.id, "Worker disconnected");
+      }
+    }
+  }
+  cancel(id: string) {
+    this.store.db
+      .query(
+        "UPDATE gate_jobs SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','leased','failed')",
+      )
+      .run(this.now(), id);
+  }
+  complete(id: string, run: unknown, local = false) {
+    this.store.db
+      .query("UPDATE gate_jobs SET state='done',result=?,updated_at=? WHERE id=? AND state=?")
+      .run(JSON.stringify(this.sanitize(run)), this.now(), id, local ? "failed" : "leased");
   }
 }

@@ -53,6 +53,9 @@ import {
 import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
+import { testWaits } from "./wait-support.ts";
+
+const waits = testWaits();
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -188,13 +191,10 @@ function factory(
 }
 // Confined gates and land checks run the restart scenarios about 3x slower than an unconfined run
 // (13 s vs 4.3 s measured on 2026-10-09), so a 10 s barrier failed land checks with nothing wrong.
-async function wait(check: () => boolean | Promise<boolean>) {
-  const end = Date.now() + 25_000;
-  while (!(await check())) {
-    if (Date.now() > end) throw new Error("barrier timed out");
-    await Bun.sleep(5);
-  }
+async function wait(check: () => boolean | Promise<boolean>, timeoutMs = 25_000) {
+  await waits.until(check, { timeoutMs, description: "barrier timed out" });
 }
+
 async function retainPids(pids: Map<number, string>, values: number[], readBirth = processBirth) {
   for (const pid of values) {
     const birth = await readBirth(pid);
@@ -363,8 +363,11 @@ test.each(["unavailable", "rejected"])(
       expect(value).not.toContain(secret);
   },
 );
-async function settled(f: Factory, id: string) {
-  await wait(() => !f.scheduler.activeRunIds.includes(id) && f.store.getRun(id)?.status !== "queued");
+async function settled(f: Factory, id: string, timeoutMs = 25_000) {
+  await waits.until(() => !f.scheduler.activeRunIds.includes(id) && f.store.getRun(id)?.status !== "queued", {
+    timeoutMs,
+    subscribe: (wake) => f.store.subscribe(wake),
+  });
 }
 async function reopen(f: Factory, handler: (s: AgentSpec) => FakeReply | Promise<FakeReply> = answer) {
   await f.stop();
@@ -1955,6 +1958,8 @@ for (const moved of [false, true])
     history(next, run.id);
   });
 
+// #556 (2026-10-16): resolution-start 8.44 s alone/10.31 s paired; implementation-committed 9.00 s/10.11 s.
+// Prior loaded gates hit 30 s; retain headroom for real Git conflict resolution and restart.
 for (const checkpoint of ["resolution-start", "implementation-committed"] as const)
   test(`factory merge survives interruption at ${checkpoint} without losing parents or replaying completed work`, async () => {
     const restore = fakeGh(join(root, "pr"));
@@ -1988,9 +1993,9 @@ for (const checkpoint of ["resolution-start", "implementation-committed"] as con
       const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
       f.scheduler.start();
       if (checkpoint === "resolution-start") {
-        await wait(() => reached);
+        await wait(() => reached, 60_000);
         await f.stop();
-      } else await settled(f, r.id);
+      } else await settled(f, r.id, 60_000);
       const state = f.store.getRunState<RunState>(r.id);
       const cwd = state?.worktreePath ?? "";
       const parent = state?.preRebaseHead;
@@ -2002,7 +2007,7 @@ for (const checkpoint of ["resolution-start", "implementation-committed"] as con
         expect(readFileSync(join(cwd, "README.md"), "utf8")).toContain("<<<<<<< HEAD");
       }
       const next = await reopen(f, handler);
-      await settled(next, r.id);
+      await settled(next, r.id, 60_000);
       expect(next.store.getRun(r.id)).toMatchObject({ status: "succeeded", error: null });
       const cache = join(next.cfg.paths.repos, "test__repo.git");
       const head = next.store.getRun(r.id)?.headSha ?? "";
@@ -2016,7 +2021,7 @@ for (const checkpoint of ["resolution-start", "implementation-committed"] as con
     } finally {
       await restore();
     }
-  });
+  }, 60_000);
 
 for (const cancel of [false, true])
   test(`verified-work draft retains its verified target across ${cancel ? "cancellation" : "PR checkpoint restart"}`, async () => {
@@ -2367,8 +2372,9 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
   }
 });
 
-for (const failures of [2, 3])
-  test(`delivery with ${failures} PR-create 502s ${failures < 3 ? "delivers" : "falls back as GitHub unavailable"}`, async () => {
+for (const failures of [2, 3]) {
+  const timeout = failures === 3 ? 60_000 : undefined;
+  const checkDelivery = async () => {
     const pr = join(root, "pr");
     const restore = fakeGh(pr);
     try {
@@ -2377,7 +2383,7 @@ for (const failures of [2, 3])
       const repo = githubRun(f);
       const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
       f.scheduler.start();
-      await settled(f, r.id);
+      await settled(f, r.id, failures === 3 ? 60_000 : 25_000);
       const run = f.store.getRun(r.id);
       expect(run?.prUrl).toBe("https://github.com/test/repo/pull/1");
       expect(ghCalls(pr, "pr create")).toHaveLength(failures + 1);
@@ -2387,7 +2393,14 @@ for (const failures of [2, 3])
     } finally {
       await restore();
     }
-  });
+  };
+  // #556 (2026-10-16), 3 failures: alone 4.36 s, paired load 5.12 s; prior loaded barriers hit 25 s.
+  test(
+    `delivery with ${failures} PR-create 502s ${failures < 3 ? "delivers" : "falls back as GitHub unavailable"}`,
+    checkDelivery,
+    timeout,
+  );
+}
 
 test("PR create retries a lagging lookup after 'already exists', up to twice", async () => {
   const pr = join(root, "pr");

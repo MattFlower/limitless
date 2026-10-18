@@ -1,6 +1,6 @@
 import type { StageName } from "../core/types.ts";
 import type { GateConfig } from "../gates/detect.ts";
-import { cancelGateExecution, executeGate } from "../gates/executor.ts";
+import { cancelGateExecution, executeGate, gateShutdown } from "../gates/executor.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
 import { headSha } from "../git/repos.ts";
 import type { RunContext } from "./context.ts";
@@ -15,6 +15,13 @@ export async function runGateExecution(
   hooks: GateHooks = {},
 ): Promise<GateRun> {
   ctx.checkCancelled();
+  // LAN retries get a fresh checkout, so they must rebuild the original setup output.
+  if (
+    ctx.deps.gateExecutor?.kind === "lan" &&
+    ctx.deps.cfg.workers.repos.includes(ctx.repo.slug) &&
+    purpose.includes("-retry")
+  )
+    gates = { ...gates, setup: ctx.state.gatesConfig?.setup ?? gates.setup };
   const round = ctx.state.round;
   const sha = await headSha(cwd);
   const pending = ctx.state.gateExecution;
@@ -35,6 +42,7 @@ export async function runGateExecution(
   try {
     const result = await executeGate(
       {
+        runId: ctx.run.id,
         repo: ctx.repo.slug,
         cwd,
         baseSha: ctx.run.baseSha ?? "",
@@ -61,7 +69,7 @@ export async function runGateExecution(
     return result;
   } finally {
     // A termination before attach leaves the durable identity available for resume.
-    if (settled) {
+    if (settled && !(ctx.state.gateExecution?.handle.kind === "lan" && gateShutdown(ctx.signal))) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");
     }

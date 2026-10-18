@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { loadConfig } from "../config.ts";
 import { type OwnerDiagnostic, ownerDiagnostics } from "../db/owner-diagnostics.ts";
+import { redactGateOutput } from "../gates/output.ts";
 
 /** Read locally, never via the daemon: loopback HTTP does not establish owner identity. */
 export function localOwnerDiagnostics(runId: string, after = 0): OwnerDiagnostic[] {
@@ -22,6 +23,6 @@ export function printOwnerDiagnostics(rows: OwnerDiagnostic[]): void {
       : row.invocationId
         ? `invocation #${row.invocationId}`
         : "run";
-    console.log(`  [owner diagnostic: ${source} ${row.kind}]\n${row.text}`);
+    console.log(`  [owner diagnostic: ${source} ${row.kind}]\n${redactGateOutput(row.text)}`);
   }
 }

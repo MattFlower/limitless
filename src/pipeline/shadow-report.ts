@@ -1,5 +1,6 @@
 import type { Run } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import type { GhRunner } from "../integrations/github.ts";
 
 type Spot = { file: string; line?: number | null };
@@ -69,7 +70,7 @@ export const ghPrHistory = (gh: GhRunner): HistoryReader => {
 };
 type Finding = { file: string; title: string; line?: number };
 const label = (f: Finding) => `${f.file}:${f.line ?? "?"}: ${f.title}`;
-const path = (file: string) => file.replace(/^(\.\/)+/, "");
+const path = (file: string) => redactGateOutput(file).replace(/^(\.\/)+/, "");
 /** As the review grader: the same file, both lines known, at most 5 apart. */
 const near = (f: Finding, s: Spot, [a, b] = [f.line ?? 0, s.line ?? 0]) =>
   path(f.file) === path(s.file) && a > 0 && b > 0 && Math.abs(a - b) <= 5;
@@ -183,7 +184,7 @@ export async function shadowReport(
       }
     }
   }
-  return { rows, limit, capped: shadowed.length > limit };
+  return redactGateData({ rows, limit, capped: shadowed.length > limit });
 }
 export function formatShadowReport({ rows, limit, capped }: ShadowReport): string {
   const join = (items: string[]) => items.join("; ") || "none";
@@ -201,5 +202,7 @@ export function formatShadowReport({ rows, limit, capped }: ShadowReport): strin
       ]),
     ])
     .join("\n");
-  return (capped ? `Showing the newest ${limit} runs; older runs were left out.\n` : "") + output;
+  return redactGateOutput(
+    (capped ? `Showing the newest ${limit} runs; older runs were left out.\n` : "") + output,
+  );
 }

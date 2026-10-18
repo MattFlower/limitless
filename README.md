@@ -76,7 +76,7 @@ explicitly if the running daemon does not support drain; failures attempt rollba
 
 The Mac backend is **oMLX**, managed externally by oMLX.app / `omlx start` on port **8989**.
 Set `OMLX_API_KEY` in `secrets.env`; the default local model is `omlx/qwen-flash`
-(Qwen3.8-Flash-Next-REAP-288-MLX-4bit), and `omlx/qwen-27b` (Swift-1.5-Qwen3.8-27b-oQ8e-mtp) is opt-in.
+(Qwen3.8-Flash-Next-oQ4e-mtp), and `omlx/qwen-27b` (Qwen3.8-27B-8bit) is opt-in.
 Tool-free roles accept `@none` / `@high`; agentic roles use the bare ID. The committed
 `routing/policy.json` overlay takes precedence over built-in defaults. For mtplx rollback, use
 `limitless service install --mtplx` and select `mtplx/qwen-27b`; existing agents are not removed.
