@@ -714,6 +714,24 @@ test("reload preserves literal control state while redacting legacy feedback", a
   ctx.state.answers = [literal];
   ctx.state.gatesConfig = { ...gates, checks: [{ name: "check", run: literal }] };
   ctx.state.baselineScripts = { check: literal };
+  // Baseline identities decide verdicts after a resume; retry history keeps a check uncitable.
+  const name = "\x1b[31mcheck";
+  const passing = { name, command: "true", ok: true, exitCode: 0, durationMs: 1, output: "pass" };
+  ctx.state.baseline = { setupOk: true, setup: [], checks: [passing] };
+  ctx.state.gateEvidence = {
+    stageId: 1,
+    sha: "a".repeat(40),
+    checks: [
+      {
+        name,
+        verdict: "pass",
+        blocking: false,
+        testCommand: "bun test",
+        result: passing,
+        firstAttempt: { ...passing, ok: false, exitCode: 1 },
+      },
+    ],
+  };
   await ctx.save();
   expect(f.store.getRunState<RunState>(ctx.run.id)).toMatchObject({
     spec: { summary: literal },
@@ -730,6 +748,8 @@ test("reload preserves literal control state while redacting legacy feedback", a
   expect(resumed.state.answers).toEqual([literal]);
   expect(resumed.state.gatesConfig?.checks[0]?.run).toBe(literal);
   expect(resumed.state.baselineScripts?.check).toBe(literal);
+  expect(resumed.state.baseline?.checks[0]?.name).toBe(name);
+  expect(resumed.state.gateEvidence?.checks[0]).toMatchObject({ name, firstAttempt: { ok: false } });
 });
 
 test.each(["hook", "purpose", "sha"] as const)(

@@ -58,8 +58,53 @@ config, all 28 still passed, and the pre-push rows had planted into the push rep
 because the fake `gh` inherited the script's `GIT_DIR` and `GIT_COMMON_DIR`. The fake git now lists
 the config each push reads, the test fails if a planted key appears there, and one row per plant
 point plants all seven keys into the clone. Under the same mutation all four rows fail. The file
-went from 122 tests to 98. The remaining candidates are left for separate changes, since each
-removal needs the mutation evidence that `test/AGENTS.md` asks for.
+went from 122 tests to 98. The other candidates are handled in
+[Overlapping tests](#overlapping-tests-2026-10-18).
+
+## Overlapping tests (2026-10-18)
+
+The overlap review's remaining candidates were each checked by mutation before anything was removed.
+The guard on the removed row's path was edited in a copy of the source, the kept rows were run, and
+the source was restored. A row was removed only if a kept row, or a new unit test, failed under that
+edit. Where every proposed mutation also passed the kept rows, the candidate stayed: for example
+`clean-scripts`, `setup-regressed`, `draft-body`, `head-lookup-malformed`, the verify-change
+`terminated` row and all four eval cancellation rows.
+
+| File | Tests before | After | What went |
+| --- | ---: | ---: | --- |
+| `failure-injection.test.ts` | 140 | 117 | Recovery and exhaustion rows that share one fallback, cancellation stages awaited like triage, stream points sharing the invoke catch, delivery calls sharing one subprocess path; one test merged into another |
+| `pipeline-delivery-privacy.test.ts` | 31 | 24 | Inputs that git-integrity and gates unit-test against the same publication checks |
+| `pipeline-verification.test.ts` | 25 | 17 | Refusal reasons and retry inputs; two moved to `gate-evidence.test.ts` |
+| `pipeline-merge-integrity.test.ts` | 11 | 5 | Three moved to `completeMerge` rows in `merge-markers.test.ts` |
+| `git-integrity.test.ts` | 228 | 215 | Clean LFS formats, inert file names; unmatched media rules moved to a pure `auditDiff` test |
+| `evals-implement-runner.test.ts` | 79 | 72 | Identical replies, cleanup rows covered by a stronger test, redundant cache-key combinations |
+| `pipeline-audit.test.ts` | 11 | 8 | Allowance spellings unit-tested in `gates.test.ts` |
+| `pipeline-gates.test.ts` | 17 | 14 | Restart rows covered by `gate-executor.test.ts` |
+| `pipeline-shadow.test.ts` | 37 | 35 | A failure kind sharing the timeout branch, a headroom value sharing one comparison; two runs fewer and one round each in the quota-reach test |
+| `pipeline-conflicts.test.ts` | 17 | 15 | Base states covered by stronger rows |
+| `pipeline-verify-change.test.ts` | 19 | 17 | A subset of `restart-repair`; one moved to an `auditDiff` row |
+| Unit files receiving moved cases (`gates`, `gate-evidence`, `merge-markers`, `hardening`, `gate-executor`) | 334 | 349 | |
+| **Changed files** | **949** | **888** | |
+
+Some removals needed a stronger kept test first. "PR creation window reconciles a stateful fake" now
+asserts a single `gh pr create`, which fails if the lookup before create is skipped; the test it
+absorbed slept 2.5 s and couldn't observe its own guarantee. The pathspec case uses 4,800 paths of
+at most 480 bytes instead of 16,000 short ones: together they still exceed Linux's 2 MiB argv limit,
+each stays well inside macOS's 1,024-byte `PATH_MAX`, and the test now also bounds the number of git
+commands.
+The shadow review's 5 s settle wait is `shadowSettle.ms`, which one test shortens. The blocked
+verify-change rows run with `maxRounds = 1`.
+
+With these removals `bun run check` took 351 s at a median load of 20.8, against 361 s at 16.7 for
+the last run before them. One failure in that run, in `needs-you-ui.test.ts`, also fails alone on
+`main` and on commits before this change.
+
+The mutations also found gaps that this change doesn't close:
+- Nothing in `failure-injection.test.ts` guards the claude stream completion check: `requireStructured`
+  masks a loosened check, and the invoke catch masks a parser that throws.
+- No mutation specific to auto-merge fails its cancellation row; it only exercises the shared merge path.
+- With `requireMerge` disabled, the factory merge rows still passed because `git merge-base HEAD
+  MERGE_HEAD` fails closed; the new single-parent unit test is the only one that fails.
 
 ## Git wrapper caching (#319)
 

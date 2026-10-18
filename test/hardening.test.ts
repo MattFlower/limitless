@@ -1780,24 +1780,38 @@ describe("audit hardening", () => {
     expect(rules).toContain("test-moved-out:block");
   });
 
-  test("changing a script a gate runs is blocked", () => {
-    const f = auditDiff(diff([{ status: "M", path: "package.json" }]), {
-      taskClass: "bugfix",
-      protectedPaths: [],
-      gateScripts: {
-        before: { test: "bun test", lint: "biome check ." },
-        after: { test: "true", lint: "biome check ." },
-      },
-    });
-    expect(f).toEqual([
-      {
-        rule: "gate-script-changed",
-        severity: "block",
-        file: "package.json",
-        detail: 'Changed the "test" script that a factory check runs ("bun test" → "true").',
-      },
-    ]);
-  });
+  test.each([
+    [
+      "changing",
+      { test: "true", lint: "biome check ." },
+      ['Changed the "test" script that a factory check runs ("bun test" → "true").'],
+    ],
+    [
+      "removing",
+      {},
+      [
+        'Removed the "test" script that a factory check runs.',
+        'Removed the "lint" script that a factory check runs.',
+      ],
+    ],
+  ] as [string, Record<string, string>, string[]][])(
+    "%s a script a gate runs is blocked",
+    (_kind, after, details) => {
+      const f = auditDiff(diff([{ status: "M", path: "package.json" }]), {
+        taskClass: "bugfix",
+        protectedPaths: [],
+        gateScripts: { before: { test: "bun test", lint: "biome check ." }, after },
+      });
+      expect(f).toEqual(
+        details.map((detail) => ({
+          rule: "gate-script-changed",
+          severity: "block",
+          file: "package.json",
+          detail,
+        })),
+      );
+    },
+  );
 
   test("skip markers inside string literals are not flagged", () => {
     const patch = [
