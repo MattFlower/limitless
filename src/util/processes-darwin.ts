@@ -210,11 +210,14 @@ export function markedDarwinProcesses(
   // the child's new session and group admit only its descendants. Only the random marker could
   // still match it, and it was not started by this invocation (hiddenDarwinProcessMember drops
   // orphans born before `started` for the same reason). Reading argv is most of a scan's cost,
-  // and almost every process predates the spawn. An unreadable start time is inspected as before.
-  const predatesSpawn = (pid: number) =>
-    spawnedAt > 0n && symbols.proc_pid_rusage(pid, 0 /* RUSAGE_INFO_V0 */, ptr(usage)) === 0
-      ? (usage[10] ?? spawnedAt) < spawnedAt
-      : false;
+  // and almost every process predates the spawn. An unreadable or unset (zero) start time is
+  // inspected as before.
+  const predatesSpawn = (pid: number) => {
+    if (spawnedAt <= 0n || symbols.proc_pid_rusage(pid, 0 /* RUSAGE_INFO_V0 */, ptr(usage)) !== 0)
+      return false;
+    const start = usage[10] ?? 0n;
+    return start > 0n && start < spawnedAt;
+  };
   const errno = () => {
     const address = symbols.__error();
     return address === null ? 0 : (new Int32Array(toArrayBuffer(address, 0, 4))[0] ?? 0);

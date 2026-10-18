@@ -701,7 +701,7 @@ else if (args[1] === "view") {
       );
       expect(
         (call.configView ?? [["unlisted"]]).filter(
-          ([origin = "", name = ""]) => visible.includes(name) && !trusted.includes(origin),
+          ([origin = "", name = ""]) => visible.includes(name.toLowerCase()) && !trusted.includes(origin),
         ),
       ).toEqual([]);
     }

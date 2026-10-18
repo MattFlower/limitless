@@ -6,9 +6,10 @@ retry_files = "bun test --isolate {files}"
 checks = [
   { name = "lint", run = "bun run lint" },
   { name = "typecheck", run = "bun run typecheck" },
-  # The full suite takes about 18 minutes while two gates and a land check share the machine (2026-10-04),
+  # The full suite took about 18 minutes while two gates and a land check shared the machine (2026-10-04),
   # so the 900 s default timed out the test gate in nearly every run, and a check that also times out
-  # on the base counts as still failing and doesn't block.
+  # on the base counts as still failing and doesn't block. It takes about 5 minutes since 2026-10-18;
+  # the limit stays for loaded machines.
   { name = "test", run = 'bun test --parallel=$(bun scripts/test-workers.ts) --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"', timeoutSec = 1800 },
 ]
 

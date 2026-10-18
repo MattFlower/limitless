@@ -314,6 +314,8 @@ describe("process handling", () => {
     expect(selected(6n)).toEqual([]);
     native.setMemberStart({ errno: 1 });
     expect(selected(6n)).toEqual([native.memberPid]);
+    native.setMemberStart(0n);
+    expect(selected(6n)).toEqual([native.memberPid]);
   });
 
   test.skipIf(process.platform !== "darwin")(

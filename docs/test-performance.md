@@ -39,10 +39,10 @@ a cleaner comparison: 42.3 s and 42.6 s on `190fe64`, 17.0 s and 17.1 s with bot
 against 22 s).
 
 With both changes the suite's per-file durations sum to 1,790 s, against 4,468 s before, so four
-workers can't go below about 450 s; `land-pr.test.ts` (189 s) is the longest file. No test was
-removed or skipped, and no assertion was weakened. The gate executor's cancellation test assumed its
-second check was already running when it cancelled; faster commands let the cancellation land while
-that check's sandbox was still starting, so the test now waits until the check runs.
+workers can't go below about 450 s; `land-pr.test.ts` (189 s) is the longest file. These two
+changes removed or skipped no test and weakened no assertion. The gate executor's cancellation test
+assumed its second check was already running when it cancelled; faster commands let the cancellation
+land while that check's sandbox was still starting, so the test now waits until the check runs.
 
 **Workers follow the machine.** The suite's default worker count was a fixed 4. With each suite now
 needing about 1,900 CPU-seconds instead of 4,800, the default is a third of the cores, clamped to
