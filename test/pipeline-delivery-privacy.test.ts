@@ -13,6 +13,9 @@ import {
   mergePullRequest,
   pushExistingBranch,
 } from "../src/git/repos.ts";
+import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
+import { reportStructure } from "../src/pipeline/report-privacy.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
@@ -44,6 +47,71 @@ const { start, githubFixture, registerGithub } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("PR bodies and round comments sanitize local paths before privacy checks", async () => {
+    const bare = await githubFixture();
+    const secret = "SYNTHETIC_PUBLICATION_CREDENTIAL_582";
+    proc.registerCredential("publication-test", secret);
+    let implementations = 0;
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return {
+        files: { "farewell.txt": `goodbye ${++implementations}\n` },
+        text: `[farewell](${s.cwd}/farewell.txt) \`${s.cwd}/farewell.txt\` [log](${f.cfg.paths.home}/runs/log.txt) ${secret}`,
+      };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), f.cfg.paths.home);
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const expected = "[farewell.txt](farewell.txt) `farewell.txt` <data>/runs/log.txt [redacted]";
+    expect(readFileSync(join(home, "gh-body"), "utf8")).toContain(expected);
+    expect(reportStructure(f.store.getArtifact(run.id, "report.md") ?? "")).toBeTruthy();
+    await f.stop();
+
+    const owner = f.store.getRun(run.id);
+    if (!owner?.prUrl || !owner.branch || !owner.headSha) throw new Error("Missing delivered PR");
+    const comments: string[] = [];
+    f.deps.gh = async (args, _signal, stdin) => {
+      if (args[1] === "comment") {
+        comments.push(stdin ?? "");
+        return "";
+      }
+      if (args[1] !== "view") throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      return JSON.stringify({
+        state: "OPEN",
+        isDraft: false,
+        headRefOid: (
+          await sh(["git", "rev-parse", `refs/heads/${owner.branch}`], { cwd: bare })
+        ).stdout.trim(),
+        headRefName: owner.branch,
+        isCrossRepository: false,
+        headRepository: { name: "repo" },
+        headRepositoryOwner: { login: "test" },
+        body: "Public report",
+        comments: [],
+      });
+    };
+    f.store.recordCiFixTrigger(
+      owner.prUrl,
+      owner.headSha,
+      "failure",
+      { check: "test", line: "FAIL validation", excerpt: "error: invalid farewell" },
+      Date.now(),
+    );
+    await processConflictTriggers(f.store, Date.now, f.deps.gh);
+    const round = f.store.reviewRounds(owner.prUrl).at(-1);
+    if (!round) throw new Error("Missing CI round");
+    expect(await executeRun(f.deps, round.runId, new AbortController().signal)).toBe("succeeded");
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain(expected);
+    for (const text of [comments[0] ?? "", readFileSync(join(home, "gh-body"), "utf8")]) {
+      expect(text).not.toContain(f.cfg.paths.home);
+      expect(text).not.toContain(secret);
+    }
+  });
+
   test.each(["entity", "clean"])("squash publication checks visible PR text: %s", async (form) => {
     await githubFixture();
     const phrase = ["private", "squash", "value"].join(" ");
