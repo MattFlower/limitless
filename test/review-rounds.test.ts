@@ -443,13 +443,18 @@ test("a changes verdict runs one round that pushes onto the PR branch with the f
   expect(kinds()).toEqual(expect.arrayContaining(["review.round_started", "review.round_delivered"]));
 });
 
-test.each(["finding newline", "finding spaces", "existing body"])(
+test.each(["finding newline", "finding spaces", "finding ampersand", "existing body"])(
   "private text in the rendered round publication blocks the edit: %s",
   async (scenario) => {
     const original = await delivered();
-    const phrase = ["private", "round", "value"].join(" ");
+    const phrase = ["private", ...(scenario === "finding ampersand" ? ["&"] : []), "round", "value"].join(
+      " ",
+    );
     const entries = [{ value: phrase, entry: 1 }];
-    const title = phrase.replaceAll(" ", scenario === "finding newline" ? "\n" : "   ");
+    const title = phrase.replaceAll(
+      " ",
+      ["finding newline", "finding ampersand"].includes(scenario) ? "\n" : "   ",
+    );
     expect(() => checkPrivateText(title, "Raw finding", entries)).not.toThrow();
     mkdirSync(factory.cfg.paths.configDir, { recursive: true });
     writeFileSync(join(factory.cfg.paths.configDir, "private-strings.txt"), phrase);
@@ -462,7 +467,7 @@ test.each(["finding newline", "finding spaces", "existing body"])(
     });
     expect(created.status).toBe(201);
     const id = created.body.round?.id as string;
-    if (scenario !== "finding newline") {
+    if (scenario === "existing body") {
       await restart({
         "store:save": { action: "kill", when: (c) => c.checkpoint === "round-delivered" },
       });
@@ -472,12 +477,36 @@ test.each(["finding newline", "finding spaces", "existing body"])(
     const round = await settle(id);
     expect(round.status).toBe("needs_human");
     expect(round.error).toContain("contains a private string (entry 1 in private-strings.txt)");
+    if (scenario === "finding ampersand") expect(round.error).toContain("PR round section contains");
     expect(round.error).not.toContain(phrase);
     expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
     expect(pr.body).toBe(body);
-    expect(factory.store.reviewRound(id)?.deliveredSha).toBe(await remoteHead());
+    // Whitespace folding now blocks the spaces-only finding in the earlier report-body check.
+    expect(factory.store.reviewRound(id)?.deliveredSha).toBe(
+      scenario === "finding spaces" ? null : await remoteHead(),
+    );
   },
 );
+
+test("clean round findings with ampersands, brackets and entity-like text still publish", async () => {
+  const original = await delivered();
+  const title = "Use & <tag> &amp; &unknown; &#65; &#x42;";
+  mkdirSync(factory.cfg.paths.configDir, { recursive: true });
+  writeFileSync(
+    join(factory.cfg.paths.configDir, "private-strings.txt"),
+    ["private", "&", "value"].join(" "),
+  );
+  const created = await review(original.id, {
+    verdict: "changes",
+    reviewedSha: await remoteHead(),
+    findings: [{ ...findings[0], title }],
+  });
+  expect(created.status).toBe(201);
+  const round = await settle(created.body.round?.id as string);
+  expect(round.status).toBe("succeeded");
+  expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+  expect(pr.body).toContain("Use &#38; &#60;tag&#62; &#38;amp; &#38;unknown; &#38;#65; &#38;#x42;");
+});
 
 test.each(["none", "round-delivered", "delivery-complete", "draft"])(
   "an environment-blocked review round publishes its checked head, restarting at %s",

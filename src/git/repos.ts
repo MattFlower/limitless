@@ -10,6 +10,7 @@ import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } f
 import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
+import { checkPublicationText } from "../gates/publication.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import {
   emptyHookFlags,
@@ -670,7 +671,7 @@ export async function checkPrivatePublication(
   },
 ) {
   const { commits: range, squash, staged } = input;
-  if (squash) privacy.checkPrivateText(`${squash.title}\n${squash.body}`, "PR text", entries);
+  if (squash) checkPublicationText(`${squash.title}\n${squash.body}`, "PR text", entries);
   const log = [
     "git",
     "--no-replace-objects",
@@ -1341,7 +1342,7 @@ export async function mergePullRequest(
         if (!rawTitle.trim()) throw new Error("missing merge subject");
         const title = squashTitle(rawTitle, prUrl);
         const body = opts.body ?? data.body;
-        privacy.checkPrivateText(`${title}\n${body}`, "PR text", entries);
+        checkPublicationText(`${title}\n${body}`, "PR text", entries);
         blocked = false;
         const subject =
           opts.body !== undefined

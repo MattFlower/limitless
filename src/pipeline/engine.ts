@@ -22,6 +22,7 @@ import {
 } from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
+import { checkPublicationText } from "../gates/publication.ts";
 import {
   compareGates,
   confinementFailed,
@@ -1947,7 +1948,7 @@ function privateEntries(ctx: RunContext, cwd: string) {
   return loadPrivateStrings(configDir, [cwd, ctx.repo.localPath, repos, work]);
 }
 
-/** Check the exact outgoing text; `pr` also checks the title, branch and published range. */
+/** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
   body: string,
@@ -1957,7 +1958,7 @@ async function checkPublication(
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = privateEntries(ctx, cwd);
-    checkPrivateText(body, location, entries);
+    checkPublicationText(body, location, entries);
     if (!pr) return;
     checkPrivateText(pr.title, "PR title", entries);
     const branch =
