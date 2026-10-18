@@ -10,7 +10,7 @@ import {
   runCodex,
 } from "../src/harness/codex.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { type ConfinementBackend, ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
+import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
 import {
