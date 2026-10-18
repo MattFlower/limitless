@@ -1,13 +1,17 @@
 import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { dirname } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { ConfinementError, homeReadPolicy } from "./read-policy.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
   agentShellEnv,
   invocationCommands,
+  privateReadRoots,
   readConfinement,
   scratchParent,
+  spellings,
   validateDenyRead,
   validateScratch,
   writeRoots,
@@ -221,13 +225,32 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       // allow would search anywhere. dontAsk refuses every other path.
       const readable = confined ? [...confined.cwd, ...confined.scratch] : [];
       if (confined) readTools = readable.map((p) => `Read(/${p}/**)`);
+      const bun = confined ? spellings([dirname(process.execPath)]) : [];
+      if (confined) {
+        // allowRead overrides denyRead: never open credentials or wrapper capabilities with Bun.
+        homeReadPolicy(bun, false, [...explicit, ...commands.root]);
+        if (
+          bun.some((allow) =>
+            privateReadRoots().some((root) => root === allow || root.startsWith(`${allow}/`)),
+          )
+        )
+          throw new ConfinementError("Bun installation would expose a private reader root");
+        for (const allow of bun)
+          for (const deny of [...explicit, ...commands.root])
+            if (allow === deny || allow.startsWith(`${deny}/`) || deny.startsWith(`${allow}/`))
+              throw new ConfinementError("Bun installation overlaps a denied reader path");
+      }
       filesystem = {
         allowWrite: [scratch],
         denyWrite: [realpathSync(spec.cwd), ...commands.root],
         ...(denyRead.length ? { denyRead } : {}),
         // Takes precedence over denyRead, so the private roots may contain cwd and scratch. Only an
         // unconfined reader receives command wrappers, so only it may read its own.
-        ...(confined ? { allowRead: readable } : commands.own.length ? { allowRead: commands.own } : {}),
+        ...(confined
+          ? { allowRead: [...readable, ...bun] }
+          : commands.own.length
+            ? { allowRead: commands.own }
+            : {}),
         disabled: false,
       };
     }

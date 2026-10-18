@@ -40,11 +40,13 @@ import {
   readConfinement,
   removeScratch,
   SCRATCH_NAME,
+  scratchParent,
   withScratch,
   writeRoots,
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
+import { protectPrivateFile } from "../src/util/private-reads.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -307,6 +309,85 @@ test("confined readers are granted reads only in their cwd and scratch", () => {
   } finally {
     cleanup();
     rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test("Claude verifier grants Bun's canonical installation only to Bash and retains its exact scratch environment", async () => {
+  const { cwd, scratch, spec, cleanup } = confinedFixture();
+  const install = join(scratchParent(scratch), "bun"),
+    alias = `${install}-alias`;
+  const executable = process.execPath;
+  mkdirSync(join(install, "bin"), { recursive: true });
+  writeFileSync(join(install, "bin", "bun"), "fixture");
+  symlinkSync(install, alias);
+  try {
+    process.execPath = join(alias, "bin", "bun");
+    await runClaude(spec, async (opts) => {
+      for (const path of [process.execPath, join(install, "bin", "bun")])
+        expect(claudeSandboxReads(opts.cmd, path)).toBe(true);
+      for (const path of [
+        join(install, "install/cache"),
+        join(install, "private"),
+        ...commandRoots().map((r) => join(r, "other", "config.json")),
+      ])
+        expect(claudeSandboxReads(opts.cmd, path)).toBe(false);
+      const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+      expect(settings.sandbox.filesystem.allowWrite).toEqual([realpathSync(scratch)]);
+      expect(settings.sandbox.filesystem.denyWrite).toContain(realpathSync(cwd));
+      const allowed = opts.cmd.slice(
+        opts.cmd.indexOf("--allowedTools") + 1,
+        opts.cmd.indexOf("--disallowedTools"),
+      );
+      expect(allowed).not.toContain(`Read(/${join(install, "bin")}/**)`);
+      expect(opts.env.CLAUDE_CODE_TMPDIR).toBe(scratchParent(scratch));
+      for (const name of ["TMPDIR", "TMP", "TEMP"]) expect(opts.env[name]).toBe(scratch);
+      expect(opts.env.PATH).toBe(process.env.PATH);
+      opts.onStdoutLine?.('{"type":"result","result":"ok"}');
+      return procResult;
+    });
+  } finally {
+    process.execPath = executable;
+    cleanup();
+  }
+});
+
+test("Claude verifier refuses Bun allowances that would override credential, private-file or wrapper denial", () => {
+  const { scratch, spec, cleanup } = confinedFixture();
+  const home = join(scratchParent(scratch), "home");
+  const executable = process.execPath;
+  const bin = join(home, "bun", "bin"),
+    credential = join(bin, "login");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(credential);
+  writeFileSync(join(bin, "bun"), "fixture");
+  const alias = join(home, "credential-alias");
+  symlinkSync(credential, alias);
+  const check = (environment: NodeJS.ProcessEnv, denied: string[] = []) =>
+    readPolicyScope.run({ home, environment }, () => {
+      expect(() => buildClaudeArgs({ ...spec, denyRead: denied }, "id")).toThrow(ConfinementError);
+    });
+  try {
+    process.execPath = join(bin, "bun");
+    check({ GH_CONFIG_DIR: alias });
+    check({}, [join(bin, "bun")]);
+    const release = protectPrivateFile(join(bin, "bun"));
+    try {
+      check({});
+    } finally {
+      release();
+    }
+    const ssh = join(home, ".ssh", "bin");
+    mkdirSync(ssh, { recursive: true });
+    process.execPath = join(ssh, "bun");
+    check({});
+    const [commands = ""] = commandRoots();
+    process.execPath = join(commands, "bun");
+    check({});
+    process.execPath = join(tmpdir(), "bun");
+    check({});
+  } finally {
+    process.execPath = executable;
+    cleanup();
   }
 });
 

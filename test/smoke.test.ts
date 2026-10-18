@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   backendChecks,
+  bunVerifierCheck,
   type CheckResult,
   type Clock,
   catalogChecks,
@@ -37,7 +38,7 @@ import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
 import { parseExcludeOrigins } from "../src/router/origins.ts";
-import { sh } from "../src/util/proc.ts";
+import { agentEnv, runProcess, sh } from "../src/util/proc.ts";
 
 const result: AgentResult = {
   status: "ok",
@@ -160,12 +161,14 @@ test("native smoke and Codex iteration never call excluded candidates and retain
   };
   const blocked = models.filter((m) => m.origin === "CN");
   const rows = await runChecks(nativeChecks({ providers, models: blocked }, ["CN"], check));
-  expect(rows).toHaveLength(14);
+  expect(rows).toHaveLength(15);
   expect(rows.every((r) => r.reason?.includes("origin excluded (CN; baseOrigin=CN)"))).toBe(true);
   expect(calls).toEqual([]);
   await runChecks(nativeChecks({ providers, models }, ["CN"], check));
   expect(calls).toEqual(
-    models.filter((m) => m.origin === "US").flatMap((m) => Array.from({ length: 7 }, () => m.id)),
+    models
+      .filter((m) => m.origin === "US")
+      .flatMap((m) => Array.from({ length: m.provider === "claude" ? 8 : 7 }, () => m.id)),
   );
   calls.length = 0;
   await checkCodexModels(
@@ -179,7 +182,9 @@ test("native smoke and Codex iteration never call excluded candidates and retain
   expect(calls).toEqual(models.filter((m) => m.provider === "codex" && m.origin === "US").map((m) => m.id));
   calls.length = 0;
   await runChecks(nativeChecks({ providers, models }, undefined, check));
-  expect(calls).toEqual(blocked.flatMap((m) => Array.from({ length: 7 }, () => m.id)));
+  expect(calls).toEqual(
+    blocked.flatMap((m) => Array.from({ length: m.provider === "claude" ? 8 : 7 }, () => m.id)),
+  );
 });
 
 test("explicit smoke refuses exclusions before any trial and absent configuration permits unknown ancestry", async () => {
@@ -839,6 +844,150 @@ test("deploy restores the previous checkout when injected smoke fails before res
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const outcome of [
+  "pass",
+  "failed-test",
+  "missing",
+  "claim",
+  "wrong-command",
+  "error-result",
+  "timeout",
+  "cancelled",
+  "throw",
+] as const) {
+  test(`Claude verifier Bun smoke requires successful bounded execution: ${outcome}`, async () => {
+    const target: ModelTarget = {
+      modelId: "fake/m",
+      provider: "claude",
+      model: "m",
+      vendor: "fake",
+      tier: 4,
+      harness: "fake",
+      billing: "subscription",
+    };
+    const paths: string[] = [];
+    const controller = new AbortController();
+    const check = () =>
+      bunVerifierCheck(
+        async (spec) => {
+          paths.push(spec.cwd, spec.scratchDir ?? "");
+          expect(spec.mode).toBe("readonly");
+          expect(spec.confineReads).toBe(true);
+          expect(spec.noTools).not.toBe(true);
+          expect(spec.commandPath).toBeUndefined();
+          expect(spec.timeoutMs).toBe(90_000);
+          const scratch = spec.scratchDir ?? "";
+          const entry = readFileSync(join(scratch, "probe.ts"), "utf8");
+          expect(entry).toContain("timeoutMs: 10_000");
+          const source = readFileSync(join(scratch, "probe.test.ts"), "utf8");
+          expect(source).toContain("expect(1).toBe(1)");
+          const command = spec.prompt.split("\n")[1] ?? "";
+          const marker = entry.match(/console.log\("([^"]+)"\)/)?.[1] ?? "missing marker";
+          if (outcome === "throw") throw new Error("fake harness failure");
+          if (outcome === "failed-test")
+            writeFileSync(join(scratch, "probe.test.ts"), source.replace("toBe(1)", "toBe(2)"));
+          let output = marker,
+            isError = false;
+          if (outcome === "pass" || outcome === "failed-test") {
+            const run = await runProcess({
+              cmd: ["/bin/sh", "-c", command],
+              cwd: spec.cwd,
+              env: agentEnv({ TMPDIR: scratch }),
+              signal: spec.signal,
+              timeoutMs: 15_000,
+            });
+            output = run.stdout + run.stderr;
+            isError = run.exitCode !== 0;
+          }
+          if (outcome === "cancelled") controller.abort();
+          if (outcome === "claim") spec.onEvent({ type: "text", text: output });
+          else {
+            spec.onEvent({
+              type: "tool_call",
+              id: "bun",
+              name: "Bash",
+              input: { command: outcome === "wrong-command" ? `echo ${command}` : command },
+            });
+            if (outcome !== "missing")
+              spec.onEvent({
+                type: "tool_result",
+                id: "bun",
+                output,
+                isError: isError || outcome === "error-result",
+              });
+          }
+          return {
+            ...result,
+            finalText: output,
+            ...(outcome === "timeout" ? { status: "timeout", error: "timed out" } : {}),
+          };
+        },
+        target,
+        controller.signal,
+      );
+    if (outcome === "throw") await expect(check()).rejects.toThrow("fake harness failure");
+    else expect((await check()).status).toBe(outcome === "pass" ? "pass" : "fail");
+    for (const path of paths) expect(existsSync(path)).toBe(false);
+  });
+}
+
+for (const stop of ["cancelled", "deadline"] as const) {
+  test(`Claude's Bun smoke ${stop} stops its owned subprocess before removing scratch`, async () => {
+    const controller = new AbortController();
+    let scratch = "",
+      pid = 0;
+    const check = await bunVerifierCheck(
+      async (spec) => {
+        scratch = spec.scratchDir ?? "";
+        const test = join(scratch, "probe.test.ts");
+        writeFileSync(
+          test,
+          'import { test } from "bun:test"; test("hang", async () => { console.log("READY", process.pid); await new Promise(() => {}); }, 60000);',
+        );
+        const command = spec.prompt.split("\n")[1] ?? "";
+        const run = await runProcess({
+          cmd: ["/bin/sh", "-c", command],
+          cwd: spec.cwd,
+          env: agentEnv({ TMPDIR: scratch }),
+          signal: spec.signal,
+          timeoutMs: 20_000,
+          onStdoutLine: (line) => {
+            if (line.startsWith("READY")) {
+              pid = Number(line.split(" ")[1]);
+              if (stop === "cancelled") controller.abort();
+            }
+          },
+        });
+        expect(run.cancelled).toBe(stop === "cancelled");
+        expect(run.timedOut).toBe(false);
+        expect(run.stdout).not.toContain("bun-test-passed");
+        spec.onEvent({ type: "tool_call", id: "bun", name: "Bash", input: { command } });
+        spec.onEvent({
+          type: "tool_result",
+          id: "bun",
+          output: run.stdout + run.stderr,
+          isError: run.exitCode !== 0,
+        });
+        return { ...result, status: stop === "cancelled" ? "cancelled" : "ok" };
+      },
+      {
+        modelId: "fake/m",
+        provider: "claude",
+        model: "m",
+        vendor: "fake",
+        tier: 4,
+        harness: "fake",
+        billing: "subscription",
+      },
+      controller.signal,
+    );
+    expect(check.status).toBe("fail");
+    expect(existsSync(scratch)).toBe(false);
+    expect(pid).toBeGreaterThan(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 25_000);
+}
 
 for (const outcome of [
   "pass",

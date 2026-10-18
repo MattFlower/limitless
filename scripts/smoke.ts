@@ -468,11 +468,12 @@ function status(result: AgentResult): CheckResult {
 export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
-  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast" | "confine",
+  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast" | "confine" | "bun",
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
   if (kind === "verify") return verifyLiveCheck(harness, target, signal);
   if (kind === "confine") return confineLiveCheck(harness, target, signal);
+  if (kind === "bun") return bunVerifierCheck(harness, target, signal);
   const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-")));
   try {
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
@@ -717,6 +718,63 @@ for label, path in [${Object.entries({ ...canaries, config: configCanary })
     rmSync(root, { recursive: true, force: true });
     rmSync(homeDir, { recursive: true, force: true });
     rmSync(configCanary, { force: true });
+  }
+}
+
+/** Exercise the verifier's real tool sandbox, including Bun's child test runner. */
+export async function bunVerifierCheck(
+  harness: Harness,
+  target: ModelTarget,
+  signal = new AbortController().signal,
+): Promise<CheckResult> {
+  const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-bun-")));
+  try {
+    return await withScratch(cwd, async (scratchDir) => {
+      const token = crypto.randomUUID(),
+        events: AgentEvent[] = [];
+      const test = join(scratchDir, "probe.test.ts"),
+        entry = join(scratchDir, "probe.ts");
+      writeFileSync(
+        test,
+        'import { test, expect } from "bun:test"; test("probe", () => expect(1).toBe(1));\n',
+      );
+      writeFileSync(
+        entry,
+        `import { runProcess } from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
+const r = await runProcess({cmd: [process.execPath, "test", ${JSON.stringify(test)}], cwd: ${JSON.stringify(scratchDir)}, env: process.env, timeoutMs: 10_000, onStdoutLine: (line) => console.log(line)});
+process.stdout.write(r.stdout); process.stderr.write(r.stderr);
+if (r.exitCode === 0 && !r.timedOut && !r.cancelled && /1 pass/.test(r.stdout + r.stderr) && /0 fail/.test(r.stdout + r.stderr)) console.log("${token}:bun-test-passed");
+else process.exitCode = 1;
+`,
+      );
+      const bundle = await Bun.build({ entrypoints: [entry], target: "bun" });
+      if (!bundle.success || !bundle.outputs[0]) return fail("cannot build bounded Bun probe");
+      const probe = join(scratchDir, "probe.mjs");
+      writeFileSync(probe, await bundle.outputs[0].text());
+      const quote = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
+      const command = `${quote(process.execPath)} ${quote(probe)}`;
+      const result = await harness({
+        cwd,
+        scratchDir,
+        target,
+        mode: "readonly",
+        confineReads: true,
+        prompt: `Execute exactly this Bash command and report its output:\n${command}`,
+        timeoutMs: 90_000,
+        idleTimeoutMs: 30_000,
+        maxToolCalls: 8,
+        signal,
+        logPath: join(cwd, "stream.log"),
+        onEvent: (event) => events.push(event),
+      });
+      if (signal.aborted) return fail("Bun verifier probe cancelled");
+      if (result.status !== "ok") return status(result);
+      return verifyProbeEvidence(events, command, token, ["bun-test-passed"])
+        ? { status: "pass" }
+        : fail("missing successful Bun test command evidence");
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 }
 
@@ -1020,7 +1078,16 @@ export function nativeChecks(
     const selectedTarget = () =>
       (target ??= targetFor(provider, cheapestModel(id, catalog.models, excludeOrigins)));
     const harness = id === "claude" ? runClaude : runCodex;
-    for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify", "confine"] as const) {
+    for (const kind of [
+      "structured",
+      "fast",
+      "noTools",
+      "edit",
+      "quota",
+      "verify",
+      "confine",
+      ...(id === "claude" ? ["bun" as const] : []),
+    ] as const) {
       checks.push({
         name: `${id} ${kind}`,
         // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
@@ -1028,7 +1095,7 @@ export function nativeChecks(
           id === "codex" && kind === "structured"
             ? 60_000 * catalog.models.filter((m) => m.provider === id && m.source !== "runtime").length +
               30_000
-            : kind === "verify" || kind === "confine"
+            : kind === "verify" || kind === "confine" || kind === "bun"
               ? 120_000
               : 90_000,
         run: async (signal) => {

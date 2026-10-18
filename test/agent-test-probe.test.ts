@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
-import { buildClaudeArgs } from "../src/harness/claude.ts";
+import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import { editorProfile } from "../src/harness/codex.ts";
 import { seatbeltForPort } from "../src/harness/sandbox.ts";
 import {
@@ -131,3 +131,96 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
     },
   );
 }
+
+test.skipIf(seatbeltSkip !== null)(
+  `Claude verifier Bun test with production settings and environment (${seatbeltSkip ?? "available"})`,
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "verifier-bun-")));
+    const cwd = join(root, "checkout");
+    mkdirSync(cwd);
+    const scratch = createScratch(cwd);
+    const file = join(scratch, "probe.test.ts");
+    writeFileSync(file, 'import {test, expect} from "bun:test"; test("probe", () => expect(1).toBe(1));');
+    const spec: AgentSpec = {
+      cwd,
+      scratchDir: scratch,
+      mode: "readonly",
+      confineReads: true,
+      prompt: "",
+      timeoutMs: 10_000,
+      idleTimeoutMs: 10_000,
+      maxToolCalls: 1,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+      logPath: join(root, "stream.log"),
+      target: {
+        modelId: "probe",
+        provider: "fake",
+        harness: "fake",
+        model: "probe",
+        vendor: "fake",
+        tier: 1,
+        billing: "subscription",
+      },
+    };
+    const previous = process.env.CLAUDE_CODE_TMPDIR;
+    try {
+      // Change only Bun's allowance between runs; keep wrappers, checkout denyWrite and CLI temp settings.
+      for (const corrected of [false, true]) {
+        await runClaude(spec, async (opts) => {
+          const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+          const filesystem: SandboxRuntimeConfig["filesystem"] = settings.sandbox.filesystem;
+          if (!corrected)
+            filesystem.allowRead = filesystem.allowRead?.filter((p) => p === cwd || p === scratch);
+          process.env.CLAUDE_CODE_TMPDIR = opts.env.CLAUDE_CODE_TMPDIR;
+          try {
+            await SandboxManager.initialize(
+              { filesystem, network: { allowedDomains: [], deniedDomains: [] } },
+              undefined,
+              false,
+            );
+            const quote = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
+            const wrapped = await SandboxManager.wrapWithSandboxArgv(
+              [process.execPath, "test", file].map(quote).join(" "),
+              "/bin/bash",
+              undefined,
+              spec.signal,
+              cwd,
+            );
+            const result = await runProcess({
+              cmd: wrapped.argv,
+              cwd,
+              env: {
+                ...opts.env,
+                ...Object.fromEntries(
+                  Object.entries(wrapped.env).filter(
+                    (entry): entry is [string, string] => entry[1] !== undefined,
+                  ),
+                ),
+              },
+              signal: spec.signal,
+              timeoutMs: 10_000,
+            });
+            console.info(
+              `Claude verifier Bun: corrected=${corrected}, timedOut=${result.timedOut}, exit=${result.exitCode}`,
+            );
+            if (corrected) {
+              expect(result.timedOut).toBe(false);
+              expect(result.exitCode).toBe(0);
+              expect(result.stdout + result.stderr).toContain("1 pass");
+            } else expect(result.exitCode === 0 && !result.timedOut).toBe(false);
+            return result;
+          } finally {
+            await SandboxManager.reset();
+          }
+        });
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CODE_TMPDIR;
+      else process.env.CLAUDE_CODE_TMPDIR = previous;
+      removeScratch(scratch);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
