@@ -12,7 +12,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
-import { gitSh } from "./confinement.ts";
+import { type GitOptions, gitSh } from "./confinement.ts";
 import { harden } from "./hardening.ts";
 
 /** Each pipeline run has its own scope; `false` opts out of the hardened git wrapper. */
@@ -89,7 +89,7 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
 export class WorktreeCleanError extends Error {}
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
-export const worktreeGit = (cmd: string[], opts: Parameters<typeof sh>[1], retryClean = false) =>
+export const worktreeGit = (cmd: string[], opts: GitOptions, retryClean = false) =>
   runGit(cmd, opts, retryClean, gitSh);
 
 /** Only factory-owned repositories and remote transports; never a checkout dirty check. */

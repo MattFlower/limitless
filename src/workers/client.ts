@@ -279,7 +279,10 @@ export async function runWorker(
           if (existsSync(cwd))
             await withRepoLock(cache, async () => {
               restoreDirectoryPermissions(cwd);
-              await worktreeGit(["git", "worktree", "remove", "--force", cwd], { cwd: cache });
+              await worktreeGit(["git", "worktree", "remove", "--force", cwd], {
+                cwd: cache,
+                additionalWriteRoots: [cwd],
+              });
             });
         } catch {
           diagnostic();

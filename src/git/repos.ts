@@ -387,12 +387,12 @@ export async function exportCommit(
     const env = {
       ...(process.env as Record<string, string>),
       GIT_INDEX_FILE: join(scratch, "index"),
-      TMPDIR: dest,
     };
     await worktreeGit(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
     await worktreeGit(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
       env,
+      additionalWriteRoots: [dest],
       signal,
       timeoutMs: 300_000,
     });

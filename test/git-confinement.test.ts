@@ -18,6 +18,7 @@ import {
   blobPrivateEntries,
   checkPrivateRange,
   commitAll,
+  exportCommit,
   pushBranch,
   rebaseOnto,
 } from "../src/git/repos.ts";
@@ -101,6 +102,86 @@ test("profile restricts execution, writes and network with safely quoted paths",
   expect(profile).not.toContain("/bin/sh");
   expect(() => gitProfile(['bad"path'], undefined, [])).toThrow(ConfinementError);
 });
+
+test("additional write roots must be nonempty absolute paths", async () => {
+  mkdirSync(join(cwd, "sub/dir"), { recursive: true });
+  const dest = join(root, "additional");
+  mkdirSync(dest);
+  const run: typeof sh = async () => ({ stdout: root, stderr: "", exitCode: 0 });
+  const backend = seatbeltGit("darwin", process.execPath, run);
+  const prepare = (path: string) =>
+    invocationScratch.run(root, () =>
+      backend.wrap([process.execPath, "status"], { cwd, additionalWriteRoots: [path] }),
+    );
+  for (const path of ["..", "sub/dir", ""])
+    await expect(prepare(path)).rejects.toBeInstanceOf(ConfinementError);
+  const wrapped = await prepare(dest);
+  expect(wrapped[2]).toContain(`(subpath "${realpathSync(dest)}")`);
+});
+
+test("export grants checkout-index a canonical destination root in the derived profile", async () => {
+  const dest = join(root, "export");
+  const link = join(root, "export-link");
+  mkdirSync(dest);
+  symlinkSync(dest, link);
+  const developer = join(root, "developer");
+  mkdirSync(join(developer, "usr/bin"), { recursive: true });
+  symlinkSync(realpathSync(Bun.which("git") ?? "git"), join(developer, "usr/bin/git"));
+  const run: typeof sh = async (cmd) => ({
+    stdout: cmd[0] === "/usr/bin/xcode-select" ? developer : cwd,
+    stderr: "",
+    exitCode: 0,
+  });
+  const backend = seatbeltGit("darwin", process.execPath, run);
+  const calls: { cmd: string[]; profile: string }[] = [];
+  await gitConfinement.run(
+    {
+      wrap: async (cmd, opts) => {
+        const wrapped = await backend.wrap(cmd, opts);
+        calls.push({ cmd, profile: wrapped[2] ?? "" });
+        return cmd;
+      },
+    },
+    () => exportCommit(cwd, "HEAD", link),
+  );
+  expect(readFileSync(join(dest, "file"), "utf8")).toBe("base\n");
+  expect(calls.filter(({ cmd }) => cmd.includes("checkout-index"))).toHaveLength(1);
+  for (const { cmd, profile } of calls) {
+    if (cmd.includes("checkout-index") || cmd.includes("read-tree"))
+      expect(profile.includes(`(subpath "${realpathSync(dest)}")`)).toBe(cmd.includes("checkout-index"));
+    expect(profile).not.toContain(`(subpath "${realpathSync(root)}")`);
+    expect(profile).not.toContain(`(subpath "${link}")`);
+  }
+  for (const name of ["missing", 'bad"root']) {
+    if (name !== "missing") mkdirSync(join(root, name));
+    await expect(
+      gitConfinement.run(backend, () =>
+        gitSh(["git", "status"], { cwd, additionalWriteRoots: [join(root, name)], allowFail: true }),
+      ),
+    ).rejects.toBeInstanceOf(ConfinementError);
+  }
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `export populates its sibling destination and denies another sibling (${seatbeltSkip ?? "available"})`,
+  async () => {
+    const dest = join(root, "export");
+    const denied = join(root, "denied");
+    mkdirSync(dest);
+    mkdirSync(denied);
+    await real(async () => {
+      await exportCommit(cwd, "HEAD", dest);
+      expect(readFileSync(join(dest, "file"), "utf8")).toBe("base\n");
+      const result = await gitSh(["git", "checkout-index", "--all", `--prefix=${denied}/`], {
+        cwd,
+        additionalWriteRoots: [dest],
+        allowFail: true,
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(existsSync(join(denied, "file"))).toBe(false);
+    });
+  },
+);
 
 test("a subprocess without the test preload cannot select the fake backend", async () => {
   const module = resolve("src/git/confinement.ts");
@@ -257,22 +338,39 @@ for (const vector of ["clean", "process"]) {
     async (shape, args) => {
       const marker = await nested(vector);
       if (shape === "commit") writeFileSync(join(cwd, "file"), "edit\n");
-      await real(async () => {
-        if (shape === "staging") await stageAll({ cwd });
-        else {
-          try {
-            await worktreeGit(["git", ...args], { cwd, allowFail: true });
-          } catch (error) {
-            if (
-              !["merge", "rebase"].includes(shape) ||
-              !(error instanceof Error) ||
-              !error.message.includes("populated nested repository")
-            )
-              throw error;
+      const backend = seatbeltGit();
+      const statusCalls: string[][] = [];
+      await gitConfinement.run(
+        {
+          wrap: async (cmd, opts) => {
+            const wrapped = await backend.wrap(cmd, opts);
+            if (cmd.includes("status")) statusCalls.push(wrapped);
+            return wrapped;
+          },
+        },
+        async () => {
+          if (shape === "staging") await stageAll({ cwd });
+          else {
+            try {
+              await worktreeGit(["git", ...args], { cwd, allowFail: true });
+            } catch (error) {
+              if (
+                !["merge", "rebase"].includes(shape) ||
+                !(error instanceof Error) ||
+                !error.message.includes("populated nested repository")
+              )
+                throw error;
+            }
           }
-        }
-      });
+        },
+      );
       expect(existsSync(marker)).toBe(false);
+      if (shape === "status") {
+        expect(statusCalls).toHaveLength(1);
+        expect(statusCalls[0]?.slice(0, 2)).toEqual(["/usr/bin/sandbox-exec", "-p"]);
+        expect(statusCalls[0]?.[2]).toContain("(deny process-exec)");
+        expect(statusCalls[0]?.[2]).toContain("(deny file-write*)");
+      }
     },
   );
   test(`identity control: nested ${vector} executes on an empty commit`, async () => {

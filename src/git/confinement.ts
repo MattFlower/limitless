@@ -1,15 +1,18 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, lstatSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { ConfinementError } from "../harness/read-policy.ts";
 import { CommandError, invocationScratch, sh } from "../util/proc.ts";
 
 export { ConfinementError };
 
-type Options = Parameters<typeof sh>[1];
+export type GitOptions = Parameters<typeof sh>[1] & {
+  /** Existing write roots chosen by the caller for this invocation, never by repository config. */
+  additionalWriteRoots?: string[];
+};
 export interface GitConfinement {
-  wrap(cmd: string[], opts: Options): Promise<string[]>;
+  wrap(cmd: string[], opts: GitOptions): Promise<string[]>;
 }
 /** Explicit injection only; production has no environment/configuration selector. */
 export const gitConfinement = new AsyncLocalStorage<GitConfinement>();
@@ -42,6 +45,8 @@ export function seatbeltGit(platform = process.platform, executable = sandbox, r
   return {
     async wrap(cmd, opts) {
       opts.signal?.throwIfAborted();
+      if (opts.additionalWriteRoots?.some((path) => !isAbsolute(path)))
+        throw new ConfinementError("Additional Git write roots must be absolute paths");
       if (platform !== "darwin" || !existsSync(executable))
         throw new ConfinementError("Git confinement requires macOS sandbox-exec");
       const env = { ...(opts.env ?? process.env) } as Record<string, string>;
@@ -100,6 +105,7 @@ export function seatbeltGit(platform = process.platform, executable = sandbox, r
             admin,
             env.GIT_COMMON_DIR ?? admin,
             scratch,
+            ...(opts.additionalWriteRoots ?? []),
           ].map((path) => realpathSync(resolve(opts.cwd, path))),
         ),
       ];
@@ -117,7 +123,7 @@ function checkApply(result: { exitCode: number | null; stderr: string }): void {
   )
     throw new ConfinementError("Cannot apply Git confinement");
 }
-export const gitSh: typeof sh = async (cmd, opts) => {
+export const gitSh = async (cmd: string[], opts: GitOptions): ReturnType<typeof sh> => {
   const inherited = invocationScratch.getStore();
   const scratch = inherited ?? mkdtempSync(join(tmpdir(), "limitless-git-"));
   try {
