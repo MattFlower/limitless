@@ -149,6 +149,206 @@ async function request(bundle = false): Promise<GateRequest> {
 }
 const fields = (run: GateRun) => run.checks.map(({ name, ok, exitCode }) => ({ name, ok, exitCode }));
 
+async function failedWorkerSetup(req: GateRequest, afterLease = () => {}, previousFailure = false) {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = workers.enqueue(req);
+  if (previousFailure) workers.fail(id, "Previous worker disconnected");
+  expect((await call("/worker/lease", {}, token)).json()).toMatchObject({ job: { id } });
+  afterLease();
+  const run: GateRun = {
+    setupOk: false,
+    setup: [
+      {
+        name: "setup",
+        command: req.gates.setup[0] ?? "",
+        ok: false,
+        exitCode: 9,
+        durationMs: 1,
+        output: "worker environment failed",
+      },
+    ],
+    checks: [],
+  };
+  expect((await call(`/worker/jobs/${id}/result`, { sha: req.headSha, run }, token)).status).toBe(200);
+  return { kind: "lan" as const, id, startedAt: Date.now() };
+}
+
+test.each([true, false])(
+  "worker setup fallback uses the local checks (passing=%s) and keeps sanitized warnings",
+  async (passing) => {
+    const req = await request();
+    const secret = `setup-warning-credential-595-${passing}`;
+    req.gates.setup = [`: '${secret}'`];
+    req.gates.checks = [{ name: "check", run: passing ? "cat tracked" : "exit 7" }];
+    const handle = await failedWorkerSetup(
+      req,
+      () => registerCredential("SETUP_WARNING_TEST", secret),
+      passing,
+    );
+    let localStarts = 0;
+    const run = await confinementScope.run(
+      {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          if (opts.cmd.includes(req.gates.setup[0] ?? "missing")) localStarts++;
+        },
+      },
+      () =>
+        executeGate(
+          req,
+          new AbortController().signal,
+          {},
+          gateExecutorFor("lan", workers, [req.repo]),
+          handle,
+        ),
+    );
+    expect(localStarts).toBe(1);
+    expect(run.setupOk).toBe(true);
+    expect(run.checks[0]?.ok).toBe(passing);
+    expect(compareGates(null, run).some((c) => c.blocking)).toBe(!passing);
+    const job = workers.job(handle.id);
+    expect(job).toMatchObject({ state: "done", worker: "runner", attempt: passing ? 2 : 1 });
+    expect(JSON.parse(job?.result ?? "null")).toEqual(run);
+    const warning = workers.list()[0]?.setupWarning;
+    expect(workers.list()[0]?.state).toBe("available");
+    expect(warning).toContain("Worker runner setup failed");
+    expect(warning).toContain("[withheld: private text]");
+    expect(warning).toContain("falling back to local execution");
+    expect(job?.events).toContain(warning ?? "missing");
+    expect(store.listEvents(req.runId ?? "").some((e) => e.type === "gate" && e.message === warning)).toBe(
+      true,
+    );
+    expect(JSON.stringify([job?.events, workers.list(), store.listEvents(req.runId ?? "")])).not.toContain(
+      secret,
+    );
+    const resumed = await executeGate(
+      req,
+      new AbortController().signal,
+      {},
+      gateExecutorFor("lan", workers, [req.repo]),
+      handle,
+    );
+    expect(resumed).toEqual(run);
+    expect(localStarts).toBe(1);
+
+    if (passing) {
+      const preload = join(home, "workers-fetch.ts");
+      writeFileSync(
+        preload,
+        `globalThis.fetch = async (input) => {
+      if (new URL(String(input)).pathname !== '/api/workers') throw new Error('Unexpected request');
+      return Response.json(${JSON.stringify([...workers.list(), { name: "pending", state: "pending", code: "PAIRING" }])});
+    };`,
+      );
+      const cli = await sh(
+        [
+          process.execPath,
+          "--preload",
+          preload,
+          join(import.meta.dir, "../src/cli/main.ts"),
+          "workers",
+          "ls",
+        ],
+        { cwd: home, env: { LIMITLESS_HOME: home } },
+      );
+      expect(cli.exitCode).toBe(0);
+      expect(cli.stdout).toContain(`runner\tavailable\t${warning}`);
+      expect(cli.stdout).toContain("pending\tpending\tPAIRING");
+      expect(cli.stdout).not.toContain(secret);
+    }
+  },
+  30_000,
+);
+
+test("the latest worker setup warning survives an older fallback finishing later", async () => {
+  const req = await request();
+  const first = await failedWorkerSetup(req);
+  const failed: GateRun = JSON.parse(workers.job(first.id)?.result ?? "null");
+  expect(workers.fallbackSetup(first.id, "test -f tracked")).toBe(true);
+  const command = "test -f newer-setup";
+  const second = workers.enqueue({ ...req, gates: { ...req.gates, setup: [command] } });
+  expect(workers.lease("runner")?.id).toBe(second);
+  workers.complete(second, { ...failed, setup: failed.setup.map((r) => ({ ...r, command })) });
+  expect(workers.fallbackSetup(second, command)).toBe(true);
+  expect(workers.complete(first.id, { setupOk: true, setup: [], checks: [] }, true)).toBe(true);
+  expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toContain("test -f newer-setup");
+  expect(workers.fallbackSetup(first.id, "test -f tracked")).toBe(false);
+});
+
+test.each(["shutdown", "cancel", "stored cancel"])(
+  "setup fallback survives %s at a deferred local boundary",
+  async (mode) => {
+    const req = await request();
+    req.gates.checks = [];
+    const handle = await failedWorkerSetup(req);
+    const started = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    let localStarts = 0;
+    const executor = gateExecutorFor("lan", workers, [req.repo]);
+    const execution = confinementScope.run(
+      {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          if (opts.cmd.includes(req.gates.setup[0] ?? "missing")) localStarts++;
+          started.resolve();
+          await release.promise;
+        },
+      },
+      () => executor.attach(handle, controller.signal),
+    );
+    void execution.result.catch(() => {});
+    try {
+      await started.promise;
+      expect(workers.job(handle.id)?.state).toBe("failed");
+      expect(workers.lease("runner")).toBeNull();
+      expect(executor.attach(handle, new AbortController().signal)).toBe(execution);
+      if (mode === "stored cancel") workers.cancel(handle.id);
+      else controller.abort(new Error(mode));
+      release.resolve();
+      await expect(execution.result).rejects.toThrow();
+      expect(workers.job(handle.id)?.state).toBe(mode === "shutdown" ? "failed" : "cancelled");
+      if (mode === "shutdown") {
+        const run = await confinementScope.run(
+          {
+            ...fakeConfinement,
+            async verify() {
+              localStarts++;
+            },
+          },
+          () =>
+            executeGate(
+              req,
+              new AbortController().signal,
+              {},
+              gateExecutorFor("lan", workers, [req.repo]),
+              handle,
+            ),
+        );
+        expect(run.setupOk).toBe(true);
+        expect(localStarts).toBe(2);
+        expect(workers.job(handle.id)?.state).toBe("done");
+        const events: { type: string; text?: string }[] = JSON.parse(workers.job(handle.id)?.events ?? "[]");
+        expect(events.filter((e) => e.text?.includes("Worker runner setup failed"))).toHaveLength(1);
+      } else {
+        const resumed = gateExecutorFor("lan", workers, [req.repo]).attach(
+          handle,
+          new AbortController().signal,
+        );
+        await expect(resumed.result).rejects.toThrow("cancelled");
+        expect(localStarts).toBe(1);
+      }
+    } finally {
+      release.resolve();
+      controller.abort();
+      await execution.result.catch(() => {});
+    }
+  },
+  30_000,
+);
+
 test("pairing codes carry 80 digest bits and approval requires all sixteen symbols", () => {
   // SHA-256 starts fc579917943cf97e15118b1405dc17eb for these inputs;
   // each symbol encodes the low five bits of a distinct digest byte.
@@ -660,6 +860,17 @@ test("owner API requires authentication for approval, listing and revocation and
     const id = workers.enqueue(req);
     expect(factory.cancelRun(req.runId ?? "")).toBe(true);
     expect(workers.job(id)?.state).toBe("cancelled");
+    const warningJob = workers.enqueue(req);
+    expect(workers.lease("owner-approved")?.id).toBe(warningJob);
+    workers.complete(warningJob, { setupOk: false, setup: [], checks: [] });
+    workers.fallbackSetup(warningJob, "test -f tracked");
+    workers.complete(warningJob, { setupOk: true, setup: [], checks: [] }, true);
+    const listing = await fetch(new URL("/api/workers", owner.url), {
+      headers: { authorization: `Bearer ${credential.token}` },
+    });
+    expect(await listing.json()).toMatchObject([
+      { name: "owner-approved", state: "available", setupWarning: workers.list()[0]?.setupWarning },
+    ]);
     expect((await post("/api/workers/owner-approved/revoke", {}, false)).status).toBe(401);
     expect((await post("/api/workers/owner-approved/revoke", {})).status).toBe(200);
     expect((await call("/worker/heartbeat", caps(), token)).status).toBe(401);
@@ -696,6 +907,8 @@ test("a worker runs real checks from the exact bundle head and returns the local
   try {
     const run = await executeGate(req, signal, {}, gateExecutorFor("lan", workers, [req.repo]));
     expect(acquisition.mock.calls[0]?.[4]).toBe("start");
+    expect(acquisition).toHaveBeenCalledTimes(1);
+    expect(workers.list()[0]?.setupWarning).toBeUndefined();
     const local = await confinementScope.run(fakeConfinement, () =>
       executeGate(req, signal, {}, localExecutor()),
     );
@@ -718,15 +931,23 @@ test("a worker runs real checks from the exact bundle head and returns the local
   }
 }, 180_000);
 
-test("a real worker setup failure completes once without infrastructure retry or local fallback", async () => {
+test("a real worker setup failure reruns locally once and the local setup failure blocks", async () => {
   await listen();
   const req = await request(true);
   req.gates.setup = ["test -f tracked", "echo broken-setup; exit 9", "echo must-not-run"];
   const worker = await loop();
+  let localStarts = 0;
   try {
-    const run = await confinementScope.run(fakeConfinement, () =>
-      executeGate(req, AbortSignal.timeout(120_000), {}, gateExecutorFor("lan", workers, [req.repo])),
+    const run = await confinementScope.run(
+      {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          if (opts.cmd.includes(req.gates.setup[0] ?? "missing")) localStarts++;
+        },
+      },
+      () => executeGate(req, AbortSignal.timeout(120_000), {}, gateExecutorFor("lan", workers, [req.repo])),
     );
+    expect(localStarts).toBe(1);
     expect(run.setupOk).toBe(false);
     expect(run.setup.map(({ name, ok, exitCode }) => ({ name, ok, exitCode }))).toEqual([
       { name: "setup-1", ok: true, exitCode: 0 },
@@ -738,9 +959,20 @@ test("a real worker setup failure completes once without infrastructure retry or
       state: "done",
       attempt: 1,
       worker: "loop-runner",
-      failure_reason: null,
     });
-    expect(store.listEvents(req.runId ?? "").filter((e) => e.type === "gate")).toEqual([]);
+    const job = workers.jobs("1=1")[0];
+    expect(JSON.parse(job?.result ?? "null")).toEqual(run);
+    expect(job?.failure_reason).toContain("echo broken-setup; exit 9");
+    expect(compareGates(null, run).some((c) => c.blocking)).toBe(true);
+    const resumed = await executeGate(
+      req,
+      new AbortController().signal,
+      {},
+      gateExecutorFor("lan", workers, [req.repo]),
+      { kind: "lan", id: job?.id ?? "", startedAt: Date.now() },
+    );
+    expect(resumed).toEqual(run);
+    expect(localStarts).toBe(1);
 
     // A setup failure permits only a matching prefix ending at the first failure.
     const first = run.setup[0],

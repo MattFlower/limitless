@@ -26,6 +26,7 @@ export interface WorkerRow {
   pairing_expires_at: number;
   last_heartbeat_at: number | null;
   capabilities: string | null;
+  setup_warning: string | null;
 }
 export interface JobRow {
   id: string;
@@ -163,6 +164,7 @@ export class WorkerStore {
           code: w.state === "pending" ? w.pairing_code : undefined,
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
+          setupWarning: w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
               ? w.state
@@ -323,9 +325,32 @@ export class WorkerStore {
       )
       .run(this.now(), id);
   }
+  fallbackSetup(id: string, command: string) {
+    return this.store.db.transaction(() => {
+      const j = this.job(id);
+      if (j?.state !== "done" || !j.worker || j.failure_reason !== null) return false;
+      const text = this.sanitize(
+        `Worker ${j.worker} setup failed: ${command}; LAN gates falling back to local execution`,
+      );
+      // Keep the worker and warning after local completion; failed is the durable fallback checkpoint.
+      this.store.db
+        .query(
+          "UPDATE gate_jobs SET state='failed',result=NULL,failure_reason=?,updated_at=? WHERE id=? AND state='done' AND failure_reason IS NULL",
+        )
+        .run(text, this.now(), id);
+      this.event(id, { type: "status", text });
+      this.store.db.query("UPDATE workers SET setup_warning=? WHERE name=?").run(text, j.worker);
+      return true;
+    })();
+  }
   complete(id: string, run: unknown, local = false) {
-    this.store.db
-      .query("UPDATE gate_jobs SET state='done',result=?,updated_at=? WHERE id=? AND state=?")
-      .run(JSON.stringify(this.sanitize(run)), this.now(), id, local ? "failed" : "leased");
+    return (
+      this.store.db
+        .query(
+          "UPDATE gate_jobs SET state='done',result=?,failure_reason=CASE WHEN ? THEN failure_reason ELSE NULL END,updated_at=? WHERE id=? AND state=?",
+        )
+        .run(JSON.stringify(this.sanitize(run)), local, this.now(), id, local ? "failed" : "leased")
+        .changes === 1
+    );
   }
 }

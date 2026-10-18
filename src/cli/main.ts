@@ -332,8 +332,12 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "workers": {
       if (rest[0] === "ls") {
-        const rows = await api<{ name: string; state: string; code?: string }[]>("/api/workers");
-        for (const w of rows) console.log(`${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}`);
+        const rows =
+          await api<{ name: string; state: string; code?: string; setupWarning?: string }[]>("/api/workers");
+        for (const w of rows)
+          console.log(
+            `${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}${w.setupWarning ? `\t${w.setupWarning}` : ""}`,
+          );
         return;
       }
       if (rest[0] === "approve" && rest[1]) {
