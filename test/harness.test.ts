@@ -1,5 +1,14 @@
 import { describe, expect } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
@@ -10,9 +19,10 @@ import {
   runCodex,
 } from "../src/harness/codex.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
+import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
+import { parseFakeStream } from "../src/harness/stream-fault.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -22,7 +32,9 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
+import { runProcess } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { deferred } from "./evals-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 
 const fixture = (name: string) =>
@@ -90,6 +102,85 @@ describe("ClaudeStreamParser", () => {
     const p = new ClaudeStreamParser((e) => events.push(e));
     p.feed("not json at all");
     expect(events[0]).toEqual({ type: "status", text: "not json at all" });
+  });
+
+  // Only these checks see a missing result: in a run, requireStructured turns the null output of a
+  // truncated stream back into an error and the invoke catch absorbs a throwing parser.
+  const init = JSON.stringify({ type: "system", subtype: "init", session_id: "s1", model: "m" });
+  const text = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "text", text: "partial" }] },
+  });
+  const result = (isError: boolean) =>
+    JSON.stringify({
+      type: "result",
+      subtype: isError ? "error_during_execution" : "success",
+      is_error: isError,
+      session_id: "s1",
+      num_turns: 1,
+      result: isError ? "run failed" : "done",
+      structured_output: { ok: true },
+    });
+  test.each([
+    ["no result event", [init, text], "claude exited with 0 and no result"],
+    [
+      "a result line cut off mid-object",
+      [init, text, '{"type":"result"'],
+      "claude exited with 0 and no result",
+    ],
+    ["an error result", [init, text, result(true)], "run failed"],
+    ["a successful result", [init, text, result(false)], null],
+  ])("a claude stream with %s completes only on a successful result", async (_, lines, cliError) => {
+    const ok = cliError === null;
+    const seam = parseFakeStream({ parser: "claude", lines }, () => {});
+    expect(seam.status).toBe(ok ? "ok" : "error");
+    expect(seam.error).toBe(
+      ok ? null : "malformed or truncated harness stream: missing successful completion",
+    );
+    const dir = mkdtempSync(join(tmpdir(), "limitless-claude-stream-"));
+    try {
+      const outcome = await runClaude(
+        {
+          cwd: dir,
+          prompt: "x",
+          mode: "readonly",
+          noTools: true,
+          target: {
+            modelId: "c/m",
+            provider: "claude",
+            harness: "claude",
+            model: "m",
+            vendor: "anthropic",
+            tier: 4,
+            billing: "subscription",
+          },
+          timeoutMs: 10_000,
+          idleTimeoutMs: 10_000,
+          maxToolCalls: 0,
+          signal: new AbortController().signal,
+          logPath: join(dir, "log"),
+          onEvent: () => {},
+        },
+        async (opts) => {
+          for (const line of lines) opts.onStdoutLine?.(line);
+          return {
+            exitCode: 0,
+            signal: null,
+            truncated: false,
+            durationMs: 1,
+            stdout: "",
+            stderr: "",
+            timedOut: false,
+            idleTimedOut: false,
+            cancelled: false,
+          };
+        },
+      );
+      expect(outcome.status).toBe(ok ? "ok" : "error");
+      expect(outcome.error).toBe(cliError);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -221,6 +312,108 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
   runCodex(spec, runner, {
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
+
+// Holds every launch before the trusted startup shell; the optional hook runs just before the spawn.
+// A chatty hold keeps writing stderr, so only runClaude's no-progress watchdog, not the byte-level
+// idle timeout, can stop it.
+const heldLaunch = (beforeSpawn = () => {}, chatty = false): ConfinementBackend => ({
+  verify: async () => {},
+  wrap: (cmd) => {
+    beforeSpawn();
+    const hold = chatty ? "while :; do echo starting >&2; sleep 0.01; done" : "sleep 900";
+    return ["/bin/sh", "-c", `${hold}; exec "$@"`, "sh", ...cmd];
+  },
+});
+const heldEdit = (
+  backend: ConfinementBackend,
+  signal: AbortSignal,
+  onEvent: (event: AgentEvent) => void = () => {},
+  processRunner = runProcess,
+) =>
+  confinementScope.run(backend, () =>
+    withScratch(import.meta.dir, (scratchDir) => {
+      const home = join(dirname(scratchDir), "home");
+      mkdirSync(home);
+      return readPolicyScope.run({ ...testReadPolicy, home, environment: {} }, () =>
+        runClaude(
+          {
+            cwd: import.meta.dir,
+            scratchDir,
+            prompt: "test",
+            mode: "edit",
+            logPath: join(scratchDir, "inv.log"),
+            target: {
+              modelId: "claude/test",
+              provider: "claude",
+              harness: "claude",
+              model: "claude-test",
+              vendor: "anthropic",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 30_000,
+            idleTimeoutMs: 50,
+            maxToolCalls: 1,
+            signal,
+            onEvent,
+          },
+          processRunner,
+        ),
+      );
+    }),
+  );
+const watchdogFired = (event: AgentEvent) =>
+  event.type === "status" && event.text.startsWith("stopping agent: no progress");
+
+test("a claude editor whose sandbox hangs until the no-progress watchdog fires is a confinement error", async () => {
+  const caller = new AbortController();
+  await expect(heldEdit(heldLaunch(undefined, true), caller.signal)).rejects.toThrow(
+    "Write confinement payload did not start: no progress",
+  );
+  expect(caller.signal.aborted).toBe(false);
+});
+
+test("the first abort decides: a watchdog stop followed by a caller cancel is still a confinement error", async () => {
+  const caller = new AbortController();
+  // The caller cancels right after the watchdog, before the hung launch has been cleaned up.
+  const onEvent = (event: AgentEvent) => {
+    if (watchdogFired(event)) caller.abort();
+  };
+  await expect(heldEdit(heldLaunch(undefined, true), caller.signal, onEvent)).rejects.toThrow(
+    "Write confinement payload did not start: no progress",
+  );
+  expect(caller.signal.aborted).toBe(true);
+});
+
+test("the first abort decides: a caller cancel followed by the watchdog during cleanup ends cancelled", async () => {
+  const caller = new AbortController();
+  const fired = deferred<void>();
+  const onEvent = (event: AgentEvent) => {
+    if (watchdogFired(event)) fired.resolve();
+  };
+  // The launch ends at the caller's cancel; cleanup outlasts the watchdog's next check.
+  const slowCleanup: typeof runProcess = async (opts) => {
+    const result = await runProcess(opts);
+    await fired.promise;
+    return result;
+  };
+  const result = await heldEdit(
+    heldLaunch(() => caller.abort()),
+    caller.signal,
+    onEvent,
+    slowCleanup,
+  );
+  expect(result.status).toBe("cancelled");
+});
+
+test("a caller cancel while a claude editor's sandbox starts ends the run cancelled", async () => {
+  const caller = new AbortController();
+  const result = await heldEdit(
+    heldLaunch(() => caller.abort()),
+    caller.signal,
+  );
+  expect(result.status).toBe("cancelled");
+});
 
 for (const harness of ["codex", "claude"] as const) {
   test(`${harness} passes private zsh startup and optional wrapper PATH to tool-enabled agents`, async () => {

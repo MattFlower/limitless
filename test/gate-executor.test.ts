@@ -8,10 +8,16 @@ import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
 import { redactGateData } from "../src/gates/output.ts";
-import { compareGates, type GateRun, retryBaselineFailures, retryRegressions } from "../src/gates/run.ts";
+import {
+  compareGates,
+  confinementFailed,
+  type GateRun,
+  retryBaselineFailures,
+  retryRegressions,
+} from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
+import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
@@ -1195,6 +1201,39 @@ test("local check events stream before completion and the start signal cancels r
     ]);
     await execution.cancel();
   });
+});
+
+test("a cancel while a check's sandbox is still starting returns a cancelled check, not a confinement error", async () => {
+  const controller = new AbortController();
+  const executor = localExecutor();
+  const req = request(fixture.repoDir);
+  req.gates = {
+    ...gates,
+    checks: [
+      { name: "first", run: "true" },
+      { name: "pending", run: "touch pending-ran" },
+    ],
+  };
+  let launches = 0;
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    // wrap runs just before the spawn: cancel there and never let the startup shell report.
+    wrap: (cmd) => {
+      if (++launches === 1) return cmd;
+      controller.abort();
+      return ["/bin/sh", "-c", 'sleep 900; exec "$@"', "sh", ...cmd];
+    },
+  };
+  await confinementScope.run(held, async () => {
+    const handle = await executor.start(req, controller.signal);
+    const completed = await executor.attach(handle, new AbortController().signal).result;
+    expect(completed.checks.map((c) => [c.name, c.ok, confinementFailed(c)])).toEqual([
+      ["first", true, false],
+      ["pending", false, false],
+    ]);
+  });
+  expect(launches).toBe(2);
+  expect(existsSync(join(fixture.repoDir, "pending-ran"))).toBe(false);
 });
 
 test.each([false, true])(

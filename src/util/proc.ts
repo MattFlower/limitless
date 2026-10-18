@@ -290,9 +290,12 @@ async function stopMarkedProcesses(
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
   spawnedAt: bigint,
-): Promise<void> {
+): Promise<boolean> {
   const group = child.pid;
-  if (group === undefined) return;
+  if (group === undefined) return false;
+  // Whether this shutdown's own SIGKILL reached the direct child while it still ran.
+  let childKillSent = false;
+  let killedRunningChild = false;
   const protectedPids = callerAncestors();
   const started = performance.now();
   const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
@@ -343,10 +346,19 @@ async function stopMarkedProcesses(
         if (birth !== identity.birth) claimed.delete(pid);
         else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
         else if (!freezing || !identity.stopped) {
+          // Decided by our SIGKILL, not the freeze or the start of shutdown: a frozen child can still
+          // be killed by something else during the checks in between. A stopped child counts as
+          // running; unreaped (exitCode null), its pid can't have been reused.
+          const signal = freezing ? "SIGSTOP" : "SIGKILL";
+          const killingChild = pid === group && signal === "SIGKILL" && !childKillSent;
+          const running =
+            killingChild && child.exitCode === null && child.signalCode === null && stillRunning(pid);
+          if (killingChild) childKillSent = true;
           try {
-            process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
+            process.kill(pid, signal);
             identity.stopped = true;
             identity.frozen = freezing;
+            if (running) killedRunningChild = true;
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
             identity.frozen = false;
@@ -355,7 +367,7 @@ async function stopMarkedProcesses(
       }
       // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
       const exited = child.exitCode !== null || child.signalCode !== null;
-      if (!claimed.size && empty && exited) return;
+      if (!claimed.size && empty && exited) return killedRunningChild;
       empty = !claimed.size && exited;
       if (deadline && claimed.size)
         throw new Error(
@@ -433,6 +445,11 @@ export interface ProcResult {
   stdoutTruncated?: boolean;
   stderrTruncated?: boolean;
   durationMs: number;
+  /**
+   * The cancel started this invocation's shutdown, and the shutdown's own SIGKILL reached the child
+   * while it still ran (not exited, not a zombie). False whenever that can't be shown.
+   */
+  cancelKilled?: boolean;
 }
 
 const DEFAULT_TAIL = 64_000;
@@ -474,6 +491,18 @@ function lineSplitter(onLine?: (line: string) => void, limit = Infinity) {
       discarding = false;
     },
   };
+}
+
+/** Whether `pid` is still running (not exited, not a zombie); false when that can't be shown. */
+function stillRunning(pid: number): boolean {
+  try {
+    if (darwin) return darwin.captureDarwinInvocationLeader(pid) !== null;
+    if (inspectionPlatform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return !stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+    }
+  } catch {}
+  return false;
 }
 
 /**
@@ -534,6 +563,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     let stdout = "";
     let stderr = "";
     let cancelled = false;
+    let cancelStarted = false;
+    let cancelKilled = false;
     let timedOut = false;
     let idleTimedOut = false;
     let settled = false;
@@ -547,8 +578,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       shutdown ??= (async () => {
         try {
           if (leaderInspectionError) throw leaderInspectionError;
-          if (child.pid !== undefined)
-            await stopMarkedProcesses(
+          if (child.pid !== undefined) {
+            const killedRunningChild = await stopMarkedProcesses(
               marker,
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
@@ -557,6 +588,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               leader,
               spawnedAt,
             );
+            cancelKilled = cancelStarted && killedRunningChild;
+          }
         } catch (error) {
           terminationError = new ProcessTerminationError(
             `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
@@ -613,6 +646,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
     const onAbort = () => {
       cancelled = true;
+      // An exit or timeout that already began the shutdown, not this cancel, ends the child.
+      if (shutdown === undefined) cancelStarted = true;
       void terminate();
     };
     // After finishTimers exists: a pre-aborted signal can fail termination synchronously.
@@ -699,6 +734,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         exitCode: code,
         signal: sig,
         cancelled,
+        cancelKilled,
         timedOut,
         idleTimedOut,
         stdout,
