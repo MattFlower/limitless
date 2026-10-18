@@ -586,8 +586,8 @@ let deliveryArgs = args;
 if (args.includes("push")) {
   const repoAt = args.indexOf("-C");
   const pushRepo = repoAt < 0 ? process.env.GIT_COMMON_DIR : args[repoAt + 1];
-  // The config this push reads, whatever transport the redirect below gives it.
-  const view = spawnSync(${JSON.stringify(gitBin)}, [...args.slice(0, args.indexOf("push")), "config", "--list", "--includes", "--show-origin", "--name-only"], { encoding: "utf8" });
+  // The config this push reads (origin, key and value), whatever transport the redirect below gives it.
+  const view = spawnSync(${JSON.stringify(gitBin)}, [...args.slice(0, args.indexOf("push")), "config", "--list", "--includes", "--show-origin"], { encoding: "utf8" });
   if (view.status !== 0) process.exit(1);
   appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "push-repo", args: [pushRepo], mode: statSync(pushRepo).mode & 0o777, alternates: readFileSync(pushRepo + "/objects/info/alternates", "utf8"), configView: view.stdout.split("\\n").filter(Boolean).map((line) => line.split("\\t")) }) + "\\n");
   if (${JSON.stringify(scenario)} === "push-failed") process.exit(1);
@@ -694,16 +694,35 @@ else if (args[1] === "view") {
       expect(call.mode).toBe(0o700);
       expect(call.alternates).toBe(`${paths[2]}/objects\n`);
       expect(existsSync(call.args[0] ?? "")).toBe(false);
-      // Planted keys may reach the push only from this test's own global and system config.
+      // Planted keys may reach the push only from this test's own global and system config, or as
+      // exactly the entries its inherited environment sets: factory gates set credential.helper
+      // through GIT_CONFIG_COUNT, which git reports as "command line:".
       const visible = plantedKeys.map((key) => key.toLowerCase());
       const trusted = [globalConfig, globalInclude, join(root, "system.config")].map(
         (file) => `file:${file}`,
       );
-      expect(
-        (call.configView ?? [["unlisted"]]).filter(
-          ([origin = "", name = ""]) => visible.includes(name.toLowerCase()) && !trusted.includes(origin),
-        ),
-      ).toEqual([]);
+      // Git lower-cases a key's section and name but keeps its subsection.
+      const canonical = (key: string) =>
+        key
+          .split(".")
+          .map((part, i, parts) => (i === 0 || i === parts.length - 1 ? part.toLowerCase() : part))
+          .join(".");
+      const inherited = Array.from(
+        { length: Number(process.env.GIT_CONFIG_COUNT ?? 0) },
+        (_, i) =>
+          `${canonical(process.env[`GIT_CONFIG_KEY_${i}`] ?? "")}=${process.env[`GIT_CONFIG_VALUE_${i}`] ?? ""}`,
+      );
+      expect(call.configView).toBeDefined();
+      const leaked = (call.configView ?? []).filter(([origin = "", ...rest]) => {
+        const entry = rest.join("\t");
+        const name = entry.split("=", 1)[0] ?? "";
+        if (!visible.includes(name.toLowerCase()) || trusted.includes(origin)) return false;
+        // Each inherited entry excuses one identical occurrence, never a second or changed one.
+        const index = origin === "command line:" ? inherited.indexOf(entry) : -1;
+        if (index >= 0) inherited.splice(index, 1);
+        return index < 0;
+      });
+      expect(leaked).toEqual([]);
     }
     expect(existsSync(marker)).toBe(false);
     if (scenario === "checks:private-repository")
