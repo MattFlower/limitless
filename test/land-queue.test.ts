@@ -15,10 +15,11 @@ import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
+import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
-import { type GitHubPrView, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
+import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -46,6 +47,7 @@ let clock: ReturnType<typeof waitClock>;
 let originalPath: string | undefined;
 let slots: number;
 let github: ReturnType<typeof fakeGitHub>;
+const pendingPrReads = new Set<object>();
 const queues: LandQueue[] = [];
 
 beforeEach(async () => {
@@ -64,6 +66,7 @@ beforeEach(async () => {
   store = new Store(paths.db);
   ci = () => ({ ci: "SUCCESS" });
   landLog.length = 0;
+  pendingPrReads.clear();
   clock = waitClock();
   github = fakeGitHub(clock.now);
   slots = gateSlots.limit;
@@ -284,6 +287,15 @@ function queue(
     },
     log: (message: string) => void landLog.push(message),
     ...opts,
+    client: async (url, signal) => {
+      const read = {};
+      pendingPrReads.add(read);
+      try {
+        return await (opts.client ?? getGitHubPr)(url, signal);
+      } finally {
+        pendingPrReads.delete(read);
+      }
+    },
   });
   queues.push(q);
   if (opts.start !== false) q.start();
@@ -297,7 +309,8 @@ async function tick(answer?: { ci: string; failing?: string[] }): Promise<void> 
   // A claimed entry with a pushed commit is in its CI phase, whatever the claim left it as.
   for (const entry of store.listLandEntries({ active: true }))
     if (entry.pushedSha && plan) observers.get(entry.prUrl)?.(entry.pushedSha, plan.ci, plan.failing ?? []);
-  await clock.advance(100);
+  // A real fake-gh subprocess needs event-loop turns, not elapsed simulated network time.
+  if (!pendingPrReads.size) await clock.advance(100);
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
@@ -612,7 +625,7 @@ test("three requests submitted together all land, with no further request", asyn
   expect(gateLog()).toEqual(["start", "end", "start", "end", "start", "end"]);
 });
 
-test("a checking entry whose merge commit is already on the remote resumes and lands", async () => {
+test("a checking entry whose merge commit is already on the remote tolerates lagging reads and lands", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "change-1.txt", "one\n", 1);
   await advanceBase();
@@ -621,8 +634,9 @@ test("a checking entry whose merge commit is already on the remote resumes and l
   await sh(["git", "merge", "-q", "--no-ff", "-m", "limitless: merge base", "main"], { cwd: seed });
   const mergeSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: seed })).stdout.trim();
   await sh(["git", "push", "-q", bare, "HEAD:refs/heads/pr-1"], { cwd: seed });
-  observe(1, mergeSha, "PENDING");
+  observe(1, head, "SUCCESS");
   approve(1, head);
+  ci = () => null;
   // What a crash between the push and the waiting_ci update leaves behind.
   const entry = store.createLandEntry({
     runId: pr.run.id,
@@ -633,7 +647,29 @@ test("a checking entry whose merge commit is already on the remote resumes and l
     approvedSha: head,
   });
   store.updateLandEntry(entry.id, { state: "checking", pushedSha: mergeSha, attempts: 1 });
-  queue();
+  let caughtUp = false;
+  let reads = 0;
+  queue({
+    ciPollMs: 100,
+    client: async () => {
+      reads++;
+      return {
+        url: url(1),
+        state: "OPEN",
+        headRefOid: caughtUp ? mergeSha : head,
+        mergedAt: null,
+        mergedBy: null,
+        ci: "SUCCESS",
+        failing: [],
+      };
+    },
+  });
+  await waitFor(() => reads > 0);
+  await settleIdle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: mergeSha });
+  await waitFor(() => reads >= 2); // Reconciliation accepted the approved head; CI still waits.
+  expect(ghCalls("pr merge")).toEqual([]);
+  caughtUp = true;
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: mergeSha, attempts: 2 });
   expect(await remoteHead("pr-1")).toBe(mergeSha); // nothing was pushed again
@@ -1180,33 +1216,185 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
   await q.stop();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "waiting_ci", pushedSha: approved });
   view.ci = "SUCCESS";
-  queue({ polling: false, client: async () => ({ ...view }) });
+  observe(1, approved, "SUCCESS");
+  const saved = store.githubPrData(url(1));
+  let reads = 0;
+  queue({
+    client: async () => {
+      reads++;
+      return { ...view };
+    },
+  });
+  ci = () => null;
   await settle();
+  expect(reads).toBeGreaterThan(0);
+  expect(store.githubPrData(url(1))).toBe(saved);
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
-  expect(ghCalls("pr merge")).toHaveLength(1);
+  const merges = ghCalls("pr merge");
+  expect(merges).toHaveLength(1);
+  expect(merges[0]).toContain(`--match-head-commit ${approved}`);
+  expect(merges[0]).not.toContain("--auto");
 });
 
 test("a restart during merging takes an already merged PR as landed without merging again", async () => {
   const pr = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
-  observe(1, head1);
-  approve(1, head1);
-  writeFileSync(join(root, "gh.hang"), "");
+  store.updateRun(pr.run.id, { status: "needs_human" });
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const saved = store.githubPrData(url(1));
+  ci = () => null; // Keep the retained OPEN, green snapshot throughout recovery.
+  const completed = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const merge = repos.mergePullRequest;
+  const boundary = spyOn(repos, "mergePullRequest").mockImplementation(async (...args) => {
+    const outcome = await merge(...args);
+    expect(outcome).toBe("merged");
+    completed.resolve();
+    await release.promise;
+    args[3]?.throwIfAborted();
+    return outcome;
+  });
   const q = queue();
-  const entry = await q.request({ target: pr.run.id });
-  await waitFor(() => store.getLandEntry(entry.id)?.state === "merging");
-  await q.stop();
-  expect(store.getLandEntry(entry.id)?.state).toBe("merging");
-  rmSync(join(root, "gh.hang"));
-  // The merge had in fact landed before the daemon stopped.
-  writeFileSync(join(root, "gh.merged-1"), "");
-  queue();
-  await settle();
-  expect(store.getLandEntry(entry.id)).toBeTruthy();
-  expect(ghCalls("pr merge")).toHaveLength(1);
-  expect(store.getRun(pr.run.id)?.merged).toBe(true);
-  expect(store.listLandEntries()[0]?.state).toBe("landed");
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await completed.promise; // GitHub completed the command; no local landing has been recorded.
+    expect(existsSync(join(root, "gh.merged-1"))).toBe(true);
+    expect(store.getLandEntry(entry.id)?.state).toBe("merging");
+    const stopped = q.stop();
+    release.resolve();
+    await stopped;
+    boundary.mockRestore();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "merging", pushedSha: head });
+    expect(store.getRun(pr.run.id)?.merged).toBe(false);
+    const reads = ghCalls("pr view").length;
+    queue();
+    await settle();
+    expect(ghCalls("pr view").length).toBeGreaterThan(reads);
+    expect(store.githubPrData(url(1))).toBe(saved);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: head, attempts: 2 });
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(store.getRun(pr.run.id)).toMatchObject({
+      status: "resolved",
+      merged: true,
+      mergedBy: "owner",
+      mergedAt: Date.parse("2026-10-13T12:00:00Z"),
+      resolution: { kind: "merged", ref: url(1) },
+    });
+  } finally {
+    release.resolve();
+    await q.stop();
+    boundary.mockRestore();
+  }
 });
+
+test.each(["different head", "missing head", "failed lookup", "missing state", "wrong URL", "closed PR"])(
+  "recovery blocks a stale green snapshot after a fresh %s",
+  async (scenario) => {
+    const pr = delivered(1, "pr-1");
+    store.updateRun(pr.run.id, { status: "needs_human" });
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, head, "SUCCESS");
+    const saved = store.githubPrData(url(1));
+    ci = () => null;
+    const entry = store.createLandEntry({
+      runId: pr.run.id,
+      repo: SLUG,
+      prUrl: url(1),
+      baseBranch: "main",
+      headBranch: "pr-1",
+      approvedSha: head,
+    });
+    store.updateLandEntry(entry.id, { state: "checking", pushedSha: head, attempts: 1 });
+    let reads = 0;
+    queue({
+      client: async () => {
+        reads++;
+        if (scenario === "failed lookup") throw new Error("lookup failed");
+        return {
+          url: scenario === "wrong URL" ? url(2) : url(1),
+          state: scenario === "missing state" ? "" : scenario === "closed PR" ? "CLOSED" : "MERGED",
+          headRefOid:
+            scenario === "missing head" ? undefined : scenario === "closed PR" ? head : "b".repeat(40),
+          mergedAt: null,
+          mergedBy: null,
+          ci: "SUCCESS",
+          failing: [],
+        };
+      },
+    });
+    await settle();
+    expect(reads).toBe(1);
+    expect(store.githubPrData(url(1))).toBe(saved);
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: "blocked",
+      reason: ["different head", "missing head"].includes(scenario)
+        ? "merged PR head is missing or differs from the pushed SHA"
+        : scenario === "closed PR"
+          ? "PR was closed without merging"
+          : "cannot confirm current GitHub merge state",
+    });
+    expect(store.getRun(pr.run.id)).toMatchObject({ status: "needs_human", merged: false });
+    expect(ghCalls("pr merge")).toEqual([]);
+  },
+);
+
+test.each(["cancel", "shutdown", "claim lost"])(
+  "a late fresh recovery observation respects %s",
+  async (interrupt) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, head, "SUCCESS");
+    const entry = store.createLandEntry({
+      runId: pr.run.id,
+      repo: SLUG,
+      prUrl: url(1),
+      baseBranch: "main",
+      headBranch: "pr-1",
+      approvedSha: head,
+    });
+    store.updateLandEntry(entry.id, { state: "merging", pushedSha: head, attempts: 1 });
+    const entered = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<GitHubPrView | null>();
+    const q = queue({
+      client: async () => {
+        entered.resolve();
+        return response.promise;
+      },
+    });
+    try {
+      await entered.promise;
+      expect(store.getLandEntry(entry.id)?.state).toBe("checking");
+      let stopping: Promise<void> | undefined;
+      if (interrupt === "cancel") expect(q.cancel(entry.id)).toBe(true);
+      else if (interrupt === "shutdown") stopping = q.stop();
+      else {
+        // Another daemon reclaimed the expired claim while this read was pending.
+        expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      }
+      response.resolve({
+        url: url(1),
+        state: "MERGED",
+        headRefOid: head,
+        mergedAt: null,
+        mergedBy: null,
+        ci: "SUCCESS",
+        failing: [],
+      });
+      if (interrupt === "claim lost") await settleIdle();
+      await (stopping ?? q.stop());
+      expect(store.getLandEntry(entry.id)).toMatchObject({
+        state: interrupt === "cancel" ? "cancelled" : "checking",
+        pushedSha: head,
+      });
+      expect(store.getRun(pr.run.id)?.merged).toBe(false);
+      expect(ghCalls("pr merge")).toEqual([]);
+    } finally {
+      response.resolve(null);
+      await q.stop();
+    }
+  },
+);
 
 test("CI that never finishes gives up with a reason", async () => {
   const pr = delivered(1, "pr-1");
@@ -1514,8 +1702,8 @@ test("a cancel during the private-range check stays cancelled after a queue rest
   approve(1, head);
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  const check = repos.checkPrivateRange;
-  const range = spyOn(repos, "checkPrivateRange").mockImplementationOnce(async (...args) => {
+  const check = repos.checkPrivatePublication;
+  const range = spyOn(repos, "checkPrivatePublication").mockImplementationOnce(async (...args) => {
     await check(...args);
     entered.resolve();
     await release.promise;
@@ -1904,8 +2092,12 @@ for (const location of ["commit", "author email", "subject", "body"]) {
     mkdirSync(paths.configDir, { recursive: true });
     writeFileSync(join(paths.configDir, "private-strings.txt"), secret);
     const pr = delivered(1, "pr-1");
-    let head = await pushBranch("pr-1", "one.txt", location === "commit" ? secret : "one\n");
-    if (location === "author email") {
+    const head = await pushBranch("pr-1", "one.txt", location === "commit" ? secret : "one\n");
+    const complete = gitMerge.completeMerge;
+    const check = spyOn(gitMerge, "completeMerge").mockImplementation(async (...args) => {
+      const head = await complete(...args);
+      if (location !== "author email") return head;
+      const cwd = args[0];
       await sh(
         [
           "git",
@@ -1916,24 +2108,27 @@ for (const location of ["commit", "author email", "subject", "body"]) {
           "--no-edit",
           "--reset-author",
         ],
-        { cwd: seed },
+        { cwd },
       );
-      await sh(["git", "push", "-q", "--force", bare, "pr-1"], { cwd: seed });
-      head = await remoteHead("pr-1");
+      return repos.headSha(cwd);
+    });
+    try {
+      if (location === "subject") store.updateRun(pr.run.id, { title: secret });
+      if (location === "body") store.putArtifact(pr.run.id, "report.md", "report", secret);
+      observe(1, head);
+      approve(1, head);
+      await advanceBase();
+      const entry = await queue().request({ target: pr.run.id });
+      await settle();
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked" });
+      expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
+      expect(store.getLandEntry(entry.id)?.reason).not.toContain(secret);
+      expect(landLog.join("\n")).not.toContain(secret);
+      expect(await remoteHead("pr-1")).toBe(head);
+      expect(ghCalls("pr merge")).toEqual([]);
+    } finally {
+      check.mockRestore();
     }
-    if (location === "subject") store.updateRun(pr.run.id, { title: secret });
-    if (location === "body") store.putArtifact(pr.run.id, "report.md", "report", secret);
-    observe(1, head);
-    approve(1, head);
-    await advanceBase();
-    const entry = await queue().request({ target: pr.run.id });
-    await settle();
-    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked" });
-    expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
-    expect(store.getLandEntry(entry.id)?.reason).not.toContain(secret);
-    expect(landLog.join("\n")).not.toContain(secret);
-    expect(await remoteHead("pr-1")).toBe(head);
-    expect(ghCalls("pr merge")).toEqual([]);
   });
 }
 
@@ -2014,7 +2209,7 @@ test("a head observation received during a CI read blocks without a timer", asyn
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
-test("land ignores an inherited local Git scope and a graft hiding private ancestry", async () => {
+test("land accepts already-published private ancestry despite an inherited local Git scope and graft", async () => {
   const secret = "denylisted-private-parent";
   mkdirSync(paths.configDir, { recursive: true });
   writeFileSync(join(paths.configDir, "private-strings.txt"), secret);
@@ -2033,11 +2228,53 @@ test("land ignores an inherited local Git scope and a graft hiding private ances
   try {
     const entry = await worktreeGitScope.run(false, () => queue().request({ target: pr.run.id }));
     await settle();
-    expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
-    expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
-    expect(ghCalls("pr merge")).toEqual([]);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(ghCalls("pr merge")).toHaveLength(1);
   } finally {
     if (previous === undefined) delete process.env.GIT_GRAFT_FILE;
     else process.env.GIT_GRAFT_FILE = previous;
   }
 });
+
+test.each(["clean", "final", "merge"])(
+  "waiting_ci rechecks persisted publication without pushing: %s",
+  async (scenario) => {
+    const unsafe = `%${"25".repeat(6)}72`;
+    const pr = delivered(1, "pr-1");
+    await pushBranch("pr-1", "transient.txt", unsafe);
+    await sh(["git", "rm", "transient.txt"], { cwd: seed });
+    await sh(["git", "commit", "-qm", "remove intermediate"], { cwd: seed });
+    const approved = await pushBranch("pr-1", "one.txt", scenario === "final" ? unsafe : "clean\n", 1);
+    await advanceBase();
+    await sh(["git", "checkout", "-q", "pr-1"], { cwd: seed });
+    await sh(["git", "merge", "-q", "--no-ff", "-m", scenario === "merge" ? unsafe : "base merge", "main"], {
+      cwd: seed,
+    });
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: seed })).stdout.trim();
+    await sh(["git", "push", "-q", bare, "HEAD:refs/heads/pr-1"], { cwd: seed });
+    observe(1, head, "SUCCESS");
+    approve(1, approved);
+    const entry = store.createLandEntry({
+      runId: pr.run.id,
+      repo: SLUG,
+      prUrl: url(1),
+      baseBranch: "main",
+      headBranch: "pr-1",
+      approvedSha: approved,
+    });
+    store.updateLandEntry(entry.id, { state: "waiting_ci", pushedSha: head, attempts: 1 });
+    const push = spyOn(repos, "pushExistingBranch");
+    try {
+      queue();
+      await settle();
+      expect(store.getLandEntry(entry.id)?.state).toBe(scenario === "clean" ? "landed" : "blocked");
+      if (scenario !== "clean") expect(store.getLandEntry(entry.id)?.reason).toContain("decoding limit");
+      expect(push).not.toHaveBeenCalled();
+      expect(await remoteHead("pr-1")).toBe(head);
+      expect(ghCalls("pr merge")).toHaveLength(scenario === "clean" ? 1 : 0);
+      expect(gateLog()).toEqual([]);
+    } finally {
+      push.mockRestore();
+    }
+  },
+);

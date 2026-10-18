@@ -30,6 +30,7 @@ import {
   attributeLimits,
   blobPrivateEntries,
   checkoutCommitted,
+  checkPrivatePublication,
   checkPrivateRange,
   commitAll,
   createWorktree,
@@ -42,6 +43,7 @@ import {
   rebaseOnto,
   removeWorktree,
   resetTo,
+  squashTitle,
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
 import { processScope, sh } from "../src/util/proc.ts";
@@ -3497,3 +3499,102 @@ test("whole-blob classification catches a valid V7 TAR with its first NUL at 972
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
+
+test("squash publication ignores removed PR history with an empty or configured denylist", async () => {
+  const unsafe = `%${"25".repeat(6)}72`;
+  writeFileSync(join(work, "transient.txt"), unsafe);
+  await commitAll(work, "intermediate");
+  rmSync(join(work, "transient.txt"));
+  writeFileSync(join(work, "safe.txt"), "final clean change");
+  await commitAll(work, "remove intermediate");
+  const head = await headSha(work);
+  for (const entries of [[], [{ value: ["private", "value"].join("-"), entry: 1 }]]) {
+    await expect(checkPrivateRange(work, `${base}..${head}`, entries)).rejects.toThrow("decoding limit");
+    await checkPrivatePublication(work, entries, {
+      squash: {
+        base,
+        head,
+        title: squashTitle("Clean title", "https://github.com/test/repo/pull/12"),
+        body: "Clean body",
+      },
+    });
+  }
+});
+
+test.each(["diff", "blob", "title", "body"])("squash publication checks %s", async (location) => {
+  const secret = ["private", "value"].join("-");
+  for (const payload of [secret, `%${"25".repeat(6)}72`]) {
+    const entries = payload === secret ? [{ value: secret, entry: 1 }] : [];
+    const file = join(work, "published.dat");
+    // An unchanged binary line is outside the U0 patch, but inside the affected final blob.
+    if (location === "blob") {
+      writeFileSync(file, `prefix\0${payload}\n${"context\n".repeat(10)}old\n`);
+      await commitAll(work, "blob base");
+    }
+    const before = await headSha(work);
+    writeFileSync(
+      file,
+      location === "blob"
+        ? `prefix\0${payload}\n${"context\n".repeat(10)}new\n`
+        : location === "diff"
+          ? payload
+          : "clean",
+    );
+    await commitAll(work, "final change");
+    const scan = checkPrivatePublication(work, entries, {
+      squash: {
+        base: before,
+        head: await headSha(work),
+        title: location === "title" ? payload : "Clean title (#12)",
+        body: location === "body" ? payload : "Clean body",
+      },
+    });
+    await expect(scan).rejects.toThrow(payload === secret ? "entry 1" : "decoding limit");
+  }
+});
+
+test.each(["message", "identity", "patch"])(
+  "only the land-created merge is checked: %s",
+  async (location) => {
+    const secret = ["private", "merge"].join("-");
+    for (const payload of [secret, `%${"25".repeat(6)}72`]) {
+      writeFileSync(join(work, "parent.txt"), payload);
+      await commitAll(work, "already published parent");
+      const parent = await headSha(work);
+      rmSync(join(work, "parent.txt"));
+      await commitAll(work, "already published removal");
+      const approved = await headSha(work);
+      const tree = (await git(work, "rev-parse", `${approved}^{tree}`)).stdout.trim();
+      const head = (
+        await sh(
+          [
+            "git",
+            "commit-tree",
+            tree,
+            "-p",
+            approved,
+            "-p",
+            parent,
+            "-m",
+            location === "message" ? payload : "base merge",
+          ],
+          {
+            cwd: work,
+            env: { ...process.env, ...(location === "identity" ? { GIT_AUTHOR_NAME: payload } : {}) },
+          },
+        )
+      ).stdout.trim();
+      const entries = payload === secret ? [{ value: secret, entry: 1 }] : [];
+      const squash = { base: approved, head, title: "Clean title", body: "Clean body" };
+      await checkPrivatePublication(work, entries, { squash });
+      await expect(checkPrivatePublication(work, entries, { squash, commits: `${head}^!` })).rejects.toThrow(
+        payload === secret ? "entry 1" : "decoding limit",
+      );
+      // A clean merge must not traverse either parent's contaminated, published history.
+      const clean = (
+        await git(work, "commit-tree", tree, "-p", approved, "-p", base, "-m", "clean base merge")
+      ).stdout.trim();
+      await checkPrivatePublication(work, entries, { squash, commits: `${clean}^!` });
+    }
+  },
+);
