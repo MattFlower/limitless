@@ -348,7 +348,9 @@ async function stopMarkedProcesses(
         else if (!freezing || !identity.stopped) {
           // Decided by our SIGKILL, not the freeze or the start of shutdown: a frozen child can still
           // be killed by something else during the checks in between. A stopped child counts as
-          // running; unreaped (exitCode null), its pid can't have been reused.
+          // running; unreaped (exitCode null), its pid can't have been reused. Residual: an external
+          // SIGKILL landing between this check and process.kill leaves a zombie that kill accepts,
+          // which userspace can't rule out; it only labels a launch already being cancelled as cancelled.
           const signal = freezing ? "SIGSTOP" : "SIGKILL";
           const killingChild = pid === group && signal === "SIGKILL" && !childKillSent;
           const running =
