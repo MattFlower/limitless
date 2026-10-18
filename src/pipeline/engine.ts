@@ -2337,7 +2337,9 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     const report = buildReport(ctx, success);
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
-    await checkPublication(ctx, report, { sha: await headSha(cwd), title });
+    // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
+    if (success || blocked || !(review || ctx.run.deliveryBranch))
+      await checkPublication(ctx, report, { sha: await headSha(cwd), title });
     head = await headSha(cwd);
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
