@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { reportStructure, stripReportManifest } from "../src/pipeline/report-privacy.ts";
 import { sh } from "../src/util/proc.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { findingEvidence } from "./review-support.ts";
@@ -378,7 +379,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(report).toContain("Acceptance criteria");
         expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--title [needs human]");
         expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
-        expect(readFileSync(join(home, "gh-body"), "utf8")).toBe(report);
+        const body = readFileSync(join(home, "gh-body"), "utf8");
+        expect(body).toBe(stripReportManifest(report));
+        expect(body).not.toContain("<!-- limitless-report:");
+        expect(reportStructure(report)).toBeTruthy();
       }
     });
   }

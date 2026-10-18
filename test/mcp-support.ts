@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { createMcpServer, type McpBackend } from "../src/integrations/mcp.ts";
+import { markReportArtifacts, type ReportPart, reportText } from "../src/pipeline/report-privacy.ts";
 import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
@@ -106,6 +107,16 @@ export const localServer = {
   requestIP: () => ({ address: "127.0.0.1", family: "IPv4", port: 40000 }),
 } as unknown as import("bun").Server<undefined>;
 
+export function saveReportFixture(
+  f: Awaited<ReturnType<typeof fixture>>,
+  runId: string,
+  parts: ReportPart[],
+) {
+  const rendered = markReportArtifacts(parts);
+  f.factory.store.putArtifact(runId, "report-sources.json", "report", JSON.stringify(rendered.sources));
+  f.factory.store.putArtifact(runId, "report.md", "report", rendered.report);
+}
+
 /** Local history and saved PR observation; never invokes GitHub or a model. */
 export async function changeFixture(
   f: Awaited<ReturnType<typeof fixture>>,
@@ -165,7 +176,7 @@ export async function changeFixture(
   };
   observe(headSha);
   const report = `Factory report\n${"Reviewed locally.\n".repeat(400)}`;
-  f.factory.store.putArtifact(run.id, "report.md", "report", report);
+  saveReportFixture(f, run.id, [reportText("prose", report.trimEnd())]);
   return { run, repo, prUrl, baseSha, headSha, report, observe };
 }
 

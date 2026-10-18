@@ -1,11 +1,18 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { Repo } from "../src/core/types.ts";
-import { checkPrivateRange, deliveryPublicationRange, pushExistingBranch } from "../src/git/repos.ts";
+import { checkPrivateText } from "../src/gates/private.ts";
+import {
+  checkPrivatePublication,
+  checkPrivateRange,
+  deliveryPublicationRange,
+  mergePullRequest,
+  pushExistingBranch,
+} from "../src/git/repos.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
@@ -37,6 +44,82 @@ const { start, githubFixture, registerGithub } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["entity", "clean"])("squash publication checks visible PR text: %s", async (form) => {
+    await githubFixture();
+    const phrase = ["private", "squash", "value"].join(" ");
+    const body = form === "entity" ? phrase.replace("v", "&#118;") : "Use & <tag> &unknown; &amp;";
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    const entries = [{ value: phrase, entry: 1 }];
+    const scan = checkPrivatePublication(repoDir, entries, {
+      squash: { base: head, head, title: "Public title", body },
+    });
+    if (form === "entity") await expect(scan).rejects.toThrow("PR text contains a private string");
+    else await scan;
+    const merged = join(home, "merged");
+    writeFileSync(
+      join(home, "bin", "gh"),
+      `#!/bin/sh
+case "$2" in
+  view) cat '${join(home, "pr.json")}' ;;
+  merge) touch '${merged}' ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(home, "pr.json"),
+      JSON.stringify({ state: "OPEN", headRefOid: head, title: "Public title", body }),
+    );
+    expect(
+      await mergePullRequest(
+        "https://github.com/test/repo/pull/1",
+        repoDir,
+        head,
+        undefined,
+        undefined,
+        entries,
+      ),
+    ).toBe(form === "entity" ? "failed" : "merged");
+    expect(existsSync(merged)).toBe(form === "clean");
+  });
+
+  test.each(["decimal", "hex", "named", "clean"])(
+    "delivery checks the visible report body: %s",
+    async (scenario) => {
+      const bare = await githubFixture();
+      const phrase = ["private", "report", "value"].join(" ");
+      const report =
+        scenario === "clean"
+          ? "Use ordinary & <tag> &amp; &unknown; &#65; &#x42;"
+          : scenario === "named"
+            ? phrase.replaceAll(" ", "&nbsp;\n\t")
+            : phrase.replace("v", scenario === "decimal" ? "&#118;" : "&#x76;");
+      expect(() => checkPrivateText(report, "Raw report", [{ value: phrase, entry: 1 }])).not.toThrow();
+      const f = start((s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" }, text: report };
+      });
+      mkdirSync(f.cfg.paths.configDir, { recursive: true });
+      writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), phrase);
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const clean = scenario === "clean";
+      expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe(
+        clean ? "succeeded" : "needs_human",
+      );
+      if (clean) {
+        expect(readFileSync(join(home, "gh-body"), "utf8")).toContain(report);
+        expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
+      } else {
+        expect(f.store.getRun(run.id)?.error).toContain("PR body contains a private string (entry 1");
+        expect(f.store.getRun(run.id)?.error).not.toContain(phrase);
+        expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+        expect(existsSync(join(home, "gh-body"))).toBe(false);
+      }
+    },
+  );
+
   test("delivery fetches an unknown remote head before rewrite detection and refuses failed lookups", async () => {
     const bare = await githubFixture();
     const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();

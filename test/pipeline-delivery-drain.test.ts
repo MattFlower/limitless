@@ -59,6 +59,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
     expect(f.scheduler.parkedRunIds).toEqual([]);
+    expect(readFileSync(join(home, "gh-body"), "utf8")).not.toContain("limitless-report:");
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("<!-- limitless-report:");
   });
 
   test("post-merge gates slower than the GitHub retry budget still deliver", async () => {
@@ -136,6 +138,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+    expect(readFileSync(join(home, "gh-body"), "utf8")).not.toContain("limitless-report:");
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("<!-- limitless-report:");
   });
 
   test.each(["succeeded", "failed"] as const)(

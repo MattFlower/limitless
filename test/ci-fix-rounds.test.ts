@@ -64,6 +64,7 @@ let draft: boolean;
 let autoMerge: boolean;
 let mode: "pass" | "gates" | "review" | "audit" | "stop" | "blocked" | "unmet";
 let implementCalls: number;
+let implementerReport: string;
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
 beforeEach(async () => {
@@ -77,6 +78,7 @@ beforeEach(async () => {
   autoMerge = false;
   mode = "pass";
   implementCalls = 0;
+  implementerReport = "Fixed greeting validation";
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
   cfg.maxRounds = 1;
   factory = new Factory(cfg, {
@@ -145,7 +147,7 @@ beforeEach(async () => {
             "greeting.txt": mode === "gates" ? "BAD\n" : "fixed feature\n",
             ...(mode === "audit" ? { "protected.txt": "rewritten\n" } : {}),
           },
-          text: "Fixed greeting validation",
+          text: implementerReport,
         };
       }),
     },
@@ -311,6 +313,27 @@ test("classifier trigger starts once, disables auto-merge before pushing and pos
   await executeRun(factory.deps, id, new AbortController().signal);
   expect(calls.filter((c) => c[1] === "comment")).toHaveLength(1);
 });
+
+test.each(["raw", "entity"])(
+  "CI comments check private text in an unchanged report-like footer: %s",
+  async (form) => {
+    const phrase = ["private", "comment", "value"].join("-");
+    // The report clips its summary; the CI comment publishes the complete implementation report.
+    const text = form === "raw" ? phrase : phrase.replace("v", "&#x76;");
+    implementerReport = `${"Public summary. ".repeat(400)}\n<!-- limitless-report:${text} -->\n`;
+    mkdirSync(factory.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(factory.cfg.paths.configDir, "private-strings.txt"), phrase);
+    const id = await start();
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+    expect(factory.store.getRun(id)?.error).toContain(
+      "PR body contains a private string (entry 1 in private-strings.txt)",
+    );
+    expect(factory.store.getRun(id)?.error).not.toContain(phrase);
+    expect(factory.store.reviewRound(id)?.deliveredSha).toBe(await remoteHead());
+    expect(calls.some((args) => args[1] === "comment")).toBe(false);
+    expect(comments).toHaveLength(0);
+  },
+);
 
 test.each(["draft", "needs_human", "security", "main-red", "land-main-red", "review", "conflict", "ci"])(
   "no CI round starts for %s",

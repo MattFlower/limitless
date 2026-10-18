@@ -11,6 +11,7 @@ import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } f
 import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
+import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import {
@@ -681,7 +682,7 @@ export async function checkPrivatePublication(
   },
 ) {
   const { commits: range, squash, staged } = input;
-  if (squash) privacy.checkPrivateText(`${squash.title}\n${squash.body}`, "PR text", entries);
+  if (squash) checkPublicationText(`${squash.title}\n${squash.body}`, "PR text", entries);
   const log = [
     "git",
     "--no-replace-objects",
@@ -696,7 +697,7 @@ export async function checkPrivatePublication(
     });
     const fields = ["author name", "author email", "committer name", "committer email"];
     identities.stdout.split("\0").forEach((value, i) => {
-      privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
+      checkPublicationText(value, `Published commit ${fields[i % 4]}`, entries);
     });
     const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
     for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
@@ -713,7 +714,7 @@ export async function checkPrivatePublication(
       const headers = text.slice(0, text.indexOf("\n\n"));
       if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
         throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
-      privacy.checkPrivateText(text, "Published commit object", entries);
+      checkPublicationText(text, "Published commit object", entries);
     }
   }
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
@@ -724,7 +725,7 @@ export async function checkPrivatePublication(
     ...(staged ? [["git", "diff", "--cached"]] : []),
   ]) {
     const { stdout } = await worktreeGit([...args, ...flags], { cwd });
-    privacy.checkPrivateText(stdout, "Published content", entries);
+    checkPublicationText(stdout, "Published content", entries);
     for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
   }
   const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
@@ -1451,7 +1452,7 @@ export async function mergePullRequest(
         if (!rawTitle.trim()) throw new Error("missing merge subject");
         const title = squashTitle(rawTitle, prUrl);
         const body = opts.body ?? data.body;
-        privacy.checkPrivateText(`${title}\n${body}`, "PR text", entries);
+        checkPublicationText(`${title}\n${body}`, "PR text", entries);
         blocked = false;
         const subject =
           opts.body !== undefined
