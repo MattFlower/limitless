@@ -10,7 +10,7 @@ import {
   runCodex,
 } from "../src/harness/codex.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
+import { type ConfinementBackend, ConfinementError, confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
 import {
@@ -221,6 +221,65 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
   runCodex(spec, runner, {
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
+
+// Holds every launch before the trusted startup shell; the optional hook runs just before the spawn.
+// A chatty hold keeps writing stderr, so only runClaude's no-progress watchdog, not the byte-level
+// idle timeout, can stop it.
+const heldLaunch = (beforeSpawn = () => {}, chatty = false): ConfinementBackend => ({
+  verify: async () => {},
+  wrap: (cmd) => {
+    beforeSpawn();
+    const hold = chatty ? "while :; do echo starting >&2; sleep 0.01; done" : "sleep 900";
+    return ["/bin/sh", "-c", `${hold}; exec "$@"`, "sh", ...cmd];
+  },
+});
+const heldEdit = (backend: ConfinementBackend, signal: AbortSignal) =>
+  confinementScope.run(backend, () =>
+    withScratch(import.meta.dir, (scratchDir) => {
+      const home = join(dirname(scratchDir), "home");
+      mkdirSync(home);
+      return readPolicyScope.run({ ...testReadPolicy, home, environment: {} }, () =>
+        runClaude({
+          cwd: import.meta.dir,
+          scratchDir,
+          prompt: "test",
+          mode: "edit",
+          logPath: join(scratchDir, "inv.log"),
+          target: {
+            modelId: "claude/test",
+            provider: "claude",
+            harness: "claude",
+            model: "claude-test",
+            vendor: "anthropic",
+            tier: 4,
+            billing: "subscription",
+          },
+          timeoutMs: 30_000,
+          idleTimeoutMs: 50,
+          maxToolCalls: 1,
+          signal,
+          onEvent: () => {},
+        }),
+      );
+    }),
+  );
+
+test("a claude editor whose sandbox hangs until the no-progress watchdog fires is a confinement error", async () => {
+  const caller = new AbortController();
+  await expect(heldEdit(heldLaunch(undefined, true), caller.signal)).rejects.toThrow(
+    "Write confinement payload did not start: no progress",
+  );
+  expect(caller.signal.aborted).toBe(false);
+});
+
+test("a caller cancel while a claude editor's sandbox starts ends the run cancelled", async () => {
+  const caller = new AbortController();
+  const result = await heldEdit(
+    heldLaunch(() => caller.abort()),
+    caller.signal,
+  );
+  expect(result.status).toBe("cancelled");
+});
 
 for (const harness of ["codex", "claude"] as const) {
   test(`${harness} passes private zsh startup and optional wrapper PATH to tool-enabled agents`, async () => {

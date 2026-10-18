@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
 import { homeReadPolicy } from "./read-policy.ts";
-import { runSandboxed } from "./sandbox.ts";
+import { ConfinementError, runSandboxed } from "./sandbox.ts";
 import {
   agentShellEnv,
   invocationCommands,
@@ -308,8 +308,25 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const shellEnv = agentShellEnv(spec);
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
-  const runner: typeof runProcess = (opts) =>
-    roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
+  // runSandboxed returns a launch cancelled before startup only because our cancel stopped it. When
+  // the no-progress watchdog, not the caller, cancelled it, the sandbox hung: keep that a confinement error.
+  const runner: typeof runProcess = async (opts) => {
+    if (!roots) return processRunner(opts);
+    let started = false;
+    const result = await runSandboxed(
+      {
+        ...opts,
+        onStarted: () => {
+          started = true;
+        },
+      },
+      roots,
+      processRunner,
+    );
+    if (!started && result.cancelled && !spec.signal.aborted)
+      throw new ConfinementError(`Write confinement payload did not start: ${stuckReason ?? "stopped"}`);
+    return result;
+  };
   appendFileSync(spec.logPath, redactCredentials(`# claude ${t.model} ${new Date().toISOString()}\n`));
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   // Agent tool read isolation for this key file is tracked in #335.
