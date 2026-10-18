@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   backendChecks,
   bunVerifierCheck,
@@ -873,11 +873,9 @@ for (const outcome of [
         async (spec) => {
           paths.push(spec.cwd, spec.scratchDir ?? "");
           expect(spec.mode).toBe("readonly");
-          // Verification runs unconfined, with `bun test` resolved to its lease wrapper.
-          expect(spec.confineReads).toBeUndefined();
+          expect(spec.confineReads).toBe(true);
           expect(spec.noTools).not.toBe(true);
-          const wrapper = join(spec.commandPath?.split(delimiter)[0] ?? "", "bun");
-          expect(readFileSync(wrapper, "utf8")).toContain("entry.js");
+          expect(spec.commandPath).toBeUndefined();
           expect(spec.timeoutMs).toBe(90_000);
           const scratch = spec.scratchDir ?? "";
           const entry = readFileSync(join(scratch, "probe.ts"), "utf8");
@@ -895,10 +893,10 @@ for (const outcome of [
             const run = await runProcess({
               cmd: ["/bin/sh", "-c", command],
               cwd: spec.cwd,
-              // Only the real Bun after the wrapper: a test run by an agent must not nest the agent's own wrapper.
+              // Confined readers receive no command wrappers.
               env: agentEnv({
                 TMPDIR: scratch,
-                PATH: `${spec.commandPath?.split(delimiter)[0]}${delimiter}${dirname(process.execPath)}`,
+                PATH: dirname(process.execPath),
               }),
               signal: spec.signal,
               timeoutMs: 15_000,
@@ -931,7 +929,6 @@ for (const outcome of [
         },
         target,
         controller.signal,
-        1,
       );
     if (outcome === "throw") await expect(check()).rejects.toThrow("fake harness failure");
     else expect((await check()).status).toBe(outcome === "pass" ? "pass" : "fail");
@@ -956,10 +953,10 @@ for (const stop of ["cancelled", "deadline"] as const) {
         const run = await runProcess({
           cmd: ["/bin/sh", "-c", command],
           cwd: spec.cwd,
-          // Only the real Bun after the wrapper: a test run by an agent must not nest the agent's own wrapper.
+          // Confined readers receive no command wrappers.
           env: agentEnv({
             TMPDIR: scratch,
-            PATH: `${spec.commandPath?.split(delimiter)[0]}${delimiter}${dirname(process.execPath)}`,
+            PATH: dirname(process.execPath),
           }),
           signal: spec.signal,
           timeoutMs: 20_000,
@@ -992,7 +989,6 @@ for (const stop of ["cancelled", "deadline"] as const) {
         billing: "subscription",
       },
       controller.signal,
-      1,
     );
     expect(check.status).toBe("fail");
     expect(existsSync(scratch)).toBe(false);

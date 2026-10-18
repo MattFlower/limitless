@@ -133,98 +133,124 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
   );
 }
 
-test.skipIf(seatbeltSkip !== null)(
-  `Claude verifier runs bun test through its wrapper in the production reader sandbox (${seatbeltSkip ?? "available"})`,
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "verifier-bun-")));
-    const cwd = join(root, "checkout");
-    mkdirSync(cwd);
-    const scratch = createScratch(cwd);
-    const file = join(scratch, "probe.test.ts");
-    writeFileSync(file, 'import {test, expect} from "bun:test"; test("probe", () => expect(1).toBe(1));');
-    // A live HTTP endpoint the sandbox must still refuse; the wrapper must not wait for it (#586).
-    const http = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () => new Response(null, { status: 500 }),
-    });
-    const spec: AgentSpec = {
-      cwd,
-      scratchDir: scratch,
-      mode: "readonly",
-      prompt: "",
-      timeoutMs: 10_000,
-      idleTimeoutMs: 10_000,
-      maxToolCalls: 1,
-      signal: new AbortController().signal,
-      onEvent: () => {},
-      logPath: join(root, "stream.log"),
-      target: {
-        modelId: "probe",
-        provider: "fake",
-        harness: "fake",
-        model: "probe",
-        vendor: "fake",
-        tier: 1,
-        billing: "subscription",
-      },
-    };
-    const previous = process.env.CLAUDE_CODE_TMPDIR;
-    try {
-      await withSlottedCommands(
-        [["bun", "test"]],
+for (const confineReads of [false, true])
+  test.skipIf(seatbeltSkip !== null)(
+    `Claude reader runs bun test (${confineReads ? "confined verifier" : "lease wrapper"}; ${seatbeltSkip ?? "available"})`,
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "verifier-bun-")));
+      const cwd = join(root, "checkout");
+      mkdirSync(cwd);
+      const scratch = createScratch(cwd);
+      const file = join(scratch, "probe.test.ts");
+      writeFileSync(file, 'import {test, expect} from "bun:test"; test("probe", () => expect(1).toBe(1));');
+      // A live HTTP endpoint the sandbox must still refuse; the wrapper must not wait for it (#586).
+      const http = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () => new Response(null, { status: 500 }),
+      });
+      const spec: AgentSpec = {
         cwd,
-        scratch,
-        Number(http.port),
-        () => {},
-        (commandPath) =>
-          runClaude({ ...spec, commandPath }, async (opts) => {
-            const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
-            process.env.CLAUDE_CODE_TMPDIR = opts.env.CLAUDE_CODE_TMPDIR;
-            try {
-              await SandboxManager.initialize(
-                {
-                  filesystem: settings.sandbox.filesystem,
-                  network: { allowedDomains: [], deniedDomains: [] },
-                },
-                undefined,
-                false,
-              );
-              const wrapped = await SandboxManager.wrapWithSandboxArgv(
-                `bun test '${file}'`,
-                "/bin/bash",
-                undefined,
-                spec.signal,
-                cwd,
-              );
-              const env = Object.fromEntries(
-                Object.entries(wrapped.env).filter(
-                  (entry): entry is [string, string] => entry[1] !== undefined,
+        scratchDir: scratch,
+        mode: "readonly",
+        confineReads,
+        prompt: "",
+        timeoutMs: confineReads ? 30_000 : 10_000,
+        idleTimeoutMs: confineReads ? 30_000 : 10_000,
+        maxToolCalls: 1,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+        logPath: join(root, "stream.log"),
+        target: {
+          modelId: "probe",
+          provider: "fake",
+          harness: "fake",
+          model: "probe",
+          vendor: "fake",
+          tier: 1,
+          billing: "subscription",
+        },
+      };
+      const previous = process.env.CLAUDE_CODE_TMPDIR;
+      try {
+        await withSlottedCommands(
+          confineReads ? [] : [["bun", "test"]],
+          cwd,
+          scratch,
+          Number(http.port),
+          () => {},
+          (commandPath) =>
+            runClaude({ ...spec, commandPath }, async (opts) => {
+              const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+              process.env.CLAUDE_CODE_TMPDIR = opts.env.CLAUDE_CODE_TMPDIR;
+              const execute = async (filesystem: SandboxRuntimeConfig["filesystem"]) => {
+                try {
+                  await SandboxManager.initialize(
+                    { filesystem, network: { allowedDomains: [], deniedDomains: [] } },
+                    undefined,
+                    false,
+                  );
+                  const wrapped = await SandboxManager.wrapWithSandboxArgv(
+                    `${confineReads ? JSON.stringify(process.execPath) : "bun"} test '${file}'`,
+                    "/bin/bash",
+                    undefined,
+                    spec.signal,
+                    cwd,
+                  );
+                  const env = Object.fromEntries(
+                    Object.entries(wrapped.env).filter(
+                      (entry): entry is [string, string] => entry[1] !== undefined,
+                    ),
+                  );
+                  return await runProcess({
+                    cmd: wrapped.argv,
+                    cwd,
+                    env: { ...opts.env, ...env },
+                    signal: opts.signal,
+                    timeoutMs: 10_000,
+                  });
+                } finally {
+                  await SandboxManager.reset();
+                }
+              };
+              const filesystem: SandboxRuntimeConfig["filesystem"] = settings.sandbox.filesystem;
+              const pathName = (entry: string | { path: string }) =>
+                typeof entry === "string" ? entry : entry.path;
+              const containsBun = (entry: string | { path: string }) =>
+                process.execPath === pathName(entry) || process.execPath.startsWith(`${pathName(entry)}/`);
+              const withoutBun = {
+                ...filesystem,
+                allowRead: filesystem.allowRead?.filter(
+                  (entry) => ![process.execPath, realpathSync(process.execPath)].includes(pathName(entry)),
                 ),
-              );
-              const result = await runProcess({
-                cmd: wrapped.argv,
-                cwd,
-                env: { ...opts.env, ...env },
-                timeoutMs: 10_000,
-              });
+              };
+              // Isolate just the executable exception when the installation lies in a private root.
+              if (
+                confineReads &&
+                filesystem.denyRead.some(containsBun) &&
+                !withoutBun.allowRead?.some(containsBun)
+              ) {
+                const control = await execute(withoutBun);
+                console.info(
+                  redactCredentials(`Claude verifier without Bun exception: ${JSON.stringify(control)}`),
+                );
+                expect(control.timedOut || control.exitCode !== 0).toBe(true);
+              }
+              const result = await execute(filesystem);
               console.info(redactCredentials(`Claude verifier bun test: ${JSON.stringify(result)}`));
               expect(result.timedOut).toBe(false);
               expect(result.exitCode).toBe(0);
               expect(result.stdout + result.stderr).toContain("1 pass");
               return result;
-            } finally {
-              await SandboxManager.reset();
-            }
-          }),
-      );
-    } finally {
-      if (previous === undefined) delete process.env.CLAUDE_CODE_TMPDIR;
-      else process.env.CLAUDE_CODE_TMPDIR = previous;
-      http.stop(true);
-      removeScratch(scratch);
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-  30_000,
-);
+            }),
+        );
+      } finally {
+        if (previous === undefined) delete process.env.CLAUDE_CODE_TMPDIR;
+        else process.env.CLAUDE_CODE_TMPDIR = previous;
+        http.stop(true);
+        removeScratch(scratch);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );

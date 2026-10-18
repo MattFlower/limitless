@@ -2,12 +2,14 @@ import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { ConfinementError, homeReadPolicy } from "./read-policy.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
   agentShellEnv,
   invocationCommands,
   readConfinement,
   scratchParent,
+  spellings,
   validateDenyRead,
   validateScratch,
   writeRoots,
@@ -165,7 +167,12 @@ export class ClaudeStreamParser {
   }
 }
 
-export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: string): string[] {
+export function buildClaudeArgs(
+  spec: AgentSpec,
+  sessionId: string,
+  keyFile?: string,
+  bunExecutable = process.execPath,
+): string[] {
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
     throw new Error("Reading invocations cannot grant additional directories");
@@ -213,7 +220,15 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
       const commands = invocationCommands(scratch, spec.cwd);
-      const denyRead = [...(confined?.deny ?? explicit), ...commands.root];
+      // The home-wide read deny also blocks Bun itself. Grant the executable alone, never its
+      // parent (which could contain credentials or other invocations' command capabilities).
+      const bun = confined ? spellings([bunExecutable]) : [];
+      const credentials = confined ? homeReadPolicy([], false, [...explicit, ...commands.root]).denyRead : [];
+      for (const allow of bun)
+        for (const deny of credentials)
+          if (allow === deny || allow.startsWith(`${deny}/`) || deny.startsWith(`${allow}/`))
+            throw new ConfinementError(`Bun read allowance overlaps denied path ${deny}`);
+      const denyRead = [...(confined?.deny ?? explicit), ...credentials, ...commands.root];
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
       denied.push(...[...explicit, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
@@ -227,7 +242,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
         ...(denyRead.length ? { denyRead } : {}),
         // Takes precedence over denyRead, so the private roots may contain cwd and scratch. Only an
         // unconfined reader receives command wrappers, so only it may read its own.
-        ...(confined ? { allowRead: readable } : commands.own.length ? { allowRead: commands.own } : {}),
+        ...(confined
+          ? { allowRead: [...readable, ...bun] }
+          : commands.own.length
+            ? { allowRead: commands.own }
+            : {}),
         disabled: false,
       };
     }
