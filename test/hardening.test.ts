@@ -833,6 +833,7 @@ describe("process handling", () => {
         { stdio: "ignore", cwd: dir },
       );
       let pid: number | undefined;
+      let birth: string | null = null;
       let spawning = true;
       const churn = (async () => {
         while (spawning) {
@@ -849,6 +850,7 @@ describe("process handling", () => {
           await Bun.sleep(10);
         pid = Number(readFileSync(pidFile, "utf8"));
         expect(pid).toBeGreaterThan(0);
+        birth = await processBirth(pid);
         expect(
           markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, Date.now(), [
             realpathSync(dir),
@@ -865,7 +867,8 @@ describe("process handling", () => {
         spawning = false;
         await churn;
         launcher.kill("SIGKILL");
-        if (pid !== undefined && pid > 0) {
+        // Under load finally can run after the sleep ends and the pid is reused; signal only our orphan.
+        if (pid !== undefined && birth !== null && (await processBirth(pid)) === birth) {
           try {
             process.kill(-pid, "SIGKILL");
           } catch {}
