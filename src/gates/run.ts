@@ -61,6 +61,8 @@ export interface GateComparison {
   verdict: GateVerdict;
   blocking: boolean;
   result: GateResult;
+  /** The matched baseline check could not provide usable comparison evidence. */
+  baselineConfinementError?: boolean;
   /** The failing run that triggered a retry. */
   firstAttempt?: GateResult;
 }
@@ -362,9 +364,10 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
   }
   for (const r of after.checks) {
     const before = findGateCounterpart(r, after.checks, baseline?.checks ?? []);
+    const baselineConfinementError = confinementFailed(before);
     let verdict: GateVerdict;
-    if (confinementFailed(r) || confinementFailed(before)) verdict = "confinement_error";
-    else if (!before) verdict = r.ok ? "new_pass" : "new_failure";
+    if (confinementFailed(r)) verdict = "confinement_error";
+    else if (!before || baselineConfinementError) verdict = r.ok ? "new_pass" : "new_failure";
     else if (before.ok && r.ok) verdict = "pass";
     else if (before.ok && !r.ok) verdict = "regressed";
     else if (!before.ok && r.ok) verdict = "fixed";
@@ -378,6 +381,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
         verdict === "regressed" ||
         verdict === "new_failure",
       result: r,
+      ...(baselineConfinementError ? { baselineConfinementError: true } : {}),
     });
   }
   return out;
