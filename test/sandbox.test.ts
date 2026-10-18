@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
 import {
   chmodSync,
   copyFileSync,
@@ -1034,6 +1034,80 @@ test("a Seatbelt diagnostic beyond the retained stderr tail still makes a cancel
   // The retained tail no longer holds the diagnostic, and the cancel did kill the launch.
   expect(seen?.stderr.includes(diagnostic)).toBe(false);
   expect(seen).toMatchObject({ cancelled: true, cancelKilled: true, signal: "SIGKILL" });
+});
+
+test("a frozen launch killed by something else before the cancel's SIGKILL stays a confinement error", async () => {
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => ["/bin/sh", "-c", 'echo "held $$" >&2; sleep 900; exec "$@"', "sh", ...cmd],
+  };
+  const inspecting = deferred<void>();
+  const release = deferred<void>();
+  let launcher = 0;
+  let frozen = false;
+  let holding = false;
+  const kill = process.kill.bind(process);
+  const signals = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    const sent = kill(pid, signal);
+    if (pid === launcher && signal === "SIGSTOP") frozen = true;
+    return sent;
+  });
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  try {
+    const launch = processBirthInspection.run(
+      {
+        // After the freeze, the launcher's next identity check (just before our SIGKILL) waits here.
+        read: async (pid, name) => {
+          if (frozen && pid === launcher && !holding) {
+            holding = true;
+            inspecting.resolve();
+            await release.promise;
+          }
+          return processBirth(pid, name);
+        },
+        now: () => Number.MAX_SAFE_INTEGER,
+      },
+      () =>
+        runSandboxed(
+          {
+            cmd: ["/usr/bin/true"],
+            cwd: work,
+            env: agentEnv(),
+            signal: abort.signal,
+            onStderrLine: (line) => {
+              const match = /^held (\d+)$/.exec(line);
+              if (!match) return;
+              launcher = Number(match[1]);
+              abort.abort();
+            },
+          },
+          { write: [work], protect: [] },
+          async (opts) => {
+            seen = await runProcess(opts);
+            return seen;
+          },
+          undefined,
+          held,
+        ),
+    );
+    await inspecting.promise;
+    // Something else kills the frozen launcher before the cancel's own SIGKILL is sent.
+    kill(launcher, "SIGKILL");
+    for (;;) {
+      try {
+        kill(launcher, 0);
+      } catch {
+        break;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    release.resolve();
+    await expect(launch).rejects.toThrow(ConfinementError);
+    expect(seen).toMatchObject({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" });
+  } finally {
+    signals.mockRestore();
+  }
 });
 
 test("a launch that dies on its own after a cancel but before the cancel's kill stays a confinement error", async () => {

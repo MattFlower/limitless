@@ -293,8 +293,8 @@ async function stopMarkedProcesses(
 ): Promise<boolean> {
   const group = child.pid;
   if (group === undefined) return false;
-  // Whether this shutdown's first signal to the direct child reached it while it still ran.
-  let childSignalled = false;
+  // Whether this shutdown's own SIGKILL reached the direct child while it still ran.
+  let childKillSent = false;
   let killedRunningChild = false;
   const protectedPids = callerAncestors();
   const started = performance.now();
@@ -346,13 +346,16 @@ async function stopMarkedProcesses(
         if (birth !== identity.birth) claimed.delete(pid);
         else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
         else if (!freezing || !identity.stopped) {
-          // Decided at delivery, not when shutdown began: the child may die on its own while
-          // discovery and identity checks run. Unreaped (exitCode null), its pid can't be reused.
-          const first = pid === group && !childSignalled;
-          const running = first && child.exitCode === null && child.signalCode === null && stillRunning(pid);
-          if (first) childSignalled = true;
+          // Decided by our SIGKILL, not the freeze or the start of shutdown: a frozen child can still
+          // be killed by something else during the checks in between. A stopped child counts as
+          // running; unreaped (exitCode null), its pid can't have been reused.
+          const signal = freezing ? "SIGSTOP" : "SIGKILL";
+          const killingChild = pid === group && signal === "SIGKILL" && !childKillSent;
+          const running =
+            killingChild && child.exitCode === null && child.signalCode === null && stillRunning(pid);
+          if (killingChild) childKillSent = true;
           try {
-            process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
+            process.kill(pid, signal);
             identity.stopped = true;
             identity.frozen = freezing;
             if (running) killedRunningChild = true;
@@ -443,8 +446,8 @@ export interface ProcResult {
   stderrTruncated?: boolean;
   durationMs: number;
   /**
-   * The cancel started this invocation's shutdown, and the shutdown's first signal to the child
-   * reached it while it still ran (not exited, not a zombie). False whenever that can't be shown.
+   * The cancel started this invocation's shutdown, and the shutdown's own SIGKILL reached the child
+   * while it still ran (not exited, not a zombie). False whenever that can't be shown.
    */
   cancelKilled?: boolean;
 }
