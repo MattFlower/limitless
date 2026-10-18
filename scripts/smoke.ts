@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveClientPort } from "../src/cli/client-port.ts";
 import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
@@ -11,6 +12,7 @@ import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveCatalog } from "../src/router/config-catalog.ts";
@@ -721,11 +723,12 @@ for label, path in [${Object.entries({ ...canaries, config: configCanary })
   }
 }
 
-/** Exercise the verifier's real tool sandbox, including Bun's child test runner. */
+/** Run `bun test` as verifiers do: an unconfined reader whose `bun test` is the lease wrapper (#586). */
 export async function bunVerifierCheck(
   harness: Harness,
   target: ModelTarget,
   signal = new AbortController().signal,
+  port = resolveClientPort(),
 ): Promise<CheckResult> {
   const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-bun-")));
   try {
@@ -741,7 +744,7 @@ export async function bunVerifierCheck(
       writeFileSync(
         entry,
         `import { runProcess } from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
-const r = await runProcess({cmd: [process.execPath, "test", ${JSON.stringify(test)}], cwd: ${JSON.stringify(scratchDir)}, env: process.env, timeoutMs: 10_000, onStdoutLine: (line) => console.log(line)});
+const r = await runProcess({cmd: [Bun.which("bun", { PATH: process.env.PATH ?? "" }) ?? "bun", "test", ${JSON.stringify(test)}], cwd: ${JSON.stringify(scratchDir)}, env: process.env, timeoutMs: 10_000, onStdoutLine: (line) => console.log(line)});
 process.stdout.write(r.stdout); process.stderr.write(r.stderr);
 if (r.exitCode === 0 && !r.timedOut && !r.cancelled && /1 pass/.test(r.stdout + r.stderr) && /0 fail/.test(r.stdout + r.stderr)) console.log("${token}:bun-test-passed");
 else process.exitCode = 1;
@@ -753,20 +756,28 @@ else process.exitCode = 1;
       writeFileSync(probe, await bundle.outputs[0].text());
       const quote = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
       const command = `${quote(process.execPath)} ${quote(probe)}`;
-      const result = await harness({
+      const result = await withSlottedCommands(
+        [["bun", "test"]],
         cwd,
         scratchDir,
-        target,
-        mode: "readonly",
-        confineReads: true,
-        prompt: `Execute exactly this Bash command and report its output:\n${command}`,
-        timeoutMs: 90_000,
-        idleTimeoutMs: 30_000,
-        maxToolCalls: 8,
-        signal,
-        logPath: join(cwd, "stream.log"),
-        onEvent: (event) => events.push(event),
-      });
+        port,
+        () => {},
+        (commandPath) =>
+          harness({
+            cwd,
+            scratchDir,
+            ...(commandPath ? { commandPath } : {}),
+            target,
+            mode: "readonly",
+            prompt: `Execute exactly this Bash command and report its output:\n${command}`,
+            timeoutMs: 90_000,
+            idleTimeoutMs: 30_000,
+            maxToolCalls: 8,
+            signal,
+            logPath: join(cwd, "stream.log"),
+            onEvent: (event) => events.push(event),
+          }),
+      );
       if (signal.aborted) return fail("Bun verifier probe cancelled");
       if (result.status !== "ok") return status(result);
       return verifyProbeEvidence(events, command, token, ["bun-test-passed"])

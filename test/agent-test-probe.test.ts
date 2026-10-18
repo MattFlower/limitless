@@ -13,6 +13,7 @@ import {
   removeScratch,
   writeRoots,
 } from "../src/harness/scratch.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
@@ -133,7 +134,7 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
 }
 
 test.skipIf(seatbeltSkip !== null)(
-  `Claude verifier Bun test with production settings and environment (${seatbeltSkip ?? "available"})`,
+  `Claude verifier runs bun test through its wrapper in the production reader sandbox (${seatbeltSkip ?? "available"})`,
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "verifier-bun-")));
     const cwd = join(root, "checkout");
@@ -141,11 +142,16 @@ test.skipIf(seatbeltSkip !== null)(
     const scratch = createScratch(cwd);
     const file = join(scratch, "probe.test.ts");
     writeFileSync(file, 'import {test, expect} from "bun:test"; test("probe", () => expect(1).toBe(1));');
+    // A live HTTP endpoint the sandbox must still refuse; the wrapper must not wait for it (#586).
+    const http = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response(null, { status: 500 }),
+    });
     const spec: AgentSpec = {
       cwd,
       scratchDir: scratch,
       mode: "readonly",
-      confineReads: true,
       prompt: "",
       timeoutMs: 10_000,
       idleTimeoutMs: 10_000,
@@ -165,71 +171,57 @@ test.skipIf(seatbeltSkip !== null)(
     };
     const previous = process.env.CLAUDE_CODE_TMPDIR;
     try {
-      // Change only Bun's allowance between runs; keep wrappers, checkout denyWrite and CLI temp settings.
-      for (const corrected of [false, true]) {
-        await runClaude(spec, async (opts) => {
-          const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
-          const filesystem: SandboxRuntimeConfig["filesystem"] = settings.sandbox.filesystem;
-          if (!corrected)
-            filesystem.allowRead = filesystem.allowRead?.filter((p) => p === cwd || p === scratch);
-          process.env.CLAUDE_CODE_TMPDIR = opts.env.CLAUDE_CODE_TMPDIR;
-          try {
-            await SandboxManager.initialize(
-              { filesystem, network: { allowedDomains: [], deniedDomains: [] } },
-              undefined,
-              false,
-            );
-            const quote = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
-            const wrapped = await SandboxManager.wrapWithSandboxArgv(
-              [process.execPath, "test", file].map(quote).join(" "),
-              "/bin/bash",
-              undefined,
-              spec.signal,
-              cwd,
-            );
-            const result = await runProcess({
-              cmd: wrapped.argv,
-              cwd,
-              env: {
-                ...opts.env,
-                ...Object.fromEntries(
-                  Object.entries(wrapped.env).filter(
-                    (entry): entry is [string, string] => entry[1] !== undefined,
-                  ),
+      await withSlottedCommands(
+        [["bun", "test"]],
+        cwd,
+        scratch,
+        Number(http.port),
+        () => {},
+        (commandPath) =>
+          runClaude({ ...spec, commandPath }, async (opts) => {
+            const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+            process.env.CLAUDE_CODE_TMPDIR = opts.env.CLAUDE_CODE_TMPDIR;
+            try {
+              await SandboxManager.initialize(
+                {
+                  filesystem: settings.sandbox.filesystem,
+                  network: { allowedDomains: [], deniedDomains: [] },
+                },
+                undefined,
+                false,
+              );
+              const wrapped = await SandboxManager.wrapWithSandboxArgv(
+                `bun test '${file}'`,
+                "/bin/bash",
+                undefined,
+                spec.signal,
+                cwd,
+              );
+              const env = Object.fromEntries(
+                Object.entries(wrapped.env).filter(
+                  (entry): entry is [string, string] => entry[1] !== undefined,
                 ),
-              },
-              signal: spec.signal,
-              timeoutMs: 10_000,
-            });
-            console.info(
-              redactCredentials(
-                `Claude verifier Bun: ${JSON.stringify({
-                  corrected,
-                  timedOut: result.timedOut,
-                  exitCode: result.exitCode,
-                  stdout: result.stdout,
-                  stderr: result.stderr,
-                })}`,
-              ),
-            );
-            expect(result.cancelled).toBe(false);
-            if (corrected) {
+              );
+              const result = await runProcess({
+                cmd: wrapped.argv,
+                cwd,
+                env: { ...opts.env, ...env },
+                timeoutMs: 10_000,
+              });
+              console.info(redactCredentials(`Claude verifier bun test: ${JSON.stringify(result)}`));
               expect(result.timedOut).toBe(false);
               expect(result.exitCode).toBe(0);
               expect(result.stdout + result.stderr).toContain("1 pass");
-            } else {
-              // An immediate denial is not the reported hang and cannot establish this diagnosis.
-              expect(result.timedOut).toBe(true);
+              return result;
+            } finally {
+              await SandboxManager.reset();
             }
-            return result;
-          } finally {
-            await SandboxManager.reset();
-          }
-        });
-      }
+          }),
+      );
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_CODE_TMPDIR;
       else process.env.CLAUDE_CODE_TMPDIR = previous;
+      http.stop(true);
       removeScratch(scratch);
       rmSync(root, { recursive: true, force: true });
     }

@@ -631,6 +631,10 @@ test.each([false, true])("healthy busy queue exits 75 without executing (lane bu
   expect(stderr).toMatch(/waited.*targeted/i);
   expect(stderr).toContain("gate lane");
   expect(stderr).toContain(busy ? "other command" : "full suite");
+  // The agent's tool sees one wait notice before the budget runs out, not silence (#586).
+  expect(
+    warning.mock.calls.filter(([m]) => String(m).includes("waiting up to 1s for the gate lane")),
+  ).toHaveLength(1);
   if (busy) expect(requests.every((body) => !body.id)).toBe(true);
   else expect(requests.at(-1)).toMatchObject({ release: true });
   expect(time.pending).toBe(0);
@@ -826,6 +830,39 @@ test.each([
   expect(stderr).not.toContain(f.config.token);
   expect(stderr).toContain("[redacted]");
   expect(existsSync(f.marker)).toBe(true);
+});
+
+test("a sandbox that refuses both connections runs the test at once instead of waiting silently", async () => {
+  // Claude's reader sandbox denies loopback and Unix-socket connects; Bun reports this shape (#586).
+  const f = fixture(),
+    { clock } = fakeClock();
+  const denied = (transport: string) =>
+    Object.assign(new TypeError(`${transport} EPERM: Was there a typo in the url or port?`), {
+      code: "EPERM",
+    });
+  const requests: string[] = [];
+  const client = wrapperLeaseClient(
+    f.config,
+    clock,
+    async () => {
+      requests.push("http");
+      throw denied("HTTP");
+    },
+    async () => {
+      requests.push("unix");
+      throw denied("socket");
+    },
+  );
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanup.push(() => warn.mockRestore());
+  const start = clock.now();
+  expect(await agentTestCommand(f.config, ["bun", "test"], client, { clock })).toBe(3);
+  expect(clock.now()).toBe(start);
+  expect(requests).toEqual(["http", "unix"]);
+  expect(existsSync(f.marker)).toBe(true);
+  const stderr = warn.mock.calls.flat().join();
+  expect(stderr).toContain("coordination unavailable");
+  expect(stderr).toContain("EPERM");
 });
 
 test("an answering endpoint rejection never falls back, and socket failure rechecks HTTP", async () => {
