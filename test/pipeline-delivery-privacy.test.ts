@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
+import type { Repo } from "../src/core/types.ts";
+import { checkPrivateRange, deliveryPublicationRange, pushExistingBranch } from "../src/git/repos.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
@@ -35,6 +37,135 @@ const { start, githubFixture, registerGithub } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("delivery fetches an unknown remote head before rewrite detection and refuses failed lookups", async () => {
+    const bare = await githubFixture();
+    const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+    const base = await git("rev-parse", "HEAD");
+    const tree = await git("rev-parse", "HEAD^{tree}");
+    const remoteOnly = await git("--git-dir", bare, "commit-tree", tree, "-p", base, "-m", "remote only");
+    await git("--git-dir", bare, "update-ref", "refs/heads/pr", remoteOnly);
+    const missing = await sh(["git", "cat-file", "-e", remoteOnly], { cwd: repoDir, allowFail: true });
+    expect(missing.exitCode).not.toBe(0);
+    const unsafe = `%${"25".repeat(6)}72`;
+    await git("commit", "--allow-empty", "-qm", unsafe);
+    const head = await git("rev-parse", "HEAD");
+    const repo: Repo = {
+      id: "repo",
+      slug: "test/repo",
+      kind: "github",
+      url: bare,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+      createdAt: 0,
+    };
+    const range = await deliveryPublicationRange(repo, repoDir, "pr", base, head);
+    expect(range).toBe(`${base}..${head}`);
+    expect((await sh(["git", "cat-file", "-e", remoteOnly], { cwd: repoDir })).exitCode).toBe(0);
+    await expect(checkPrivateRange(repoDir, range, [])).rejects.toThrow("decoding limit");
+    await expect(
+      deliveryPublicationRange({ ...repo, url: join(home, "missing.git") }, repoDir, "pr", base, head),
+    ).rejects.toThrow();
+  });
+
+  test("a second delivery pushes clean commits without rescanning published history", async () => {
+    const bare = await githubFixture();
+    const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+    const base = await git("rev-parse", "HEAD");
+    const unsafe = `%${"25".repeat(6)}72`;
+    writeFileSync(join(repoDir, "transient.txt"), unsafe);
+    await git("add", ".");
+    await git("commit", "-qm", "intermediate");
+    rmSync(join(repoDir, "transient.txt"));
+    await git("commit", "-qam", "remove intermediate");
+    const remote = await git("rev-parse", "HEAD");
+    await git("push", bare, "HEAD:refs/heads/pr");
+    writeFileSync(join(repoDir, "farewell.txt"), "goodbye\n");
+    await git("add", ".");
+    await git("commit", "-qm", "second delivery");
+    const head = await git("rev-parse", "HEAD");
+    const repo: Repo = {
+      id: "repo",
+      slug: "test/repo",
+      kind: "github",
+      url: bare,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+      createdAt: 0,
+    };
+    const range = await deliveryPublicationRange(repo, repoDir, "pr", base, head);
+    expect(range).toBe(`${remote}..${head}`);
+    for (const entries of [[], [{ value: ["private", "value"].join("-"), entry: 1 }]]) {
+      await expect(checkPrivateRange(repoDir, `${base}..${head}`, entries)).rejects.toThrow("decoding limit");
+      await checkPrivateRange(repoDir, range, entries);
+    }
+    await pushExistingBranch(repo, repoDir, "pr", remote, undefined, undefined, head);
+    expect(await git("--git-dir", bare, "rev-parse", "refs/heads/pr")).toBe(head);
+  });
+
+  test.each(["new", "missing", "rewrite", "equal"])(
+    "delivery scans only newly published commits: %s",
+    async (scenario) => {
+      const bare = await githubFixture();
+      const unsafe = `%${"25".repeat(6)}72`;
+      const f = start(async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: s.cwd })).stdout.trim();
+        if (role === "review") {
+          if (scenario === "equal") {
+            const branch = await git("symbolic-ref", "--short", "HEAD");
+            await git("push", bare, `HEAD:refs/heads/${branch}`);
+          }
+          return { structured: approve };
+        }
+        const base = await git("rev-parse", "HEAD");
+        const branch = await git("symbolic-ref", "--short", "HEAD");
+        const commit = async (message: string) => {
+          await git("add", ".");
+          await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", message);
+        };
+        writeFileSync(join(s.cwd, "transient.txt"), unsafe);
+        await commit("intermediate");
+        rmSync(join(s.cwd, "transient.txt"));
+        await commit("remove intermediate");
+        if (scenario === "new") await git("push", bare, `HEAD:refs/heads/${branch}`);
+        if (scenario === "rewrite") {
+          const tree = await git("rev-parse", `${base}^{tree}`);
+          const other = await git("commit-tree", tree, "-p", base, "-m", "other history");
+          await git("push", bare, `${other}:refs/heads/${branch}`);
+        }
+        if (scenario === "new") {
+          writeFileSync(join(s.cwd, "another.txt"), "clean");
+          await commit(unsafe);
+        }
+        return { files: { "farewell.txt": "goodbye\n" }, text: "Done" };
+      });
+      // Exercise both an absent denylist and a configured, nonmatching one.
+      if (scenario === "rewrite") {
+        mkdirSync(f.cfg.paths.configDir, { recursive: true });
+        writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), ["private", "value"].join("-"));
+      }
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const clean = scenario === "equal";
+      const status = await waitFor(f, run.id, ["needs_human", "failed", "succeeded"]);
+      const result = f.store.getRun(run.id);
+      if (clean) expect(result?.error).toBeNull();
+      expect(status).toBe(clean ? "succeeded" : "needs_human");
+      if (clean) expect(result?.prUrl).toBe("https://github.com/test/repo/pull/1");
+      else {
+        expect(result?.error).toContain("decoding limit");
+        expect(result?.prUrl).toBeNull();
+        const remote = (
+          await sh(["git", "ls-remote", bare, `refs/heads/${result?.branch}`], { cwd: repoDir })
+        ).stdout;
+        expect(remote).not.toContain(result?.headSha ?? "missing SHA");
+      }
+    },
+  );
+
   test.each([
     "commit",
     "title",

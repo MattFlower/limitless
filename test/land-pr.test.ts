@@ -66,6 +66,7 @@ describe("land-pr private strings", () => {
     "absent",
     "clean",
     "history",
+    "published-history",
     "message",
     "author-email",
     "utf16-author-email",
@@ -118,7 +119,12 @@ describe("land-pr private strings", () => {
       const body = scenario === "body" ? entry.toUpperCase() : "Safe body";
       writeFileSync(
         join(root, "pr.json"),
-        JSON.stringify({ baseRefOid: sha, body, headRefName: scenario === "head-ref" ? entry : "pr" }),
+        JSON.stringify({
+          baseRefOid: sha,
+          headRefOid: sha,
+          body,
+          headRefName: scenario === "head-ref" ? entry : "pr",
+        }),
       );
       if (scenario === "unreadable") mkdirSync(join(config, "private-strings.txt"));
       else if (scenario !== "absent")
@@ -156,8 +162,11 @@ describe("land-pr private strings", () => {
         );
         expectedHead = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
       }
-      if (["history", "message", "utf16-message"].includes(scenario)) {
-        writeFileSync(join(work, "transient.txt"), scenario === "history" ? entry : "safe");
+      if (["history", "published-history", "message", "utf16-message"].includes(scenario)) {
+        writeFileSync(
+          join(work, "transient.txt"),
+          scenario === "published-history" ? `%${"25".repeat(6)}72` : scenario === "history" ? entry : "safe",
+        );
         await commit(scenario.endsWith("message") ? `Safe subject\n\n${entry}` : "safe");
         rmSync(join(work, "transient.txt"));
         await commit("remove transient");
@@ -210,6 +219,11 @@ describe("land-pr private strings", () => {
       await git("-C", work, "add", ".");
       if (scenario !== "post-commit" && (await git("-C", work, "diff", "--cached", "--name-only")).stdout)
         await commit("safe");
+      if (scenario === "published-history")
+        writeFileSync(
+          join(root, "pr.json"),
+          JSON.stringify({ baseRefOid: sha, headRefOid: expectedHead, body, headRefName: "pr" }),
+        );
       // Stop permitted deliveries at push so the script never reaches the network.
       writeFileSync(
         join(bin, "git"),
@@ -242,7 +256,7 @@ describe("land-pr private strings", () => {
       if (scenario.endsWith("author-email")) expect(result.stderr).toContain("author email");
       if (scenario !== "post-commit")
         expect((await git("-C", work, "rev-parse", "HEAD")).stdout.trim()).toBe(expectedHead);
-      if (["absent", "clean", "excluded"].includes(scenario)) {
+      if (["absent", "clean", "excluded", "published-history"].includes(scenario)) {
         expect(readFileSync(join(root, "mutations"), "utf8")).toBe("push\n");
       } else {
         expect(existsSync(join(root, "mutations"))).toBe(false);
@@ -609,15 +623,15 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "gh", args }) + "\\n");
 if (args[0] === "run" && args[1] === "list") console.log("123");
 else if (args[1] === "view") {
-  if (args.includes("baseRefOid,body,headRefName") && existsSync(${JSON.stringify(pinned)}) && ${planted && plantAt === "pre-push"}) {
+  if (args.includes("baseRefOid,body,headRefName,headRefOid") && existsSync(${JSON.stringify(pinned)}) && ${planted && plantAt === "pre-push"}) {
     for (const command of ${JSON.stringify(plantCommands)}) {
       const changed = spawnSync(${JSON.stringify(gitBin)}, command, { stdio: "inherit" });
       if (changed.status !== 0) process.exit(1);
     }
   }
   if (args.includes("--jq")) console.log("pr");
-  else if (args.includes("title,body,headRefOid")) console.log(JSON.stringify({ title: "safe", body: "safe", headRefOid: readFileSync(${JSON.stringify(pinned)}, "utf8") }));
-  else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: value.base, body: "safe", headRefName: "pr" }))});
+  else if (args.includes("title,body,headRefOid,baseRefOid")) console.log(JSON.stringify({ title: "safe", body: "safe", baseRefOid: ${JSON.stringify(value.base)}, headRefOid: readFileSync(${JSON.stringify(pinned)}, "utf8") }));
+  else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: value.base, headRefOid: value.base, body: "safe", headRefName: "pr" }))});
 }
 `,
       { mode: 0o755 },
@@ -796,9 +810,7 @@ else if (args[1] === "view") {
     expect(push.at(-2)).toBe(expectedUrl);
     expect(push.at(-1)).toBe(`${sha}:refs/heads/pr`);
     expect(commands("git", "remote.origin.url").filter((args) => args.includes("--get-all"))).toHaveLength(1);
-    expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(
-      scenario !== "no-private-strings",
-    );
+    expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
     expect(commands("gh", "list")).toEqual([
       [
         "run",
@@ -1009,7 +1021,12 @@ test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "m
       const sha = (await git("rev-parse", "HEAD")).stdout.trim();
       const denied = scenario === "subject" ? "Fresh safe title" : entry;
       writeFileSync(join(config, "private-strings.txt"), denied);
-      const final = { title: "Fresh safe title", body: "Fresh body\n\nSecond line\n", headRefOid: sha };
+      const final = {
+        title: "Fresh safe title",
+        body: "Fresh body\n\nSecond line\n",
+        headRefOid: sha,
+        baseRefOid: base,
+      };
       if (scenario === "title") final.title = entry;
       if (scenario === "body") final.body = entry;
       if (scenario === "moved") final.headRefOid = "a".repeat(40);
@@ -1030,7 +1047,7 @@ else if (args[1] === "view") {
   else if (existsSync(${JSON.stringify(watched)})) {
     if (${JSON.stringify(scenario)} === "lookup-failed") process.exit(1);
     console.log(${JSON.stringify(scenario === "malformed" ? "not-json" : scenario === "missing" ? "{}" : JSON.stringify(final))});
-  } else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: base, body: "Initial safe body", headRefName: "safe-branch" }))});
+  } else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: base, headRefOid: base, body: "Initial safe body", headRefName: "safe-branch" }))});
 }
 `,
         { mode: 0o755 },
@@ -1100,7 +1117,7 @@ exec '${gitBin}' "$@"
             "--squash",
             "--delete-branch",
             "--subject",
-            final.title,
+            `${final.title} (#123)`,
             "--body",
             final.body,
             "--match-head-commit",
@@ -1131,6 +1148,82 @@ exec '${gitBin}' "$@"
         child.kill("SIGTERM");
         await child.exited;
       }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["history", "diff", "blob", "title", "body"])(
+  "manual --merge inspects squash publication: %s",
+  async (scenario) => {
+    const root = mkdtempSync(join(tmpdir(), "land-squash-"));
+    try {
+      const { value } = await repositories(root);
+      const work = join(root, "source");
+      const bin = join(root, "bin");
+      const config = join(root, "config");
+      mkdirSync(bin);
+      mkdirSync(config);
+      const unsafe = `%${"25".repeat(6)}72`;
+      const git = (...args: string[]) => sh(["git", ...args], { cwd: work });
+      const commit = async (message: string) => {
+        await git("add", ".");
+        await git("commit", "-qm", message);
+      };
+      const file = join(work, "fixture.dat");
+      writeFileSync(file, unsafe);
+      await commit("intermediate");
+      rmSync(file);
+      await commit("removed intermediate");
+      let base = value.base;
+      if (scenario === "blob") {
+        writeFileSync(file, `prefix\0${unsafe}\n${"context\n".repeat(10)}old\n`);
+        await commit("blob base");
+        base = (await git("rev-parse", "HEAD")).stdout.trim();
+      }
+      writeFileSync(
+        file,
+        scenario === "blob"
+          ? `prefix\0${unsafe}\n${"context\n".repeat(10)}new\n`
+          : scenario === "diff"
+            ? unsafe
+            : "safe",
+      );
+      await commit("final change");
+      const head = (await git("rev-parse", "HEAD")).stdout.trim();
+      const data = {
+        title: scenario === "title" ? unsafe : "Clean title",
+        body: scenario === "body" ? unsafe : "Clean body",
+        headRefOid: head,
+        baseRefOid: base,
+      };
+      const marker = join(root, "merged");
+      writeFileSync(
+        join(bin, "gh"),
+        `#!${process.execPath}\nif(process.argv[3]==="view") console.log(${JSON.stringify(JSON.stringify(data))}); else await Bun.write(${JSON.stringify(marker)}, "merged");\n`,
+        { mode: 0o755 },
+      );
+      const result = await sh(
+        [
+          process.execPath,
+          "--config=/dev/null",
+          "--no-env-file",
+          resolve("scripts/check-private-strings.ts"),
+          "123",
+          "test/repo",
+          "--merge",
+          head,
+        ],
+        {
+          cwd: work,
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, LIMITLESS_CONFIG_DIR: config },
+          allowFail: true,
+        },
+      );
+      expect(result.exitCode).toBe(scenario === "history" ? 0 : 1);
+      expect(existsSync(marker)).toBe(scenario === "history");
+      if (scenario !== "history") expect(result.stderr).toContain("decoding limit");
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   },

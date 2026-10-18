@@ -659,8 +659,18 @@ async function localLfsPayload(cwd: string, env: Record<string, string> | undefi
   return undefined;
 }
 
-/** Checks raw commits and patches (and optionally the index), not the net diff. */
-export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
+/** Inspect only the commits and squash content this step publishes. */
+export async function checkPrivatePublication(
+  cwd: string,
+  entries: PrivateStrings,
+  input: {
+    commits?: string;
+    squash?: { base: string; head: string; title: string; body: string };
+    staged?: boolean;
+  },
+) {
+  const { commits: range, squash, staged } = input;
+  if (squash) privacy.checkPrivateText(`${squash.title}\n${squash.body}`, "PR text", entries);
   const log = [
     "git",
     "--no-replace-objects",
@@ -669,34 +679,37 @@ export async function checkPrivateRange(cwd: string, range: string, entries: Pri
     "log",
     "--encoding=UTF-8",
   ];
-  const identities = await worktreeGit([...log, "-z", "--format=%an%x00%ae%x00%cn%x00%ce", range], {
-    cwd,
-  });
-  const fields = ["author name", "author email", "committer name", "committer email"];
-  identities.stdout.split("\0").forEach((value, i) => {
-    privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
-  });
-  const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
-  for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
-    const raw = await worktreeGit(["git", "--no-replace-objects", "cat-file", "commit", sha], {
+  if (range) {
+    const identities = await worktreeGit([...log, "-z", "--format=%an%x00%ae%x00%cn%x00%ce", range], {
       cwd,
-      encoding: "latin1",
     });
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(raw.stdout, "latin1"));
-    } catch {
-      throw new privacy.PrivateError("Published commit is not valid UTF-8; publication blocked");
+    const fields = ["author name", "author email", "committer name", "committer email"];
+    identities.stdout.split("\0").forEach((value, i) => {
+      privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
+    });
+    const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
+    for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
+      const raw = await worktreeGit(["git", "--no-replace-objects", "cat-file", "commit", sha], {
+        cwd,
+        encoding: "latin1",
+      });
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(raw.stdout, "latin1"));
+      } catch {
+        throw new privacy.PrivateError("Published commit is not valid UTF-8; publication blocked");
+      }
+      const headers = text.slice(0, text.indexOf("\n\n"));
+      if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
+        throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
+      privacy.checkPrivateText(text, "Published commit object", entries);
     }
-    const headers = text.slice(0, text.indexOf("\n\n"));
-    if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
-      throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
-    privacy.checkPrivateText(text, "Published commit object", entries);
   }
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
   const blobs: string[] = [];
   for (const args of [
-    [...log, "-m", "--format=%B", range],
+    ...(range ? [[...log, "-m", "--format=%B", range]] : []),
+    ...(squash ? [["git", "diff", `${squash.base}..${squash.head}`]] : []),
     ...(staged ? [["git", "diff", "--cached"]] : []),
   ]) {
     const { stdout } = await worktreeGit([...args, ...flags], { cwd });
@@ -705,6 +718,63 @@ export async function checkPrivateRange(cwd: string, range: string, entries: Pri
   }
   const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
   if (hit) throw new privacy.PrivateError(privacy.privateReason("Published blob", hit[1]));
+}
+
+/** Checks raw commits and patches (and optionally the index), not the net diff. */
+export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
+  await checkPrivatePublication(cwd, entries, { commits: range, staged });
+}
+
+export function squashTitle(title: string, pr: string): string {
+  const number = pr.match(/(?:\/pull\/|^)(\d+)$/)?.[1];
+  return number ? `${title} (#${number})` : title;
+}
+
+/** A missing remote branch or a rewrite publishes the full branch range again. */
+export async function publicationRange(
+  cwd: string,
+  base: string,
+  head: string,
+  remoteHead: string | null,
+): Promise<string> {
+  if (remoteHead) {
+    await worktreeGit(["git", "cat-file", "-e", `${remoteHead}^{commit}`], { cwd });
+    const ancestry = await worktreeGit(["git", "merge-base", "--is-ancestor", remoteHead, head], {
+      cwd,
+      allowFail: true,
+    });
+    if (ancestry.exitCode === 0) return `${remoteHead}..${head}`;
+    if (ancestry.exitCode !== 1)
+      throw new privacy.PrivateError("Cannot inspect remote ancestry; publication blocked");
+  }
+  return `${base}..${head}`;
+}
+
+export async function deliveryPublicationRange(
+  repo: Repo,
+  cwd: string,
+  branch: string,
+  base: string,
+  head: string,
+  signal?: AbortSignal,
+  budget?: GitHubBudget,
+): Promise<string> {
+  const url = repo.kind === "local" ? repo.localPath : repo.url;
+  if (!url) throw new privacy.PrivateError("Cannot inspect destination branch; publication blocked");
+  const opts = { cwd, signal, budget };
+  const remote = await remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], opts);
+  const remoteHead = remote.stdout.trim().split(/\s+/)[0] || null;
+  if (remoteHead) {
+    if (!/^[a-f0-9]{40,64}$/.test(remoteHead)) throw new privacy.PrivateError("Cannot inspect remote head");
+    // An unknown object is not evidence of a rewrite; fetch it before deciding ancestry.
+    const object = await worktreeGit(["git", "cat-file", "-e", `${remoteHead}^{commit}`], {
+      cwd,
+      signal,
+      allowFail: true,
+    });
+    if (object.exitCode !== 0) await remoteSh(["git", "fetch", "--no-tags", url, remoteHead], opts);
+  }
+  return publicationRange(cwd, base, head, remoteHead);
 }
 
 function lfsPointer(text: string): string | null {
@@ -1240,7 +1310,6 @@ export async function mergePullRequest(
   entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
   opts: { body?: string; title?: string; auto?: boolean } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
-  const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
@@ -1270,7 +1339,7 @@ export async function mergePullRequest(
         const data = schema.parse(input);
         const rawTitle = opts.title ?? data.title;
         if (!rawTitle.trim()) throw new Error("missing merge subject");
-        const title = number ? `${rawTitle} (#${number})` : rawTitle;
+        const title = squashTitle(rawTitle, prUrl);
         const body = opts.body ?? data.body;
         privacy.checkPrivateText(`${title}\n${body}`, "PR text", entries);
         blocked = false;

@@ -15,6 +15,7 @@ import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
+import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
@@ -1701,8 +1702,8 @@ test("a cancel during the private-range check stays cancelled after a queue rest
   approve(1, head);
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  const check = repos.checkPrivateRange;
-  const range = spyOn(repos, "checkPrivateRange").mockImplementationOnce(async (...args) => {
+  const check = repos.checkPrivatePublication;
+  const range = spyOn(repos, "checkPrivatePublication").mockImplementationOnce(async (...args) => {
     await check(...args);
     entered.resolve();
     await release.promise;
@@ -2091,8 +2092,12 @@ for (const location of ["commit", "author email", "subject", "body"]) {
     mkdirSync(paths.configDir, { recursive: true });
     writeFileSync(join(paths.configDir, "private-strings.txt"), secret);
     const pr = delivered(1, "pr-1");
-    let head = await pushBranch("pr-1", "one.txt", location === "commit" ? secret : "one\n");
-    if (location === "author email") {
+    const head = await pushBranch("pr-1", "one.txt", location === "commit" ? secret : "one\n");
+    const complete = gitMerge.completeMerge;
+    const check = spyOn(gitMerge, "completeMerge").mockImplementation(async (...args) => {
+      const head = await complete(...args);
+      if (location !== "author email") return head;
+      const cwd = args[0];
       await sh(
         [
           "git",
@@ -2103,24 +2108,27 @@ for (const location of ["commit", "author email", "subject", "body"]) {
           "--no-edit",
           "--reset-author",
         ],
-        { cwd: seed },
+        { cwd },
       );
-      await sh(["git", "push", "-q", "--force", bare, "pr-1"], { cwd: seed });
-      head = await remoteHead("pr-1");
+      return repos.headSha(cwd);
+    });
+    try {
+      if (location === "subject") store.updateRun(pr.run.id, { title: secret });
+      if (location === "body") store.putArtifact(pr.run.id, "report.md", "report", secret);
+      observe(1, head);
+      approve(1, head);
+      await advanceBase();
+      const entry = await queue().request({ target: pr.run.id });
+      await settle();
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked" });
+      expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
+      expect(store.getLandEntry(entry.id)?.reason).not.toContain(secret);
+      expect(landLog.join("\n")).not.toContain(secret);
+      expect(await remoteHead("pr-1")).toBe(head);
+      expect(ghCalls("pr merge")).toEqual([]);
+    } finally {
+      check.mockRestore();
     }
-    if (location === "subject") store.updateRun(pr.run.id, { title: secret });
-    if (location === "body") store.putArtifact(pr.run.id, "report.md", "report", secret);
-    observe(1, head);
-    approve(1, head);
-    await advanceBase();
-    const entry = await queue().request({ target: pr.run.id });
-    await settle();
-    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked" });
-    expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
-    expect(store.getLandEntry(entry.id)?.reason).not.toContain(secret);
-    expect(landLog.join("\n")).not.toContain(secret);
-    expect(await remoteHead("pr-1")).toBe(head);
-    expect(ghCalls("pr merge")).toEqual([]);
   });
 }
 
@@ -2201,7 +2209,7 @@ test("a head observation received during a CI read blocks without a timer", asyn
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
-test("land ignores an inherited local Git scope and a graft hiding private ancestry", async () => {
+test("land accepts already-published private ancestry despite an inherited local Git scope and graft", async () => {
   const secret = "denylisted-private-parent";
   mkdirSync(paths.configDir, { recursive: true });
   writeFileSync(join(paths.configDir, "private-strings.txt"), secret);
@@ -2220,11 +2228,53 @@ test("land ignores an inherited local Git scope and a graft hiding private ances
   try {
     const entry = await worktreeGitScope.run(false, () => queue().request({ target: pr.run.id }));
     await settle();
-    expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
-    expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
-    expect(ghCalls("pr merge")).toEqual([]);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(ghCalls("pr merge")).toHaveLength(1);
   } finally {
     if (previous === undefined) delete process.env.GIT_GRAFT_FILE;
     else process.env.GIT_GRAFT_FILE = previous;
   }
 });
+
+test.each(["clean", "final", "merge"])(
+  "waiting_ci rechecks persisted publication without pushing: %s",
+  async (scenario) => {
+    const unsafe = `%${"25".repeat(6)}72`;
+    const pr = delivered(1, "pr-1");
+    await pushBranch("pr-1", "transient.txt", unsafe);
+    await sh(["git", "rm", "transient.txt"], { cwd: seed });
+    await sh(["git", "commit", "-qm", "remove intermediate"], { cwd: seed });
+    const approved = await pushBranch("pr-1", "one.txt", scenario === "final" ? unsafe : "clean\n", 1);
+    await advanceBase();
+    await sh(["git", "checkout", "-q", "pr-1"], { cwd: seed });
+    await sh(["git", "merge", "-q", "--no-ff", "-m", scenario === "merge" ? unsafe : "base merge", "main"], {
+      cwd: seed,
+    });
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: seed })).stdout.trim();
+    await sh(["git", "push", "-q", bare, "HEAD:refs/heads/pr-1"], { cwd: seed });
+    observe(1, head, "SUCCESS");
+    approve(1, approved);
+    const entry = store.createLandEntry({
+      runId: pr.run.id,
+      repo: SLUG,
+      prUrl: url(1),
+      baseBranch: "main",
+      headBranch: "pr-1",
+      approvedSha: approved,
+    });
+    store.updateLandEntry(entry.id, { state: "waiting_ci", pushedSha: head, attempts: 1 });
+    const push = spyOn(repos, "pushExistingBranch");
+    try {
+      queue();
+      await settle();
+      expect(store.getLandEntry(entry.id)?.state).toBe(scenario === "clean" ? "landed" : "blocked");
+      if (scenario !== "clean") expect(store.getLandEntry(entry.id)?.reason).toContain("decoding limit");
+      expect(push).not.toHaveBeenCalled();
+      expect(await remoteHead("pr-1")).toBe(head);
+      expect(ghCalls("pr merge")).toHaveLength(scenario === "clean" ? 1 : 0);
+      expect(gateLog()).toEqual([]);
+    } finally {
+      push.mockRestore();
+    }
+  },
+);
