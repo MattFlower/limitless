@@ -3,6 +3,7 @@ import { basename, join } from "node:path";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
+import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
@@ -33,6 +34,8 @@ export interface GateResult {
   testCoverage?: TestCoverage;
   failedFiles?: string[];
   failedFileTimes?: FailedTestFiles["failedFileTimes"];
+  /** Affirmative whole-stream and JUnit evidence, required only for targeted-only retries. */
+  failureAttributionComplete?: boolean;
   targetedRetry?: GateResult;
 }
 
@@ -93,7 +96,9 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
+  const evidence = new RunnerFailureEvidence();
   const observe = (line: string) => {
+    evidence.observe(line);
     line = redactGateOutput(line);
     coverage.observe(line);
     excerpts.observe(line);
@@ -118,6 +123,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
+  const { attributedCounts, ...failedFiles } = readJUnit(report, cwd) ?? {};
   return {
     name: cmd.name,
     command: cmd.run,
@@ -125,7 +131,8 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
-    ...readJUnit(report, cwd),
+    ...failedFiles,
+    failureAttributionComplete: evidence.agrees(attributedCounts),
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
@@ -229,14 +236,15 @@ export interface GateRetryOptions {
 export const UNSLOTTED_RETRY_MAX_FILES = 5;
 export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
 
-/** First confirm known failing files; a pass alone still needs a full-suite retry. */
-async function retryFailures(
+/** Confirm known failing files; factory gates also require a full-suite retry after a pass. */
+export async function retryFailures(
   failures: { check: GateCommand; original: GateResult }[],
   cwd: string,
   cfg: GateConfig,
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
+  targetedOnly = false,
 ): Promise<Map<GateResult, GateResult>> {
   const results = new Map<GateResult, GateResult>();
   const targets = new Map<GateResult, GateResult>();
@@ -244,6 +252,16 @@ async function retryFailures(
   for (const entry of failures) {
     if (signal.aborted) break;
     const { check, original } = entry;
+    if (
+      targetedOnly &&
+      (original.ok ||
+        original.failureAttributionComplete !== true ||
+        original.exitCode === null ||
+        original.exitCode === 0 ||
+        original.timedOut ||
+        confinementFailed(original))
+    )
+      continue;
     const files = original.failedFiles;
     if (cfg.retryFiles?.split("{files}").length === 2 && files && validRetryFiles(files, cwd)) {
       const times = files.map((file) => original.failedFileTimes?.[file]);
@@ -268,12 +286,16 @@ async function retryFailures(
       ).checks[0];
       if (!attempt) continue;
       targets.set(original, attempt);
+      if (targetedOnly) {
+        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: attempt });
+        continue;
+      }
       if (confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
         results.set(original, { ...original, firstAttempt: original, targetedRetry: attempt });
         continue;
       }
     }
-    full.push(entry);
+    if (!targetedOnly) full.push(entry);
   }
   if (full.length && !signal.aborted) {
     const retried = await retryChecks(
