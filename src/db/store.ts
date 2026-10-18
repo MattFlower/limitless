@@ -2759,9 +2759,13 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       where.push(`state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")})`);
       params.push(...ACTIVE_LAND_STATES);
     }
-    params.push(String(opts.limit ?? 100));
-    const sql = `${LAND_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY id LIMIT ?`;
-    return this.db.query(sql).all(...params) as LandEntry[];
+    const filter = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+    const sql = `SELECT * FROM (${LAND_SELECT}${filter} ORDER BY id DESC LIMIT ?)
+      UNION ${LAND_SELECT}${filter}${where.length ? " AND" : " WHERE"}
+        state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")}) ORDER BY id`;
+    return this.db
+      .query(sql)
+      .all(...params, opts.limit ?? 100, ...params, ...ACTIVE_LAND_STATES) as LandEntry[];
   }
 
   /**
