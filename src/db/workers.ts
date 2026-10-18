@@ -39,6 +39,7 @@ export interface JobRow {
   attempt_deadline_at: number | null;
   result: string | null;
   failure_reason: string | null;
+  setup_fallback: number;
   excluded: string;
   events: string;
   created_at: number;
@@ -328,14 +329,14 @@ export class WorkerStore {
   fallbackSetup(id: string, command: string) {
     return this.store.db.transaction(() => {
       const j = this.job(id);
-      if (j?.state !== "done" || !j.worker || j.failure_reason !== null) return false;
+      if (j?.state !== "done" || !j.worker || j.setup_fallback) return false;
       const text = this.sanitize(
         `Worker ${j.worker} setup failed: ${command}; LAN gates falling back to local execution`,
       );
-      // Keep the worker and warning after local completion; failed is the durable fallback checkpoint.
+      // Historical worker completions can retain infrastructure failure reasons; mark fallback separately.
       this.store.db
         .query(
-          "UPDATE gate_jobs SET state='failed',result=NULL,failure_reason=?,updated_at=? WHERE id=? AND state='done' AND failure_reason IS NULL",
+          "UPDATE gate_jobs SET state='failed',result=NULL,setup_fallback=1,failure_reason=?,updated_at=? WHERE id=? AND state='done' AND setup_fallback=0",
         )
         .run(text, this.now(), id);
       this.event(id, { type: "status", text });

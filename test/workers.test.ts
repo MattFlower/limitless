@@ -175,11 +175,15 @@ async function failedWorkerSetup(req: GateRequest, afterLease = () => {}, previo
   return { kind: "lan" as const, id, startedAt: Date.now() };
 }
 
-test.each([true, false])(
-  "worker setup fallback uses the local checks (passing=%s) and keeps sanitized warnings",
-  async (passing) => {
+test.each([
+  [true, false],
+  [false, false],
+  [true, true],
+])(
+  "worker setup fallback uses the local checks (passing=%s, legacy completion=%s) and keeps sanitized warnings",
+  async (passing, legacy) => {
     const req = await request();
-    const secret = `setup-warning-credential-595-${passing}`;
+    const secret = `setup-warning-credential-595-${passing}-${legacy}`;
     req.gates.setup = [`: '${secret}'`];
     req.gates.checks = [{ name: "check", run: passing ? "cat tracked" : "exit 7" }];
     const handle = await failedWorkerSetup(
@@ -187,6 +191,11 @@ test.each([true, false])(
       () => registerCredential("SETUP_WARNING_TEST", secret),
       passing,
     );
+    if (legacy) {
+      // The previous release retained infrastructure failure reasons on worker completion.
+      store.db.query("UPDATE gate_jobs SET failure_reason='Lease expired' WHERE id=?").run(handle.id);
+      expect(workers.job(handle.id)).toMatchObject({ state: "done", failure_reason: "Lease expired" });
+    }
     let localStarts = 0;
     const run = await confinementScope.run(
       {
