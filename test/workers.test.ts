@@ -1137,17 +1137,14 @@ test.each([true, false, undefined])(
         )
       ).status,
     ).toBe(200);
-    const run = await executeGate(
-      req,
-      new AbortController().signal,
-      {},
-      gateExecutorFor("lan", workers, [req.repo]),
-      {
+    const run = await confinementScope.run(fakeConfinement, () =>
+      executeGate(req, new AbortController().signal, {}, gateExecutorFor("lan", workers, [req.repo]), {
         kind: "lan",
         id,
         startedAt: Date.now(),
-      },
+      }),
     );
+    expect(workers.jobs("1=1")[0]).toMatchObject({ state: "done", failure_reason: null });
     const result = run.checks[0];
     if (!result) throw new Error("Missing worker check");
     expect(result.failureAttributionComplete).toBe(complete);

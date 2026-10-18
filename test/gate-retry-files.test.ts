@@ -553,7 +553,7 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
     );
     writeFileSync(
       join(f.cwd, "test/b.test.ts"),
-      'import { test } from "bun:test"; test("pending pass", async () => { await Bun.sleep(300); });',
+      'import { test } from "bun:test"; test("pending pass", async () => { await Bun.sleep(3_000); });',
     );
     writeFileSync(
       join(f.cwd, "test/c.test.ts"),
