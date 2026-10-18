@@ -332,6 +332,25 @@ export class LandQueue {
    */
   private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
     const { repo, run } = this.context(entry);
+    // Claims reset merging to checking; any recorded push may have merged before a restart.
+    if (entry.pushedSha) {
+      const fresh = await this.mergeMetadata(entry.prUrl, signal);
+      signal.throwIfAborted();
+      if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) return;
+      if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
+        throw new LandBlocked("cannot confirm current GitHub merge state");
+      if (fresh.headRefOid !== entry.pushedSha)
+        throw new LandBlocked(
+          fresh.state === "MERGED"
+            ? "merged PR head is missing or differs from the pushed SHA"
+            : "head moved after approval",
+        );
+      if (fresh.state === "MERGED") {
+        this.landed(entry, run, entry.pushedSha, { ...fresh, head: fresh.headRefOid });
+        await this.discard(repo, this.worktreePath(entry));
+        return;
+      }
+    }
     if (!entry.baseBranch || entry.baseBranch === entry.headBranch) {
       const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);
       signal.throwIfAborted();
@@ -371,6 +390,8 @@ export class LandQueue {
 
   /** A PR that already merged is recorded, never merged again. */
   private landed(entry: LandEntry, run: Run, sha: string, observation: LandObservation | null): void {
+    if (observation?.state === "MERGED" && observation.head !== sha)
+      throw new LandBlocked("merged PR head is missing or differs from the pushed SHA");
     const at = observation?.mergedAt ? Date.parse(observation.mergedAt) : NaN;
     const mergedBy = observation?.state === "MERGED" ? (observation.mergedBy?.login ?? null) : null;
     const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
@@ -624,6 +645,7 @@ export class LandQueue {
         auto: false,
       },
     );
+    signal.throwIfAborted();
     if (outcome !== "merged") {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
