@@ -1204,6 +1204,9 @@ for (const kind of ["harness", "gate", "preview"] as const)
 
 /** Stateful fake `gh` (one PR per branch) and a `git push` stub on PATH; returns a restore hook. */
 function fakeGh(pr: string) {
+  // Keep the fixture's Git: /usr/bin/git invokes xcrun and its cache is outside confined scratch.
+  const realGit = Bun.which("git");
+  if (!realGit) throw new Error("git not found");
   const bin = join(root, "bin");
   mkdirSync(bin);
   writeFileSync(
@@ -1229,13 +1232,13 @@ if(process.argv[3]==="view") {
     const texts=existsSync(file+".text")?JSON.parse(readFileSync(file+".text","utf8")):[];
     const data=texts.shift();
     writeFileSync(file+".text",JSON.stringify(texts));
-    const head=Bun.spawnSync(["/usr/bin/git","rev-parse","HEAD"]);
+    const head=Bun.spawnSync([${JSON.stringify(realGit)},"rev-parse","HEAD"]);
     out(JSON.stringify(data??{state:state(),title:"T",body:"B",headRefOid:head.exitCode===0?head.stdout.toString().trim():"a".repeat(40)}));
   } else if(process.argv.includes("state,headRefOid")) {
-    const head=Bun.spawnSync(["/usr/bin/git","rev-parse","HEAD"]);
+    const head=Bun.spawnSync([${JSON.stringify(realGit)},"rev-parse","HEAD"]);
     out(existsSync(file+".merge-state")?readFileSync(file+".merge-state","utf8"):JSON.stringify({state:state(),headRefOid:head.exitCode===0?head.stdout.toString().trim():"a".repeat(40)}));
   } else if(process.argv.includes("headRefOid")) {
-    const head=Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(join(root, "remote.git"))},"rev-parse","refs/heads/pr-head"]);
+    const head=Bun.spawnSync([${JSON.stringify(realGit)},"--git-dir",${JSON.stringify(join(root, "remote.git"))},"rev-parse","refs/heads/pr-head"]);
     out(JSON.stringify({headRefOid:head.stdout.toString().trim()}));
   } else out(process.argv.includes("--jq") ? state() : JSON.stringify({state:state(),url:readFileSync(file,"utf8")}));
 }
@@ -1245,7 +1248,7 @@ end();
   );
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec '${realGit.replaceAll("'", "'\\''")}' "$@"\n`,
     { mode: 0o755 },
   );
   const oldPath = process.env.PATH;

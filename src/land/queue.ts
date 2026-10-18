@@ -47,6 +47,7 @@ import {
   savedSnapshot,
 } from "../integrations/github-poller.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
+import { stripReportManifest } from "../pipeline/report-privacy.ts";
 import { redactCredentials } from "../util/proc.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
@@ -687,7 +688,7 @@ export class LandQueue {
       this.publication(entry, run, cwd),
       {
         title: run.title ?? "",
-        body: this.store.getArtifact(run.id, "report.md") ?? "",
+        body: stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? ""),
         auto: false,
       },
     );
@@ -738,7 +739,7 @@ export class LandQueue {
         base,
         head,
         title: squashTitle(run.title ?? "", entry.prUrl),
-        body: this.store.getArtifact(run.id, "report.md") ?? "",
+        body: stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? ""),
       },
       // Select the factory's merge itself, never traverse either parent's existing history.
       ...(head !== entry.approvedSha ? { commits: `${head}^!` } : {}),

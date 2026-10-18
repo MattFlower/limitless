@@ -26,6 +26,7 @@ import { observerRoots } from "../src/harness/sandbox.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
+import { markReport, reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -2456,6 +2457,24 @@ for (const location of ["commit", "author email", "subject", "body"]) {
     }
   });
 }
+
+test("squash publication strips report metadata and preserves the stored manifest", async () => {
+  mkdirSync(paths.configDir, { recursive: true });
+  writeFileSync(join(paths.configDir, "private-strings.txt"), "limitless-report:");
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  const report = markReport(["## Checks", reportText("implementer", "Public summary")]);
+  store.putArtifact(pr.run.id, "report.md", "report", report);
+  const entry = await queue().request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  const body = readFileSync(join(root, "gh.body-1"), "utf8");
+  expect(body).toContain("Public summary");
+  expect(body).not.toContain("limitless-report:");
+  expect(reportStructure(store.getArtifact(pr.run.id, "report.md") ?? "")).toBeTruthy();
+});
 
 test("an empty report sends an explicit empty merge body", async () => {
   const pr = delivered(1, "pr-1");

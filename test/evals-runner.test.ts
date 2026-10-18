@@ -1424,8 +1424,15 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
   }
 }, 30_000);
 
-// #556 measurement (2026-10-16): alone 18.94 s, paired load 30.24 s; three cases plus replay, cache and resume use real Git.
-test("control and causal replay share candidates and a pinned verifier but grade and cache independently", async () => {
+// Each case exercises source, paired replay, cache reuse and resume with real Git. Keep each
+// complete lifecycle within its own deadline under shared-machine load.
+test.each(["introduced", "preexisting", "clean"])(
+  "control and causal replay share candidates and a pinned verifier but grade and cache independently (%s)",
+  checkCausalReplay,
+  75_000,
+);
+
+async function checkCausalReplay(caseId: string) {
   const f = await evalFixture([verifierModel]);
   try {
     const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
@@ -1453,7 +1460,7 @@ test("control and causal replay share candidates and a pinned verifier but grade
         defects: [],
         input: { ...reviewCase.input, prompt: "CLEAN_CASE" },
       },
-    ];
+    ].filter((item) => item.id === caseId);
     writeFileSync(f.casePath, JSON.stringify({ role: "review", version: 1, cases }));
     const system = {
       name: "source",
@@ -1497,8 +1504,8 @@ test("control and causal replay share candidates and a pinned verifier but grade
     };
     const calls = f.calls.length;
     const paired = await f.run(request);
-    expect(f.calls.slice(calls).map((s) => s.target.modelId)).toEqual(Array(6).fill("verifier-c"));
-    expect(f.calls.slice(calls).filter((s) => s.prompt.includes("# Causal attribution"))).toHaveLength(3);
+    expect(f.calls.slice(calls).map((s) => s.target.modelId)).toEqual(Array(2).fill("verifier-c"));
+    expect(f.calls.slice(calls).filter((s) => s.prompt.includes("# Causal attribution"))).toHaveLength(1);
     for (const item of cases) {
       const a = paired.trials.find((t) => t.caseId === item.id && t.details.system === "control");
       const b = paired.trials.find((t) => t.caseId === item.id && t.details.system === "causal");
@@ -1530,7 +1537,7 @@ test("control and causal replay share candidates and a pinned verifier but grade
         details: { ...b.details, grade: { ...b.details.grade, pass: !b.pass } },
       });
     }
-    expect(f.factory.evals.regrade(paired.run.id)).toMatchObject({ regraded: 6, changed: 3, skipped: [] });
+    expect(f.factory.evals.regrade(paired.run.id)).toMatchObject({ regraded: 2, changed: 1, skipped: [] });
     const regraded = f.factory.evals.report(paired.run.id)?.trials ?? [];
     for (const item of cases) {
       const trial = regraded.find((t) => t.caseId === item.id && t.details.system === "causal");
@@ -1546,7 +1553,7 @@ test("control and causal replay share candidates and a pinned verifier but grade
       );
     }
     const repeated = await f.run(request);
-    expect(f.calls).toHaveLength(calls + 6);
+    expect(f.calls).toHaveLength(calls + 2);
     expect(repeated.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review])).toEqual(
       paired.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review]),
     );
@@ -1561,11 +1568,11 @@ test("control and causal replay share candidates and a pinned verifier but grade
         .report(resumed.id)
         ?.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review]),
     ).toEqual(paired.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review]));
-    expect(f.calls).toHaveLength(calls + 6);
+    expect(f.calls).toHaveLength(calls + 2);
   } finally {
     await f.close();
   }
-}, 75_000);
+}
 
 test("executed trials snapshot fast mode and cached trials retain it across toggles", async () => {
   const f = await evalFixture(

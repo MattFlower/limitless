@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:os";
+import { decodeHTML } from "entities";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
+import { redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, normalizedLayers, privateMatches } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
-import { holdoutBoundaryPattern, privateHoldoutDetails } from "../pipeline/prompts.ts";
+import { holdoutBoundaryPattern, privateHoldoutDetails, privateVerifySummary } from "../pipeline/prompts.ts";
+import { reportSourcesSchema, reportStructure } from "../pipeline/report-privacy.ts";
 import { HoldoutSchema, renderSpec, rowKind, SpecSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registeredCredentials } from "../util/proc.ts";
@@ -37,12 +40,19 @@ const DISTINCTIVE_LENGTH = 12;
 const normalizeWhitespace = (value: string) => value.replace(/\\+[nrt]/gu, " ").replace(/\s+/gu, " ");
 // Platform error names are public diagnostics, as in verifier feedback.
 const errnoNames = Object.keys(constants.errno);
-type HoldoutRedactor = (value: string) => string;
+/** Clipped spans supply their complete rendering for matching before the display cut. */
+type HoldoutRedactor = (value: string, source?: string) => string;
 // Retain at most 2,048 details totaling 256K UTF-16 characters per store. Larger catalogues
 // still redact each read, but their patterns are not retained. Privacy filters load each read.
 const CATALOGUE_DETAILS_CAP = 2_048;
 const CATALOGUE_CHARACTERS_CAP = 256_000;
-type Catalogue = { redact: HoldoutRedactor; cacheable: boolean };
+type Catalogue = {
+  redact: HoldoutRedactor;
+  factoryRedact: HoldoutRedactor;
+  verifierRedact: HoldoutRedactor;
+  implementerRedact: HoldoutRedactor;
+  cacheable: boolean;
+};
 const catalogues = new WeakMap<Factory["store"], { key: string; catalogue: Catalogue }>();
 
 function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): string | null {
@@ -59,6 +69,9 @@ function catalogueKey(store: Factory["store"], ids: string[], rounds: unknown): 
         .get(id);
       if (!run) return null;
       hash.update(JSON.stringify([id, run.prompt, run.state_json]));
+      hash.update(
+        JSON.stringify([store.getArtifact(id, "report.md"), store.getArtifact(id, "report-sources.json")]),
+      );
       hash.update(
         JSON.stringify(
           store.db
@@ -87,6 +100,8 @@ const verificationText = z.object({
     .array(
       z.object({
         id: z.string(),
+        status: z.string().optional(),
+        requirement: z.string().nullish(),
         evidence: z.string().optional(),
         publicSummary: z.string().optional(),
         requirementCitation: z.string().nullish(),
@@ -109,92 +124,185 @@ function withoutHoldoutSection(report: string, redact: HoldoutRedactor) {
   return `${redact(report.slice(0, start))}[withheld: holdout section; 1 section, ${section.split("\n").length} lines]${end > start ? redact(report.slice(end)) : "\n"}`;
 }
 
-/** Match before paging and retain a line map through decoding, including escaped line breaks. */
-function redactMultiline(value: string, pattern: RegExp, keep?: (line: string) => number): string | null {
-  const lines = value.split("\n");
-  const hidden = new Set<number>();
-  type ContentLine = { index: number; prefix: string; text: string };
-  let hunk: ContentLine[] = [];
-  const match = (content: ContentLine[]): boolean => {
-    const layers = content.map(({ text }) => normalizedLayers(text));
-    if (layers.some((layer) => layer === null)) return false;
-    const depth = Math.max(1, ...layers.map((layer) => layer?.length ?? 0));
-    for (let layer = 0; layer < depth; layer++) {
-      let text = "";
-      const ranges: { index: number; start: number; end: number }[] = [];
-      for (let i = 0; i < content.length; i++) {
-        const forms = layers[i];
-        const line = content[i];
-        if (!forms || !line) return false;
-        const decoded = (forms[Math.min(layer, forms.length - 1)] ?? "").replace(
-          /\\+[nrt]/gu,
-          (sequence) => ({ n: "\n", r: "\r", t: "\t" })[sequence.at(-1) ?? ""] ?? sequence,
-        );
-        // Collapse each whitespace run once, merging runs across physical line boundaries.
-        // A shared space belongs to both lines so a match hides every contributing line.
-        let normalized = `${decoded}\n`.replace(/\s+/gu, " ");
-        const shared = text.length > 0 && normalized.startsWith(" ");
-        if (shared) normalized = normalized.slice(1);
-        ranges.push({
-          index: line.index,
-          start: text.length - Number(shared),
-          // The appended line separator has no original character to withhold.
-          end: text.length + normalized.length - Number(!/\s$/u.test(decoded)),
-        });
-        text += normalized;
+/** Apply each author’s backstop only within validated factory structure. */
+function redactReport(report: string, catalogue: Catalogue, sourcesArtifact: string | null): string {
+  const structure = reportStructure(report);
+  if (structure === null) return "[withheld: invalid report structure]";
+  if (!structure) return "[withheld: report without structural provenance]";
+  const { body, spans } = structure;
+  let sources: Record<string, string> = {};
+  try {
+    const parsed = reportSourcesSchema.safeParse(JSON.parse(sourcesArtifact ?? "null"));
+    if (parsed.success && parsed.data.digest === structure.digest) sources = parsed.data.sources;
+  } catch {
+    // Clipped spans fail closed without a valid, matching sources artifact.
+  }
+  let filtered = "";
+  let cursor = 0;
+  for (const [index, span] of spans.entries()) {
+    filtered += catalogue.factoryRedact(body.slice(cursor, span.start));
+    const text = body.slice(span.start, span.end);
+    const source = span.clipped ? sources[index] : undefined;
+    filtered +=
+      span.clipped && source === undefined
+        ? "[withheld: clipped report span without matching source]"
+        : span.kind === "private"
+          ? `[withheld: private verifier rendering; ${text.split("\n").length} lines]`
+          : span.kind === "verifier"
+            ? catalogue.verifierRedact(text, source)
+            : span.kind === "implementer"
+              ? catalogue.implementerRedact(text, source)
+              : catalogue.factoryRedact(text, source);
+    cursor = span.end;
+  }
+  filtered += catalogue.factoryRedact(body.slice(cursor));
+  // An evidence-cell match withholds its whole acceptance row, including id and criterion.
+  filtered = filtered
+    .split("\n")
+    .map((line) =>
+      line.startsWith("| ") && /\[(?:withheld:|private detail\])/u.test(line)
+        ? "[withheld: report row containing private or unconfirmed text]"
+        : line,
+    )
+    .join("\n");
+  return withoutHoldoutSection(filtered, (text) => text);
+}
+
+type LineRange = { first: number; last: number };
+
+/** Every normalization replacement retains the source lines it consumed. */
+function markdownProjection(text: string, origins: LineRange[]) {
+  const replace = (pattern: RegExp, replacement: (match: RegExpExecArray) => string) => {
+    const next: string[] = [];
+    const mapped: LineRange[] = [];
+    let cursor = 0;
+    for (const match of text.matchAll(pattern)) {
+      next.push(text.slice(cursor, match.index));
+      for (let i = cursor; i < match.index; i++) {
+        const origin = origins[i];
+        if (origin) mapped.push(origin);
       }
-      pattern.lastIndex = 0;
-      let cursor = 0;
-      for (const found of text.matchAll(pattern)) {
-        const end = found.index + found[0].length;
-        while (ranges[cursor] && (ranges[cursor]?.end ?? 0) <= found.index) cursor++;
-        for (let i = cursor; i < ranges.length; i++) {
-          const range = ranges[i];
-          if (!range || range.start >= end) break;
-          if (range.end > found.index) hidden.add(range.index);
-        }
+      const output = replacement(match);
+      next.push(output);
+      const first = origins[match.index]?.first ?? 0;
+      const last = origins[match.index + match[0].length - 1]?.last ?? first;
+      for (let i = 0; i < output.length; i++) mapped.push({ first, last });
+      cursor = match.index + match[0].length;
+    }
+    next.push(text.slice(cursor));
+    for (let i = cursor; i < origins.length; i++) {
+      const origin = origins[i];
+      if (origin) mapped.push(origin);
+    }
+    text = next.join("");
+    origins = mapped;
+  };
+  replace(/&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]+;?)/gu, (match) =>
+    decodeHTML(match[0]).normalize("NFKC").toLowerCase(),
+  );
+  replace(/\\+(?:r\\+n|[nrt])/gu, (match) => (match[0].endsWith("t") ? "\t" : "\n"));
+  replace(/[\p{Cf}\u00ad]/gu, () => "");
+  // Table cell line breaks are factory rendering, including within code spans.
+  replace(/<br\s*\/?>/giu, () => "\n");
+  // Protect code contents before classifying markup or emphasis; restore them for private matching.
+  let codeMarker = "\ue000";
+  while (text.includes(codeMarker)) codeMarker += "\ue000";
+  const code = new Map<string, string>();
+  replace(/(?<!`)(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)/gu, (match) => {
+    const token = `${codeMarker}${code.size}\ue001`;
+    code.set(token, match[2] ?? "");
+    return token;
+  });
+  if (text.includes("`")) return null;
+  let unparsedMarkup = false;
+  replace(/<!--[\s\S]*?-->/gu, () => "");
+  replace(/<\/?(?:em|strong|b|i|u|s|code|span|sub|sup|mark|kbd|a|del|ins|small)\b[^>]*>/giu, (match) => {
+    // Attributes are outside the confirmed projection; do not guess where their values end.
+    if (!/^<\/?[a-z]+\s*\/?>$/iu.test(match[0])) unparsedMarkup = true;
+    return "";
+  });
+  if (unparsedMarkup || text.includes("<")) return null;
+  replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/gu, (match) => match[1] ?? "");
+  replace(/!?\[([^\]]*)\]\([^)]*\)/gu, (match) => match[1] ?? "");
+  replace(/^[ \t]*(?:>[ \t]*|(?:[-+*]|\d+[.)])[ \t]+)+/gmu, () => "");
+  const emphasis: string[] = [];
+  let ambiguous = false;
+  replace(/[*_~]+/gu, (match) => {
+    // Delimiter flanking is local: a newline is whitespace, never an identifier neighbor.
+    const before = match.input[match.index - 1] ?? "";
+    const after = match.input[match.index + match[0].length] ?? "";
+    const word = (character: string) => /[\p{L}\p{N}_]/u.test(character);
+    if ([...match[0]].some((character) => character !== match[0][0])) ambiguous = true;
+    if (word(before) && word(after)) {
+      if (emphasis.length) ambiguous = true;
+      return match[0];
+    }
+    const space = (character: string) => !character || /\s/u.test(character);
+    const punctuation = (character: string) => /[\p{P}\p{S}]/u.test(character);
+    const opens = !space(after) && (!punctuation(after) || space(before) || punctuation(before));
+    const closes = !space(before) && (!punctuation(before) || space(after) || punctuation(after));
+    // Only a homogeneous run with a single role and an exact pair is confirmed formatting.
+    if (opens && closes) ambiguous = true;
+    else if (opens) emphasis.push(match[0]);
+    else if (closes) {
+      if (emphasis.pop() !== match[0]) ambiguous = true;
+    } else return match[0];
+    return "";
+  });
+  if (ambiguous || emphasis.length) return null;
+  replace(/\|/gu, () => "");
+  for (const [token, content] of code) replace(new RegExp(token, "gu"), () => content);
+  replace(/\s+/gu, (match) => (/[\r\n]/u.test(match[0]) ? "\0" : " "));
+  return { text, origins };
+}
+
+function normalizeMarkdown(text: string): string | null {
+  return markdownProjection(text, [])?.text.replace(/^[ \0]+|[ \0]+$/gu, "") ?? null;
+}
+
+/** Match before paging, across wraps and at every offset, then withhold original lines. */
+function redactMultiline(value: string, pattern: RegExp): string | null {
+  const lines = value.split("\n");
+  const layers = lines.map((line) => normalizedLayers(decodeHTML(line)));
+  if (layers.some((layer) => layer === null)) return null;
+  const hidden = new Set<number>();
+  const depth = Math.max(1, ...layers.map((layer) => layer?.length ?? 0));
+  for (let layer = 0; layer < depth; layer++) {
+    let text = "";
+    const origins: LineRange[] = [];
+    for (const [index, forms] of layers.entries()) {
+      const line = forms?.[Math.min(layer, forms.length - 1)] ?? "";
+      text += `${line}\n`;
+      for (let i = 0; i <= line.length; i++) origins.push({ first: index, last: index });
+    }
+    const projection = markdownProjection(text, origins);
+    if (!projection) return null;
+    pattern.lastIndex = 0;
+    for (const match of projection.text.matchAll(pattern)) {
+      const end = match.index + (match[1] ?? match[0]).length;
+      for (let i = match.index; i < end; i++) {
+        const range = projection.origins[i];
+        if (range) for (let line = range.first; line <= range.last; line++) hidden.add(line);
       }
     }
-    return true;
-  };
-  const flush = () => {
-    // Old and new file projections prevent interleaved removed lines from interrupting a
-    // phrase in context and additions (and vice versa). Neither crosses a hunk boundary.
-    const ok = keep
-      ? match(hunk.filter((line) => line.prefix !== "-")) && match(hunk.filter((line) => line.prefix !== "+"))
-      : match(hunk);
-    hunk = [];
-    return ok;
-  };
-  for (const [index, line] of lines.entries()) {
-    if (!keep) hunk.push({ index, prefix: "", text: line });
-    else if (keep(line) > 0) {
-      if (!flush()) return null;
-      const suffix = line.slice(keep(line));
-      if (suffix && !match([{ index, prefix: "", text: suffix }])) return null;
-    } else if (/^[-+ ]/u.test(line)) hunk.push({ index, prefix: line[0] ?? "", text: line.slice(1) });
-    else if (line.startsWith("\\")) {
-      // Git's missing-final-newline marker is structure, not intervening file content.
-    } else if (!flush()) return null;
   }
-  if (!flush()) return null;
-  return lines
-    .map((line, index) => {
-      const prefix = keep ? (/^@@ [^@]* @@/u.exec(line)?.[0] ?? line.slice(0, 1)) : "";
-      return hidden.has(index) ? `${prefix}[private detail]` : line;
-    })
-    .join("\n");
+  return lines.map((line, index) => (hidden.has(index) ? "[private detail]" : line)).join("\n");
 }
 
 function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | null {
   // Holdouts from earlier rounds remain private even after a later round delivers.
   const details = new Set<string>();
+  const literals = new Set<string>();
+  const proseDetails = new Set<string>();
+  const verifierDetails = new Set<string>();
+  const receivedSummaries = new Set<string>();
+  const privateRows = new Set<string>();
   for (const id of ids) {
     const state = z
       .object({
-        holdout: HoldoutSchema.optional(),
+        holdout: HoldoutSchema.or(z.object({ scenarios: z.tuple([]) })).optional(),
         spec: SpecSchema.nullish().catch(null),
-        lastVerify: verificationText.nullish(),
+        lastVerify: verificationText.extend({ modelOutput: verificationText.optional() }).nullish(),
         verifyResults: z
           .array(verificationText.extend({ modelOutput: verificationText.optional() }))
           .optional(),
@@ -202,13 +310,18 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       .safeParse(store.getRunState(id) ?? {});
     if (!state.success) return null;
     const { holdout, spec } = state.data;
-    if (!holdout?.scenarios.length) continue;
+    for (const ac of spec?.acceptance_criteria ?? [])
+      if (rowKind(ac.id, spec ?? null, holdout) !== "public") privateRows.add(ac.id.trim().toUpperCase());
+    const scenarios = holdout?.scenarios ?? [];
+    for (const scenario of scenarios)
+      for (const text of [scenario.description, scenario.steps, scenario.expected])
+        if (text.trim()) verifierDetails.add(text.trim());
     // Same exemption as verifier feedback: what the run's request and spec already state is public.
     const publicSources = [store.getRun(id)?.prompt ?? "", spec ? renderSpec(spec) : "", ...errnoNames].join(
       "\n",
     );
     const standalone = {
-      scenarios: holdout.scenarios.map((scenario) => ({
+      scenarios: scenarios.map((scenario) => ({
         ...scenario,
         description: /[\r\n\t]/u.test(scenario.description) ? "" : scenario.description,
         steps: /[\r\n\t]/u.test(scenario.steps) ? "" : scenario.steps,
@@ -217,15 +330,15 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
     };
     const independent = privateHoldoutDetails(standalone, publicSources);
     const quoted = new Set(
-      holdout.scenarios.flatMap((scenario) =>
+      scenarios.flatMap((scenario) =>
         [scenario.description, scenario.steps, scenario.expected].flatMap((source) =>
           [...source.matchAll(/(["'`])(?:(?!\1)[^\n])*?\1/gu)].map((match) => match[0].slice(1, -1)),
         ),
       ),
     );
-    // Multiline phrases protect generic syntax in context. Quoted values, paths, flags and
+    // Legacy multiline phrases protect generic syntax in context. Literal values, paths, flags and
     // distinctive identifiers also match independently; bare numbers and assertion methods do not.
-    for (const detail of privateHoldoutDetails(holdout, publicSources))
+    for (const detail of privateHoldoutDetails({ scenarios }, publicSources))
       if (
         independent.has(detail) ||
         /[\r\n\t]/u.test(detail) ||
@@ -235,41 +348,71 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
             /[/_-]|[\p{L}$].*\d|\d.*[\p{L}$]/u.test(detail)))
       )
         details.add(detail);
-    const collect = (observed?: string, privateProse = false) => {
-      if (observed !== undefined) {
-        for (const detail of privateHoldoutDetails(standalone, publicSources, observed)) details.add(detail);
-        const prose = observed.trim();
-        const words = normalizeWhitespace(normalizedLayers(prose)?.at(-1) ?? prose).trim();
-        // Gate citations and generic notes are public; only private observations need
-        // whole-prose matching when they have no distinctive literals to harvest.
-        if (
-          privateProse &&
-          words.length >= DISTINCTIVE_LENGTH &&
-          words.split(" ").length > 1 &&
-          !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources)
-        )
-          details.add(prose);
-      }
+    const harvest = (source: string) => {
+      for (const literal of privateHoldoutDetails({ scenarios: [] }, publicSources, source))
+        literals.add(literal);
     };
-    const collectOutput = (value: unknown, privateProse = false) => {
-      if (typeof value === "string") collect(value, privateProse);
+    for (const scenario of scenarios)
+      for (const source of [scenario.description, scenario.steps, scenario.expected]) harvest(source);
+    const collect = (observed?: string, privateProse = false, legacyShort = false) => {
+      if (observed === undefined) return;
+      harvest(observed);
+      for (const detail of privateHoldoutDetails(standalone, publicSources, observed)) details.add(detail);
+      const prose = observed.trim();
+      if (privateProse && prose) verifierDetails.add(prose);
+      // Keep the legacy catalogue at least as protective as before marked reports existed.
+      const words = normalizeWhitespace(normalizedLayers(prose)?.at(-1) ?? prose).trim();
+      if (
+        privateProse &&
+        words.split(" ").length > 1 &&
+        (legacyShort || words.length >= DISTINCTIVE_LENGTH) &&
+        !new RegExp(holdoutBoundaryPattern(prose), "iu").test(publicSources)
+      )
+        proseDetails.add(prose);
+    };
+    const collectOutput = (value: unknown, privateProse = false, legacyShort = false) => {
+      if (typeof value === "string") collect(value, privateProse, legacyShort);
       else if (value && typeof value === "object")
-        for (const field of Object.values(value)) collectOutput(field, privateProse);
+        for (const field of Object.values(value)) collectOutput(field, privateProse, legacyShort);
     };
     collect();
-    const collectVerification = (verify: z.output<typeof verificationText> | null | undefined) => {
+    const collectVerification = (
+      verify: z.output<typeof verificationText> | null | undefined,
+      feedback = true,
+    ) => {
       collect(verify?.notes);
+      if (verify?.notes?.trim()) verifierDetails.add(verify.notes.trim());
       for (const criterion of verify?.criteria ?? []) {
         // Public acceptance evidence/summaries stay public, as in preDeliveryVerifyArtifact.
         const kind = rowKind(criterion.id, spec ?? null, holdout);
         if (kind !== "public") {
-          if (kind === "holdout") details.add(criterion.id.trim());
-          collectOutput([criterion.evidence, criterion.publicSummary, criterion.requirementCitation], true);
+          privateRows.add(criterion.id.trim().toUpperCase());
+          if (kind === "holdout") {
+            details.add(criterion.id.trim());
+            literals.add(criterion.id.trim());
+          }
+          if (
+            feedback &&
+            kind !== "unknown" &&
+            criterion.status !== "met" &&
+            criterion.status !== "blocked" &&
+            !(criterion.status === "unmet" && criterion.requirement === "not_required")
+          ) {
+            receivedSummaries.add(
+              privateVerifySummary(criterion.publicSummary ?? "", holdout, publicSources),
+            );
+          }
+          collectOutput(
+            [criterion.evidence, criterion.publicSummary, criterion.requirementCitation],
+            true,
+            kind === "holdout",
+          );
         }
         collectOutput(criterion.gateEvidence);
       }
     };
     collectVerification(state.data.lastVerify);
+    collectVerification(state.data.lastVerify?.modelOutput);
     for (const verify of state.data.verifyResults ?? []) {
       collectVerification(verify);
       collectVerification(verify.modelOutput);
@@ -292,21 +435,48 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       const verify = VerifySchema.safeParse(output);
       const fields = verificationText.safeParse(output);
       if (verify.success) {
-        collectVerification(verify.data);
+        collectVerification(verify.data, false);
         // Factory gate citations are not part of the model's Verify schema.
         if (fields.success)
           for (const criterion of fields.data.criteria ?? []) collectOutput(criterion.gateEvidence);
-      } else if (fields.success && fields.data.criteria) {
+      } else if (fields.success && (fields.data.criteria || fields.data.notes !== undefined)) {
         // Incomplete verifier JSON still distinguishes public rows from private observations.
-        collectVerification(fields.data);
+        collectVerification(fields.data, false);
       } else {
         // Only unstructured diagnostics need whole-text harvesting, including quoted JSON
         // literals that lose their quotes when parsed.
-        if (diagnostic.kind !== "event") collect(diagnostic.text);
-        collectOutput(output);
+        if (diagnostic.kind !== "event") collect(diagnostic.text, true);
+        collectOutput(output, true);
       }
     }
   }
+  const allDetails = new Set([...details, ...proseDetails]);
+  // Verifier-written text is matched against every private string, including holdout phrases.
+  const strict = new Set([...allDetails, ...literals, ...verifierDetails]);
+  const implementer = new Set([...literals, ...receivedSummaries]);
+  const retained = new Set([...allDetails, ...strict, ...implementer]);
+  // Author redactors apply only to marked reports, so compile them on first use.
+  const lazy = (details: Set<string>): HoldoutRedactor => {
+    let built: HoldoutRedactor | undefined;
+    return (value, source) => {
+      built ??= buildReportRedactor(details);
+      return built(value, source);
+    };
+  };
+  return {
+    redact: buildReportRedactor(allDetails, privateRows),
+    verifierRedact: lazy(strict),
+    implementerRedact: lazy(implementer),
+    factoryRedact: lazy(literals),
+    cacheable:
+      retained.size <= CATALOGUE_DETAILS_CAP &&
+      [...retained].reduce((size, detail) => size + detail.length, 0) <= CATALOGUE_CHARACTERS_CAP,
+  };
+}
+
+export function buildReportRedactor(details: Set<string>, privateRows = new Set<string>()): HoldoutRedactor {
+  // Match the exact sanitizer used before report spans and clipped sources are stored.
+  details = new Set([...details].map(redactGateOutput));
   const pattern = details.size
     ? new RegExp(
         [...details]
@@ -331,36 +501,62 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
     const layers = normalizedLayers(text);
     return !layers || layers.some((layer) => boundary?.test(layer));
   };
+  let invalidCatalogue = false;
+  const matchForm = (detail: string) => {
+    const layers = normalizedLayers(decodeHTML(detail));
+    const projected = normalizeMarkdown(layers?.at(-1) ?? "");
+    const normalized = normalizeWhitespace(projected ?? "");
+    if (!layers || !normalized) invalidCatalogue = true;
+    return normalized;
+  };
   // Any phrase can wrap in a report, even if its catalogue entry is a single line.
   const multilineDetails = [...details];
   const multiline = multilineDetails.length
     ? new RegExp(
-        multilineDetails
+        `(?=(${multilineDetails
+          .sort((a, b) => b.length - a.length)
           .map((detail) => {
-            const normalized = normalizeWhitespace(
-              normalizedLayers(detail)?.at(-1) ?? detail.normalize("NFKC").toLowerCase(),
-            );
-            const literal = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            return detail.length >= DISTINCTIVE_LENGTH ? literal : holdoutBoundaryPattern(normalized);
+            const normalized = matchForm(detail);
+            const wrap = "\x00?";
+            const literal = [...normalized]
+              .map((character) =>
+                character === " "
+                  ? "[ \x00]+"
+                  : character === "\0"
+                    ? "[ \x00]*"
+                    : character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+              )
+              .join(wrap);
+            return detail.length >= DISTINCTIVE_LENGTH
+              ? literal
+              : `(?<![\\p{L}\\p{N}_$])${literal}(?![\\p{L}\\p{N}_$])`;
           })
-          .join("|"),
+          .join("|")}))`,
         "giu",
       )
     : null;
-  const holdoutRedact: HoldoutRedactor = (value) => {
+  const holdoutRedact = (value: string): string => {
+    if (invalidCatalogue) return "[withheld: private matching normalization unavailable]";
+    if (!pattern && !privateRows.size) return value;
     if (multiline) {
       const matched = redactMultiline(value, multiline);
       if (matched === null)
         return `[withheld: holdout result or quotation; ${value.split("\n").length} lines]`;
       value = matched;
     }
-    if (!pattern) return value;
     return value
       .split("\n")
       .map((line) => {
-        pattern.lastIndex = 0;
-        return line.includes("[private detail]") ||
-          pattern.test(line) ||
+        if (pattern) pattern.lastIndex = 0;
+        const rowId = /^\|([^|]*)\|/u
+          .exec(line)?.[1]
+          ?.trim()
+          .replace(/^(?:[✅❌❔·]|🚧 blocked)\s+/u, "")
+          .trim()
+          .toUpperCase();
+        return (rowId !== undefined && privateRows.has(rowId)) ||
+          line.includes("[private detail]") ||
+          pattern?.test(line) ||
           encoded(line) ||
           privateMatches(line, distinctive).length
           ? "[withheld: holdout result or quotation; 1 line]"
@@ -368,11 +564,21 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       })
       .join("\n");
   };
-  return {
-    redact: holdoutRedact,
-    cacheable:
-      details.size <= CATALOGUE_DETAILS_CAP &&
-      [...details].reduce((size, detail) => size + detail.length, 0) <= CATALOGUE_CHARACTERS_CAP,
+  return (value, source) => {
+    if (source === undefined) return holdoutRedact(value);
+    // Command cells add a closing backtick after the cut; all other clipped displays are prefixes.
+    const prefix = value.startsWith("`") && value.endsWith("`") ? value.slice(0, -1) : value;
+    if (!source.startsWith(prefix)) return "[withheld: invalid clipped source mapping]";
+    const original = source.split("\n");
+    if (value.split("\n").length > original.length) return "[withheld: invalid clipped source mapping]";
+    const filtered = holdoutRedact(source).split("\n");
+    // A normalization failure withholds the entire source rather than individual lines.
+    if (original.length !== filtered.length)
+      return `[withheld: holdout result or quotation; ${value.split("\n").length} lines]`;
+    return value
+      .split("\n")
+      .map((line, index) => (filtered[index] === original[index] ? line : filtered[index]))
+      .join("\n");
   };
 }
 
@@ -432,10 +638,9 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   if (!catalogue) return { available: false, reason: "Holdout policy unavailable; content withheld." };
   if (key && catalogue.cacheable) catalogues.set(store, { key, catalogue });
   else catalogues.delete(store);
-  const holdoutRedact = catalogue.redact;
   const protect = (value: string) =>
     privacy(value) === value
-      ? privacy(holdoutRedact(value))
+      ? privacy(catalogue.redact(value))
       : privacy(`[withheld: private text; ${value.split("\n").length} lines]`);
   const cwd = cachePath(factory.cfg.paths, repo);
   const git = async (args: string[]) =>
@@ -593,7 +798,7 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
             available: true,
             ...page(
               privacy(report) === report
-                ? privacy(withoutHoldoutSection(report, holdoutRedact))
+                ? privacy(redactReport(report, catalogue, store.getArtifact(run, "report-sources.json")))
                 : protect(report),
               q.reportOffset,
               REPORT_CAP,

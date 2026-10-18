@@ -21,7 +21,8 @@ import {
   readRetryFiles,
 } from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
-import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
+import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
+import { checkPublicationText } from "../gates/publication.ts";
 import {
   compareGates,
   confinementFailed,
@@ -104,7 +105,8 @@ import {
   triagePrompt,
   verifyPrompt,
 } from "./prompts.ts";
-import { buildReport } from "./report.ts";
+import { buildReportArtifacts, saveReport } from "./report.ts";
+import { stripReportManifest } from "./report-privacy.ts";
 import {
   blockingReviewFindings,
   FinderSkipped,
@@ -1946,21 +1948,22 @@ function privateEntries(ctx: RunContext, cwd: string) {
   return loadPrivateStrings(configDir, [cwd, ctx.repo.localPath, repos, work]);
 }
 
-/** Without `pr`, `body` is a PR comment and only its text is checked. */
+/** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
   body: string,
   pr?: { sha: string; title: string; branch?: string },
+  location = pr ? "PR body" : "PR comment",
 ) {
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = privateEntries(ctx, cwd);
-    checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
+    checkPublicationText(body, location, entries);
     if (!pr) return;
-    checkPrivateText(pr.title, "PR title", entries);
+    checkPublicationText(pr.title, "PR title", entries);
     const branch =
       pr.branch ?? reviewRound(ctx)?.grant.owner.branch ?? ctx.run.deliveryBranch ?? ctx.run.branch;
-    checkPrivateText(branch ?? "", "Branch name", entries);
+    checkPublicationText(branch ?? "", "Branch name", entries);
     if (!branch || !ctx.run.baseSha) throw new Error("Missing publication branch or base");
     const range = await deliveryPublicationRange(
       ctx.repo,
@@ -1998,8 +2001,9 @@ async function deliverVerifiedDraft(
   const branch = ctx.run.branch;
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
-  const report = buildReport(ctx, false, { sha, stage, reason, base });
-  ctx.artifact("report.md", "report", report);
+  const rendered = buildReportArtifacts(ctx, false, { sha, stage, reason, base });
+  const body = stripReportManifest(rendered.report);
+  saveReport(ctx, rendered);
   ctx.checkCancelled();
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
   // keep the draft below from finding it.
@@ -2009,14 +2013,14 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}`, branch });
+  await checkPublication(ctx, body, { sha, title: `[needs human] ${ctx.run.title}`, branch });
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
     base,
     title: `[needs human] ${ctx.run.title}`,
-    body: report,
+    body,
     cwd,
     draft: true,
     signal: ctx.signal,
@@ -2134,8 +2138,12 @@ async function deliverReviewRound(
       return;
     }
     const { marker, text } = roundSection(ctx.run.id, review.round, redactGateData(review.findings));
-    if (!pr.body.includes(marker))
-      await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, pr.body + text);
+    if (!pr.body.includes(marker)) {
+      const body = pr.body + text;
+      await checkPublication(ctx, text, undefined, "PR round section");
+      await checkPublication(ctx, body, undefined, "PR body");
+      await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, body);
+    }
   });
 }
 
@@ -2184,7 +2192,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
         ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
-        ctx.artifact("report.md", "report", buildReport(ctx, true));
+        saveReport(ctx, buildReportArtifacts(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `PR ${pr.url} — merged`, value: undefined };
@@ -2200,7 +2208,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.state.verification) {
       await discardChanges(cwd);
       if (!success) {
-        ctx.artifact("report.md", "report", buildReport(ctx, false));
+        saveReport(ctx, buildReportArtifacts(ctx, false));
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
@@ -2208,7 +2216,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           headSha: await headSha(cwd),
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
         });
-        const report = buildReport(ctx, true);
+        const rendered = buildReportArtifacts(ctx, true);
+        const report = rendered.report;
         if (!ctx.state.verdictCommentPosted) {
           const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
@@ -2268,12 +2277,12 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.state.needsHumanReason = undefined;
-                ctx.artifact("report.md", "report", buildReport(ctx, false));
+                saveReport(ctx, buildReportArtifacts(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
-              const body = `${marker}\n${report}`;
+              const body = `${marker}\n${stripReportManifest(report)}`;
               await checkPublication(ctx, body);
               await runner([...comment, "--body", body], ctx.signal);
             },
@@ -2285,7 +2294,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;
-            ctx.artifact("report.md", "report", buildReport(ctx, false));
+            saveReport(ctx, buildReportArtifacts(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
           });
@@ -2293,7 +2302,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");
         }
-        ctx.artifact("report.md", "report", report);
+        saveReport(ctx, rendered);
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
@@ -2335,16 +2344,17 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         note("the branch does not contain the recorded base");
     }
-    const report = buildReport(ctx, success);
+    const rendered = buildReportArtifacts(ctx, success);
+    const body = stripReportManifest(rendered.report);
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
     if (success || blocked || !(review || ctx.run.deliveryBranch))
-      await checkPublication(ctx, report, { sha: await headSha(cwd), title });
+      await checkPublication(ctx, body, { sha: await headSha(cwd), title });
     head = await headSha(cwd);
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
     const publish = () => {
-      ctx.artifact("report.md", "report", report);
+      saveReport(ctx, rendered);
       if (ctx.state.holdout) {
         ctx.artifact("holdout-scenarios.json", "holdout", JSON.stringify(ctx.state.holdout, null, 2));
         for (const result of ctx.state.verifyResults ?? [])
@@ -2398,7 +2408,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       branch: ctx.run.branch as string,
       base: ctx.run.baseBranch as string,
       title,
-      body: report,
+      body,
       cwd,
       draft: !success,
       signal: ctx.signal,
