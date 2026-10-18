@@ -694,14 +694,21 @@ else if (args[1] === "view") {
       expect(call.mode).toBe(0o700);
       expect(call.alternates).toBe(`${paths[2]}/objects\n`);
       expect(existsSync(call.args[0] ?? "")).toBe(false);
-      // Planted keys may reach the push only from this test's own global and system config.
+      // Planted keys may reach the push only from this test's own global and system config, or from
+      // the environment it inherits: factory gates set credential.helper through GIT_CONFIG_COUNT.
       const visible = plantedKeys.map((key) => key.toLowerCase());
       const trusted = [globalConfig, globalInclude, join(root, "system.config")].map(
         (file) => `file:${file}`,
       );
+      const inherited = Array.from({ length: Number(process.env.GIT_CONFIG_COUNT ?? 0) }, (_, i) =>
+        (process.env[`GIT_CONFIG_KEY_${i}`] ?? "").toLowerCase(),
+      );
       expect(
         (call.configView ?? [["unlisted"]]).filter(
-          ([origin = "", name = ""]) => visible.includes(name.toLowerCase()) && !trusted.includes(origin),
+          ([origin = "", name = ""]) =>
+            visible.includes(name.toLowerCase()) &&
+            !trusted.includes(origin) &&
+            !(origin === "command line:" && inherited.includes(name.toLowerCase())),
         ),
       ).toEqual([]);
     }
