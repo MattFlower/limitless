@@ -31,6 +31,7 @@ import {
   compareGates,
   type GateRun,
   retryBaselineFailures,
+  retryFailures,
   retryRegressions,
   runLocalGates,
 } from "../src/gates/run.ts";
@@ -1095,6 +1096,76 @@ test("a job that no worker picks up falls back and cannot pass a failing local c
     acquisition.mockRestore();
   }
 }, 30_000);
+
+test.each([true, false, undefined])(
+  "LAN attribution metadata %s controls targeted land retry",
+  async (complete) => {
+    const req = await request();
+    mkdirSync(join(req.cwd, "test"));
+    writeFileSync(join(req.cwd, "test/a.test.ts"), "");
+    const check = { name: "test", run: "full-test" };
+    req.gates = { ...req.gates, setup: [], checks: [check], retryFiles: "base-retry {files}" };
+    await listen();
+    const token = await paired();
+    await call("/worker/heartbeat", caps(), token);
+    const id = workers.enqueue(req);
+    await call("/worker/lease", {}, token);
+    const original = {
+      name: "test",
+      command: check.run,
+      ok: false,
+      exitCode: 1,
+      durationMs: 1,
+      output: "failure",
+      failedFiles: ["test/a.test.ts"],
+      failedFileTimes: { "test/a.test.ts": 1 },
+      ...(complete === undefined ? {} : { failureAttributionComplete: complete }),
+    };
+    expect(
+      (await call(`/worker/jobs/${id}/events`, { type: "check", phase: "check", result: original }, token))
+        .status,
+    ).toBe(200);
+    expect(
+      (
+        await call(
+          `/worker/jobs/${id}/result`,
+          {
+            sha: req.headSha,
+            run: { setupOk: true, setup: [], checks: [original] },
+          },
+          token,
+        )
+      ).status,
+    ).toBe(200);
+    const run = await confinementScope.run(fakeConfinement, () =>
+      executeGate(req, new AbortController().signal, {}, gateExecutorFor("lan", workers, [req.repo]), {
+        kind: "lan",
+        id,
+        startedAt: Date.now(),
+      }),
+    );
+    expect(workers.jobs("1=1")[0]).toMatchObject({ state: "done", failure_reason: null });
+    const result = run.checks[0];
+    if (!result) throw new Error("Missing worker check");
+    expect(result.failureAttributionComplete).toBe(complete);
+    const calls: string[] = [];
+    const retried = await retryFailures(
+      [{ check, original: result }],
+      req.cwd,
+      req.gates,
+      new AbortController().signal,
+      undefined,
+      async (gates, options) => {
+        expect(options).toEqual({ targeted: true, skipGateSlot: true });
+        calls.push(...gates.checks.map((c) => c.run));
+        return { setupOk: true, setup: [], checks: [{ ...result, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toEqual(complete === true ? ["base-retry './test/a.test.ts'"] : []);
+    expect(retried.size).toBe(complete === true ? 1 : 0);
+  },
+);
 
 test.each([
   "sha",

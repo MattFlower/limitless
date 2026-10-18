@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import { type AttributedTestCounts, attributedJUnitCounts } from "./attribution.ts";
 
 export const MAX_RETRY_FILES = 50;
 const MAX_REPORT_BYTES = 16 * 1024 * 1024;
@@ -8,6 +9,8 @@ export interface FailedTestFiles {
   failedFiles: string[];
   /** Seconds, including passing tests in each failing file. Missing means unknown. */
   failedFileTimes: Record<string, number>;
+  /** Present only when every XML counter agrees with the descendant testcases. */
+  attributedCounts?: AttributedTestCounts;
 }
 
 /** Validate again before execution: the checkout may have changed since report capture. */
@@ -86,8 +89,25 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
     else for (const suite of elements(root).filter((child) => child.name === "testsuite")) visit(suite);
     const failedFiles = [...failed];
     if (!validRetryFiles(failedFiles, cwd)) return undefined;
+    const checkout = realpathSync(cwd);
+    const attributedCounts = attributedJUnitCounts(root, failed, cwd, (file) => {
+      try {
+        if (file.split(/[\\/]/).includes("node_modules")) return undefined;
+        const rel = relative(checkout, realpathSync(resolve(checkout, file)));
+        return rel &&
+          !isAbsolute(rel) &&
+          rel !== ".." &&
+          !rel.startsWith(`..${sep}`) &&
+          !rel.split(sep).includes("node_modules")
+          ? rel
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    });
     return {
       failedFiles,
+      ...(attributedCounts ? { attributedCounts } : {}),
       failedFileTimes: Object.fromEntries(
         failedFiles.flatMap((file) => {
           const time = times.get(file);
