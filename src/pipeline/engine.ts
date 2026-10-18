@@ -1947,16 +1947,17 @@ function privateEntries(ctx: RunContext, cwd: string) {
   return loadPrivateStrings(configDir, [cwd, ctx.repo.localPath, repos, work]);
 }
 
-/** Without `pr`, `body` is a PR comment and only its text is checked. */
+/** Check the exact outgoing text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
   body: string,
   pr?: { sha: string; title: string; branch?: string },
+  location = pr ? "PR body" : "PR comment",
 ) {
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = privateEntries(ctx, cwd);
-    checkPrivateText(stripReportManifest(body), pr ? "PR body" : "PR comment", entries);
+    checkPrivateText(body, location, entries);
     if (!pr) return;
     checkPrivateText(pr.title, "PR title", entries);
     const branch =
@@ -2000,7 +2001,7 @@ async function deliverVerifiedDraft(
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
   const rendered = buildReportArtifacts(ctx, false, { sha, stage, reason, base });
-  const report = rendered.report;
+  const body = stripReportManifest(rendered.report);
   saveReport(ctx, rendered);
   ctx.checkCancelled();
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
@@ -2011,14 +2012,14 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}`, branch });
+  await checkPublication(ctx, body, { sha, title: `[needs human] ${ctx.run.title}`, branch });
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
     base,
     title: `[needs human] ${ctx.run.title}`,
-    body: stripReportManifest(report),
+    body,
     cwd,
     draft: true,
     signal: ctx.signal,
@@ -2136,8 +2137,12 @@ async function deliverReviewRound(
       return;
     }
     const { marker, text } = roundSection(ctx.run.id, review.round, redactGateData(review.findings));
-    if (!pr.body.includes(marker))
-      await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, pr.body + text);
+    if (!pr.body.includes(marker)) {
+      const body = pr.body + text;
+      await checkPublication(ctx, text, undefined, "PR round section");
+      await checkPublication(ctx, body, undefined, "PR body");
+      await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, body);
+    }
   });
 }
 
@@ -2339,11 +2344,11 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         note("the branch does not contain the recorded base");
     }
     const rendered = buildReportArtifacts(ctx, success);
-    const report = rendered.report;
+    const body = stripReportManifest(rendered.report);
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
     if (success || blocked || !(review || ctx.run.deliveryBranch))
-      await checkPublication(ctx, report, { sha: await headSha(cwd), title });
+      await checkPublication(ctx, body, { sha: await headSha(cwd), title });
     head = await headSha(cwd);
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
 
@@ -2402,7 +2407,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       branch: ctx.run.branch as string,
       base: ctx.run.baseBranch as string,
       title,
-      body: stripReportManifest(report),
+      body,
       cwd,
       draft: !success,
       signal: ctx.signal,

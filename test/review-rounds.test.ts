@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { ReviewFinding, Run, RunDetail } from "../src/core/types.ts";
+import { checkPrivateText } from "../src/gates/private.ts";
 import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
@@ -424,6 +425,7 @@ test("a changes verdict runs one round that pushes onto the PR branch with the f
   expect(pr.calls.some((args) => args[1] === "create")).toBe(false);
   expect(pr.body).toStartWith("Factory report");
   expect(pr.body).toContain("## Round 1");
+  expect(pr.body.split(`<!-- limitless-review-round:${roundId} -->`)).toHaveLength(2);
   for (const f of findings) expect(pr.body).toContain(f.title.slice(0, 20));
 
   // The findings reach the implementer as quoted data after the original request.
@@ -440,6 +442,42 @@ test("a changes verdict runs one round that pushes onto the PR branch with the f
   ]);
   expect(kinds()).toEqual(expect.arrayContaining(["review.round_started", "review.round_delivered"]));
 });
+
+test.each(["finding newline", "finding spaces", "existing body"])(
+  "private text in the rendered round publication blocks the edit: %s",
+  async (scenario) => {
+    const original = await delivered();
+    const phrase = ["private", "round", "value"].join(" ");
+    const entries = [{ value: phrase, entry: 1 }];
+    const title = phrase.replaceAll(" ", scenario === "finding newline" ? "\n" : "   ");
+    expect(() => checkPrivateText(title, "Raw finding", entries)).not.toThrow();
+    mkdirSync(factory.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(factory.cfg.paths.configDir, "private-strings.txt"), phrase);
+    if (scenario === "existing body") pr.body += `\n${phrase}`;
+    const body = pr.body;
+    const created = await review(original.id, {
+      verdict: "changes",
+      reviewedSha: await remoteHead(),
+      findings: scenario === "existing body" ? findings : [{ ...findings[0], title }],
+    });
+    expect(created.status).toBe(201);
+    const id = created.body.round?.id as string;
+    if (scenario !== "finding newline") {
+      await restart({
+        "store:save": { action: "kill", when: (c) => c.checkpoint === "round-delivered" },
+      });
+      await settle(id, (run) => run.status === "running");
+      await restart();
+    }
+    const round = await settle(id);
+    expect(round.status).toBe("needs_human");
+    expect(round.error).toContain("contains a private string (entry 1 in private-strings.txt)");
+    expect(round.error).not.toContain(phrase);
+    expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
+    expect(pr.body).toBe(body);
+    expect(factory.store.reviewRound(id)?.deliveredSha).toBe(await remoteHead());
+  },
+);
 
 test.each(["none", "round-delivered", "delivery-complete", "draft"])(
   "an environment-blocked review round publishes its checked head, restarting at %s",
@@ -1090,9 +1128,13 @@ test("a delivered review round finishes after restart without undoing a branch r
   });
   expect(await settle(roundId, (run) => run.status === "running")).toMatchObject({ status: "running" });
   expect(factory.store.reviewRound(roundId)?.deliveredSha).toBe(await remoteHead());
+  const body = pr.body;
+  expect(body).toStartWith("Factory report\n\n");
+  expect(body.split(`<!-- limitless-review-round:${roundId} -->`)).toHaveLength(2);
   await sh(["git", "update-ref", `refs/heads/${BRANCH}`, reviewed], { cwd: remote });
   await restart();
   expect(await settle(roundId)).toMatchObject({ status: "succeeded" });
   expect(await remoteHead()).toBe(reviewed);
   expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+  expect(pr.body).toBe(body);
 });
