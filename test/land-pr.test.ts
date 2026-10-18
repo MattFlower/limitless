@@ -232,7 +232,7 @@ describe("land-pr private strings", () => {
       );
       writeFileSync(
         join(bin, "bun"),
-        `#!/bin/sh\ncase "$*" in\n*check-private-strings.ts*) exec '${bunBin}' "$@" ;;\n${scenario === "post-commit" ? `*gate-slot*) exec '${gitBin}' -c user.name=t -c user.email=t@t commit -qm '${entry}' ;;` : ""}\nesac\nexit 0\n`,
+        `#!/bin/sh\ncase "$*" in\n*check-private-strings.ts*|*git-confined.ts*) exec '${bunBin}' --preload='${resolve("test/git-preload.ts")}' "$@" ;;\n${scenario === "post-commit" ? `*gate-slot*) exec '${gitBin}' -c user.name=t -c user.email=t@t commit -qm '${entry}' ;;` : ""}\nesac\nexit 0\n`,
         { mode: 0o755 },
       );
       writeFileSync(
@@ -387,9 +387,17 @@ test.each([
       realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git/worktrees/work")),
       realpathSync(scenario === "fresh-clone" ? join(work, ".git") : join(source, ".git")),
     ];
-    const recorded = await sh([process.execPath, resolve("scripts/check-private-strings.ts"), "--record"], {
-      cwd: work,
-    });
+    const recorded = await sh(
+      [
+        process.execPath,
+        `--preload=${resolve("test/git-preload.ts")}`,
+        resolve("scripts/check-private-strings.ts"),
+        "--record",
+      ],
+      {
+        cwd: work,
+      },
+    );
     expect(recorded.stdout.trim().split("\n")).toEqual(paths);
     if (scenario !== "fresh-clone")
       expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
@@ -497,7 +505,7 @@ if (args[1] === "gate-slot") {
   args = command[0] === "bun" ? command.slice(1) : command;
 }
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
-appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths, landLog: process.env.LAND_PR_LOG ?? null }) + "\\n");
+if (!args[0]?.endsWith("git-confined.ts")) appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths, landLog: process.env.LAND_PR_LOG ?? null }) + "\\n");
 if (args[0] === "install" || args[0] === "run") {
   if (${JSON.stringify(scenario)} === "checks:private-repository") {
     const repos = readdirSync(process.env.TMPDIR).filter(name => name.startsWith("land-pr-push."));
@@ -558,7 +566,7 @@ if (args[0].endsWith(".ts")) {
       if (moved.status !== 0) process.exit(1);
     }
   }
-  const result = spawnSync(${JSON.stringify(process.execPath)}, [...bunFlags, ...args], { stdio: "inherit" });
+  const result = spawnSync(${JSON.stringify(process.execPath)}, [...bunFlags, "--preload=" + ${JSON.stringify(resolve("test/git-preload.ts"))}, ...args], { stdio: "inherit" });
   if (args[1] === "--record") appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "recorded", args: [] }) + "\\n");
   process.exit(result.status ?? 1);
 }
@@ -934,7 +942,16 @@ test.each(["HEAD", "f".repeat(40)])(
     try {
       await repositories(root);
       const result = await sh(
-        [process.execPath, resolve("scripts/check-private-strings.ts"), "123", "local", "safe", "pr", head],
+        [
+          process.execPath,
+          `--preload=${resolve("test/git-preload.ts")}`,
+          resolve("scripts/check-private-strings.ts"),
+          "123",
+          "local",
+          "safe",
+          "pr",
+          head,
+        ],
         {
           cwd: join(root, "source"),
           env: { ...process.env, LIMITLESS_CONFIG_DIR: join(root, "absent") },
@@ -957,7 +974,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     const calls = join(root, "calls");
     writeFileSync(
       join(bin, "bun"),
-      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$4" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
+      `#!/bin/sh\ncase "$*" in *git-confined.ts*) shift; shift; shift; exec git "$@" ;; esac\necho "$*" >> '${calls}'\n[ "$4" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
       {
         mode: 0o755,
       },
@@ -995,7 +1012,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     const marker = join(root, "published");
     writeFileSync(
       join(bin, "bun"),
-      '#!/bin/sh\n[ "$4" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
+      '#!/bin/sh\ncase "$*" in *git-confined.ts*) shift; shift; shift; exec git "$@" ;; esac\n[ "$4" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
       { mode: 0o755 },
     );
     writeFileSync(
@@ -1087,7 +1104,7 @@ else if (args[1] === "view") {
       );
       writeFileSync(
         join(bin, "bun"),
-        `#!/bin/sh\ncase "$*" in *check-private-strings.ts*) exec '${process.execPath}' "$@" ;; esac\nexit 0\n`,
+        `#!/bin/sh\ncase "$*" in *check-private-strings.ts*|*git-confined.ts*) exec '${process.execPath}' --preload='${resolve("test/git-preload.ts")}' "$@" ;; esac\nexit 0\n`,
         { mode: 0o755 },
       );
       writeFileSync(
@@ -1241,6 +1258,7 @@ test.each(["history", "diff", "blob", "title", "body"])(
           process.execPath,
           "--config=/dev/null",
           "--no-env-file",
+          `--preload=${resolve("test/git-preload.ts")}`,
           resolve("scripts/check-private-strings.ts"),
           "123",
           "test/repo",

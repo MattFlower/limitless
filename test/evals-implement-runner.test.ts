@@ -18,8 +18,10 @@ import { basename, dirname, join } from "node:path";
 import * as cache from "../src/evals/cache.ts";
 import type { ImplementCase } from "../src/evals/cases.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
+import { gradeImplement } from "../src/evals/implement.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
+import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { observerRoots, seatbeltBackend } from "../src/harness/sandbox.ts";
 import * as scratch from "../src/harness/scratch.ts";
@@ -1656,8 +1658,8 @@ for (const [outcome, reason] of [
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
       // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch,
-      // plus one confined scratch per gate run (baseline and grading), shared by its setup and checks.
-      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 2);
+      // plus bundle-transfer scratch and one confined scratch per gate run (baseline and grading).
+      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 3);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
@@ -1723,8 +1725,8 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     f.save();
     expect((await f.run()).trials[0]?.pass).toBe(true);
     const dirs = allocated.mock.results.map((r) => String(r.value));
-    // Harness, grading checkout and hidden scratch, plus the baseline and grading gate commands'.
-    expect(dirs).toHaveLength(5);
+    // Harness, grading checkout, bundle transfer and hidden scratch, plus both gate commands'.
+    expect(dirs).toHaveLength(6);
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();
@@ -1753,6 +1755,48 @@ test("injected confinement covers preparation, grading gates and the hidden grad
         ({ opts }) => opts.cwd === hidden?.opts.cwd && opts.env.LIMITLESS_CONFINED === "1",
       ),
     ).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("grading candidate metadata and untracked state use confined git", async () => {
+  const f = await fixture();
+  try {
+    const marker = join(f.home, "fsmonitor-marker");
+    const monitor = join(f.home, "fsmonitor");
+    writeFileSync(monitor, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    await sh(["git", "config", "core.fsmonitor", monitor], { cwd: f.source });
+    await sh(["git", "ls-files", "-z", "-o"], { cwd: f.source });
+    expect(existsSync(marker)).toBe(true);
+    rmSync(marker);
+    const calls: string[][] = [];
+    const grade = await gitConfinement.run(
+      {
+        wrap: async (cmd, opts) => {
+          if (opts.cwd === f.source) calls.push(cmd);
+          // Stop before hidden execution: this test exercises only the candidate-side git boundary.
+          if (cmd.includes("init")) throw new ConfinementError("grading init refused");
+          return cmd;
+        },
+      },
+      () =>
+        gradeImplement(
+          f.item,
+          f.source,
+          [],
+          {
+            gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+            baseline: { setup: [], checks: [], setupOk: true },
+          },
+          [],
+          new AbortController().signal,
+        ),
+    );
+    expect(grade.implement?.error).toBe("grading init refused");
+    expect(calls.some((cmd) => cmd.includes("ls-files") && cmd.includes("-o"))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes("rev-parse") && cmd.at(-1) === "HEAD")).toBe(true);
+    expect(existsSync(marker)).toBe(false);
   } finally {
     await f.close();
   }

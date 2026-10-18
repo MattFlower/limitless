@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -221,20 +222,44 @@ describe("review shadow panel: single reviews decide, the panel only records", (
 
   test("a pinned production reviewer leaves the shadow panel's targets unchanged", async () => {
     const calls = newCalls();
-    const f = start(scenario(calls));
-    shadowOn(f);
-    const run = await f.createRun({
-      repo: repoDir,
-      prompt: "Add farewell",
-      profile: "quick",
-      models: { implement: ["alpha/m"], review: ["alpha/m"] },
+    const marker = join(home, "prune-marker");
+    const helper = join(home, "fsmonitor");
+    writeFileSync(helper, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    const respond = scenario(calls);
+    const f = start(async (spec) => {
+      if (roleOf(spec) === "implement")
+        await sh(["git", "config", "core.fsmonitor", helper], { cwd: spec.cwd });
+      return respond(spec);
     });
-    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(calls.primary.map((s) => s.target.modelId)).toEqual(["alpha/m", "alpha/m"]);
-    expect(calls.shadow.map((s) => s.target.modelId)).toContain("beta/m");
-    expect(
-      f.store.listInvocations(run.id).some((i) => i.role === "review_shadow" && i.modelId === "beta/m"),
-    ).toBe(true);
+    let prunes = 0;
+    await gitConfinement.run(
+      {
+        wrap: async (cmd) => {
+          if (cmd.includes("worktree") && cmd.includes("prune")) {
+            prunes++;
+            throw new ConfinementError("shadow prune refused");
+          }
+          return cmd;
+        },
+      },
+      async () => {
+        shadowOn(f);
+        const run = await f.createRun({
+          repo: repoDir,
+          prompt: "Add farewell",
+          profile: "quick",
+          models: { implement: ["alpha/m"], review: ["alpha/m"] },
+        });
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(prunes).toBeGreaterThan(0);
+        expect(existsSync(marker)).toBe(false);
+        expect(calls.primary.map((s) => s.target.modelId)).toEqual(["alpha/m", "alpha/m"]);
+        expect(calls.shadow.map((s) => s.target.modelId)).toContain("beta/m");
+        expect(
+          f.store.listInvocations(run.id).some((i) => i.role === "review_shadow" && i.modelId === "beta/m"),
+        ).toBe(true);
+      },
+    );
   });
   // Runs differ only in commit SHAs and run ids.
   const normalize = (specs: AgentSpec[], runId: string) =>
