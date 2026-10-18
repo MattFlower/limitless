@@ -39,7 +39,7 @@ export function sanitizePublication(
   const prefixes = roots.map((root) => root.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   if (!prefixes.length) return text;
   const paths = new RegExp(
-    `https?://[^\\s\x60<>"']+|(?<![\\w/.:~%-])(?:file://)?(?:${prefixes.join("|")})(?=/|$|[\\s\x60<>"'()\\[\\]{},;!?])(?:/[^\\s\x60<>"'()\\[\\]{},;!?]*)?`,
+    `https?://[^\\s\x60<>"']+|(?<![\\w/.~%-])(?:file://)?(?:${prefixes.join("|")})(?=/|$|[\\s\x60<>"'()\\[\\]{},;!?])(?:/[^\\s\x60<>"'()\\[\\]{},;!?]*)?`,
     "giu",
   );
   // Only schemes are case-insensitive: filesystem roots retain their literal spelling.

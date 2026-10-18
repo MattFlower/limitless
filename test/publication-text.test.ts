@@ -91,6 +91,19 @@ test("labels and titles are sanitized independently of relative and case-insensi
   expect(sanitizePublication(expected, work, data)).toBe(expected);
 });
 
+test("paths after prose colons are sanitized in labels, titles and bare text", () => {
+  const data = "/Users/example/.factory";
+  const work = `${data}/work/run`;
+  const input =
+    `[f](src/a.ts "Source:${work}/a.ts") [Log:${data}/logs/a](src/a.ts)\n` +
+    `Source:${work}/b.ts Log:file://${data}/logs/b https://example.com:443/x?p=:${work}/a.ts`;
+  const expected =
+    `[f](src/a.ts "Source:a.ts") [Log:<data>/logs/a](src/a.ts)\n` +
+    `Source:b.ts Log:<data>/logs/b https://example.com:443/x?p=:${work}/a.ts`;
+  expect(sanitizePublication(input, work, data)).toBe(expected);
+  expect(sanitizePublication(expected, work, data)).toBe(expected);
+});
+
 test("configured and canonical aliases rewrite file URLs with complete directory boundaries", () => {
   const temp = mkdtempSync(join(tmpdir(), "publication-alias-"));
   try {
