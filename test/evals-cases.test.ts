@@ -21,6 +21,9 @@ import { checkPrivateText, loadPrivateStrings } from "../src/gates/private.ts";
 import type { ModelDef } from "../src/router/catalog.ts";
 import { evalFixture } from "./evals-support.ts";
 
+// M5.2 adjudicated cases are review-040..review-108; the 2026-10-16 fresh clean set follows them.
+const M52_END = 110;
+
 test("committed 90 cases load (60 development + 30 held out), including notes and gold alternatives", () => {
   const file = loadCases();
   expect(file.cases).toHaveLength(90);
@@ -594,7 +597,7 @@ test("M5.2 cases preserve previous cases and load with pins, adjudicated labels 
   expect(fingerprint(file.notes?.split(" M5.2 (")[0] ?? "")).toBe(
     "1918b7714b81731b47bfeac3b0c48571bb028da4915454d4edade4807b14f9b1",
   );
-  const added = file.cases.slice(53);
+  const added = file.cases.slice(53, M52_END);
   // Adjudication dropped the candidates left without a gold defect; LABELS.md records each outcome.
   const labels = readFileSync(new URL("../evals/review/LABELS.md", import.meta.url), "utf8");
   const outcomes = new Map(
@@ -715,7 +718,7 @@ test("all new review ids validate without scheduling model calls", () => {
 test("fixed-seed review split groups whole PRs and reproduces the pre-registered assignment", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
   const recorded = new Map<number, "dev" | "heldout">();
-  for (const item of file.cases.slice(53)) {
+  for (const item of file.cases.slice(53, M52_END)) {
     const pr = Number(/^pr #(\d+)/.exec(item.source)?.[1]);
     if (!item.split || !pr) throw new Error(`missing split or PR: ${item.id}`);
     const previous = recorded.get(pr);
@@ -794,4 +797,60 @@ test("pending review helper prints selected defects and CLI errors without netwo
   expect(unknown.status).not.toBe(0);
   expect(unknown.stdout).toBe("");
   expect(unknown.stderr).toContain("Unknown case ID: missing-case");
+});
+
+test("the 2026-10-16 fresh clean set matches its LABELS.md table, splits and labels", () => {
+  const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
+  const fresh = file.cases.slice(M52_END);
+  expect(fresh.map((item) => item.id)).toEqual(
+    Array.from({ length: 25 }, (_, index) => `review-${String(index + 109).padStart(3, "0")}`),
+  );
+  const labels = readFileSync(new URL("../evals/review/LABELS.md", import.meta.url), "utf8");
+  const section = labels.split("## M5.2 fresh clean set — results, 2026-10-16")[1] ?? "";
+  const rows = [...section.matchAll(/^\| (sb)?#(\d+) \| (dev|heldout) \| ([^|]+) \|$/gm)].map((m) => ({
+    repo: m[1] ? "MattFlower/limitless-sandbox" : "MattFlower/limitless",
+    pr: Number(m[2]),
+    split: m[3] as "dev" | "heldout",
+    outcome: (m[4] ?? "").trim(),
+  }));
+  expect(rows).toHaveLength(34);
+  // The split was assigned once over all 34 eligible numbers, before any adjudicator ran.
+  const assigned = assignReviewSplits(
+    rows.map((row) => row.pr),
+    REVIEW_SPLIT_SEED,
+  );
+  for (const row of rows) expect(assigned.get(row.pr)).toBe(row.split);
+  const vetted = rows.filter((row) => row.outcome !== "not vetted (dev stop)");
+  expect(vetted).toHaveLength(fresh.length);
+  const privateStrings = loadPrivateStrings();
+  for (const item of fresh) {
+    const source = /^pr #(\d+) fresh clean set 2026-10-16 @ ([0-9a-f]{7})$/.exec(item.source);
+    if (!source) throw new Error(`invalid source: ${item.id}`);
+    expect(source[2]).toBe(item.head.slice(0, 7));
+    const row = vetted.find((r) => r.repo === item.repo && r.pr === Number(source[1]));
+    expect(row).toMatchObject({ split: item.split, outcome: `${item.kind} (${item.id})` });
+    expect(item.input).toMatchObject({ spec: null, implementerReport: "", gates: [] });
+    if (item.kind === "clean") expect(item.defects).toEqual([]);
+    else {
+      expect(item.kind).toBe("real");
+      expect(item.defects.length).toBeGreaterThan(0);
+      for (const defect of item.defects) {
+        expect(defect).toMatchObject({ severity: "major", required: true, adjudication: "confirmed" });
+        expect(defect.summary).toMatch(/^[^.!?]+[.!?]$/);
+      }
+    }
+    const text = JSON.stringify(item);
+    expect(text).not.toMatch(
+      /\/Users\/|\/home\/|~\/|\.limitless\/|\/private\/|\/var\/folders|[\w.+-]+@[\w-]+\.[\w.]+|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}/,
+    );
+    expect(() => checkPrivateText(text, item.id, privateStrings)).not.toThrow();
+  }
+  const count = (split: string, kind: string) =>
+    fresh.filter((item) => item.split === split && item.kind === kind).length;
+  expect([
+    count("heldout", "clean"),
+    count("heldout", "real"),
+    count("dev", "clean"),
+    count("dev", "real"),
+  ]).toEqual([10, 1, 12, 2]);
 });

@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { auditDiff } from "../src/gates/audit.ts";
-import { cacheableBaseline } from "../src/gates/cache.ts";
+import { baselineCacheKey, cacheableBaseline } from "../src/gates/cache.ts";
 import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
@@ -1310,4 +1310,20 @@ test.each([false, true])("baseline targeted evidence is redacted before caching 
             : "baseline check: retry FAIL again (targeted: 1 files)"),
       ),
   ).toBe(true);
+});
+
+test("baseline environment hashes separate LAN and local execution", () => {
+  const input = {
+    repoId: "test/repo",
+    baseSha: "base",
+    gates,
+    lockfileHash: "lock",
+    bunVersion: Bun.version,
+    platform: "darwin",
+    arch: "arm64",
+    buildSha: "build",
+    envDigest: "env",
+  };
+  expect(baselineCacheKey(input)).toEqual(baselineCacheKey({ ...input, executor: "local" }));
+  expect(baselineCacheKey({ ...input, executor: "lan" }).envHash).not.toBe(baselineCacheKey(input).envHash);
 });

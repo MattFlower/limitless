@@ -586,7 +586,8 @@ test.each(["maxWords", "cafe\u0301"])(
   },
 );
 
-// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
+// #556 (2026-10-17), 2/3-line cases: alone 2.98/2.82 s; worst of 10 paired runs 1.92/1.98 s.
+// Before trimming page requests: alone 3.42/3.36 s, paired 4.21/4.08 s; real Git per page.
 test.each([2, 3])(
   "change pages expose %i-line PR prose but protect its holdout quotation in reports",
   async (length) => {
@@ -621,6 +622,7 @@ test.each([2, 3])(
         });
         for (const conn of [connections.direct, connections.proxy]) {
           let text = "",
+            report = "",
             offset = 0;
           do {
             const page = resultValue<ChangePage>(
@@ -631,18 +633,12 @@ test.each([2, 3])(
             );
             expect(page.available).toBe(true);
             text += page.diff.text;
+            if (offset === 0) report = page.reports[0]?.text ?? "";
             offset = page.diff.nextOffset ?? 0;
           } while (offset);
           for (const line of prose) expect(text).toContain(line);
           expect(text).toContain("unrelated readable line");
           expect(text).toContain("more readable code");
-          const report =
-            resultValue<ChangePage>(
-              await conn.client.callTool({
-                name: "limitless_get_change",
-                arguments: { run: c.run.id },
-              }),
-            ).reports[0]?.text ?? "";
           for (const line of prose) expect(report).not.toContain(line);
           expect(report).toContain("[withheld: holdout result or quotation; 1 line]");
           expect(report).toContain("public report ending");
@@ -652,7 +648,7 @@ test.each([2, 3])(
       await connections.close();
     }
   },
-  20_000,
+  15_000,
 );
 
 test.each(["\\n", "\\r", "\\r\\n", "\\t", "\\u000a", "\\u000d", "\\u0009"])(
@@ -873,11 +869,13 @@ test("escaped multiline PR hunk annotations stay visible with Git ranges", async
   }
 });
 
+// #556 (2026-10-17): alone 4.42 s, worst of 10 paired runs 3.25 s; Git and catalogue invalidations.
+// Before trimming the paged fixture: alone 3.77 s, paired 4.97 s.
 test("change pages reuse the catalogue and refresh diagnostics, holdouts and privacy inputs", async () => {
   const c = await changeFixture(
     f,
     {
-      "hello.txt": `${"readable line\n".repeat(1500)}diagnosticSecret\nholdoutSecret\nroundSecret\nprivacySecret\ncredentialSecret\n`,
+      "hello.txt": `${"readable line\n".repeat(1100)}diagnosticSecret\nholdoutSecret\nroundSecret\nprivacySecret\ncredentialSecret\n`,
     },
     true,
   );
@@ -1013,7 +1011,7 @@ test("change pages reuse the catalogue and refresh diagnostics, holdouts and pri
     reads.mockRestore();
     await conn.close();
   }
-}, 30_000);
+}, 20_000);
 
 test("change pages protect verifier quotations while returning implementer-visible literals", async () => {
   const hidden = "runtimeProbeSecret",
@@ -1860,12 +1858,13 @@ test.each([
   }
 });
 
-// Load-sensitive (#556): timed out at 5.00–5.06 s in loaded gates and land checks; 20 s until #556 measures and trims it.
+// #556 (2026-10-17): alone 3.00 s, worst of 10 paired runs 2.63 s; Git and paged privacy scans.
+// Before trimming the paged fixtures: alone 3.04 s, paired 3.69 s.
 test("change view preserves PR text and withholds private paths, patch lines, reports and errors on both backends", async () => {
   const hidden = "hiddenScenarioSentinel";
   const c = await changeFixture(f, {
-    "hello.txt": `hello\n${"safe line\n".repeat(3000)}${privacyTexts.join("\n")}\npublic neighbor after secrets\n`,
-    "holdout-patch.txt": `${"safe line\n".repeat(3000)}privacy-test-credential\nsecret-host.example\npublic neighbor after secrets\n${[...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("")}\n`,
+    "hello.txt": `hello\n${"safe line\n".repeat(1800)}${privacyTexts.join("\n")}\npublic neighbor after secrets\n`,
+    "holdout-patch.txt": `${"safe line\n".repeat(1800)}privacy-test-credential\nsecret-host.example\npublic neighbor after secrets\n${[...hidden].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("")}\n`,
     [`${hidden}.txt`]: "private path\n",
     "secret-host.example.txt": "private configured path\n",
     "privacy-test-credential.txt": "private credential path\n",
@@ -1910,6 +1909,7 @@ test("change view preserves PR text and withholds private paths, patch lines, re
       const file = first.files.find((file) => file.path === "holdout-patch.txt")?.index;
       const ordinary = resultValue<ChangePage>(await read({ ...pin, file }));
       expect(ordinary.diff.text).toContain("+safe line");
+      expect(ordinary.diff.nextOffset).not.toBeNull();
       let diff = ordinary.diff.text;
       let offset = ordinary.diff.nextOffset;
       while (offset !== null) {
@@ -1944,7 +1944,7 @@ test("change view preserves PR text and withholds private paths, patch lines, re
   } finally {
     await connections.close();
   }
-}, 20_000);
+}, 15_000);
 
 test.each(["hiddenScenarioSentinel", ...privacyTexts].map((report, index) => [index, report] as const))(
   "change view protects the complete report before paging on both backends (encoding %i)",

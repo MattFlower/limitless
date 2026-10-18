@@ -322,3 +322,71 @@ audit. Production's reviewer and the adversarial variant blocked the 3 held-out 
 - **Use.** The new clean cases join their splits. Decisions measured before this set existed
   keep their recorded verdicts. Results for systems built on either adjudicator's model carry
   the usual independence caveat.
+
+## M5.2 fresh clean set — results, 2026-10-16
+Recorded on 2026-10-16 (checked with `date`). This follows the 2026-10-15 procedure above, for #542. The selection manifest was frozen at 2026-10-15 20:22 EDT and posted on #542 before any adjudicator ran.
+
+- **Population and exclusions.** 61 pull requests merged in MattFlower/limitless and MattFlower/limitless-sandbox on 2026-10-08 through 2026-10-13, by America/New_York merge date. Excluded:
+  - 8 `hand/` branches;
+  - 6 pull requests already used for cases;
+  - 13 with a later fix: #433, #436, #443, #449, #458, #460, #469, #479, #483, #485, #489, #492, #499.
+
+  The later-fix survey ran `git log -L` over each squash commit's added hunks up to current main, plus later issues and pull requests that reference the candidate. Every pairing was classified by hand; the manifest on #542 gives each fix reference.
+- **Eligible: 34.** Splits come from `assignReviewSplits` (seed 427202610) over the 34 eligible numbers: 11 held out and 23 development. Sandbox pull requests are written `sb#N` below; their numbers don't collide with this repository's.
+- **Order and stop.** Every held-out candidate was vetted. Development candidates were vetted in ascending merge time until 12 were confirmed clean. The 9 later development candidates were not vetted and stay out.
+- **Adjudication.** codex/sol-6.1 at high effort and claude/opus each reviewed every vetted candidate once, against the same input: the scrubbed request and `base..head`, but not the pull request body. They agreed on 23 of 25 candidates. The orchestrator re-ran or re-quoted every claim.
+- **Method correction.** The first request builder preferred a pull request's closing issue over the factory's own `## Request` section, which is the text the change was written for. All 34 requests were compared afterwards. Two differed materially:
+  - #471 had not been vetted, and its request was replaced first.
+  - #446 had been vetted once against the older issue text. That pass is kept only as a record. Both vendors re-ran on the factory request, and only the re-run decides its label.
+
+| Candidate | Split | Outcome |
+|---|---|---|
+| #431 | heldout | clean (review-112) |
+| #438 | heldout | clean (review-114) |
+| #445 | heldout | clean (review-118) |
+| #455 | heldout | clean (review-123) |
+| #456 | heldout | clean (review-124) |
+| #466 | heldout | clean (review-126) |
+| #478 | heldout | real (review-129) |
+| #490 | heldout | clean (review-130) |
+| sb#8 | heldout | clean (review-131) |
+| sb#10 | heldout | clean (review-132) |
+| sb#14 | heldout | clean (review-133) |
+| #414 | dev | clean (review-109) |
+| #428 | dev | clean (review-110) |
+| #430 | dev | clean (review-111) |
+| #437 | dev | clean (review-113) |
+| #444 | dev | clean (review-117) |
+| #439 | dev | clean (review-115) |
+| #447 | dev | clean (review-120) |
+| #442 | dev | clean (review-116) |
+| #454 | dev | clean (review-122) |
+| #446 | dev | real (review-119) |
+| #451 | dev | clean (review-121) |
+| #463 | dev | clean (review-125) |
+| #467 | dev | real (review-127) |
+| #468 | dev | clean (review-128) |
+| #471 | dev | not vetted (dev stop) |
+| sb#9 | dev | not vetted (dev stop) |
+| sb#11 | dev | not vetted (dev stop) |
+| #497 | dev | not vetted (dev stop) |
+| #481 | dev | not vetted (dev stop) |
+| #503 | dev | not vetted (dev stop) |
+| #504 | dev | not vetted (dev stop) |
+| sb#12 | dev | not vetted (dev stop) |
+| sb#13 | dev | not vetted (dev stop) |
+
+**Counts.**
+- **Held out:** 10 clean and 1 real. Only 11 candidates were eligible, so the registered 12 couldn't be reached, as the procedure allows.
+- **Development:** 12 clean and 2 real.
+- **Docs-only clean cases:** 3 (review-109, review-112, review-118). These don't separate reviewers.
+- **Cost:** about $16 API-equivalent on the Claude subscription for the Opus adjudications, plus the Codex adjudications on the ChatGPT subscription.
+
+**Claims, verified by the orchestrator.**
+- **#478 (both vendors), confirmed major, real.** The head MCP proxy sends `repo` to `/api/runs` (`src/integrations/mcp.ts:235`) and returns `runs.slice(0, limit)` without checking that the filter was applied. A base-release daemon reads only `status`, `ids` and `limit`, so against an older daemon `limitless_list_runs {repo}` returns other repositories' runs as matches. Codex reproduced this against the base route code. AGENTS.md requires a newer client to keep working against an older daemon.
+- **#446 (claude/opus on the re-run; codex/sol-6.1 found it clean), confirmed major, real.** `owner_diagnostics` declares `event_id` and `invocation_id` with `ON DELETE CASCADE` but indexes only `(run_id, id)`. With `PRAGMA foreign_keys = ON`, the daemon's synchronous bulk `DELETE FROM events WHERE level = 'debug' …` scans the table once per deleted event. Measured with the real Store: deleting 20,000 events took 13 ms with no owner rows and 5,318 ms with 20,000 owner rows. Production has the same schema; #558 tracks the fix.
+- **#467 (both vendors), confirmed major, real.** Delivery stops after a clean factory merge is persisted and before the push. On resume after the base moves again, the second merge's first parent is the earlier merge, but `assertDeliveryHead` calls `validateMerge(worktree, reviewedSha, base)`, which requires `[reviewedSha, base]`. The run ends needs_human. Both vendors reproduced it at head, and it succeeded at base. Main has the same check; #559 tracks it.
+- **sb#14 (codex/sol-6.1 only), confirmed but minor, stays clean.** `dedupe --ignore-case` keeps `ΟΣ`/`Οσ` and `Straße`/`STRASSE` as distinct lines. The request doesn't ask for Unicode case folding, and per-line `toLowerCase()` is the conventional implementation.
+- **#446, first pass against the older request (record only).** The claims matched the closed #429 design: write-time redaction removed, UI access, raw invocation logs. The factory request explicitly kept write-time redaction and made the UI optional, so these weren't labels.
+
+**Use.** The 22 new clean cases join their splits. Decisions measured before this set existed keep their recorded verdicts. Results for systems built on Sol 6.1 or Opus carry the usual independence caveat, because both adjudicators are those models.

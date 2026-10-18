@@ -199,8 +199,9 @@ use the file first, then the environment.
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
-| `[gates] executor` | `"local"` | `local` is the only supported value. |
+| `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
+| `[workers] repos` | `[]` | Repositories allowed to send gate code to paired workers, for example `["owner/name"]`. Requires `[gates] executor = "lan"`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
 | `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
@@ -235,8 +236,11 @@ after ten minutes. The coordinator creates and reuses a self-signed certificate 
 `<data>/worker-tls/`; workers pin its fingerprint and keep credentials under `<data>/worker/`.
 Changing the coordinator's certificate requires pairing again. Keep both machines on the same
 release SHA and Bun version; mismatches show as `needs update`. Workers send heartbeats every
-ten seconds and show as offline after thirty seconds without a heartbeat. This release covers
-pairing and heartbeats only: workers receive no gate jobs, and gates always run locally.
+ten seconds and show as offline after thirty seconds without a heartbeat. Opted-in gates run from
+git bundles at the requested commit, without GitHub credentials on the worker. Leases renew with
+heartbeats and expire after sixty seconds. Infrastructure failures retry once on another worker,
+then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
+restarts re-attach to the same job, while cancelling a run tells its worker to stop.
 Bonjour discovery, power/idle selection and Linux workers are not supported.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default
@@ -456,7 +460,7 @@ submission, inbox handling, review and landing, including uncertain mutation res
 | `running` | Executing; `stage` shows where |
 | `waiting_input` | Paused on open questions; answer them to continue |
 | `succeeded` | Delivered: a PR (merged, auto-merge enabled, or left open) or a local branch |
-| `needs_human` | The factory stopped deliberately; see [below](#needs-human) |
+| `needs_human` | The factory stopped deliberately; see [below](#needs_human-and-what-to-do-about-it) |
 | `failed` | An unexpected error, for example git or `gh` failing; see `error` and the event log |
 | `cancelled` | Cancelled by you (UI, CLI, Discord, MCP) |
 | `resolved` | Dealt with outside the factory, with a recorded resolution |
@@ -615,8 +619,8 @@ Encode the full ID in the API path (for example `omlx%2Fnew-local`). Before
 deleted IDs and skip them as missing catalog entries. Provider definitions still require
 config.toml and a daemon restart.
 
-For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
-`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
+For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-oQ4e-mtp`);
+`omlx/qwen-27b` (`Qwen3.8-27B-8bit`) is opt-in. The smoke check, and free-first
 routing among free models the policy does not name, take catalog order, so they use Flash. Put `OMLX_API_KEY`
 in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
 override using `[providers.omlx] max_concurrent = 8` in `config.toml`. Tool-free selections

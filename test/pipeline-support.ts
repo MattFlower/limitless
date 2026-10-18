@@ -21,6 +21,11 @@ import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { seeded } from "./seeded.ts";
+import { testWaits, waitUntil } from "./wait-support.ts";
+
+// The file scope also covers factories constructed directly by its tests.
+let pipelineWaits: ReturnType<typeof testWaits> | undefined;
+const waitSignals = new WeakMap<Factory, AbortSignal>();
 
 const originalPath = process.env.PATH;
 
@@ -165,28 +170,28 @@ export async function waitFor(
   statuses: RunStatus[],
   timeoutMs = 20_000,
 ): Promise<RunStatus> {
-  const deadline = Date.now() + timeoutMs;
-  // A run update wakes the check a turn later, once the scheduler has settled; the poll covers the rest.
-  let wake = () => {};
-  const unsubscribe = f.store.subscribe((msg) => {
-    if (msg.kind === "run") wake();
-  });
-  try {
-    while (Date.now() < deadline) {
-      const run = f.store.getRun(runId);
-      if (run && statuses.includes(run.status)) return run.status;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 25);
-        wake = () => {
-          clearTimeout(timer);
-          setImmediate(resolve);
-        };
-      });
-    }
-  } finally {
-    unsubscribe();
-  }
-  throw new Error(`timed out waiting for ${statuses.join("|")}; status=${f.store.getRun(runId)?.status}`);
+  const signal = waitSignals.get(f) ?? pipelineWaits?.signal;
+  if (!signal) throw new Error("Pipeline fixture has no test wait scope");
+  waitSignals.set(f, signal);
+  let status: RunStatus | undefined;
+  await waitUntil(
+    () => {
+      status = f.store.getRun(runId)?.status;
+      return status !== undefined && statuses.includes(status);
+    },
+    {
+      signal,
+      timeoutMs,
+      description: `timed out waiting for ${statuses.join("|")}`,
+      pollMs: null,
+      subscribe: (wake) =>
+        f.store.subscribe((msg) => {
+          if (msg.kind === "run") wake();
+        }),
+    },
+  );
+  if (status === undefined) throw new Error("Missing run status");
+  return status;
 }
 
 interface PipelineFixture {
@@ -197,6 +202,8 @@ interface PipelineFixture {
 
 // Register hooks in the importing file; each parallel worker owns its fixture and seeded repo.
 export function pipelineSetup(state: PipelineFixture) {
+  const waits = testWaits();
+  pipelineWaits = waits;
   // Real git and subprocesses outlast Bun's 5 s default under CPU load (#140).
   setDefaultTimeout(30_000);
 
@@ -238,6 +245,7 @@ export function pipelineSetup(state: PipelineFixture) {
       bootSha: "test-build",
       ...options,
     });
+    waitSignals.set(state.factory, waits.signal);
     state.factory.start();
     return state.factory;
   }
@@ -350,6 +358,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
   }
 
   return {
+    wait: waits.until,
     start,
     makeRepo,
     fixture,
