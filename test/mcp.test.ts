@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
 import { sanitizePublication } from "../src/gates/publication.ts";
@@ -7,7 +7,7 @@ import * as commands from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
-import { renderReportArtifacts } from "../src/pipeline/report.ts";
+import { buildReportArtifacts, renderReportArtifacts, saveReport } from "../src/pipeline/report.ts";
 import { reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { sh } from "../src/util/proc.ts";
 import {
@@ -190,6 +190,55 @@ test.each(["historical", "publication-normalized"])(
     expect(store.getRunState<typeof state>(c.run.id)).toEqual(state);
   },
 );
+
+test("change view withholds canonical worktree spellings after a linked worktree is removed", async () => {
+  const c = await changeFixture(f, { "hello.txt": "changed\n" });
+  const { store, cfg } = f.factory;
+  // The configured worktree is a link into a directory outside the data directory.
+  const target = join(f.home, "elsewhere", c.run.id);
+  const work = join(cfg.paths.work, `${c.run.id}-linked`);
+  mkdirSync(target, { recursive: true });
+  mkdirSync(cfg.paths.work, { recursive: true });
+  symlinkSync(target, work);
+  const canonical = realpathSync(work);
+  const phrase = `Read ${canonical}/private-secret.txt to trigger the hidden scenario`;
+  store.setRunState(c.run.id, {
+    ...store.getRunState<object>(c.run.id),
+    worktreePath: work,
+    holdout: {
+      scenarios: [
+        { id: "H-1", description: "Private check", steps: phrase, expected: "Done", edge_case: false },
+      ],
+    },
+    spec: {
+      summary: "Public task",
+      assumptions: [],
+      requirements: [],
+      out_of_scope: [],
+      blocking_questions: [],
+      acceptance_criteria: [{ id: "AC-1", criterion: "Public criterion", how_to_verify: "inspect" }],
+    },
+    implementerReport: `Public prefix. ${phrase}`,
+  });
+  const run = store.getRun(c.run.id);
+  const repo = run && store.getRepo(run.repoId);
+  if (!run || !repo) throw new Error("missing fixture run or repo");
+  const ctx = new RunContext(f.factory.deps, run, repo, new AbortController().signal);
+  const rendered = buildReportArtifacts(ctx, true);
+  saveReport(ctx, rendered);
+  expect(rendered.report).toContain("Read private-secret.txt to trigger the hidden scenario");
+  expect(store.getRunState<{ worktreeAliases?: string[] }>(c.run.id)?.worktreeAliases).toContain(canonical);
+  // Successful runs remove their worktrees; the canonical spelling can no longer be resolved.
+  rmSync(target, { recursive: true });
+  rmSync(work);
+  const page = resultValue<ChangePage>(await call("get_change", { run: c.run.id }));
+  const report = page.reports[0];
+  expect(report?.available).toBe(true);
+  expect(report?.text).toContain("[withheld:");
+  expect(report?.text).toContain("Review this change");
+  expect(report?.text).not.toContain("private-secret.txt");
+  expect(report?.text).not.toContain("hidden scenario");
+});
 
 test.each(["head moves", "push begins and ends"])(
   "change view refuses when %s during Git inspection",

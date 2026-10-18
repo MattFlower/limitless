@@ -2,7 +2,7 @@ import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { redactGateData } from "../gates/output.ts";
-import { sanitizePublication } from "../gates/publication.ts";
+import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import type { RunContext, RunState } from "./context.ts";
 import {
   markReportArtifacts,
@@ -399,6 +399,12 @@ export function buildReportArtifacts(
   verifiedFailure?: ReportInput["verifiedFailure"],
 ): ReportArtifacts {
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
+  // Report privacy matches historical reports with the spellings rewritten here.
+  const worktree = publicationWorktree(ctx.state);
+  if (worktree.length && worktree.join("\0") !== ctx.state.worktreeAliases?.join("\0")) {
+    ctx.state.worktreeAliases = worktree;
+    ctx.store.setRunState(ctx.run.id, ctx.state);
+  }
   return renderReportArtifacts(
     {
       success,
@@ -414,7 +420,7 @@ export function buildReportArtifacts(
       models: ctx.run.models,
       ...(issueClosedBy(ctx) ? { closesIssue: issueClosedBy(ctx) as number } : {}),
     },
-    (text) => sanitizePublication(text, ctx.state.worktreePath ?? "", ctx.deps.cfg.paths.home),
+    (text) => sanitizePublication(text, worktree, ctx.deps.cfg.paths.home),
   );
 }
 

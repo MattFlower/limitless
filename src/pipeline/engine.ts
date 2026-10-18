@@ -22,7 +22,7 @@ import {
 } from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
-import { checkPublicationText, sanitizePublication } from "../gates/publication.ts";
+import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import {
   compareGates,
   confinementFailed,
@@ -1949,7 +1949,11 @@ function privateEntries(ctx: RunContext, cwd: string) {
 }
 
 function publicationText(ctx: RunContext, text: string): string {
-  return sanitizePublication(redactCredentials(text), ctx.state.worktreePath ?? "", ctx.deps.cfg.paths.home);
+  return sanitizePublication(
+    redactCredentials(text),
+    publicationWorktree(ctx.state),
+    ctx.deps.cfg.paths.home,
+  );
 }
 
 /** Check outgoing and visible text; `pr` also checks the title, branch and published range. */

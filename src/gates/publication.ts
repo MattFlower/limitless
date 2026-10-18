@@ -2,20 +2,33 @@ import { realpathSync } from "node:fs";
 import { decodeHTML } from "entities";
 import { checkPrivateText, type PrivateStrings } from "./private.ts";
 
-/** Rewrite local paths only on publication copies, after stripping report metadata. */
-export function sanitizePublication(text: string, worktree: string, dataDirectory: string): string {
-  const aliases = (root: string): string[] => {
+/** Configured and canonical spellings of roots; removed roots keep their known spellings. */
+export function publicationRoots(roots: readonly (string | undefined)[]): string[] {
+  const aliases = roots.flatMap((root) => {
     if (!root) return [];
-    let canonical = root;
     try {
-      canonical = realpathSync(root);
+      return [root, realpathSync(root)];
     } catch {
-      // Removed worktrees still need their configured spelling rewritten.
+      return [root];
     }
-    return [...new Set([root, canonical].map((path) => path.replace(/\/+$/u, "")))].filter(Boolean);
-  };
-  const workRoots = aliases(worktree);
-  const roots = [...workRoots, ...aliases(dataDirectory)];
+  });
+  return [...new Set(aliases.map((path) => path.replace(/\/+$/u, "")))].filter(Boolean);
+}
+
+/** A run's worktree spellings: its configured path, current realpath and retained aliases. */
+export function publicationWorktree(state: { worktreePath?: string; worktreeAliases?: unknown }): string[] {
+  const retained = Array.isArray(state.worktreeAliases) ? state.worktreeAliases : [];
+  return publicationRoots([state.worktreePath, ...retained.filter((path) => typeof path === "string")]);
+}
+
+/** Rewrite local paths only on publication copies, after stripping report metadata. */
+export function sanitizePublication(
+  text: string,
+  worktree: string | readonly string[],
+  dataDirectory: string,
+): string {
+  const workRoots = publicationRoots([worktree].flat());
+  const roots = [...workRoots, ...publicationRoots([dataDirectory])];
   const rewrite = (value: string): string => {
     const path = value.replace(/^file:\/\//iu, "");
     const root = roots.find((root) => path === root || path.startsWith(`${root}/`));

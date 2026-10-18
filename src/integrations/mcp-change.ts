@@ -6,7 +6,7 @@ import type { Factory } from "../app.ts";
 import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, normalizedLayers, privateMatches } from "../gates/private.ts";
-import { sanitizePublication } from "../gates/publication.ts";
+import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
 import { holdoutBoundaryPattern, privateHoldoutDetails, privateVerifySummary } from "../pipeline/prompts.ts";
@@ -298,11 +298,12 @@ function buildCatalogue(store: Factory["store"], ids: string[], dataDirectory: s
   const verifierDetails = new Set<string>();
   const receivedSummaries = new Set<string>();
   const privateRows = new Set<string>();
-  const worktrees: string[] = [];
+  const worktrees: string[][] = [];
   for (const id of ids) {
     const state = z
       .object({
         worktreePath: z.string().optional(),
+        worktreeAliases: z.array(z.string()).optional().catch(undefined),
         holdout: HoldoutSchema.or(z.object({ scenarios: z.tuple([]) })).optional(),
         spec: SpecSchema.nullish().catch(null),
         lastVerify: verificationText.extend({ modelOutput: verificationText.optional() }).nullish(),
@@ -312,7 +313,7 @@ function buildCatalogue(store: Factory["store"], ids: string[], dataDirectory: s
       })
       .safeParse(store.getRunState(id) ?? {});
     if (!state.success) return null;
-    worktrees.push(state.data.worktreePath ?? "");
+    worktrees.push(publicationWorktree(state.data));
     const { holdout, spec } = state.data;
     for (const ac of spec?.acceptance_criteria ?? [])
       if (rowKind(ac.id, spec ?? null, holdout) !== "public") privateRows.add(ac.id.trim().toUpperCase());
