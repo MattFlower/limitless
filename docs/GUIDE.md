@@ -460,7 +460,7 @@ submission, inbox handling, review and landing, including uncertain mutation res
 | `running` | Executing; `stage` shows where |
 | `waiting_input` | Paused on open questions; answer them to continue |
 | `succeeded` | Delivered: a PR (merged, auto-merge enabled, or left open) or a local branch |
-| `needs_human` | The factory stopped deliberately; see [below](#needs-human) |
+| `needs_human` | The factory stopped deliberately; see [below](#needs_human-and-what-to-do-about-it) |
 | `failed` | An unexpected error, for example git or `gh` failing; see `error` and the event log |
 | `cancelled` | Cancelled by you (UI, CLI, Discord, MCP) |
 | `resolved` | Dealt with outside the factory, with a recorded resolution |

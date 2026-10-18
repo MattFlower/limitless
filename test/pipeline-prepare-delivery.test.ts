@@ -90,7 +90,7 @@ case "$1 $2" in
       echo '[{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}]'
     else echo '${url}'; fi
   fi ;;
-  'pr create') cat >/dev/null; echo '${url}' ;;
+  'pr create') cat >/dev/null; echo OPEN > '${stateFile}'; echo '${url}' ;;
   'pr merge') echo MERGED > '${stateFile}' ;;
 esac
 `,
