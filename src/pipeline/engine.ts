@@ -2126,14 +2126,18 @@ async function deliverReviewRound(
             .map((c, index) => {
               if (rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown")
                 return `🚧 blocked unknown-${index + 1}: private evidence withheld`;
-              const evidence = redactGateOutput(
-                redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources),
+              const evidence = publicationText(
+                ctx,
+                redactGateOutput(redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources)),
               ).slice(0, 300);
               return `🚧 blocked ${c.id}: ${evidence}`;
             });
           // Keep checked-head evidence ahead of quoted requests; the full report is a run artifact.
-          text = redactGateOutput(
-            `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+          text = publicationText(
+            ctx,
+            redactGateOutput(
+              `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+            ),
           ).slice(0, 60_000);
         }
         text = publicationText(ctx, text);
