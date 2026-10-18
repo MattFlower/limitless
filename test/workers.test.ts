@@ -196,11 +196,13 @@ test.each([
       store.db.query("UPDATE gate_jobs SET failure_reason='Lease expired' WHERE id=?").run(handle.id);
       expect(workers.job(handle.id)).toMatchObject({ state: "done", failure_reason: "Lease expired" });
     }
+    expect(workers.list()[0]?.setupWarning).toBeUndefined();
     let localStarts = 0;
     const run = await confinementScope.run(
       {
         ...fakeConfinement,
         async verify(_roots, opts) {
+          expect(workers.list()[0]?.setupWarning).toBeUndefined();
           if (opts.cmd.includes(req.gates.setup[0] ?? "missing")) localStarts++;
         },
       },
@@ -225,6 +227,7 @@ test.each([
     expect(warning).toContain("Worker runner setup failed");
     expect(warning).toContain("[withheld: private text]");
     expect(warning).toContain("falling back to local execution");
+    expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toBe(warning);
     expect(job?.events).toContain(warning ?? "missing");
     expect(store.listEvents(req.runId ?? "").some((e) => e.type === "gate" && e.message === warning)).toBe(
       true,
@@ -271,19 +274,83 @@ test.each([
   30_000,
 );
 
-test("the latest worker setup warning survives an older fallback finishing later", async () => {
+test("successful worker setup clears a confirmed warning and preserves fallback history", async () => {
   const req = await request();
   const first = await failedWorkerSetup(req);
   const failed: GateRun = JSON.parse(workers.job(first.id)?.result ?? "null");
   expect(workers.fallbackSetup(first.id, "test -f tracked")).toBe(true);
-  const command = "test -f newer-setup";
-  const second = workers.enqueue({ ...req, gates: { ...req.gates, setup: [command] } });
-  expect(workers.lease("runner")?.id).toBe(second);
-  workers.complete(second, { ...failed, setup: failed.setup.map((r) => ({ ...r, command })) });
-  expect(workers.fallbackSetup(second, command)).toBe(true);
+  expect(workers.list()[0]?.setupWarning).toBeUndefined();
   expect(workers.complete(first.id, { setupOk: true, setup: [], checks: [] }, true)).toBe(true);
-  expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toContain("test -f newer-setup");
+  const warning = workers.list()[0]?.setupWarning;
+  expect(warning).toContain("Worker runner setup failed");
+  const events = workers.job(first.id)?.events;
+  const runEvents = store.listEvents(req.runId ?? "");
+  const command = "test -f another-setup";
+  const second = workers.enqueue({ ...req, gates: { ...req.gates, setup: [command] } });
+  const secondFailed = { ...failed, setup: failed.setup.map((r) => ({ ...r, command })) };
+  expect(workers.lease("runner")?.id).toBe(second);
+  expect(workers.complete(second, secondFailed)).toBe(true);
+  expect(workers.list()[0]?.setupWarning).toBe(warning);
+  expect(workers.fallbackSetup(second, command)).toBe(true);
+  expect(workers.complete(second, secondFailed, true)).toBe(true);
+  expect(workers.list()[0]?.setupWarning).toBe(warning);
+  const third = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(third);
+  expect(workers.complete(third, { ...failed, setupOk: true, checks: failed.setup })).toBe(true);
+  expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toBeUndefined();
+  expect(workers.job(first.id)?.events).toBe(events);
+  expect(store.listEvents(req.runId ?? "")).toEqual(expect.arrayContaining(runEvents));
+});
+
+test("equal timestamps and commands cannot let older or rejected completions change a newer warning", async () => {
+  const now = Date.now();
+  workers = new WorkerStore(store, releaseSha, { poll: 30, tick: 5 }, () => now);
+  const req = await request();
+  const first = await failedWorkerSetup(req);
+  const failed: GateRun = JSON.parse(workers.job(first.id)?.result ?? "null");
+  const passing = { setupOk: true, setup: [], checks: [] };
+  const command = req.gates.setup[0] ?? "";
+  expect(workers.fallbackSetup(first.id, command)).toBe(true);
+  const olderSuccess = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(olderSuccess);
+  const worker = workers.worker("runner");
+  if (!worker) throw new Error("Missing worker");
+  workers.heartbeat(worker, caps([olderSuccess]));
+  const newer = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(newer);
+  expect(workers.complete(newer, failed)).toBe(true);
+  expect(workers.fallbackSetup(newer, command)).toBe(true);
+  expect(workers.complete(newer, passing, true)).toBe(true);
+  const warning = workers.list()[0]?.setupWarning;
+  expect(warning).toContain(command);
+  // Simulate a daemon restart before the stale completions arrive.
+  workers = new WorkerStore(store, releaseSha, {}, () => now);
+  expect(workers.complete(first.id, passing, true)).toBe(true);
+  expect(workers.complete(olderSuccess, passing)).toBe(true);
+  expect(workers.list()[0]?.setupWarning).toBe(warning);
   expect(workers.fallbackSetup(first.id, "test -f tracked")).toBe(false);
+  expect(workers.complete(newer, passing)).toBe(false);
+  expect(workers.complete(newer, passing, true)).toBe(false);
+  for (const local of [false, true]) {
+    const cancelled = workers.enqueue(req);
+    expect(workers.lease("runner")?.id).toBe(cancelled);
+    if (local) {
+      expect(workers.complete(cancelled, failed)).toBe(true);
+      expect(workers.fallbackSetup(cancelled, command)).toBe(true);
+    }
+    workers.cancel(cancelled);
+    expect(workers.complete(cancelled, passing, local)).toBe(false);
+    expect(workers.list()[0]?.setupWarning).toBe(warning);
+  }
+  const pending = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(pending);
+  expect(workers.complete(pending, failed)).toBe(true);
+  expect(workers.fallbackSetup(pending, command)).toBe(true);
+  const recovery = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(recovery);
+  expect(workers.complete(recovery, passing)).toBe(true);
+  expect(workers.complete(pending, passing, true)).toBe(true);
+  expect(workers.list()[0]?.setupWarning).toBeUndefined();
 });
 
 test.each(["shutdown", "cancel", "stored cancel"])(
@@ -312,6 +379,8 @@ test.each(["shutdown", "cancel", "stored cancel"])(
     try {
       await started.promise;
       expect(workers.job(handle.id)?.state).toBe("failed");
+      expect(workers.list()[0]?.setupWarning).toBeUndefined();
+      expect(workers.job(handle.id)?.events).toContain("Worker runner setup failed: test -f tracked");
       expect(workers.lease("runner")).toBeNull();
       expect(executor.attach(handle, new AbortController().signal)).toBe(execution);
       if (mode === "stored cancel") workers.cancel(handle.id);
@@ -319,6 +388,7 @@ test.each(["shutdown", "cancel", "stored cancel"])(
       release.resolve();
       await expect(execution.result).rejects.toThrow();
       expect(workers.job(handle.id)?.state).toBe(mode === "shutdown" ? "failed" : "cancelled");
+      expect(workers.list()[0]?.setupWarning).toBeUndefined();
       if (mode === "shutdown") {
         const run = await confinementScope.run(
           {
@@ -339,6 +409,7 @@ test.each(["shutdown", "cancel", "stored cancel"])(
         expect(run.setupOk).toBe(true);
         expect(localStarts).toBe(2);
         expect(workers.job(handle.id)?.state).toBe("done");
+        expect(workers.list()[0]?.setupWarning).toContain("Worker runner setup failed");
         const events: { type: string; text?: string }[] = JSON.parse(workers.job(handle.id)?.events ?? "[]");
         expect(events.filter((e) => e.text?.includes("Worker runner setup failed"))).toHaveLength(1);
       } else {
@@ -873,6 +944,7 @@ test("owner API requires authentication for approval, listing and revocation and
     expect(workers.lease("owner-approved")?.id).toBe(warningJob);
     workers.complete(warningJob, { setupOk: false, setup: [], checks: [] });
     workers.fallbackSetup(warningJob, "test -f tracked");
+    expect(workers.list()[0]?.setupWarning).toBeUndefined();
     workers.complete(warningJob, { setupOk: true, setup: [], checks: [] }, true);
     const listing = await fetch(new URL("/api/workers", owner.url), {
       headers: { authorization: `Bearer ${credential.token}` },
@@ -952,12 +1024,14 @@ test("a real worker setup failure reruns locally once and the local setup failur
         ...fakeConfinement,
         async verify(_roots, opts) {
           if (opts.cmd.includes(req.gates.setup[0] ?? "missing")) localStarts++;
+          expect(workers.list()[0]?.setupWarning).toBeUndefined();
         },
       },
       () => executeGate(req, AbortSignal.timeout(120_000), {}, gateExecutorFor("lan", workers, [req.repo])),
     );
     expect(localStarts).toBe(1);
     expect(run.setupOk).toBe(false);
+    expect(workers.list()[0]?.setupWarning).toBeUndefined();
     expect(run.setup.map(({ name, ok, exitCode }) => ({ name, ok, exitCode }))).toEqual([
       { name: "setup-1", ok: true, exitCode: 0 },
       { name: "setup-2", ok: false, exitCode: 9 },
