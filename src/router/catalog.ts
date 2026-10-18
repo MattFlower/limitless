@@ -403,7 +403,7 @@ export const MODELS: ModelDef[] = [
   {
     id: "omlx/qwen-flash",
     provider: "omlx",
-    model: "Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+    model: "Qwen3.8-Flash-Next-oQ4e-mtp",
     vendor: "qwen",
     origin: "CN",
     baseOrigin: "CN",
@@ -411,13 +411,13 @@ export const MODELS: ModelDef[] = [
     tier: 2,
     price: { input: 0, output: 0 },
     notes:
-      "Local Qwen3.8 Flash Next (oQ5e quantisation, with MTP), served by oMLX on this Mac; the default local model",
+      "Local Qwen3.8 Flash Next (Jundot oQ4e quantisation, with MTP), served by oMLX on this Mac; the default local model",
   },
   {
     id: "omlx/qwen-27b",
     checkpoint: "qwen3.8-27b",
     provider: "omlx",
-    model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+    model: "Qwen3.8-27B-8bit",
     vendor: "qwen",
     origin: "CN",
     baseOrigin: "CN",
@@ -425,7 +425,7 @@ export const MODELS: ModelDef[] = [
     tier: 2,
     price: { input: 0, output: 0 },
     notes:
-      "Local Swift-1.5 Qwen3.8 27B oQ8e MTP build, served by oMLX on this Mac; opt-in (it needs far more memory than Flash)",
+      "Local Qwen3.8 27B 8-bit (mlx-community), served by oMLX on this Mac; opt-in (it needs far more memory than Flash)",
   },
   {
     id: "mtplx/qwen-27b",

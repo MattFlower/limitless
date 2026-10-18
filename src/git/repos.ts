@@ -1245,10 +1245,17 @@ export async function mergePullRequest(
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
   let blocked = false;
+  const verifiedState = (input: unknown) => {
+    const data = z.object({ state: z.enum(["OPEN", "MERGED"]), headRefOid: z.string() }).parse(input);
+    if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
+    return data.state;
+  };
   const landed = async () => {
-    const view = ["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"];
-    const merged = (await sh(view, { cwd, signal })).stdout.trim() === "MERGED";
+    blocked = true;
+    const view = ["gh", "pr", "view", prUrl, "--json", "state,headRefOid"];
+    const merged = verifiedState(JSON.parse((await sh(view, { cwd, signal })).stdout)) === "MERGED";
     unsure = false;
+    blocked = false;
     return merged;
   };
   const merge = (extra: string[]) =>
@@ -1256,10 +1263,11 @@ export async function mergePullRequest(
       async () => {
         if (unsure && (await landed())) return "merged" as const;
         blocked = true;
-        const view = ["gh", "pr", "view", prUrl, "--json", "title,body,headRefOid"];
+        const view = ["gh", "pr", "view", prUrl, "--json", "title,body,headRefOid,state"];
+        const input: unknown = JSON.parse((await sh(view, { cwd, signal })).stdout);
+        if (verifiedState(input) === "MERGED") return "merged" as const;
         const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
-        const data = schema.parse(JSON.parse((await sh(view, { cwd, signal })).stdout));
-        if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
+        const data = schema.parse(input);
         const rawTitle = opts.title ?? data.title;
         if (!rawTitle.trim()) throw new Error("missing merge subject");
         const title = number ? `${rawTitle} (#${number})` : rawTitle;

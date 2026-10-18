@@ -311,7 +311,7 @@ test("catalog oMLX thinking and authentication survive HTTP repair", async () =>
       ).toBe("ok");
       expect(bodies).toHaveLength(2);
       for (const body of bodies) {
-        expect(body.model).toBe("Swift-1.5-Qwen3.8-27b-oQ8e-mtp");
+        expect(body.model).toBe("Qwen3.8-27B-8bit");
         expect(body.chat_template_kwargs).toEqual(
           effort ? { enable_thinking: effort === "high" } : undefined,
         );

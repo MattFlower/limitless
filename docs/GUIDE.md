@@ -460,7 +460,7 @@ submission, inbox handling, review and landing, including uncertain mutation res
 | `running` | Executing; `stage` shows where |
 | `waiting_input` | Paused on open questions; answer them to continue |
 | `succeeded` | Delivered: a PR (merged, auto-merge enabled, or left open) or a local branch |
-| `needs_human` | The factory stopped deliberately; see [below](#needs-human) |
+| `needs_human` | The factory stopped deliberately; see [below](#needs_human-and-what-to-do-about-it) |
 | `failed` | An unexpected error, for example git or `gh` failing; see `error` and the event log |
 | `cancelled` | Cancelled by you (UI, CLI, Discord, MCP) |
 | `resolved` | Dealt with outside the factory, with a recorded resolution |
@@ -619,8 +619,8 @@ Encode the full ID in the API path (for example `omlx%2Fnew-local`). Before
 deleted IDs and skip them as missing catalog entries. Provider definitions still require
 config.toml and a daemon restart.
 
-For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
-`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
+For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-oQ4e-mtp`);
+`omlx/qwen-27b` (`Qwen3.8-27B-8bit`) is opt-in. The smoke check, and free-first
 routing among free models the policy does not name, take catalog order, so they use Flash. Put `OMLX_API_KEY`
 in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
 override using `[providers.omlx] max_concurrent = 8` in `config.toml`. Tool-free selections

@@ -46,3 +46,4 @@ No real config, credentials, timestamps, network access or live quota readings a
 Do not regenerate expectations during routine tests.
 
 Later edits: the `omlx/qwen-flash` served model was renamed in place (2026-10-04) when oMLX stopped serving the REAP-pruned build; routing decisions are otherwise unchanged.
+Later edits: the `omlx/qwen-flash` and `omlx/qwen-27b` served models were renamed in place (2026-10-16) when oMLX moved to Jundot/Qwen3.8-Flash-Next-oQ4e-mtp and mlx-community/Qwen3.8-27B-8bit; routing decisions are otherwise unchanged.

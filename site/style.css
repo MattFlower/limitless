@@ -1,0 +1,166 @@
+:root {
+  color-scheme: dark;
+  font:
+    17px / 1.65 system-ui,
+    sans-serif;
+  color: #d9e2ed;
+  background: #10151c;
+}
+body {
+  margin: 0;
+}
+a {
+  color: #8dd9c3;
+  text-underline-offset: 0.25em;
+}
+a:hover {
+  color: #fff;
+}
+header,
+footer {
+  padding: 1.5rem 5vw;
+}
+header,
+header nav,
+.get-started nav {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.brand,
+h1,
+h2,
+h3 {
+  color: #f4f7fa;
+  line-height: 1.15;
+}
+.brand {
+  font-size: 1.4rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+.landing {
+  max-width: 1060px;
+  margin: auto;
+  padding: 0 2rem;
+}
+section {
+  padding: 3rem 0;
+  border-bottom: 1px solid #354356;
+}
+.hero h1 {
+  font-size: clamp(3rem, 7vw, 5.5rem);
+  letter-spacing: -0.035em;
+}
+h2 {
+  font-size: 2rem;
+}
+p {
+  max-width: 78ch;
+}
+.eyebrow {
+  color: #8dd9c3;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  font-size: 0.8rem;
+}
+.button {
+  display: inline-block;
+  padding: 0.7rem 1.1rem;
+  margin-right: 1rem;
+  background: #8dd9c3;
+  color: #10151c;
+  text-decoration: none;
+}
+.flow,
+pre,
+code {
+  background: #19212c;
+  font-family: ui-monospace, monospace;
+}
+.flow,
+pre {
+  overflow: auto;
+  padding: 1rem;
+}
+article {
+  margin: 3rem 0;
+}
+img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid #354356;
+  border-radius: 0.6rem;
+  margin: 1.5rem 0;
+}
+.docs {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+}
+aside {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 2rem 1.5rem;
+  font-size: 0.85rem;
+}
+aside nav a {
+  display: block;
+  padding: 0.25rem 0;
+}
+aside ul {
+  list-style: none;
+  padding: 0;
+}
+aside li {
+  margin: 0.45rem 0;
+  line-height: 1.4;
+}
+aside .level-3 {
+  padding-left: 1rem;
+}
+.docs main {
+  max-width: 1100px;
+  min-width: 0;
+  padding: 2rem 4vw 6rem;
+  overflow-wrap: anywhere;
+}
+.docs h2 {
+  margin-top: 3rem;
+}
+table {
+  display: block;
+  overflow: auto;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+th,
+td {
+  border: 1px solid #354356;
+  padding: 0.5rem;
+  text-align: left;
+}
+.skip {
+  position: absolute;
+  left: -10000px;
+}
+.skip:focus {
+  left: 1rem;
+  background: #10151c;
+}
+@media (max-width: 800px) {
+  .docs {
+    display: block;
+  }
+  aside {
+    position: static;
+    height: auto;
+  }
+  aside details {
+    display: none;
+  }
+}
