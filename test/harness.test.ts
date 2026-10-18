@@ -1,5 +1,14 @@
 import { describe, expect } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
@@ -13,6 +22,7 @@ import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
+import { parseFakeStream } from "../src/harness/stream-fault.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -92,6 +102,85 @@ describe("ClaudeStreamParser", () => {
     const p = new ClaudeStreamParser((e) => events.push(e));
     p.feed("not json at all");
     expect(events[0]).toEqual({ type: "status", text: "not json at all" });
+  });
+
+  // Only these checks see a missing result: in a run, requireStructured turns the null output of a
+  // truncated stream back into an error and the invoke catch absorbs a throwing parser.
+  const init = JSON.stringify({ type: "system", subtype: "init", session_id: "s1", model: "m" });
+  const text = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "text", text: "partial" }] },
+  });
+  const result = (isError: boolean) =>
+    JSON.stringify({
+      type: "result",
+      subtype: isError ? "error_during_execution" : "success",
+      is_error: isError,
+      session_id: "s1",
+      num_turns: 1,
+      result: isError ? "run failed" : "done",
+      structured_output: { ok: true },
+    });
+  test.each([
+    ["no result event", [init, text], "claude exited with 0 and no result"],
+    [
+      "a result line cut off mid-object",
+      [init, text, '{"type":"result"'],
+      "claude exited with 0 and no result",
+    ],
+    ["an error result", [init, text, result(true)], "run failed"],
+    ["a successful result", [init, text, result(false)], null],
+  ])("a claude stream with %s completes only on a successful result", async (_, lines, cliError) => {
+    const ok = cliError === null;
+    const seam = parseFakeStream({ parser: "claude", lines }, () => {});
+    expect(seam.status).toBe(ok ? "ok" : "error");
+    expect(seam.error).toBe(
+      ok ? null : "malformed or truncated harness stream: missing successful completion",
+    );
+    const dir = mkdtempSync(join(tmpdir(), "limitless-claude-stream-"));
+    try {
+      const outcome = await runClaude(
+        {
+          cwd: dir,
+          prompt: "x",
+          mode: "readonly",
+          noTools: true,
+          target: {
+            modelId: "c/m",
+            provider: "claude",
+            harness: "claude",
+            model: "m",
+            vendor: "anthropic",
+            tier: 4,
+            billing: "subscription",
+          },
+          timeoutMs: 10_000,
+          idleTimeoutMs: 10_000,
+          maxToolCalls: 0,
+          signal: new AbortController().signal,
+          logPath: join(dir, "log"),
+          onEvent: () => {},
+        },
+        async (opts) => {
+          for (const line of lines) opts.onStdoutLine?.(line);
+          return {
+            exitCode: 0,
+            signal: null,
+            truncated: false,
+            durationMs: 1,
+            stdout: "",
+            stderr: "",
+            timedOut: false,
+            idleTimedOut: false,
+            cancelled: false,
+          };
+        },
+      );
+      expect(outcome.status).toBe(ok ? "ok" : "error");
+      expect(outcome.error).toBe(cliError);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
