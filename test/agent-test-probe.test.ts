@@ -14,7 +14,7 @@ import {
   writeRoots,
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import { agentEnv, runProcess } from "../src/util/proc.ts";
+import { agentEnv, redactCredentials, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
@@ -202,13 +202,25 @@ test.skipIf(seatbeltSkip !== null)(
               timeoutMs: 10_000,
             });
             console.info(
-              `Claude verifier Bun: corrected=${corrected}, timedOut=${result.timedOut}, exit=${result.exitCode}`,
+              redactCredentials(
+                `Claude verifier Bun: ${JSON.stringify({
+                  corrected,
+                  timedOut: result.timedOut,
+                  exitCode: result.exitCode,
+                  stdout: result.stdout,
+                  stderr: result.stderr,
+                })}`,
+              ),
             );
+            expect(result.cancelled).toBe(false);
             if (corrected) {
               expect(result.timedOut).toBe(false);
               expect(result.exitCode).toBe(0);
               expect(result.stdout + result.stderr).toContain("1 pass");
-            } else expect(result.exitCode === 0 && !result.timedOut).toBe(false);
+            } else {
+              // An immediate denial is not the reported hang and cannot establish this diagnosis.
+              expect(result.timedOut).toBe(true);
+            }
             return result;
           } finally {
             await SandboxManager.reset();
