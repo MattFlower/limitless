@@ -561,7 +561,7 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
     );
     const check = {
       name: "test",
-      run: `'${process.execPath}' test --parallel=2 --bail --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts ./test/b.test.ts ./test/c.test.ts`,
+      run: `'${process.execPath}' test --parallel=2 --bail --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts ./test/b.test.ts ./test/c.test.ts; bail_status=$?; cp "$LIMITLESS_GATE_REPORT" report.xml; exit "$bail_status"`,
     };
     const run = await confinementScope.run(fakeConfinement, () =>
       runGates(f.cwd, { ...config, checks: [check] }, signal),
@@ -571,6 +571,12 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
     expect(original.output).toContain("Bailed out after 1 failure");
     expect(original.output).toContain("Ran 1 test across 1 file.");
     expect(original.failedFiles).toEqual(["test/a.test.ts"]);
+    const junit = parseJUnit(readFileSync(join(f.cwd, "report.xml"), "utf8"), f.cwd);
+    expect(junit?.attributedCounts).toEqual({ tests: 1, failures: 1, errors: 0, skipped: 0 });
+    const withoutBail = new RunnerFailureEvidence();
+    for (const line of original.output.split("\n"))
+      if (!line.startsWith("Bailed out after ")) withoutBail.observe(line);
+    expect(withoutBail.agrees(junit?.attributedCounts)).toBe(true);
     expect(original.failureAttributionComplete).toBe(false);
     let calls = 0;
     const retries = await retryFailures(
@@ -623,6 +629,9 @@ test("arms leak", () => {
     expect(original.output).toContain("1 pass");
     expect(original.output).toContain("1 fail");
     expect(original.failedFiles).toEqual(["test/b.test.ts"]);
+    const evidence = new RunnerFailureEvidence();
+    for (const line of original.output.split("\n")) evidence.observe(line);
+    expect(evidence.agrees({ tests: 2, failures: 1, errors: 0, skipped: 0 })).toBe(true);
     expect(original.failureAttributionComplete).toBe(false);
     let calls = 0;
     const retries = await retryFailures(
