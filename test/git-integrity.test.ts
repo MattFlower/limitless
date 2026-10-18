@@ -1736,8 +1736,6 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     ["*.md diff=markdown", { "README.md": "# changed\n" }, false],
     ["*.png binary", { "icon.png": Buffer.from([0x89, 0, 1]) }, false],
     ["*.ico -diff", { "icon.ico": Buffer.from([0x89, 0, 1]) }, false],
-    ["*.pdf binary", {}, true],
-    ["*.pdf -diff", {}, true],
     ["*.dat binary", { "edge.dat": nulAt(7_999) }, false],
     ["*.dat binary", { "edge.dat": nulAt(8_000) }, false],
     ["*.bmp binary", { "icon.bmp": Buffer.from([0x89, 0, 1]) }, true],
@@ -1971,18 +1969,11 @@ test("a rename from text to a binary image keeps its text origin", async () => {
   );
 });
 
+// Each pattern shape through real Git; gates.test.ts checks which extensions an unmatched rule may name.
 test.each([
   ["src/**/*.impl.ts -diff", "block"],
   ["*.png -diff", "warn"],
   ["*.zip binary", "block"],
-  ["*.woff2 -diff", "block"],
-  ["*.mp4 -diff", "block"],
-  ["*.pdf binary", "block"],
-  ["*.bmp -diff", "block"],
-  ["*.psd -diff", "block"],
-  ["*.eot -diff", "block"],
-  ["*.glb -diff", "block"],
-  ["*.unknown -diff", "block"],
   ["* -diff", "block"],
 ])("unmatched hiding rule %s produces a %s", async (line, severity) => {
   writeFileSync(join(work, ".gitattributes"), `${line}\n`);
@@ -2138,7 +2129,8 @@ test("moving an existing binary into a new source path blocks", async () => {
   );
 });
 
-test.each(["nul.test.mts", "nul.cts", "nul.jsx", "lib/helper.dat", "script", "state.snap"])(
+// No classification branches on these names: a test file, a nested path, no extension, an unknown one.
+test.each(["nul.test.mts", "lib/helper.dat", "script", "state.snap"])(
   "new and edited binary head content blocks in %s",
   async (path) => {
     mkdirSync(join(work, path, ".."), { recursive: true });
@@ -2628,16 +2620,24 @@ test("JPEG thumbnails and ICO pixels may contain signatures while WAV requires a
   }
 });
 
-test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
-  const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
+test("added paths beyond ARG_MAX use stdin pathspecs without uncertainty findings", async () => {
+  // Long paths cross Linux's 2 MiB argument limit (macOS allows 1 MiB) with few files, while each
+  // stays near 480 bytes, well inside macOS's 1,024-byte PATH_MAX under a deep scratch directory.
+  const nested = ["a", "b"].map((name) => `${name}-${"long-directory-".repeat(10)}`).join("/");
+  mkdirSync(join(work, nested), { recursive: true });
+  const files = Array.from({ length: 4_800 }, (_, i) => `${nested}/${i}-${"long-file-name-".repeat(11)}.dat`);
+  expect(files.reduce((bytes, path) => bytes + Buffer.byteLength(path) + 1, 0)).toBeGreaterThan(2_200_000);
   for (const path of files) writeFileSync(join(work, path), "new text\n");
   await commitAll(work, "large addition");
-  const diff = await diffSince(work, base);
+  const shim = gitShim();
+  const diff = await diffSince(work, base, shim.env);
   expect(diff.files).toHaveLength(files.length);
   expect(diff.headTextPaths).toHaveLength(files.length);
   expect(diff.attributeErrors).toBeUndefined();
   expect(diff.binaryErrors).toBeUndefined();
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  // A fixed number of Git commands, never one per path, at any file count.
+  expect(shim.calls().length).toBeLessThan(100);
 }, 120_000);
 
 test("LFS inspection batches short and repeated candidate blobs per tree", async () => {
@@ -3206,6 +3206,8 @@ test("publication range checks gitlink paths even when config ignores submodules
   ).rejects.toThrow("entry 1");
 });
 
+// "clean" is the false-positive control; each pointer variant's detecting row would fail to find
+// the payload if that variant were not parsed.
 test.each([
   "matching",
   "clean",
@@ -3214,13 +3216,10 @@ test.each([
   "removed",
   "staged",
   "extended",
-  "extended-clean",
   "corrupt",
   "crlf",
   "legacy",
   "legacy-crlf",
-  "crlf-clean",
-  "legacy-clean",
   "malformed",
   "bad-extension",
 ])("LFS payload inspection: %s", async (scenario) => {

@@ -21,8 +21,10 @@ import { test } from "./read-policy-support.ts";
 
 // No model calls: launch commands directly through each harness's production sandbox policy.
 for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as const) {
-  test.skipIf(seatbeltSkip !== null)(
-    `${sandbox} lease transport probe (${seatbeltSkip ?? "available"})`,
+  const probeSkip =
+    sandbox === "codex-editor" && !Bun.which("codex") ? "codex CLI not installed" : seatbeltSkip;
+  test.skipIf(probeSkip !== null)(
+    `${sandbox} lease transport probe (${probeSkip ?? "available"})`,
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "lease-probe-")));
       const cwd = join(root, "checkout");
@@ -70,12 +72,10 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
         let cmd: string[],
           extra: Record<string, string> = {};
         if (sandbox === "codex-editor") {
-          const codex = Bun.which("codex");
-          if (!codex) throw new Error("Codex CLI required for the editor transport probe");
           const home = join(root, "codex-home");
           mkdirSync(home);
           extra = { CODEX_HOME: home };
-          cmd = [codex, "sandbox", ...editorProfile(spec), "--", ...command];
+          cmd = ["codex", "sandbox", ...editorProfile(spec), "--", ...command];
           // As in production: Claude editors' outer profile denies the daemon's own port (#484).
         } else if (sandbox === "claude-editor")
           cmd = seatbeltForPort(Number(http.port)).wrap(command, writeRoots(cwd, scratch));

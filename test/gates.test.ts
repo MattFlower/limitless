@@ -40,6 +40,7 @@ import { ConfinementError } from "../src/harness/sandbox.ts";
 import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
+import { resolveTestWorkers } from "../src/util/test-workers.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
@@ -444,7 +445,7 @@ describe("runGates / compareGates", () => {
 
   test.each([
     ["2", "2"],
-    ["invalid", "4"],
+    ["invalid", String(resolveTestWorkers(""))],
   ])("gate command receives validated test workers: %s", async (value, expected) => {
     const previous = process.env.LIMITLESS_TEST_WORKERS;
     const secret = process.env.LIMITLESS_TEST_SECRET;
@@ -574,6 +575,51 @@ describe("runGates / compareGates", () => {
       ["types", "pass", false],
     ]);
   });
+
+  test.each(["flag", "output", "firstAttempt", "targetedRetry"] as const)(
+    "baseline confinement failure makes only its check unusable (%s)",
+    (kind) => {
+      const passed = { ...r("test", true), confinementError: false };
+      const confinement = {
+        ...r("test", false),
+        ...(kind === "flag"
+          ? { confinementError: true }
+          : { output: "sandbox_apply: Operation not permitted" }),
+      };
+      const baseline: GateRun = {
+        setupOk: true,
+        setup: [],
+        checks: [
+          kind === "firstAttempt" || kind === "targetedRetry"
+            ? { ...passed, [kind]: confinement }
+            : confinement,
+          r("lint", true),
+        ],
+      };
+      const compare = (result: GateRun["checks"][number]) =>
+        compareGates(baseline, { setupOk: true, setup: [], checks: [result, r("lint", true)] });
+      const cmp = compare(passed);
+      expect(cmp.map((c) => [c.verdict, c.blocking])).toEqual([
+        ["new_pass", false],
+        ["pass", false],
+      ]);
+      expect(cmp[0]?.result).toBe(passed);
+      expect(formatGateFeedback(cmp)).toBe("");
+      for (const timedOut of [false, true]) {
+        const failed = { ...r("test", false), output: "candidate assertion failed", timedOut };
+        const cmp = compare(failed);
+        expect(cmp[0]).toMatchObject({ verdict: "new_failure", blocking: true });
+        expect(cmp[0]?.result).toBe(failed);
+        const feedback = formatGateFeedback(cmp);
+        expect(feedback).toContain("Baseline couldn't be compared because of baseline confinement failure");
+        expect(feedback).toContain(failed.output);
+        expect(feedback).not.toContain("CONFINEMENT ERROR");
+        expect(feedback).not.toContain("sandbox launch failed");
+        expect(feedback).not.toContain("passed before your change");
+        if (timedOut) expect(feedback).toContain("timed out");
+      }
+    },
+  );
 
   test("gate counterparts prefer exact names and reject sanitized ambiguity on either side", () => {
     const base = (checks: GateRun["checks"]): GateRun => ({ setupOk: true, setup: [], checks });
@@ -1210,6 +1256,37 @@ describe("auditDiff", () => {
     ).toEqual(["gitlink", "gitattributes", "test-skipped"]);
   });
 
+  // Only the inert image formats may name a rule that matches no files yet; git-integrity covers Git's side.
+  test.each([
+    ["*.png -diff", "warn"],
+    ["*.woff2 -diff", "block"],
+    ["*.mp4 -diff", "block"],
+    ["*.pdf binary", "block"],
+    ["*.bmp -diff", "block"],
+    ["*.psd -diff", "block"],
+    ["*.eot -diff", "block"],
+    ["*.glb -diff", "block"],
+    ["*.unknown -diff", "block"],
+  ])("an unmatched rule %s produces a %s", (line, severity) => {
+    const patch = `diff --git a/.gitattributes b/.gitattributes\n+++ b/.gitattributes\n+${line}`;
+    const keys = attributeRules(patch).map((rule) => rule.key);
+    expect(keys).toHaveLength(1);
+    const unmatched = {
+      ...diff(patch, [{ status: "A", path: ".gitattributes" }]),
+      attributePatch: patch,
+      attributeMatches: Object.fromEntries(keys.map((key) => [key, []])),
+      attributeUnmatched: keys,
+    };
+    expect(auditDiff(unmatched, { taskClass: null, protectedPaths: [] })).toEqual([
+      expect.objectContaining({
+        rule: "gitattributes",
+        severity,
+        file: ".gitattributes",
+        detail: expect.stringContaining(line.split(" ")[0] ?? ""),
+      }),
+    ]);
+  });
+
   test("blocks an empty diff", () => {
     const f = auditDiff(diff("", []), { taskClass: "feature", protectedPaths: [] });
     expect(f).toEqual([
@@ -1814,7 +1891,7 @@ for (const padding of [0, 70_000])
   });
 
 for (const padding of [0, 70_000])
-  test(`output-only confinement results stay blocking through comparison and retries (${padding} bytes)`, async () => {
+  test(`output-only confinement results distinguish candidate and baseline through retries (${padding} bytes)`, async () => {
     const result = {
       name: "check",
       command: "exit 0",
@@ -1840,17 +1917,19 @@ for (const padding of [0, 70_000])
     const signal = new AbortController().signal;
     // No subprocess may retry away this operational failure, including restored results without flags.
     expect(await retryBaselineFailures(failed, "/nonexistent", cfg, signal)).toBe(failed);
-    for (const [baseline, after] of [
-      [failed, failed],
-      [run(passed), failed],
-      [failed, run(passed)],
-      [run(passed), recovered],
-      [recovered, run(passed)],
+    for (const [baseline, after, verdict, blocking] of [
+      [failed, failed, "confinement_error", true],
+      [run(passed), failed, "confinement_error", true],
+      [failed, run(passed), "new_pass", false],
+      [run(passed), recovered, "confinement_error", true],
+      [failed, recovered, "confinement_error", true],
+      [recovered, run(passed), "new_pass", false],
     ] as const) {
       const cmp = compareGates(baseline, after);
-      expect(cmp[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
+      expect(cmp[0]).toMatchObject({ verdict, blocking });
       expect(await retryRegressions(cmp, "/nonexistent", cfg, [], signal)).toBe(cmp);
-      expect(formatGateFeedback(cmp)).toContain("CONFINEMENT ERROR (sandbox launch failed)");
+      if (blocking) expect(formatGateFeedback(cmp)).toContain("CONFINEMENT ERROR (sandbox launch failed)");
+      else expect(formatGateFeedback(cmp)).toBe("");
     }
     const setup: GateRun = { setupOk: false, setup: [result], checks: [] };
     expect(compareGates(setup, setup)[0]).toMatchObject({ verdict: "confinement_error", blocking: true });

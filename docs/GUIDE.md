@@ -235,9 +235,11 @@ immediately removes its access. `--name <name>` overrides the pairing name. Pair
 after ten minutes. The coordinator creates and reuses a self-signed certificate under
 `<data>/worker-tls/`; workers pin its fingerprint and keep credentials under `<data>/worker/`.
 Changing the coordinator's certificate requires pairing again. Keep both machines on the same
-release SHA and Bun version; mismatches show as `needs update`. Workers send heartbeats every
-ten seconds and show as offline after thirty seconds without a heartbeat. Opted-in gates run from
-git bundles at the requested commit, without GitHub credentials on the worker. Leases renew with
+release SHA and Bun version; mismatches show as `needs update`. Upgrade the coordinator before
+its workers: older coordinators reject the new `failureAttributionComplete` worker result metadata.
+Workers send heartbeats every ten seconds and show as offline after thirty seconds without a
+heartbeat. Opted-in gates run from git bundles at the requested commit, without GitHub credentials
+on the worker. Leases renew with
 heartbeats and expire after sixty seconds. Infrastructure failures retry once on another worker,
 then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
 restarts re-attach to the same job, while cancelling a run tells its worker to stop.

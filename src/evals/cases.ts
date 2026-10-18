@@ -92,6 +92,7 @@ export const GateComparisonSchema = z.strictObject({
     "confinement_error",
   ]),
   blocking: z.boolean(),
+  baselineConfinementError: z.boolean().optional(),
   result: GateResultSchema,
   firstAttempt: GateResultSchema.optional(),
 });

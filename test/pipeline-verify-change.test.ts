@@ -37,10 +37,10 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  // restart-repair covers the plain review repair; a removed gate script is an auditDiff row.
   test.each([
     "approve",
     "gates",
-    "review",
     "persistent",
     "repair-audit",
     "baseline",
@@ -54,7 +54,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "head-lookup-malformed",
     "base-script",
     "pr-script",
-    "pr-script-removed",
     "private-comment",
     "private-marker",
   ])(
@@ -67,8 +66,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         return git("rev-parse", "HEAD");
       };
       const scriptAudit = scenario.includes("script");
-      const prScript = scenario.startsWith("pr-script");
+      const prScript = scenario === "pr-script";
       const stale = scenario.startsWith("head-");
+      const blocked =
+        prScript ||
+        ["persistent", "repair-audit", "empty", "private-comment", "private-marker"].includes(scenario);
       const records = join(home, "gate-revisions");
       writeFileSync(
         join(repoDir, ".limitless.toml"),
@@ -88,7 +90,7 @@ protected_paths = ["protected.txt"]
       if (prScript)
         writeFileSync(
           join(repoDir, "package.json"),
-          JSON.stringify({ scripts: scenario === "pr-script-removed" ? {} : { "audit-check": "echo pr" } }),
+          JSON.stringify({ scripts: { "audit-check": "echo pr" } }),
         );
       if (scenario !== "empty") writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
       if (scenario === "gates") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
@@ -121,7 +123,7 @@ protected_paths = ["protected.txt"]
         security: false,
         ...findingEvidence,
       };
-      const needsReviewRepair = ["review", "persistent", "repair-audit", "restart-repair"].includes(scenario);
+      const needsReviewRepair = ["persistent", "repair-audit", "restart-repair"].includes(scenario);
       const handler: Handler = async (agent): Promise<FakeReply> => {
         const role = roleOf(agent);
         if (role === "triage") return { structured: triage() }; // PR source overrides feature + standard triage.
@@ -194,7 +196,13 @@ protected_paths = ["protected.txt"]
           text: "Repaired compatibility",
         };
       };
-      let f = start(handler);
+      // maxRounds + 2 = 3 rounds: enough to repeat a block and escalate the implementer once.
+      const begin = () => {
+        const next = start(handler);
+        if (blocked) next.cfg.maxRounds = 1;
+        return next;
+      };
+      let f = begin();
       if (["private-comment", "private-marker"].includes(scenario)) {
         mkdirSync(f.cfg.paths.configDir, { recursive: true });
         writeFileSync(
@@ -264,7 +272,7 @@ protected_paths = ["protected.txt"]
         expect(f.store.getRunState<RunState>(runId)?.verdictCommentPending).toBe(true);
         expect(f.store.getRunState<RunState>(runId)?.verdictCommentPosted).not.toBe(true);
         f.store.close();
-        f = start(handler);
+        f = begin();
         f.deps.gh = gh;
       }
       if (scenario.startsWith("restart")) {
@@ -277,7 +285,7 @@ protected_paths = ["protected.txt"]
         await stopping;
         stopNotifier();
         f.store.close();
-        f = start(handler);
+        f = begin();
         f.deps.gh = gh;
         stopNotifier = startGitHubNotifier(
           f.store,
@@ -289,9 +297,6 @@ protected_paths = ["protected.txt"]
         expect(before?.verification?.headSha).toBe(head);
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
-      const blocked =
-        prScript ||
-        ["persistent", "repair-audit", "empty", "private-comment", "private-marker"].includes(scenario);
       expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
         scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );

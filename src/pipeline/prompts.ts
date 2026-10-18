@@ -4,7 +4,7 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
-import type { GateComparison, GateRun } from "../gates/run.ts";
+import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
 import {
   citationInSource,
   citedRequirement,
@@ -116,8 +116,11 @@ function checksSection(cfg: GateConfig, baseline: GateRun | null): string {
   for (const s of cfg.setup) lines.push(`- setup: \`${s}\``);
   for (const c of cfg.checks) {
     const base = baseline?.checks.find((b) => b.name === c.name);
-    const note =
-      base && !base.ok ? " — already FAILING on the base branch (not your fault, fix only if in scope)" : "";
+    const note = confinementFailed(base)
+      ? " — baseline result unavailable for comparison due to confinement failure; a failing candidate check will block"
+      : base && !base.ok
+        ? " — already FAILING on the base branch (not your fault, fix only if in scope)"
+        : "";
     lines.push(`- ${c.name}: \`${c.run}\`${note}`);
   }
   return lines.join("\n");
@@ -180,6 +183,10 @@ export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): str
     .map((c) => {
       const check = findGateCounterpart(c, cmp, cfg?.checks ?? []);
       c = redactGateData(c);
+      const baselineNote =
+        c.baselineConfinementError && c.verdict !== "confinement_error"
+          ? "\nBaseline couldn't be compared because of baseline confinement failure."
+          : "";
       if (c.result.timedOut) {
         const limit = check?.timeoutSec ?? 900;
         const output = stripVTControlCharacters(c.result.output);
@@ -197,9 +204,9 @@ export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): str
                 /^([ \t]*)(?:not )?ok[ \t]+\d+(?:[ \t]+(?:-[ \t]+)?([^\r\n]*?))?(?:[ \t]+# (?:SKIP|TODO)\b[^\r\n]*)?[ \t]*\r?$/gim,
               ),
           ].some((result) => result[1] === last[1] && (!result[2] || result[2].trim() === last[3]?.trim()));
-        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last && !completed ? `; the last test running was ${last[3] ?? last[4]}` : ""}\nCommand: \`${c.result.command}\`\n${fence(formatGateOutput(c.result))}`;
+        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last && !completed ? `; the last test running was ${last[3] ?? last[4]}` : ""}${baselineNote}\nCommand: \`${c.result.command}\`\n${fence(formatGateOutput(c.result))}`;
       }
-      return `### Check \`${c.name}\` ${c.verdict === "confinement_error" ? "CONFINEMENT ERROR (sandbox launch failed)" : c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(formatGateOutput(c.result))}`;
+      return `### Check \`${c.name}\` ${c.verdict === "confinement_error" ? "CONFINEMENT ERROR (sandbox launch failed)" : c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}${baselineNote}\nCommand: \`${c.result.command}\`\n${fence(formatGateOutput(c.result))}`;
     })
     .join("\n\n");
 }

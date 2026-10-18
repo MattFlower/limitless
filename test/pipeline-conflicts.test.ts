@@ -35,19 +35,19 @@ const { start, githubFixture, registerGithub, advanceBase, assertPublished, reso
   });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  // fixed-regressed covers any check that passed before the merge and fails after it, whatever the
+  // base did; conflict-scripts runs every assertion of a plain conflict.
   for (const kind of [
     "unchanged",
     "clean",
     "clean-scripts",
-    "regressed",
     "setup-regressed",
     "fixed-regressed",
-    "conflict",
     "conflict-scripts",
     "rewritten",
   ] as const) {
     test(`GitHub delivery handles ${kind} base`, async () => {
-      const conflict = kind === "conflict" || kind === "conflict-scripts";
+      const conflict = kind === "conflict-scripts";
       const changedScripts = kind === "clean-scripts" || kind === "conflict-scripts";
       if (kind === "setup-regressed" || kind === "fixed-regressed") {
         writeFileSync(
@@ -113,11 +113,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
               );
             }
             if (conflict) writeFileSync(join(repoDir, "base.txt"), "base only\n");
-            baseTip = await advanceBase(
-              bare,
-              conflict ? "greeting.txt" : "base.txt",
-              kind === "regressed" ? "BAD base\n" : "new base\n",
-            );
+            baseTip = await advanceBase(bare, conflict ? "greeting.txt" : "base.txt", "new base\n");
             if (kind === "rewritten") {
               // Replace the initial commit so the fetched base no longer descends from it.
               baseTip = (
