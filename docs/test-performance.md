@@ -95,9 +95,14 @@ commands.
 The shadow review's 5 s settle wait is `shadowSettle.ms`, which one test shortens. The blocked
 verify-change rows run with `maxRounds = 1`.
 
-With these removals `bun run check` took 351 s at a median load of 20.8, against 361 s at 16.7 for
-the last run before them. One failure in that run, in `needs-you-ui.test.ts`, also fails alone on
-`main` and on commits before this change.
+With these removals `bun run check` passed all 4,243 tests in 344 s at a median load of 17.8,
+against 361 s at 16.7 for the last run before them.
+
+An earlier run here reported one failure, `needs-you-ui.test.ts` "a pushed update beats an older read
+in flight". It failed only in checkouts whose `node_modules` was a symlink to another checkout's. The
+harness redirected Solid's store to the client build only when the importer equalled a path built
+through `node_modules`, and the bundler reports importers by real path. So the store loaded a second
+copy of Solid and its updates never re-rendered. The harness now compares real paths.
 
 The mutations also found gaps that this change doesn't close:
 - Nothing in `failure-injection.test.ts` guards the claude stream completion check: `requireStructured`
