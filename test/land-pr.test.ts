@@ -331,7 +331,8 @@ test.each([
   "ext-url",
   "git-config-env",
   ...originForms.map((url) => `origin:${url}`),
-  ...plantedKeys.flatMap((key) => ["before", "install", "checks", "pre-push"].map((at) => `${at}:${key}`)),
+  // Every planted key at once: each push lists what it sees and none may be visible.
+  ...["before", "install", "checks", "pre-push"].map((at) => `${at}:all-keys`),
 ])("land publishes its pinned SHA from an isolated push repository: %s", async (scenario) => {
   const root = mkdtempSync(join(tmpdir(), "land-trusted-"));
   try {
@@ -419,28 +420,25 @@ test.each([
       ],
       "malformed-include": [["include.path", injected]],
     };
-    const planted = plantedKeys.includes(plantKey ?? "") || (plantKey ?? "") in postCheckConfig;
+    const planted = plantKey === "all-keys" || (plantKey ?? "") in postCheckConfig;
     writeFileSync(injected, `[remote "origin"]\nreceivepack = ${JSON.stringify(command)}\n`);
-    const plantValue =
-      plantKey === "include.path"
+    const plantValue = (key: string) =>
+      key === "include.path"
         ? injected
-        : plantKey?.includes("helper")
+        : key.includes("helper")
           ? `!${command}`
-          : plantKey === "remote.origin.pushurl"
+          : key === "remote.origin.pushurl"
             ? `ext::${command}`
-            : plantKey === "url.attack.insteadOf"
+            : key === "url.attack.insteadOf"
               ? origin
               : command;
-    const plantArgs = ["--git-dir", paths[2] ?? "", "config", plantKey ?? "", plantValue];
-    const plantCommands = (postCheckConfig[plantKey ?? ""] ?? []).map((settings) => [
-      "--git-dir",
-      paths[2] ?? "",
-      "config",
-      ...settings,
-    ]);
-    if (plantCommands.length === 0) plantCommands.push(plantArgs);
+    const plantCommands = (
+      plantKey === "all-keys"
+        ? plantedKeys.map((key) => [key, plantValue(key)])
+        : (postCheckConfig[plantKey ?? ""] ?? [])
+    ).map((settings) => ["--git-dir", paths[2] ?? "", "config", ...settings]);
     if (plantKey === "malformed-include") writeFileSync(injected, `[${entry}-secret-config-value\n`);
-    if (planted && plantAt === "before") await git(...plantArgs);
+    if (planted && plantAt === "before") for (const command of plantCommands) await git(...command);
     const extHelper = join(root, "ext-helper");
     writeFileSync(extHelper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
     const expectedUrl = scenario.startsWith("origin:")
@@ -588,7 +586,10 @@ let deliveryArgs = args;
 if (args.includes("push")) {
   const repoAt = args.indexOf("-C");
   const pushRepo = repoAt < 0 ? process.env.GIT_COMMON_DIR : args[repoAt + 1];
-  appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "push-repo", args: [pushRepo], mode: statSync(pushRepo).mode & 0o777, alternates: readFileSync(pushRepo + "/objects/info/alternates", "utf8") }) + "\\n");
+  // The config this push reads, whatever transport the redirect below gives it.
+  const view = spawnSync(${JSON.stringify(gitBin)}, [...args.slice(0, args.indexOf("push")), "config", "--list", "--includes", "--show-origin", "--name-only"], { encoding: "utf8" });
+  if (view.status !== 0) process.exit(1);
+  appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "push-repo", args: [pushRepo], mode: statSync(pushRepo).mode & 0o777, alternates: readFileSync(pushRepo + "/objects/info/alternates", "utf8"), configView: view.stdout.split("\\n").filter(Boolean).map((line) => line.split("\\t")) }) + "\\n");
   if (${JSON.stringify(scenario)} === "push-failed") process.exit(1);
   if (!${JSON.stringify(["file-path", "file-url", "ext-url"].includes(scenario))}) {
     // Only delivery is redirected to a real local bare remote. Policy remains intact for denied URLs.
@@ -624,8 +625,10 @@ appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "gh", args }) + 
 if (args[0] === "run" && args[1] === "list") console.log("123");
 else if (args[1] === "view") {
   if (args.includes("baseRefOid,body,headRefName,headRefOid") && existsSync(${JSON.stringify(pinned)}) && ${planted && plantAt === "pre-push"}) {
+    // The script exports the push repository as GIT_DIR and GIT_COMMON_DIR; plant into the clone.
+    const env = { ...process.env, GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined };
     for (const command of ${JSON.stringify(plantCommands)}) {
-      const changed = spawnSync(${JSON.stringify(gitBin)}, command, { stdio: "inherit" });
+      const changed = spawnSync(${JSON.stringify(gitBin)}, command, { stdio: "inherit", env });
       if (changed.status !== 0) process.exit(1);
     }
   }
@@ -663,6 +666,7 @@ else if (args[1] === "view") {
       checked?: boolean;
       mode?: number;
       alternates?: string;
+      configView?: string[][];
     }[] = readFileSync(calls, "utf8")
       .trim()
       .split("\n")
@@ -690,6 +694,16 @@ else if (args[1] === "view") {
       expect(call.mode).toBe(0o700);
       expect(call.alternates).toBe(`${paths[2]}/objects\n`);
       expect(existsSync(call.args[0] ?? "")).toBe(false);
+      // Planted keys may reach the push only from this test's own global and system config.
+      const visible = plantedKeys.map((key) => key.toLowerCase());
+      const trusted = [globalConfig, globalInclude, join(root, "system.config")].map(
+        (file) => `file:${file}`,
+      );
+      expect(
+        (call.configView ?? [["unlisted"]]).filter(
+          ([origin = "", name = ""]) => visible.includes(name) && !trusted.includes(origin),
+        ),
+      ).toEqual([]);
     }
     expect(existsSync(marker)).toBe(false);
     if (scenario === "checks:private-repository")

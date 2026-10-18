@@ -51,10 +51,15 @@ still overrides it.
 
 **Overlapping tests.** A read-only review of the costliest files found about 220 s of the 1,790 s
 (12%) in rows that repeat another row's guard and outcome, or input variants that the responsible
-function's unit tests already cover. The largest single case is `land-pr.test.ts`'s 28 planted-key
-rows. The fake git sends every permitted push to a local path, so the transport keys they plant are
-never read, and one row per plant point would catch the same failures. None of this is removed
-here: each removal needs the mutation evidence that `test/AGENTS.md` asks for.
+function's unit tests already cover. The largest single case was `land-pr.test.ts`'s 28 planted-key
+rows (seven keys at four points). The fake git sends every permitted push to a local path, so the
+transport keys they planted were never read. With the push repository made to include the clone's
+config, all 28 still passed, and the pre-push rows had planted into the push repository itself,
+because the fake `gh` inherited the script's `GIT_DIR` and `GIT_COMMON_DIR`. The fake git now lists
+the config each push reads, the test fails if a planted key appears there, and one row per plant
+point plants all seven keys into the clone. Under the same mutation all four rows fail. The file
+went from 122 tests to 98. The remaining candidates are left for separate changes, since each
+removal needs the mutation evidence that `test/AGENTS.md` asks for.
 
 ## Git wrapper caching (#319)
 
