@@ -152,18 +152,24 @@ test("abort while queued releases the lease, reports SIGTERM and never starts th
   const f = fixture(),
     waiting = Promise.withResolvers<void>();
   const requests: Record<string, unknown>[] = [];
-  const before = process.listenerCount("SIGTERM");
+  // Another caller's once listener disappears during cancellation, independently of this invocation.
+  const unrelated = () => {};
+  process.once("SIGTERM", unrelated);
+  cleanup.push(() => process.off("SIGTERM", unrelated));
+  const before = process.listeners("SIGTERM");
   const work = agentTestCommand(f.config, ["bun", "test"], async (body) => {
     requests.push(body);
     waiting.resolve();
     return { id: "lease", acquired: false };
   });
   await waiting.promise;
+  const installed = process.listeners("SIGTERM").filter((listener) => !before.includes(listener));
+  expect(installed.length).toBeGreaterThan(0);
   process.emit("SIGTERM");
   expect(await work).toBe(143);
   expect(existsSync(f.marker)).toBe(false);
   expect(requests.at(-1)).toMatchObject({ release: true });
-  expect(process.listenerCount("SIGTERM")).toBe(before);
+  for (const listener of installed) expect(process.listeners("SIGTERM")).not.toContain(listener);
 });
 
 test("resolution excludes wrapper aliases, runs once, and returns 127 when missing", async () => {

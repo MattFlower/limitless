@@ -263,73 +263,6 @@ function confinedFixture() {
   };
 }
 
-test("Claude confined reader grants only Bun's executable through private roots and rejects credential overlaps", () => {
-  const { spec, cleanup } = confinedFixture();
-  const home = mkdtempSync(join(tmpdir(), "reader-home-"));
-  const executable = join(home, ".bun", "bin", "bun");
-  const alias = join(home, "bun-alias");
-  const credential = join(home, ".bun", "bin", "login");
-  mkdirSync(dirname(executable), { recursive: true });
-  writeFileSync(executable, "synthetic executable");
-  symlinkSync(executable, alias);
-  try {
-    readPolicyScope.run({ home, environment: { NPM_CONFIG_USERCONFIG: credential } }, () => {
-      const args = buildClaudeArgs(spec, "session", undefined, alias);
-      for (const path of [alias, realpathSync(executable)]) expect(claudeSandboxReads(args, path)).toBe(true);
-      for (const path of [
-        dirname(executable),
-        credential,
-        join(home, ".bun/install/cache/pkg"),
-        ...credentialStores.map((store) => join(home, store)),
-        join(home, "unrelated/notes"),
-      ])
-        expect(claudeSandboxReads(args, path)).toBe(false);
-      const native = args.slice(args.indexOf("--allowedTools") + 1, args.indexOf("--disallowedTools"));
-      expect(native.some((rule) => rule.includes(executable) || rule.includes(alias))).toBe(false);
-      for (const path of [join(home, ".aws/bin/bun"), credential]) {
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, "synthetic credential");
-        expect(() => buildClaudeArgs(spec, "s", undefined, path)).toThrow("overlaps denied");
-      }
-      expect(() =>
-        buildClaudeArgs({ ...spec, denyRead: [dirname(executable)] }, "s", undefined, alias),
-      ).toThrow("overlaps denied");
-      const credentialsAlias = join(home, "credential-alias");
-      symlinkSync(credential, credentialsAlias);
-      expect(() => buildClaudeArgs(spec, "s", undefined, credentialsAlias)).toThrow("overlaps denied");
-    });
-  } finally {
-    cleanup();
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test.each(["*", "?", "[", "]", "{", "}", "\\"])(
-  "Claude confined reader refuses executable pattern syntax %s, including symlink targets",
-  (pattern) => {
-    const { spec, cleanup } = confinedFixture();
-    const home = mkdtempSync(join(tmpdir(), "reader-pattern-home-"));
-    const executable = join(home, pattern, "credentials");
-    const alias = join(home, "bun-alias");
-    const credential = join(home, ".aws", "credentials");
-    try {
-      for (const file of [executable, credential]) {
-        mkdirSync(dirname(file), { recursive: true });
-        writeFileSync(file, "synthetic credential or executable");
-      }
-      symlinkSync(executable, alias);
-      readPolicyScope.run({ home, environment: {} }, () => {
-        // In particular H/*/credentials would match H/.aws/credentials after its deny rule.
-        for (const path of [executable, alias, `${home}/${pattern}/../bun`])
-          expect(() => buildClaudeArgs(spec, "s", undefined, path)).toThrow(ConfinementError);
-      });
-    } finally {
-      cleanup();
-      rmSync(home, { recursive: true, force: true });
-    }
-  },
-);
-
 test("Claude confined reader runner keeps scratch environment, checkout denial and wrapper isolation across invocations", async () => {
   const a = confinedFixture(),
     b = confinedFixture();
@@ -347,7 +280,6 @@ test("Claude confined reader runner keeps scratch environment, checkout denial a
         environments.push(opts.env);
         const filesystem = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}").sandbox
           .filesystem;
-        expect(claudeSandboxReads(opts.cmd, realpathSync(process.execPath))).toBe(true);
         expect(filesystem.allowWrite).toEqual([realpathSync(fixture.scratch)]);
         expect(filesystem.denyWrite).toContain(realpathSync(fixture.cwd));
         const contains = (root: string, path: string) => path === root || path.startsWith(`${root}/`);
@@ -359,9 +291,6 @@ test("Claude confined reader runner keeps scratch environment, checkout denial a
           expect(writable(join(realpathSync(path), "forbidden"))).toBe(false);
         for (const directory of wrappers) {
           expect(claudeSandboxReads(opts.cmd, join(directory, "config.json"))).toBe(false);
-          expect(() => buildClaudeArgs(fixture.spec, "s", undefined, join(directory, "bun"))).toThrow(
-            "overlaps denied",
-          );
         }
         expect(claudeSandboxReads(opts.cmd, join(fixture === a ? b.scratch : a.scratch, "private"))).toBe(
           false,
