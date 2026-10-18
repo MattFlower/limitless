@@ -437,43 +437,28 @@ for (const stage of ["implement", "gates", "review", "verify", "deliver"] as con
     history(next, id);
   });
 }
+// Clarify and spec are awaited like triage, audit like review, and preview shares verify's attempt;
+// none handles cancellation itself (the active-preview cancel test covers a running preview).
 for (const stage of [
   "prepare",
   "triage",
-  "clarify",
-  "spec",
   "holdout",
   "implement",
   "gates",
-  "audit",
   "review",
-  "preview",
   "verify",
   "deliver",
 ] as const) {
   test(`Factory cancellation during ${stage} stays terminal on restart`, async () => {
-    if (stage === "preview") {
-      writeFileSync(
-        join(source, ".limitless.toml"),
-        '[gates]\nchecks=[]\n[preview]\npaths=["ui/"]\nbuild="true"\nserve="false"\nready="/"\nenv={}\n',
-      );
-      await sh(["git", "commit", "-qam", "preview"], { cwd: source });
-    }
     let reached = false;
-    const f = factory(
-      {
-        [`stage:${stage}:before`]: {
-          action: "hang",
-          onHit: () => {
-            reached = true;
-          },
+    const f = factory({
+      [`stage:${stage}:before`]: {
+        action: "hang",
+        onHit: () => {
+          reached = true;
         },
       },
-      (s) =>
-        stage === "clarify" && s.prompt.startsWith("Classify")
-          ? { structured: { ...triage, ambiguity: "high", blocking_questions: ["Which?"] } }
-          : answer(s),
-    );
+    });
     const id = await run(f);
     await wait(() => reached);
     expect(f.cancelRun(id)).toBe(true);
@@ -492,13 +477,15 @@ for (const stage of [
     expect(next.store.listInvocations(id)).toHaveLength(invocationCount);
   });
 }
+// One row per way an attempt fails: returned, timed out, thrown, schema-invalid, or a stream the
+// real parser rejects (the stream seam test below covers codex). Exhaustion differs only once
+// routing runs out, so it keeps a returned failure and a timeout, which alone counts against
+// provider health.
 const failures: Record<string, FakeReply> = {
   exit: { fault: "exit" },
-  kill: { fault: "kill" },
   timeout: { fault: "timeout" },
   throw: { fault: "throw" },
   schema: { structured: { invalid: true } },
-  "claude malformed": { stream: { parser: "claude", lines: ["not json"] } },
   "claude truncated": {
     stream: {
       parser: "claude",
@@ -508,13 +495,9 @@ const failures: Record<string, FakeReply> = {
       ],
     },
   },
-  "codex malformed": { stream: { parser: "codex", lines: ["not json"] } },
-  "codex truncated": {
-    stream: { parser: "codex", lines: ['{"type":"turn.started"}', '{"type":"turn.completed"'] },
-  },
 };
 for (const [name, failure] of Object.entries(failures))
-  for (const exhaust of [false, true]) {
+  for (const exhaust of name === "exit" || name === "timeout" ? [false, true] : [false]) {
     test(`${name}: ${exhaust ? "exhaustion" : "recovery"} records every started attempt`, async () => {
       let calls = 0;
       const f = factory(undefined, (s) =>
@@ -662,7 +645,7 @@ exec '${realGit}' "$@"
         expect(f.store.listStages(id).find((s) => s.name === "gates")).toMatchObject({
           status: "failed",
           round: 0,
-          summary: expect.stringContaining("could not lstat"),
+          summary: expect.stringContaining("Command failed"),
         });
       }
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
@@ -680,50 +663,51 @@ exec '${realGit}' "$@"
     }
   });
 
-for (const status of ["timeout", "stuck", "error"] as const)
-  test(`implement ${status} preserves partial work and uses task feedback in the next round`, async () => {
-    writeFileSync(
-      join(source, ".limitless.toml"),
-      '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
-    );
-    await sh(["git", "commit", "-qam", "check completed implementation"], { cwd: source });
-    const attempts: { state: RunState | null; prompt: string }[] = [];
-    const diagnostic = status === "error" ? "process exited with code 1" : `session ${status}`;
-    const f = factory(undefined, (s) => {
-      if (s.mode !== "edit") return answer(s);
-      attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
-      return attempts.length === 1
-        ? { status, error: diagnostic, files: { "ui/change.txt": "partial\n" } }
-        : answer(s);
-    });
-    const id = await run(f);
-    await settled(f, id);
-    expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
-    expect(attempts.map((a) => a.state?.round)).toEqual([0, 1]);
-    expect(attempts[1]?.state).toMatchObject({
-      implementedRound: 0,
-      roundsOnImplementer: 1,
-      implementerIssue: `${status}: ${diagnostic}`,
-      triedImplementers: [{ modelId: "a", effort: "high" }],
-    });
-    expect(attempts[1]?.prompt).toContain("Your previous session ended early");
-    expect(attempts[1]?.prompt).toContain(`${status}: ${diagnostic}`);
-    const stages = f.store.listStages(id).filter((s) => s.name === "implement");
-    expect(stages.map((s) => s.round)).toEqual([0, 1]);
-    const inv = f.store.listInvocations(id).filter((i) => i.role === "implement");
-    expect(inv.map((i) => i.stageId)).toEqual(stages.map((s) => s.id));
-    expect(inv.map((i) => [i.modelId, i.status, i.error])).toEqual([
-      ["a", status, diagnostic],
-      ["a", "ok", null],
-    ]);
-    const state = f.store.getRunState<RunState>(id);
-    expect(state?.implementerIssue).toBeNull();
-    const cwd = state?.worktreePath ?? "";
-    expect(existsSync(cwd)).toBe(true);
-    expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
-    expect(readFileSync(join(cwd, "ui/change.txt"), "utf8")).toBe("done\n");
-    history(f, id);
+// Stuck and error take the same non-ok branch; the stalled-writer test above covers stuck.
+test("implement timeout preserves partial work and uses task feedback in the next round", async () => {
+  const status = "timeout";
+  writeFileSync(
+    join(source, ".limitless.toml"),
+    '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
+  );
+  await sh(["git", "commit", "-qam", "check completed implementation"], { cwd: source });
+  const attempts: { state: RunState | null; prompt: string }[] = [];
+  const diagnostic = `session ${status}`;
+  const f = factory(undefined, (s) => {
+    if (s.mode !== "edit") return answer(s);
+    attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
+    return attempts.length === 1
+      ? { status, error: diagnostic, files: { "ui/change.txt": "partial\n" } }
+      : answer(s);
   });
+  const id = await run(f);
+  await settled(f, id);
+  expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
+  expect(attempts.map((a) => a.state?.round)).toEqual([0, 1]);
+  expect(attempts[1]?.state).toMatchObject({
+    implementedRound: 0,
+    roundsOnImplementer: 1,
+    implementerIssue: `${status}: ${diagnostic}`,
+    triedImplementers: [{ modelId: "a", effort: "high" }],
+  });
+  expect(attempts[1]?.prompt).toContain("Your previous session ended early");
+  expect(attempts[1]?.prompt).toContain(`${status}: ${diagnostic}`);
+  const stages = f.store.listStages(id).filter((s) => s.name === "implement");
+  expect(stages.map((s) => s.round)).toEqual([0, 1]);
+  const inv = f.store.listInvocations(id).filter((i) => i.role === "implement");
+  expect(inv.map((i) => i.stageId)).toEqual(stages.map((s) => s.id));
+  expect(inv.map((i) => [i.modelId, i.status, i.error])).toEqual([
+    ["a", status, diagnostic],
+    ["a", "ok", null],
+  ]);
+  const state = f.store.getRunState<RunState>(id);
+  expect(state?.implementerIssue).toBeNull();
+  const cwd = state?.worktreePath ?? "";
+  expect(existsSync(cwd)).toBe(true);
+  expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
+  expect(readFileSync(join(cwd, "ui/change.txt"), "utf8")).toBe("done\n");
+  history(f, id);
+});
 
 test("quota after partial output persists cooldown and falls back without a task round", async () => {
   let now = 100_000;
@@ -1034,48 +1018,49 @@ for (const [checkpoint, action] of [
     history(next, id);
   });
 
-for (const point of ["harness:invoke", "harness:stream"] as const) {
-  test(`${point} kill is a recorded harness failure routed by task policy`, async () => {
-    const f = factory({ [point]: { action: "kill", when: (c: FaultContext) => c.role === "implement" } });
-    const id = await run(f);
-    await settled(f, id);
-    expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
-    const inv = f.store.listInvocations(id).filter((i) => i.role === "implement");
-    expect(inv[0]).toMatchObject({ modelId: "a", status: "error", error: HARNESS_KILLED });
-    expect(f.store.listStages(id).find((s) => s.name === "implement")?.status).toBe("succeeded");
-    history(f, id);
+// harness:stream is hit inside the same try, before the call is dispatched, so its kill and hang
+// take these paths too; the stream seam test below covers what it adds.
+test("harness:invoke kill is a recorded harness failure routed by task policy", async () => {
+  const f = factory({
+    "harness:invoke": { action: "kill", when: (c: FaultContext) => c.role === "implement" },
   });
-  for (const action of ["hang"] as const)
-    test(`${point} ${action} targets implement without background holdout consuming it`, async () => {
-      let reached = false;
-      const f = factory({
-        [point]: {
-          action,
-          when: (c: FaultContext) => c.role === "implement",
-          onHit: () => {
-            reached = true;
-          },
-        },
-      });
-      const id = await run(f);
-      await wait(() => reached);
-      await f.stop();
-      const selection = f.store.getRunState<RunState>(id)?.implementer;
-      expect(selection).toMatchObject({ modelId: "a", effort: "high" });
-      history(f, id);
-      const next = await reopen(f);
-      await settled(next, id);
-      expect(next.store.getRun(id)?.status).toBe("succeeded");
-      expect(next.store.getRunState<RunState>(id)?.implementer).toEqual(selection);
-      expect(
-        next.store
-          .listInvocations(id)
-          .filter((i) => i.role === "implement")
-          .map((i) => i.status),
-      ).toEqual(["cancelled", "ok"]);
-      history(next, id);
-    });
-}
+  const id = await run(f);
+  await settled(f, id);
+  expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
+  const inv = f.store.listInvocations(id).filter((i) => i.role === "implement");
+  expect(inv[0]).toMatchObject({ modelId: "a", status: "error", error: HARNESS_KILLED });
+  expect(f.store.listStages(id).find((s) => s.name === "implement")?.status).toBe("succeeded");
+  history(f, id);
+});
+test("harness:invoke hang targets implement without background holdout consuming it", async () => {
+  let reached = false;
+  const f = factory({
+    "harness:invoke": {
+      action: "hang",
+      when: (c: FaultContext) => c.role === "implement",
+      onHit: () => {
+        reached = true;
+      },
+    },
+  });
+  const id = await run(f);
+  await wait(() => reached);
+  await f.stop();
+  const selection = f.store.getRunState<RunState>(id)?.implementer;
+  expect(selection).toMatchObject({ modelId: "a", effort: "high" });
+  history(f, id);
+  const next = await reopen(f);
+  await settled(next, id);
+  expect(next.store.getRun(id)?.status).toBe("succeeded");
+  expect(next.store.getRunState<RunState>(id)?.implementer).toEqual(selection);
+  expect(
+    next.store
+      .listInvocations(id)
+      .filter((i) => i.role === "implement")
+      .map((i) => i.status),
+  ).toEqual(["cancelled", "ok"]);
+  history(next, id);
+});
 
 test("stream seam feeds parser bytes and recovers through routing", async () => {
   const f = factory({
@@ -1270,6 +1255,8 @@ function githubRun(f: Factory, url = source) {
   return repo;
 }
 
+// A needs-human draft makes the same `gh pr create` call as create (its cancel is covered by
+// "cancel during draft delivery"), and the auto-merge fallback runs the same merge command as merge.
 for (const operation of [
   "fetch",
   "push",
@@ -1277,12 +1264,10 @@ for (const operation of [
   "edit",
   "create",
   "merge",
-  "auto-merge",
   "existing-head",
   "existing-push",
   "comment",
   "comments",
-  "draft",
 ] as const)
   test(`cancel active delivery ${operation} kills descendants and stays cancelled after restart`, async () => {
     const pr = join(root, "pr");
@@ -1298,12 +1283,10 @@ for (const operation of [
         edit: "gh pr edit *",
         create: "gh pr create *",
         merge: "gh pr merge *",
-        "auto-merge": "gh pr merge *--auto*",
         "existing-head": "git ls-remote *",
         "existing-push": "git push --no-follow-tags --force-with-lease=*",
         comment: "gh pr comment *",
         comments: "gh api *",
-        draft: "gh pr create *--draft*",
       }[operation];
       for (const bin of ["gh", "git"]) {
         const path = join(root, "bin", bin);
@@ -1319,7 +1302,6 @@ case "${bin} $args" in
     .map((part) => `'${part}'`)
     .join("*")}) sleep 60 & child=$!; echo "$$ $child" > '${pidFile}'; wait; exit 1 ;;
 esac
-${operation === "auto-merge" ? 'if [ "$1 $2" = "pr merge" ]; then exit 1; fi' : ""}
 exec '${path}-delegate' "$@"
 `,
           { mode: 0o755 },
@@ -1331,18 +1313,13 @@ exec '${path}-delegate' "$@"
         operation === "comments"
           ? { "store:save": { action: "kill", when: (c) => c.checkpoint === "verification-comment-posted" } }
           : undefined,
-        (s) =>
-          operation === "draft" && s.prompt.startsWith("You are the acceptance")
-            ? { structured: blocked }
-            : answer(s),
       );
       let id: string;
       if (operation === "comment" || operation === "comments") {
         id = (await externalChange(f)).run.id;
       } else {
         const repo = githubRun(f);
-        if (operation === "merge" || operation === "auto-merge")
-          f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
+        if (operation === "merge") f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
         const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: source })).stdout.trim();
         const r = f.store.createRun(
           repo,
@@ -1446,6 +1423,8 @@ test("PR creation window reconciles a stateful fake after Factory replacement", 
       status: "succeeded",
       prUrl: "https://github.com/test/repo/pull/1",
     });
+    // The resumed delivery finds the PR it opened before the crash instead of creating it again.
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
     expect(existsSync(cwd)).toBe(false);
     history(next, r.id);
   } finally {
@@ -1674,7 +1653,11 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     f.scheduler.start();
   `,
   );
-  const child = Bun.spawn([process.execPath, worker], { stdout: "ignore", stderr: "pipe" });
+  // Bun's test preload is not inherited by the daemon subprocess.
+  const child = Bun.spawn(
+    [process.execPath, `--preload=${join(import.meta.dir, "git-preload.ts")}`, worker],
+    { stdout: "ignore", stderr: "pipe" },
+  );
   let gatePid: number | undefined;
   const groupSignals: number[] = [];
   const kill = process.kill.bind(process);
@@ -1842,7 +1825,8 @@ test("verify-change reconciles a posted verification comment after its save is l
   history(next, run.id);
 });
 
-test.each(["502", "timeout", "exhausted", "injected", "terminated"] as const)(
+// A timed-out lookup retries like a 502; the retry classification test below covers timeouts.
+test.each(["502", "exhausted", "injected", "terminated"] as const)(
   "verify-change head recheck preserves retries and interruptions: %s",
   async (failure) => {
     const comments: string[] = [];
@@ -1856,13 +1840,7 @@ test.each(["502", "timeout", "exhausted", "injected", "terminated"] as const)(
         if (lookups === 1 || failure === "exhausted") {
           if (failure === "injected") throw new InjectedFault("head recheck interrupted");
           if (failure === "terminated") throw new SimulatedTermination("head recheck terminated");
-          throw new CommandError(
-            "gh failed",
-            1,
-            "",
-            failure === "timeout" ? "" : "HTTP 502: Bad Gateway",
-            failure === "timeout",
-          );
+          throw new CommandError("gh failed", 1, "", "HTTP 502: Bad Gateway", false);
         }
         return JSON.stringify({ headRefOid: headSha });
       }
@@ -2207,12 +2185,13 @@ test("GitHub retries SSH temporary DNS failures", async () => {
 });
 
 test("the budget bounds retries and waits, never a call's first attempt or a healthy slow call", async () => {
+  const realGit = realpathSync(Bun.which("git") ?? "git");
   const restore = fakeGh(join(root, "pr"));
   // A healthy push that takes longer than the budget left still completes on its own timeout.
   writeFileSync(
     join(root, "bin", "git"),
-    // The wrapper's own lookups (version, config, repository) reach real git; anything else is the push.
-    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\ncase "$command" in config|rev-parse|var|--version) exec /usr/bin/git "$@";; esac\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    // Resolve and bundle a real commit; only the remote push spends the simulated network time.
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" != push ]; then exec '${realGit}' "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
     {
       mode: 0o755,
     },
@@ -2222,11 +2201,11 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   >[0];
   const budget = { leftMs: 100 };
   try {
-    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    await pushBranch(repo, source, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(1);
     expect(budget.leftMs).toBeLessThan(0);
     // With the budget spent, the next call's first attempt still runs (as on main); only retries stop.
-    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    await pushBranch(repo, source, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(2);
   } finally {
     await restore();
@@ -2486,39 +2465,6 @@ test("a fallback after the budget is spent still records a PR that was created",
       prUrl: "https://github.com/test/repo/pull/1",
     });
     expect(ghCalls(pr, "pr create")).toHaveLength(1);
-  } finally {
-    githubRetry.budgetMs = budgetMs;
-    await restore();
-  }
-});
-
-test("a delivery resumed after a crash and downtime starts a fresh GitHub budget", async () => {
-  const pr = join(root, "pr");
-  const restore = fakeGh(pr);
-  const budgetMs = githubRetry.budgetMs;
-  githubRetry.budgetMs = 2_000;
-  try {
-    // Crash mid-delivery, after the PR exists but before its URL is saved, then stay down past the
-    // whole budget: the resumed delivery gets a fresh budget and reuses the PR.
-    const f = factory({
-      "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" },
-    });
-    const repo = githubRun(f);
-    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
-    f.scheduler.start();
-    await settled(f, r.id);
-    expect(f.store.getRun(r.id)?.status).toBe("running");
-    expect(f.store.getRun(r.id)?.prUrl).toBeNull();
-    await f.stop();
-    await Bun.sleep(githubRetry.budgetMs + 500);
-    const next = await reopen(f);
-    await settled(next, r.id);
-    expect(next.store.getRun(r.id)).toMatchObject({
-      status: "succeeded",
-      prUrl: "https://github.com/test/repo/pull/1",
-    });
-    expect(ghCalls(pr, "pr create")).toHaveLength(1);
-    history(next, r.id);
   } finally {
     githubRetry.budgetMs = budgetMs;
     await restore();

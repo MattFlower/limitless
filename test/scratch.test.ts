@@ -33,7 +33,9 @@ import {
 } from "../src/harness/read-policy.ts";
 import { ConfinementError, confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
 import {
+  commandDir,
   commandRoots,
+  createCommandRoot,
   createScratch,
   invocationCommands,
   privateReadRoots,
@@ -260,6 +262,54 @@ function confinedFixture() {
     },
   };
 }
+
+test("Claude confined reader runner keeps scratch environment, checkout denial and wrapper isolation across invocations", async () => {
+  const a = confinedFixture(),
+    b = confinedFixture();
+  const wrappers: string[] = [];
+  const environments: Record<string, string>[] = [];
+  try {
+    for (const fixture of [a, b]) {
+      createCommandRoot(fixture.cwd, fixture.scratch);
+      const directory = commandDir(fixture.scratch, fixture.cwd);
+      mkdirSync(directory);
+      wrappers.push(directory);
+    }
+    for (const fixture of [a, b]) {
+      await runClaude(fixture.spec, async (opts) => {
+        environments.push(opts.env);
+        const filesystem = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}").sandbox
+          .filesystem;
+        expect(filesystem.allowWrite).toEqual([realpathSync(fixture.scratch)]);
+        expect(filesystem.denyWrite).toContain(realpathSync(fixture.cwd));
+        const contains = (root: string, path: string) => path === root || path.startsWith(`${root}/`);
+        const writable = (path: string) =>
+          filesystem.allowWrite.some((root: string) => contains(root, path)) &&
+          !filesystem.denyWrite.some((root: string) => contains(root, path));
+        expect(writable(join(realpathSync(fixture.scratch), "probe.test.ts"))).toBe(true);
+        for (const path of [fixture.cwd, homedir(), process.execPath, ...wrappers])
+          expect(writable(join(realpathSync(path), "forbidden"))).toBe(false);
+        for (const directory of wrappers) {
+          expect(claudeSandboxReads(opts.cmd, join(directory, "config.json"))).toBe(false);
+        }
+        expect(claudeSandboxReads(opts.cmd, join(fixture === a ? b.scratch : a.scratch, "private"))).toBe(
+          false,
+        );
+        expect(opts.env.CLAUDE_CODE_TMPDIR).toBe(dirname(fixture.scratch));
+        expect(join(opts.env.CLAUDE_CODE_TMPDIR ?? "", SCRATCH_NAME)).toBe(fixture.scratch);
+        for (const key of ["TMPDIR", "TMP", "TEMP"]) expect(opts.env[key]).toBe(fixture.scratch);
+        expect(opts.env.ZDOTDIR?.startsWith(`${fixture.scratch}/`)).toBe(true);
+        opts.onStdoutLine?.('{"type":"result","subtype":"success","result":"ok"}');
+        return procResult;
+      });
+    }
+    expect(environments[0]?.CLAUDE_CODE_TMPDIR).not.toBe(environments[1]?.CLAUDE_CODE_TMPDIR);
+  } finally {
+    for (const directory of wrappers) rmSync(directory, { recursive: true, force: true });
+    a.cleanup();
+    b.cleanup();
+  }
+});
 
 test("confined readers are granted reads only in their cwd and scratch", () => {
   const { cwd, scratch, spec, cleanup } = confinedFixture();

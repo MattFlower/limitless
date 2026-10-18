@@ -17,14 +17,14 @@ import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { stageAll, worktreeGit } from "../git/command.ts";
-import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
+import { diffSince, discardChanges, readFileAt, withGitBundle } from "../git/repos.ts";
 import { runConfined } from "../harness/sandbox.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
-import { agentEnv, sh } from "../util/proc.ts";
+import { agentEnv } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { prepareEvalGates } from "./prepare.ts";
 
@@ -105,7 +105,7 @@ async function untrackedState(cwd: string, env: Record<string, string>, since: b
       state.set(path, `${meta}:${createHash("sha256").update(body).digest("hex")}`);
     }
   };
-  const out = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
+  const out = await worktreeGit(["git", "ls-files", "-z", "-o"], { cwd, env });
   for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
   return state;
 }
@@ -212,7 +212,7 @@ export async function gradeImplement(
       ],
       { cwd, env, signal },
     );
-    const commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
+    const commit = (await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     evidence.commit = commit;
     before = await untrackedState(cwd, env, since);
     // Grade in a fresh repository outside the candidate's: hidden files never touch its checkout,
@@ -221,9 +221,21 @@ export async function gradeImplement(
     checkout = createScratch(cwd);
     const opts = { cwd: checkout, env, signal };
     await worktreeGit(["git", "init", "-q"], opts);
-    await worktreeGit(
-      ["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base],
-      opts,
+    await withGitBundle(cwd, [commit, item.base], signal, (bundle) =>
+      worktreeGit(
+        [
+          "git",
+          "fetch",
+          "-q",
+          "--no-tags",
+          "--no-recurse-submodules",
+          "--no-write-fetch-head",
+          bundle,
+          commit,
+          item.base,
+        ],
+        opts,
+      ),
     );
     await worktreeGit(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit], opts);
     // Audit before gates run: their commands could move HEAD or rewrite the grading repository.

@@ -33,17 +33,14 @@ const { start } = pipelineSetup({
   },
 });
 
+// Each refusal reason (no gate stage, no checks, a non-test or unrelated gate, another SHA, a
+// retried pass) is unit-tested in gate-evidence.test.ts; these rows cover the engine and resume.
 for (const evidence of [
   "matching",
   "suite",
-  "absent",
-  "unrelated",
   "different-sha",
-  "prior-round",
   "resume",
   "resume-redacted",
-  "resume-other-sha",
-  "resume-retried",
   "resume-failed-stage",
 ] as const) {
   test(`loopback verification uses confined gate evidence: ${evidence}`, async () => {
@@ -69,17 +66,12 @@ test("loopback server", () => {
     writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "bun test" } }));
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      evidence === "absent"
-        ? "[gates]\nchecks = []\n"
-        : evidence === "unrelated"
-          ? `[gates]\nchecks = [{ name = "unrelated", run = "true" }]\n`
-          : `[gates]\nchecks = [{ name = ${JSON.stringify(gateName)}, run = "${command}" }]\n`,
+      `[gates]\nchecks = [{ name = ${JSON.stringify(gateName)}, run = "${command}" }]\n`,
     );
     await sh(["git", "add", "."], { cwd: repoDir });
     await sh(["git", "commit", "-qm", "loopback gate fixture"], { cwd: repoDir });
     let attempts = 0;
     let initialGateSha = "";
-    let priorGates: RunState["gateEvidence"];
     const loopbackSpec = {
       ...spec,
       acceptance_criteria: [
@@ -104,23 +96,6 @@ test("loopback server", () => {
       }
       if (role === "verify") {
         attempts++;
-        if (evidence === "prior-round" && attempts === 1) {
-          const runId = f.store.listRuns()[0]?.id;
-          const prior = runId ? f.store.getRunState<RunState>(runId) : null;
-          initialGateSha = prior?.gateEvidence?.sha ?? "";
-          priorGates = prior?.gateEvidence;
-          return {
-            structured: {
-              ...pass,
-              overall: "fail",
-              criteria: pass.criteria.map((c) =>
-                c.id === "H-1"
-                  ? { ...c, status: "unmet", evidence: "wrong output", publicSummary: "wrong output" }
-                  : c,
-              ),
-            },
-          };
-        }
         return {
           structured: {
             ...pass,
@@ -138,17 +113,10 @@ test("loopback server", () => {
           },
         };
       }
-      return {
-        files: {
-          "farewell.txt": `goodbye\n${evidence === "prior-round" && attempts ? "next commit\n" : ""}`,
-        },
-      };
+      return { files: { "farewell.txt": "goodbye\n" } };
     });
     const resume = evidence.startsWith("resume");
     if (resume) f.deps.faults = { "stage:verify:after": { action: "kill", occurrence: 1 } };
-    // Exercise stale evidence retained from an earlier round while the next round has a new SHA.
-    if (evidence === "prior-round")
-      f.deps.faults = { "stage:verify:before": { action: "kill", occurrence: 2 } };
     const interrupted = deferred<void>();
     const unsubscribe = f.store.subscribe((message) => {
       if (message.kind === "stage" && message.stage.status === "cancelled") interrupted.resolve();
@@ -159,12 +127,12 @@ test("loopback server", () => {
       profile: "standard",
     });
     let terminal: RunStatus;
-    if (resume || evidence === "prior-round") {
+    if (resume) {
       await interrupted.promise;
       await f.stop();
       const state = f.store.getRunState<RunState>(run.id);
       expect(state).not.toBeNull();
-      if (state && resume) {
+      if (state) {
         const recorded = state.verifyResults?.at(-1);
         const original = recorded?.modelOutput?.criteria.find((c) => c.id === "AC-1");
         expect(original).toMatchObject({
@@ -178,19 +146,8 @@ test("loopback server", () => {
           gateEvidence: { stageId: state.gateEvidence?.stageId },
         });
         expect(f.store.getArtifact(run.id, "verify-0.json")).not.toContain("modelOutput");
-        if (evidence === "resume-other-sha" && state.gateEvidence) state.gateEvidence.sha = "b".repeat(40);
-        if (evidence === "resume-retried") {
-          const check = state.gateEvidence?.checks[0];
-          if (!check) throw new Error("missing gate check");
-          check.firstAttempt = { ...check.result };
-        }
         if (evidence === "resume-failed-stage")
           f.store.finishStage(state.gateEvidence?.stageId ?? -1, "failed", "gate record invalidated");
-        f.store.setRunState(run.id, state);
-      }
-      if (state && evidence === "prior-round") {
-        expect(priorGates).toBeDefined();
-        state.gateEvidence = priorGates;
         f.store.setRunState(run.id, state);
       }
       f.deps.faults = undefined;
@@ -235,18 +192,10 @@ test("loopback server", () => {
   });
 }
 
-for (const scenario of [
-  "blocked",
-  "passes",
-  "retry-unmet",
-  "initial-unmet",
-  "unclear",
-  "no-alternative",
-  "blocked-not-required",
-  "passes-not-required",
-] as const) {
+// Which verdicts retry (an unclear row never; a not_required holdout doesn't prevent it) and the
+// feedback they produce are unit-tested with blockedOnly and formatVerifyFeedback.
+for (const scenario of ["blocked", "passes", "retry-unmet", "initial-unmet", "no-alternative"] as const) {
   test(`environment verification retry: ${scenario}`, async () => {
-    const path = scenario.replace("-not-required", "");
     const verifierModels: string[] = [];
     const scratchPaths: string[] = [];
     const implementationPrompts: string[] = [];
@@ -270,16 +219,11 @@ for (const scenario of [
       if (role === "verify") {
         verifierModels.push(s.target.modelId);
         const n = verifierModels.length;
-        if (path === "no-alternative") f.tracker.blockModel("alpha/m", "unavailable alternative");
-        if (
-          (path === "passes" && n === 2) ||
-          n === 3 ||
-          ((path === "initial-unmet" || path === "unclear") && n === 2)
-        )
+        if (scenario === "no-alternative") f.tracker.blockModel("alpha/m", "unavailable alternative");
+        if ((scenario === "passes" && n === 2) || n === 3 || (scenario === "initial-unmet" && n === 2))
           return { structured: pass };
         const actionable =
-          ((path === "initial-unmet" || path === "unclear") && n === 1) ||
-          (path === "retry-unmet" && n === 2);
+          (scenario === "initial-unmet" && n === 1) || (scenario === "retry-unmet" && n === 2);
         return {
           structured: {
             ...pass,
@@ -293,15 +237,8 @@ for (const scenario of [
                     publicSummary: "",
                   }
                 : c.id === "H-1" && actionable
-                  ? {
-                      ...c,
-                      status: path === "unclear" ? "unclear" : "unmet",
-                      evidence: "Observed wrong output",
-                      publicSummary: "",
-                    }
-                  : c.id === "H-2" && scenario.endsWith("-not-required")
-                    ? { ...c, status: "unmet", requirement: "not_required" }
-                    : c,
+                  ? { ...c, status: "unmet", evidence: "Observed wrong output", publicSummary: "" }
+                  : c,
             ),
           },
         };
@@ -311,9 +248,11 @@ for (const scenario of [
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile: "standard" });
     const terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
-    expect(terminal).toBe(path === "blocked" || path === "no-alternative" ? "needs_human" : "succeeded");
+    expect(terminal).toBe(
+      scenario === "blocked" || scenario === "no-alternative" ? "needs_human" : "succeeded",
+    );
     const state = f.store.getRunState<RunState>(run.id);
-    const actionable = ["retry-unmet", "initial-unmet", "unclear"].includes(path);
+    const actionable = scenario === "retry-unmet" || scenario === "initial-unmet";
     expect(implementationPrompts).toHaveLength(actionable ? 2 : 1);
     expect(state?.round).toBe(actionable ? 1 : 0);
     expect(state?.roundsOnImplementer).toBe(actionable ? 1 : 0);
@@ -321,7 +260,7 @@ for (const scenario of [
     expect(new Set(scratchPaths).size).toBe(scratchPaths.length);
     for (const scratch of scratchPaths) expect(existsSync(scratch)).toBe(false);
     expect(verifierModels[0]).toBe("beta/m");
-    if (["blocked", "passes", "retry-unmet"].includes(path)) {
+    if (["blocked", "passes", "retry-unmet"].includes(scenario)) {
       expect(verifierModels[1]).toBe("alpha/m");
       expect(order.slice(order.indexOf("verify"), order.indexOf("verify") + 2)).toEqual(["verify", "verify"]);
       expect(state?.verifyResults?.slice(0, 2).map((v) => [v.round, v.attempt, v.modelId])).toEqual([
@@ -333,7 +272,7 @@ for (const scenario of [
     if (terminal === "needs_human") {
       expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
       expect(state?.terminalReason).toContain("EPERM");
-      if (path === "no-alternative") expect(verifierModels).toHaveLength(1);
+      if (scenario === "no-alternative") expect(verifierModels).toHaveLength(1);
       else expect(verifierModels).toHaveLength(2);
     }
     if (actionable) {

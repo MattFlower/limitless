@@ -101,6 +101,7 @@ export async function startWorkerListener(
                 await worktreeGit(["git", "update-ref", names[i] ?? "", sha], { cwd: cache, signal });
               await worktreeGit(["git", "bundle", "create", bundle, ...names], {
                 cwd: cache,
+                additionalWriteRoots: [dir],
                 signal,
                 timeoutMs: 300_000,
               });
