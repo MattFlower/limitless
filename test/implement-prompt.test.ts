@@ -31,11 +31,11 @@ function promptWithBaseline(baseline: GateRun | null): string {
   });
 }
 
-test.each(["flag", "output", "firstAttempt", "targetedRetry"] as const)(
+test.each(["flag", "output", "passing output", "firstAttempt", "targetedRetry"] as const)(
   "implement guidance for an unusable baseline detected via %s",
   (kind) => {
     const confinement = {
-      ...failed,
+      ...(kind === "passing output" ? passed : failed),
       ...(kind === "flag"
         ? { confinementError: true }
         : { confinementError: undefined, output: "sandbox_apply: Operation not permitted" }),
