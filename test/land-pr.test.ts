@@ -1225,6 +1225,7 @@ test.each(["history", "diff", "blob", "title", "body"])(
           process.execPath,
           "--config=/dev/null",
           "--no-env-file",
+          `--preload=${resolve("test/git-preload.ts")}`,
           resolve("scripts/check-private-strings.ts"),
           "123",
           "test/repo",
