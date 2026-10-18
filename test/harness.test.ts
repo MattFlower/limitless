@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
@@ -966,6 +966,16 @@ test("native fast flags cover edit, structured and isolated readers without leak
             expect(settings.sandbox.enabled).toBe(true);
             expect(settings.sandbox.filesystem.allowWrite).toEqual([scratchDir]);
             expect(settings.disableAllHooks).toBe(true);
+            const confinedArgs = buildClaudeArgs({ ...claude, confineReads: true }, "session");
+            const confined = JSON.parse(confinedArgs[confinedArgs.indexOf("--settings") + 1] ?? "{}").sandbox
+              .filesystem;
+            expect(confined.allowRead).toEqual([
+              ...new Set([base.cwd, realpathSync(base.cwd)]),
+              ...new Set([scratchDir, realpathSync(scratchDir)]),
+            ]);
+            expect(confined.allowWrite).toEqual([scratchDir]);
+            expect(confined.denyWrite).toContain(realpathSync(base.cwd));
+            expect(confined.denyRead).toContain(join(testReadPolicy.home ?? "", ".aws"));
           }
           const backendArgs = buildClaudeArgs(
             { ...claude, target: { ...claude.target, provider: "openrouter" } },

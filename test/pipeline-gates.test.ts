@@ -37,102 +37,80 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
-  test.each(["credential command", "escaped identity", "script names"])(
-    "literal gate state survives restart: %s",
-    async (scenario) => {
-      const secret = "synthetic-gate-resume-credential-494";
-      registerCredential("resume-command-test", secret);
-      const name = scenario === "escaped identity" ? "\x1b[31mcheck" : "check";
-      const command = scenario === "escaped identity" ? "exit 1" : `test "$(cat expected.txt)" = '${secret}'`;
-      const scripts = { ok: "true", output: `true # ${secret}` };
-      const checks =
-        scenario === "script names"
-          ? Object.keys(scripts).map((name) => ({ name, run: `bun run ${name}` }))
-          : [{ name, run: command }];
-      if (scenario === "script names")
-        writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts }));
-      writeFileSync(join(repoDir, "expected.txt"), secret);
-      writeFileSync(
-        join(repoDir, ".limitless.toml"),
-        `[gates]\nchecks = [${checks.map((c) => `{ name = ${JSON.stringify(c.name)}, run = ${JSON.stringify(c.run)} }`).join(", ")}]\n`,
-      );
-      await sh(["git", "add", "."], { cwd: repoDir });
-      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "literal gates"], {
-        cwd: repoDir,
-      });
-      const f = start((s) => {
-        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-        if (roleOf(s) === "review") return { structured: approve };
-        return { files: { "farewell.txt": "goodbye\n" } };
-      });
-      await f.stop();
-      const commands: string[] = [];
-      const realProcess = proc.runProcess;
-      const processSpy = spyOn(proc, "runProcess").mockImplementation((opts) => {
-        if (opts.cmd[0] === "/bin/sh") commands.push(opts.cmd.at(-1) ?? "");
-        return realProcess(opts);
-      });
-      try {
-        const verdicts = [];
-        for (const restart of [false, true]) {
-          commands.length = 0;
-          f.deps.faults = restart
-            ? {
-                "store:save": {
-                  action: "kill",
-                  when: (c) => c.stage === "gates" && c.checkpoint === "gate-started",
-                },
-              }
-            : undefined;
-          const run = await f.createRun({
-            repo: repoDir,
-            prompt: "Add farewell",
-            profile: "quick",
-            noBaselineCache: true,
-          });
-          const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
-          if (restart) expect(await execute()).toBe("running");
-          expect(await execute()).toBe("succeeded");
-          const state = f.store.getRunState<RunState>(run.id);
-          if (scenario === "script names") {
-            expect(state?.baselineScripts).toEqual(scripts);
-            expect(state?.lastAudit).not.toContainEqual(
-              expect.objectContaining({ rule: "gate-script-changed" }),
-            );
-            expect(state?.lastGates?.map((c) => [c.name, c.result.command, c.verdict])).toEqual([
-              ["ok", "bun run ok", "pass"],
-              ["output", "bun run output", "pass"],
-            ]);
-            expect(commands).toEqual(["bun run ok", "bun run output", "bun run ok", "bun run output"]);
-          } else {
-            expect(state?.baseline?.checks[0]?.name).toBe(name);
-            expect(state?.lastGates?.[0]).toMatchObject({
-              name,
-              verdict: scenario === "escaped identity" ? "still_failing" : "pass",
-              blocking: false,
-              result: { name, command },
-            });
-            expect(state?.gateEvidence?.checks[0]?.name).toBe(name);
-            expect(commands).toEqual(Array(scenario === "escaped identity" ? 3 : 2).fill(command));
-          }
-          verdicts.push(state?.lastGates?.[0]?.verdict);
-          const outward = JSON.stringify([
-            f.store.listEvents(run.id),
-            f.store.getArtifact(run.id, "gates-0.json"),
-            f.store.getArtifact(run.id, "baseline-gates.json"),
-          ]);
-          expect(outward).not.toContain(secret);
-          expect(outward).not.toContain("\\u001b");
-        }
-        expect(verdicts[1]).toBe(verdicts[0]);
-      } finally {
-        processSpy.mockRestore();
+  // Literal commands and escaped gate names across a gate-started restart are covered in
+  // gate-executor.test.ts; this case covers package scripts named by gates.
+  test("literal gate state survives restart: script names", async () => {
+    const secret = "synthetic-gate-resume-credential-494";
+    registerCredential("resume-command-test", secret);
+    const scripts = { ok: "true", output: `true # ${secret}` };
+    const checks = Object.keys(scripts).map((name) => ({ name, run: `bun run ${name}` }));
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts }));
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [${checks.map((c) => `{ name = ${JSON.stringify(c.name)}, run = ${JSON.stringify(c.run)} }`).join(", ")}]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "literal gates"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    const commands: string[] = [];
+    const realProcess = proc.runProcess;
+    const processSpy = spyOn(proc, "runProcess").mockImplementation((opts) => {
+      if (opts.cmd[0] === "/bin/sh") commands.push(opts.cmd.at(-1) ?? "");
+      return realProcess(opts);
+    });
+    try {
+      const verdicts = [];
+      for (const restart of [false, true]) {
+        commands.length = 0;
+        f.deps.faults = restart
+          ? {
+              "store:save": {
+                action: "kill",
+                when: (c) => c.stage === "gates" && c.checkpoint === "gate-started",
+              },
+            }
+          : undefined;
+        const run = await f.createRun({
+          repo: repoDir,
+          prompt: "Add farewell",
+          profile: "quick",
+          noBaselineCache: true,
+        });
+        const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+        if (restart) expect(await execute()).toBe("running");
+        expect(await execute()).toBe("succeeded");
+        const state = f.store.getRunState<RunState>(run.id);
+        expect(state?.baselineScripts).toEqual(scripts);
+        expect(state?.lastAudit).not.toContainEqual(expect.objectContaining({ rule: "gate-script-changed" }));
+        expect(state?.lastGates?.map((c) => [c.name, c.result.command, c.verdict])).toEqual([
+          ["ok", "bun run ok", "pass"],
+          ["output", "bun run output", "pass"],
+        ]);
+        expect(commands).toEqual(["bun run ok", "bun run output", "bun run ok", "bun run output"]);
+        verdicts.push(state?.lastGates?.[0]?.verdict);
+        const outward = JSON.stringify([
+          f.store.listEvents(run.id),
+          f.store.getArtifact(run.id, "gates-0.json"),
+          f.store.getArtifact(run.id, "baseline-gates.json"),
+        ]);
+        expect(outward).not.toContain(secret);
+        expect(outward).not.toContain("\\u001b");
       }
-    },
-  );
+      expect(verdicts[1]).toBe(verdicts[0]);
+    } finally {
+      processSpy.mockRestore();
+    }
+  });
 
+  // "slot" is the plain timeout re-run that passes, with the re-run also queued for a gate slot.
   test.each([
-    "passes",
     "twice",
     "base",
     "slot",
@@ -275,7 +253,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(prompts).toHaveLength(
           ["twice", "mixed", "unflagged", "setup", "retry setup failure"].includes(scenario) ? 2 : 1,
         );
-        if (scenario === "passes" || scenario === "slot") {
+        if (scenario === "slot") {
           expect(state?.round).toBe(0);
           expect(state?.feedback).toBeNull();
         }

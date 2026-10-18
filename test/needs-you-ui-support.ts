@@ -1,4 +1,5 @@
 import { expect } from "bun:test";
+import { realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { type PresetTarget, transformAsync } from "@babel/core";
@@ -8,9 +9,17 @@ import type { RunDetail } from "../src/core/types.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 // Server-rendered signals and memos never track reads, so the page's own reactive state comes from
-// Solid's client build; components still render on the server.
-const clientSolid = join(import.meta.dir, "../node_modules/solid-js/dist/solid.js");
-const clientStore = join(import.meta.dir, "../node_modules/solid-js/store/dist/store.js");
+// Solid's client build; components still render on the server. Importers are compared by real path,
+// since node_modules may be a symlink and the bundler need not report the path it was given.
+const real = (path: string) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+};
+const clientSolid = real(join(import.meta.dir, "../node_modules/solid-js/dist/solid.js"));
+const clientStore = real(join(import.meta.dir, "../node_modules/solid-js/store/dist/store.js"));
 type Handler = (event?: { currentTarget: { value: string } }) => void | Promise<void>;
 export type NeedsYouUi = {
   mount: (detail: RunDetail, initiallyEmpty?: boolean) => void;
@@ -31,7 +40,7 @@ export async function buildNeedsYouUi(dir: string): Promise<NeedsYouUi> {
         name: "needs-you-ssr-events",
         setup(builder) {
           builder.onResolve({ filter: /^solid-js$/ }, (args) =>
-            args.importer === clientStore ? { path: clientSolid } : undefined,
+            real(args.importer) === clientStore ? { path: clientSolid } : undefined,
           );
           builder.onLoad({ filter: /\.tsx$/ }, async (args) => {
             let source = await Bun.file(args.path).text();

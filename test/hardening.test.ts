@@ -295,6 +295,29 @@ describe("process handling", () => {
     expect(selected).toThrow(`Process birth time inspection failed for ${native.unreadablePid}`);
   });
 
+  test("native discovery skips marked processes that started before the spawn unless the start is unreadable", async () => {
+    const native = await loadNativeInspection(dir);
+    native.setMemberMarker("this-invocation");
+    const selected = (spawnedAt: bigint) =>
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "this-invocation",
+        native.leaderPid,
+        100,
+        [dir],
+        null,
+        new Set([process.pid]),
+        spawnedAt,
+      );
+    native.setMemberStart(5n);
+    expect(selected(5n)).toEqual([native.memberPid]);
+    expect(selected(6n)).toEqual([]);
+    native.setMemberStart({ errno: 1 });
+    expect(selected(6n)).toEqual([native.memberPid]);
+    native.setMemberStart(0n);
+    expect(selected(6n)).toEqual([native.memberPid]);
+  });
+
   test.skipIf(process.platform !== "darwin")(
     "finishing one invocation never signals another invocation's hidden scratch orphan",
     async () => {
@@ -844,6 +867,50 @@ describe("process handling", () => {
             process.kill(-pid, "SIGKILL");
           } catch {}
         }
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "macOS native inspection claims a marked process started after the spawn, not one started before",
+    async () => {
+      const { darwinCallerAncestors, darwinClock, markedDarwinProcesses } = await import(
+        "../src/util/processes-darwin.ts"
+      );
+      const marker = "spawn-boundary";
+      // Not a platform binary, so the kernel exposes its environment.
+      const holder = () =>
+        spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
+          env: { ...process.env, LIMITLESS_INVOCATION: marker },
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      const ready = (child: ChildProcess) =>
+        new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
+      const older = holder();
+      const spawnedAt = darwinClock();
+      const newer = holder();
+      try {
+        await Promise.all([ready(older), ready(newer)]);
+        const [olderPid, newerPid] = [older.pid, newer.pid];
+        if (olderPid === undefined || newerPid === undefined) throw new Error("holder did not start");
+        const scan = (since: bigint) =>
+          markedDarwinProcesses(
+            process.getuid?.() ?? 0,
+            marker,
+            newerPid,
+            0,
+            [realpathSync(dir)],
+            null,
+            darwinCallerAncestors(),
+            since,
+          );
+        expect(scan(0n)).toEqual(expect.arrayContaining([olderPid, newerPid]));
+        const found = scan(spawnedAt);
+        expect(found).toContain(newerPid);
+        expect(found).not.toContain(olderPid);
+      } finally {
+        older.kill("SIGKILL");
+        newer.kill("SIGKILL");
       }
     },
   );
@@ -1713,24 +1780,38 @@ describe("audit hardening", () => {
     expect(rules).toContain("test-moved-out:block");
   });
 
-  test("changing a script a gate runs is blocked", () => {
-    const f = auditDiff(diff([{ status: "M", path: "package.json" }]), {
-      taskClass: "bugfix",
-      protectedPaths: [],
-      gateScripts: {
-        before: { test: "bun test", lint: "biome check ." },
-        after: { test: "true", lint: "biome check ." },
-      },
-    });
-    expect(f).toEqual([
-      {
-        rule: "gate-script-changed",
-        severity: "block",
-        file: "package.json",
-        detail: 'Changed the "test" script that a factory check runs ("bun test" → "true").',
-      },
-    ]);
-  });
+  test.each([
+    [
+      "changing",
+      { test: "true", lint: "biome check ." },
+      ['Changed the "test" script that a factory check runs ("bun test" → "true").'],
+    ],
+    [
+      "removing",
+      {},
+      [
+        'Removed the "test" script that a factory check runs.',
+        'Removed the "lint" script that a factory check runs.',
+      ],
+    ],
+  ] as [string, Record<string, string>, string[]][])(
+    "%s a script a gate runs is blocked",
+    (_kind, after, details) => {
+      const f = auditDiff(diff([{ status: "M", path: "package.json" }]), {
+        taskClass: "bugfix",
+        protectedPaths: [],
+        gateScripts: { before: { test: "bun test", lint: "biome check ." }, after },
+      });
+      expect(f).toEqual(
+        details.map((detail) => ({
+          rule: "gate-script-changed",
+          severity: "block",
+          file: "package.json",
+          detail,
+        })),
+      );
+    },
+  );
 
   test("skip markers inside string literals are not flagged", () => {
     const patch = [

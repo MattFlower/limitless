@@ -11,8 +11,8 @@ import { parseArtifact } from "./shadow-report.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 
 const SHADOW_MIN_HEADROOM = 0.1;
-/** How long aborted calls get to record their spend before the artifact is written without it. */
-const SETTLE_MS = 5_000;
+/** How long aborted calls get to record their spend before the artifact is written without it (tests shorten it). */
+export const shadowSettle = { ms: 5_000 };
 export type ShadowDeps = (system: ReviewSystem) => ReviewDeps<InvokeOutcome>;
 
 export async function shadowReview(
@@ -96,7 +96,7 @@ export async function shadowReview(
   clearTimeout(timer);
   abort.abort();
   if (ctx.signal.aborted) return;
-  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, SETTLE_MS).unref())]);
+  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, shadowSettle.ms).unref())]);
   if (record.status !== "completed") ctx.log(`Shadow panel ${record.status}: ${record.reason}`, "warn");
   const spent = guard.ids.flatMap((id) => store.getInvocation(id) ?? []);
   const cost = (key: "costUsd" | "costEquivUsd") => spent.reduce((total, i) => total + i[key], 0);

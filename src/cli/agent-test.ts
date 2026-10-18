@@ -120,7 +120,13 @@ export function realExecutable(name: string, path: string, wrapperDir: string): 
   return null;
 }
 
-const PRECONNECTION_SOCKET_CODES = new Set(["ECONNREFUSED", "ConnectionRefused", "FailedToOpenSocket"]);
+// EPERM: a sandbox refused connect() itself, as Claude's reader sandbox does for loopback and sockets.
+const PRECONNECTION_SOCKET_CODES = new Set([
+  "ECONNREFUSED",
+  "ConnectionRefused",
+  "FailedToOpenSocket",
+  "EPERM",
+]);
 const UNIX_PATH_MISSING_CODES = new Set(["ENOENT", "ENOTDIR"]);
 
 function preconnectionFailure(error: unknown, socket: boolean): boolean {

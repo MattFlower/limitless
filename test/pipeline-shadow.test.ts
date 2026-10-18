@@ -17,7 +17,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { invokeGuard, RunContext, type RunState } from "../src/pipeline/context.ts";
-import { shadowReview } from "../src/pipeline/review-shadow.ts";
+import { shadowReview, shadowSettle } from "../src/pipeline/review-shadow.ts";
 import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -343,8 +343,8 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     expect(on.cost).toBeCloseTo(off.cost + 0.6, 6);
   });
 
+  // Headroom below the floor is covered by the quota-lost test next.
   test.each([
-    [0.05, "skipped"],
     [0.1, "skipped"],
     [0.11, "completed"],
   ] as const)("headroom %d: shadow work is %s at the 0.1 floor", async (headroom, status) => {
@@ -640,9 +640,9 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     f.deps.cfg.reviewRosters = { ...f.deps.cfg.reviewRosters, quick };
     Object.assign(f.tracker.def("beta") ?? {}, { maxConcurrent: 4 });
   };
+  // An unavailable reply shares timeout's circuit-breaker branch (#263) and quota's fallback branch.
   const failures: Record<string, FakeReply> = {
     timeout: { fault: "timeout" },
-    unavailable: { status: "unavailable", error: "overloaded" },
     rejected: { status: "error", error: "model_not_found" },
     exhausted: {
       status: "quota",
@@ -706,8 +706,17 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     },
   );
 
-  // Six full pipeline runs (about 17 s alone), so under the parallel suite it needs more than 30 s.
+  // Four full pipeline runs; under the parallel suite they can need more than 30 s.
   test("quota headroom is checked only for providers the shadow roster can reach, and unknown headroom skips it", async () => {
+    // The single review approves at once: the first round's shadow shows each decision.
+    const approvedAtOnce = (calls: Calls): Handler => {
+      const base = scenario(calls);
+      return (s) => {
+        if (isShadowCall(s) || roleOf(s) !== "review") return base(s);
+        calls.primary.push(s);
+        return { structured: approve, costEquivUsd: 1 };
+      };
+    };
     const omega: ProviderDef = {
       id: "omega",
       label: "Omega",
@@ -720,7 +729,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       const alpha = models[0] as ModelDef;
       factory = new Factory(cfg, {
         confinement: fakeConfinement,
-        harnesses: { fake: fakeHarness(scenario(calls)) },
+        harnesses: { fake: fakeHarness(approvedAtOnce(calls)) },
         providers: [...providers, omega].map((p) =>
           unlimited.includes(p.id) ? { ...p, quota: "unlimited" } : p,
         ),
@@ -744,22 +753,18 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       return { shadow: JSON.parse(f.store.getArtifact(run.id, "review-0.shadow.json") ?? "null"), calls };
     };
-    // Omega is enabled but no review route reaches it: unknown or low there never skips the shadow.
-    expect((await outcome(["alpha", "beta"])).shadow.status).toBe("completed");
+    // Omega is enabled but no review route reaches it: unknown and low there never skip the shadow.
     expect((await outcome(["alpha", "beta"], "omega")).shadow.status).toBe("completed");
     const noLimit = await outcome([], undefined, ["alpha", "beta"]);
     expect(noLimit.shadow.status).toBe("completed");
     expect(noLimit.calls.shadow.length).toBeGreaterThan(0);
-    expect((await outcome([], undefined, ["alpha"])).shadow).toMatchObject({
-      status: "skipped",
-      reason: "beta quota headroom is unknown",
-    });
-    // Beta is the roster's route, alpha a fallback (and verifier) route: either unknown skips it.
-    for (const [observed, reason] of [
-      [["alpha"], "beta quota headroom is unknown"],
-      [["beta"], "alpha quota headroom is unknown"],
+    // Beta is the roster's route, alpha a fallback (and verifier) route: either unknown skips it,
+    // whether the other is known from its windows or because it has no quota limit.
+    for (const [observed, unlimited, reason] of [
+      [[], ["alpha"], "beta quota headroom is unknown"],
+      [["beta"], [], "alpha quota headroom is unknown"],
     ] as const) {
-      const { shadow, calls } = await outcome([...observed]);
+      const { shadow, calls } = await outcome([...observed], undefined, [...unlimited]);
       expect(shadow).toMatchObject({ status: "skipped", reason, usage: { invocations: 0 } });
       expect(calls.shadow.length + calls.verifier.length).toBe(0);
     }
@@ -903,37 +908,44 @@ describe("review shadow panel: single reviews decide, the panel only records", (
   });
 
   test("a shadow call still running after its abort never holds the run past the grace period or touches its worktree", async () => {
-    const calls = newCalls();
-    const { handler, slow, release } = slowShadow(calls, Promise.resolve(), true);
-    const f = start(handler);
-    shadowOn(f);
-    slowRoster(f);
-    // Long enough for the fast finder to be recorded; at 0 that raced the single review's completion.
-    f.deps.cfg.reviewShadowGraceSeconds = 0.5;
-    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    const stage = f.store.listStages(run.id).find((st) => st.name === "review");
-    // Past the grace, aborted calls get at most 5 s to record their spend; this one never does.
-    expect((stage?.finishedAt ?? Infinity) - (stage?.startedAt ?? 0)).toBeLessThan(8_000);
-    const stored = f.store.getArtifact(run.id, "review-0.shadow.json");
-    expect(JSON.parse(stored ?? "null")).toMatchObject({
-      status: "timeout",
-      finished: [{ finder: 0, status: "ok" }],
-      usage: { invocations: 2, partial: true },
-    });
-    // The pending call reads its own checkout of the reviewed commit, not the run's worktree.
-    const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
-    expect(slow[0]?.signal.aborted).toBe(true);
-    expect(slow[0]?.cwd).not.toBe(worktree);
-    expect(slow[0]?.cwd).not.toContain(worktree ?? "?");
-    for (const done of release) done();
-    const deadline = Date.now() + 5_000;
-    while ((f.tracker.status("beta")?.inFlight ?? 0) > 0 && Date.now() < deadline) await Bun.sleep(10);
-    expect(f.tracker.status("beta")?.inFlight).toBe(0);
-    expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBe(stored);
-    // Its checkout goes once its last call ends.
-    while (existsSync(slow[0]?.cwd ?? "") && Date.now() < deadline) await Bun.sleep(10);
-    expect(existsSync(slow[0]?.cwd ?? "")).toBe(false);
+    // This call never settles, so the settle wait only adds time; shorten it here.
+    const settle = shadowSettle.ms;
+    shadowSettle.ms = 100;
+    try {
+      const calls = newCalls();
+      const { handler, slow, release } = slowShadow(calls, Promise.resolve(), true);
+      const f = start(handler);
+      shadowOn(f);
+      slowRoster(f);
+      // Long enough for the fast finder to be recorded; at 0 that raced the single review's completion.
+      f.deps.cfg.reviewShadowGraceSeconds = 0.5;
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const stage = f.store.listStages(run.id).find((st) => st.name === "review");
+      // Past the grace, aborted calls get only the settle wait to record their spend; this one never does.
+      expect((stage?.finishedAt ?? Infinity) - (stage?.startedAt ?? 0)).toBeLessThan(5_000);
+      const stored = f.store.getArtifact(run.id, "review-0.shadow.json");
+      expect(JSON.parse(stored ?? "null")).toMatchObject({
+        status: "timeout",
+        finished: [{ finder: 0, status: "ok" }],
+        usage: { invocations: 2, partial: true },
+      });
+      // The pending call reads its own checkout of the reviewed commit, not the run's worktree.
+      const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
+      expect(slow[0]?.signal.aborted).toBe(true);
+      expect(slow[0]?.cwd).not.toBe(worktree);
+      expect(slow[0]?.cwd).not.toContain(worktree ?? "?");
+      for (const done of release) done();
+      const deadline = Date.now() + 5_000;
+      while ((f.tracker.status("beta")?.inFlight ?? 0) > 0 && Date.now() < deadline) await Bun.sleep(10);
+      expect(f.tracker.status("beta")?.inFlight).toBe(0);
+      expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBe(stored);
+      // Its checkout goes once its last call ends.
+      while (existsSync(slow[0]?.cwd ?? "") && Date.now() < deadline) await Bun.sleep(10);
+      expect(existsSync(slow[0]?.cwd ?? "")).toBe(false);
+    } finally {
+      shadowSettle.ms = settle;
+    }
   }, 20_000);
 
   test("an aborted shadow call that settles soon after has its final spend in the artifact", async () => {
