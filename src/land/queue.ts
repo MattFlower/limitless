@@ -337,6 +337,8 @@ export class LandQueue {
       const fresh = await this.mergeMetadata(entry.prUrl, signal);
       signal.throwIfAborted();
       if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) return;
+      if (fresh?.url === entry.prUrl && fresh.headRefOid === entry.pushedSha && fresh.state === "CLOSED")
+        throw new LandBlocked("PR was closed without merging");
       if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
         throw new LandBlocked("cannot confirm current GitHub merge state");
       if (fresh.state === "MERGED") {

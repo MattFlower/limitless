@@ -1287,7 +1287,7 @@ test("a restart during merging takes an already merged PR as landed without merg
   }
 });
 
-test.each(["different head", "missing head", "failed lookup", "missing state", "wrong URL"])(
+test.each(["different head", "missing head", "failed lookup", "missing state", "wrong URL", "closed PR"])(
   "recovery blocks a stale green snapshot after a fresh %s",
   async (scenario) => {
     const pr = delivered(1, "pr-1");
@@ -1312,8 +1312,9 @@ test.each(["different head", "missing head", "failed lookup", "missing state", "
         if (scenario === "failed lookup") throw new Error("lookup failed");
         return {
           url: scenario === "wrong URL" ? url(2) : url(1),
-          state: scenario === "missing state" ? "" : "MERGED",
-          headRefOid: scenario === "missing head" ? undefined : "b".repeat(40),
+          state: scenario === "missing state" ? "" : scenario === "closed PR" ? "CLOSED" : "MERGED",
+          headRefOid:
+            scenario === "missing head" ? undefined : scenario === "closed PR" ? head : "b".repeat(40),
           mergedAt: null,
           mergedBy: null,
           ci: "SUCCESS",
@@ -1328,7 +1329,9 @@ test.each(["different head", "missing head", "failed lookup", "missing state", "
       state: "blocked",
       reason: ["different head", "missing head"].includes(scenario)
         ? "merged PR head is missing or differs from the pushed SHA"
-        : "cannot confirm current GitHub merge state",
+        : scenario === "closed PR"
+          ? "PR was closed without merging"
+          : "cannot confirm current GitHub merge state",
     });
     expect(store.getRun(pr.run.id)).toMatchObject({ status: "needs_human", merged: false });
     expect(ghCalls("pr merge")).toEqual([]);
