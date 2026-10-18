@@ -678,7 +678,7 @@ exec '${realGit}' "$@"
         expect(f.store.listStages(id).find((s) => s.name === "gates")).toMatchObject({
           status: "failed",
           round: 0,
-          summary: expect.stringContaining("could not lstat"),
+          summary: expect.stringContaining("Command failed"),
         });
       }
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
@@ -1701,7 +1701,11 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     f.scheduler.start();
   `,
   );
-  const child = Bun.spawn([process.execPath, worker], { stdout: "ignore", stderr: "pipe" });
+  // Bun's test preload is not inherited by the daemon subprocess.
+  const child = Bun.spawn(
+    [process.execPath, `--preload=${join(import.meta.dir, "git-preload.ts")}`, worker],
+    { stdout: "ignore", stderr: "pipe" },
+  );
   let gatePid: number | undefined;
   const groupSignals: number[] = [];
   const kill = process.kill.bind(process);
@@ -2229,12 +2233,13 @@ test("GitHub retries SSH temporary DNS failures", async () => {
 });
 
 test("the budget bounds retries and waits, never a call's first attempt or a healthy slow call", async () => {
+  const realGit = realpathSync(Bun.which("git") ?? "git");
   const restore = fakeGh(join(root, "pr"));
   // A healthy push that takes longer than the budget left still completes on its own timeout.
   writeFileSync(
     join(root, "bin", "git"),
-    // The wrapper's own lookups (version, config, repository) reach real git; anything else is the push.
-    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\ncase "$command" in config|rev-parse|var|--version) exec /usr/bin/git "$@";; esac\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    // Resolve and bundle a real commit; only the remote push spends the simulated network time.
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" != push ]; then exec '${realGit}' "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
     {
       mode: 0o755,
     },
@@ -2244,11 +2249,11 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   >[0];
   const budget = { leftMs: 100 };
   try {
-    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    await pushBranch(repo, source, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(1);
     expect(budget.leftMs).toBeLessThan(0);
     // With the budget spent, the next call's first attempt still runs (as on main); only retries stop.
-    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    await pushBranch(repo, source, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(2);
   } finally {
     await restore();

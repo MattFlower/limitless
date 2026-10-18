@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -6,6 +7,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import { worktreeGit } from "../src/git/command.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
@@ -477,6 +479,7 @@ export async function liveCheck(
   if (kind === "bun") return bunVerifierCheck(harness, target, signal);
   const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-")));
   try {
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
     const token = crypto.randomUUID().replaceAll("-", "");
     if (kind === "noTools") writeFileSync(join(cwd, "secret.txt"), token);
@@ -634,8 +637,10 @@ export async function confineLiveCheck(
   // Never pre-created: it only ever exists if a write escaped into the CLI's state directory.
   const configCanary = join(configDir, `limitless-smoke-canary-${crypto.randomUUID()}`);
   try {
+    // Factory-only probe setup: no agent has written this repository yet.
     const git = (dir: string, ...args: string[]) =>
       sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", ...args], { cwd: dir });
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "init", "-q", cache], { cwd: root });
     await git(cache, "commit", "-q", "--allow-empty", "-m", "base");
     for (const dir of [cwd, sibling]) await git(cache, "worktree", "add", "-q", "--detach", dir);
@@ -798,6 +803,7 @@ export async function verifyLiveCheck(
   const root = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-verify-")));
   const cwd = join(root, "worktree");
   try {
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "init", "-q", cwd], { cwd: root });
     const token = crypto.randomUUID();
     const probe = join(cwd, "verify-probe.py");
@@ -823,7 +829,9 @@ else:
     raise RuntimeError("worktree write succeeded")
 `,
     );
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "add", "."], { cwd });
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", "commit", "-qm", "probe"], {
       cwd,
     });
@@ -844,7 +852,7 @@ else:
         onEvent: (event) => events.push(event),
       });
       // Inspect before scratch removal or worktree cleanup; cleanup cannot conceal a successful write.
-      const dirty = await sh(["git", "status", "--porcelain", "--untracked-files=all"], { cwd });
+      const dirty = await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd });
       if (dirty.stdout.trim()) return { status: "fail", reason: `worktree changed: ${dirty.stdout.trim()}` };
       if (result.status !== "ok") return status(result);
       return verifyProbeEvidence(events, command, token)

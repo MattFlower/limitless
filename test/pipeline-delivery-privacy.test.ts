@@ -388,7 +388,11 @@ exec '${gitBin}' "$@"
     );
     const realProcess = proc.runProcess;
     const scan = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
-      if (!armed || opts.cmd.join(" ") !== "git --no-replace-objects cat-file --batch")
+      if (
+        !armed ||
+        !opts.cmd.includes("--no-replace-objects") ||
+        opts.cmd.slice(-2).join(" ") !== "cat-file --batch"
+      )
         return realProcess(opts);
       const scope = proc.processScope.getStore();
       if (!scope) throw new Error("blob scan missing run process scope");

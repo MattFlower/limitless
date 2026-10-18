@@ -148,6 +148,7 @@ export async function harden(
   git: string[],
   opts: Options,
   lookup: () => Promise<string[]>,
+  run = sh,
 ): Promise<Hardening> {
   const env = opts.env ?? (process.env as Record<string, string>);
   const vars = configEnv(env);
@@ -159,10 +160,10 @@ export async function harden(
   if (cached && fresh(cached)) return cached;
   // A caller arriving during another's listing waits for it, then checks the cache like any caller.
   const listing = listings.get(key);
-  const retry = () => harden(git, opts, lookup);
+  const retry = () => harden(git, opts, lookup, run);
   if (listing) return listing.then(retry, retry);
   entries.delete(key);
-  const pending = refresh(git, opts, lookup, env, vars, key, cached?.sources.keys() ?? []);
+  const pending = refresh(git, opts, lookup, env, vars, key, cached?.sources.keys() ?? [], run);
   listings.set(key, pending);
   return pending.finally(() => listings.delete(key));
 }
@@ -175,9 +176,10 @@ async function refresh(
   vars: string,
   key: string,
   previous: Iterable<string>,
+  run: typeof sh,
 ): Promise<Hardening> {
   // Relative GIT_CONFIG_GLOBAL/SYSTEM paths are resolved by git against the command's directory.
-  const files = (await (configFiles.get(vars) ?? gitConfigFiles(vars, opts, env)))?.map((f) =>
+  const files = (await (configFiles.get(vars) ?? gitConfigFiles(vars, opts, env, run)))?.map((f) =>
     resolve(opts.cwd, f),
   );
   if (!files) return { hooks: await lookup(), emptyTree: null };
@@ -186,7 +188,7 @@ async function refresh(
     // Sources must read the same before and after the listing, or a concurrent edit could hide.
     const before = new Map(known.map((path) => [path, snapshot(path)]));
     const located = locate(opts.cwd, git, env);
-    const listed = await list(git, opts, env, files);
+    const listed = await list(git, opts, env, files, run);
     if (!listed.parsed) return { hooks: await lookup(), emptyTree: listed.emptyTree };
     const { sources, hooks, emptyTree, where } = listed;
     if (
@@ -210,8 +212,13 @@ async function refresh(
   }
 }
 
-function gitConfigFiles(vars: string, opts: Options, env: Record<string, string>): Promise<string[] | null> {
-  const query = (name: string) => sh(["git", "var", name], { ...opts, signal: undefined, allowFail: true });
+function gitConfigFiles(
+  vars: string,
+  opts: Options,
+  env: Record<string, string>,
+  run: typeof sh,
+): Promise<string[] | null> {
+  const query = (name: string) => run(["git", "var", name], { ...opts, signal: undefined, allowFail: true });
   const files = Promise.all([query("GIT_CONFIG_SYSTEM"), query("GIT_CONFIG_GLOBAL")]).then(
     ([system, global]) => {
       // A killed query says nothing about git: forget it. Git before 2.42 lacks these variables,
@@ -233,7 +240,13 @@ function gitConfigFiles(vars: string, opts: Options, env: Record<string, string>
 }
 
 /** One listing of every config entry with its origin; `sources` is null when the result can't be pinned. */
-async function list(git: string[], opts: Options, env: Record<string, string>, files: string[]) {
+async function list(
+  git: string[],
+  opts: Options,
+  env: Record<string, string>,
+  files: string[],
+  run: typeof sh,
+) {
   const rev = [
     "rev-parse",
     "--path-format=absolute",
@@ -243,8 +256,8 @@ async function list(git: string[], opts: Options, env: Record<string, string>, f
   ];
   const [revParse, config] = await Promise.all([
     // Outside a repository git still reads system and global config, but nothing pins the result.
-    sh([...git, ...rev], { ...opts, allowFail: true }),
-    sh([...git, "config", "--list", "--show-origin", "--show-scope", "--includes", "-z"], opts),
+    run([...git, ...rev], { ...opts, allowFail: true }),
+    run([...git, "config", "--list", "--show-origin", "--show-scope", "--includes", "-z"], opts),
   ]);
   const lines = revParse.stdout.split("\n");
   const [gitDir = "", commonDir = "", format = ""] = lines;

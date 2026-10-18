@@ -13,6 +13,7 @@ private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strin
 # The checkout's own CLI: `limitless` need not be on PATH.
 cli="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/cli/main.ts"
 cd "$dir"
+confined_git="$(dirname "$private_check")/git-confined.ts"
 checker=""
 push_repo=""
 trap '[ -z "$push_repo" ] || rm -rf -- "$push_repo"' EXIT
@@ -21,15 +22,16 @@ trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$chec
 check_private() { (cd "${check_dir:-$PWD}"; exec bun --config=/dev/null --no-env-file "$private_check" "$@") & checker=$!; wait "$checker"; checker=""; }
 # Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
 export LIMITLESS_GIT_EMPTY_HOOK=""
+git_exec() { bun --config=/dev/null --no-env-file "$confined_git" "$@"; }
 safe_git() {
   # Key names never contain newlines (git forbids them in subsections); no temp files, which confined runs can't create.
   local keys key flags=()
-  keys="$(git config --name-only --get-regexp '^(hook|filter)\.' 2>/dev/null)" || [ $? = 1 ] || { echo "Cannot read git config; refusing to land" >&2; return 1; }
+  keys="$(git_exec config --name-only --get-regexp '^(hook|filter)\.' 2>/dev/null)" || [ $? = 1 ] || { echo "Cannot read git config; refusing to land" >&2; return 1; }
   set -f
   local IFS=$'\n'
   for key in $keys; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done
   set +f
-  git --no-pager -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
+  git_exec --no-pager -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
     ${flags[@]+"${flags[@]}"} "$@"
 }
 if ! admin="$(git rev-parse --absolute-git-dir 2>/dev/null)" || ! admin="$(cd "$admin" && pwd -P)" ||
@@ -124,7 +126,12 @@ if [ -n "$dirty" ]; then
 fi
 # A PR process still running as the user can act as the user directly; this script
 # cannot defend against it. The land queue runs checks confined instead.
-safe_git -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
+# Remote transport runs only from the factory-owned push repository, with no worktree operations.
+keys="$(safe_git config --name-only --get-regexp '^(hook|filter)\.' 2>/dev/null)" || [ $? = 1 ] || exit 1
+flags=()
+while IFS= read -r key; do [ -z "$key" ] || flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done <<< "$keys"
+git --no-pager -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
+  ${flags[@]+"${flags[@]}"} -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
   push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.

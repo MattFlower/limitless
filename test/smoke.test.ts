@@ -34,6 +34,7 @@ import {
   verifyLiveCheck,
 } from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
+import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
@@ -1786,3 +1787,46 @@ for (const outcome of [
     }
   });
 }
+
+test("verify smoke confines git after the harness has run", async () => {
+  const root = mkdtempSync(join(tmpdir(), "smoke-git-boundary-"));
+  const marker = join(root, "marker");
+  const helper = join(root, "fsmonitor");
+  writeFileSync(helper, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+  let calls = 0;
+  try {
+    await expect(
+      gitConfinement.run(
+        {
+          wrap: async (cmd) => {
+            if (cmd.includes("status")) {
+              calls++;
+              throw new ConfinementError("smoke inspection refused");
+            }
+            return cmd;
+          },
+        },
+        () =>
+          verifyLiveCheck(
+            async (spec) => {
+              await sh(["git", "config", "core.fsmonitor", helper], { cwd: spec.cwd });
+              return result;
+            },
+            {
+              modelId: "fake/m",
+              provider: "fake",
+              model: "m",
+              vendor: "fake",
+              tier: 4,
+              harness: "fake",
+              billing: "subscription",
+            },
+          ),
+      ),
+    ).rejects.toThrow("smoke inspection refused");
+    expect(calls).toBe(1);
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

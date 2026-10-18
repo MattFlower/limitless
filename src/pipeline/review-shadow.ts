@@ -2,8 +2,8 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ResolvedProfile, ReviewSystem } from "../core/types.ts";
 import { redactGateOutput } from "../gates/output.ts";
+import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree } from "../git/repos.ts";
-import { sh } from "../util/proc.ts";
 import { type InvokeOutcome, invokeGuard, NoCapacityError, type RunContext } from "./context.ts";
 import { type ReviewDeps, type ReviewInput, runReview } from "./review.ts";
 import { configuredReviewSystem } from "./review-system.ts";
@@ -75,7 +75,7 @@ export async function shadowReview(
         // Only now, after its last call ends, possibly after the run moved on.
         if (parent) rmSync(parent, { recursive: true, force: true });
         const { worktreePath: cwd } = ctx.state;
-        if (parent && cwd) await sh(["git", "worktree", "prune"], { cwd, allowFail: true });
+        if (parent && cwd) await worktreeGit(["git", "worktree", "prune"], { cwd, allowFail: true });
       }
     })
     .catch((error) => ({ status: "error", reason: String(error), finished }));

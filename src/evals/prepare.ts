@@ -40,6 +40,7 @@ export async function gatesAt(cwd: string, revision: string, signal: AbortSignal
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir);
   try {
+    // Factory-created eval checkout: no agent or candidate has written it during preparation.
     const tree = await sh(["git", "ls-tree", "-z", revision], { cwd, signal });
     for (const entry of tree.stdout.split("\0").filter(Boolean)) {
       const [meta = "", name = ""] = entry.split("\t");
@@ -48,6 +49,7 @@ export async function gatesAt(cwd: string, revision: string, signal: AbortSignal
       else if (type === "blob")
         writeFileSync(
           join(dir, name),
+          // Factory-only preparation, before any candidate writes the repository.
           GATE_FILES.has(name) ? (await sh(["git", "cat-file", "blob", oid], { cwd, signal })).stdout : "",
         );
     }
@@ -89,6 +91,7 @@ export async function prepareCase(
     };
   }
   if (patch !== undefined) {
+    // Factory-only seed application, before any agent or candidate writes the checkout.
     await sh(["git", "apply", "--index", "-"], { cwd, stdin: patch, signal });
     await worktreeGit(
       [
