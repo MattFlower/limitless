@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { launchFailure } from "../gates/output.ts";
+import { launchFailureScan } from "../gates/output.ts";
 import { agentEnv, invocationScratch, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import {
   ancestorReadPolicy,
@@ -253,8 +253,14 @@ export async function runSandboxed(
   const lineLimit = opts.maxLineLength ?? Infinity;
   const forwardLine = (line: string, onLine?: (line: string) => void) =>
     onLine?.(line.length > lineLimit ? `${line.slice(0, lineLimit)} [truncated]` : line);
+  // Raw streams, before redaction and tail cuts, as gate classification scans them.
+  const launch = launchFailureScan();
   const payload: ProcOptions = {
     ...opts,
+    onRawChunk: (chunk, stream) => {
+      launch.observe(chunk, stream);
+      opts.onRawChunk?.(chunk, stream);
+    },
     // The startup token must fit even when candidate output has a smaller cap.
     maxLineLength: Math.max(lineLimit, token.length),
     cmd: [
@@ -277,7 +283,7 @@ export async function runSandboxed(
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
   if (!started) {
     // Our cancel stopped the launch before the trusted shell ran, so the payload never did.
-    if (killedByCancel(result)) return result;
+    if (killedByCancel(result) && !launch.failed()) return result;
     throw new ConfinementError(
       `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
     );
@@ -286,16 +292,17 @@ export async function runSandboxed(
 }
 
 /**
- * A cancel's termination freezes, then SIGKILLs the invocation (`runProcess`). An exit, a timeout,
- * another signal or a Seatbelt diagnostic is a failed launch even when a cancel arrived with it.
+ * A cancel's termination freezes, then SIGKILLs the invocation (`runProcess`), and `cancelKilled`
+ * records that the cancel began it while the child still ran. An exit, a timeout, another signal,
+ * a child that was already dead or a Seatbelt diagnostic is a failed launch even with a cancel.
  */
 const killedByCancel = (result: ProcResult): boolean =>
   result.cancelled &&
+  result.cancelKilled === true &&
   !result.timedOut &&
   !result.idleTimedOut &&
   result.exitCode === null &&
-  result.signal === "SIGKILL" &&
-  !launchFailure(result.stderr);
+  result.signal === "SIGKILL";
 
 /** Keep installed toolchains readable; writable package caches belong to the suite scratch. */
 export async function runConfined(

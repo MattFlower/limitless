@@ -22,7 +22,9 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
+import { runProcess } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { deferred } from "./evals-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 
 const fixture = (name: string) =>
@@ -233,36 +235,46 @@ const heldLaunch = (beforeSpawn = () => {}, chatty = false): ConfinementBackend 
     return ["/bin/sh", "-c", `${hold}; exec "$@"`, "sh", ...cmd];
   },
 });
-const heldEdit = (backend: ConfinementBackend, signal: AbortSignal) =>
+const heldEdit = (
+  backend: ConfinementBackend,
+  signal: AbortSignal,
+  onEvent: (event: AgentEvent) => void = () => {},
+  processRunner = runProcess,
+) =>
   confinementScope.run(backend, () =>
     withScratch(import.meta.dir, (scratchDir) => {
       const home = join(dirname(scratchDir), "home");
       mkdirSync(home);
       return readPolicyScope.run({ ...testReadPolicy, home, environment: {} }, () =>
-        runClaude({
-          cwd: import.meta.dir,
-          scratchDir,
-          prompt: "test",
-          mode: "edit",
-          logPath: join(scratchDir, "inv.log"),
-          target: {
-            modelId: "claude/test",
-            provider: "claude",
-            harness: "claude",
-            model: "claude-test",
-            vendor: "anthropic",
-            tier: 4,
-            billing: "subscription",
+        runClaude(
+          {
+            cwd: import.meta.dir,
+            scratchDir,
+            prompt: "test",
+            mode: "edit",
+            logPath: join(scratchDir, "inv.log"),
+            target: {
+              modelId: "claude/test",
+              provider: "claude",
+              harness: "claude",
+              model: "claude-test",
+              vendor: "anthropic",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 30_000,
+            idleTimeoutMs: 50,
+            maxToolCalls: 1,
+            signal,
+            onEvent,
           },
-          timeoutMs: 30_000,
-          idleTimeoutMs: 50,
-          maxToolCalls: 1,
-          signal,
-          onEvent: () => {},
-        }),
+          processRunner,
+        ),
       );
     }),
   );
+const watchdogFired = (event: AgentEvent) =>
+  event.type === "status" && event.text.startsWith("stopping agent: no progress");
 
 test("a claude editor whose sandbox hangs until the no-progress watchdog fires is a confinement error", async () => {
   const caller = new AbortController();
@@ -270,6 +282,39 @@ test("a claude editor whose sandbox hangs until the no-progress watchdog fires i
     "Write confinement payload did not start: no progress",
   );
   expect(caller.signal.aborted).toBe(false);
+});
+
+test("the first abort decides: a watchdog stop followed by a caller cancel is still a confinement error", async () => {
+  const caller = new AbortController();
+  // The caller cancels right after the watchdog, before the hung launch has been cleaned up.
+  const onEvent = (event: AgentEvent) => {
+    if (watchdogFired(event)) caller.abort();
+  };
+  await expect(heldEdit(heldLaunch(undefined, true), caller.signal, onEvent)).rejects.toThrow(
+    "Write confinement payload did not start: no progress",
+  );
+  expect(caller.signal.aborted).toBe(true);
+});
+
+test("the first abort decides: a caller cancel followed by the watchdog during cleanup ends cancelled", async () => {
+  const caller = new AbortController();
+  const fired = deferred<void>();
+  const onEvent = (event: AgentEvent) => {
+    if (watchdogFired(event)) fired.resolve();
+  };
+  // The launch ends at the caller's cancel; cleanup outlasts the watchdog's next check.
+  const slowCleanup: typeof runProcess = async (opts) => {
+    const result = await runProcess(opts);
+    await fired.promise;
+    return result;
+  };
+  const result = await heldEdit(
+    heldLaunch(() => caller.abort()),
+    caller.signal,
+    onEvent,
+    slowCleanup,
+  );
+  expect(result.status).toBe("cancelled");
 });
 
 test("a caller cancel while a claude editor's sandbox starts ends the run cancelled", async () => {

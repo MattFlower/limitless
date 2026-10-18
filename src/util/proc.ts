@@ -433,6 +433,11 @@ export interface ProcResult {
   stdoutTruncated?: boolean;
   stderrTruncated?: boolean;
   durationMs: number;
+  /**
+   * The cancel began this invocation's termination while its child was still running (not exited
+   * and not a zombie), so the cancel's own kill ended it. False whenever that can't be shown.
+   */
+  cancelKilled?: boolean;
 }
 
 const DEFAULT_TAIL = 64_000;
@@ -474,6 +479,18 @@ function lineSplitter(onLine?: (line: string) => void, limit = Infinity) {
       discarding = false;
     },
   };
+}
+
+/** Whether `pid` is still running (not exited, not a zombie); false when that can't be shown. */
+function stillRunning(pid: number): boolean {
+  try {
+    if (darwin) return darwin.captureDarwinInvocationLeader(pid) !== null;
+    if (inspectionPlatform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return !stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+    }
+  } catch {}
+  return false;
 }
 
 /**
@@ -534,6 +551,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     let stdout = "";
     let stderr = "";
     let cancelled = false;
+    let cancelKilled = false;
     let timedOut = false;
     let idleTimedOut = false;
     let settled = false;
@@ -613,6 +631,13 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
     const onAbort = () => {
       cancelled = true;
+      // Only a cancel that starts the shutdown of a live child is the cause of its death.
+      cancelKilled =
+        shutdown === undefined &&
+        child.exitCode === null &&
+        child.signalCode === null &&
+        child.pid !== undefined &&
+        stillRunning(child.pid);
       void terminate();
     };
     // After finishTimers exists: a pre-aborted signal can fail termination synchronously.
@@ -699,6 +724,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         exitCode: code,
         signal: sig,
         cancelled,
+        cancelKilled,
         timedOut,
         idleTimedOut,
         stdout,

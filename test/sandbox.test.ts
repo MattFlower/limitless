@@ -37,8 +37,17 @@ import {
   withCommandScratch,
 } from "../src/harness/sandbox.ts";
 import { writeRoots } from "../src/harness/scratch.ts";
-import { agentEnv, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import {
+  agentEnv,
+  type ProcOptions,
+  type ProcResult,
+  processBirth,
+  processBirthInspection,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { deferred } from "./evals-support.ts";
 import { test } from "./read-policy-support.ts";
 
 // Real git and sandboxed subprocesses.
@@ -956,6 +965,8 @@ test("a backend startup failure after successful verification is operational, ne
     proc({ cancelled: true, exitCode: null, signal: "SIGKILL", timedOut: true }),
     proc({ cancelled: true, exitCode: null, signal: "SIGKILL", idleTimedOut: true }),
     proc({ cancelled: true, exitCode: null, signal: "SIGSEGV" }),
+    // A cancel that arrived after the launch already died does not show that the cancel killed it.
+    proc({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" }),
   ]) {
     const abort = new AbortController();
     await expect(
@@ -982,6 +993,49 @@ test("a backend startup failure after successful verification is operational, ne
   );
   expect(result.exitCode).toBe(71);
   expect(result.stdout).toBe("user output");
+});
+
+test("a launch killed by something else before a late cancel stays a confinement error", async () => {
+  // The launcher SIGKILLs itself before the startup shell; a child keeps its pipes open, so the
+  // shutdown is still finding descendants when the cancel arrives.
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => ["/bin/sh", "-c", '(exec sleep 30) & kill -9 $$; exec "$@"', "sh", ...cmd],
+  };
+  const shuttingDown = deferred<void>();
+  const release = deferred<void>();
+  let holding = false;
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  const launch = processBirthInspection.run(
+    {
+      read: async (pid, name) => {
+        if (!holding) {
+          holding = true;
+          shuttingDown.resolve();
+          await release.promise;
+        }
+        return processBirth(pid, name);
+      },
+      now: () => Number.MAX_SAFE_INTEGER,
+    },
+    () =>
+      runSandboxed(
+        { cmd: ["/usr/bin/true"], cwd: work, env: agentEnv(), signal: abort.signal },
+        { write: [work], protect: [] },
+        async (opts) => {
+          seen = await runProcess(opts);
+          return seen;
+        },
+        undefined,
+        held,
+      ),
+  );
+  await shuttingDown.promise;
+  abort.abort();
+  release.resolve();
+  await expect(launch).rejects.toThrow(ConfinementError);
+  expect(seen).toMatchObject({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" });
 });
 
 test.each([false, true])(
