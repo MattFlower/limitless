@@ -290,9 +290,12 @@ async function stopMarkedProcesses(
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
   spawnedAt: bigint,
-): Promise<void> {
+): Promise<boolean> {
   const group = child.pid;
-  if (group === undefined) return;
+  if (group === undefined) return false;
+  // Whether this shutdown's first signal to the direct child reached it while it still ran.
+  let childSignalled = false;
+  let killedRunningChild = false;
   const protectedPids = callerAncestors();
   const started = performance.now();
   const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
@@ -343,10 +346,16 @@ async function stopMarkedProcesses(
         if (birth !== identity.birth) claimed.delete(pid);
         else if (deadline) names.push(`${pid} (${redactCredentials(name)})`);
         else if (!freezing || !identity.stopped) {
+          // Decided at delivery, not when shutdown began: the child may die on its own while
+          // discovery and identity checks run. Unreaped (exitCode null), its pid can't be reused.
+          const first = pid === group && !childSignalled;
+          const running = first && child.exitCode === null && child.signalCode === null && stillRunning(pid);
+          if (first) childSignalled = true;
           try {
             process.kill(pid, freezing ? "SIGSTOP" : "SIGKILL");
             identity.stopped = true;
             identity.frozen = freezing;
+            if (running) killedRunningChild = true;
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
             identity.frozen = false;
@@ -355,7 +364,7 @@ async function stopMarkedProcesses(
       }
       // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
       const exited = child.exitCode !== null || child.signalCode !== null;
-      if (!claimed.size && empty && exited) return;
+      if (!claimed.size && empty && exited) return killedRunningChild;
       empty = !claimed.size && exited;
       if (deadline && claimed.size)
         throw new Error(
@@ -434,8 +443,8 @@ export interface ProcResult {
   stderrTruncated?: boolean;
   durationMs: number;
   /**
-   * The cancel began this invocation's termination while its child was still running (not exited
-   * and not a zombie), so the cancel's own kill ended it. False whenever that can't be shown.
+   * The cancel started this invocation's shutdown, and the shutdown's first signal to the child
+   * reached it while it still ran (not exited, not a zombie). False whenever that can't be shown.
    */
   cancelKilled?: boolean;
 }
@@ -551,6 +560,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     let stdout = "";
     let stderr = "";
     let cancelled = false;
+    let cancelStarted = false;
     let cancelKilled = false;
     let timedOut = false;
     let idleTimedOut = false;
@@ -565,8 +575,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       shutdown ??= (async () => {
         try {
           if (leaderInspectionError) throw leaderInspectionError;
-          if (child.pid !== undefined)
-            await stopMarkedProcesses(
+          if (child.pid !== undefined) {
+            const killedRunningChild = await stopMarkedProcesses(
               marker,
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
@@ -575,6 +585,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               leader,
               spawnedAt,
             );
+            cancelKilled = cancelStarted && killedRunningChild;
+          }
         } catch (error) {
           terminationError = new ProcessTerminationError(
             `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
@@ -631,13 +643,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
     const onAbort = () => {
       cancelled = true;
-      // Only a cancel that starts the shutdown of a live child is the cause of its death.
-      cancelKilled =
-        shutdown === undefined &&
-        child.exitCode === null &&
-        child.signalCode === null &&
-        child.pid !== undefined &&
-        stillRunning(child.pid);
+      // An exit or timeout that already began the shutdown, not this cancel, ends the child.
+      if (shutdown === undefined) cancelStarted = true;
       void terminate();
     };
     // After finishTimers exists: a pre-aborted signal can fail termination synchronously.

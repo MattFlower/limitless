@@ -995,6 +995,110 @@ test("a backend startup failure after successful verification is operational, ne
   expect(result.stdout).toBe("user output");
 });
 
+test("a Seatbelt diagnostic beyond the retained stderr tail still makes a cancelled launch a confinement error", async () => {
+  // Built at runtime so the diagnostic never sits on a source line a failure report would print.
+  const diagnostic = ["sandbox-exec: sandbox_apply", "Operation not permitted"].join(": ");
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    // The diagnostic, then more stderr than runProcess keeps, then a line that triggers the cancel.
+    wrap: (cmd) => [
+      "/bin/sh",
+      "-c",
+      'echo "$1" >&2; head -c 70000 /dev/zero | tr "\\0" x >&2; echo >&2; echo held >&2; sleep 900; shift; exec "$@"',
+      "sh",
+      diagnostic,
+      ...cmd,
+    ],
+  };
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  const launch = runSandboxed(
+    {
+      cmd: ["/usr/bin/true"],
+      cwd: work,
+      env: agentEnv(),
+      signal: abort.signal,
+      onStderrLine: (line) => {
+        if (line === "held") abort.abort();
+      },
+    },
+    { write: [work], protect: [] },
+    async (opts) => {
+      seen = await runProcess(opts);
+      return seen;
+    },
+    undefined,
+    held,
+  );
+  await expect(launch).rejects.toThrow(ConfinementError);
+  // The retained tail no longer holds the diagnostic, and the cancel did kill the launch.
+  expect(seen?.stderr.includes(diagnostic)).toBe(false);
+  expect(seen).toMatchObject({ cancelled: true, cancelKilled: true, signal: "SIGKILL" });
+});
+
+test("a launch that dies on its own after a cancel but before the cancel's kill stays a confinement error", async () => {
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => ["/bin/sh", "-c", 'echo "held $$" >&2; sleep 900; exec "$@"', "sh", ...cmd],
+  };
+  const inspecting = deferred<void>();
+  const release = deferred<void>();
+  let holding = false;
+  let launcher = 0;
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  const launch = processBirthInspection.run(
+    {
+      // The shutdown's first identity check, before it signals anything, waits here.
+      read: async (pid, name) => {
+        if (!holding) {
+          holding = true;
+          inspecting.resolve();
+          await release.promise;
+        }
+        return processBirth(pid, name);
+      },
+      now: () => Number.MAX_SAFE_INTEGER,
+    },
+    () =>
+      runSandboxed(
+        {
+          cmd: ["/usr/bin/true"],
+          cwd: work,
+          env: agentEnv(),
+          signal: abort.signal,
+          onStderrLine: (line) => {
+            const match = /^held (\d+)$/.exec(line);
+            if (!match) return;
+            launcher = Number(match[1]);
+            abort.abort();
+          },
+        },
+        { write: [work], protect: [] },
+        async (opts) => {
+          seen = await runProcess(opts);
+          return seen;
+        },
+        undefined,
+        held,
+      ),
+  );
+  await inspecting.promise;
+  // The launcher dies of something else while the cancel's shutdown is still inspecting.
+  process.kill(launcher, "SIGKILL");
+  for (;;) {
+    try {
+      process.kill(launcher, 0);
+    } catch {
+      break;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  release.resolve();
+  await expect(launch).rejects.toThrow(ConfinementError);
+  expect(seen).toMatchObject({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" });
+});
+
 test("a launch killed by something else before a late cancel stays a confinement error", async () => {
   // The launcher SIGKILLs itself before the startup shell; a child keeps its pipes open, so the
   // shutdown is still finding descendants when the cancel arrives.
