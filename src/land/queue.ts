@@ -10,12 +10,12 @@ import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
 import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
+import { loadPrivateStrings } from "../gates/private.ts";
 import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
   addDetachedWorktree,
-  checkPrivateRange,
+  checkPrivatePublication,
   disableAutoMerge,
   ensureCache,
   exportCommit,
@@ -26,6 +26,7 @@ import {
   pushExistingBranch,
   remoteBranchSha,
   removeWorktree,
+  squashTitle,
 } from "../git/repos.ts";
 import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
@@ -348,7 +349,7 @@ export class LandQueue {
       if (!head) {
         head = await this.mergeBase(cwd, entry, baseSha);
         await this.checks(entry, cwd, baseSha, signal);
-        await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
+        await this.checkPublication(entry, run, cwd, baseSha, head);
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
         const waiting = this.store.db.transaction(() => {
@@ -359,8 +360,7 @@ export class LandQueue {
         })();
         if (!waiting) return;
       }
-      if (entry.pushedSha)
-        await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
+      if (entry.pushedSha) await this.checkPublication(entry, run, cwd, baseSha, head);
       const ci = await this.awaitCi(entry, head, signal);
       if (ci !== "green") return this.landed(entry, run, head, ci);
       await this.merge(entry, run, cwd, head, signal);
@@ -664,6 +664,19 @@ export class LandQueue {
 
   // ---- helpers -------------------------------------------------------------
 
+  private async checkPublication(entry: LandEntry, run: Run, cwd: string, base: string, head: string) {
+    await checkPrivatePublication(cwd, this.publication(entry, run, cwd), {
+      squash: {
+        base,
+        head,
+        title: squashTitle(run.title ?? "", entry.prUrl),
+        body: this.store.getArtifact(run.id, "report.md") ?? "",
+      },
+      // Select the factory's merge itself, never traverse either parent's existing history.
+      ...(head !== entry.approvedSha ? { commits: `${head}^!` } : {}),
+    });
+  }
+
   private publication(entry: LandEntry, run: Run, cwd: string) {
     const { configDir, repos, work } = this.deps.paths;
     const entries = loadPrivateStrings(configDir, [
@@ -673,13 +686,6 @@ export class LandQueue {
       work,
     ]);
     if (!run.title?.trim()) throw new LandBlocked("missing merge subject");
-    checkPrivateText(
-      `${run.title} (#${entry.prUrl.match(/\/pull\/(\d+)/)?.[1] ?? ""})`,
-      "Merge subject",
-      entries,
-    );
-    checkPrivateText(this.store.getArtifact(run.id, "report.md") ?? "", "Merge body", entries);
-    checkPrivateText(entry.headBranch, "Branch name", entries);
     return entries;
   }
 

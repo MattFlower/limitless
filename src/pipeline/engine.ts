@@ -40,6 +40,7 @@ import {
   commitAll,
   createPullRequest,
   createWorktree,
+  deliveryPublicationRange,
   diffSince,
   discardChanges,
   ensureCache,
@@ -1946,29 +1947,31 @@ function privateEntries(ctx: RunContext, cwd: string) {
 }
 
 /** Without `pr`, `body` is a PR comment and only its text is checked. */
-async function checkPublication(ctx: RunContext, body: string, pr?: { sha: string; title: string }) {
+async function checkPublication(
+  ctx: RunContext,
+  body: string,
+  pr?: { sha: string; title: string; branch?: string },
+) {
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = privateEntries(ctx, cwd);
-    if (!entries.length) return;
     checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
     if (!pr) return;
     checkPrivateText(pr.title, "PR title", entries);
-    checkPrivateText(ctx.run.deliveryBranch ?? ctx.run.branch ?? "", "Branch name", entries);
-    await checkPrivateRange(cwd, `${ctx.run.baseSha}..${pr.sha}`, entries);
-    const messages = await worktreeGit(
-      [
-        "git",
-        "-c",
-        "i18n.logOutputEncoding=UTF-8",
-        "log",
-        "--encoding=UTF-8",
-        "--format=%B",
-        `${ctx.run.baseSha}..${pr.sha}`,
-      ],
-      { cwd },
+    const branch =
+      pr.branch ?? reviewRound(ctx)?.grant.owner.branch ?? ctx.run.deliveryBranch ?? ctx.run.branch;
+    checkPrivateText(branch ?? "", "Branch name", entries);
+    if (!branch || !ctx.run.baseSha) throw new Error("Missing publication branch or base");
+    const range = await deliveryPublicationRange(
+      ctx.repo,
+      cwd,
+      branch,
+      ctx.run.baseSha,
+      pr.sha,
+      ctx.signal,
+      deliveryBudget(ctx),
     );
-    checkPrivateText(messages.stdout, "Commit message", entries);
+    await checkPrivateRange(cwd, range, entries);
     const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
       configDir: ctx.deps.cfg.paths.configDir,
       taskClass: ctx.run.taskClass,
@@ -2006,7 +2009,7 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}` });
+  await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}`, branch });
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
