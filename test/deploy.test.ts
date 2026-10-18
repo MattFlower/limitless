@@ -25,11 +25,14 @@ import {
 import { deploy } from "../src/cli/service.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { registerCredential, type sh } from "../src/util/proc.ts";
+import { resolveTestWorkers } from "../src/util/test-workers.ts";
 
 const dirs: string[] = [];
 const originalWorkers = process.env.LIMITLESS_TEST_WORKERS;
+// The default follows the machine's cores; pin it so gate commands read the same everywhere.
+const defaultWorkers = resolveTestWorkers(undefined);
 beforeEach(() => {
-  delete process.env.LIMITLESS_TEST_WORKERS;
+  process.env.LIMITLESS_TEST_WORKERS = "4";
 });
 afterEach(() => {
   if (originalWorkers === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
@@ -187,14 +190,14 @@ test("deploy enables runner redaction for every gate including smoke", async () 
 });
 
 test.each([
-  [undefined, 4],
+  [undefined, defaultWorkers],
   ["3", 3],
-  ["", 4],
-  ["0", 4],
-  ["-2", 4],
-  ["1.5", 4],
-  ["invalid", 4],
-  ["9007199254740992", 4],
+  ["", defaultWorkers],
+  ["0", defaultWorkers],
+  ["-2", defaultWorkers],
+  ["1.5", defaultWorkers],
+  ["invalid", defaultWorkers],
+  ["9007199254740992", defaultWorkers],
 ] as const)("deploy resolves test workers at gate execution: %s", async (value, workers) => {
   const previous = process.env.LIMITLESS_TEST_WORKERS;
   try {
