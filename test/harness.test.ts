@@ -314,8 +314,7 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
   } as unknown as CodexReaderProbe);
 
 // Holds every launch before the trusted startup shell; the optional hook runs just before the spawn.
-// A chatty hold keeps writing stderr, so only runClaude's no-progress watchdog, not the byte-level
-// idle timeout, can stop it.
+// A chatty hold emits diagnostics without reporting agent progress.
 const heldLaunch = (beforeSpawn = () => {}, chatty = false): ConfinementBackend => ({
   verify: async () => {},
   wrap: (cmd) => {
@@ -328,7 +327,8 @@ const heldEdit = (
   backend: ConfinementBackend,
   signal: AbortSignal,
   onEvent: (event: AgentEvent) => void = () => {},
-  processRunner = runProcess,
+  // Exercise the harness watchdog without racing the byte-idle timer under scheduler load.
+  processRunner: typeof runProcess = (opts) => runProcess({ ...opts, idleTimeoutMs: undefined }),
 ) =>
   confinementScope.run(backend, () =>
     withScratch(import.meta.dir, (scratchDir) => {

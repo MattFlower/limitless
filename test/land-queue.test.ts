@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -16,13 +16,13 @@ import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import type { GateExecutor, GateRequest } from "../src/gates/executor.ts";
 import { parseJUnit } from "../src/gates/junit.ts";
-import type { GateResult, GateRun } from "../src/gates/run.ts";
+import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
 import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
-import { observerRoots } from "../src/harness/sandbox.ts";
+import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
@@ -32,7 +32,7 @@ import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
-import { testReadPolicy } from "./read-policy-support.ts";
+import { test, testReadPolicy } from "./read-policy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 // These tests drive real git and confined gate commands; under CPU load they outlast Bun's 5 s default.
@@ -361,12 +361,19 @@ const gateLog = () =>
 const retryFile = "space ' quote.test.ts";
 const retryCommand = "base-retry './space '\\'' quote.test.ts'";
 
-async function retryLandFixture(retryFiles: unknown = "base-retry {files}", checkName = "test") {
-  writeFileSync(join(seed, retryFile), "test fixture\n");
+async function retryLandFixture(
+  retryFiles: unknown = "base-retry {files}",
+  checkName = "test",
+  setup = "prepare",
+) {
+  writeFileSync(
+    join(seed, retryFile),
+    'import { test, expect } from "bun:test";\nimport ready from "retry-dependency";\ntest("retry dependency", () => expect(ready).toBe(true));\n',
+  );
   writeFileSync(
     join(seed, ".limitless.toml"),
     `[gates]
-setup = ["prepare"]
+setup = [${JSON.stringify(setup)}]
 checks = [{ name = ${JSON.stringify(checkName)}, run = "full-test", timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
 ${retryFiles === null ? "" : `retry_files = ${JSON.stringify(retryFiles)}`}
 `,
@@ -459,7 +466,7 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
     [retryCommand],
     ["base-retry './README.md'"],
   ]);
-  expect(fake.requests.map((r) => r.gates.setup)).toEqual([["prepare"], [], []]);
+  expect(fake.requests.map((r) => r.gates.setup)).toEqual([["prepare"], ["prepare"], ["prepare"]]);
   expect(fake.requests.map((r) => r.priority)).toEqual(["ship", "ship", "ship"]);
   expect(fake.requests.slice(1).map((r) => [r.skipGateSlot, r.gates.checks[0]?.timeoutSec])).toEqual([
     [true, 120],
@@ -470,7 +477,9 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
   ]);
   const log = readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8");
   expect(log).toContain("$ full-test\ninitial test failure [redacted]");
-  expect(log).toContain(`# targeted retry\n\n$ ${retryCommand}\ntargeted pass [redacted]`);
+  expect(log).toContain(
+    `# targeted retry\n\n$ prepare\npassed\n\n$ ${retryCommand}\ntargeted pass [redacted]`,
+  );
   expect(log).not.toContain(credential);
   if (restart) {
     await q.stop();
@@ -484,6 +493,48 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
   });
   expect(fake.requests).toHaveLength(3);
   expect(ghCalls("pr merge")).toHaveLength(1);
+});
+
+test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)", async (setupFails) => {
+  const setup = setupFails
+    ? "echo retry setup failed >&2; exit 1"
+    : "mkdir -p node_modules/retry-dependency && echo 'export default true;' > node_modules/retry-dependency/index.js";
+  const template = `'${process.execPath}' test {files}`;
+  const { pr, head } = await retryLandFixture(template, "test", setup);
+  const fresh = join(root, "retry-checkout");
+  const fake = fakeLandGates((req, attempt, signal) => {
+    if (attempt === 1) return retryRun(req, { test: testFailure });
+    mkdirSync(fresh);
+    writeFileSync(join(fresh, retryFile), readFileSync(join(req.cwd, retryFile)));
+    expect(existsSync(join(fresh, "node_modules"))).toBe(false);
+    return confinementScope.run(fakeConfinement, () => runLocalGates(fresh, req.gates, signal));
+  });
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const completed = store.getLandEntry(entry.id);
+  expect(fake.requests).toHaveLength(2);
+  const log = readFileSync(completed?.logPath ?? "", "utf8");
+  expect(log).toContain("initial test failure");
+  if (setupFails) {
+    expect(completed).toMatchObject({
+      state: "blocked",
+      pushedSha: null,
+      reason: `test failed (${completed?.logPath})`,
+    });
+    expect(log).toContain("retry setup failed");
+    expect(log).not.toContain(`\n$ '${process.execPath}' test`);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } else {
+    expect(completed).toMatchObject({
+      state: "landed",
+      reason: `flaky: test (${retryFile}); merged ${head.slice(0, 12)}`,
+    });
+    expect(log).toContain("(pass) retry dependency");
+    expect(log.indexOf(`\n$ ${setup}`, log.indexOf("# targeted retry"))).toBeLessThan(
+      log.indexOf(`\n$ '${process.execPath}' test`),
+    );
+    expect(ghCalls("pr merge")).toHaveLength(1);
+  }
 });
 
 test.each([

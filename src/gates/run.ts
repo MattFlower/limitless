@@ -279,7 +279,8 @@ export async function retryFailures(
       const attempt = (
         await retryChecks(
           cwd,
-          { ...cfg, setup: [], checks: [{ ...check, run, timeoutSec }] },
+          // Executors may create a fresh checkout for each retry.
+          { ...cfg, setup: runner ? cfg.setup : [], checks: [{ ...check, run, timeoutSec }] },
           signal,
           onWait,
           runner,
@@ -302,7 +303,7 @@ export async function retryFailures(
   if (full.length && !signal.aborted) {
     const retried = await retryChecks(
       cwd,
-      { ...cfg, setup: [], checks: full.map((entry) => entry.check) },
+      { ...cfg, setup: runner ? cfg.setup : [], checks: full.map((entry) => entry.check) },
       signal,
       onWait,
       runner,

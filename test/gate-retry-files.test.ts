@@ -165,6 +165,40 @@ const failed: GateResult = {
   durationMs: 10,
 };
 
+test.each([false, true])("local retries preserve setup output (executor: %s)", async (executor) => {
+  const f = fixture();
+  try {
+    const check = { name: "test", run: "test -f dependency && echo full >> checks" };
+    const cfg = {
+      ...config,
+      setup: ["echo setup >> setups && echo ready > dependency"],
+      checks: [check],
+      retryFiles: "test -f dependency && printf 'targeted %s\\n' {files} >> checks",
+    };
+    const original = { ...failed, command: check.run, failedFiles: ["test/a.test.ts"] };
+    await confinementScope.run(fakeConfinement, async () => {
+      await runGates(f.cwd, { ...cfg, checks: [] }, signal);
+      const retries = await retryFailures(
+        [{ check, original }],
+        f.cwd,
+        cfg,
+        signal,
+        undefined,
+        executor ? (retry) => runGates(f.cwd, retry, signal) : undefined,
+      );
+      expect(retries.get(original)).toMatchObject({
+        ok: true,
+        firstAttempt: original,
+        targetedRetry: { ok: true },
+      });
+    });
+    expect(readFileSync(join(f.cwd, "setups"), "utf8")).toBe("setup\n".repeat(executor ? 3 : 1));
+    expect(readFileSync(join(f.cwd, "checks"), "utf8")).toBe("targeted ./test/a.test.ts\nfull\n");
+  } finally {
+    f.close();
+  }
+});
+
 const attributedSuite = suite(
   "test/a.test.ts",
   'tests="1" failures="1" errors="0"',
