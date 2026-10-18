@@ -792,7 +792,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
     return { stdout: "", stderr: "", exitCode: 0 };
   };
   try {
-    delete process.env.LIMITLESS_TEST_WORKERS;
+    process.env.LIMITLESS_TEST_WORKERS = "4";
     await expect(
       deploy(7400, "feature", true, {
         leaseClient: async () => ({ id: "lease", acquired: true }),

@@ -1,5 +1,66 @@
 # Test runtime and coverage review
 
+## macOS process scans and git's locale (2026-10-18)
+
+On the factory's Mac (Apple M5 Max, 18 cores, about 650 processes running as the owner) the
+suite took 18–23 minutes while other work ran. Two costs outside the tests made up most of it.
+
+**Every command's shutdown scanned every process twice.** `runProcess` looks for descendants that
+escaped the child's process group. On macOS `markedDarwinProcesses` read each of the user's
+processes' arguments and environment with `KERN_PROCARGS2`. That read costs about 11 µs per process,
+85% of a scan. One scan took about 9 ms at load 10 (3 ms when idle), almost all of it kernel time.
+So `sh(["git", "--version"])` took 30 ms against 11 ms for a bare spawn, and the cost grew with the
+number of processes on the machine. The whole baseline suite spent 3,420 s of system CPU against
+1,410 s of user CPU.
+
+The scan now reads each process's monotonic start time (`proc_pid_rusage`, about 1.7 µs) and skips
+the argv read for processes that started before the command was spawned. Such a process can't
+descend from the command: orphans reparent to launchd, and the child's new session and process group
+admit only its descendants. A process whose start time can't be read is inspected as before. A
+filtered scan takes 0.6 ms against 3.2 ms for a full one at the same load.
+
+**git without a locale asks macOS for the preferred language.** Homebrew's git links gettext, which
+queries CoreFoundation when `LANG`, `LC_ALL` and `LC_MESSAGES` are all unset. The daemon (started
+by launchd) and the desktop app set none of them, so every git process in their test runs, gates
+included, cost 4.4 ms of CPU and 6.0 ms of wall time instead of 2.3 ms and 2.8 ms. `test/setup.ts`
+now sets CI's `LANG=C.UTF-8` when no locale is set.
+
+| Run on the same Mac | Workers | Wall | User CPU | System CPU | 1-min load (median / max) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `main` at `190fe64` | 4 | 1,237 s | 1,410 s | 3,420 s | spot checks 9–15 |
+| with the scan change | 4 | 653 s | 1,054 s | 1,554 s | 8.6 / 10.0 |
+| with the scan change and locale | 4 | 486 s | 914 s | 1,220 s | 11.5 / 21.9 |
+| with the scan change and locale | 6 | 301 s | 825 s | 1,095 s | 10.2 / 12.4 |
+| `bun run check`, default workers | 6 | 294 s | 817 s | 1,068 s | 9.6 / 10.1 |
+
+Each row is one whole-suite run (4,216–4,219 tests, the three added here included) while other work
+ran, so load differs between rows. Alternating runs of `pipeline-spec.test.ts` alone at load 4 give
+a cleaner comparison: 42.3 s and 42.6 s on `190fe64`, 17.0 s and 17.1 s with both changes (CPU 49 s
+against 22 s).
+
+With both changes the suite's per-file durations sum to 1,790 s, against 4,468 s before, so four
+workers can't go below about 450 s; `land-pr.test.ts` (189 s) is the longest file. These two
+changes removed or skipped no test and weakened no assertion. The gate executor's cancellation test
+assumed its second check was already running when it cancelled; faster commands let the cancellation
+land while that check's sandbox was still starting, so the test now waits until the check runs.
+
+**Workers follow the machine.** The suite's default worker count was a fixed 4. With each suite now
+needing about 1,900 CPU-seconds instead of 4,800, the default is a third of the cores, clamped to
+4–8: 6 on this Mac, still 4 on CI's 4-vCPU runner and smaller machines. `LIMITLESS_TEST_WORKERS`
+still overrides it.
+
+**Overlapping tests.** A read-only review of the costliest files found about 220 s of the 1,790 s
+(12%) in rows that repeat another row's guard and outcome, or input variants that the responsible
+function's unit tests already cover. The largest single case was `land-pr.test.ts`'s 28 planted-key
+rows (seven keys at four points). The fake git sends every permitted push to a local path, so the
+transport keys they planted were never read. With the push repository made to include the clone's
+config, all 28 still passed, and the pre-push rows had planted into the push repository itself,
+because the fake `gh` inherited the script's `GIT_DIR` and `GIT_COMMON_DIR`. The fake git now lists
+the config each push reads, the test fails if a planted key appears there, and one row per plant
+point plants all seven keys into the clone. Under the same mutation all four rows fail. The file
+went from 122 tests to 98. The remaining candidates are left for separate changes, since each
+removal needs the mutation evidence that `test/AGENTS.md` asks for.
+
 ## Git wrapper caching (#319)
 
 The second pass found that half of all git processes came from `worktreeGit` in `src/git/command.ts`: a hook-config lookup before every command, and an empty-tree `hash-object` before every diff or log. #319 caches both without trusting a stale result.

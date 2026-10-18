@@ -37,7 +37,7 @@ const fixture: { home: string; repoDir: string; factory: Factory | null } = {
   repoDir: "",
   factory: null,
 };
-const { start, githubFixture, registerGithub, advanceBase, assertUnpublished } = pipelineSetup(fixture);
+const { start, githubFixture, registerGithub, advanceBase, assertUnpublished, wait } = pipelineSetup(fixture);
 const handler: Handler = (s) => {
   const role = roleOf(s);
   if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
@@ -1151,7 +1151,7 @@ test("local check events stream before completion and the start signal cancels r
     ...gates,
     checks: [
       { name: "first", run: "true" },
-      { name: "pending", run: "sleep 900" },
+      { name: "pending", run: "touch pending-started; sleep 900" },
     ],
   };
   await confinementScope.run(fakeConfinement, async () => {
@@ -1160,12 +1160,19 @@ test("local check events stream before completion and the start signal cancels r
     try {
       const event = await execution.events[Symbol.asyncIterator]().next();
       expect(event.value).toMatchObject({ type: "check", result: { name: "first", ok: true } });
+      // Cancel the second check once it runs, not while its sandbox is still starting.
+      await wait(() => existsSync(join(fixture.repoDir, "pending-started")), {
+        timeoutMs: 10_000,
+        description: "pending check did not start",
+      });
     } finally {
       controller.abort();
     }
     const completed = await execution.result;
-    expect(completed.checks.length).toBeLessThanOrEqual(2);
-    expect(completed.checks.find((c) => c.name === "pending")?.ok ?? false).toBe(false);
+    expect(completed.checks.map((c) => [c.name, c.ok])).toEqual([
+      ["first", true],
+      ["pending", false],
+    ]);
     await execution.cancel();
   });
 });
