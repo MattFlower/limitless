@@ -314,6 +314,7 @@ export async function runConfined(
           ...scratchEnv({ scratchDir: scratch }),
           XDG_CACHE_HOME: join(scratch, "cache"),
           npm_config_cache: join(scratch, "npm"),
+          BUN_INSTALL_CACHE_DIR: join(scratch, "bun"),
           CARGO_HOME: cargo,
           RUSTUP_HOME: opts.env.RUSTUP_HOME ?? join(home, ".rustup"),
           GOCACHE: join(scratch, "go-build"),

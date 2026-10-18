@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -982,7 +983,16 @@ test("command scratch persists across setup, checks and retry scopes, with reada
     let scratch = "";
     // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
     const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
-    const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
+    const opts = {
+      command: "unused",
+      cwd: work,
+      env: {
+        ...env,
+        TMPPREFIX: join(home, "zsh"),
+        BUN_INSTALL: join(home, ".bun"),
+        BUN_INSTALL_CACHE_DIR: join(home, "bun-cache"),
+      },
+    };
     mkdirSync(join(home, ".cargo"));
     writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
     const run = async (opts: ProcOptions) => {
@@ -990,6 +1000,9 @@ test("command scratch persists across setup, checks and retry scopes, with reada
       expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
       const current = opts.env.TMPDIR ?? "";
       expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
+      expect(opts.env.BUN_INSTALL_CACHE_DIR).toBe(join(current, "bun"));
+      expect(opts.env.BUN_INSTALL).toBe(join(home, ".bun"));
+      expect(opts.env.PATH).toBe(env.PATH);
       expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
       if (scratch) {
         expect(current).toBe(scratch);
@@ -1009,6 +1022,51 @@ test("command scratch persists across setup, checks and retry scopes, with reada
     });
     expect(existsSync(scratch)).toBe(false);
   }));
+
+test.skipIf(seatbeltSkip !== null)(
+  `Bun frozen install keeps its cache in scratch with an external BUN_INSTALL ${seatbeltSkip ?? ""}`,
+  async () => {
+    const pkg = join(root, "fixture", "package");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(
+      join(pkg, "package.json"),
+      JSON.stringify({ name: "cache-fixture", version: "1.0.0", main: "index.js" }),
+    );
+    writeFileSync(join(pkg, "index.js"), "module.exports = 42;\n");
+    await sh(["tar", "-czf", join(work, "fixture.tgz"), "-C", dirname(pkg), "package"], { cwd: work });
+    writeFileSync(
+      join(work, "package.json"),
+      JSON.stringify({ name: "fixture-app", dependencies: { "cache-fixture": "file:./fixture.tgz" } }),
+    );
+    const bunHome = join(home, ".bun");
+    mkdirSync(join(bunHome, "install/cache"), { recursive: true });
+    const env = agentEnv({ BUN_INSTALL: bunHome });
+    delete env.BUN_INSTALL_CACHE_DIR;
+    await sh([process.execPath, "install", "--lockfile-only"], {
+      cwd: work,
+      env: { ...env, BUN_INSTALL_CACHE_DIR: join(root, "seed-cache") },
+    });
+    const lock = readFileSync(join(work, "bun.lock"), "utf8");
+    const opts = {
+      command: `'${process.execPath}' install --frozen-lockfile`,
+      cwd: work,
+      env,
+    };
+    const unfixed = await runConfined({
+      ...opts,
+      command: `unset BUN_INSTALL_CACHE_DIR; ${opts.command}`,
+    });
+    expect(unfixed.exitCode).not.toBe(0);
+    expect(unfixed.stderr).toContain("bun is unable to write files to tempdir");
+    const result = await runConfined(opts);
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(readFileSync(join(work, "node_modules/cache-fixture/index.js"), "utf8")).toBe(
+      "module.exports = 42;\n",
+    );
+    expect(readFileSync(join(work, "bun.lock"), "utf8")).toBe(lock);
+    expect(readdirSync(join(bunHome, "install/cache"))).toEqual([]);
+  },
+);
 
 test.skipIf(seatbeltSkip !== null)(
   `installed rustup discovery survives command confinement ${seatbeltSkip ?? ""}`,
