@@ -1,7 +1,7 @@
 import { expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -232,6 +232,59 @@ test("a staged new file containing markers blocks a clean resolution", async () 
     await mergeGit(dir, ["add", "-A"]);
     await expect(completeMerge(dir, head, base)).rejects.toThrow("Unresolved conflict markers: new.txt");
     await assertPending(dir, head, base);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("markers in an untracked file and an unstaged edit outside the conflict block the merge", async () => {
+  const { dir, head, base } = await conflict(
+    async (dir, side) => {
+      writeFileSync(join(dir, "f.bin"), `${side}\n`);
+    },
+    { "README.md": "Project\n" },
+  );
+  try {
+    writeFileSync(join(dir, "f.bin"), "ours\ntheirs\n");
+    writeFileSync(join(dir, "new.txt"), "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> base\n");
+    writeFileSync(join(dir, "README.md"), "Project\n=======\n<<<<<<< HEAD\nours\n");
+    await expect(completeMerge(dir, head, base)).rejects.toThrow(
+      "Unresolved conflict markers: new.txt, README.md",
+    );
+    await assertPending(dir, head, base);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a resolver that drops MERGE_HEAD and commits a single-parent resolution is refused", async () => {
+  const { dir, head, base } = await conflict(async (dir, side) => {
+    writeFileSync(join(dir, "f.bin"), `${side}\n`);
+  });
+  try {
+    rmSync(resolve(dir, (await mergeGit(dir, ["rev-parse", "--git-path", "MERGE_HEAD"])).stdout.trim()));
+    writeFileSync(join(dir, "f.bin"), "replacement\n");
+    await mergeGit(dir, ["add", "-A"]);
+    await mergeGit(dir, ["commit", "-qm", "lost merge parent"]);
+    await expect(completeMerge(dir, head, base)).rejects.toThrow("Missing or unexpected MERGE_HEAD");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a setext underline longer than a separator is not a conflict marker", async () => {
+  const { dir, head, base, paths } = await conflict(
+    async (dir, side) => {
+      writeFileSync(join(dir, "guide.md"), `${side}\n`);
+    },
+    { "guide.md": "shared\n" },
+  );
+  try {
+    expect(paths).toEqual(["guide.md"]);
+    const resolved = "Greeting\n========\nours\ntheirs\n";
+    writeFileSync(join(dir, "guide.md"), resolved);
+    await assertCompleted(dir, head, base);
+    expect((await mergeGit(dir, ["show", "HEAD:guide.md"])).stdout).toBe(resolved);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
