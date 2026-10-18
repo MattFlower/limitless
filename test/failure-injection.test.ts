@@ -477,6 +477,39 @@ for (const stage of [
     expect(next.store.listInvocations(id)).toHaveLength(invocationCount);
   });
 }
+// The stage rows above hang before the stage body, so none reaches the answer wait itself.
+test("cancelling a run waiting for clarify answers stays cancelled on restart", async () => {
+  let calls = 0;
+  const handler = (s: AgentSpec): FakeReply => {
+    calls++;
+    return s.prompt.startsWith("Classify")
+      ? { structured: { ...triage, ambiguity: "high", blocking_questions: ["Which?"] } }
+      : answer(s);
+  };
+  const f = factory(undefined, handler);
+  const id = await run(f);
+  await waits.until(() => f.store.getRun(id)?.status === "waiting_input", {
+    timeoutMs: 25_000,
+    subscribe: (wake) => f.store.subscribe(wake),
+  });
+  expect(f.scheduler.activeRunIds).toEqual([id]);
+  expect(f.cancelRun(id)).toBe(true);
+  await settled(f, id);
+  expect(f.store.getRun(id)).toMatchObject({ status: "cancelled", error: "cancelled by user" });
+  expect(f.store.listStages(id).at(-1)).toMatchObject({ name: "clarify", status: "cancelled" });
+  history(f, id);
+  const stages = f.store.listStages(id);
+  const invocations = f.store.listInvocations(id);
+  const before = calls;
+  const next = await reopen(f, handler);
+  await settled(next, id);
+  expect(next.store.getRun(id)?.status).toBe("cancelled");
+  expect(next.scheduler.activeRunIds).toEqual([]);
+  expect(next.store.listStages(id)).toEqual(stages);
+  expect(next.store.listInvocations(id)).toEqual(invocations);
+  expect(calls).toBe(before);
+  expect(next.store.listQuestions(id).map((q) => [q.question, q.answer])).toEqual([["Which?", null]]);
+});
 // One row per way an attempt fails: returned, timed out, thrown, schema-invalid, or a stream the
 // real parser rejects (the stream seam test below covers codex). Exhaustion differs only once
 // routing runs out, so it keeps a returned failure and a timeout, which alone counts against
@@ -1256,7 +1289,8 @@ function githubRun(f: Factory, url = source) {
 }
 
 // A needs-human draft makes the same `gh pr create` call as create (its cancel is covered by
-// "cancel during draft delivery"), and the auto-merge fallback runs the same merge command as merge.
+// "cancel during draft delivery"). merge-auto fails the plain merge, so the cancel lands in the
+// auto-merge fallback, where a swallowed abort would record the delivery as complete.
 for (const operation of [
   "fetch",
   "push",
@@ -1264,6 +1298,7 @@ for (const operation of [
   "edit",
   "create",
   "merge",
+  "merge-auto",
   "existing-head",
   "existing-push",
   "comment",
@@ -1283,6 +1318,7 @@ for (const operation of [
         edit: "gh pr edit *",
         create: "gh pr create *",
         merge: "gh pr merge *",
+        "merge-auto": "gh pr merge * --squash --auto *",
         "existing-head": "git ls-remote *",
         "existing-push": "git push --no-follow-tags --force-with-lease=*",
         comment: "gh pr comment *",
@@ -1308,6 +1344,8 @@ exec '${path}-delegate' "$@"
         );
       }
       if (operation === "edit") writeFileSync(pr, "https://github.com/test/repo/pull/1");
+      if (operation === "merge-auto")
+        writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", err: "checks required" }]));
       const existing = operation.startsWith("existing-");
       let f = factory(
         operation === "comments"
@@ -1319,7 +1357,7 @@ exec '${path}-delegate' "$@"
         id = (await externalChange(f)).run.id;
       } else {
         const repo = githubRun(f);
-        if (operation === "merge") f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
+        if (operation.startsWith("merge")) f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
         const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: source })).stdout.trim();
         const r = f.store.createRun(
           repo,
@@ -1365,16 +1403,26 @@ exec '${path}-delegate' "$@"
       expect(pids.size).toBe(2);
       expect(f.store.getRun(id)).toMatchObject({ status: "running", stage: "deliver" });
       const beforeCancel = readFileSync(calls, "utf8");
+      if (operation === "merge-auto")
+        expect(
+          beforeCancel
+            .split("\n")
+            .filter((c) => c.startsWith("gh pr merge"))
+            .map((c) => c.includes(" --squash --auto ")),
+        ).toEqual([false, true]);
       f.cancelRun(id);
       await settled(f, id);
       for (const pid of pids.keys()) {
         await wait(async () => (await processBirth(pid)) !== pids.get(pid));
         pids.delete(pid);
       }
-      expect(f.store.getRun(id)?.status).toBe("cancelled");
+      expect(f.store.getRun(id)).toMatchObject({ status: "cancelled", merged: false });
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
       expect(existsSync(cwd)).toBe(true);
       expect(f.store.listStages(id).at(-1)).toMatchObject({ name: "deliver", status: "cancelled" });
+      // A cancelled delivery is neither complete nor a failed merge.
+      expect(f.store.getRunState<RunState>(id)?.deliveryComplete).toBeUndefined();
+      expect(f.store.listEvents(id).filter((e) => e.message.includes("merge failed"))).toEqual([]);
       history(f, id);
       const stages = f.store.listStages(id);
       const invocations = f.store.listInvocations(id);
@@ -2460,6 +2508,40 @@ test("a fallback after the budget is spent still records a PR that was created",
       prUrl: "https://github.com/test/repo/pull/1",
     });
     expect(ghCalls(pr, "pr create")).toHaveLength(1);
+  } finally {
+    githubRetry.budgetMs = budgetMs;
+    await restore();
+  }
+});
+
+test("a delivery resumed after a crash retries GitHub on a fresh budget", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  const budgetMs = githubRetry.budgetMs;
+  // The crashed attempt has no budget left; first attempts still run, so it reaches the PR.
+  githubRetry.budgetMs = 0;
+  try {
+    const f = factory({
+      "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" },
+    });
+    const repo = githubRun(f);
+    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+    f.scheduler.start();
+    await settled(f, r.id);
+    expect(f.store.getRun(r.id)).toMatchObject({ status: "running", prUrl: null });
+    githubRetry.budgetMs = budgetMs;
+    // The resumed delivery's first GitHub call, its PR lookup, answers 502 once.
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr list", err: bad502 }]));
+    const next = await reopen(f);
+    await settled(next, r.id);
+    expect(next.store.getRun(r.id)).toMatchObject({
+      status: "succeeded",
+      prUrl: "https://github.com/test/repo/pull/1",
+    });
+    expect(JSON.parse(readFileSync(`${pr}.fail`, "utf8"))).toEqual([]);
+    expect(ghCalls(pr, "pr list").filter((c) => c.endsWith("--json state,url"))).toHaveLength(2);
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+    history(next, r.id);
   } finally {
     githubRetry.budgetMs = budgetMs;
     await restore();
