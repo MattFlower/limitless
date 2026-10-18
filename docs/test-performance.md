@@ -88,10 +88,16 @@ edit. Where every proposed mutation also passed the kept rows, the candidate sta
 
 Some removals needed a stronger kept test first. "PR creation window reconciles a stateful fake" now
 asserts a single `gh pr create`, which fails if the lookup before create is skipped; the test it
-absorbed slept 2.5 s and couldn't observe its own guarantee. The 3,200-file pathspec case still
-crosses Linux's 2 MiB argv limit with 720-byte paths, and now also bounds the number of git commands.
+absorbed slept 2.5 s and couldn't observe its own guarantee. The pathspec case uses 4,800 paths of
+at most 480 bytes instead of 16,000 short ones: together they still exceed Linux's 2 MiB argv limit,
+each stays well inside macOS's 1,024-byte `PATH_MAX`, and the test now also bounds the number of git
+commands.
 The shadow review's 5 s settle wait is `shadowSettle.ms`, which one test shortens. The blocked
 verify-change rows run with `maxRounds = 1`.
+
+With these removals `bun run check` took 351 s at a median load of 20.8, against 361 s at 16.7 for
+the last run before them. One failure in that run, in `needs-you-ui.test.ts`, also fails alone on
+`main` and on commits before this change.
 
 The mutations also found gaps that this change doesn't close:
 - Nothing in `failure-injection.test.ts` guards the claude stream completion check: `requireStructured`

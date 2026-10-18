@@ -2621,10 +2621,11 @@ test("JPEG thumbnails and ICO pixels may contain signatures while WAV requires a
 });
 
 test("added paths beyond ARG_MAX use stdin pathspecs without uncertainty findings", async () => {
-  // Long paths cross Linux's 2 MiB argument limit (macOS allows 1 MiB) with few files.
-  const nested = ["a", "b"].map((name) => `${name}-${"long-directory-".repeat(16)}`).join("/");
+  // Long paths cross Linux's 2 MiB argument limit (macOS allows 1 MiB) with few files, while each
+  // stays near 480 bytes, well inside macOS's 1,024-byte PATH_MAX under a deep scratch directory.
+  const nested = ["a", "b"].map((name) => `${name}-${"long-directory-".repeat(10)}`).join("/");
   mkdirSync(join(work, nested), { recursive: true });
-  const files = Array.from({ length: 3_200 }, (_, i) => `${nested}/${i}-${"long-file-name-".repeat(15)}.dat`);
+  const files = Array.from({ length: 4_800 }, (_, i) => `${nested}/${i}-${"long-file-name-".repeat(11)}.dat`);
   expect(files.reduce((bytes, path) => bytes + Buffer.byteLength(path) + 1, 0)).toBeGreaterThan(2_200_000);
   for (const path of files) writeFileSync(join(work, path), "new text\n");
   await commitAll(work, "large addition");

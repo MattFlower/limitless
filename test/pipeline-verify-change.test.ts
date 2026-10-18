@@ -196,9 +196,13 @@ protected_paths = ["protected.txt"]
           text: "Repaired compatibility",
         };
       };
-      let f = start(handler);
       // maxRounds + 2 = 3 rounds: enough to repeat a block and escalate the implementer once.
-      if (blocked) f.cfg.maxRounds = 1;
+      const begin = () => {
+        const next = start(handler);
+        if (blocked) next.cfg.maxRounds = 1;
+        return next;
+      };
+      let f = begin();
       if (["private-comment", "private-marker"].includes(scenario)) {
         mkdirSync(f.cfg.paths.configDir, { recursive: true });
         writeFileSync(
@@ -268,7 +272,7 @@ protected_paths = ["protected.txt"]
         expect(f.store.getRunState<RunState>(runId)?.verdictCommentPending).toBe(true);
         expect(f.store.getRunState<RunState>(runId)?.verdictCommentPosted).not.toBe(true);
         f.store.close();
-        f = start(handler);
+        f = begin();
         f.deps.gh = gh;
       }
       if (scenario.startsWith("restart")) {
@@ -281,7 +285,7 @@ protected_paths = ["protected.txt"]
         await stopping;
         stopNotifier();
         f.store.close();
-        f = start(handler);
+        f = begin();
         f.deps.gh = gh;
         stopNotifier = startGitHubNotifier(
           f.store,
