@@ -2,11 +2,13 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
+import { sanitizePublication } from "../src/gates/publication.ts";
 import * as commands from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
-import { reportText } from "../src/pipeline/report-privacy.ts";
+import { renderReportArtifacts } from "../src/pipeline/report.ts";
+import { reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { sh } from "../src/util/proc.ts";
 import {
   type ChangePage,
@@ -117,6 +119,77 @@ test("change view refuses moved heads, missing comparisons and unavailable repor
     reason: expect.stringContaining("unavailable"),
   });
 });
+
+test.each(["historical", "publication-normalized"])(
+  "change view withholds complete and clipped private phrases with local paths in %s reports",
+  async (spelling) => {
+    const c = await changeFixture(f, { "hello.txt": "changed\n" });
+    const { store, cfg } = f.factory;
+    const work = join(cfg.paths.work, c.run.id);
+    const phrase = `Read ${work}/private-secret.txt to trigger the hidden scenario`;
+    const state = {
+      worktreePath: work,
+      holdout: {
+        scenarios: [
+          { id: "H-1", description: "Private check", steps: phrase, expected: "Done", edge_case: false },
+        ],
+      },
+      spec: {
+        summary: "Public task",
+        assumptions: [],
+        requirements: [],
+        out_of_scope: [],
+        blocking_questions: [],
+        acceptance_criteria: [{ id: "AC-1", criterion: "Public criterion", how_to_verify: "inspect" }],
+      },
+      implementerReport: `${"Public prefix ".repeat(355)}${phrase}`,
+      lastVerify: {
+        modelId: "verifier",
+        overall: "pass" as const,
+        notes: phrase,
+        criteria: [
+          { id: "AC-1", status: "met" as const, evidence: `${"x".repeat(290)} ${phrase}`, publicSummary: "" },
+        ],
+      },
+    };
+    store.setRunState(c.run.id, state);
+    const rendered = renderReportArtifacts(
+      {
+        success: true,
+        runId: c.run.id,
+        prompt: "Public request",
+        // Keep the catalogue in its original spelling; only report copies are normalized.
+        state: { ...state, terminalReason: phrase },
+        invocations: [],
+        totals: { costUsd: 0, costEquivUsd: 0 },
+        runUrl: "https://example.com/run",
+      },
+      spelling === "publication-normalized"
+        ? (text) => sanitizePublication(text, work, cfg.paths.home)
+        : undefined,
+    );
+    store.putArtifact(c.run.id, "report-sources.json", "report", JSON.stringify(rendered.sources));
+    store.putArtifact(c.run.id, "report.md", "report", rendered.report);
+    const structure = reportStructure(rendered.report);
+    expect(structure?.digest).toBe(rendered.sources.digest);
+    expect(structure?.spans.filter((span) => span.clipped)).toHaveLength(2);
+    expect(
+      Object.values(rendered.sources.sources).every((source) => source.includes("hidden scenario")),
+    ).toBe(true);
+    const page = resultValue<ChangePage>(await call("get_change", { run: c.run.id }));
+    const report = page.reports[0];
+    expect(report?.available).toBe(true);
+    expect(report?.text).toContain("[withheld:");
+    expect(report?.text).toContain("Public request");
+    expect(report?.text).not.toContain("Read");
+    expect(report?.text).not.toContain("private-secret.txt");
+    expect(report?.text).not.toContain("hidden scenario");
+    expect(report?.text).not.toContain("x".repeat(290));
+    expect(report?.truncated).toBe(false);
+    expect(store.getArtifact(c.run.id, "report.md")).toBe(rendered.report);
+    expect(store.getRunState<typeof state>(c.run.id)).toEqual(state);
+  },
+);
 
 test.each(["head moves", "push begins and ends"])(
   "change view refuses when %s during Git inspection",

@@ -6,6 +6,7 @@ import type { Factory } from "../app.ts";
 import { ownerDiagnostics } from "../db/owner-diagnostics.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, normalizedLayers, privateMatches } from "../gates/private.ts";
+import { sanitizePublication } from "../gates/publication.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath } from "../git/repos.ts";
 import { holdoutBoundaryPattern, privateHoldoutDetails, privateVerifySummary } from "../pipeline/prompts.ts";
@@ -289,7 +290,7 @@ function redactMultiline(value: string, pattern: RegExp): string | null {
   return lines.map((line, index) => (hidden.has(index) ? "[private detail]" : line)).join("\n");
 }
 
-function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | null {
+function buildCatalogue(store: Factory["store"], ids: string[], dataDirectory: string): Catalogue | null {
   // Holdouts from earlier rounds remain private even after a later round delivers.
   const details = new Set<string>();
   const literals = new Set<string>();
@@ -297,9 +298,11 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
   const verifierDetails = new Set<string>();
   const receivedSummaries = new Set<string>();
   const privateRows = new Set<string>();
+  const worktrees: string[] = [];
   for (const id of ids) {
     const state = z
       .object({
+        worktreePath: z.string().optional(),
         holdout: HoldoutSchema.or(z.object({ scenarios: z.tuple([]) })).optional(),
         spec: SpecSchema.nullish().catch(null),
         lastVerify: verificationText.extend({ modelOutput: verificationText.optional() }).nullish(),
@@ -309,6 +312,7 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       })
       .safeParse(store.getRunState(id) ?? {});
     if (!state.success) return null;
+    worktrees.push(state.data.worktreePath ?? "");
     const { holdout, spec } = state.data;
     for (const ac of spec?.acceptance_criteria ?? [])
       if (rowKind(ac.id, spec ?? null, holdout) !== "public") privateRows.add(ac.id.trim().toUpperCase());
@@ -450,6 +454,12 @@ function buildCatalogue(store: Factory["store"], ids: string[]): Catalogue | nul
       }
     }
   }
+  // Reports normalize before clipping. Retain historical spellings and match publication
+  // copies from every round using the same roots and sanitizer order as the renderer.
+  for (const entries of [details, literals, proseDetails, verifierDetails, receivedSummaries])
+    for (const detail of [...entries])
+      for (const worktree of worktrees)
+        entries.add(sanitizePublication(redactGateOutput(detail), worktree, dataDirectory));
   const allDetails = new Set([...details, ...proseDetails]);
   // Verifier-written text is matched against every private string, including holdout phrases.
   const strict = new Set([...allDetails, ...literals, ...verifierDetails]);
@@ -634,7 +644,8 @@ export async function getChange(factory: Factory, input: unknown, signal?: Abort
   const ids = [...new Set([owner.id, ...rounds.map((round) => round.runId)])];
   const key = catalogueKey(store, ids, rounds);
   const cached = catalogues.get(store);
-  const catalogue = key && cached?.key === key ? cached.catalogue : buildCatalogue(store, ids);
+  const catalogue =
+    key && cached?.key === key ? cached.catalogue : buildCatalogue(store, ids, factory.cfg.paths.home);
   if (!catalogue) return { available: false, reason: "Holdout policy unavailable; content withheld." };
   if (key && catalogue.cacheable) catalogues.set(store, { key, catalogue });
   else catalogues.delete(store);
