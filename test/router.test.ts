@@ -1237,7 +1237,7 @@ test("oMLX catalog targets and authenticated health gate routing", async () => {
   for (const effort of [undefined, "none", "high"] as const) {
     const resolved = router.resolve(`omlx/qwen-27b${effort ? `@${effort}` : ""}`);
     expect(resolved.model).toMatchObject({
-      model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+      model: "Qwen3.8-27B-8bit",
       vendor: "qwen",
       origin: "CN",
       baseOrigin: "CN",

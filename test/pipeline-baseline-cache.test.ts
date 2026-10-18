@@ -280,7 +280,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
     });
 
-    test("a changed nonsecret setting with a secret-looking name misses", async () => {
+    // Separate settings so six full pipelines do not share one test's timeout under load.
+    test.each([
+      ["GOPRIVATE", "other.example/*"],
+      ["NODE_TLS_REJECT_UNAUTHORIZED", "0"],
+    ])("a changed nonsecret setting %s with a secret-looking name misses", async (name, changed) => {
       const count = join(home, "gate-runs");
       await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
       const names = ["GOPRIVATE", "NODE_TLS_REJECT_UNAUTHORIZED"] as const;
@@ -291,10 +295,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         const f = start(quick);
         await prepared(f);
         expect((await prepared(f)).state?.baselineCached).toBe(true);
-        process.env.GOPRIVATE = "other.example/*";
-        expect((await prepared(f)).state?.baselineCached).toBe(false);
-        expect((await prepared(f)).state?.baselineCached).toBe(true);
-        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+        process.env[name] = changed;
         expect((await prepared(f)).state?.baselineCached).toBe(false);
         expect((await prepared(f)).state?.baselineCached).toBe(true);
       } finally {

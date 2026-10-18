@@ -940,7 +940,7 @@ test("oMLX smoke rows skip unavailable providers and fail attempted bad edits", 
   }) as typeof fetch;
   const check: typeof liveCheck = async (_harness, target, kind) => {
     invocations++;
-    expect(target.model).toBe("Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp");
+    expect(target.model).toBe("Qwen3.8-Flash-Next-oQ4e-mtp");
     expect(target.backend).toEqual({ baseUrl: "http://127.0.0.1:8989", authToken: "key" });
     return liveCheck(async () => ({ ...result, structured: { smoke: "ready" } }), target, kind);
   };

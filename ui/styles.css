@@ -1703,6 +1703,16 @@ p {
   }
 }
 
+.gate-slots-banner {
+  padding: 6px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
 .draining-banner {
   padding: 14px 24px;
   border-bottom: 2px solid #d99a32;

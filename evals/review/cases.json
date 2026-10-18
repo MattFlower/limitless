@@ -8487,6 +8487,449 @@
         "gates": []
       },
       "defects": []
+    },
+    {
+      "id": "review-109",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "619cbdb791c70cd191f97f5e85d38e9b12ba4339",
+      "head": "b15422fbf1a31a680c6eb22b6de17a30160eef41",
+      "source": "pr #414 fresh clean set 2026-10-16 @ b15422f",
+      "split": "dev",
+      "input": {
+        "prompt": "Adds the owner's 2026-10-07 throughput milestone to `docs/PLAN.md`. More machines raise how much work finishes per day, which no test speed-up does; speed still matters when something must ship quickly or blocks other work.\n\n- **M6.2 Throughput (later).** Workers on the owner's LAN, switched on when needed, lease whole runs from today's daemon, which stays the coordinator and source of truth. Builds on the design in #165 and docs/research/13-cloud-workers.md.\n- **Apple Silicon Macs first.** They are the most energy-efficient machines available and already have the sandbox the factory uses.\n- **x86 Linux workers later.** They need equivalent confinement before they run code the factory didn't write.\n- **Quota.** Subscription quota belongs to the account, so workers add CPU, memory and local-model capacity, not model quota.\n- **Demo.** A day of work spread over several Macs, against one machine, including the throughput each added machine buys.\n\nDocs only.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-110",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "febaff9bd6c9aafc711c1934470e52a45ce4f6d0",
+      "head": "4c9320e9c9b47137c5135c3f4c32aff00de204de",
+      "source": "pr #428 fresh clean set 2026-10-16 @ 4c9320e",
+      "split": "dev",
+      "input": {
+        "prompt": "Main's CI is red on febaff9 (#424): \"responsive Setup wraps cells and open editors at a 375px viewport without horizontal overflow\" timed out at Bun's 5-second default. It launches headless Chromium twice, and under the new `--parallel=4` on a 4-core CI runner that exceeds 5 seconds.\n\n- `setupLayout` (test/setup-ui-support.ts) now reuses one page per test file instead of launching a browser per call. The page stays open because a `--single-process` Chromium (required by factory confinement) exits when its last page closes; `closeSetupBrowser()` closes it in the file's `afterAll`.\n- The test gets an explicit 20-second timeout, because it drives a real browser rather than a unit.\n\nChecked locally: the UI test files plus two pipeline files pass 3/3 under `bun test --parallel=4`. Test-only change.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-111",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "063a46d07dc7c727a837a13ae53fedbbdf4814da",
+      "head": "fc0cd9ec133b038d350c64e6cc3c281f9056a932",
+      "source": "pr #430 fresh clean set 2026-10-16 @ fc0cd9e",
+      "split": "dev",
+      "input": {
+        "prompt": "## Problem\nInside confinement, every zsh here-document fails with `zsh:1: can't create temp file for here document: operation not permitted`. zsh writes here-document temp files under `TMPPREFIX`, which defaults to `<tmp>`, and confined commands can't write the system temp directories (by design; AGENTS.md says not to hardcode `/tmp`). Agents on this Mac run their shell commands in zsh (`/bin/zsh -lc ...`), so any here-doc they write (`cat <<EOF`, `python3 - <<'PY'`) fails, and they lose turns working around it. The message appears repeatedly in recent runs' event logs (for example run <run-id> on 2026-10-08).\n\nProbe with `runConfined` on 2026-10-08:\n- default: `zsh -lc 'cat <<EOF ...'` → exit 1, the error above;\n- `TMPPREFIX=\"$TMPDIR/zsh\"`, set by `export` inside the command or through the environment → exit 0, the here-doc works (a login shell's profile doesn't override it).\n\n## Change\nWherever the factory points `TMPDIR` at a run's or command's private scratch, also set `TMPPREFIX` to a path inside that same scratch (for example `<scratch>/zsh`): `runConfined` in `src/harness/sandbox.ts` and the environments of the Codex and Claude agent invocations. Use one helper so the two can't drift apart.\n\n## Tests\n- A confined `zsh -lc` here-doc succeeds, and the same command without the fix fails (the probe above, skipped where zsh or Seatbelt is unavailable, using `seatbeltSkip`).\n- The agent environment builders set `TMPPREFIX` inside the scratch they set `TMPDIR` to.\n\n## Budget\nA few lines, plus tests.\n\n## Out of scope\n- Other shells' temp settings.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-112",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "9fc2db51966b4c6d99f32181c5a8e46a5175e2fc",
+      "head": "ec3ede44a21ce9ed2d32ea05a652357d2d581e71",
+      "source": "pr #431 fresh clean set 2026-10-16 @ ec3ede4",
+      "split": "heldout",
+      "input": {
+        "prompt": "Two developer-facing lessons from recent factory runs:\n\n- **Keep generated load bounded** (The machine is shared). Reproduce races with the real parallel suite first; synthetic load is at most 4 processes for at most 10 minutes, stopped by pid. A run for #425 ran about 20 busy loops for 30 minutes and starved every other run's gates.\n- **Gate output is scanned for the Seatbelt nesting error** (Isolation). `src/gates/run.ts` and `src/pipeline/gate-evidence.ts` treat output containing `sandbox_apply: Operation not permitted` as a confinement failure, so a test title containing that literal blocked a round (#398).\n\nDocs only.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-113",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "2f19860da25ce669836a1cf6d14001e7c0830ad8",
+      "head": "a84ce49057729cbabeea675bc886586459523067",
+      "source": "pr #437 fresh clean set 2026-10-16 @ a84ce49",
+      "split": "dev",
+      "input": {
+        "prompt": "## Problem\n`scripts/land-pr.sh` writes its check output to `$LAND_PR_LOG` when it's set, and passed that variable into `bun run check`. `test/land-pr.test.ts` runs `land-pr.sh` with `...process.env`, so every nested run inherited the outer log path:\n\n- the nested runs truncated the outer log while the outer check kept writing at its offset, so the log started with 29–35 KB of NUL bytes and lost the failing tests' names;\n- concurrent nested runs wrote over each other's logs, and a land-pr test (\"land publishes its pinned SHA from an isolated push repository\") failed about half the time.\n\nReproduced: `LAND_PR_LOG=<file> bun test test/land-pr.test.ts` gives 114 pass / 1 fail; unset, 115 pass. The factory's land queue doesn't use this script; manual landings set the variable.\n\n## Change\n- The check runs with `-u LAND_PR_LOG`.\n- The push harness sets `LAND_PR_LOG` for the outer run, its fake `bun` records the variable, and the test asserts the check command doesn't see it (48 scenarios fail without the script change).\n\n`bun run check`: 3150 pass, 0 fail.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-114",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "efced6dbe906ed155cc862df6a34272deb4227fd",
+      "head": "cca0e765cf94e7155d7ee54e5340e1f5751fe457",
+      "snapshot": true,
+      "source": "pr #438 fresh clean set 2026-10-16 @ cca0e76",
+      "split": "heldout",
+      "input": {
+        "prompt": "## Problem\n`evals/review/cases.json` on main has 183 absolute local paths of the form `<private-path>/...` in 38 existing cases (review-001 to review-039 and review-h01 to review-h13), mostly in `input.implementerReport` links and gate output. They were copied from stored run records when the cases were built (#129 and earlier). The repository is public, and AGENTS.md says never to commit usernames or the owner's machine details. The private-strings check passes because it only blocks listed strings, not local paths.\n\n## Change\n1. Replace each local work-directory prefix in `evals/review/cases.json` with a placeholder that keeps the repository-relative part readable, for example `<private-path>/src/git/repos.ts` → `<worktree>/src/git/repos.ts`. Apply the same to any other absolute home-directory path in those cases. Change nothing else in the cases: ids, kinds, labels, defects, base and head stay as they are.\n2. Add a test that fails when any review or implement case contains an absolute home-directory path (`<home>/` or `<home>/`), so new cases can't reintroduce one.\n\n## Tests\n- The new test fails on main's `cases.json` and passes after the change.\n- The existing eval case tests still pass.\n\n## Budget\nA mechanical data change plus a test of about 20 lines.\n\n## Out of scope\n- Rewriting git history.\n- Changing case labels or stored eval results. If the eval cache keys on case input text, say in the report which cached outputs these edits invalidate.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-115",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "a9c39600d8e9f7fe2f615d8bab4358b8e19316c2",
+      "head": "1a9996d371b1e40ce62ce70ee5a5b7cf4f7dfc40",
+      "source": "pr #439 fresh clean set 2026-10-16 @ 1a9996d",
+      "split": "dev",
+      "input": {
+        "prompt": "## Problem\n\"environment verification retry: passes\" (test/failure-injection.test.ts) failed once in the deploy gate on 2026-10-08, with the suite running under `--parallel=4` (deploy of febaff9, attempt 1). The assertion was `Expected: \"succeeded\"`, `Received: \"failed\"`, after 1.6 s. The retry passed. This is the same pattern as the panel-mode test fixed in #424, whose cause turned out to be a real race between panel cleanup's `git status` (with its optional index refresh) and the worktree admin-directory safety check (\"Unsafe worktree Git administration\").\n\n## Change\n1. Reproduce it under contention, **gently: other runs share this machine.** First try running the test file many times under `bun test --parallel=4` together with a few other pipeline-*.test.ts files. That is the real load that triggered it. Only if that doesn't reproduce it, add synthetic CPU load: **at most 4 load processes, at most 10 minutes in total**, keep their pids and stop exactly those. (A previous attempt ran about 20 busy loops for 30 minutes, which starved every other run's gates and was cancelled.) Run the test many times, and on failure dump the run's stage results and events from the store to find which stage failed and why.\n2. Fix the cause. If it is another git call that takes optional locks while a safety check inspects the admin directory, prefer one shared fix (for example `--no-optional-locks` or `GIT_OPTIONAL_LOCKS=0` for read-only status calls in the hardened worktree git wrapper) over a one-off. Don't relax the safety check, and don't just raise timeouts. Explain the cause in one comment where you fix it.\n3. Then run the whole pipeline-*.test.ts set under the same load and report any other flaky test with its cause.\n\n## Tests\n- The test passes 30 times in a row under the same bounded load, at its original deadlines. Report how it failed before the fix.\n- A regression test for the cause if it is in factory code.\n\n## Out of scope\n- Raising timeouts or retrying tests.\n\n## Budget\nSmall; the fix depends on the cause.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-116",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "5e37dddbd94c569af71178783f3e176bfe80dceb",
+      "head": "e72b2ed09591cd5947b923d759d21f2b26cc37f8",
+      "source": "pr #442 fresh clean set 2026-10-16 @ e72b2ed",
+      "split": "dev",
+      "input": {
+        "prompt": "## Problem\nTwo tests in `test/land-queue.test.ts` fail intermittently on Linux CI with one extra entry in the fake gate's log right after the queue stops:\n- \"stopping mid-check leaves a later entry unstarted\" (PR #433's CI, 2026-10-08), `expect(gateLog()).toEqual([\"start\"])` at line 581;\n- \"a restart during checking re-runs the checks from the start\" (PR #439's CI, run 37886446828, 2026-10-09), the same assertion at line 647.\n\nThe fake land check is `echo start >> gates.log; sleep 0.3; echo end >> gates.log` (line 76). Both tests wait until \"start\" appears, call `stop()`, and assert the log is still `[\"start\"]`, so they assume `stop()` interrupts the check within 0.3 s of the poll that saw \"start\". On a loaded runner the poll interval plus stop latency can exceed that, the check writes \"end\", and the assertion fails. This is a timing assumption in the test, not a land-queue defect: the tests' later assertions show a stopped check is re-run from the start.\n\n## Change\nMake the fake check wait for an explicit release instead of a fixed sleep: for example `echo start >> gates.log; while [ ! -e release ]; do sleep 0.05; done; echo end >> gates.log`, with the tests that need checks to finish creating the release file (immediately, or at the point they currently rely on the sleep). The two stop tests keep the check unreleased until after `stop()`, so \"end\" can only appear if `stop()` failed to interrupt it. Keep each test's other assertions as they are.\n\n## Tests\n- The two tests pass, and fail if `stop()` stops interrupting a running check (check by temporarily making `stop()` wait for the check to finish).\n- The other land-queue tests still pass with the release mechanism, without longer timeouts.\n\n## Budget\nTest-only, about 30 lines.\n\n## Out of scope\n- Changing the land queue's stop or resume behavior.\n- Raising timeouts or retrying tests.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-117",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "f32509f958bda7e250e1e9941e6887ecbee331f2",
+      "head": "b0a7028baf5d39e63719766bf63c945a5e52090f",
+      "source": "pr #444 fresh clean set 2026-10-16 @ b0a7028",
+      "split": "dev",
+      "input": {
+        "prompt": "Each scenario in `test/land-pr.test.ts` runs the real `land-pr.sh` with git and fake tools; on an idle machine they take about 4 s (for example `redirect` 3.9 s), close to Bun's 5 s default. Under parallel load they cross it: `redirect` failed #439's land check at 5001 ms and `changed-local-exclude` timed out in a review run. Other real-git test files already set `setDefaultTimeout(30_000)` for the same reason (#140); this file didn't.\n\nTest-only. `bun test test/land-pr.test.ts`: 115 pass.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-118",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "566c24b7063e682d56e758db2eebb9aaac5732e1",
+      "head": "6569a358117c58bdcdb48d5b278267cb8b4f7eee",
+      "source": "pr #445 fresh clean set 2026-10-16 @ 6569a35",
+      "split": "heldout",
+      "input": {
+        "prompt": "By decision (2026-10-09): M5 pauses so M5.5 can start sooner.\n\n- **Now and next:** M5.5 first (landing through the queue #352, then #46, CI fix rounds, #71, the new-agent test); M5.1 measures where gate and prepare time goes before choosing a fix; M5.2 moves to the review variants on dev cases.\n- **M5:** paused apart from in-flight #441 (process ownership in cleanup) and #423 (the owner's own holdout diagnostics). #335 and #340 must land before the M6 work pilot.\n- **M5.1 / M5.2 rows:** record the parallel suite's effect (land check about 28 → 9–12 min, CI about 9 → 5.5 min, factory gates not faster under load) and the M5.2 dataset (#433).\n\nDocs only.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-119",
+      "kind": "real",
+      "repo": "MattFlower/limitless",
+      "base": "c9c004c1e538c60333202a2f50bbadfef715f87f",
+      "head": "c7e65bbd0e203aaaf23a0690b4337f448dbafd6f",
+      "source": "pr #446 fresh clean set 2026-10-16 @ c7e65bb",
+      "split": "dev",
+      "input": {
+        "prompt": "Fixes #423.\n\n## Decision (2026-10-09)\nPR #429 moved holdout redaction from write time to output time: it stored verifier diagnostics in full and redacted each agent- and GitHub-facing output. Its reviews kept finding outputs without the guard (provider records, restored state, clipped tool-call previews, MCP error responses, agent-requested SSE and artifact endpoints, the review-round PR section, several prompt families), so every new output path would need to remember it. #429 is closed. This is the design to use instead.\n\n## Problem\nMain redacts a verify or holdout invocation's output when it is written (`redactHoldout` in `src/pipeline/context.ts`, and the run error detail in `src/pipeline/engine.ts`). Everything an agent or GitHub can see is therefore holdout-safe by construction, but the owner loses the same diagnostics: for example #422's verify run errors and the providers' structured 400 responses were scrubbed, which hid why verification failed.\n\n## Change\n1. **Keep main's write-time redaction unchanged.** Every stored record that agents, prompts, MCP, REST, SSE, the digest or GitHub can read stays exactly as main writes it today.\n2. **Also keep an owner-only copy of the raw text** wherever write-time redaction changed something: the verify and holdout invocations' raw error, result text and event messages, and the raw detail behind the redacted run error. Store it only where agents can't read it:\n   - never returned by any MCP tool, prompt, digest, feed item or GitHub text;\n   - never served by the HTTP/SSE API to a request that isn't the owner (check how `src/server/http.ts` and `src/server/auth.ts` decide that, including local unauthenticated requests; if the API can't tell, don't serve it over HTTP at all);\n   - not in a path an agent sandbox can read (check the editor and reader read rules: `privateReadRoots`, `denyRead`, the factory home).\n   A new table or a file under the run's private directory both work; add any table in a new additive migration.\n3. **Show it to the owner:** `limitless show <run>` and `limitless logs <run>` print the owner diagnostics next to the redacted records, clearly marked, and the owner UI may show them if it can do so under the same rule.\n4. Credential redaction still applies to the owner copy (`redactCredentials`).\n\n## Tests\n- A verify invocation whose error, result and events contain authored holdout text and runtime literals: every agent-, prompt- and GitHub-facing path shows exactly what main shows today, and `limitless show`/`logs` show the raw text.\n- The owner copy is not reachable through any MCP tool on either transport, nor through the REST/SSE API without owner authorization.\n- A run that never redacted anything stores no owner copy.\n- A run created before the change still displays and resumes (no owner copy, no error).\n\n## Budget\nAbout 150 source lines plus tests, mostly additive.\n\n## Out of scope\n- Changing what agents, prompts or GitHub receive.\n- Redacting more than main does today.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": [
+        {
+          "file": "src/db/migrations/20261009T223115-owner-diagnostics.sql",
+          "lines": [
+            4,
+            9
+          ],
+          "severity": "major",
+          "category": "performance",
+          "summary": "The owner_diagnostics foreign keys cascade on delete without an index on event_id or invocation_id, so the daemon's synchronous debug-event cleanup scans the whole table for every deleted event and slows as owner rows grow.",
+          "required": true,
+          "foundBy": "fresh clean-set vetting 2026-10-16 (codex/sol-6.1 high and claude/opus), confirmed by the orchestrator",
+          "adjudication": "confirmed"
+        }
+      ]
+    },
+    {
+      "id": "review-120",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "0ce36db04635374c0a2019e3c44738eef003ff51",
+      "head": "edc203afe350d5fbfa8bc26c7ab219d151cf483d",
+      "source": "pr #447 fresh clean set 2026-10-16 @ edc203a",
+      "split": "dev",
+      "input": {
+        "prompt": "The land queue's confined check failed #442 three times. The last attempt had the only gate slot and failed just two tests, both at the 10 s `wait()` barrier in `test/failure-injection.test.ts` (`settled()` never returned in time).\n\nMeasured on 2026-10-09 (main 0ce36db):\n- the two restart scenarios: 4.3 s and 2.8 s unconfined, 13.0 s and 8.1 s under the gates' confinement (`runConfined` with `gateEnv()`);\n- the whole file: 263 s unconfined, 339 s confined, all passing with a 25 s barrier.\n\nThe barrier waits for a run to settle; it doesn't guard a race, so a longer wait hides nothing. It stays under the file's 30 s test timeout. Why the confined restart scenarios are this much slower is for M5.1's measurement work.\n\nTest-only. `bun test test/failure-injection.test.ts`: 131 pass.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-121",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "df2ef2ff0c39cea820d0640ab5e1cb1106d9618f",
+      "head": "8bc5ec526eebd2be5fe437a086854be4b80c73d2",
+      "source": "pr #451 fresh clean set 2026-10-16 @ 8bc5ec5",
+      "split": "dev",
+      "input": {
+        "prompt": "## Problem\nFollow-up to #448 / #449. After the landing queue pushes its own base merge, GitHub can briefly still report the approved head. #449 made every explicit head check in `awaitCi` (`src/land/queue.ts`) tolerate that lag, but one path still doesn't: when CI **fails** on the pushed merge and the transient-failure rerun preflight runs, `ciDecision` (`src/integrations/ci-classifier.ts:434`) returns `head_moved` for any head other than the pinned SHA, including the approved SHA, and `awaitCi` (`src/land/queue.ts:450`) treats `head_moved` as fatal. The entry then blocks with `head moved after approval` instead of waiting for GitHub to catch up and re-running the transient failure. A review reproduced it: failed CI on the pushed merge plus a lagging preflight read leaves the entry `blocked` where `waiting_ci` is expected.\n\nIt fails closed (it never merges), but a transient CI failure right after a base merge loses its one rerun.\n\n## Change\nLet the classifier's result distinguish \"the reported head is the approved SHA\" (lag: pending, no rerun requested yet) from \"some other head\" (blocks, as today), using the same rule as #449's `headMoved` helper. Keep one implementation of the rule.\n\n## Tests\n- Failed CI on the pushed merge with a lagging approved-head read stays `waiting_ci`, then reruns once when GitHub reports the pushed head.\n- A head that is neither still blocks with `head moved after approval`.\n- Each test fails without the change.\n\n## Budget\nSmall.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-122",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "c9c004c1e538c60333202a2f50bbadfef715f87f",
+      "head": "bbcff62fdf47605b14bf4f2f26c0e1ab57e48cc9",
+      "source": "pr #454 fresh clean set 2026-10-16 @ bbcff62",
+      "split": "dev",
+      "input": {
+        "prompt": "`review shadow panel … quota headroom is checked only for providers the shadow roster can reach` runs six full pipeline runs (fake agents, real git and gates). It takes about 17 s alone, confined or not, against the 30 s default from `test/pipeline-support.ts`, so under the parallel suite it timed out in land checks (#451's land entry 14 at 30083 ms, and an earlier one). This gives that one test 60 s; splitting it into one test per scenario is M5.1 work.\n\nTest-only. `bun test test/pipeline-shadow.test.ts`: 35 pass.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-123",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "ea28c5b76faf0c562208c4c3d999b95e5eb4f4a2",
+      "head": "744df1b600f2be2c6a3be75d0f6d0053ee10a45a",
+      "source": "pr #455 fresh clean set 2026-10-16 @ 744df1b",
+      "split": "heldout",
+      "input": {
+        "prompt": "## Problem\n`newId()` in `src/db/store.ts` makes ids from `Date.now().toString(36)` plus 4 characters of `Math.random().toString(36)` (padded with \"0\" when shorter): about 1.7 million values per millisecond. Ids created in the same millisecond collide by the birthday bound once a few dozen are made together. PR #451's CI hit it (run 38023447567): `test/routing-http.test.ts:364` creates 100 runs in a loop and `insertRun` failed with `UNIQUE constraint failed: runs.id`. Production creates runs slowly, but eval trials, proposals and other bulk inserts use the same function.\n\n## Change\nMake ids unique under bursts while keeping their shape (lowercase base 36, within `RUN_ID`'s 32 characters, sortable by creation time): keep the time prefix and replace the 4 `Math.random` characters with enough cryptographic randomness (for example 10 characters from `crypto.getRandomValues`), or add a per-process counter after the time. Existing ids stay valid.\n\n## Tests\n- Generating 100,000 ids in a tight loop yields no duplicates and every id matches `RUN_ID`. This fails with the current implementation.\n\n## Budget\nA few lines plus the test.\n\n## Out of scope\n- Changing existing ids or their format beyond the random part.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-124",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "b82747ba0a1789e69d651af2caf99c1b0f288597",
+      "head": "4cfeb5fd66a50afc2dde94e79fb1456feed9d5d8",
+      "source": "pr #456 fresh clean set 2026-10-16 @ 4cfeb5f",
+      "split": "heldout",
+      "input": {
+        "prompt": "## Problem\nThe landing queue checks a PR against the wrong base when the land request resolves to a review-round run. `LandQueue.request` (`src/land/queue.ts`, around line 166) takes `baseBranch: run.baseBranch ?? repo.defaultBranch` from the run it was given. A review round's run delivers onto the PR's head branch, so its `baseBranch` is that same branch. The queue then \"merges the base\" by merging the PR branch into itself, a no-op, and runs the land check on the PR head **without** the PR's real base (`main`).\n\nSeen on 2026-10-10: land entry 13 for PR #446 (requested through the round run <run-id>) recorded `base_branch` = the PR's own branch, and its check ran a tree missing #447, which had been on `main` for hours (two tests failed on the old 10 s barrier #447 had removed). Entry 9 for #443 (also a round run) only checked the right tree because its head already contained `main`. GitHub's `pull_request` CI runs on the merge ref, which catches some of this, but the queue's own land check, the one that gates the merge, tested the wrong tree.\n\n## Change\n- A land entry's base branch is the PR's real base: the owning (non-round) run's base branch, or the base branch GitHub reports for the PR. Never a branch equal to the entry's head branch. Use one resolution for every way a land is requested (`limitless land <run|pr|url>`, `POST /api/land`, MCP `limitless_land`, review approval).\n- If the base can't be determined, block the entry with a clear reason instead of guessing.\n- Entries already queued keep working; when a stored `base_branch` equals its `head_branch`, resolve the real base when the entry runs.\n\n## Tests (fake `gh`, a local bare repository)\n- Requesting a land through a review-round run records `main` as the base and merges current `main` into the approved head before the check.\n- An entry stored with `base_branch` = `head_branch` is resolved to the real base when it runs.\n- An undeterminable base blocks with a clear reason.\n- Each test fails without the change.\n\n## Budget\nSmall to medium.\n\n## Out of scope\n- Conflict rounds (#46).",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-125",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "7ff5c6094ad25c307f9f05d08c78f641633ff335",
+      "head": "e794ae5e59c3ecc6761cdcce2cd190c8c258a54b",
+      "source": "pr #463 fresh clean set 2026-10-16 @ e794ae5",
+      "split": "dev",
+      "input": {
+        "prompt": "## What happened\nLinux CI failed on the landing queue's base merge for #451 (run 38034887488, 2026-10-10):\n\n```\n(fail) cancel active delivery comments kills descendants and stays cancelled after restart [1197.15ms]\ntest/failure-injection.test.ts:1373  expect(pids.size).toBe(2)  Expected: 2  Received: 0\n```\n\n#451 doesn't touch delivery, and this is the first occurrence in the last 25 failed CI runs.\n\n## Cause\nIn the `comments` case, the fake `gh api` blocks and writes `delivery-pids` during the first factory's delivery. The test then runs `settled` and `reopen(f)`. Stopping the first factory kills that blocked `gh api` and its `sleep`, but the file stays.\n\nAfter the restart, `await wait(() => existsSync(pidFile))` returns at once on the old file. Whether `retainPids` sees live pids then depends on whether the reopened factory's delivery has already overwritten the file: here it hadn't, so both pids were dead.\n\n## Change\nRemove `delivery-pids` before `reopen(f)` in the `comments` case, so the wait observes the reopened factory's process. Change nothing else in the test.\n\n## Test\n- The test passes 20 times in a row under `bun test --parallel=4` with `test/failure-injection.test.ts` alone.\n- Without the change, show the race: with a short sleep injected between `reopen` and the read (in a scratch copy, not committed), the test gets 0 pids.\n\n## Budget\nA few lines in `test/failure-injection.test.ts` only.\n\n## Out of scope\nThe other cases and the file's barriers.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-126",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "0da69619a3de904fb0734ac39876a4e0ba11a62b",
+      "head": "a3112a07dedb3a2d8f29417942be988fe9603cc0",
+      "source": "pr #466 fresh clean set 2026-10-16 @ a3112a0",
+      "split": "heldout",
+      "input": {
+        "prompt": "## What happened\nThe landing queue's check for #460 (land entry 21, 2026-10-10) failed in one test that #460 doesn't touch:\n\n```\n(fail) pipeline (fake agents, real git + gates) > baseline cache > uncacheable baselines on one base > with the kill switch, same-base runs execute their baselines concurrently [6187.65ms]\ntest/pipeline-baseline-cache.test.ts:139  expected [\"start\",\"start\",\"start\"], received [\"start\",\"start\",\"end\"]\n```\n\n## Cause\nEach baseline check logs `start`, sleeps 1 s, then logs `end`. The test passes only if all three runs' prepare stages reach their check within that second. Under a confined, loaded land check, run preparation (worktree, setup) can stagger by more than a second. The first baseline then ends before the third starts, although the code under test did run them concurrently.\n\nThe sibling test \"a failing flight releases its waiters to run concurrently\" uses the same `timed` helper and has the same exposure.\n\n## Change\nMake the overlap deterministic. In `timed`, each check appends `start`, then waits until the log holds as many `start` lines as the test expects before it logs `end`. The wait is bounded: poll every 50 ms for at most 10 s, then continue. Serialized baselines (the defect these tests guard against) therefore still fail the assertion instead of hanging. Keep the assertions as they are.\n\n## Test\n- Both tests pass 20 times in a row under `bun test --parallel=4 test/pipeline-baseline-cache.test.ts`.\n- With `gateSlots.setLimit(1)` in a scratch copy (forcing serial baselines), the kill-switch test still fails, within the bound.\n\n## Budget\nA few lines in `test/pipeline-baseline-cache.test.ts` only.\n\n## Out of scope\nThe baseline cache code.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-127",
+      "kind": "real",
+      "repo": "MattFlower/limitless",
+      "base": "1aa4f2b6440be92feed70794c485779c20f56f09",
+      "head": "261559da0ec2376d0c2614ce30205f81e43e94bd",
+      "source": "pr #467 fresh clean set 2026-10-16 @ 261559d",
+      "split": "dev",
+      "input": {
+        "prompt": "## What happens\nDelivery pushes the worktree's current HEAD (`const head = sha ?? (await headSha(cwd))` in `deliver`, `src/pipeline/engine.ts`). It doesn't check that this commit is the one the gates, audit and review checked. Review records `ctx.state.reviewedSha`, but only the verify-change flow compares it with HEAD.\n\nA run that stops between review and delivery and resumes with a different HEAD therefore pushes a commit nothing checked.\n\nReproduced on main (2026-10-10) with the `test/review-rounds.test.ts` harness:\n1. A review round is killed by the fault plan `{ \"stage:deliver:before\": { action: \"kill\" } }`.\n2. The round's worktree commit is amended (`fix.txt` changed, same parent).\n3. The daemon restarts.\n\nThe round ends `succeeded` and the PR branch holds the amended commit `91cda74`, not the reviewed `18e60a1`.\n\nOnly the factory writes a run's git admin directory, so this is a gap in \"act on the exact commit you checked\" (AGENTS.md), not a known exploit. #458's review found it while checking conflict rounds, which deliver through the same code.\n\n## Change\n- Before any push (review-round delivery, existing-branch delivery and new-PR delivery), require HEAD to equal the commit recorded by the last passing gates and review for this round.\n- If it differs, refuse without pushing and end the run needs_human with a reason naming both SHAs.\n- The check runs on the resume path as well as the first attempt, through one shared helper.\n\n## Tests (fake agents, local bare repository, fault plan; no network)\n- The scenario above pushes nothing and ends needs_human. It fails on main.\n- An ordinary resume with HEAD unchanged still delivers once.\n- The same check holds for a new-PR delivery and an existing-branch delivery.\n\n## Budget\nAbout 30 changed source lines plus tests.\n\n## Out of scope\n- Re-running gates or review automatically after a mismatch.\n- Conflict rounds' own delivery checks (#458).",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": [
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [
+            1790,
+            1795
+          ],
+          "severity": "major",
+          "category": "delivery",
+          "summary": "A resumed delivery whose base advanced again after a completed factory merge is refused, because the check requires the second merge's first parent to be the reviewed commit instead of the earlier factory merge.",
+          "required": true,
+          "foundBy": "fresh clean-set vetting 2026-10-16 (codex/sol-6.1 high and claude/opus), confirmed by the orchestrator",
+          "adjudication": "confirmed"
+        }
+      ]
+    },
+    {
+      "id": "review-128",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "78c89febae1adfa0455183208452f371415acdee",
+      "head": "4dee0057de86a73d808945173c8e222ca6cf7a80",
+      "source": "pr #468 fresh clean set 2026-10-16 @ 4dee005",
+      "split": "dev",
+      "input": {
+        "prompt": "Follow-up from #458's review. It ships before CI fix rounds, which will add a new `review_rounds.kind`.\n\n## Change\n1. **Readers tolerate an unknown round kind.** `validateRoundKind` (`src/db/store.ts`) throws on any kind other than `review` or `conflict`, and `reviewRounds` runs it on every row. A rollback from a release that writes a new kind would therefore make every round read for that PR throw. Instead:\n   - an unknown kind is kept as data;\n   - it counts as in flight for the one-round-per-PR rule while its run isn't terminal;\n   - it counts toward neither the review cap nor the conflict cap;\n   - the engine refuses to execute or deliver a round of an unknown kind, failing it with a clear reason, without throwing in readers.\n2. **Draft deferrals are rechecked on change, not on every pass.** A trigger skipped with \"PR is draft\" is looked up live about every 60 s for as long as the PR stays a draft (`pendingConflictTriggers`, `processConflictTriggers`). Recheck it only when the poller observes a change on that PR: no longer draft, a new head, or closed.\n\n## Tests (no network)\n- A row with kind `ci` doesn't make `reviewRounds` throw. It blocks a new review or conflict round on that PR while in flight, and counts toward neither cap.\n- An unknown-kind round run fails with a clear reason and pushes nothing.\n- A draft deferral makes no `gh` lookups while the PR is unchanged, and starts its round once the poller sees the PR become ready on the same head.\n\n## Budget\nAbout 40 lines plus tests.\n\n## Out of scope\nCI fix rounds themselves (filed separately, after this ships).",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-129",
+      "kind": "real",
+      "repo": "MattFlower/limitless",
+      "base": "a3184c3233013933e235c2aeab36b27726927c7e",
+      "head": "b4188ea3ec2e58f9df0696022b681c027f3de234",
+      "source": "pr #478 fresh clean set 2026-10-16 @ b4188ea",
+      "split": "heldout",
+      "input": {
+        "prompt": "Found by the new-agent test (#473): MCP tool outputs too large for an agent to read.\n\n## What happened\n- `limitless_list_runs` with no arguments returned 99 KB (every run ever), over the client's limit. With `limit: 3` it worked.\n- `limitless_get_run` output was large enough that the agent avoided it (\"Those outputs are big\").\n- `list_runs` showed `merged: true` while `mergedBy` and `mergedAt` were still null; `limitless_status` was right.\n\n## Change\n1. `limitless_list_runs` defaults to a small limit, newest first, with `repo` and `status` filters, and says when more remain.\n2. `limitless_get_run` returns a compact summary by default (state, stage, PR, head SHA, delivered rounds, land entry, last error), with an option for full detail.\n3. The merge fields are consistent: `mergedAt` and `mergedBy` are set when `merged` is, or omitted until known.\n\nAdditive changes only. Old fields stay available through the full-detail option.\n\n## Tests\n- Default sizes stay under a byte budget with many runs.\n- The filters work.\n- `merged` and its fields agree.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": [
+        {
+          "file": "src/integrations/mcp.ts",
+          "lines": [
+            235,
+            235
+          ],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "Against an older daemon that ignores the new repo parameter, limitless_list_runs returns other repositories' runs as matches, because the proxy never checks that the filter was applied.",
+          "required": true,
+          "foundBy": "fresh clean-set vetting 2026-10-16 (codex/sol-6.1 high and claude/opus), confirmed by the orchestrator",
+          "adjudication": "confirmed"
+        }
+      ]
+    },
+    {
+      "id": "review-130",
+      "kind": "clean",
+      "repo": "MattFlower/limitless",
+      "base": "af76c2be1c63479c33d43ebb9beb184c7651a71e",
+      "head": "40056f0df80b7ef6812fcdf4b96c9ce31a576d88",
+      "source": "pr #490 fresh clean set 2026-10-16 @ 40056f0",
+      "split": "heldout",
+      "input": {
+        "prompt": "## What's wrong\nWhen the verifier can only report environment blocks (`verification blocked by the environment`), the run ends `needs_human`. The two delivery paths handle that differently:\n- **A first delivery** pushes and opens a **draft** PR with the 🚧 evidence. The guide's advice (\"verify those criteria yourself and mark the PR ready\", GUIDE §8) depends on that push.\n- **A review, conflict or CI-fix round** returns `PR update needs human review; no push` (`src/pipeline/engine.ts`, `deliverReviewRound` is skipped when `!success`). The round's commit stays in the factory's repository cache. The PR still shows the previous head, and nothing the owner can open or land contains the fixes.\n\nSeen on 2026-10-10. Review round <run-id> on #483:\n- the gates passed and review approved;\n- verify met 11 of 15 criteria and blocked the other 4, because real-Seatbelt tests skip inside confined gates;\n- the round's commit was never pushed.\n\nThe orchestrator had to fetch it from the cache by SHA to review it. The blocked criteria pass unconfined.\n\n## Change\n1. **A round that ends blocked only by its environment pushes its commit,** the same way a first delivery does, as long as gates, the audit and review would have let it deliver.\n   - It updates the PR branch with an explicit pinned refspec.\n   - It posts the round comment with the 🚧 evidence, and marks the PR as a draft or leaves it unchanged; whichever the first-delivery path does, match it.\n   - It doesn't mark the round approved.\n   - The run still ends `needs_human`, with the same reason.\n2. **Feed and run detail** name the pushed head, so `limitless review <run> --approve --sha <head>` and `limitless land <pr> --sha <head>` work on it without a cache lookup.\n3. **Every other `!success` outcome stays as it is,** with no push: a real verify failure, an audit or gate block, or exhausted rounds.\n\n## Tests (fake `gh`, no network)\n- A review round whose verify returns only `blocked` criteria pushes its head to the PR branch, posts the evidence and ends `needs_human`.\n- A review round whose verify has an `unmet` criterion doesn't push.\n- Restarting after the push doesn't push again (an existing durable checkpoint, or a new one).\n- A conflict round and a CI-fix round behave like a review round.\n\n## Budget\nAbout 60 changed source lines plus tests.\n\n## Out of scope\nMaking Seatbelt tests runnable inside confined gates, and changing the verifier's gate-substitution rule.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-131",
+      "kind": "clean",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "ce9ea564ed0ec40f9c7d77824a749977b6ffe9dd",
+      "head": "3921f1ba67c259d968baf78cf7dd8cd90459396d",
+      "source": "pr #8 fresh clean set 2026-10-16 @ 3921f1b",
+      "split": "heldout",
+      "input": {
+        "prompt": "Lists the checks the factory already auto-detects (a `.limitless.toml` turns detection off) and sets `[policy] merge = \"pr\"`, so delivery leaves PRs open for review and landing goes through the landing queue. Prepares the M5.5 new-agent test (MattFlower/limitless#473).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-132",
+      "kind": "clean",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "6c591afbcaa5c65e649a2f6f2619bf42320db6d8",
+      "head": "c2944083a9a9bfc471960e80ee9aac157463cf77",
+      "source": "pr #10 fresh clean set 2026-10-16 @ c294408",
+      "split": "heldout",
+      "input": {
+        "prompt": "Add a `reverse` command to textkit's CLI that reverses its input. Include tests.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
+    },
+    {
+      "id": "review-133",
+      "kind": "clean",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "d63d09a62ce9ce95af1cf8a451ad9d1f1ed117a2",
+      "head": "4e4676ecc4188559602aed5bd8f8e38c0c2ba6b5",
+      "source": "pr #14 fresh clean set 2026-10-16 @ 4e4676e",
+      "split": "heldout",
+      "input": {
+        "prompt": "Add a `dedupe` command to textkit's CLI that removes duplicate lines from its input. Follow existing command conventions and add tests.",
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
+      },
+      "defects": []
     }
   ]
 }

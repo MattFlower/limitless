@@ -19,7 +19,7 @@ const Shell: Component<RouteSectionProps> = (props) => (
     <NavBar />
     <Show when={live.gateSlots()}>
       {(slots) => (
-        <div role="status">
+        <div class="gate-slots-banner" role="status">
           Gate slots: {slots().occupied}/{slots().limit} {slots().holders.join(", ")}
         </div>
       )}

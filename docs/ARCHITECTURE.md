@@ -166,7 +166,7 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 | 5 | Claude Opus 5.5 | (OpenRouter frontier — last resort) |
 | 4 | Claude Sonnet 5.5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
-| 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, opt-in), config-defined LAN llama.cpp models |
+| 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Qwen3.8 27B 8-bit (`omlx/qwen-27b`, opt-in), config-defined LAN llama.cpp models |
 
 The primary Mac backend is **oMLX**, managed externally by oMLX.app / `omlx start` at
 `http://127.0.0.1:8989` (port 8989). Set `OMLX_API_KEY` in
@@ -178,8 +178,8 @@ Limitless defaults to 4 concurrent oMLX requests; override in `config.toml` with
 max_concurrent = 8
 ```
 
-The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
-`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first routing
+The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-oQ4e-mtp`);
+`omlx/qwen-27b` (`Qwen3.8-27B-8bit`) is opt-in. The smoke check, and free-first routing
 among free models the policy does not name, take catalog order, so they use Flash. Tool-free roles accept
 `omlx/qwen-flash@none` / `omlx/qwen-flash@high` to turn thinking off/on; compare them with
 `limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow`.
