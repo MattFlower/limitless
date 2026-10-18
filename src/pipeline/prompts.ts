@@ -4,7 +4,7 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
-import type { GateComparison, GateRun } from "../gates/run.ts";
+import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
 import {
   citationInSource,
   citedRequirement,
@@ -116,8 +116,11 @@ function checksSection(cfg: GateConfig, baseline: GateRun | null): string {
   for (const s of cfg.setup) lines.push(`- setup: \`${s}\``);
   for (const c of cfg.checks) {
     const base = baseline?.checks.find((b) => b.name === c.name);
-    const note =
-      base && !base.ok ? " — already FAILING on the base branch (not your fault, fix only if in scope)" : "";
+    const note = confinementFailed(base)
+      ? " — baseline result unavailable for comparison due to confinement failure; a failing candidate check will block"
+      : base && !base.ok
+        ? " — already FAILING on the base branch (not your fault, fix only if in scope)"
+        : "";
     lines.push(`- ${c.name}: \`${c.run}\`${note}`);
   }
   return lines.join("\n");

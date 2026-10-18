@@ -1,5 +1,81 @@
 import { expect, test } from "bun:test";
+import type { GateResult, GateRun } from "../src/gates/run.ts";
 import { FACTORY_PREAMBLE, implementPrompt } from "../src/pipeline/prompts.ts";
+
+const passed: GateResult = {
+  name: "test",
+  command: "bun test",
+  ok: true,
+  exitCode: 0,
+  durationMs: 1,
+  output: "",
+  confinementError: false,
+};
+const failed = { ...passed, ok: false, exitCode: 1 };
+
+function promptWithBaseline(baseline: GateRun | null): string {
+  return implementPrompt({
+    prompt: "Fix the bug",
+    spec: null,
+    gates: {
+      setup: [],
+      checks: [{ name: "test", run: "bun test" }],
+      source: "none",
+      protectedPaths: [],
+    },
+    baseline,
+    baseSha: "base",
+    feedback: null,
+    round: 0,
+    hasHoldout: false,
+  });
+}
+
+test.each(["flag", "output", "firstAttempt", "targetedRetry"] as const)(
+  "implement guidance for an unusable baseline detected via %s",
+  (kind) => {
+    const confinement = {
+      ...failed,
+      ...(kind === "flag"
+        ? { confinementError: true }
+        : { confinementError: undefined, output: "sandbox_apply: Operation not permitted" }),
+    };
+    const check =
+      kind === "firstAttempt" || kind === "targetedRetry" ? { ...passed, [kind]: confinement } : confinement;
+    const prompt = promptWithBaseline({ setupOk: true, setup: [], checks: [check] });
+    expect(prompt).toContain("baseline result unavailable for comparison");
+    expect(prompt).toContain("a failing candidate check will block");
+    expect(prompt).not.toContain("already FAILING");
+    expect(prompt).not.toContain("not your fault");
+    expect(prompt).not.toContain("fix only if in scope");
+  },
+);
+
+test.each(["ordinary failure", "passing", "missing counterpart", "no baseline"])(
+  "implement baseline guidance: %s",
+  (kind) => {
+    const baseline =
+      kind === "no baseline"
+        ? null
+        : {
+            setupOk: true,
+            setup: [],
+            checks: [
+              kind === "ordinary failure"
+                ? failed
+                : kind === "missing counterpart"
+                  ? { ...failed, name: "lint" }
+                  : passed,
+            ],
+          };
+    const prompt = promptWithBaseline(baseline);
+    const guidance = "already FAILING on the base branch (not your fault, fix only if in scope)";
+    if (kind === "ordinary failure") expect(prompt).toContain(guidance);
+    else expect(prompt).not.toContain(guidance);
+    expect(prompt).not.toContain("unavailable for comparison");
+    expect(prompt).not.toContain("a failing candidate check will block");
+  },
+);
 
 for (const round of [0, 1]) {
   for (const hasHoldout of [true, false]) {

@@ -18,6 +18,7 @@ import {
   validateRequest,
 } from "../src/evals/cases.ts";
 import { checkPrivateText, loadPrivateStrings } from "../src/gates/private.ts";
+import { compareGates } from "../src/gates/run.ts";
 import type { ModelDef } from "../src/router/catalog.ts";
 import { evalFixture } from "./evals-support.ts";
 
@@ -558,8 +559,45 @@ test("recorded gate comparisons accept a confinement verdict and keep rejecting 
     result: { ...result, confinementError: true },
   };
   expect(GateComparisonSchema.parse(confined)).toEqual(confined);
+  for (const baselineConfinementError of [true, false]) {
+    const comparison = { ...confined, baselineConfinementError };
+    expect(GateComparisonSchema.parse(comparison)).toEqual(comparison);
+  }
+  for (const extra of [{ baselineConfinementError: "true" }, { unknown: true }])
+    expect(GateComparisonSchema.safeParse({ ...confined, ...extra }).success).toBe(false);
   expect(() => GateComparisonSchema.parse({ ...confined, result: { ...result, unknown: true } })).toThrow();
 });
+
+test.each([true, false])(
+  "review cases accept comparisons against an unusable baseline (candidate ok: %s)",
+  async (ok) => {
+    const { reviewCase } = await import("./evals-reading-support.ts");
+    const result = {
+      name: "test",
+      command: "bun test",
+      ok,
+      exitCode: ok ? 0 : 1,
+      durationMs: 1,
+      output: "",
+      confinementError: false,
+    };
+    const gates = compareGates(
+      { setupOk: true, setup: [], checks: [{ ...result, ok: false, confinementError: true }] },
+      { setupOk: true, setup: [], checks: [result] },
+    );
+    const parsed = ReviewCaseFileSchema.parse({
+      role: "review",
+      version: 1,
+      cases: [{ ...reviewCase, input: { ...reviewCase.input, gates } }],
+    });
+    expect(parsed.cases[0]?.input.gates).toEqual(gates);
+    expect(parsed.cases[0]?.input.gates[0]).toMatchObject({
+      baselineConfinementError: true,
+      verdict: ok ? "new_pass" : "new_failure",
+      blocking: !ok,
+    });
+  },
+);
 
 test("review split and adjudication fields are optional, enumerated and strict", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
