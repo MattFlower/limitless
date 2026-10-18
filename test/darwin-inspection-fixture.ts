@@ -13,6 +13,8 @@ let unreadable: {
   cwd: { path: string } | { errno: number };
   inGroup?: boolean;
 } | null = null;
+let memberStart: bigint | { errno: number } = 10n;
+let memberMarker: string | null = null;
 let errno = 3;
 let readAllowlist = false;
 
@@ -35,6 +37,13 @@ export function setAncestorFailure(value: typeof ancestorFailure): void {
 export function setUnreadableProcess(value: typeof unreadable): void {
   unreadable = value;
 }
+/** Start time (mach absolute units) of the member; every other process starts at 10. */
+export function setMemberStart(value: typeof memberStart): void {
+  memberStart = value;
+}
+export function setMemberMarker(value: string): void {
+  memberMarker = value;
+}
 
 export const FFIType = { ptr: 0, i32: 1, u32: 2, u64: 3 };
 export const ptr = (buffer: ArrayBufferView) => buffer;
@@ -42,6 +51,16 @@ export const toArrayBuffer = () => new Int32Array([errno]).buffer;
 export const dlopen = () => ({
   symbols: {
     __error: () => 1,
+    proc_pid_rusage: (pid: number, _flavor: number, buffer: BigUint64Array) => {
+      buffer.fill(0n);
+      const start = pid === memberPid ? memberStart : 10n;
+      if (typeof start !== "bigint") {
+        errno = start.errno;
+        return -1;
+      }
+      buffer[10] = start;
+      return 0;
+    },
     sandbox_check: (_pid: number, _operation: Uint8Array, _filter: number, ...args: unknown[]) => {
       const value = args.at(-1);
       if (!(value instanceof Uint8Array)) throw new Error("Missing sandbox query value");
@@ -123,7 +142,9 @@ export const dlopen = () => ({
           `/visible-command\0visible-command\0PATH=/usr/bin\0${
             protectedMarker && [process.pid, process.ppid, ancestorPid].includes(mib[2] ?? 0)
               ? `LIMITLESS_INVOCATION=${protectedMarker}\0`
-              : ""
+              : memberMarker && mib[2] === memberPid
+                ? `LIMITLESS_INVOCATION=${memberMarker}\0`
+                : ""
           }`,
         ),
       ]);

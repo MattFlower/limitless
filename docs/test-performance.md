@@ -1,5 +1,116 @@
 # Test runtime and coverage review
 
+## macOS process scans and git's locale (2026-10-18)
+
+On the factory's Mac (Apple M5 Max, 18 cores, about 650 processes running as the owner) the
+suite took 18–23 minutes while other work ran. Two costs outside the tests made up most of it.
+
+**Every command's shutdown scanned every process twice.** `runProcess` looks for descendants that
+escaped the child's process group. On macOS `markedDarwinProcesses` read each of the user's
+processes' arguments and environment with `KERN_PROCARGS2`. That read costs about 11 µs per process,
+85% of a scan. One scan took about 9 ms at load 10 (3 ms when idle), almost all of it kernel time.
+So `sh(["git", "--version"])` took 30 ms against 11 ms for a bare spawn, and the cost grew with the
+number of processes on the machine. The whole baseline suite spent 3,420 s of system CPU against
+1,410 s of user CPU.
+
+The scan now reads each process's monotonic start time (`proc_pid_rusage`, about 1.7 µs) and skips
+the argv read for processes that started before the command was spawned. Such a process can't
+descend from the command: orphans reparent to launchd, and the child's new session and process group
+admit only its descendants. A process whose start time can't be read is inspected as before. A
+filtered scan takes 0.6 ms against 3.2 ms for a full one at the same load.
+
+**git without a locale asks macOS for the preferred language.** Homebrew's git links gettext, which
+queries CoreFoundation when `LANG`, `LC_ALL` and `LC_MESSAGES` are all unset. The daemon (started
+by launchd) and the desktop app set none of them, so every git process in their test runs, gates
+included, cost 4.4 ms of CPU and 6.0 ms of wall time instead of 2.3 ms and 2.8 ms. `test/setup.ts`
+now sets CI's `LANG=C.UTF-8` when no locale is set.
+
+| Run on the same Mac | Workers | Wall | User CPU | System CPU | 1-min load (median / max) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `main` at `190fe64` | 4 | 1,237 s | 1,410 s | 3,420 s | spot checks 9–15 |
+| with the scan change | 4 | 653 s | 1,054 s | 1,554 s | 8.6 / 10.0 |
+| with the scan change and locale | 4 | 486 s | 914 s | 1,220 s | 11.5 / 21.9 |
+| with the scan change and locale | 6 | 301 s | 825 s | 1,095 s | 10.2 / 12.4 |
+| `bun run check`, default workers | 6 | 294 s | 817 s | 1,068 s | 9.6 / 10.1 |
+
+Each row is one whole-suite run (4,216–4,219 tests, the three added here included) while other work
+ran, so load differs between rows. Alternating runs of `pipeline-spec.test.ts` alone at load 4 give
+a cleaner comparison: 42.3 s and 42.6 s on `190fe64`, 17.0 s and 17.1 s with both changes (CPU 49 s
+against 22 s).
+
+With both changes the suite's per-file durations sum to 1,790 s, against 4,468 s before, so four
+workers can't go below about 450 s; `land-pr.test.ts` (189 s) is the longest file. These two
+changes removed or skipped no test and weakened no assertion. The gate executor's cancellation test
+assumed its second check was already running when it cancelled; faster commands let the cancellation
+land while that check's sandbox was still starting, so the test now waits until the check runs.
+
+**Workers follow the machine.** The suite's default worker count was a fixed 4. With each suite now
+needing about 1,900 CPU-seconds instead of 4,800, the default is a third of the cores, clamped to
+4–8: 6 on this Mac, still 4 on CI's 4-vCPU runner and smaller machines. `LIMITLESS_TEST_WORKERS`
+still overrides it.
+
+**Overlapping tests.** A read-only review of the costliest files found about 220 s of the 1,790 s
+(12%) in rows that repeat another row's guard and outcome, or input variants that the responsible
+function's unit tests already cover. The largest single case was `land-pr.test.ts`'s 28 planted-key
+rows (seven keys at four points). The fake git sends every permitted push to a local path, so the
+transport keys they planted were never read. With the push repository made to include the clone's
+config, all 28 still passed, and the pre-push rows had planted into the push repository itself,
+because the fake `gh` inherited the script's `GIT_DIR` and `GIT_COMMON_DIR`. The fake git now lists
+the config each push reads, the test fails if a planted key appears there, and one row per plant
+point plants all seven keys into the clone. Under the same mutation all four rows fail. The file
+went from 122 tests to 98. The other candidates are handled in
+[Overlapping tests](#overlapping-tests-2026-10-18).
+
+## Overlapping tests (2026-10-18)
+
+The overlap review's remaining candidates were each checked by mutation before anything was removed.
+The guard on the removed row's path was edited in a copy of the source, the kept rows were run, and
+the source was restored. A row was removed only if a kept row, or a new unit test, failed under that
+edit. Where every proposed mutation also passed the kept rows, the candidate stayed: for example
+`clean-scripts`, `setup-regressed`, `draft-body`, `head-lookup-malformed`, the verify-change
+`terminated` row and all four eval cancellation rows.
+
+| File | Tests before | After | What went |
+| --- | ---: | ---: | --- |
+| `failure-injection.test.ts` | 140 | 117 | Recovery and exhaustion rows that share one fallback, cancellation stages awaited like triage, stream points sharing the invoke catch, delivery calls sharing one subprocess path; one test merged into another |
+| `pipeline-delivery-privacy.test.ts` | 31 | 24 | Inputs that git-integrity and gates unit-test against the same publication checks |
+| `pipeline-verification.test.ts` | 25 | 17 | Refusal reasons and retry inputs; two moved to `gate-evidence.test.ts` |
+| `pipeline-merge-integrity.test.ts` | 11 | 5 | Three moved to `completeMerge` rows in `merge-markers.test.ts` |
+| `git-integrity.test.ts` | 228 | 215 | Clean LFS formats, inert file names; unmatched media rules moved to a pure `auditDiff` test |
+| `evals-implement-runner.test.ts` | 79 | 72 | Identical replies, cleanup rows covered by a stronger test, redundant cache-key combinations |
+| `pipeline-audit.test.ts` | 11 | 8 | Allowance spellings unit-tested in `gates.test.ts` |
+| `pipeline-gates.test.ts` | 17 | 14 | Restart rows covered by `gate-executor.test.ts` |
+| `pipeline-shadow.test.ts` | 37 | 35 | A failure kind sharing the timeout branch, a headroom value sharing one comparison; two runs fewer and one round each in the quota-reach test |
+| `pipeline-conflicts.test.ts` | 17 | 15 | Base states covered by stronger rows |
+| `pipeline-verify-change.test.ts` | 19 | 17 | A subset of `restart-repair`; one moved to an `auditDiff` row |
+| Unit files receiving moved cases (`gates`, `gate-evidence`, `merge-markers`, `hardening`, `gate-executor`) | 334 | 349 | |
+| **Changed files** | **949** | **888** | |
+
+Some removals needed a stronger kept test first. "PR creation window reconciles a stateful fake" now
+asserts a single `gh pr create`, which fails if the lookup before create is skipped; the test it
+absorbed slept 2.5 s and couldn't observe its own guarantee. The pathspec case uses 4,800 paths of
+at most 480 bytes instead of 16,000 short ones: together they still exceed Linux's 2 MiB argv limit,
+each stays well inside macOS's 1,024-byte `PATH_MAX`, and the test now also bounds the number of git
+commands.
+The shadow review's 5 s settle wait is `shadowSettle.ms`, which one test shortens. The blocked
+verify-change rows run with `maxRounds = 1`.
+
+With these removals `bun run check` passed all 4,243 tests in 344 s at a median load of 17.8,
+against 361 s at 16.7 for the last run before them.
+
+An earlier run here reported one failure, `needs-you-ui.test.ts` "a pushed update beats an older read
+in flight". It failed only in checkouts whose `node_modules` was a symlink to another checkout's. The
+harness redirected Solid's store to the client build only when the importer equalled a path built
+through `node_modules`, and the bundler reports importers by real path. So the store loaded a second
+copy of Solid and its updates never re-rendered. The harness now compares real paths.
+
+The mutations also found gaps that this change doesn't close:
+- Nothing in `failure-injection.test.ts` guards the claude stream completion check: `requireStructured`
+  masks a loosened check, and the invoke catch masks a parser that throws.
+- No mutation specific to auto-merge fails its cancellation row; it only exercises the shared merge path.
+- With `requireMerge` disabled, the factory merge rows still passed because `git merge-base HEAD
+  MERGE_HEAD` fails closed; the new single-parent unit test is the only one that fails.
+
 ## Git wrapper caching (#319)
 
 The second pass found that half of all git processes came from `worktreeGit` in `src/git/command.ts`: a hook-config lookup before every command, and an empty-tree `hash-object` before every diff or log. #319 caches both without trusting a stale result.

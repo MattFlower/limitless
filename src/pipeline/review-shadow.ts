@@ -2,8 +2,8 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ResolvedProfile, ReviewSystem } from "../core/types.ts";
 import { redactGateOutput } from "../gates/output.ts";
+import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree } from "../git/repos.ts";
-import { sh } from "../util/proc.ts";
 import { type InvokeOutcome, invokeGuard, NoCapacityError, type RunContext } from "./context.ts";
 import { type ReviewDeps, type ReviewInput, runReview } from "./review.ts";
 import { configuredReviewSystem } from "./review-system.ts";
@@ -11,8 +11,8 @@ import { parseArtifact } from "./shadow-report.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 
 const SHADOW_MIN_HEADROOM = 0.1;
-/** How long aborted calls get to record their spend before the artifact is written without it. */
-const SETTLE_MS = 5_000;
+/** How long aborted calls get to record their spend before the artifact is written without it (tests shorten it). */
+export const shadowSettle = { ms: 5_000 };
 export type ShadowDeps = (system: ReviewSystem) => ReviewDeps<InvokeOutcome>;
 
 export async function shadowReview(
@@ -75,7 +75,7 @@ export async function shadowReview(
         // Only now, after its last call ends, possibly after the run moved on.
         if (parent) rmSync(parent, { recursive: true, force: true });
         const { worktreePath: cwd } = ctx.state;
-        if (parent && cwd) await sh(["git", "worktree", "prune"], { cwd, allowFail: true });
+        if (parent && cwd) await worktreeGit(["git", "worktree", "prune"], { cwd, allowFail: true });
       }
     })
     .catch((error) => ({ status: "error", reason: String(error), finished }));
@@ -96,7 +96,7 @@ export async function shadowReview(
   clearTimeout(timer);
   abort.abort();
   if (ctx.signal.aborted) return;
-  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, SETTLE_MS).unref())]);
+  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, shadowSettle.ms).unref())]);
   if (record.status !== "completed") ctx.log(`Shadow panel ${record.status}: ${record.reason}`, "warn");
   const spent = guard.ids.flatMap((id) => store.getInvocation(id) ?? []);
   const cost = (key: "costUsd" | "costEquivUsd") => spent.reduce((total, i) => total + i[key], 0);

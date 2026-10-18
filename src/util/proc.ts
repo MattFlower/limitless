@@ -73,6 +73,7 @@ async function markedProcesses(
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
   protectedPids: ReadonlySet<number>,
+  spawnedAt: bigint,
   attempt = 0,
 ): Promise<number[]> {
   const uid = process.getuid?.();
@@ -82,13 +83,31 @@ async function markedProcesses(
   const nativeProcesses = async () => {
     if (!darwin) throw new Error("Native process inspection is unavailable");
     try {
-      return darwin.markedDarwinProcesses(uid, marker, group, started, directories, leader, protectedPids);
+      return darwin.markedDarwinProcesses(
+        uid,
+        marker,
+        group,
+        started,
+        directories,
+        leader,
+        protectedPids,
+        spawnedAt,
+      );
     } catch (error) {
       // Unreadable argv uses hidden membership rules. Retry only inspection failures
       // that still prevent proving ownership or confirming a claimed process's identity.
       if (attempt >= 10) throw error;
       await Bun.sleep(10);
-      return markedProcesses(marker, group, started, directories, leader, protectedPids, attempt + 1);
+      return markedProcesses(
+        marker,
+        group,
+        started,
+        directories,
+        leader,
+        protectedPids,
+        spawnedAt,
+        attempt + 1,
+      );
     }
   };
   if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
@@ -171,7 +190,16 @@ async function markedProcesses(
   if (!changed) return pids;
   // A shell may exec between snapshots; never signal it based on mismatched argv.
   if (attempt < 3)
-    return markedProcesses(marker, group, started, directories, leader, protectedPids, attempt + 1);
+    return markedProcesses(
+      marker,
+      group,
+      started,
+      directories,
+      leader,
+      protectedPids,
+      spawnedAt,
+      attempt + 1,
+    );
   throw new Error("Process arguments changed during inspection");
 }
 
@@ -261,6 +289,7 @@ async function stopMarkedProcesses(
   invokedAt: number,
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
+  spawnedAt: bigint,
 ): Promise<void> {
   const group = child.pid;
   if (group === undefined) return;
@@ -273,7 +302,15 @@ async function stopMarkedProcesses(
   let empty = false;
   try {
     for (;;) {
-      const pids = await markedProcesses(marker, group, invokedAt, directories, leader, protectedPids);
+      const pids = await markedProcesses(
+        marker,
+        group,
+        invokedAt,
+        directories,
+        leader,
+        protectedPids,
+        spawnedAt,
+      );
       for (const pid of pids) {
         if (protectedPids.has(pid) || claimed.has(pid)) continue;
         const birth = await readBirth(pid);
@@ -459,6 +496,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       inspectionPlatform === "darwin"
         ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
         : [];
+    const spawnedAt = darwin?.darwinClock() ?? 0n;
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
@@ -517,6 +555,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               started,
               directories,
               leader,
+              spawnedAt,
             );
         } catch (error) {
           terminationError = new ProcessTerminationError(

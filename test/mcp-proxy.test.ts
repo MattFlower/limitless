@@ -671,7 +671,10 @@ test.each(quotationForms)(
     state.terminalReason = quotation;
     state.lastVerify?.criteria.push({ id: "AC-1", status: "met", evidence: quotation, publicSummary: "" });
     await renderedPages(state, (text) => {
-      expect(text).not.toMatch(/red|owl|amber|lantern|ultraviolet|Private behavior|&#|&amp;/);
+      // Random run IDs can contain "red" or "owl"; only the run line is excluded.
+      expect(text.replace(/^Run `[a-z0-9]+` · u$/m, "Run")).not.toMatch(
+        /red|owl|amber|lantern|ultraviolet|Private behavior|&#|&amp;/,
+      );
       expect(text).not.toContain("AC-1");
       expect(text).not.toContain("🚧");
       expect(text).toContain("## Implementer's summary\n\n[withheld:");
