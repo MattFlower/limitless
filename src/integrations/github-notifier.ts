@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
+import { loadPrivateStrings } from "../gates/private.ts";
+import { checkPublicationText } from "../gates/publication.ts";
 import { sh } from "../util/proc.ts";
 import { type GhRunner, runGh } from "./github.ts";
 import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
@@ -307,7 +308,7 @@ export function startGitHubNotifier(
     try {
       const cwd = store.getRunState<{ worktreePath?: string }>(run.id)?.worktreePath;
       const entries = loadPrivateStrings(configDir, [cwd, store.getRepo(run.repoId)?.localPath, ...roots]);
-      checkPrivateText(body, "Factory comment", entries);
+      checkPublicationText(body, "Factory comment", entries);
     } catch {
       return log("Factory comment blocked by private-string policy");
     }
