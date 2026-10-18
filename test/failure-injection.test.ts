@@ -1225,12 +1225,15 @@ if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"
 if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
 if(process.argv[3]==="merge") writeFileSync(file+".merged","");
 if(process.argv[3]==="view") {
-  if(process.argv.includes("title,body,headRefOid")) {
+  if(process.argv.some(arg=>arg.startsWith("title,body,headRefOid"))) {
     const texts=existsSync(file+".text")?JSON.parse(readFileSync(file+".text","utf8")):[];
     const data=texts.shift();
     writeFileSync(file+".text",JSON.stringify(texts));
     const head=Bun.spawnSync(["/usr/bin/git","rev-parse","HEAD"]);
-    out(JSON.stringify(data??{title:"T",body:"B",headRefOid:head.exitCode===0?head.stdout.toString().trim():"a".repeat(40)}));
+    out(JSON.stringify(data??{state:state(),title:"T",body:"B",headRefOid:head.exitCode===0?head.stdout.toString().trim():"a".repeat(40)}));
+  } else if(process.argv.includes("state,headRefOid")) {
+    const head=Bun.spawnSync(["/usr/bin/git","rev-parse","HEAD"]);
+    out(existsSync(file+".merge-state")?readFileSync(file+".merge-state","utf8"):JSON.stringify({state:state(),headRefOid:head.exitCode===0?head.stdout.toString().trim():"a".repeat(40)}));
   } else if(process.argv.includes("headRefOid")) {
     const head=Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(join(root, "remote.git"))},"rev-parse","refs/heads/pr-head"]);
     out(JSON.stringify({headRefOid:head.stdout.toString().trim()}));
@@ -2255,7 +2258,12 @@ test.each([
     scenario.endsWith("subject") ? "Checked subject (#1)" : "secret-host.example",
   );
   const sha = "a".repeat(40);
-  const safe = { title: "Checked subject", body: "Complete body\n\nLast paragraph\n", headRefOid: sha };
+  const safe = {
+    state: "OPEN",
+    title: "Checked subject",
+    body: "Complete body\n\nLast paragraph\n",
+    headRefOid: sha,
+  };
   const changed = { ...safe };
   if (scenario.endsWith("body")) changed.body = "secret-host.example";
   if (scenario === "title") changed.title = "secret-host.example";
@@ -2303,12 +2311,48 @@ test.each([
     if (scenario === "auto") expect(merges[1]).toContain("--auto");
     for (let i = 0; i < calls.length; i++) {
       if (calls[i]?.[1] === "merge")
-        expect(calls[i - 1]).toEqual(["pr", "view", url, "--json", "title,body,headRefOid"]);
+        expect(calls[i - 1]).toEqual(["pr", "view", url, "--json", "title,body,headRefOid,state"]);
     }
   } finally {
     await restore();
   }
 });
+
+for (const uncertain of [false, true])
+  test.each(["matching", "different", "missing", "invalid expected"])(
+    `a merged PR verifies its head without another merge (uncertain=${uncertain}): %s`,
+    async (head) => {
+      const pr = join(root, "pr");
+      const restore = fakeGh(pr);
+      const sha = "a".repeat(40);
+      writeFileSync(pr, "https://github.com/test/repo/pull/1");
+      const merged = {
+        state: "MERGED",
+        title: "Checked title",
+        body: "Checked body",
+        headRefOid: head === "missing" ? undefined : head === "different" ? "b".repeat(40) : sha,
+      };
+      if (uncertain) {
+        writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", err: bad502, landed: true }]));
+        writeFileSync(`${pr}.merge-state`, JSON.stringify(merged));
+      } else {
+        writeFileSync(`${pr}.merged`, "");
+        writeFileSync(`${pr}.text`, JSON.stringify([merged]));
+      }
+      try {
+        expect(
+          await mergePullRequest(
+            "https://github.com/test/repo/pull/1",
+            root,
+            head === "invalid expected" ? "invalid" : sha,
+          ),
+        ).toBe(head === "matching" ? "merged" : "failed");
+        expect(ghCalls(pr, "pr merge")).toHaveLength(uncertain && head !== "invalid expected" ? 1 : 0);
+      } finally {
+        await restore();
+      }
+    },
+  );
 
 test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is final", async () => {
   const pr = join(root, "pr");
