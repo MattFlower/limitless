@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { launchFailure } from "../gates/output.ts";
 import { agentEnv, invocationScratch, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import {
   ancestorReadPolicy,
@@ -274,12 +275,27 @@ export async function runSandboxed(
     onStderrLine: (line) => forwardLine(line, opts.onStderrLine),
   };
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
-  if (!started)
+  if (!started) {
+    // Our cancel stopped the launch before the trusted shell ran, so the payload never did.
+    if (killedByCancel(result)) return result;
     throw new ConfinementError(
       `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
     );
+  }
   return { ...result, stdout: result.stdout.replace(`${token}\n`, "") };
 }
+
+/**
+ * A cancel's termination freezes, then SIGKILLs the invocation (`runProcess`). An exit, a timeout,
+ * another signal or a Seatbelt diagnostic is a failed launch even when a cancel arrived with it.
+ */
+const killedByCancel = (result: ProcResult): boolean =>
+  result.cancelled &&
+  !result.timedOut &&
+  !result.idleTimedOut &&
+  result.exitCode === null &&
+  result.signal === "SIGKILL" &&
+  !launchFailure(result.stderr);
 
 /** Keep installed toolchains readable; writable package caches belong to the suite scratch. */
 export async function runConfined(

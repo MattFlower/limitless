@@ -27,6 +27,7 @@ import {
   readPolicyScope,
 } from "../src/harness/read-policy.ts";
 import {
+  type ConfinementBackend,
   ConfinementError,
   confinementScope,
   runConfined,
@@ -939,12 +940,32 @@ test("a backend startup failure after successful verification is operational, ne
     proc({ exitCode: 71, stderr: "sandbox initialization failed" }),
     proc({ exitCode: null, timedOut: true }),
     proc({ cancelled: true }),
+    proc({ exitCode: null, signal: "SIGKILL" }),
   ]) {
     await expect(
       runConfined(
         opts,
         async () => {},
         async () => failure,
+      ),
+    ).rejects.toThrow(ConfinementError);
+  }
+  // A cancel arriving while the launch exits, times out or crashes on its own does not hide that.
+  for (const failure of [
+    proc({ cancelled: true, exitCode: 71, stderr: "sandbox initialization failed" }),
+    proc({ cancelled: true, exitCode: null, signal: "SIGKILL", timedOut: true }),
+    proc({ cancelled: true, exitCode: null, signal: "SIGKILL", idleTimedOut: true }),
+    proc({ cancelled: true, exitCode: null, signal: "SIGSEGV" }),
+  ]) {
+    const abort = new AbortController();
+    await expect(
+      runConfined(
+        { ...opts, signal: abort.signal },
+        async () => {},
+        async () => {
+          abort.abort();
+          return failure;
+        },
       ),
     ).rejects.toThrow(ConfinementError);
   }
@@ -962,6 +983,43 @@ test("a backend startup failure after successful verification is operational, ne
   expect(result.exitCode).toBe(71);
   expect(result.stdout).toBe("user output");
 });
+
+test.each([false, true])(
+  "a cancel while the sandbox starts returns the cancelled result unless startup reported a launch failure (diagnostic=%s)",
+  async (diagnostic) => {
+    const marker = join(root, "payload-ran");
+    const announce = diagnostic ? "sandbox-exec: sandbox_apply: Operation not permitted" : "launch held";
+    // Holds every launch before the trusted startup shell, so the token cannot print first.
+    const held: ConfinementBackend = {
+      verify: async () => {},
+      wrap: (cmd) => ["/bin/sh", "-c", 'echo "$1" >&2; shift; sleep 900; exec "$@"', "sh", announce, ...cmd],
+    };
+    const abort = new AbortController();
+    let started = false;
+    const launch = runSandboxed(
+      {
+        cmd: ["/usr/bin/touch", marker],
+        cwd: work,
+        env: agentEnv(),
+        signal: abort.signal,
+        onStarted: () => {
+          started = true;
+        },
+        onStderrLine: (line) => {
+          if (line === announce) abort.abort();
+        },
+      },
+      { write: [work], protect: [] },
+      runProcess,
+      undefined,
+      held,
+    );
+    if (diagnostic) await expect(launch).rejects.toThrow(ConfinementError);
+    else expect(await launch).toMatchObject({ cancelled: true, exitCode: null, signal: "SIGKILL" });
+    expect(started).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  },
+);
 
 test("the effective profile is probed before the native-tool process and failed probes never launch it", async () => {
   const roots = { write: [work], protect: [join(work, ".git")] };
