@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { FeedPage, Question, Run } from "../src/core/types.ts";
+import type { FeedPage, LandEntry, Question, Run } from "../src/core/types.ts";
 import * as diagnosticCatalogue from "../src/db/owner-diagnostics.ts";
 import * as gitCommand from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
@@ -3631,9 +3631,9 @@ test("status finds the latest land by run or PR beyond 100 historical entries on
       approvedSha: sha,
     });
   store.db.transaction(() => {
-    for (let i = 1; i <= 100; i++) {
+    for (let i = 1; i <= 120; i++) {
       const entry = createEntry(`historical-${i}`, `https://github.com/o/r/pull/${i}`);
-      store.updateLandEntry(entry.id, { state: "landed" });
+      if (i > 1) store.updateLandEntry(entry.id, { state: "landed" });
     }
   })();
   const blocked = createEntry("review-round", prUrl);
@@ -3655,7 +3655,20 @@ test("status finds the latest land by run or PR beyond 100 historical entries on
     }
   };
   try {
-    expect(f.factory.land.list()).toHaveLength(100);
+    const landRoute = (routes["/api/land"] as { GET: Route }).GET;
+    const listed = (await (
+      await landRoute(requestWithParams("http://daemon.invalid/api/land"), localServer)
+    ).json()) as LandEntry[];
+    expect(listed.map((entry) => entry.id)).toEqual([1, ...Array.from({ length: 100 }, (_, i) => i + 22)]);
+    expect(f.factory.land.list()).toEqual(listed);
+    const scoped = await (
+      await landRoute(
+        requestWithParams(`http://daemon.invalid/api/land?${new URLSearchParams({ run: run.id })}`),
+        localServer,
+      )
+    ).json();
+    expect(scoped).toMatchObject([{ id: blocked.id, state: "blocked", reason: "CI failed" }]);
+    expect(await factoryBackend(f.factory).lands(run.id)).toEqual(scoped);
     await check("Landing blocked", blocked.id, "CI failed");
     const queued = createEntry(run.id, prUrl);
     await check("Landing in progress (queued)", queued.id, null);
