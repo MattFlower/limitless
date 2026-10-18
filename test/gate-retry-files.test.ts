@@ -598,69 +598,78 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
   }
 });
 
-test("real Bun asynchronous failure in a passing file blocks targeted land retry", async () => {
-  const f = fixture();
-  try {
-    writeFileSync(
-      join(f.cwd, "test/a.test.ts"),
-      `import { test } from "bun:test";
+test.each(["poll", "poll (leak)"])(
+  "real Bun asynchronous %s failure in a passing file blocks targeted land retry",
+  async (pollName) => {
+    const f = fixture();
+    try {
+      writeFileSync(
+        join(f.cwd, "test/a.test.ts"),
+        `import { test } from "bun:test";
 test("arms leak", () => {
   const poll = () => {
     if (globalThis.active) { Promise.reject(new Error("leaked from a")); return; }
     setTimeout(poll, 1).unref();
   };
+  Object.defineProperty(poll, "name", { value: ${JSON.stringify(pollName)} });
   setTimeout(poll, 1).unref();
 });`,
-    );
-    writeFileSync(
-      join(f.cwd, "test/b.test.ts"),
-      'import { test } from "bun:test"; test("receives leak", async () => { globalThis.active = true; await Bun.sleep(100); });',
-    );
-    const check = {
-      name: "test",
-      run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts ./test/b.test.ts`,
-    };
-    const run = await confinementScope.run(fakeConfinement, () =>
-      runGates(f.cwd, { ...config, checks: [check] }, signal),
-    );
-    const original = run.checks[0];
-    if (!original) throw new Error("Missing check");
-    expect(original.output).toContain("leaked from a");
-    expect(original.output).toContain("1 pass");
-    expect(original.output).toContain("1 fail");
-    expect(original.failedFiles).toEqual(["test/b.test.ts"]);
-    const evidence = new RunnerFailureEvidence();
-    for (const line of original.output.split("\n")) evidence.observe(line);
-    expect(evidence.agrees({ tests: 2, failures: 1, errors: 0, skipped: 0 })).toBe(true);
-    expect(original.failureAttributionComplete).toBe(false);
-    let calls = 0;
-    const retries = await retryFailures(
-      [{ check, original }],
-      f.cwd,
-      config,
-      signal,
-      undefined,
-      async () => {
-        calls++;
-        return { setupOk: true, setup: [], checks: [{ ...original, ok: true, exitCode: 0 }] };
-      },
-      true,
-    );
-    expect(calls).toBe(0);
-    expect(retries.size).toBe(0);
-  } finally {
-    f.close();
-  }
-});
+      );
+      writeFileSync(
+        join(f.cwd, "test/b.test.ts"),
+        'import { test } from "bun:test"; test("receives leak", async () => { globalThis.active = true; await Bun.sleep(100); });',
+      );
+      const check = {
+        name: "test",
+        run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts ./test/b.test.ts`,
+      };
+      const run = await confinementScope.run(fakeConfinement, () =>
+        runGates(f.cwd, { ...config, checks: [check] }, signal),
+      );
+      const original = run.checks[0];
+      if (!original) throw new Error("Missing check");
+      expect(original.output).toContain("leaked from a");
+      expect(original.output).toContain(`at ${pollName} (`);
+      expect(original.output).toContain("1 pass");
+      expect(original.output).toContain("1 fail");
+      expect(original.failedFiles).toEqual(["test/b.test.ts"]);
+      const evidence = new RunnerFailureEvidence();
+      for (const line of original.output.split("\n")) evidence.observe(line);
+      expect(evidence.agrees({ tests: 2, failures: 1, errors: 0, skipped: 0 })).toBe(true);
+      expect(original.failureAttributionComplete).toBe(false);
+      let calls = 0;
+      const retries = await retryFailures(
+        [{ check, original }],
+        f.cwd,
+        config,
+        signal,
+        undefined,
+        async () => {
+          calls++;
+          return { setupOk: true, setup: [], checks: [{ ...original, ok: true, exitCode: 0 }] };
+        },
+        true,
+      );
+      expect(calls).toBe(0);
+      expect(retries.size).toBe(0);
+    } finally {
+      f.close();
+    }
+  },
+);
 
-test.each([false, true])(
-  "real Bun own-file failure with helper=%s permits one targeted land retry",
-  async (helper) => {
+test.each([
+  { helper: false, file: "test/a.test.ts" },
+  { helper: true, file: "test/a.test.ts" },
+  { helper: false, file: "test/space (quote).test.ts" },
+])(
+  "real Bun own-file failure in $file with helper=$helper permits one targeted land retry",
+  async ({ helper, file }) => {
     const f = fixture();
     try {
       writeFileSync(join(f.cwd, "helper.ts"), 'export function fail() { throw new Error("own failure"); }');
       writeFileSync(
-        join(f.cwd, "test/a.test.ts"),
+        join(f.cwd, file),
         `import { test } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
 import { fail } from "../helper.ts";
@@ -672,15 +681,17 @@ test("fails once", () => {
       );
       const check = {
         name: "test",
-        run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" ./test/a.test.ts`,
+        run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" './${file}'`,
       };
       const cfg = { ...config, checks: [check], retryFiles: `'${process.execPath}' test {files}` };
       await confinementScope.run(fakeConfinement, async () => {
         const run = await runGates(f.cwd, cfg, signal);
         const original = run.checks[0];
         if (!original) throw new Error("Missing check");
+        expect(original.ok).toBe(false);
+        expect(original.output).toContain("own failure");
         expect(original.failureAttributionComplete).toBe(true);
-        expect(original.failedFiles).toEqual(["test/a.test.ts"]);
+        expect(original.failedFiles).toEqual([file]);
         const calls: string[] = [];
         const retries = await retryFailures(
           [{ check, original }],
@@ -695,7 +706,7 @@ test("fails once", () => {
           },
           true,
         );
-        expect(calls).toEqual([`'${process.execPath}' test './test/a.test.ts'`]);
+        expect(calls).toEqual([`'${process.execPath}' test './${file}'`]);
         expect(retries.get(original)?.ok).toBe(true);
         expect(retries.size).toBe(1);
       });

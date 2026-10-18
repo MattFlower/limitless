@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 export interface AttributedTestCounts {
@@ -11,12 +13,20 @@ export interface AttributedTestCounts {
 export function attributedJUnitCounts(
   root: Bun.XML.Node,
   files: ReadonlySet<string>,
+  checkout: string,
   canonicalFile: (file: string) => string | undefined,
 ): AttributedTestCounts | undefined {
-  const reportFiles = new Set<string>();
+  const canonicalCheckout = realpathSync(checkout);
+  const reportFiles = new Map<string, Set<string>>();
   const collect = (node: Bun.XML.Node) => {
-    const file = node.attributes.file && canonicalFile(node.attributes.file);
-    if (file) reportFiles.add(file);
+    const raw = node.attributes.file;
+    const file = raw && canonicalFile(raw);
+    if (file) {
+      const paths = reportFiles.get(file) ?? new Set([file, resolve(canonicalCheckout, file)]);
+      paths.add(raw);
+      paths.add(resolve(checkout, raw));
+      reportFiles.set(file, paths);
+    }
     for (const child of node.children) if (typeof child === "object" && "name" in child) collect(child);
   };
   collect(root);
@@ -37,11 +47,21 @@ export function attributedJUnitCounts(
         if (child.name === "failure" || child.name === "error") {
           const text = child.children.filter((part) => typeof part === "string").join("");
           for (const frame of text.matchAll(/^\s*at (.+?):\d+:\d+\)?\s*$/gm)) {
-            if (!frame[1]) continue;
-            // Try the bare path first: a filename can itself contain " (".
-            const location = canonicalFile(frame[1]) ?? canonicalFile(frame[1].replace(/^(?:.*? )?\(/, ""));
-            if (location && reportFiles.has(location) && location !== (file && canonicalFile(file)))
-              throw new Error("Cross-file testcase failure");
+            const prefix = frame[1];
+            if (!prefix) continue;
+            const bareLocation = canonicalFile(prefix);
+            const ownFile = file && canonicalFile(file);
+            for (const [location, paths] of reportFiles) {
+              if (location === ownFile) continue;
+              // Match known locations from the end; function names and paths can contain parentheses.
+              if (
+                bareLocation === location ||
+                [...paths].some(
+                  (path) => prefix === path || prefix === `(${path}` || prefix.endsWith(` (${path}`),
+                )
+              )
+                throw new Error("Cross-file testcase failure");
+            }
           }
         }
       }

@@ -90,7 +90,7 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
     const failedFiles = [...failed];
     if (!validRetryFiles(failedFiles, cwd)) return undefined;
     const checkout = realpathSync(cwd);
-    const attributedCounts = attributedJUnitCounts(root, failed, (file) => {
+    const attributedCounts = attributedJUnitCounts(root, failed, cwd, (file) => {
       try {
         if (file.split(/[\\/]/).includes("node_modules")) return undefined;
         const rel = relative(checkout, realpathSync(resolve(checkout, file)));
