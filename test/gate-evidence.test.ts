@@ -303,6 +303,7 @@ test.each([
   "no-output",
   "skipped",
   "unrelated",
+  "non-test-command",
   "filtered",
   "other-sha",
 ])("gate evidence refuses %s checks", (reason) => {
@@ -335,6 +336,12 @@ test.each([
     case "unrelated":
       check.result.output = "test/other.test.ts:\n(pass) something else";
       break;
+    case "non-test-command":
+      // A passing gate that runs no test runner has no test command to cover a criterion.
+      check.testCommand = null;
+      check.result.command = "true";
+      check.result.output = "";
+      break;
     case "filtered":
       check.testCommand = "bun test --test-name-pattern other";
       break;
@@ -347,6 +354,20 @@ test.each([
   expect(result.criteria[0]?.status).toBe("blocked");
   expect(result.criteria[0]?.evidence).toContain("Factory gate substitution unavailable");
   if (reason === "other-sha") expect(result.criteria[0]?.evidence).toContain("exact verified SHA");
+  if (reason === "non-test-command")
+    expect(result.criteria[0]?.evidence).toContain("do not cover every required verification step");
+});
+
+test("a missing or empty candidate gate stage never substitutes", () => {
+  expect(resolve(blocked).criteria[0]).toMatchObject({
+    status: "blocked",
+    evidence: "Factory gate substitution unavailable: no completed candidate gate stage for this run.",
+  });
+  expect(resolve(blocked, { ...gates(), checks: [] }).criteria[0]).toMatchObject({
+    status: "blocked",
+    evidence:
+      "Factory gate substitution unavailable: candidate gate checks did not all pass cleanly without retries or skipped tests.",
+  });
 });
 
 test("only the covering file is substituted; actionable or unclear criteria remain failures", () => {
