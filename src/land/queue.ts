@@ -339,17 +339,13 @@ export class LandQueue {
       if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) return;
       if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
         throw new LandBlocked("cannot confirm current GitHub merge state");
-      if (fresh.headRefOid !== entry.pushedSha)
-        throw new LandBlocked(
-          fresh.state === "MERGED"
-            ? "merged PR head is missing or differs from the pushed SHA"
-            : "head moved after approval",
-        );
       if (fresh.state === "MERGED") {
-        this.landed(entry, run, entry.pushedSha, { ...fresh, head: fresh.headRefOid });
+        this.landed(entry, run, entry.pushedSha, { ...fresh, head: fresh.headRefOid ?? "" });
         await this.discard(repo, this.worktreePath(entry));
         return;
       }
+      if (headMoved(fresh.headRefOid ?? "", entry.pushedSha, entry.approvedSha))
+        throw new LandBlocked("head moved after approval");
     }
     if (!entry.baseBranch || entry.baseBranch === entry.headBranch) {
       const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);

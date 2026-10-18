@@ -624,7 +624,7 @@ test("three requests submitted together all land, with no further request", asyn
   expect(gateLog()).toEqual(["start", "end", "start", "end", "start", "end"]);
 });
 
-test("a checking entry whose merge commit is already on the remote resumes and lands", async () => {
+test("a checking entry whose merge commit is already on the remote tolerates lagging reads and lands", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "change-1.txt", "one\n", 1);
   await advanceBase();
@@ -633,8 +633,9 @@ test("a checking entry whose merge commit is already on the remote resumes and l
   await sh(["git", "merge", "-q", "--no-ff", "-m", "limitless: merge base", "main"], { cwd: seed });
   const mergeSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: seed })).stdout.trim();
   await sh(["git", "push", "-q", bare, "HEAD:refs/heads/pr-1"], { cwd: seed });
-  observe(1, mergeSha, "PENDING");
+  observe(1, head, "SUCCESS");
   approve(1, head);
+  ci = () => null;
   // What a crash between the push and the waiting_ci update leaves behind.
   const entry = store.createLandEntry({
     runId: pr.run.id,
@@ -645,7 +646,29 @@ test("a checking entry whose merge commit is already on the remote resumes and l
     approvedSha: head,
   });
   store.updateLandEntry(entry.id, { state: "checking", pushedSha: mergeSha, attempts: 1 });
-  queue();
+  let caughtUp = false;
+  let reads = 0;
+  queue({
+    ciPollMs: 100,
+    client: async () => {
+      reads++;
+      return {
+        url: url(1),
+        state: "OPEN",
+        headRefOid: caughtUp ? mergeSha : head,
+        mergedAt: null,
+        mergedBy: null,
+        ci: "SUCCESS",
+        failing: [],
+      };
+    },
+  });
+  await waitFor(() => reads > 0);
+  await settleIdle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: mergeSha });
+  await waitFor(() => reads >= 2); // Reconciliation accepted the approved head; CI still waits.
+  expect(ghCalls("pr merge")).toEqual([]);
+  caughtUp = true;
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: mergeSha, attempts: 2 });
   expect(await remoteHead("pr-1")).toBe(mergeSha); // nothing was pushed again
