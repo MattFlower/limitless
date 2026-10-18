@@ -313,6 +313,13 @@ test.each([
   ["absolute membership", "at test/b.test.ts:3:92", "$CWD/test/b.test.ts", false],
   ["canonical alias", "at $CWD/test/./b.test.ts:3:92", "./test/b.test.ts", false],
   ["symlink identity", "at test/alias.test.ts:3:92", "test/b.test.ts", false],
+  ["bare path with parentheses", "at test/space (quote).test.ts:3:92", "test/space (quote).test.ts", false],
+  [
+    "wrapped path with parentheses",
+    "at leaked (test/space (quote).test.ts:3:92)",
+    "test/space (quote).test.ts",
+    false,
+  ],
   [
     "decoded XML and testcase file",
     "at leaked (test/space &apos; quote.test.ts:3:92)",
@@ -328,6 +335,7 @@ test.each([
   const f = fixture();
   try {
     writeFileSync(join(f.cwd, "helper.ts"), "");
+    writeFileSync(join(f.cwd, "test/space (quote).test.ts"), "");
     mkdirSync(join(f.cwd, "node_modules/pkg"), { recursive: true });
     writeFileSync(join(f.cwd, "node_modules/pkg/test.ts"), "");
     symlinkSync(join(f.cwd, "test/b.test.ts"), join(f.cwd, "test/alias.test.ts"));

@@ -36,8 +36,10 @@ export function attributedJUnitCounts(
           throw new Error("Unknown testcase evidence");
         if (child.name === "failure" || child.name === "error") {
           const text = child.children.filter((part) => typeof part === "string").join("");
-          for (const frame of text.matchAll(/^\s*at (?:.* \(|\()?(.+?):\d+:\d+\)?\s*$/gm)) {
-            const location = frame[1] && canonicalFile(frame[1]);
+          for (const frame of text.matchAll(/^\s*at (.+?):\d+:\d+\)?\s*$/gm)) {
+            if (!frame[1]) continue;
+            // Try the bare path first: a filename can itself contain " (".
+            const location = canonicalFile(frame[1]) ?? canonicalFile(frame[1].replace(/^(?:.*? )?\(/, ""));
             if (location && reportFiles.has(location) && location !== (file && canonicalFile(file)))
               throw new Error("Cross-file testcase failure");
           }
