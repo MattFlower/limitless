@@ -2,6 +2,7 @@ import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { homeReadPolicy } from "./read-policy.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
   agentShellEnv,
@@ -213,7 +214,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
       const commands = invocationCommands(scratch, spec.cwd);
-      const denyRead = [...(confined?.deny ?? explicit), ...commands.root];
+      const credentials = confined ? homeReadPolicy([], false, [...explicit, ...commands.root]).denyRead : [];
+      const denyRead = [...(confined?.deny ?? explicit), ...credentials, ...commands.root];
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
       denied.push(...[...explicit, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
