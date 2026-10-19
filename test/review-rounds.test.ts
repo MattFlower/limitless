@@ -6,13 +6,14 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { ReviewFinding, Run, RunDetail } from "../src/core/types.ts";
 import { checkPrivateText } from "../src/gates/private.ts";
+import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
-import type { FaultPlan } from "../src/pipeline/faults.ts";
+import { type FaultPlan, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { ENVIRONMENT_BLOCKED } from "../src/pipeline/verification.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -153,7 +154,9 @@ function answer(s: AgentSpec): FakeReply | Promise<FakeReply> {
       structured: {
         verdict: "approve",
         summary: "ok: checked the diff against the request and every finding",
-        findings: repair ? [{ ...findings[0], security: false, ...findingEvidence }] : [],
+        findings: repair
+          ? [{ ...findings[0], security: false, suggestion: "Fix it", ...findingEvidence }]
+          : [],
       },
     };
   }
@@ -819,7 +822,7 @@ test("a round that changes nothing ends needs_human without touching the PR", as
 });
 
 test.each([false, true])(
-  "a base that conflicts with the PR ends the round needs_human without pushing (denylist: %s)",
+  "an unresolved review-base conflict ends needs_human without pushing (denylist: %s)",
   async (denylist) => {
     const original = await delivered();
     const reviewed = await remoteHead();
@@ -831,12 +834,300 @@ test.each([false, true])(
     const round = await settle((await changes(original.id)).body.round?.id as string);
     expect(round.status).toBe("needs_human");
     expect(round.error).toContain("The PR branch conflicts with main in feature.txt");
-    expect(factory.store.listInvocations(round.id)).toHaveLength(0);
+    expect(implementPrompts).toHaveLength(1);
+    expect(implementPrompts[0]).toContain("## Conflict resolution");
+    expect(round.error).toContain("Unresolved conflict markers: feature.txt");
     expect(await remoteHead()).toBe(reviewed);
     expect(pr.body).toBe("Factory report");
     expect(pr.calls.some((args) => ["edit", "comment"].includes(args[1] ?? ""))).toBe(false);
   },
 );
+
+test("a review resolves its base conflict before findings and pushes only the combined head", async () => {
+  const original = await delivered("standard");
+  factory.store.updateRun(original.id, { status: "needs_human" });
+  const reviewed = await remoteHead();
+  const tip = await push("main", "feature.txt", "conflicting base\n");
+  onImplement = async (): Promise<Record<string, string>> =>
+    implementPrompts.length === 1
+      ? { "feature.txt": "feature\nconflicting base\n" }
+      : { "fix.txt": "handles empty input\n" };
+  const pushed = spyOn(repos, "pushExistingBranch");
+  const round = await settle((await changes(original.id)).body.round?.id as string);
+  expect(round.status).toBe("succeeded");
+  expect(implementPrompts).toHaveLength(2);
+  expect(implementPrompts[0]).toContain("## Conflict resolution");
+  expect(implementPrompts[0]).not.toContain("Handle the empty input");
+  expect(implementPrompts[1]).not.toContain("## Conflict resolution");
+  expect(implementPrompts[1]).toContain("Handle the empty input");
+  const head = await remoteHead();
+  const show = async (ref: string) => (await sh(["git", "show", ref], { cwd: remote })).stdout;
+  expect(await show(`${head}:feature.txt`)).toBe("feature\nconflicting base\n");
+  expect(await show(`${head}:fix.txt`)).toBe("handles empty input\n");
+  expect((await sh(["git", "merge-base", "--is-ancestor", tip, head], { cwd: remote })).exitCode).toBe(0);
+  const state = factory.store.getRunState<RunState>(round.id);
+  const merge = state?.reviewResolution?.sha;
+  if (!merge) throw new Error("missing resolution checkpoint");
+  expect(
+    (await sh(["git", "rev-list", "--parents", "-n", "1", merge as string], { cwd: remote })).stdout.trim(),
+  ).toBe(`${merge} ${reviewed} ${tip}`);
+  expect(
+    (await sh(["git", "diff", "--name-only", merge as string, head], { cwd: remote })).stdout.trim(),
+  ).toBe("fix.txt");
+  expect(state?.reviewHistory?.map((r) => r.sha)).toEqual([merge, head]);
+  expect(
+    factory.store
+      .listStages(round.id)
+      .filter((s) => ["gates", "audit", "review"].includes(s.name) && s.round === 1)
+      .map((s) => [s.name, s.status]),
+  ).toEqual([
+    ["gates", "succeeded"],
+    ["audit", "succeeded"],
+    ["review", "succeeded"],
+  ]);
+  expect(pushed).toHaveBeenCalledTimes(1);
+  expect(pushed.mock.calls[0]?.[6]).toBe(head);
+});
+
+test.each(["audit", "review", "empty"] as const)(
+  "a resolution rejected by the existing %s check skips findings and leaves the remote unchanged",
+  async (check) => {
+    const original = await delivered();
+    const reviewed = await remoteHead();
+    await push("main", "feature.txt", "conflicting base\n");
+    rejectNextReview = check === "review";
+    onImplement = async () => ({
+      "feature.txt": check === "empty" ? "conflicting base\n" : "feature\nconflicting base\n",
+      ...(check === "audit" ? { "protected.txt": "changed\n" } : {}),
+      ...(check === "empty" ? { ".limitless.toml": BASE_CONFIG } : {}),
+    });
+    const pushed = spyOn(repos, "pushExistingBranch");
+    const round = await settle((await changes(original.id)).body.round?.id as string);
+    expect(round.status).toBe("needs_human");
+    expect(round.error).toContain("The PR branch conflicts with main in feature.txt");
+    expect(round.error).toContain(
+      check === "audit"
+        ? "protected"
+        : check === "review"
+          ? "Handle the empty input"
+          : "no change against main",
+    );
+    expect(implementPrompts).toHaveLength(1);
+    expect(pushed).not.toHaveBeenCalled();
+    expect(await remoteHead()).toBe(reviewed);
+  },
+);
+
+const resolutionRestarts: { checkpoint: string; faults: FaultPlan; implementations: number }[] = [
+  {
+    checkpoint: "pending",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-start" } },
+    implementations: 0,
+  },
+  { checkpoint: "ready", faults: {}, implementations: 1 },
+  {
+    checkpoint: "merge",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "implementation-committed" } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "checks",
+    faults: { "stage:review:before": { action: "kill", when: (c) => c.round === 1 } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "checked",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-checked" } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "resolution",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-complete" } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "findings",
+    faults: { "stage:implement:after": { action: "kill", when: (c) => c.round === 2 } },
+    implementations: 2,
+  },
+];
+
+test.each([
+  ...resolutionRestarts,
+  ...resolutionRestarts
+    .filter((entry) => ["ready", "checked"].includes(entry.checkpoint))
+    .map((entry) => ({ ...entry, checkpoint: `prior-${entry.checkpoint}` })),
+])(
+  "a review restart at $checkpoint preserves completed work and delivers once",
+  async ({ checkpoint, faults, implementations }) => {
+    const boundary = checkpoint.replace("prior-", "");
+    const original = await delivered();
+    const reviewed = await remoteHead();
+    const tip = await push("main", "feature.txt", "conflicting base\n");
+    onImplement = async (): Promise<Record<string, string>> =>
+      implementPrompts.length === 1
+        ? { "feature.txt": "feature\nconflicting base\n" }
+        : { "fix.txt": "handles empty input\n" };
+    const id = (await changes(original.id)).body.round?.id as string;
+    factory.deps.faults = { ...faults };
+    // Kill immediately after the durable ready write, before completeMerge can consume the edits.
+    const save = factory.store.setRunState.bind(factory.store);
+    const snapshots: RunState[] = [];
+    const saving = spyOn(factory.store, "setRunState").mockImplementation((runId, state) => {
+      save(runId, state);
+      const persisted = factory.store.getRunState<RunState>(runId);
+      if (runId !== id || !persisted) return;
+      snapshots.push(persisted);
+      if (
+        boundary === "ready" &&
+        persisted.implementationReadyRound === 1 &&
+        persisted.implementedRound !== 1
+      )
+        throw new SimulatedTermination("terminated after implementation-ready");
+    });
+    const update = factory.store.updateRun.bind(factory.store);
+    const updating = spyOn(factory.store, "updateRun").mockImplementation((...args) => {
+      const result = update(...args);
+      if (args[0] === id) {
+        const state = factory.store.getRunState<RunState>(id);
+        if (state) snapshots.push(state);
+      }
+      return result;
+    });
+    const completing = spyOn(merges, "completeMerge");
+    expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+    saving.mockRestore();
+    updating.mockRestore();
+    expect(await remoteHead()).toBe(reviewed);
+    for (const state of snapshots) {
+      if (state.reviewResolution && !state.reviewResolution.sha) expect(state.needsHumanReason).toBeTruthy();
+    }
+    const saved = factory.store.getRunState<RunState>(id);
+    if (!saved?.worktreePath) throw new Error("missing review worktree");
+    const cwd = saved.worktreePath;
+    const local = async (...args: string[]) => (await sh(["git", ...args], { cwd })).stdout.trim();
+    const committed = await local("rev-parse", "HEAD");
+    const merge = saved.reviewResolution?.sha ?? (committed !== reviewed ? committed : undefined);
+    const completedMerges = completing.mock.calls.length;
+    const resolutionChecks = () =>
+      factory.store
+        .listStages(id)
+        .filter(
+          (s) => s.round === 1 && s.status === "succeeded" && ["gates", "audit", "review"].includes(s.name),
+        );
+    const checked = resolutionChecks();
+    expect(saved.reviewBaseSha).toBe(tip);
+    expect(implementPrompts).toHaveLength(implementations);
+    if (boundary === "ready") {
+      expect(saved.implementationReadyRound).toBe(1);
+      expect(await local("diff", "--", "feature.txt")).toContain("conflicting base");
+      expect(committed).toBe(reviewed);
+      expect(completedMerges).toBe(0);
+    }
+    expect(pr.comments).toHaveLength(0);
+    expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(0);
+    if (!saved.reviewResolution?.sha) {
+      // The previous engine checks needsHumanReason before buildLoop. For an authorized review
+      // round its failure path never pushes. Even cached quick approval cannot bypass this block.
+      expect(saved.needsHumanReason).toBeTruthy();
+      if (boundary === "checked") {
+        expect(saved.implementedRound).toBe(saved.conflictRound);
+        expect(saved.completedChecks?.values.review).toMatchObject({ verdict: "approve" });
+        expect(saved.lastVerifiedSha).toBe(merge);
+        expect(checked.map((s) => s.name)).toEqual(["gates", "audit", "review"]);
+      }
+    } else if (boundary === "resolution") {
+      // Once the block is removed, the previous engine must implement findings before checks.
+      expect(saved.needsHumanReason).toBeUndefined();
+      expect(saved.implementedRound).not.toBe(saved.round);
+      expect(saved.completedChecks?.round).not.toBe(saved.round);
+    }
+    if (checkpoint.startsWith("prior-")) {
+      // The branch's original format saved this resolution evidence without a rollback block.
+      delete saved.needsHumanReason;
+      factory.store.setRunState(id, saved);
+    }
+    await push("main", "later.txt", "base advanced during restart\n");
+    await restart();
+    const resumeUpdate = factory.store.updateRun.bind(factory.store);
+    const resumedWrites: RunState[] = [];
+    spyOn(factory.store, "updateRun").mockImplementation((...args) => {
+      const result = resumeUpdate(...args);
+      if (args[0] === id && args[2] !== undefined) {
+        const state = factory.store.getRunState<RunState>(id);
+        if (state) resumedWrites.push(state);
+      }
+      return result;
+    });
+    const pushed = spyOn(repos, "pushExistingBranch");
+    const round = await settle(id);
+    expect(round.status).toBe("succeeded");
+    expect(resumedWrites.length).toBeGreaterThan(0);
+    const state = factory.store.getRunState<RunState>(id);
+    const finalMerge = state?.reviewResolution?.sha;
+    if (!finalMerge) throw new Error("missing completed resolution");
+    if (merge) expect(finalMerge).toBe(merge);
+    expect(state?.reviewBaseSha).toBe(tip);
+    for (const persisted of resumedWrites) {
+      if (persisted.reviewResolution && !persisted.reviewResolution.sha)
+        expect(persisted.needsHumanReason).toBeTruthy();
+    }
+    expect(state?.reviewHistory?.map((r) => r.sha)).toEqual([finalMerge, await remoteHead()]);
+    expect(resolutionChecks()).toHaveLength(3);
+    expect(resolutionChecks().filter((s) => checked.some((old) => old.id === s.id))).toEqual(checked);
+    // A completed merge is validated on resume, never committed again.
+    expect(completing).toHaveBeenCalledTimes(merge ? completedMerges : 1);
+    if (boundary === "findings") expect(await remoteHead()).toBe(committed);
+    const remoteGit = async (...args: string[]) =>
+      (await sh(["git", ...args], { cwd: remote })).stdout.trim();
+    expect(await remoteGit("rev-list", "--parents", "-n", "1", finalMerge)).toBe(
+      `${finalMerge} ${reviewed} ${tip}`,
+    );
+    expect(await remoteGit("rev-parse", `${await remoteHead()}^`)).toBe(finalMerge);
+    expect(await remoteGit("show", `${await remoteHead()}:feature.txt`)).toBe("feature\nconflicting base");
+    expect(await remoteGit("show", `${await remoteHead()}:fix.txt`)).toBe("handles empty input");
+    expect(implementPrompts).toHaveLength(2);
+    expect(pushed).toHaveBeenCalledTimes(1);
+    expect(pr.comments).toHaveLength(0);
+    expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+  },
+);
+
+test("resolution review does not turn the first findings review into a re-review", async () => {
+  const original = await delivered();
+  await push("main", "feature.txt", "conflicting base\n");
+  onImplement = async (): Promise<Record<string, string>> => {
+    if (implementPrompts.length === 1) return { "feature.txt": "feature\nconflicting base\n" };
+    rejectNextReview = implementPrompts.length === 2;
+    return { "fix.txt": implementPrompts.length === 2 ? "incomplete\n" : "handles empty input\n" };
+  };
+  const round = await settle((await changes(original.id)).body.round?.id as string);
+  expect(round.status).toBe("succeeded");
+  expect(implementPrompts).toHaveLength(3);
+  expect(implementPrompts[2]).toContain("Code review findings (must fix)");
+  expect((await sh(["git", "show", `${await remoteHead()}:fix.txt`], { cwd: remote })).stdout).toBe(
+    "handles empty input\n",
+  );
+});
+
+test("a PR head moved during resolution is never overwritten by review delivery", async () => {
+  const original = await delivered();
+  await push("main", "feature.txt", "conflicting base\n");
+  let moved = "";
+  onImplement = async (): Promise<Record<string, string>> => {
+    if (implementPrompts.length === 1) {
+      moved = await push(BRANCH, "external.txt", "external change\n");
+      return { "feature.txt": "feature\nconflicting base\n" };
+    }
+    return { "fix.txt": "handles empty input\n" };
+  };
+  const pushed = spyOn(repos, "pushExistingBranch");
+  const round = await settle((await changes(original.id)).body.round?.id as string);
+  expect(round.status).toBe("failed");
+  expect(round.error).toContain("head moved");
+  expect(await remoteHead()).toBe(moved);
+  expect(pushed).not.toHaveBeenCalled();
+});
 
 test("at most one round in flight, and the fourth changes verdict leaves the run needs_human", async () => {
   const original = await delivered();

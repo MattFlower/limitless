@@ -252,7 +252,10 @@ export async function gradeImplement(
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
-    const after = await runGates(checkout, prepared.gates, signal, { holder: "eval trial" });
+    const after = await runGates(checkout, prepared.gates, signal, {
+      holder: "eval trial",
+      priority: "start",
+    });
     signal.throwIfAborted();
     await worktreeGit(["git", "reset", "--hard", "-q", commit], opts);
     await worktreeGit(["git", "clean", "-fdq"], opts);

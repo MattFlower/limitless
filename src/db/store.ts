@@ -2821,6 +2821,11 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     }
   }
 
+  /** Ownership survives lease expiry until another worker reclaims the entry. */
+  ownsLandClaim(id: number, owner: string): boolean {
+    return !!this.db.query("SELECT 1 FROM land_entries WHERE id = ? AND claim_owner = ?").get(id, owner);
+  }
+
   /** Renew only the claim this queue owns; loss of ownership aborts its worker. */
   heartbeatLandClaim(id: number, owner: string, now = Date.now()): boolean {
     return (

@@ -68,6 +68,7 @@ export async function prepareEvalGates(
   const gates = await gatesAt(cwd, item.base, signal);
   const baseline = await runGates(cwd, setupOnly ? { ...gates, checks: [] } : gates, signal, {
     holder: setupOnly ? "eval review setup" : "eval baseline",
+    priority: "start",
   });
   signal.throwIfAborted();
   return { gates, baseline };

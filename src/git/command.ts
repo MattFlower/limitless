@@ -93,15 +93,19 @@ export const worktreeGit = (cmd: string[], opts: GitOptions, retryClean = false)
   runGit(cmd, opts, retryClean, gitSh);
 
 /** Only factory-owned repositories and remote transports; never a checkout dirty check. */
-export const cacheGit = (cmd: string[], opts: Parameters<typeof sh>[1]) => runGit(cmd, opts, false, sh);
+export const cacheGit = (cmd: string[], opts: Parameters<typeof sh>[1], guard?: () => void) =>
+  runGit(cmd, opts, false, sh, guard);
 
 async function runGit(
   cmd: string[],
   opts: Parameters<typeof sh>[1],
   retryClean: boolean,
   execute: typeof sh,
+  guard?: () => void,
 ) {
   const run = async (cmd: string[], opts: Parameters<typeof sh>[1]) => {
+    // All asynchronous Git preparation is complete; no await may precede execution here.
+    guard?.();
     try {
       return await execute(cmd, opts);
     } catch (error) {

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -28,7 +29,8 @@ import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import { markReport, reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { registerCredential, sh } from "../src/util/proc.ts";
+import * as proc from "../src/util/proc.ts";
+import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -131,6 +133,9 @@ const branch=existsSync(file+".branch-"+pr)?readFileSync(file+".branch-"+pr,"utf
 const baseRefName=existsSync(file+".base-"+pr)?readFileSync(file+".base-"+pr,"utf8").trim():undefined;
 const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
 const flag=(n)=>args.includes(n);
+if(args[1]==="view" && args.includes("title,body,headRefOid,state")) {
+ while(existsSync(file+".hold-view")) await Bun.sleep(10);
+}
 if(args[0]!=="pr"||args[1]!=="merge"){
  if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({url:args[2],title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",mergedBy:merged&&!existsSync(file+".no-metadata")?{login:"owner"}:null,mergedAt:merged&&!existsSync(file+".no-metadata")?"2026-10-13T12:00:00Z":null,statusCheckRollup:[]}));
  process.exit(0);
@@ -841,7 +846,10 @@ test.each(["complete", "fail", "abort", "timeout", "unmerged", "different PR"])(
       if (outcome === "abort") await q.stop();
       if (outcome === "timeout" || outcome === "abort") expect(metadataSignal?.aborted).toBe(true);
       if (outcome === "timeout")
-        await waitWithoutClock(() => !existsSync(join(paths.work, `land-${entry.id}`)), 15_000);
+        await waitWithoutClock(
+          () => !existsSync(join(paths.work, `land-${entry.id}-${store.getLandEntry(entry.id)?.attempts}`)),
+          15_000,
+        );
       const observation: GitHubPrView = {
         url: url(outcome === "different PR" ? 2 : 1),
         state: outcome === "unmerged" ? "OPEN" : "MERGED",
@@ -853,7 +861,9 @@ test.each(["complete", "fail", "abort", "timeout", "unmerged", "different PR"])(
       };
       if (outcome === "fail") response.reject(new Error("metadata unavailable"));
       else response.resolve(observation);
-      await waitFor(() => !existsSync(join(paths.work, `land-${entry.id}`)));
+      await waitFor(
+        () => !existsSync(join(paths.work, `land-${entry.id}-${store.getLandEntry(entry.id)?.attempts}`)),
+      );
       await q.stop();
       expect(store.getLandEntry(entry.id)?.state).toBe("landed");
       for (const id of [round.id, pr.run.id]) {
@@ -1614,6 +1624,165 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
   expect(merges[0]).not.toContain("--auto");
 });
 
+test.each(["merged", "failed", "exception"] as const)(
+  "a late merge result after reclaim leaves the newer claim unchanged: %s",
+  async (outcome) => {
+    const pr = delivered(1, "pr-1");
+    store.updateRun(pr.run.id, { status: "needs_human" });
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, head, "SUCCESS");
+    approve(1, head);
+    if (outcome === "failed") writeFileSync(join(root, "gh.reject"), "");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const merge = repos.mergePullRequest;
+    const boundary = spyOn(repos, "mergePullRequest").mockImplementation(async (...args) => {
+      const result = await merge(...args);
+      entered.resolve();
+      await release.promise;
+      if (outcome === "exception") throw new Error("merge response failed");
+      return result;
+    });
+    const cleanup = spyOn(repos, "disableAutoMerge");
+    const q = queue();
+    try {
+      const entry = await q.request({ target: pr.run.id });
+      await entered.promise;
+      expect(store.getLandEntry(entry.id)?.state).toBe("merging");
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const snapshot = () => ({
+        entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+        run: store.getRun(pr.run.id),
+        feed: store.readFeed({ limit: 100 }).items,
+        conflicts: store.pendingConflictTriggers(),
+        commands: ghCalls("pr "),
+      });
+      const before = snapshot();
+      release.resolve();
+      await waitWithoutClock(() => clock.pending === 0, 15_000);
+      await q.stop();
+      expect(snapshot()).toEqual(before);
+      expect(boundary).toHaveBeenCalledTimes(1);
+      expect(cleanup).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await q.stop();
+      boundary.mockRestore();
+      cleanup.mockRestore();
+    }
+  },
+);
+
+test("a resumed land cannot merge after losing its claim during a CI read", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "waiting_ci", pushedSha: head });
+  const view: GitHubPrView = {
+    url: url(1),
+    state: "OPEN",
+    headRefOid: head,
+    mergedAt: null,
+    mergedBy: null,
+    ci: "SUCCESS",
+    failing: [],
+  };
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<GitHubPrView | null>();
+  let reads = 0;
+  const q = queue({
+    polling: false,
+    client: async () => {
+      if (++reads === 1) return view; // The fresh recovery lookup confirms OPEN.
+      entered.resolve();
+      return response.promise;
+    },
+  });
+  try {
+    await entered.promise;
+    expect(reads).toBe(2);
+    expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    const snapshot = () => ({
+      entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+      run: store.getRun(pr.run.id),
+      feed: store.readFeed({ limit: 100 }).items,
+    });
+    const before = snapshot();
+    response.resolve(view);
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await q.stop();
+    expect(snapshot()).toEqual(before);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    response.resolve(null);
+    await q.stop();
+  }
+});
+
+test.each(["preparation", "completion"] as const)(
+  "a reclaim during push %s prevents further publication and checkpoints",
+  async (phase) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, head, "SUCCESS");
+    approve(1, head);
+    await advanceBase();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const remote = repos.remoteBranchSha;
+    const push = repos.pushExistingBranch;
+    const preparation = spyOn(repos, "remoteBranchSha").mockImplementation(async (...args) => {
+      const result = await remote(...args);
+      if (phase === "preparation") {
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    const completion = spyOn(repos, "pushExistingBranch").mockImplementation(async (...args) => {
+      const result = await push(...args);
+      if (phase === "completion") {
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    const q = queue();
+    try {
+      const entry = await q.request({ target: pr.run.id });
+      await entered.promise;
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const snapshot = () => ({
+        entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+        run: store.getRun(pr.run.id),
+        feed: store.readFeed({ limit: 100 }).items,
+      });
+      const before = snapshot();
+      const pushed = await remoteHead("pr-1");
+      release.resolve();
+      await waitWithoutClock(() => clock.pending === 0, 15_000);
+      await q.stop();
+      expect(snapshot()).toEqual(before);
+      expect(await remoteHead("pr-1")).toBe(pushed);
+      expect(completion).toHaveBeenCalledTimes(phase === "preparation" ? 0 : 1);
+      expect(ghCalls("pr merge")).toEqual([]);
+    } finally {
+      release.resolve();
+      await q.stop();
+      preparation.mockRestore();
+      completion.mockRestore();
+    }
+  },
+);
+
 test("a restart during merging takes an already merged PR as landed without merging again", async () => {
   const pr = delivered(1, "pr-1");
   store.updateRun(pr.run.id, { status: "needs_human" });
@@ -2182,6 +2351,59 @@ test("a cancel interrupts a CI read that never answers", async () => {
   expect(store.getLandEntry(entry.id)?.state).toBe("cancelled");
 });
 
+test.each(["review", "conflict", "ci"] as const)(
+  "a %s round lands with the original run's checked squash subject",
+  async (kind) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    store.updateRun(pr.run.id, { baseSha: await remoteHead("main") });
+    let round: Run | null;
+    if (kind === "review") {
+      round = roundRun(pr.run.id, url(1), head);
+      store.updateRun(round.id, { title: "Review round 1: PR 1" });
+    } else {
+      if (kind === "conflict") store.recordConflictTrigger(url(1), head, "land", clock.now());
+      else
+        store.recordCiFixTrigger(
+          url(1),
+          head,
+          "failure",
+          { check: "test", line: "FAIL", excerpt: "FAIL" },
+          clock.now(),
+        );
+      const trigger =
+        kind === "conflict" ? store.pendingConflictTriggers()[0] : store.pendingCiFixTriggers()[0];
+      if (!trigger) throw new Error("missing round trigger");
+      const observation = { state: "OPEN", headRefOid: head };
+      round =
+        kind === "conflict"
+          ? store.startConflictTrigger(trigger.id, observation, clock.now())
+          : store.startCiFixTrigger(trigger.id, observation, clock.now());
+      if (round) store.updateRun(round.id, { status: "succeeded" });
+    }
+    if (!round) throw new Error("round refused");
+    expect(store.reviewRound(round.id)?.kind).toBe(kind);
+    observe(1, head);
+    store.recordApproval(round.id, url(1), head, "orchestrator");
+    const publication = repos.checkPrivatePublication;
+    const check = spyOn(repos, "checkPrivatePublication").mockImplementation(async (...args) => {
+      await publication(...args);
+      store.updateRun(pr.run.id, { title: "Changed after publication check" });
+    });
+    try {
+      const entry = await queue().request({ target: round.id });
+      await settle();
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      expect(check.mock.calls.map(([, , input]) => input?.squash?.title)).toEqual(["PR 1 (#1)"]);
+      expect(ghCalls("pr merge")).toEqual([
+        `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${head} --subject PR 1 (#1) --body-file -`,
+      ]);
+    } finally {
+      check.mockRestore();
+    }
+  },
+);
+
 test("a review-round land merges current main into the approved head before checking", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n");
@@ -2704,3 +2926,312 @@ test.each(["clean", "final", "merge"])(
     }
   },
 );
+
+function claimSnapshot(entry: LandEntry) {
+  return {
+    entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+    run: store.getRun(entry.runId),
+    feed: store.readFeed({ limit: 1000 }).items,
+    failures: store.ciFailures(entry.prUrl, entry.pushedSha ?? entry.approvedSha),
+    triggers: store.pendingCiFixTriggers(),
+    main: store.getSetting(`ci.main:${SLUG}`, null),
+    events: store.listEvents(entry.runId),
+  };
+}
+
+test("a reclaim during push retry backoff prevents the next push and all publication", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  await advanceBase();
+  let pushes = 0;
+  let release: (() => void) | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const set = globalThis.setTimeout;
+  const execute = proc.sh;
+  const transport = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
+    if (cmd.includes("push")) {
+      pushes++;
+      return Promise.reject(
+        new CommandError("push unavailable", 1, "", pushes === 1 ? "HTTP 502" : "rejected", false),
+      );
+    }
+    return execute(cmd, opts);
+  });
+  const pause = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: unknown[]) => void,
+    ms?: number,
+    ...args: unknown[]
+  ) => {
+    if (pushes === 1 && ms === repos.githubRetry.baseDelayMs && !release) {
+      // Keep the native timer handle for clearTimeout, but release backoff explicitly.
+      timer = set(() => {}, 60_000);
+      release = () => callback(...args);
+      return timer;
+    }
+    return set(callback, ms, ...args);
+  }) as typeof setTimeout);
+  const q = queue({ gateExecutor: fakeLandGates((req) => retryRun(req)).executor });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitWithoutClock(() => !!release, 15_000);
+    expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    const before = claimSnapshot(entry);
+    const now = clock.now();
+    release?.();
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    expect(pushes).toBe(1);
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(claimSnapshot(entry)).toEqual(before);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(clock.now()).toBe(now);
+  } finally {
+    release?.();
+    if (timer) clearTimeout(timer);
+    await q.stop();
+    pause.mockRestore();
+    transport.mockRestore();
+  }
+});
+
+test("a restarted land removes only older base exports as plain directories before checkout", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "checking", attempts: 2 });
+  const prefix = `land-${entry.id}`;
+  const abandoned = [prefix, `${prefix}-1`, `${prefix}-base`, `${prefix}-1-base`, `${prefix}-2-base`];
+  const preserved = [
+    `${prefix}-3-base`,
+    `${prefix}-4-base`,
+    `${prefix}-4`,
+    `land-${entry.id + 1}-1-base`,
+    `${prefix}-other-base`,
+    `${prefix}-2-base-extra`,
+    `${prefix}-2-base.git-paths`,
+  ];
+  for (const name of [...abandoned, ...preserved]) {
+    mkdirSync(join(paths.work, name));
+    writeFileSync(join(paths.work, name, "sentinel"), name);
+  }
+  let inspected = false;
+  const add = repos.addDetachedWorktree;
+  const checkout = spyOn(repos, "addDetachedWorktree").mockImplementation((...args) => {
+    expect(args[2]).toBe(join(paths.work, `${prefix}-3`));
+    for (const name of abandoned) expect(existsSync(join(paths.work, name))).toBe(false);
+    for (const name of preserved) expect(readFileSync(join(paths.work, name, "sentinel"), "utf8")).toBe(name);
+    inspected = true;
+    return add(...args);
+  });
+  const removal = spyOn(repos, "removeWorktree");
+  const q = queue({ gateExecutor: fakeLandGates((req) => retryRun(req)).executor });
+  try {
+    await settle();
+    await q.stop();
+    expect(inspected).toBe(true);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", attempts: 3 });
+    expect(removal.mock.calls.map(([, , cwd]) => cwd).sort()).toEqual(
+      [prefix, `${prefix}-1`, `${prefix}-3`].map((name) => join(paths.work, name)).sort(),
+    );
+    for (const name of preserved.filter((name) => name !== `${prefix}-3-base`))
+      expect(readFileSync(join(paths.work, name, "sentinel"), "utf8")).toBe(name);
+  } finally {
+    await q.stop();
+    checkout.mockRestore();
+    removal.mockRestore();
+  }
+});
+
+test("a reclaim during the pre-merge lookup prevents every merge command", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  writeFileSync(join(root, "gh.hold-view"), "");
+  const q = queue();
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => ghCalls("pr view").some((c) => c.includes("title,body,headRefOid,state")));
+    expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    const before = claimSnapshot(entry);
+    rmSync(join(root, "gh.hold-view"));
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    expect(claimSnapshot(entry)).toEqual(before);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    rmSync(join(root, "gh.hold-view"), { force: true });
+    await q.stop();
+  }
+});
+
+test("pushExistingBranch checks the claim after its internal remote lookup and aborts", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  await advanceBase();
+  const push = repos.pushExistingBranch;
+  let before: ReturnType<typeof claimSnapshot> | undefined;
+  let entry: LandEntry | undefined;
+  let signal: AbortSignal | undefined;
+  const boundary = spyOn(repos, "pushExistingBranch").mockImplementation(async (...args) => {
+    signal = args[4];
+    const guard = args[7];
+    args[7] = () => {
+      entry = store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000) ?? undefined;
+      if (!entry) throw new Error("reclaim failed");
+      before = claimSnapshot(entry);
+      guard?.();
+    };
+    return push(...args);
+  });
+  const q = queue();
+  try {
+    await q.request({ target: pr.run.id });
+    await waitWithoutClock(() => !!before && clock.pending === 0, 15_000);
+    if (!entry || !before) throw new Error("guard never reached");
+    expect(claimSnapshot(entry)).toEqual(before);
+    expect(signal?.aborted).toBe(true);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    await q.stop();
+    boundary.mockRestore();
+  }
+});
+
+test.each([201, 422])("a reclaim during a pending rerun POST leaves no writes (%s)", async (status) => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const q = queue();
+  const response = Promise.withResolvers<ReturnType<typeof respond>>();
+  const entered = Promise.withResolvers<void>();
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
+    workflow(head, 1, "failure");
+    github.responses.set(`repos/${SLUG}/actions/jobs/21/rerun`, () => {
+      entered.resolve();
+      return response.promise;
+    });
+    observe(1, head, "FAILURE", ["network"]);
+    await entered.promise;
+    const reclaimed = store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000);
+    if (!reclaimed) throw new Error("reclaim failed");
+    const before = claimSnapshot(reclaimed);
+    const calls = github.rest().length;
+    response.resolve(respond(status, {}));
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    expect(claimSnapshot(reclaimed)).toEqual(before);
+    expect(github.rest()).toHaveLength(calls);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    response.resolve(respond(status, {}));
+    await q.stop();
+  }
+});
+
+test("a heartbeat aborts after the replacement owner blocks the entry", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let signal: AbortSignal | undefined;
+  const boundary = spyOn(repos, "mergePullRequest").mockImplementation(async (...args) => {
+    signal = args[3];
+    entered.resolve();
+    await release.promise;
+    signal?.throwIfAborted();
+    return "merged";
+  });
+  const q = queue();
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await entered.promise;
+    expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    store.updateLandEntry(entry.id, { state: "blocked", reason: "replacement blocked" });
+    const before = claimSnapshot(entry);
+    await clock.advance(10_000);
+    expect(signal?.aborted).toBe(true);
+    expect(claimSnapshot(entry)).toEqual(before);
+    release.resolve();
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+  } finally {
+    release.resolve();
+    await q.stop();
+    boundary.mockRestore();
+  }
+});
+
+test("replacement checkout survives the stale worker's cleanup", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const publication = repos.checkPrivatePublication;
+  let firstPath = "";
+  let first = true;
+  const boundary = spyOn(repos, "checkPrivatePublication").mockImplementation(async (...args) => {
+    const result = await publication(...args);
+    if (first) {
+      first = false;
+      firstPath = args[0];
+      entered.resolve();
+      await release.promise;
+    }
+    return result;
+  });
+  const q = queue();
+  let replacement: LandQueue | undefined;
+  let replacementWork: Promise<void> | undefined;
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await entered.promise;
+    rmSync(gateReleasePath());
+    // A second daemon has its own in-memory drain map. Invoke its claimed worker directly here.
+    replacement = queue({ start: false });
+    const worker = replacement as unknown as {
+      owner: string;
+      process: (entry: LandEntry) => Promise<void>;
+    };
+    const claimed = store.claimLandEntry(SLUG, 30_000, worker.owner, clock.now() + 31_000);
+    if (!claimed) throw new Error("replacement did not claim");
+    replacementWork = worker.process(claimed);
+    const path = join(paths.work, `land-${entry.id}-${claimed.attempts}`);
+    await waitWithoutClock(() => existsSync(`${path}.git-paths`) && existsSync(`${path}-base`), 15_000);
+    expect(path).not.toBe(firstPath);
+    release.resolve();
+    const stale = q as unknown as { workers: Map<string, Promise<void>> };
+    await Promise.all(stale.workers.values());
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(`${path}.git-paths`)).toBe(true);
+    writeFileSync(gateReleasePath(), "");
+    await replacementWork;
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(readdirSync(paths.work)).toEqual([]);
+  } finally {
+    release.resolve();
+    writeFileSync(gateReleasePath(), "");
+    await q.stop();
+    await replacement?.stop();
+    await replacementWork;
+    boundary.mockRestore();
+  }
+});
