@@ -121,7 +121,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "setup",
     "retry setup failure",
     "retry-lint",
+    "retry clean once",
+    "retry clean persists",
   ])("gate timeout: %s", async (scenario) => {
+    const retryClean = scenario.startsWith("retry clean");
     const limit = scenario === "twice" ? 37 : 900;
     writeFileSync(
       join(repoDir, ".limitless.toml"),
@@ -139,17 +142,33 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") return { structured: approve };
       prompts.push(s.prompt);
-      return { files: { "farewell.txt": "goodbye\n" } };
+      return {
+        files: { "farewell.txt": "goodbye\n" },
+        ...(retryClean && prompts.length === 1 ? { status: "stuck", error: "repeated shell call" } : {}),
+      };
     });
     const previous = gateSlots.limit;
     gateSlots.setLimit(1);
     let held: Promise<() => void> | undefined;
     let release: (() => void) | undefined;
     let calls = 0;
+    let cleanAttempts = 0;
     let waits = 0;
     const commands: string[] = [];
     const realProcess = proc.runProcess;
     const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      // Only fail the checkout between the timed-out gate and its re-run.
+      if (
+        retryClean &&
+        calls === 2 &&
+        prompts.length === 1 &&
+        opts.cmd.at(-2) === "clean" &&
+        opts.cmd.at(-1) === "-ffdxq"
+      ) {
+        cleanAttempts++;
+        if (cleanAttempts === 1 || scenario === "retry clean persists")
+          throw new proc.CommandError("could not lstat node_modules/writer", 1, "", "", false);
+      }
       if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
       opts.signal?.throwIfAborted();
       const attempt = calls++;
@@ -246,6 +265,23 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(calls).toBe(2);
         expect(state?.feedback).toBeNull();
         expect(f.store.getArtifact(run.id, "gates-0.json")).toContain('"timedOut": true');
+      } else if (retryClean) {
+        expect(status).toBe("succeeded");
+        expect(cleanAttempts).toBe(2);
+        expect(calls).toBe(3);
+        const persistent = scenario === "retry clean persists";
+        expect(prompts).toHaveLength(persistent ? 2 : 1);
+        expect(state?.round).toBe(persistent ? 1 : 0);
+        expect(f.store.getArtifact(run.id, "gates-timeout-0.json")).toContain('"timedOut":true');
+        expect(f.store.listStages(run.id).find((s) => s.name === "gates")).toMatchObject({
+          round: 0,
+          status: persistent ? "failed" : "succeeded",
+        });
+        if (persistent) {
+          expect(prompts[1]).toContain("Worktree cleanup failed after retry");
+          expect(prompts[1]).toContain("could not lstat node_modules/writer");
+          expect(prompts[1]).toContain("stuck: repeated shell call");
+        } else expect(state?.lastGates?.[0]?.firstAttempt?.timedOut).toBe(true);
       } else {
         expect(status).toBe("succeeded");
         const retries = ["mixed", "unflagged", "setup"].includes(scenario) ? 0 : 1;
