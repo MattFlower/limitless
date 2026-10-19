@@ -58,6 +58,7 @@ const securityFailure = (log: string) =>
 // Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
 const timeoutDiagnostic =
   /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
+class CiWriteDenied extends Error {}
 const pending = (f: CiFailure) => f.outcome === "rerunning" || f.outcome === "rerun_requested";
 /** The approved head can lag a factory push; any other head supersedes the pinned commit. */
 export const headMoved = (head: string, sha: string, approvedSha?: string): boolean =>
@@ -91,10 +92,21 @@ async function inspectCi(
   onFailure: () => void,
   consumer: "poller" | "land",
   approvedSha?: string,
+  writeGuard: () => boolean = () => true,
 ): Promise<boolean | "head_moved"> {
+  const allowed = () => {
+    if (!writeGuard()) throw new CiWriteDenied();
+  };
+  const write = <T>(fn: () => T): T =>
+    store.transaction(() => {
+      allowed();
+      return fn();
+    });
   const root = `repos/${pr.repo}`;
   const read = async (path: string, optionalLog = false, fallback = "") => {
+    allowed();
     const res = await call(pr.repo, `${root}/${path}`, undefined, optionalLog);
+    allowed();
     // A verified job may have no uploaded log after its workflow times out.
     if (optionalLog && res?.status === 404)
       return ["error: Job log unavailable (HTTP 404)", fallback].join("\n");
@@ -193,9 +205,8 @@ async function inspectCi(
     excerpt = f.line,
     unsafe = false,
   ) => {
-    if (kind === "ci.needs_fix") onFailure();
     const evidence = redactCredentials(excerpt).trim().slice(0, 2000);
-    store.db.transaction(() => {
+    write(() => {
       if (kind === "ci.needs_fix" && !repository && !unsafe && !state.get(f.check)?.red)
         store.recordCiFixTrigger(pr.url, snap.headRefOid, key, { ...f, excerpt: evidence }, Date.now());
       store.saveGithubPr(null, false, [
@@ -213,14 +224,17 @@ async function inspectCi(
           },
         },
       ]);
-    })();
+    });
+    if (kind === "ci.needs_fix") onFailure();
   };
   const reject = (f: CiFailure, excerpt = f.line, unsafe = false) => {
-    store.finishCiFailure(f, "rerun_rejected");
+    write(() => store.finishCiFailure(f, "rerun_rejected"));
     emit("ci.needs_fix", f, `${pr.url}:${f.sha}:${f.signature}`, false, excerpt, unsafe);
   };
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
+    allowed();
     const res = await call(pr.repo, `${root}/actions/jobs/${job}/rerun`, {});
+    allowed();
     if (res?.rerunRetryAt !== undefined) {
       reject(f, excerpt);
       return;
@@ -230,7 +244,7 @@ async function inspectCi(
       return;
     }
     if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
-    store.finishCiFailure(f, "rerunning");
+    write(() => store.finishCiFailure(f, "rerunning"));
   };
   const branch = store.getRepoBySlug(pr.repo)?.defaultBranch ?? "main";
   const mainSha = z
@@ -264,7 +278,7 @@ async function inspectCi(
       );
     state.set(name, { red, episode });
   }
-  store.setSetting(`ci.main:${pr.repo}`, Object.fromEntries(state));
+  write(() => store.setSetting(`ci.main:${pr.repo}`, Object.fromEntries(state)));
   if (!current()) return true;
   const resolved = new Set<number>();
   const outstanding = store.ciFailures(pr.url, snap.headRefOid).filter(pending);
@@ -290,7 +304,7 @@ async function inspectCi(
       throw new Error("Incomplete CI rerun job");
     if (!current()) return true;
     if (job.status !== "completed") continue;
-    if (job.conclusion === "success") store.finishCiFailure(f, "failed_then_passed");
+    if (job.conclusion === "success") write(() => store.finishCiFailure(f, "failed_then_passed"));
     else if (bad.has(job.conclusion ?? "") && !state.get(f.check)?.red) {
       const log =
         job.started_at === null || job.conclusion === "startup_failure"
@@ -311,8 +325,8 @@ async function inspectCi(
       if (!checkId) throw new Error("Incomplete CI rerun check");
       const unsafe = security.test(f.check) || (await unsafeEvidence(Number(checkId[1]), job, log));
       if (!current()) return true;
-      if (!unsafe) store.recordCiFailure(failure);
-      store.finishCiFailure(f, "failed_again");
+      if (!unsafe) write(() => store.recordCiFailure(failure));
+      write(() => store.finishCiFailure(f, "failed_again"));
       emit(
         "ci.needs_fix",
         failure,
@@ -428,7 +442,7 @@ async function inspectCi(
         reject(refused, log || f.line, unsafe);
         continue;
       }
-      if (!unsafe) store.recordCiFailure(f);
+      if (!unsafe) write(() => store.recordCiFailure(f));
       const needsFix = () =>
         emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line, unsafe);
       const transient =
@@ -455,12 +469,14 @@ async function inspectCi(
         if (remote.state !== "open" || !current()) continue;
         if (!ready()) return false;
         if (
-          store.claimCiRerun(f, marker, {
-            id: job.id,
-            runId: job.run_id,
-            attempt: job.run_attempt,
-            name: job.name,
-          })
+          write(() =>
+            store.claimCiRerun(f, marker, {
+              id: job.id,
+              runId: job.run_id,
+              attempt: job.run_attempt,
+              name: job.name,
+            }),
+          )
         ) {
           await requestRerun(f, job.id, log || f.line);
           continue;
@@ -494,6 +510,7 @@ export function ciDecision(
   current: () => boolean,
   consumer: "poller" | "land" = "poller",
   approvedSha?: string,
+  writeGuard: () => boolean = () => true,
 ): Promise<CiDecision> {
   let active = inspections.get(store);
   if (!active) {
@@ -504,8 +521,9 @@ export function ciDecision(
   const previous = active.get(key);
   const result = (async (): Promise<CiDecision> => {
     await previous?.catch(() => undefined);
-    if (!current()) return { complete: false, state: "pending" };
+    if (!current() || !writeGuard()) return { complete: false, state: "pending" };
     let failed = false;
+    let denied = false;
     const complete = await inspectCi(
       store,
       pr,
@@ -519,7 +537,15 @@ export function ciDecision(
       },
       consumer,
       approvedSha,
-    );
+      writeGuard,
+    ).catch((error: unknown) => {
+      if (error instanceof CiWriteDenied || !writeGuard()) {
+        denied = true;
+        return false;
+      }
+      throw error;
+    });
+    if (denied || !writeGuard()) return { complete: false, state: "pending" };
     if (complete === "head_moved") return { complete: false, state: "head_moved" };
     const waiting = store.ciFailures(pr.url, snap.headRefOid).some(pending);
     return {
