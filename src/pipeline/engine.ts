@@ -178,9 +178,14 @@ export async function executeRun(
   );
 }
 
+const REVIEW_RESOLUTION_BLOCK = "Review-base resolution requires a compatible engine to implement findings";
+
 async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
   const { deps, run } = ctx;
   const runId = run.id;
+  // Upgrade pending checkpoints from before rollback protection, before any state/run write.
+  if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
+    ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
@@ -196,7 +201,14 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
-    if (ctx.state.needsHumanReason)
+    if (
+      ctx.state.needsHumanReason &&
+      !(
+        ctx.state.needsHumanReason === REVIEW_RESOLUTION_BLOCK &&
+        ctx.state.reviewResolution &&
+        !ctx.state.reviewResolution.sha
+      )
+    )
       throw new NeedsHumanError(
         ctx.state.needsHumanReason.startsWith(ENVIRONMENT_BLOCKED) &&
           ctx.state.terminalReason &&
@@ -309,8 +321,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !ctx.run.deliveryBranch &&
       (!ctx.run.prUrl || !!ctx.state.needsHumanReason) &&
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
-    const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
+    const resolvingReview = !!ctx.state.reviewResolution && !ctx.state.reviewResolution.sha;
+    const needsHuman =
+      e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure || resolvingReview;
     let message = redactGateOutput((e as Error).message);
+    if (resolvingReview) {
+      message = redactGateOutput(
+        `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
+      );
+      ctx.state.needsHumanReason = message;
+      deps.store.setRunState(runId, ctx.state);
+    }
     const failureStage =
       ctx.state.conflictRound !== undefined
         ? "conflict resolution"
@@ -357,7 +378,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       ctx.state.worktreePath &&
-      ((ctx.state.conflictRound === undefined && !ctx.state.pendingRebaseSha) ||
+      ((ctx.state.conflictRound === undefined && !ctx.state.pendingRebaseSha && !resolvingReview) ||
         environmentBlockedRound(ctx)) &&
       !(reviewRound(ctx)?.kind === "ci" && ctx.run.headSha === reviewRound(ctx)?.reviewedSha)
     ) {
@@ -648,14 +669,15 @@ async function prepare(ctx: RunContext): Promise<void> {
 
 /**
  * Merges the original run's base into the PR branch when the PR doesn't contain it, with the
- * factory's merge helpers; returns the merge commit, or null when none was needed. The base is
- * saved before merging, so a resume completes or accepts exactly that merge and nothing else.
+ * factory's merge helpers; returns the merge commit, or null when unnecessary or deferred.
+ * The base is saved before merging, so a resume completes or accepts exactly that merge.
  */
 async function mergeReviewBase(
   ctx: RunContext,
   cwd: string,
   review: { owner: Run; reviewedSha: string },
 ): Promise<string | null> {
+  if (ctx.state.reviewResolution) return null;
   const head = review.reviewedSha;
   const at = await headSha(cwd);
   let tip = ctx.state.reviewBaseSha;
@@ -671,9 +693,11 @@ async function mergeReviewBase(
     const conflicts = await prepareMerge(cwd, head, tip);
     if (conflicts.length) {
       await mergeGit(cwd, ["merge", "--abort"]);
-      throw new NeedsHumanError(
-        `The PR branch conflicts with ${base} in ${conflicts.join(", ")}; review rounds do not resolve conflicts yet`,
-      );
+      ctx.state.conflictFiles = conflicts;
+      ctx.state.reviewResolution = {};
+      ctx.state.needsHumanReason = REVIEW_RESOLUTION_BLOCK;
+      await ctx.save();
+      return null;
     }
     await completeMerge(cwd, head, tip);
     ctx.log(`Merged ${base} (${tip.slice(0, 8)}) into the PR branch before the round`);
@@ -886,6 +910,30 @@ function profile(ctx: RunContext): ResolvedProfile {
 }
 
 async function buildLoop(ctx: RunContext): Promise<void> {
+  if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha) {
+    const review = reviewRound(ctx);
+    const tip = ctx.state.reviewBaseSha;
+    if (!review || !tip) throw new Error("Missing review-base resolution revisions");
+    await ctx.save("review-resolution-start");
+    if (ctx.state.conflictRound === undefined)
+      await mergeForDelivery(ctx, ctx.state.worktreePath as string, tip, review.reviewedSha);
+    if (!(await oneRound(ctx, ctx.state.round, null)))
+      throw new NeedsHumanError(`Conflict resolution rejected:\n${ctx.state.feedback ?? ""}`);
+    await ctx.save("review-resolution-checked");
+    const sha = await headSha(ctx.state.worktreePath as string);
+    ctx.state.reviewResolution.sha = sha;
+    ctx.state.conflictRound = undefined;
+    ctx.state.pendingRebaseSha = undefined;
+    ctx.state.preRebaseHead = undefined;
+    ctx.state.preRebaseGates = undefined;
+    ctx.state.feedback = null;
+    ctx.state.round++;
+    // Clear the legacy block with the findings round and its baseline in one database write.
+    // The old engine must implement that round; resolution's cached checks belong to the prior one.
+    ctx.state.needsHumanReason = undefined;
+    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: sha }, ctx.state);
+    await ctx.save("review-resolution-complete");
+  }
   if (ctx.state.verification && !ctx.state.verification.initialComplete) {
     // Initial verification does not consume an implementation round.
     const passed = await oneRound(ctx, -1, null);
@@ -897,7 +945,9 @@ async function buildLoop(ctx: RunContext): Promise<void> {
   const maxRounds =
     ctx.state.conflictRound !== undefined
       ? ctx.state.conflictRound + 1
-      : Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
+      : Math.max(1, ctx.deps.cfg.maxRounds) +
+        ROUNDS_PER_IMPLEMENTER +
+        (ctx.state.reviewResolution?.sha ? 2 : 0);
   const holdout =
     ctx.state.flow === "verify-change" || profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
@@ -1061,13 +1111,16 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           complexity: ctx.complexity,
           constraints,
           prompt: implementPrompt({
-            prompt: ctx.run.prompt,
-            spec: ctx.state.spec ?? null,
+            prompt:
+              merge && ctx.state.reviewResolution
+                ? (reviewRound(ctx)?.owner.prompt ?? ctx.run.prompt)
+                : ctx.run.prompt,
+            spec: merge && ctx.state.reviewResolution ? null : (ctx.state.spec ?? null),
             gates,
             baseline: ctx.state.baseline ?? null,
             baseSha: ctx.state.verification?.baseSha ?? baseSha,
             externalChange: ctx.state.flow === "verify-change",
-            round,
+            round: !merge && ctx.state.reviewResolution?.sha ? round - 2 : round,
             feedback: ctx.state.feedback,
             hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
             resolution: merge,
@@ -1423,7 +1476,8 @@ async function oneRound(
   if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
   const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
-  const priorReview = earlierReviews.at(-1);
+  const findingsReviews = earlierReviews.filter((entry) => entry.sha !== ctx.state.reviewResolution?.sha);
+  const priorReview = findingsReviews.at(-1);
   const reviewedSha = await headSha(cwd);
   // R2 and R3 review only the fixes since the previous review. A conflict-resolution review, like a
   // single one, sees the change against the new base, so upstream-only files never appear.
@@ -1442,7 +1496,7 @@ async function oneRound(
     ? {
         sha: priorReview.sha,
         findings: priorReview.blocking,
-        ...(fixSha ? { resolved: resolvedPriorFindings(earlierReviews) } : {}),
+        ...(fixSha ? { resolved: resolvedPriorFindings(findingsReviews) } : {}),
       }
     : undefined;
   const reviewText = (text: string) => redactPrivate(redactGateOutput(text), privateStrings());
@@ -1482,8 +1536,11 @@ async function oneRound(
         ...(panelRules ? { panelReview: panelRules } : {}),
         ...(ctx.state.implementer ? { implementerModel: ctx.state.implementer.modelId } : {}),
         prompt: {
-          prompt: ctx.run.prompt,
-          spec: ctx.state.spec ?? null,
+          prompt:
+            resolution && ctx.state.reviewResolution
+              ? (reviewRound(ctx)?.owner.prompt ?? ctx.run.prompt)
+              : ctx.run.prompt,
+          spec: resolution && ctx.state.reviewResolution ? null : (ctx.state.spec ?? null),
           baseSha,
           stat: reviewDiff.stat,
           ...(ctx.state.flow === "verify-change" ? { patch: reviewDiff.patch } : {}),
@@ -1667,7 +1724,11 @@ async function oneRound(
   }
 
   // --- verify acceptance criteria (standard/deep)
-  if (ctx.state.flow === "verify-change" || profile(ctx) === "quick") {
+  if (
+    (resolution && ctx.state.reviewResolution) ||
+    ctx.state.flow === "verify-change" ||
+    profile(ctx) === "quick"
+  ) {
     ctx.state.lastVerify = null;
     if (ctx.state.flow !== "verify-change") await recordVerified(ctx, reviewedSha);
     return true;
