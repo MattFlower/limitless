@@ -1265,3 +1265,49 @@ test("a pre-upgrade land rerun consumes the shared PR head claim", async () => {
   expect(result.state).toBe("failed");
   expect(reruns()).toHaveLength(0);
 });
+
+test("a write guard prevents default-branch settings, feed and failure writes", async () => {
+  h = pollerHarness();
+  const f = failure(1, "test", "failure");
+  f.state.log = "error: test failed";
+  h.gh.responses.set(checksPath(mainSha), () =>
+    respond(200, { total_count: 1, check_runs: [{ ...f.check, head_sha: mainSha }] }),
+  );
+  const snap = normalizePr(f.node);
+  const pr = h.store.githubTracked()[0];
+  if (!snap || !pr) throw new Error("missing PR fixture");
+  const decide = (guard?: () => boolean) =>
+    ciDecision(
+      h.store,
+      pr,
+      snap,
+      (_repo, path, body) => h.gh.client(path, body),
+      true,
+      () => true,
+      () => true,
+      "land",
+      undefined,
+      guard,
+    );
+  expect(await decide(() => false)).toEqual({ complete: false, state: "pending" });
+  expect(h.store.getSetting("ci.main:o/r", null)).toBeNull();
+  expect(items("ci.main_red")).toEqual([]);
+  expect(items("ci.needs_fix")).toEqual([]);
+  expect(h.store.ciFailures(pr.url, SHA)).toEqual([]);
+  expect(h.store.pendingCiFixTriggers()).toEqual([]);
+  // Also lose permission during the default-branch read, after the initial guard passed.
+  let allowed = true;
+  h.gh.responses.set(checksPath(mainSha), () => {
+    allowed = false;
+    return respond(200, { total_count: 1, check_runs: [{ ...f.check, head_sha: mainSha }] });
+  });
+  expect(await decide(() => allowed)).toEqual({ complete: false, state: "pending" });
+  expect(h.store.getSetting("ci.main:o/r", null)).toBeNull();
+  expect(items("ci.main_red")).toEqual([]);
+  expect(items("ci.needs_fix")).toEqual([]);
+  expect(h.store.pendingCiFixTriggers()).toEqual([]);
+  expect((await decide()).state).toBe("failed");
+  expect(h.store.getSetting("ci.main:o/r", null)).not.toBeNull();
+  expect(items("ci.main_red")).toHaveLength(1);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+});

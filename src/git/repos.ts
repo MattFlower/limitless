@@ -40,6 +40,8 @@ export interface GitHubBudget {
 export class GitHubUnavailableError extends Error {}
 /** A retryable outcome that is not a failed command, e.g. a PR lookup lagging behind its create. */
 class RetryableError extends Error {}
+/** Keep a caller guard failure out of retry and outcome classification. */
+class MergeGuardError extends Error {}
 
 // Every pattern contains a space, which a branch name cannot, so echoed refs never look transient.
 const TRANSIENT = [
@@ -1302,6 +1304,7 @@ export async function pushExistingBranch(
   signal?: AbortSignal,
   budget?: GitHubBudget,
   sha = "HEAD",
+  guard?: () => void,
 ): Promise<void> {
   const url = repo.url;
   if (repo.kind !== "github" || !url) throw new Error("existing PR delivery requires a GitHub repo");
@@ -1318,6 +1321,7 @@ export async function pushExistingBranch(
       signal,
     });
     if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
+    guard?.();
     await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, url, `${head}:${ref}`], {
       cwd: transport,
       timeoutMs: 300_000,
@@ -1419,7 +1423,7 @@ export async function mergePullRequest(
   signal?: AbortSignal,
   budget?: GitHubBudget,
   entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
-  opts: { body?: string; title?: string; auto?: boolean } = {},
+  opts: { body?: string; title?: string; auto?: boolean; guard?: () => void } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
@@ -1459,6 +1463,11 @@ export async function mergePullRequest(
             ? ["--match-head-commit", sha, "--subject", title, "--body-file", "-"]
             : ["--subject", title, "--body", body, "--match-head-commit", sha];
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
+        try {
+          opts.guard?.();
+        } catch (cause) {
+          throw new MergeGuardError("Merge guard refused", { cause });
+        }
         return sh(cmd, { cwd, signal, stdin: body }).then(
           () => "ok" as const,
           async (e) => {
@@ -1471,6 +1480,7 @@ export async function mergePullRequest(
       },
       { budget, signal },
     ).catch((e) => {
+      if (e instanceof MergeGuardError) throw e.cause;
       if (signal?.aborted) throw e;
       return e instanceof GitHubUnavailableError ? ("unavailable" as const) : ("failed" as const);
     });

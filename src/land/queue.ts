@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { Paths } from "../config.ts";
@@ -301,6 +301,10 @@ export class LandQueue {
     const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
     const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
     const beat = (): void => {
+      if (!this.store.ownsLandClaim(entry.id, this.owner)) {
+        controller.abort();
+        return;
+      }
       const current = this.store.getLandEntry(entry.id);
       if (current && !this.isActive(current)) return;
       if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) controller.abort();
@@ -519,7 +523,9 @@ export class LandQueue {
       if (remote !== entry.approvedSha) throw new LandBlocked("head moved after approval");
       this.store.updateLandEntry(entry.id, { pushedSha: head });
     });
-    await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal, undefined, head);
+    await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal, undefined, head, () =>
+      this.assertClaim(entry.id),
+    );
   }
 
   /**
@@ -581,10 +587,13 @@ export class LandQueue {
           throw new LandBlocked("head moved after approval");
         const inspection = new AbortController();
         const inspectionSignal = AbortSignal.any([signal, inspection.signal]);
-        const current = () =>
-          !inspectionSignal.aborted &&
-          this.store.ownsLandClaim(entry.id, this.owner) &&
-          !unexpectedHead(this.store.prHead(entry.prUrl)?.sha);
+        const current = () => {
+          if (!this.store.ownsLandClaim(entry.id, this.owner)) {
+            this.inFlight.get(entry.id)?.abort();
+            return false;
+          }
+          return !inspectionSignal.aborted && !unexpectedHead(this.store.prHead(entry.prUrl)?.sha);
+        };
         const snap: PrSnapshot = {
           ...(saved?.headRefOid === sha ? saved : {}),
           id: saved?.id ?? "",
@@ -632,7 +641,9 @@ export class LandQueue {
             current,
             "land",
             entry.approvedSha,
+            current,
           );
+          this.assertClaim(entry.id);
         } catch (error) {
           signal.throwIfAborted();
           if (inspection.signal.aborted) throw inspection.signal.reason;
@@ -709,6 +720,7 @@ export class LandQueue {
         title: run.title ?? "",
         body: this.reportBody(run),
         auto: false,
+        guard: () => this.assertClaim(entry.id),
       },
     );
     signal.throwIfAborted();
@@ -756,7 +768,10 @@ export class LandQueue {
   // ---- helpers -------------------------------------------------------------
 
   private assertClaim(id: number): void {
-    if (!this.store.ownsLandClaim(id, this.owner)) throw new LandClaimLost();
+    if (!this.store.ownsLandClaim(id, this.owner)) {
+      this.inFlight.get(id)?.abort();
+      throw new LandClaimLost();
+    }
   }
 
   /** No await may separate ownership validation from a worker's durable write. */
@@ -809,7 +824,7 @@ export class LandQueue {
   }
 
   private worktreePath(entry: LandEntry): string {
-    return join(this.deps.paths.work, `land-${entry.id}`);
+    return join(this.deps.paths.work, `land-${entry.id}-${entry.attempts}`);
   }
 
   /** A detached checkout of `sha`; the hardened git wrapper needs its record before PR code runs. */
@@ -821,8 +836,15 @@ export class LandQueue {
     signal: AbortSignal,
   ): Promise<string> {
     const path = this.worktreePath(entry);
-    await removeWorktree(this.deps.paths, repo, path); // a previous attempt's linked worktree
-    rmSync(path, { recursive: true, force: true });
+    const legacy = `land-${entry.id}`;
+    mkdirSync(this.deps.paths.work, { recursive: true });
+    for (const name of readdirSync(this.deps.paths.work)) {
+      const attempt = name.startsWith(`${legacy}-`) ? name.slice(legacy.length + 1) : "";
+      if (name !== legacy && (!/^\d+$/.test(attempt) || Number(attempt) >= entry.attempts)) continue;
+      this.assertClaim(entry.id);
+      await this.discard(repo, join(this.deps.paths.work, name));
+    }
+    this.assertClaim(entry.id);
     try {
       await addDetachedWorktree(cache, sha, path, signal);
     } catch (error) {

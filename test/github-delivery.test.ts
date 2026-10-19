@@ -1,11 +1,17 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Repo } from "../src/core/types.ts";
 import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
-import { pushBranch, pushExistingBranch, remoteBranchSha } from "../src/git/repos.ts";
-import { sh } from "../src/util/proc.ts";
+import {
+  githubRetry,
+  mergePullRequest,
+  pushBranch,
+  pushExistingBranch,
+  remoteBranchSha,
+} from "../src/git/repos.ts";
+import { CommandError, sh } from "../src/util/proc.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -108,3 +114,63 @@ test.each(["passing", "rejecting"])(
     expect(existsSync(marker)).toBe(false);
   },
 );
+
+test.each([
+  { failure: "HTTP 502", throwsAt: 0 },
+  { failure: "checks required", throwsAt: 0 },
+  { failure: "HTTP 502", throwsAt: 1 },
+  { failure: "HTTP 502", throwsAt: 2 },
+  { failure: "checks required", throwsAt: 2 },
+])("merge guard covers attempts and propagates refusal: %j", async ({ failure, throwsAt }) => {
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  const calls = join(dir, "merge-calls");
+  const sha = "a".repeat(40);
+  writeFileSync(
+    join(bin, "gh"),
+    `#!${process.execPath}
+import {appendFileSync, existsSync} from "node:fs";
+const args = process.argv.slice(2), file = ${JSON.stringify(calls)};
+if(args[1] === "view") {
+ console.log(JSON.stringify({title:"PR",body:"body",headRefOid:${JSON.stringify(sha)},state:"OPEN"}));
+} else if(args[1] === "merge") {
+ const first = !existsSync(file);
+ appendFileSync(file, args.join(" ")+"\\n");
+ if(first) {console.error(${JSON.stringify(failure)});process.exit(1);}
+}
+`,
+    { mode: 0o755 },
+  );
+  const path = process.env.PATH;
+  const delay = githubRetry.baseDelayMs;
+  process.env.PATH = `${bin}:${path}`;
+  githubRetry.baseDelayMs = 1;
+  let guards = 0;
+  const refused =
+    throwsAt === 2 ? new CommandError("claim lost", 1, "", "HTTP 502", false) : new Error("claim lost");
+  try {
+    const result = mergePullRequest(
+      "https://github.com/test/repo/pull/1",
+      work,
+      sha,
+      undefined,
+      undefined,
+      [],
+      {
+        guard: () => {
+          guards++;
+          if (guards === throwsAt) throw refused;
+        },
+      },
+    );
+    if (throwsAt) await expect(result).rejects.toBe(refused);
+    else expect(await result).toBe(failure === "HTTP 502" ? "merged" : "auto");
+    const merges = existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [];
+    expect(guards).toBe(throwsAt || 2);
+    expect(merges).toHaveLength(throwsAt ? throwsAt - 1 : 2);
+    if (!throwsAt && failure === "checks required") expect(merges[1]).toContain("--auto");
+  } finally {
+    process.env.PATH = path;
+    githubRetry.baseDelayMs = delay;
+  }
+});
