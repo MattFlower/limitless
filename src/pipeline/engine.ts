@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
@@ -1964,11 +1964,21 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
   )
     throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
   if (ctx.state.pendingRebaseSha && head === ctx.state.preRebaseHead) {
-    const mergeHead = (
-      await mergeGit(ctx.state.worktreePath as string, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], true)
-    ).stdout.trim();
-    if (mergeHead && mergeHead !== ctx.state.pendingRebaseSha)
-      throw new DeliveryHeadError(`${reason}; unexpected MERGE_HEAD ${mergeHead}`);
+    try {
+      const cwd = ctx.state.worktreePath as string;
+      const path = (await mergeGit(cwd, ["rev-parse", "--git-path", "MERGE_HEAD"])).stdout.trim();
+      if (!path) throw new Error("Missing MERGE_HEAD path");
+      try {
+        const mergeHead = readFileSync(resolve(cwd, path), "utf8").replace(/\n$/, "");
+        if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(mergeHead) || mergeHead !== ctx.state.pendingRebaseSha)
+          throw new Error("Unexpected MERGE_HEAD contents");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    } catch {
+      ctx.checkCancelled();
+      throw new DeliveryHeadError(`${reason}; invalid or unreadable pending MERGE_HEAD`);
+    }
   }
   if (head === expected) return;
   if (environmentBlockedRound(ctx)) throw new DeliveryHeadError(reason);

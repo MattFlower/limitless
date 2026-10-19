@@ -1,7 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
+import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { SimulatedTermination } from "../src/pipeline/faults.ts";
@@ -52,6 +53,72 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  const invalidMergeHeads = [
+    "wrong MERGE_HEAD",
+    "multiple MERGE_HEAD entries",
+    "abbreviated MERGE_HEAD",
+    "empty MERGE_HEAD",
+    "garbage MERGE_HEAD",
+    "MERGE_HEAD read failure",
+    "MERGE_HEAD path failure",
+  ];
+
+  async function setMergeHead(cwd: string, scenario: string, base: string, other: string) {
+    const path = resolve(
+      cwd,
+      (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim(),
+    );
+    if (scenario === "MERGE_HEAD read failure") {
+      rmSync(path);
+      mkdirSync(path); // Deterministic EISDIR, independent of permission bits and user privileges.
+      return;
+    }
+    const contents: Record<string, string> = {
+      "wrong MERGE_HEAD": `${other}\n`,
+      "multiple MERGE_HEAD entries": `${base}\n${other}\n`,
+      "abbreviated MERGE_HEAD": `${base.slice(0, 12)}\n`,
+      "empty MERGE_HEAD": "",
+      "garbage MERGE_HEAD": "not-an-object-id\n",
+      "MERGE_HEAD without newline": base,
+    };
+    const content = contents[scenario];
+    if (content !== undefined) writeFileSync(path, content);
+  }
+
+  async function assertRefusedResume(bare: string, runId: string, handler: Handler, scenario: string) {
+    const publication = spyOn(repos, "pushBranch");
+    const git = merges.mergeGit;
+    let pathFailure = false;
+    const resolution =
+      scenario === "MERGE_HEAD path failure"
+        ? spyOn(merges, "mergeGit").mockImplementation((cwd, args, ...rest) => {
+            if (args.join(" ") === "rev-parse --git-path MERGE_HEAD") {
+              pathFailure = true;
+              // Even ENOENT from path resolution must not count as an absent MERGE_HEAD file.
+              throw Object.assign(new Error("injected path resolution failure"), { code: "ENOENT" });
+            }
+            return git(cwd, args, ...rest);
+          })
+        : undefined;
+    try {
+      const resumed = start(handler);
+      expect(await waitFor(resumed, runId, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+      const finished = resumed.store.getRun(runId);
+      expect(finished?.error).toContain("Delivery refused");
+      expect(finished?.prUrl).toBeNull();
+      expect(publication).not.toHaveBeenCalled();
+      expect(
+        (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+          .stdout,
+      ).toBe("");
+      expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+      if (resolution) expect(pathFailure).toBe(true);
+    } finally {
+      publication.mockRestore();
+      resolution?.mockRestore();
+    }
+  }
+
   async function interruptGatedMerge() {
     const bare = await githubFixture();
     let base = "";
@@ -159,7 +226,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "pass",
     "block",
     "merge still in progress",
-    "wrong MERGE_HEAD",
+    "MERGE_HEAD without newline",
+    "absent MERGE_HEAD",
+    ...invalidMergeHeads.slice(0, 3),
     "completed merge retains MERGE_HEAD",
   ])(
     "a pending second delivery merge resumes its own gates or refuses inconsistent state (%s)",
@@ -192,35 +261,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
           .stdout,
       ).toBe("");
       expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
-      if (scenario === "merge still in progress" || scenario === "wrong MERGE_HEAD") {
+      if (scenario !== "pass" && scenario !== "block" && scenario !== "completed merge retains MERGE_HEAD") {
         await sh(["git", "reset", "--hard", merge], { cwd });
-        await sh(["git", "merge", "--no-ff", "--no-commit", nextBase], { cwd });
-        if (scenario === "wrong MERGE_HEAD") {
-          const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
-          writeFileSync(resolve(cwd, path), `${pending.reviewedSha}\n`);
-        }
+        if (scenario !== "absent MERGE_HEAD")
+          await sh(["git", "merge", "--no-ff", "--no-commit", nextBase], { cwd });
+        await setMergeHead(cwd, scenario, nextBase, pending.reviewedSha);
       } else if (scenario === "completed merge retains MERGE_HEAD") {
         const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
         writeFileSync(resolve(cwd, path), `${nextBase}\n`);
       }
       interrupted.store.close();
-      if (scenario === "completed merge retains MERGE_HEAD" || scenario === "wrong MERGE_HEAD") {
-        const publication = spyOn(repos, "pushBranch");
-        try {
-          const resumed = start(noAgents);
-          expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
-          const finished = resumed.store.getRun(run.id);
-          expect(finished?.error).toContain("Delivery refused");
-          expect(finished?.prUrl).toBeNull();
-          expect(publication).not.toHaveBeenCalled();
-          expect(
-            (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
-              .stdout,
-          ).toBe("");
-          expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
-        } finally {
-          publication.mockRestore();
-        }
+      if (scenario === "completed merge retains MERGE_HEAD" || invalidMergeHeads.includes(scenario)) {
+        await assertRefusedResume(bare, run.id, noAgents, scenario);
         return;
       }
       const resumed = start(noAgents);
@@ -411,7 +463,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "post-rebase-gates",
     "post-rebase-gates-fail",
     "interrupted-merge",
-    "interrupted-merge wrong MERGE_HEAD",
+    "interrupted-merge MERGE_HEAD without newline",
+    "interrupted-merge absent MERGE_HEAD",
+    ...invalidMergeHeads.map((scenario) => `interrupted-merge ${scenario}`),
     "base-moved",
     "base-moved-during-gates",
     "conflict-implement",
@@ -523,15 +577,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         const cwd = state?.worktreePath;
         if (!cwd || !state?.preRebaseHead) throw new Error("missing delivery checkpoint");
         await sh(["git", "reset", "--hard", state.preRebaseHead], { cwd });
-        await sh(
-          ["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "--no-ff", "--no-commit", baseTip],
-          { cwd },
-        );
-        if (checkpoint === "interrupted-merge wrong MERGE_HEAD") {
-          expect(state.reviewedSha).toBe(state.preRebaseHead);
-          const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
-          writeFileSync(resolve(cwd, path), `${state.preRebaseHead}\n`);
-        }
+        if (checkpoint !== "interrupted-merge absent MERGE_HEAD")
+          await sh(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "--no-ff", "--no-commit", baseTip],
+            { cwd },
+          );
+        expect(state.reviewedSha).toBe(state.preRebaseHead);
+        await setMergeHead(cwd, checkpoint.slice("interrupted-merge ".length), baseTip, state.preRebaseHead);
       }
       if (checkpoint === "conflict-committed" && state) {
         // Also exercise the crash window after git commit but before implementedRound is saved.
@@ -542,23 +594,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       restarting = true;
       if (checkpoint === "base-moved" || conflict) await advanceBase(bare, "again.txt", "newer base\n");
       writeFileSync(release, "resume");
-      if (checkpoint === "interrupted-merge wrong MERGE_HEAD") {
-        const publication = spyOn(repos, "pushBranch");
-        try {
-          const resumed = start(handler);
-          expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
-          const finished = resumed.store.getRun(run.id);
-          expect(finished?.error).toContain("Delivery refused");
-          expect(finished?.prUrl).toBeNull();
-          expect(publication).not.toHaveBeenCalled();
-          expect(
-            (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
-              .stdout,
-          ).toBe("");
-          expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
-        } finally {
-          publication.mockRestore();
-        }
+      if (invalidMergeHeads.includes(checkpoint.slice("interrupted-merge ".length))) {
+        await assertRefusedResume(bare, run.id, handler, checkpoint.slice("interrupted-merge ".length));
         return;
       }
       const resumed = start(handler);
