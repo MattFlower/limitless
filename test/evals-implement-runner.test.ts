@@ -21,6 +21,7 @@ import { formatEvalReport } from "../src/evals/format.ts";
 import { gradeImplement } from "../src/evals/implement.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
+import { gateSlots } from "../src/gates/slots.ts";
 import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { observerRoots, seatbeltBackend } from "../src/harness/sandbox.ts";
@@ -111,6 +112,58 @@ async function pinBase(f: Awaited<ReturnType<typeof fixture>>) {
   await sh(["git", "push", f.cache, "HEAD:refs/heads/eval-base"], { cwd: f.source });
   f.save();
 }
+
+test.each(["eval baseline", "eval trial"])("%s queues behind production finish gates", async (holder) => {
+  const f = await fixture();
+  const limit = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const signal = new AbortController().signal;
+  let held: (() => void) | undefined;
+  let finish: (() => void) | undefined;
+  if (holder === "eval baseline") held = await gateSlots.acquire(signal);
+  else
+    f.respond(async () => {
+      held = await gateSlots.acquire(signal);
+      return { files: { answer: "correct" } };
+    });
+  const queued = deferred<void>();
+  const admitted: string[] = [];
+  const acquire = gateSlots.acquire.bind(gateSlots);
+  const spy = spyOn(gateSlots, "acquire").mockImplementation(
+    async (signal, onWait, name, running, priority) => {
+      const release = await acquire(
+        signal,
+        (limit) => {
+          onWait?.(limit);
+          if (name === holder) queued.resolve();
+        },
+        name,
+        running,
+        priority,
+      );
+      admitted.push(name ?? "gate");
+      return release;
+    },
+  );
+  const pending = f.run();
+  try {
+    await queued.promise;
+    admitted.length = 0;
+    const finishing = gateSlots.acquire(signal, undefined, "production finish", false, "finish");
+    held?.();
+    finish = await finishing;
+    expect(admitted[0]).toBe("production finish");
+    finish();
+    expect((await pending).trials[0]?.pass).toBe(true);
+  } finally {
+    held?.();
+    finish?.();
+    spy.mockRestore();
+    await f.close();
+    await pending;
+    gateSlots.setLimit(limit);
+  }
+});
 
 test("later retry rounds reject a retained target excluded during the slot wait", async () => {
   const f = await fixture("true", undefined, [], { policy: {} as Policy, excludeOrigins: ["CN"] });
