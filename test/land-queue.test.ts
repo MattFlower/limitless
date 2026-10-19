@@ -415,6 +415,7 @@ function fakeLandGates(
   const requests: GateRequest[] = [];
   const executor: GateExecutor = {
     kind: "lan",
+    freshCheckoutFor: () => true,
     async start(req) {
       requests.push(req);
       return { kind: "lan", id: String(requests.length), startedAt: 0 };

@@ -469,6 +469,7 @@ export class LandQueue {
           );
         },
         true,
+        this.deps.gateExecutor?.freshCheckoutFor?.(entry.repo),
       );
       signal.throwIfAborted();
       const failed = [...run.setup, ...run.checks].filter((c) => {
