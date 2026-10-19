@@ -372,6 +372,10 @@ export class LandQueue {
         this.store.updateLandEntry(entry.id, { baseBranch, pushedSha: null, ciRerun: null }),
       );
     }
+    const ownerId = run.sourceRef?.kind === "review-round" ? run.sourceRef.runId : run.id;
+    const owner = typeof ownerId === "string" ? this.store.getRun(ownerId) : null;
+    if (!owner?.title?.trim()) throw new LandBlocked("missing merge subject");
+    const subject = squashTitle(owner.title, entry.prUrl);
     // The claim already moved the entry into `checking` and counted this attempt.
     this.log(`[land] ${entry.id}: checking ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`);
     const cache = await ensureCache(this.deps.paths, repo, signal);
@@ -382,7 +386,7 @@ export class LandQueue {
       if (!head) {
         head = await this.mergeBase(cwd, entry, baseSha);
         await this.checks(entry, cwd, baseSha, signal);
-        await this.checkPublication(entry, run, cwd, baseSha, head);
+        await this.checkPublication(entry, run, cwd, baseSha, head, subject);
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
         const waiting = this.owned(entry.id, () => {
@@ -393,10 +397,10 @@ export class LandQueue {
         });
         if (!waiting) return;
       }
-      if (entry.pushedSha) await this.checkPublication(entry, run, cwd, baseSha, head);
+      if (entry.pushedSha) await this.checkPublication(entry, run, cwd, baseSha, head, subject);
       const ci = await this.awaitCi(entry, head, signal);
       if (ci !== "green") return this.landed(entry, run, head, ci);
-      await this.merge(entry, run, cwd, head, signal);
+      await this.merge(entry, run, cwd, head, subject, signal);
     } finally {
       await this.discard(repo, cwd);
     }
@@ -695,6 +699,7 @@ export class LandQueue {
     run: Run,
     cwd: string,
     sha: string,
+    subject: string,
     signal: AbortSignal,
   ): Promise<void> {
     const merging = this.owned(entry.id, () => {
@@ -715,9 +720,9 @@ export class LandQueue {
       sha,
       signal,
       undefined,
-      this.publication(entry, run, cwd),
+      this.publication(entry, cwd),
       {
-        title: run.title ?? "",
+        subject,
         body: this.reportBody(run),
         auto: false,
         guard: () => this.assertClaim(entry.id),
@@ -790,12 +795,19 @@ export class LandQueue {
     );
   }
 
-  private async checkPublication(entry: LandEntry, run: Run, cwd: string, base: string, head: string) {
-    await checkPrivatePublication(cwd, this.publication(entry, run, cwd), {
+  private async checkPublication(
+    entry: LandEntry,
+    run: Run,
+    cwd: string,
+    base: string,
+    head: string,
+    subject: string,
+  ) {
+    await checkPrivatePublication(cwd, this.publication(entry, cwd), {
       squash: {
         base,
         head,
-        title: squashTitle(run.title ?? "", entry.prUrl),
+        title: subject,
         body: this.reportBody(run),
       },
       // Select the factory's merge itself, never traverse either parent's existing history.
@@ -803,7 +815,7 @@ export class LandQueue {
     });
   }
 
-  private publication(entry: LandEntry, run: Run, cwd: string) {
+  private publication(entry: LandEntry, cwd: string) {
     const { configDir, repos, work } = this.deps.paths;
     const entries = loadPrivateStrings(configDir, [
       cwd,
@@ -811,7 +823,6 @@ export class LandQueue {
       repos,
       work,
     ]);
-    if (!run.title?.trim()) throw new LandBlocked("missing merge subject");
     return entries;
   }
 

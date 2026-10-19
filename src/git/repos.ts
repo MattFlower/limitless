@@ -1436,7 +1436,7 @@ export async function mergePullRequest(
   signal?: AbortSignal,
   budget?: GitHubBudget,
   entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
-  opts: { body?: string; title?: string; auto?: boolean; guard?: () => void } = {},
+  opts: { body?: string; title?: string; subject?: string; auto?: boolean; guard?: () => void } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
@@ -1465,9 +1465,9 @@ export async function mergePullRequest(
         if (verifiedState(input) === "MERGED") return "merged" as const;
         const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
         const data = schema.parse(input);
-        const rawTitle = opts.title ?? data.title;
+        const rawTitle = opts.subject ?? opts.title ?? data.title;
         if (!rawTitle.trim()) throw new Error("missing merge subject");
-        const title = squashTitle(rawTitle, prUrl);
+        const title = opts.subject ?? squashTitle(rawTitle, prUrl);
         const body = opts.body ?? data.body;
         checkPublicationText(`${title}\n${body}`, "PR text", entries);
         blocked = false;
