@@ -38,7 +38,7 @@ import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
-import { redactCredentialData, withInvocationProcesses } from "../util/proc.ts";
+import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
@@ -816,8 +816,6 @@ export class RunContext {
                 this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
         };
-        const invokeHarness: Harness = (spec) =>
-          withInvocationProcesses(spec.signal, (signal) => harness({ ...spec, signal }));
         const faultContext = {
           runId: this.run.id,
           stage: opts.stage.name,
@@ -864,13 +862,12 @@ export class RunContext {
                   message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
                   data,
                 }),
-              (commandPath) =>
-                invokeHarness({ ...spec, scratchDir, ...(commandPath ? { commandPath } : {}) }),
+              (commandPath) => harness({ ...spec, scratchDir, ...(commandPath ? { commandPath } : {}) }),
             );
           });
         } else {
           dispatch();
-          result = await invokeHarness(spec);
+          result = await harness(spec);
         }
       } catch (e) {
         if (e instanceof SimulatedTermination) {

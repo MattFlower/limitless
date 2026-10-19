@@ -1281,7 +1281,7 @@ async function oneRound(
               "warn",
             );
             // The re-run starts from the committed tree too, not from what the first attempt left behind.
-            await checkoutCommitted(cwd);
+            await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
             after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
             ctx.checkCancelled();
             after = {
