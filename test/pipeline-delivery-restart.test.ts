@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
+import * as repos from "../src/git/repos.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { sh } from "../src/util/proc.ts";
 import {
   approve,
@@ -50,6 +52,265 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  async function interruptGatedMerge() {
+    const bare = await githubFixture();
+    let base = "";
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        base = await advanceBase(bare, "base.txt", "first base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const update = f.store.updateRun.bind(f.store);
+    const persist = spyOn(f.store, "updateRun").mockImplementation((...args) => {
+      const result = update(...args);
+      if (base && args[1].baseSha === base && args[1].headSha !== base && args[2])
+        throw new SimulatedTermination("interrupted after persisted gated merge, before push");
+      return result;
+    });
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    await wait(
+      () => f.store.listStages(run.id).findLast((s) => s.name === "deliver")?.status === "cancelled",
+      { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => f.store.subscribe(wake) },
+    );
+    persist.mockRestore();
+    await f.stop();
+    const state = f.store.getRunState<RunState>(run.id);
+    const merge = f.store.getRun(run.id)?.headSha;
+    if (!state?.worktreePath || !state.reviewedSha || !merge) throw new Error("missing merged state");
+    expect(state.pendingRebaseSha).toBeUndefined();
+    expect(
+      f.store.listStages(run.id).filter((s) => s.name === "gates" && s.status === "succeeded"),
+    ).toHaveLength(2);
+    await assertUnpublished(bare);
+    expect(
+      (await sh(["git", "rev-list", "--parents", "-n", "1", merge], { cwd: state.worktreePath })).stdout
+        .trim()
+        .split(" "),
+    ).toEqual([merge, state.reviewedSha, base]);
+    return { f, run, state, bare, base, merge, cwd: state.worktreePath };
+  }
+
+  test.each(["recorded", "legacy", "HEAD moved before push"])(
+    "delivery resumes a gated merge when the base advances a second time (%s)",
+    async (scenario) => {
+      const { f, run, state, bare, base, merge, cwd } = await interruptGatedMerge();
+      if (scenario === "legacy") {
+        state.deliveryMerges = undefined;
+        f.store.setRunState(run.id, state);
+      }
+      const nextBase = await advanceBase(bare, "again.txt", "second base\n");
+      expect((await sh(["git", "rev-parse", `${nextBase}^`], { cwd: bare })).stdout.trim()).toBe(base);
+      f.store.close();
+      const push = repos.pushBranch;
+      let changed = "";
+      const publication = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+        if (scenario === "HEAD moved before push") {
+          await sh(["git", "commit", "--allow-empty", "-qm", "unreviewed late commit"], { cwd });
+          changed = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+          expect(args[3]).not.toBe(changed);
+          expect(args[3]).not.toBe("HEAD");
+        }
+        return push(...args);
+      });
+      try {
+        const resumed = start(() => {
+          throw new Error("delivery must not invoke agents");
+        });
+        const status = await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"]);
+        const finished = resumed.store.getRun(run.id);
+        const newest = finished?.headSha;
+        if (!newest) throw new Error("missing delivered SHA");
+        expect(newest).not.toBe(state.reviewedSha);
+        expect(newest).not.toBe(merge);
+        expect(finished?.baseSha).toBe(nextBase);
+        expect(
+          (
+            await sh(["git", "rev-list", "--parents", "-n", "1", newest], {
+              cwd: status === "succeeded" ? bare : cwd,
+            })
+          ).stdout
+            .trim()
+            .split(" "),
+        ).toEqual([newest, merge, nextBase]);
+        expect(
+          resumed.store.listStages(run.id).filter((s) => s.name === "gates" && s.status === "succeeded"),
+        ).toHaveLength(3);
+        expect(finished?.error).toBeNull();
+        expect(status).toBe("succeeded");
+        expect(
+          (await sh(["git", "rev-parse", `refs/heads/${finished?.branch}`], { cwd: bare })).stdout.trim(),
+        ).toBe(newest);
+        if (changed)
+          expect(
+            (await sh(["git", "cat-file", "-e", changed], { cwd: bare, allowFail: true })).exitCode,
+          ).not.toBe(0);
+      } finally {
+        publication.mockRestore();
+      }
+    },
+  );
+
+  test.each(["pass", "block", "merge still in progress", "completed merge retains MERGE_HEAD"])(
+    "a pending second delivery merge resumes its own gates (%s)",
+    async (scenario) => {
+      const { f, run, bare, merge, cwd } = await interruptGatedMerge();
+      const nextBase = await advanceBase(bare, "again.txt", scenario === "block" ? "BAD\n" : "second base\n");
+      f.store.close();
+      const noAgents = () => {
+        throw new Error("delivery must not invoke agents");
+      };
+      const interrupted = start(noAgents, false, false, {
+        faults: { "stage:gates:before": { action: "kill" } },
+      });
+      await wait(
+        () =>
+          interrupted.store.listStages(run.id).findLast((s) => s.name === "deliver")?.status === "cancelled",
+        { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => interrupted.store.subscribe(wake) },
+      );
+      await interrupted.stop();
+      const pending = interrupted.store.getRunState<RunState>(run.id);
+      if (!pending?.reviewedSha) throw new Error("missing pending review evidence");
+      expect(pending?.pendingRebaseSha).toBe(nextBase);
+      expect(pending?.preRebaseHead).toBe(merge);
+      const newest = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+      expect(
+        (await sh(["git", "rev-list", "--parents", "-n", "1", newest], { cwd })).stdout.trim().split(" "),
+      ).toEqual([newest, merge, nextBase]);
+      expect(
+        (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+          .stdout,
+      ).toBe("");
+      expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+      if (scenario === "merge still in progress") {
+        await sh(["git", "reset", "--hard", merge], { cwd });
+        await sh(["git", "merge", "--no-ff", "--no-commit", nextBase], { cwd });
+      } else if (scenario === "completed merge retains MERGE_HEAD") {
+        const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
+        writeFileSync(resolve(cwd, path), `${nextBase}\n`);
+      }
+      interrupted.store.close();
+      if (scenario === "completed merge retains MERGE_HEAD") {
+        const publication = spyOn(repos, "pushBranch");
+        try {
+          const resumed = start(noAgents);
+          expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+          const finished = resumed.store.getRun(run.id);
+          expect(finished?.error).toContain("Delivery refused");
+          expect(finished?.prUrl).toBeNull();
+          expect(publication).not.toHaveBeenCalled();
+          expect(
+            (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+              .stdout,
+          ).toBe("");
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+        } finally {
+          publication.mockRestore();
+        }
+        return;
+      }
+      const resumed = start(noAgents);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "block" ? "needs_human" : "succeeded",
+      );
+      const stages = resumed.store.listStages(run.id).filter((s) => s.name === "gates");
+      expect(stages.map((s) => s.status)).toEqual([
+        "succeeded",
+        "succeeded",
+        "cancelled",
+        scenario === "block" ? "failed" : "succeeded",
+      ]);
+      const finished = resumed.store.getRun(run.id);
+      const published = (
+        await sh(["git", "rev-parse", `refs/heads/${finished?.branch}`], { cwd: bare })
+      ).stdout.trim();
+      if (scenario === "block") {
+        expect(finished?.error).toContain("post-merge gates regressed");
+        expect(published).toBe(pending?.reviewedSha);
+        expect(published).not.toBe(newest);
+      } else {
+        expect(finished?.headSha).toBe(published);
+        expect(
+          (await sh(["git", "rev-list", "--parents", "-n", "1", published], { cwd: bare })).stdout
+            .trim()
+            .split(" "),
+        ).toEqual([published, merge, nextBase]);
+      }
+    },
+  );
+
+  test.each([
+    "unrecorded commit",
+    "unrecorded merge",
+    "extra parent at HEAD",
+    "extra parent in history",
+    "another review",
+    "another run",
+    "another review at HEAD",
+    "another run at HEAD",
+  ])("delivery refuses a chain with %s without a draft fallback", async (scenario) => {
+    const { f, run, state, bare, base, merge, cwd } = await interruptGatedMerge();
+    const reviewed = state.reviewedSha;
+    if (!reviewed) throw new Error("missing reviewed SHA");
+    const nextBase = await advanceBase(bare, "again.txt", "second base\n");
+    await sh(["git", "fetch", bare, "main"], { cwd });
+    const tree = (await sh(["git", "rev-parse", `${merge}^{tree}`], { cwd })).stdout.trim();
+    const commit = async (parents: string[]) =>
+      (
+        await sh(["git", "commit-tree", tree, ...parents.flatMap((p) => ["-p", p])], {
+          cwd,
+          stdin: "test ancestry\n",
+        })
+      ).stdout.trim();
+    const record = (sha: string, head: string, base: string) => ({
+      runId: run.id,
+      reviewedSha: reviewed,
+      sha,
+      head,
+      base,
+    });
+    let intermediate = merge;
+    state.deliveryMerges = [record(merge, reviewed, base)];
+    if (scenario.startsWith("unrecorded"))
+      intermediate = await commit(scenario === "unrecorded commit" ? [merge] : [merge, nextBase]);
+    if (scenario === "extra parent in history") {
+      // Three-parent (octopus) commits must be refused even with a matching recorded parent pair.
+      intermediate = await commit([reviewed, base, nextBase]);
+      state.deliveryMerges = [record(intermediate, reviewed, base)];
+    }
+    if (scenario.startsWith("another"))
+      state.deliveryMerges = [
+        {
+          ...record(merge, reviewed, base),
+          ...(scenario.startsWith("another review") ? { reviewedSha: base } : { runId: `${run.id}-other` }),
+        },
+      ];
+    const newest =
+      scenario.startsWith("another") && scenario.endsWith("at HEAD")
+        ? merge
+        : await commit(
+            scenario === "extra parent at HEAD" ? [intermediate, nextBase, base] : [intermediate, nextBase],
+          );
+    if (newest !== merge) state.deliveryMerges.push(record(newest, intermediate, nextBase));
+    await sh(["git", "reset", "--hard", newest], { cwd });
+    expect((await sh(["git", "merge-base", "--is-ancestor", reviewed, newest], { cwd })).exitCode).toBe(0);
+    f.store.updateRun(run.id, { headSha: newest, baseSha: newest === merge ? base : nextBase }, state);
+    const refs = (await sh(["git", "show-ref"], { cwd: bare })).stdout;
+    f.store.close();
+    const resumed = start(() => {
+      throw new Error("delivery must not invoke agents");
+    });
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    expect(resumed.store.getRun(run.id)?.error).toContain("Delivery refused");
+    expect(resumed.store.getRun(run.id)?.prUrl).toBeNull();
+    expect((await sh(["git", "show-ref"], { cwd: bare })).stdout).toBe(refs);
+    expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+  });
+
   test.each([
     "amended HEAD",
     "missing reviewed SHA",
@@ -90,6 +351,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(state.phase).toBe("deliver");
     const expected = state.reviewedSha;
     const cwd = state.worktreePath;
+    if (scenario === "completed clean merge") {
+      state.deliveryMerges = undefined;
+      f.store.setRunState(run.id, state);
+    }
     if (scenario === "amended HEAD") {
       writeFileSync(join(cwd, "farewell.txt"), "unreviewed amendment\n");
       await sh(["git", "add", "farewell.txt"], { cwd });

@@ -1439,6 +1439,7 @@ export async function mergePullRequest(
   opts: {
     body?: string;
     title?: string;
+    subject?: string;
     auto?: boolean;
     guard?: () => void;
     onFailure?: (reason: string) => void;
@@ -1471,9 +1472,9 @@ export async function mergePullRequest(
         if (verifiedState(input) === "MERGED") return "merged" as const;
         const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
         const data = schema.parse(input);
-        const rawTitle = opts.title ?? data.title;
+        const rawTitle = opts.subject ?? opts.title ?? data.title;
         if (!rawTitle.trim()) throw new Error("missing merge subject");
-        const title = squashTitle(rawTitle, prUrl);
+        const title = opts.subject ?? squashTitle(rawTitle, prUrl);
         const body = opts.body ?? data.body;
         checkPublicationText(`${title}\n${body}`, "PR text", entries);
         blocked = false;
