@@ -751,7 +751,7 @@ describe("process handling", () => {
   });
 
   test.each([false, true])(
-    "inspection selects exact markers and uid, excluding argv matches (exec race: %s)",
+    "inspection selects exact markers and uid, excluding argv matches (exec race: %p)",
     async (changing) => {
       const children = Array.from({ length: 3 }, () =>
         spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }),
@@ -816,20 +816,24 @@ describe("process handling", () => {
   );
 
   test.skipIf(process.platform !== "darwin").each([false, true])(
-    "macOS native inspection ignores an older hidden orphan (inherited marker: %s)",
+    "macOS native inspection ignores an older hidden orphan (inherited marker: %p)",
     async (marked) => {
       const { markedDarwinProcesses } = await import("../src/util/processes-darwin.ts");
       const pidFile = join(dir, "hidden-pid");
+      // The orphan works in this test's own directory, so only its birth time keeps the invocations
+      // below from claiming it; in a shared directory another file's invocation could. It outlives
+      // the test's 30 s timeout and is killed in finally.
       const launcher = spawn(
         process.execPath,
         [
           "-e",
-          `require("node:child_process").spawn("/bin/sh", ["-c", 'echo $$ > "$1"; sleep 15', "sh", ${JSON.stringify(pidFile)}],
+          `require("node:child_process").spawn("/bin/sh", ["-c", 'echo $$ > "$1"; exec sleep 60', "sh", ${JSON.stringify(pidFile)}],
           {detached:true, stdio:"ignore", env:${marked ? '{LIMITLESS_INVOCATION:"hidden-writer"}' : "{}"}}).unref();`,
         ],
-        { stdio: "ignore" },
+        { stdio: "ignore", cwd: dir },
       );
       let pid: number | undefined;
+      let birth: string | null = null;
       let spawning = true;
       const churn = (async () => {
         while (spawning) {
@@ -846,6 +850,7 @@ describe("process handling", () => {
           await Bun.sleep(10);
         pid = Number(readFileSync(pidFile, "utf8"));
         expect(pid).toBeGreaterThan(0);
+        birth = await processBirth(pid);
         expect(
           markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, Date.now(), [
             realpathSync(dir),
@@ -862,7 +867,8 @@ describe("process handling", () => {
         spawning = false;
         await churn;
         launcher.kill("SIGKILL");
-        if (pid !== undefined) {
+        // Under load finally can run after the sleep ends and the pid is reused; signal only our orphan.
+        if (pid !== undefined && birth !== null && (await processBirth(pid)) === birth) {
           try {
             process.kill(-pid, "SIGKILL");
           } catch {}
