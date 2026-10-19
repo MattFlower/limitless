@@ -1567,7 +1567,7 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       if (mode === "completed") {
         expect(output).toMatch(/completed\s+PASS/);
         const completed = Number(readFileSync(join(dir, "completed"), "utf8").trim());
-        expect(() => process.kill(completed, 0)).toThrow();
+        expectProcessStopped(completed);
         expect(
           readFileSync(join(dir, "signals"), "utf8")
             .split("\n")

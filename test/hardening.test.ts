@@ -669,7 +669,7 @@ describe("process handling", () => {
           expect(result.cancelled).toBe(true);
           expect(snapshots).toBeGreaterThan(2);
           expect(pid).toBeGreaterThan(0);
-          expect(() => process.kill(pid ?? 0, 0)).toThrow();
+          expectProcessStopped(pid ?? 0);
           // This callback represents the cleanup that is allowed only after shutdown.
           writeFileSync(join(dir, "cleanup-started"), "");
         },
@@ -738,7 +738,7 @@ describe("process handling", () => {
       expect(signals.some((target) => protectedPids.includes(target))).toBe(false);
       expect(signals).not.toContain(control.pid);
       expect(kill(control.pid ?? 0, 0)).toBe(true);
-      expect(() => kill(pid ?? 0, 0)).toThrow();
+      expectProcessStopped(pid ?? 0);
       pid = undefined;
     } finally {
       killSpy.mockRestore();

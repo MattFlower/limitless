@@ -14,7 +14,10 @@ export function expectProcessStopped(pid: number): void {
       stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ESRCH") return;
+      if (code === "ENOENT" || code === "ESRCH") {
+        expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+        return;
+      }
       throw error;
     }
     expect(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]).toBe("Z");
