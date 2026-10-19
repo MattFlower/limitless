@@ -1,21 +1,45 @@
-import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-const canonical = (p: string): string =>
+const darwin = process.platform === "darwin" ? await import("../util/processes-darwin.ts") : undefined;
+
+/** Exported for tests: a path that changes between lstat and realpath throws. */
+export const canonical = (p: string): string =>
   lstatSync(p, { throwIfNoEntry: false }) ? realpathSync(p) : join(canonical(dirname(p)), basename(p));
 const absent = (path: string) => !lstatSync(path, { throwIfNoEntry: false });
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
 /** `path` is `root` or below it; the filesystem root contains every path. */
 const within = (path: string, root: string) => `${path}/`.startsWith(root.endsWith("/") ? root : `${root}/`);
 export class PrivateError extends Error {}
+const read = (path: string) => readFileSync(path, "utf8").trim();
+
+/** The real path of the file behind an open descriptor; it throws when that can't be confirmed. */
+function descriptorPath(fd: number): string {
+  if (process.platform === "linux") return readlinkSync(`/proc/self/fd/${fd}`);
+  const path = darwin?.darwinDescriptorPath(fd);
+  if (!path) throw new Error("Cannot confirm the private config's real path");
+  return path;
+}
 
 /**
  * Checkouts of the linked worktrees listed in `worktrees`. Another run's worktree that git is adding or
  * removing is skipped only in git's own transient states, judged by lstat: an entry or gitdir file that
- * no longer (or doesn't yet) exist, or an empty gitdir file while git's "initializing" lock is held.
- * A symlink, an unreadable file, or an empty gitdir without the lock (`worktree move` rewrites it) is read
- * strictly and blocks.
+ * no longer (or doesn't yet) exist, or an empty gitdir file while git's add holds its lock (a regular
+ * `locked` file reading "initializing"). A symlink, an unreadable file, an empty gitdir under any other
+ * lock (a reason, a symlink, a localized git) or none (`worktree move` rewrites gitdir) is read strictly
+ * and blocks.
+ *
+ * Accepted residuals, since only the owner's own git writes this metadata: a `worktree move` racing the
+ * scan, and a stale "initializing" lock left by a git that crashed while adding.
  */
 function linkedCheckouts(worktrees: string): string[] {
   let names: string[];
@@ -37,13 +61,15 @@ function linkedCheckouts(worktrees: string): string[] {
     const plain = stat.isDirectory() && file?.isFile() === true;
     let target: string;
     try {
-      target = readFileSync(gitdir, "utf8").trim();
+      target = read(gitdir);
     } catch (error) {
       if (plain && missing(error) && absent(gitdir)) return [];
       throw error;
     }
     if (!target) {
-      if (plain && !absent(join(entry, "locked"))) return [];
+      const lock = join(entry, "locked");
+      if (plain && lstatSync(lock, { throwIfNoEntry: false })?.isFile() && read(lock) === "initializing")
+        return [];
       throw new Error(`Empty gitdir in ${entry}`);
     }
     // git can write the checkout's path relative to the entry.
@@ -54,7 +80,6 @@ function linkedCheckouts(worktrees: string): string[] {
 function readPrivateStrings(configDir: string, roots: (string | null | undefined)[]) {
   const file = canonical(join(configDir, "private-strings.txt"));
   const locations = [resolve(configDir), canonical(configDir), file];
-  const read = (path: string) => readFileSync(path, "utf8").trim();
   const repositoryRoots = roots.flatMap((root) => {
     if (!root) return [];
     let git = canonical(join(root, ".git"));
@@ -68,12 +93,22 @@ function readPrivateStrings(configDir: string, roots: (string | null | undefined
     return [root, git, ...(basename(git) === ".git" ? [dirname(git)] : []), ...linked];
   });
   const boundaries = repositoryRoots.flatMap((root) => [resolve(root), canonical(resolve(root))]);
-  if (boundaries.some((root) => locations.some((path) => within(path, root))))
-    throw new PrivateError("Private config is inside repository; publication blocked");
+  const refuseInside = (paths: string[]) => {
+    if (boundaries.some((root) => paths.some((path) => within(path, root))))
+      throw new PrivateError("Private config is inside repository; publication blocked");
+  };
+  refuseInside(locations);
   if (!lstatSync(file, { throwIfNoEntry: false })) return [];
-  // Read only the path that was checked: a symlinked component restored since then could lead elsewhere.
-  if (realpathSync(file) !== file) throw new Error("Private config moved during the check");
-  const text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
+  // Check the file actually opened and read through that descriptor, so a component swapped after the
+  // checks above can't redirect the read into a repository.
+  const fd = openSync(file, "r");
+  let text: string;
+  try {
+    refuseInside([descriptorPath(fd)]);
+    text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(fd));
+  } finally {
+    closeSync(fd);
+  }
   return text.split(/\r?\n/).flatMap((line, i) => {
     const value = line.trim();
     return value && !value.startsWith("#") ? [{ value, entry: i + 1 }] : [];

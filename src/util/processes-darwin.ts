@@ -10,6 +10,10 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
   mach_absolute_time: { args: [], returns: FFIType.u64 },
   proc_listpids: { args: [FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   proc_pid_rusage: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+  proc_pidfdinfo: {
+    args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.i32],
+    returns: FFIType.i32,
+  },
   proc_pidinfo: {
     args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32],
     returns: FFIType.i32,
@@ -144,6 +148,19 @@ export function captureDarwinInvocationLeader(pid: number): DarwinInvocationLead
   if (info[3] === 5 /* SZOMB */) return null;
   if (session < 0) throw new Error(`Process session inspection failed for ${pid}`);
   return { pid, birth, session, group: info[2] ?? 0 };
+}
+
+/**
+ * The path of the file an open descriptor of this process refers to (PROC_PIDFDVNODEPATHINFO; fcntl's
+ * F_GETPATH is variadic), or null when the kernel doesn't report one.
+ */
+export function darwinDescriptorPath(fd: number): string | null {
+  // struct vnode_fdinfowithpath: proc_fileinfo (24 bytes), vnode_info (152), then vip_path[MAXPATHLEN].
+  const info = new Uint8Array(24 + 152 + 1024);
+  if (symbols.proc_pidfdinfo(process.pid, fd, 2, ptr(info), info.byteLength) !== info.byteLength) return null;
+  const path = info.subarray(176);
+  const end = path.indexOf(0);
+  return end > 0 ? Buffer.from(path.subarray(0, end)).toString("utf8") : null;
 }
 
 /** Monotonic, in the units of a process's start time from proc_pid_rusage; read it before spawning. */
