@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sh } from "../src/util/proc.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { seeded } from "./seeded.ts";
 
 // Each scenario drives the real script, git and fake tools (about 4 s on an idle machine); under CPU
@@ -1143,7 +1144,7 @@ exec '${gitBin}' "$@"
           }),
         ]);
         expect(Date.now() - at).toBeLessThan(5000);
-        for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
+        for (const pid of pids) expectProcessStopped(pid);
         expect(existsSync(pushed)).toBe(false);
       }
       const code = await child.exited;

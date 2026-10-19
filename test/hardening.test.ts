@@ -42,6 +42,7 @@ import {
   sh,
 } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -399,7 +400,7 @@ describe("process handling", () => {
           expect(existsSync(ownerScratch)).toBe(true);
           writeFileSync(release, "");
           await owner;
-          expect(() => kill(writerPid, 0)).toThrow();
+          expectProcessStopped(writerPid);
           expect(scope.scratchDirs.size).toBe(0);
           expect(existsSync(ownerScratch)).toBe(false);
         });
@@ -446,7 +447,7 @@ describe("process handling", () => {
         cwd: dir,
         env: process.env as Record<string, string>,
       });
-      expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow();
+      expectProcessStopped(Number(readFileSync(pidFile, "utf8")));
       await Bun.sleep(20);
       rmSync(marker);
       await Bun.sleep(300);
@@ -482,7 +483,7 @@ describe("process handling", () => {
       });
       const pid = Number(readFileSync(pidFile, "utf8"));
       expect(pid).toBeGreaterThan(0);
-      expect(() => process.kill(pid, 0)).toThrow();
+      expectProcessStopped(pid);
       expect(existsSync(scratch)).toBe(true);
       rmSync(scratch, { recursive: true, force: true });
     } finally {
@@ -573,7 +574,7 @@ describe("process handling", () => {
         if (ending === "normal" || ending === "error") expect(res.exitCode).toBe(ending === "error" ? 3 : 0);
         expect(writerPid).toBeGreaterThan(0);
         await (async () => {
-          expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+          expectProcessStopped(writerPid ?? 0);
           expect(control.pid).toBeGreaterThan(0);
           expect(process.kill(control.pid ?? 0, 0)).toBe(true);
           expect(argumentControl?.pid).toBeGreaterThan(0);
@@ -1188,7 +1189,7 @@ describe("process handling", () => {
             expect(processScope.getStore()?.terminationError).toBeUndefined();
             const writerPid = Number(readFileSync(pidFile, "utf8"));
             expect(writerPid).toBeGreaterThan(0);
-            expect(() => process.kill(writerPid, 0)).toThrow();
+            expectProcessStopped(writerPid);
             expect(process.kill(control.pid ?? 0, 0)).toBe(true);
             rmSync(output);
             await Bun.sleep(30);
@@ -1260,7 +1261,7 @@ describe("process handling", () => {
             expect(writerSignals[0]).toBe("SIGSTOP");
             expect(writerSignals.slice(1)).toContain("SIGKILL");
             expect(writerSignals.slice(1).every((signal) => signal === "SIGKILL")).toBe(true);
-            expect(() => kill(writerPid, 0)).toThrow();
+            expectProcessStopped(writerPid);
             expect(readFileSync(output).length).toBeGreaterThan(0);
             // Simulate worktree cleanup immediately after invocation shutdown is confirmed.
             rmSync(output);
@@ -1351,7 +1352,7 @@ describe("process handling", () => {
         expect(pid).toBeGreaterThan(0);
         expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGSTOP");
         expect(signals.filter((s) => s.pid === pid).map((s) => s.signal)).toContain("SIGKILL");
-        expect(() => kill(pid, 0)).toThrow();
+        expectProcessStopped(pid);
         expect(kill(control.pid ?? 0, 0)).toBe(true);
         expect(signals.some((s) => s.pid === control.pid)).toBe(false);
       } finally {

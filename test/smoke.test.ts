@@ -40,6 +40,7 @@ import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts"
 import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
 import { parseExcludeOrigins } from "../src/router/origins.ts";
 import { agentEnv, runProcess, sh } from "../src/util/proc.ts";
+import { expectProcessStopped } from "./process-support.ts";
 
 const result: AgentResult = {
   status: "ok",
@@ -1023,7 +1024,7 @@ for (const stop of ["cancelled", "deadline"] as const) {
     expect(existsSync(scratch)).toBe(false);
     for (const path of resources) expect(existsSync(path)).toBe(false);
     expect(pid).toBeGreaterThan(0);
-    expect(() => process.kill(pid, 0)).toThrow();
+    expectProcessStopped(pid);
   }, 25_000);
 }
 
@@ -1414,6 +1415,8 @@ test.skipIf(stateSkip)(
       await gone([pid]);
       expect(processState(pid)).toMatch(/^Z/);
       expect(() => process.kill(pid, 0)).not.toThrow();
+      expectProcessStopped(pid);
+      expect(() => expectProcessStopped(parent.pid)).toThrow();
       await expect(gone([parent.pid])).rejects.toThrow(String(parent.pid));
     } finally {
       parent.stdin.end();
@@ -1456,6 +1459,7 @@ wait
       entry,
       `
 import { reportChecks } from ${JSON.stringify(join(process.cwd(), "scripts/smoke.ts"))};
+import { expectProcessStopped } from ${JSON.stringify(join(import.meta.dir, "process-support.ts"))};
 import { sh, runProcess } from ${JSON.stringify(join(process.cwd(), "src/util/proc.ts"))};
 import { readFileSync, appendFileSync } from 'node:fs';
 import { CodexReaderProbe } from ${JSON.stringify(join(process.cwd(), "src/harness/codex.ts"))};
@@ -1464,7 +1468,7 @@ process.kill = (pid, signal) => { appendFileSync('${dir}/signals', pid + ' ' + s
 const run = async (signal) => {
   if (${mode === "probe"}) { await new CodexReaderProbe().verify({cwd: '${dir}', signal}, runProcess); return {status: 'pass'}; }
   const previous = ${timed} ? readFileSync('${dir}/pids', 'utf8').trim().split(/\\s+/).map(Number).filter(Boolean) : [];
-  for (const pid of previous) { try { kill(pid, 0); throw Error('previous attempt survived'); } catch (e) { if (e.code !== 'ESRCH') throw e; } }
+  for (const pid of previous) expectProcessStopped(pid);
   if (${mode === "idle-timeout"}) { const r = await runProcess({cmd: ['claude'], cwd: '${dir}', env: process.env, signal, idleTimeoutMs: 250}); return {status: r.idleTimedOut ? 'pass' : 'fail'}; }
   try { await sh(['claude'], {cwd: '${dir}', signal, timeoutMs: ${ownTimeout ? 250 : 60000}}); return {status: 'pass'}; }
   catch (e) { if (!signal.aborted) throw e; return {status: 'fail', transient: 'timeout', reason: 'cancelled'}; }
@@ -1530,7 +1534,7 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
         expect(output).toContain("FAIL");
         expect(pids()).toHaveLength(mode === "timeout" || mode === "escaped-timeout" ? 4 : 2);
         if (escaped) {
-          expect(() => process.kill(Number(readFileSync(join(dir, "escaped"), "utf8")), 0)).toThrow();
+          expectProcessStopped(Number(readFileSync(join(dir, "escaped"), "utf8")));
           expect(output).toContain("retried after:");
           expect(output).not.toContain("attempt did not stop, not retried");
           expect(output).toMatch(/next\s+PASS/);
