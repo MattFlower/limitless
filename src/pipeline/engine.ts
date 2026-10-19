@@ -75,6 +75,7 @@ import {
   CommandError,
   ProcessTerminationError,
   processScope,
+  recoverProcessCleanups,
   redactCredentials,
 } from "../util/proc.ts";
 import {
@@ -165,10 +166,26 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
+  try {
+    await recoverProcessCleanups(deps.store, runId, deps.store.getRunState<RunState>(runId)?.worktreePath);
+  } catch (error) {
+    deps.store.updateRun(runId, {
+      status: "failed",
+      error: redactCredentials((error as Error).message),
+      finishedAt: Date.now(),
+    });
+    return "failed";
+  }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
   const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
   return processScope.run(
-    { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
+    {
+      signal: ctx.signal,
+      killGraceMs: 100,
+      children: new Map(),
+      scratchDirs: new Set(),
+      cleanup: { store: deps.store, runId },
+    },
     () =>
       confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
         readPolicyScope.run(deps.cfg.readPolicy, () =>

@@ -14,11 +14,79 @@ export const processScope = new AsyncLocalStorage<{
   killGraceMs: number;
   children: Map<ChildProcess, Promise<void>>;
   scratchDirs: Set<string>;
+  cleanup?: { store: ProcessCleanupStore; runId: string };
   terminationError?: ProcessTerminationError;
 }>();
 
 export class ProcessTerminationError extends Error {
   static readonly prefix = "Invocation termination could not be confirmed";
+}
+
+export interface ProcessCleanupRecord {
+  runId: string;
+  invocation: string;
+  cwd: string;
+  pid: number;
+  birth: string;
+}
+
+export interface ProcessCleanupStore {
+  recordProcessCleanup(record: ProcessCleanupRecord): void;
+  pendingProcessCleanups(): ProcessCleanupRecord[];
+  completeProcessCleanup(invocation: string): void;
+}
+
+// Recovery and live cleanup must never signal the same invocation concurrently.
+const cleanups = new Map<string, Promise<unknown>>();
+async function cleanupLocked<T>(invocation: string, cleanup: () => Promise<T>): Promise<T> {
+  const pending = Promise.resolve().then(cleanup);
+  cleanups.set(invocation, pending);
+  try {
+    return await pending;
+  } finally {
+    if (cleanups.get(invocation) === pending) cleanups.delete(invocation);
+  }
+}
+
+export async function recoverProcessCleanups(
+  store: ProcessCleanupStore,
+  runId?: string,
+  cwd?: string,
+): Promise<void> {
+  const failures: string[] = [];
+  const records = store.pendingProcessCleanups().filter((r) => !runId || r.runId === runId || r.cwd === cwd);
+  for (const invocation of new Set(records.map((r) => r.invocation))) {
+    const record = records.find((r) => r.invocation === invocation);
+    try {
+      await (cleanups.get(invocation) ??
+        cleanupLocked(invocation, async () => {
+          const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
+          for (const member of store.pendingProcessCleanups().filter((r) => r.invocation === invocation)) {
+            const started = performance.now();
+            if ((await readBirth(member.pid)) !== member.birth) continue;
+            try {
+              process.kill(member.pid, "SIGKILL");
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+            }
+            while ((await readBirth(member.pid)) === member.birth) {
+              if (performance.now() - started >= 10_000)
+                throw new Error(`Recorded process still alive: ${member.pid}`);
+              await Bun.sleep(10);
+            }
+          }
+          store.completeProcessCleanup(invocation);
+        }));
+      if (store.pendingProcessCleanups().some((r) => r.invocation === invocation))
+        throw new Error("Active invocation cleanup remains unresolved");
+    } catch (error) {
+      failures.push(`run ${record?.runId}, invocation ${invocation}: ${(error as Error).message}`);
+    }
+  }
+  if (failures.length)
+    throw new ProcessTerminationError(
+      redactCredentials(`${ProcessTerminationError.prefix}: ${failures.join("; ")}`),
+    );
 }
 
 /** A failed shutdown blocks subsequent commands, including worktree cleanup. */
@@ -290,6 +358,7 @@ async function stopMarkedProcesses(
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
   spawnedAt: bigint,
+  recordMember: (pid: number, birth: string) => void,
 ): Promise<boolean> {
   const group = child.pid;
   if (group === undefined) return false;
@@ -327,6 +396,7 @@ async function stopMarkedProcesses(
           }
           // Allow one clock quantum: milliseconds for macOS births, USER_HZ ticks for Linux.
           growing ||= bornAt !== null && birthTime(birth) > bornAt + (birth.includes(":") ? 1000 : 1);
+          recordMember(pid, birth);
           claimed.set(pid, { birth, stopped: false, frozen: false });
         }
       }
@@ -512,9 +582,25 @@ function stillRunning(pid: number): boolean {
 /**
  * Mark a child and its descendants so shutdown also finds detached, reparented processes.
  */
-export function runProcess(opts: ProcOptions): Promise<ProcResult> {
+export async function runProcess(opts: ProcOptions): Promise<ProcResult> {
   assertProcessesStopped();
   const scope = processScope.getStore();
+  if (scope?.cleanup) {
+    try {
+      await recoverProcessCleanups(scope.cleanup.store, scope.cleanup.runId, realpathSync(opts.cwd));
+    } catch (error) {
+      scope.terminationError =
+        error instanceof ProcessTerminationError
+          ? error
+          : new ProcessTerminationError(
+              redactCredentials(
+                `${ProcessTerminationError.prefix}: run ${scope.cleanup.runId}: ${(error as Error).message}`,
+              ),
+            );
+      throw scope.terminationError;
+    }
+    assertProcessesStopped();
+  }
   if (scope)
     opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
   if (scope) opts.signal?.throwIfAborted();
@@ -523,6 +609,17 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
     const marker = randomUUID();
+    const cleanup = scope?.cleanup;
+    const cwd = cleanup ? realpathSync(opts.cwd) : opts.cwd;
+    let ownershipWriteFailed = false;
+    const recordMember = (pid: number, birth: string) => {
+      try {
+        cleanup?.store.recordProcessCleanup({ runId: cleanup.runId, invocation: marker, cwd, pid, birth });
+      } catch (error) {
+        ownershipWriteFailed = true;
+        throw new Error(`Could not persist cleanup ownership for ${pid}`, { cause: error });
+      }
+    };
     const scratch = invocationScratch.getStore();
     // Capture canonical roots before spawning: cleanup may later remove scratch paths.
     const directories =
@@ -579,7 +676,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     let shutdown: Promise<void> | undefined;
     let terminationError: ProcessTerminationError | undefined;
     const terminate = () => {
-      shutdown ??= (async () => {
+      shutdown ??= cleanupLocked(marker, async () => {
         try {
           if (leaderInspectionError) throw leaderInspectionError;
           if (child.pid !== undefined) {
@@ -591,17 +688,37 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               directories,
               leader,
               spawnedAt,
+              recordMember,
             );
             cancelKilled = cancelStarted && killedRunningChild;
           }
+          cleanup?.store.completeProcessCleanup(marker);
         } catch (error) {
+          let reason = (error as Error).message;
+          // The direct child is owned too; the error path must obey the same write-before-signal rule.
+          try {
+            if (
+              !ownershipWriteFailed &&
+              child.pid !== undefined &&
+              child.exitCode === null &&
+              child.signalCode === null
+            ) {
+              if (cleanup) {
+                const birth = await (processBirthInspection.getStore()?.read ?? processBirth)(child.pid);
+                if (birth === null) throw new Error("Direct child identity could not be confirmed");
+                recordMember(child.pid, birth);
+              }
+              child.kill("SIGKILL");
+            }
+          } catch (failure) {
+            reason += `; ${(failure as Error).message}`;
+          }
           terminationError = new ProcessTerminationError(
-            `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
-            { cause: error },
+            redactCredentials(
+              `${ProcessTerminationError.prefix}: ${cleanup ? `run ${cleanup.runId}, invocation ${marker}: ` : ""}${reason}`,
+            ),
           );
           if (scope) scope.terminationError = terminationError;
-          // The directly spawned child is ours even if process discovery is unavailable.
-          child.kill("SIGKILL");
           settled = true;
           finishTimers();
           reject(terminationError);
@@ -614,7 +731,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
             child.stderr.destroy();
           }
         }
-      })();
+      });
       return shutdown;
     };
     child.once("exit", terminate);

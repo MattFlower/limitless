@@ -56,7 +56,7 @@ import { quotedJson } from "../integrations/github.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
-import { redactCredentials } from "../util/proc.ts";
+import { type ProcessCleanupRecord, redactCredentials } from "../util/proc.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
 
@@ -428,6 +428,24 @@ export class Store {
   close(): void {
     this.db.close();
     this.releasePrivateReads();
+  }
+
+  recordProcessCleanup(record: ProcessCleanupRecord): void {
+    this.db
+      .query("INSERT OR IGNORE INTO process_cleanups VALUES (?, ?, ?, ?, ?)")
+      .run(record.runId, record.invocation, record.cwd, record.pid, record.birth);
+  }
+
+  pendingProcessCleanups(): ProcessCleanupRecord[] {
+    return this.db
+      .query<ProcessCleanupRecord, []>(
+        "SELECT run_id AS runId, invocation, cwd, pid, birth FROM process_cleanups",
+      )
+      .all();
+  }
+
+  completeProcessCleanup(invocation: string): void {
+    this.db.query("DELETE FROM process_cleanups WHERE invocation = ?").run(invocation);
   }
 
   recordOwnerDiagnostic(
