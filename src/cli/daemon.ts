@@ -7,7 +7,7 @@ import { createApiToken } from "../server/api-token.ts";
 import { startHttp } from "../server/http.ts";
 import { startWorkerListener } from "../server/workers.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
-import { recoverProcessCleanups } from "../util/proc.ts";
+import { recoverProcessCleanups, redactCredentials } from "../util/proc.ts";
 
 /** Protect retained credentials before integrations resume the land queue or start agents. */
 export async function startDaemon(
@@ -33,7 +33,14 @@ export async function startDaemon(
     if (failure?.status === "rejected") throw failure.reason;
   };
   try {
-    await recoverProcessCleanups(factory.store);
+    // An unresolved record blocks only its run and checkout; executeRun and runProcess retry recovery.
+    for (const runId of new Set(factory.store.pendingProcessCleanups().map((r) => r.runId))) {
+      await recoverProcessCleanups(factory.store, runId).catch((error: unknown) => {
+        const message = redactCredentials((error as Error).message);
+        console.error(`[cleanup] ${message}`);
+        factory.store.addEvent({ runId, type: "error", level: "error", message });
+      });
+    }
     for (const [dir, files] of [
       ["worker-tls", ["key.pem"]],
       ["worker", ["token", "key.pem", "coordinator-fingerprint"]],

@@ -474,6 +474,47 @@ test("startup recovers a cancelled run before integrations and legacy runs still
   }
 });
 
+test("unresolved startup recovery is reported against its run without stopping the daemon", async () => {
+  const { fixture } = await import("./mcp-support.ts");
+  const { startDaemon } = await import("../src/cli/daemon.ts");
+  const f = await fixture();
+  f.factory.cfg.port = 0;
+  f.factory.cfg.listenLan = null;
+  const start = spyOn(f.factory, "start").mockImplementation(() => {});
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  let daemon: Awaited<ReturnType<typeof startDaemon>> | undefined;
+  try {
+    const run = await f.factory.createRun({ repo: f.repo, prompt: "stuck cleanup" });
+    f.factory.store.updateRun(run.id, { status: "failed" });
+    // Synthetic PID: inspection fails, so nothing is signalled.
+    f.factory.store.recordProcessCleanup({ ...record(424245), runId: run.id });
+    await processBirthInspection.run(
+      {
+        read: async () => {
+          throw new Error("birth inspection denied");
+        },
+      },
+      async () => {
+        daemon = await startDaemon(f.factory, {}, async () => ({
+          routes: {},
+          notes: [],
+          stop: async () => {},
+        }));
+      },
+    );
+    expect(start).toHaveBeenCalled();
+    expect(f.factory.store.pendingProcessCleanups()).toHaveLength(1);
+    const events = f.factory.store.listEvents(run.id).filter((e) => e.level === "error");
+    expect(events.map((e) => e.message).join("\n")).toContain(`run ${run.id}, invocation invocation`);
+    expect(events.map((e) => e.message).join("\n")).toContain("birth inspection denied");
+  } finally {
+    await daemon?.server.stop(true);
+    start.mockRestore();
+    error.mockRestore();
+    await f.close();
+  }
+});
+
 test("run resume is blocked by pending identity inspection and continues once recovery succeeds", async () => {
   const { fixture } = await import("./mcp-support.ts");
   const { executeRun } = await import("../src/pipeline/engine.ts");
