@@ -272,8 +272,11 @@ detection, per-invocation budget, process-group kill on cancel.
   compatibility still require validation on the deployment host.
 - Gates and implement-eval hidden commands use the same Seatbelt boundary. Each launch probes
   its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
-  enforcement raises an operational error, even against a failing baseline. macOS is the only
-  implemented backend for these commands and Claude editors; other platforms fail closed.
+  enforcement raises an operational error, even against a failing baseline. Only a launch our own
+  cancel killed before its marker returns a cancelled (failing) result instead, and only a probe
+  step our own cancel killed rethrows that cancel; a leak or failure the probe showed still raises.
+  macOS is the only implemented backend for these commands and Claude editors; other platforms
+  fail closed.
   A restricted host that forbids nested Seatbelt also fails closed. Tests inject a recording
   backend through factory dependencies, scoped per run with `AsyncLocalStorage` across gates,
   retries and eval preparation/grading; concurrent runs keep separate backends. No environment or

@@ -16,6 +16,7 @@ test("installation selects only explicitly requested rollback and tunnel agents"
       for (const [label, content] of units) {
         expect(content).toContain(`<key>Label</key><string>${label}</string>`);
         expect(content).toContain(`<key>LimitlessService</key><string>${label.split(".").at(-1)}</string>`);
+        expect(content).toContain("<key>LANG</key><string>C.UTF-8</string>");
         expect(content).toContain(
           `<key>StandardOutPath</key><string>${join(homedir(), ".limitless", "logs", `${label}.log`)}</string>`,
         );

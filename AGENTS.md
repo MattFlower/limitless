@@ -253,8 +253,8 @@ finish.
   apply a modifier: with `sha=abc`, `$sha:refs/heads/x` expands to `abcefs/heads/x`, and
   `$rev:src/a` fails with `bad substitution` (redirected output is then just empty). Write
   `"${var}:..."`.
-- launchd starts the daemon without `LANG` or `LC_*`. Homebrew git then asks macOS for the preferred
-  language on every start, which doubles its cost, and its messages follow the owner's macOS
-  language. `test/setup.ts` sets `LANG=C.UTF-8` when no locale is set.
+- launchd sets no locale, so the service units set `LANG=C.UTF-8` (src/cli/service.ts) and
+  `test/setup.ts` sets it when unset. Without one, Homebrew git asks macOS for the preferred language
+  on every start, which doubles its cost, and its messages follow the owner's macOS language.
 - Biome also formats JSON. Run `bunx biome check --write <files>` on anything generated or edited by
   a script.

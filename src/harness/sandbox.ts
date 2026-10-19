@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { launchFailureScan } from "../gates/output.ts";
 import { agentEnv, invocationScratch, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import {
   ancestorReadPolicy,
@@ -115,7 +116,8 @@ export async function verifySeatbelt(
   try {
     await probeSeatbelt(run, executable, platform, roots, signal);
   } catch (error) {
-    if (error instanceof ConfinementError) throw error;
+    // The probe rethrows our cancel's reason only when that cancel, not the probe, stopped it.
+    if (error instanceof ConfinementError || (signal?.aborted && error === signal.reason)) throw error;
     throw new ConfinementError(`Signal confinement preflight failed: ${String(error)}`);
   }
 }
@@ -148,22 +150,41 @@ async function probeSeatbelt(
     throw new ConfinementError(`Write confinement unavailable: ${platform} has no Seatbelt (${executable})`);
   const root = realpathSync(mkdtempSync(join(tmpdir(), "limitless-seatbelt-")));
   const allowed = mkdtempSync(join(roots?.write[0] ?? root, "seatbelt-allowed-"));
-  try {
-    const [inside, outside] = [join(allowed, "file"), join(root, "denied")];
-    const proc = await run({
-      cmd: [
-        executable,
-        "-p",
-        seatbeltProfile(roots ?? { write: [allowed], protect: [] }),
-        "/bin/sh",
-        "-c",
-        WRITE_BOTH,
-      ].concat(["sh", inside, outside]),
+  // Our signal first: under a run's process scope, runProcess would throw the scope's reason instead.
+  const step = async (cmd: string[]) => {
+    signal?.throwIfAborted();
+    const launch = launchFailureScan();
+    const result = await run({
+      cmd,
       cwd: root,
       env: agentEnv(),
       timeoutMs: 30_000,
       signal,
+      onRawChunk: launch.observe,
     });
+    return { result, killed: killedByCancel(result) && !launch.failed() };
+  };
+  // Our cancel killed the step before it reached a verdict: surface the cancel. Anything else,
+  // including a step that finished as the cancel arrived, keeps failing closed below.
+  const surfaceCancel = (killed: boolean) => {
+    if (killed) signal?.throwIfAborted();
+  };
+  try {
+    const [inside, outside] = [join(allowed, "file"), join(root, "denied")];
+    const write = await step([
+      executable,
+      "-p",
+      seatbeltProfile(roots ?? { write: [allowed], protect: [] }),
+      "/bin/sh",
+      "-c",
+      WRITE_BOTH,
+      "sh",
+      inside,
+      outside,
+    ]);
+    const proc = write.result;
+    // A write outside the profile is a leak even when our cancel killed the probe afterwards.
+    if (!existsSync(outside)) surfaceCancel(write.killed);
     const wrote = existsSync(inside) && readFileSync(inside, "utf8") === "ok";
     if (
       proc.cancelled ||
@@ -181,13 +202,17 @@ async function probeSeatbelt(
     const profile = seatbeltProfile(roots ?? { write: [allowed], protect: [] });
     for (const file of roots?.denyRead ?? []) {
       if (!existsSync(file)) continue;
-      const read = await run({
-        cmd: [executable, "-p", profile, "/bin/sh", "-c", READ_PROBE, "sh", file],
-        cwd: root,
-        env: agentEnv(),
-        timeoutMs: 30_000,
-        signal,
-      });
+      const { result: read, killed } = await step([
+        executable,
+        "-p",
+        profile,
+        "/bin/sh",
+        "-c",
+        READ_PROBE,
+        "sh",
+        file,
+      ]);
+      surfaceCancel(killed);
       if (
         read.exitCode !== 1 ||
         read.cancelled ||
@@ -196,8 +221,17 @@ async function probeSeatbelt(
       )
         throw new ConfinementError(`Private read confinement not verified: ${file}`);
     }
-    const cmd = ["/bin/sh", "-c", SIGNAL_PROBE, "sh", executable, profile, join(allowed, "ready")];
-    const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 30_000, signal });
+    const signals = await step([
+      "/bin/sh",
+      "-c",
+      SIGNAL_PROBE,
+      "sh",
+      executable,
+      profile,
+      join(allowed, "ready"),
+    ]);
+    surfaceCancel(signals.killed);
+    const p = signals.result;
     // An interrupted probe is inconclusive even when its marker was printed.
     if (
       p.exitCode !== 0 ||
@@ -252,8 +286,14 @@ export async function runSandboxed(
   const lineLimit = opts.maxLineLength ?? Infinity;
   const forwardLine = (line: string, onLine?: (line: string) => void) =>
     onLine?.(line.length > lineLimit ? `${line.slice(0, lineLimit)} [truncated]` : line);
+  // Raw streams, before redaction and tail cuts, as gate classification scans them.
+  const launch = launchFailureScan();
   const payload: ProcOptions = {
     ...opts,
+    onRawChunk: (chunk, stream) => {
+      launch.observe(chunk, stream);
+      opts.onRawChunk?.(chunk, stream);
+    },
     // The startup token must fit even when candidate output has a smaller cap.
     maxLineLength: Math.max(lineLimit, token.length),
     cmd: [
@@ -274,12 +314,28 @@ export async function runSandboxed(
     onStderrLine: (line) => forwardLine(line, opts.onStderrLine),
   };
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
-  if (!started)
+  if (!started) {
+    // Our cancel stopped the launch before the trusted shell ran, so the payload never did.
+    if (killedByCancel(result) && !launch.failed()) return result;
     throw new ConfinementError(
       `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
     );
+  }
   return { ...result, stdout: result.stdout.replace(`${token}\n`, "") };
 }
+
+/**
+ * A cancel's termination freezes, then SIGKILLs the invocation (`runProcess`), and `cancelKilled`
+ * records that the cancel began it while the child still ran. An exit, a timeout, another signal,
+ * a child that was already dead or a Seatbelt diagnostic is a failed launch even with a cancel.
+ */
+const killedByCancel = (result: ProcResult): boolean =>
+  result.cancelled &&
+  result.cancelKilled === true &&
+  !result.timedOut &&
+  !result.idleTimedOut &&
+  result.exitCode === null &&
+  result.signal === "SIGKILL";
 
 /** Keep installed toolchains readable; writable package caches belong to the suite scratch. */
 export async function runConfined(

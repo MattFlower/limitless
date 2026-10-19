@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { redactGateOutput } from "../src/gates/output.ts";
+import { sanitizePublication } from "../src/gates/publication.ts";
 import { buildReportRedactor } from "../src/integrations/mcp-change.ts";
 import { renderReportArtifacts } from "../src/pipeline/report.ts";
 import {
@@ -417,3 +418,76 @@ test.each(["``red *owl```", "`red *owl``", "``red *owl`"])(
     );
   },
 );
+
+test("report summaries and cells normalize paths and credentials before clipping and preserve source mappings", () => {
+  const data = `/Users/${"synthetic-owner"}/.factory`;
+  const work = `${data}/work/run`;
+  const secret = "SYNTHETIC_REPORT_CUT_CREDENTIAL_582";
+  registerCredential("report-cut-test", secret);
+  const crossing = (limit: number, path: string) =>
+    `${"x".repeat(limit - 10)} ${path}/a.ts ${secret} ${"tail ".repeat(50)}`;
+  const { report, sources } = renderReportArtifacts(
+    {
+      success: true,
+      runId: "r",
+      prompt: "Public request",
+      state: {
+        implementerReport: crossing(5000, work),
+        spec: {
+          summary: "Public task",
+          assumptions: [],
+          requirements: [],
+          out_of_scope: [],
+          blocking_questions: [],
+          acceptance_criteria: [{ id: "AC-1", criterion: crossing(300, data), how_to_verify: "inspect" }],
+        },
+        lastVerify: {
+          modelId: "verifier",
+          overall: "pass",
+          notes: "",
+          criteria: [{ id: "AC-1", status: "met", evidence: crossing(300, work), publicSummary: "" }],
+        },
+        lastGates: [
+          {
+            name: "test",
+            verdict: "pass",
+            blocking: false,
+            result: {
+              name: "test",
+              ok: true,
+              command: crossing(300, work),
+              exitCode: 0,
+              timedOut: false,
+              output: "",
+              durationMs: 1,
+            },
+          },
+        ],
+      },
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    },
+    (text) => sanitizePublication(text, work, data),
+  );
+  for (const text of [report, JSON.stringify(sources)]) {
+    expect(text).not.toContain("/Users/");
+    expect(text).not.toContain(secret);
+  }
+  expect(report).toContain(`${"x".repeat(290)} a.ts [red`);
+  expect(report).toContain(`${"x".repeat(290)} <data>/a`);
+  const structure = reportStructure(report);
+  if (!structure) throw new Error("Invalid report structure");
+  expect(structure.digest).toBe(sources.digest);
+  const clipped = structure.spans.filter((span) => span.clipped);
+  expect(clipped).toHaveLength(4);
+  for (const [index, span] of structure.spans.entries()) {
+    if (!span.clipped) continue;
+    const shown = structure.body.slice(span.start, span.end);
+    const source = sources.sources[index] ?? "";
+    expect(source).toContain("[redacted]");
+    expect(source).toContain("tail tail tail");
+    expect(source).toStartWith(shown.startsWith("`") ? shown.slice(0, -1) : shown);
+    expect(shown.length).toBeLessThanOrEqual(span.kind === "implementer" ? 5000 : 302);
+  }
+});
