@@ -105,6 +105,10 @@ as the same user.
 - **Don't hardcode `/tmp` or `/var/tmp`.** Confined commands get `TMPDIR` pointing into private
   scratch and can't write the system temp directories. Use `os.tmpdir()`/`mkdtemp` in TypeScript and
   `${TMPDIR:-/tmp}` in shell.
+- **Keep scratch output out of the checkout.** Write test logs, reporter files and probe scripts
+  under `$TMPDIR`, never inside the repository: the factory commits the whole worktree after each
+  round and publishes every commit, so a file you delete later still ships in history. A round that
+  committed 9,000 lines of gate output was refused by the private-text check and delivered nothing.
 - **Never use `git stash`.** The stash stack is shared by every worktree of a repository.
 
 ## Isolation, processes and git

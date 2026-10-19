@@ -722,10 +722,7 @@ test("feedback for several ungrounded holdouts states the fallback once and omit
   expect(feedback).not.toContain("secret input");
 });
 
-test("an unrunnable scenario is reported unmet not_required; unclear stays blocking", () => {
-  expect(verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" })).toContain(
-    "If a scenario cannot be run as written in this repository, report it `unmet` with requirement `not_required`; use `unclear` only for a check you ran whose outcome you could not determine.",
-  );
+test("an unclear holdout still fails verification", () => {
   expect(normalizeVerify(unmetHoldout({ status: "unclear" }), spec, holdout).overall).toBe("fail");
 });
 

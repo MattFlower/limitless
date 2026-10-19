@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
@@ -1281,7 +1281,7 @@ async function oneRound(
               "warn",
             );
             // The re-run starts from the committed tree too, not from what the first attempt left behind.
-            await checkoutCommitted(cwd);
+            await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
             after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
             ctx.checkCancelled();
             after = {
@@ -1963,6 +1963,23 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
     ctx.state.lastAudit.some((f) => f.severity === "block")
   )
     throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
+  if (ctx.state.pendingRebaseSha && head === ctx.state.preRebaseHead) {
+    try {
+      const cwd = ctx.state.worktreePath as string;
+      const path = (await mergeGit(cwd, ["rev-parse", "--git-path", "MERGE_HEAD"])).stdout.trim();
+      if (!path) throw new Error("Missing MERGE_HEAD path");
+      try {
+        const mergeHead = readFileSync(resolve(cwd, path), "utf8").replace(/\n$/, "");
+        if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(mergeHead) || mergeHead !== ctx.state.pendingRebaseSha)
+          throw new Error("Unexpected MERGE_HEAD contents");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    } catch {
+      ctx.checkCancelled();
+      throw new DeliveryHeadError(`${reason}; invalid or unreadable pending MERGE_HEAD`);
+    }
+  }
   if (head === expected) return;
   if (environmentBlockedRound(ctx)) throw new DeliveryHeadError(reason);
   for (let current = head; current !== expected; ) {

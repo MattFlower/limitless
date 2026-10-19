@@ -24,6 +24,7 @@ import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
+import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
@@ -141,8 +142,12 @@ const flag=(n)=>args.includes(n);
 if(args[1]==="view" && args.includes("title,body,headRefOid,state")) {
  while(existsSync(file+".hold-view")) await Bun.sleep(10);
 }
+if(args[1]==="view" && args.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt")) {
+ if(existsSync(file+".preflight-error")){ console.error("metadata lookup denied"); process.exit(1); }
+ if(existsSync(file+".preflight")){ console.log(readFileSync(file+".preflight","utf8")); process.exit(0); }
+}
 if(args[0]!=="pr"||args[1]!=="merge"){
- if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({url:args[2],title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",mergedBy:merged&&!existsSync(file+".no-metadata")?{login:"owner"}:null,mergedAt:merged&&!existsSync(file+".no-metadata")?"2026-10-13T12:00:00Z":null,statusCheckRollup:[],headRefName:branch,isCrossRepository:false,...extra}));
+ if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({url:args[2],title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",isDraft:false,mergedBy:merged&&!existsSync(file+".no-metadata")?{login:"owner"}:null,mergedAt:merged&&!existsSync(file+".no-metadata")?"2026-10-13T12:00:00Z":null,statusCheckRollup:[],headRefName:branch,isCrossRepository:false,...extra}));
  process.exit(0);
 }
 if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
@@ -152,7 +157,7 @@ if(existsSync(file+".hang")) await Bun.sleep(600000);
 while(existsSync(file+".hold-merge")) await Bun.sleep(10);
 const pin=args[args.indexOf("--match-head-commit")+1];
 if(pin&&pin!==head()){ console.error("head ref was modified; not merging"); process.exit(1); }
-if(existsSync(file+".reject")){ console.error("Pull request is not mergeable"); process.exit(1); }
+if(existsSync(file+".reject")){ console.error(readFileSync(file+".reject","utf8")||"Pull request is not mergeable"); process.exit(1); }
 writeFileSync(file+".merged-"+pr,"");
 `,
     { mode: 0o755 },
@@ -289,6 +294,7 @@ function queue(
     ciReruns?: boolean;
     start?: boolean;
     gateExecutor?: GateExecutor;
+    gh?: GhRunner;
   } = {},
 ): LandQueue {
   const q = new LandQueue({
@@ -1210,16 +1216,248 @@ test("poller head versions catching up to a base merge do not block CI inspectio
   expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${pushed}`);
 });
 
+test.each([
+  ["draft", "PR is a draft"],
+  ["closed", "PR was closed without merging"],
+  ["missing head", "PR head is missing"],
+  ["empty head", "PR head is missing"],
+  ["moved head", "head moved after approval"],
+  ["failed lookup", "cannot inspect current GitHub PR metadata"],
+  ["invalid JSON", "cannot inspect current GitHub PR metadata"],
+  ["missing state", "cannot inspect current GitHub PR metadata"],
+  ["missing draft", "cannot inspect current GitHub PR metadata"],
+  ["wrong URL", "cannot inspect current GitHub PR metadata"],
+])("fresh PR preflight blocks before any check: %s", async (scenario, reason) => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS"); // A cached eligible head must not bypass the fresh lookup.
+  approve(1, head);
+  const view = {
+    url: scenario === "wrong URL" ? url(2) : url(1),
+    state: scenario === "missing state" ? undefined : scenario === "closed" ? "CLOSED" : "OPEN",
+    isDraft: scenario === "missing draft" ? undefined : scenario === "draft",
+    headRefOid:
+      scenario === "missing head"
+        ? undefined
+        : scenario === "empty head"
+          ? ""
+          : scenario === "moved head"
+            ? "b".repeat(40)
+            : head,
+  };
+  writeFileSync(join(root, "gh.preflight"), scenario === "invalid JSON" ? "{" : JSON.stringify(view));
+  if (scenario === "failed lookup") writeFileSync(join(root, "gh.preflight-error"), "");
+  const gates = fakeLandGates((req) => retryRun(req));
+  const entry = await queue({ gateExecutor: gates.executor }).request({ target: pr.run.id });
+  await settle();
+  const blocked = store.getLandEntry(entry.id);
+  expect(blocked?.state).toBe("blocked");
+  expect(blocked?.reason).toContain(reason);
+  if (!["failed lookup", "invalid JSON", "missing state", "missing draft", "wrong URL"].includes(scenario))
+    expect(blocked?.reason).toBe(reason);
+  if (scenario === "failed lookup") expect(blocked?.reason).toContain("metadata lookup denied");
+  expect(store.readFeed({ limit: 100 }).items.find((item) => item.kind === "land.blocked")).toMatchObject({
+    summary: blocked?.reason,
+    data: { reason: blocked?.reason },
+  });
+  expect(gates.requests).toHaveLength(0);
+  expect(gateLog()).toEqual([]);
+  expect(
+    ghCalls("pr view").filter((call) => call.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt")),
+  ).toHaveLength(1);
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(ghCalls("pr ready")).toEqual([]);
+});
+
+test("a transient fresh PR preflight failure retries and lands", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  let attempts = 0;
+  const gates = fakeLandGates((req) => retryRun(req));
+  const delay = repos.githubRetry.baseDelayMs;
+  repos.githubRetry.baseDelayMs = 1;
+  const q = queue({
+    gateExecutor: gates.executor,
+    gh: async (args, signal) => {
+      if (args.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt")) {
+        attempts++;
+        expect(signal).toBeInstanceOf(AbortSignal);
+        if (attempts === 1) throw new CommandError("HTTP 502", 1, "", "HTTP 502", false);
+      }
+      return (await runGh(args, signal)) ?? "";
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await settle();
+    expect(attempts).toBe(2);
+    expect(gates.requests).toHaveLength(1);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+  } finally {
+    await q.stop();
+    repos.githubRetry.baseDelayMs = delay;
+  }
+});
+
+test("exhausted fresh PR preflight retries report sanitized GitHub unavailability", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const secret = "SYNTHETIC_PREFLIGHT_CREDENTIAL_566";
+  registerCredential("land-preflight-test", secret);
+  // Put the credential across the stored reason's truncation boundary.
+  const diagnostic = `HTTP 502: ${"x".repeat(1895)}${secret}${"y".repeat(2500)}`;
+  let attempts = 0;
+  const gates = fakeLandGates((req) => retryRun(req));
+  const policy = { ...repos.githubRetry };
+  Object.assign(repos.githubRetry, { attempts: 3, budgetMs: 5_000, baseDelayMs: 1 });
+  const q = queue({
+    gateExecutor: gates.executor,
+    gh: async () => {
+      attempts++;
+      throw new CommandError(diagnostic, 1, "", diagnostic, false);
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await settle();
+    const reason =
+      `cannot inspect current GitHub PR metadata: Error: GitHub unavailable: HTTP 502: ${"x".repeat(1895)}[redacted]${"y".repeat(2500)}`.slice(
+        0,
+        2000,
+      );
+    expect(attempts).toBe(3);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason });
+    const blocked = store.readFeed({ limit: 100 }).items.find((item) => item.kind === "land.blocked");
+    expect(blocked).toMatchObject({ summary: reason.slice(0, 500), data: { reason } });
+    expect(reason).toContain("[redacted]");
+    expect(JSON.stringify([blocked, landLog, store.getLandEntry(entry.id)])).not.toContain(secret);
+    expect(gates.requests).toHaveLength(0);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    await q.stop();
+    Object.assign(repos.githubRetry, policy);
+  }
+});
+
+test.each([
+  { action: "cancel", response: "eligible" },
+  { action: "claim lost", response: "eligible" },
+  { action: "cancel", response: "error" },
+  { action: "claim lost", response: "error" },
+])("a pending fresh PR preflight retry respects $action on $response", async ({ action, response }) => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
+  const pending = Promise.withResolvers<string>();
+  const gates = fakeLandGates((req) => retryRun(req));
+  let attempts = 0;
+  const delay = repos.githubRetry.baseDelayMs;
+  repos.githubRetry.baseDelayMs = 1;
+  const q = queue({
+    gateExecutor: gates.executor,
+    gh: async (_args, signal) => {
+      attempts++;
+      if (attempts === 1) throw new CommandError("HTTP 502", 1, "", "HTTP 502", false);
+      entered.resolve(signal);
+      return pending.promise;
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    const signal = await entered.promise;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    if (action === "cancel") {
+      expect(q.cancel(entry.id)).toBe(true);
+      expect(signal?.aborted).toBe(true);
+    } else {
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    }
+    const before = claimSnapshot(entry);
+    if (response === "error") pending.reject(new CommandError("lookup denied", 1, "", "denied", false));
+    else pending.resolve(JSON.stringify({ url: url(1), state: "OPEN", isDraft: false, headRefOid: head }));
+    await waitWithoutClock(() => clock.pending === 0);
+    expect(claimSnapshot(entry)).toEqual(before);
+    expect(attempts).toBe(2);
+    expect(gates.requests).toHaveLength(0);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    pending.resolve("{}");
+    await q.stop();
+    repos.githubRetry.baseDelayMs = delay;
+  }
+});
+
+test("a PR merged outside the queue is recorded as landed before any check", async () => {
+  const pr = delivered(1, "pr-1");
+  store.updateRun(pr.run.id, { status: "needs_human" });
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  writeFileSync(join(root, "gh.merged-1"), "");
+  const gates = fakeLandGates((req) => retryRun(req));
+  const entry = await queue({ gateExecutor: gates.executor }).request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "landed",
+    reason: `merged ${head.slice(0, 12)}`,
+  });
+  expect(store.getRun(pr.run.id)).toMatchObject({ status: "resolved", merged: true, mergedBy: "owner" });
+  expect(gates.requests).toHaveLength(0);
+  expect(gateLog()).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a PR merged outside the queue at another head blocks before any check", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  writeFileSync(
+    join(root, "gh.preflight"),
+    JSON.stringify({ url: url(1), state: "MERGED", isDraft: false, headRefOid: "b".repeat(40) }),
+  );
+  const gates = fakeLandGates((req) => retryRun(req));
+  const entry = await queue({ gateExecutor: gates.executor }).request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: "merged PR head is missing or differs from the pushed SHA",
+  });
+  expect(store.getRun(pr.run.id)?.merged).toBe(false);
+  expect(gates.requests).toHaveLength(0);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
 test("a rejected merge blocks, arms no auto-merge, and a later head never lands", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head);
   approve(1, head);
-  writeFileSync(join(root, "gh.reject"), "");
+  const secret = "SYNTHETIC_MERGE_CREDENTIAL_566";
+  registerCredential("land-merge-test", secret);
+  const diagnostic = `Pull request is not mergeable: ${"x".repeat(1940)}${secret}${"y".repeat(2500)}`;
+  writeFileSync(join(root, "gh.reject"), diagnostic);
   const q = queue();
   const entry = await q.request({ target: pr.run.id });
   await settle();
-  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "merge failed" });
+  const reason =
+    `merge failed: Pull request is not mergeable: ${"x".repeat(1940)}[redacted]${"y".repeat(2500)}`.slice(
+      0,
+      2000,
+    );
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason });
+  const blocked = store.readFeed({ limit: 100 }).items.find((item) => item.kind === "land.blocked");
+  expect(blocked).toMatchObject({ summary: reason.slice(0, 500), data: { reason } });
+  expect(landLog).toContain(`[land] ${entry.id} blocked: ${reason}`);
+  expect(JSON.stringify([blocked, landLog, store.getLandEntry(entry.id)])).not.toContain(secret);
   expect(ghCalls("pr merge").some((c) => c.includes("--auto"))).toBe(false);
   expect(autoArmed()).toBe(false);
   expect(ghCalls("pr merge").at(-1)).toContain("--disable-auto");
@@ -1841,56 +2079,77 @@ test("a restart during merging takes an already merged PR as landed without merg
   }
 });
 
-test.each(["different head", "missing head", "failed lookup", "missing state", "wrong URL", "closed PR"])(
-  "recovery blocks a stale green snapshot after a fresh %s",
-  async (scenario) => {
-    const pr = delivered(1, "pr-1");
-    store.updateRun(pr.run.id, { status: "needs_human" });
-    const head = await pushBranch("pr-1", "one.txt", "one\n");
-    observe(1, head, "SUCCESS");
-    const saved = store.githubPrData(url(1));
-    ci = () => null;
-    const entry = store.createLandEntry({
-      runId: pr.run.id,
-      repo: SLUG,
-      prUrl: url(1),
-      baseBranch: "main",
-      headBranch: "pr-1",
-      approvedSha: head,
-    });
-    store.updateLandEntry(entry.id, { state: "checking", pushedSha: head, attempts: 1 });
-    let reads = 0;
-    queue({
-      client: async () => {
-        reads++;
-        if (scenario === "failed lookup") throw new Error("lookup failed");
-        return {
-          url: scenario === "wrong URL" ? url(2) : url(1),
-          state: scenario === "missing state" ? "" : scenario === "closed PR" ? "CLOSED" : "MERGED",
-          headRefOid:
-            scenario === "missing head" ? undefined : scenario === "closed PR" ? head : "b".repeat(40),
-          mergedAt: null,
-          mergedBy: null,
-          ci: "SUCCESS",
-          failing: [],
-        };
-      },
-    });
-    await settle();
-    expect(reads).toBe(1);
-    expect(store.githubPrData(url(1))).toBe(saved);
-    expect(store.getLandEntry(entry.id)).toMatchObject({
-      state: "blocked",
-      reason: ["different head", "missing head"].includes(scenario)
-        ? "merged PR head is missing or differs from the pushed SHA"
-        : scenario === "closed PR"
+test.each([
+  "different head",
+  "missing head",
+  "open missing head",
+  "open empty head",
+  "failed lookup",
+  "missing state",
+  "wrong URL",
+  "closed PR",
+  "closed moved head",
+])("recovery blocks a stale green snapshot after a fresh %s", async (scenario) => {
+  const pr = delivered(1, "pr-1");
+  store.updateRun(pr.run.id, { status: "needs_human" });
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  const saved = store.githubPrData(url(1));
+  ci = () => null;
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "checking", pushedSha: head, attempts: 1 });
+  let reads = 0;
+  queue({
+    client: async () => {
+      reads++;
+      if (scenario === "failed lookup") throw new Error("lookup failed");
+      return {
+        url: scenario === "wrong URL" ? url(2) : url(1),
+        state: scenario.startsWith("open")
+          ? "OPEN"
+          : scenario === "missing state"
+            ? ""
+            : scenario.startsWith("closed")
+              ? "CLOSED"
+              : "MERGED",
+        headRefOid: scenario.includes("missing head")
+          ? undefined
+          : scenario === "open empty head"
+            ? ""
+            : scenario === "closed PR"
+              ? head
+              : "b".repeat(40),
+        mergedAt: null,
+        mergedBy: null,
+        ci: "SUCCESS",
+        failing: [],
+      };
+    },
+  });
+  await settle();
+  expect(reads).toBe(1);
+  expect(store.githubPrData(url(1))).toBe(saved);
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: ["different head", "missing head"].includes(scenario)
+      ? "merged PR head is missing or differs from the pushed SHA"
+      : scenario.startsWith("open")
+        ? "PR head is missing"
+        : scenario.startsWith("closed")
           ? "PR was closed without merging"
           : "cannot confirm current GitHub merge state",
-    });
-    expect(store.getRun(pr.run.id)).toMatchObject({ status: "needs_human", merged: false });
-    expect(ghCalls("pr merge")).toEqual([]);
-  },
-);
+  });
+  expect(store.getRun(pr.run.id)).toMatchObject({ status: "needs_human", merged: false });
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(gateLog()).toEqual([]);
+});
 
 test.each(["cancel", "shutdown", "claim lost"])(
   "a late fresh recovery observation respects %s",

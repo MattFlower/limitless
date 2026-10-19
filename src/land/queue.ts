@@ -30,6 +30,7 @@ import {
   remoteBranchSha,
   removeWorktree,
   squashTitle,
+  withGitHubRetry,
 } from "../git/repos.ts";
 import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
@@ -402,7 +403,7 @@ export class LandQueue {
       const fresh = await this.mergeMetadata(entry.prUrl, signal);
       signal.throwIfAborted();
       this.assertClaim(entry.id);
-      if (fresh?.url === entry.prUrl && fresh.headRefOid === entry.pushedSha && fresh.state === "CLOSED")
+      if (fresh?.url === entry.prUrl && fresh.state === "CLOSED")
         throw new LandBlocked("PR was closed without merging");
       if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
         throw new LandBlocked("cannot confirm current GitHub merge state");
@@ -411,9 +412,51 @@ export class LandQueue {
         await this.discard(repo, this.worktreePath(entry));
         return;
       }
+      if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
       if (headMoved(fresh.headRefOid ?? "", entry.pushedSha, entry.approvedSha))
         throw new LandBlocked("head moved after approval");
     }
+    const preflight = z.object({
+      url: z.literal(entry.prUrl),
+      state: z.enum(["OPEN", "CLOSED", "MERGED"]),
+      isDraft: z.boolean(),
+      headRefOid: z.string().nullish(),
+      mergedBy: z.object({ login: z.string() }).nullish(),
+      mergedAt: z.string().nullish(),
+    });
+    let fresh: z.infer<typeof preflight>;
+    try {
+      const json = await withGitHubRetry(
+        async () =>
+          (this.deps.gh ?? runGh)(
+            ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid,mergedBy,mergedAt"],
+            signal,
+          ),
+        { signal },
+      );
+      fresh = preflight.parse(JSON.parse(String(json)));
+    } catch (error) {
+      throw new LandBlocked(`cannot inspect current GitHub PR metadata: ${String(error)}`);
+    }
+    signal.throwIfAborted();
+    this.assertClaim(entry.id);
+    if (fresh.state === "CLOSED") throw new LandBlocked("PR was closed without merging");
+    // A PR merged outside the queue is recorded as landed when it merged the approved head.
+    if (fresh.state === "MERGED") {
+      this.landed(entry, repo, entry.approvedSha, {
+        ...fresh,
+        head: fresh.headRefOid ?? "",
+        ci: null,
+        failing: [],
+      });
+      await this.discard(repo, this.worktreePath(entry));
+      return;
+    }
+    // Approval does not publish a draft as ready for review.
+    if (fresh.isDraft) throw new LandBlocked("PR is a draft");
+    if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
+    if (headMoved(fresh.headRefOid, entry.pushedSha ?? entry.approvedSha, entry.approvedSha))
+      throw new LandBlocked("head moved after approval");
     if (!entry.baseBranch || entry.baseBranch === entry.headBranch) {
       const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);
       signal.throwIfAborted();
@@ -769,6 +812,7 @@ export class LandQueue {
     if (!merging) return;
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.
+    let failure: string | undefined;
     const outcome = await mergePullRequest(
       entry.prUrl,
       cwd,
@@ -781,13 +825,16 @@ export class LandQueue {
         body: run ? this.reportBody(run) : "",
         auto: false,
         guard: () => this.assertClaim(entry.id),
+        onFailure: (reason) => {
+          failure = reason;
+        },
       },
     );
     signal.throwIfAborted();
     this.assertClaim(entry.id);
     if (outcome !== "merged") {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
-      throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
+      throw new LandBlocked(failure ?? (outcome === "unavailable" ? "GitHub unavailable" : "merge failed"));
     }
     this.landed(entry, repo, sha, null);
     const observed = await this.mergeMetadata(entry.prUrl, signal);
@@ -971,6 +1018,7 @@ export class LandQueue {
   }
 
   private block(id: number, reason: string, conflict = false): void {
+    reason = redactCredentials(reason).slice(0, 2000);
     const current = this.store.getLandEntry(id);
     if (!current || !this.isActive(current)) return;
     this.log(`[land] ${id} blocked: ${reason}`);

@@ -51,6 +51,7 @@ import {
   sh,
 } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 import { testWaits } from "./wait-support.ts";
@@ -641,7 +642,7 @@ exec '${realGit}' "$@"
       });
       expect(result.cancelled).toBe(true);
       expect(writerPid).toBeGreaterThan(0);
-      expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      expectProcessStopped(writerPid ?? 0);
       writerPid = undefined;
       return {
         status: "stuck",
@@ -2375,9 +2376,17 @@ test.each([
   if (scenario === "lookup-failed")
     writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr view", err: "lookup denied" }]));
   try {
-    const outcome = await mergePullRequest(url, root, sha, undefined, undefined, loadPrivateStrings(config));
+    let reason = "";
+    const outcome = await mergePullRequest(url, root, sha, undefined, undefined, loadPrivateStrings(config), {
+      onFailure: (diagnostic) => {
+        reason = diagnostic;
+      },
+    });
     const success = ["clean", "auto", "retry-clean"].includes(scenario);
     expect(outcome).toBe(success ? (fallback ? "auto" : "merged") : "failed");
+    if (scenario.endsWith("moved") || scenario === "invalid") expect(reason).toContain("PR head moved");
+    if (["title", "body", "subject", "auto-body", "auto-subject", "retry-body"].includes(scenario))
+      expect(reason).toContain("PR text contains a private string");
     const calls: string[][] = readFileSync(`${pr}.args`, "utf8")
       .trim()
       .split("\n")

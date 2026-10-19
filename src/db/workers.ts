@@ -167,7 +167,7 @@ export class WorkerStore {
           code: w.state === "pending" ? w.pairing_code : undefined,
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
-          setupWarning: w.setup_warning ?? undefined,
+          setupWarning: c?.updateWarning ?? w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
               ? w.state
@@ -181,6 +181,7 @@ export class WorkerStore {
   }
   heartbeat(w: WorkerRow, c: Capabilities) {
     this.sweep();
+    if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
     this.store.db
       .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
       .run(this.now(), JSON.stringify(c), w.name);
@@ -195,7 +196,7 @@ export class WorkerStore {
           )
           .run(Math.min(this.now() + this.times.lease, j.attempt_deadline_at ?? 0), this.now(), id, w.name);
     }
-    return { cancelled };
+    return { cancelled, ...(this.releaseSha ? { releaseSha: this.releaseSha } : {}) };
   }
   jobs(where: string, ...args: string[]) {
     return this.store.db.query<JobRow, string[]>(`SELECT * FROM gate_jobs WHERE ${where}`).all(...args);

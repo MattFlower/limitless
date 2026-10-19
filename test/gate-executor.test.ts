@@ -36,6 +36,7 @@ import {
   triage,
   waitFor,
 } from "./pipeline-support.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
@@ -798,7 +799,7 @@ test.each(["hook", "purpose", "sha"] as const)(
         await ctx.save();
         const start = executor.start.bind(executor);
         executor.start = (...args) => {
-          expect(() => process.kill(pid, 0)).toThrow();
+          expectProcessStopped(pid);
           expect(gateSlots.snapshot().occupied).toBe(0);
           return start(...args);
         };
@@ -806,13 +807,13 @@ test.each(["hook", "purpose", "sha"] as const)(
         const hooks = {
           onResult() {
             if (reason === "hook") throw failure;
-            expect(() => process.kill(pid, 0)).toThrow();
+            expectProcessStopped(pid);
           },
         };
         const attempt = runGateExecution(ctx, "gates", "initial", fixture.repoDir, gates, hooks);
         if (reason === "hook") await expect(attempt).rejects.toBe(failure);
         else expect((await attempt).checks[0]?.ok).toBe(true);
-        expect(() => process.kill(pid, 0)).toThrow();
+        expectProcessStopped(pid);
         expect(gateSlots.snapshot().occupied).toBe(0);
         expect(f.store.getRunState<RunState>(ctx.run.id)?.gateExecution).toBeUndefined();
       } finally {
@@ -1134,7 +1135,9 @@ test.each(["injected", "local"])("landing checks log setup and check events once
       ci: "SUCCESS",
       failing: [],
     }),
-    gh: async () => {
+    gh: async (args) => {
+      if (args.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt"))
+        return JSON.stringify({ url: prUrl, state: "OPEN", isDraft: false, headRefOid: sha });
       throw new Error("Unexpected GitHub call");
     },
     log: (message) => {

@@ -192,9 +192,84 @@ test("loopback server", () => {
   });
 }
 
-// Which verdicts retry (an unclear row never; a not_required holdout doesn't prevent it) and the
-// feedback they produce are unit-tested with blockedOnly and formatVerifyFeedback.
-for (const scenario of ["blocked", "passes", "retry-unmet", "initial-unmet", "no-alternative"] as const) {
+test("Linux checks skipped on simulated macOS deliver an environment-blocked round", async () => {
+  process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
+  mkdirSync(join(repoDir, "test"));
+  writeFileSync(
+    join(repoDir, "test/linux.test.ts"),
+    `import { expect, test } from "bun:test";
+const platform = () => "darwin"; // Simulate macOS on either host platform.
+test("fixture loads", () => expect(true).toBe(true));
+test.skipIf(platform() !== "linux")("Linux wrapper", () => expect(platform()).toBe("linux"));
+`,
+  );
+  const command = "bun test test/linux.test.ts";
+  writeFileSync(
+    join(repoDir, ".limitless.toml"),
+    `[gates]\nchecks = [{ name = "test", run = "${command}" }]\n`,
+  );
+  await sh(["git", "add", "."], { cwd: repoDir });
+  await sh(["git", "commit", "-qm", "platform gate fixture"], { cwd: repoDir });
+  const platformSpec = {
+    ...spec,
+    acceptance_criteria: [{ id: "AC-1", criterion: "Linux tests pass", how_to_verify: command }],
+  };
+  const evidence = `${command}: 1 pass, 1 skip. Inspected test/linux.test.ts:4: platform() !== "linux" guard skips on the simulated current macOS (darwin) host; required platform is Linux (linux). Linux verification is still needed; CI has not been observed.`;
+  let implementations = 0;
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: platformSpec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify")
+      return {
+        structured: {
+          ...pass,
+          overall: "fail",
+          criteria: pass.criteria.map((c) =>
+            c.id === "AC-1" ? { ...c, status: "blocked", blockedReason: "environment", evidence } : c,
+          ),
+        },
+      };
+    implementations++;
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  const run = await f.createRun({
+    repo: repoDir,
+    prompt: "Add farewell and verify Linux tests",
+    profile: "standard",
+  });
+  expect(await waitFor(f, run.id, ["succeeded", "needs_human", "failed"])).toBe("needs_human");
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(implementations).toBe(1);
+  expect(state?.round).toBe(0);
+  expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
+  expect(f.store.getRun(run.id)?.error).not.toContain("Still failing after");
+  expect(state?.lastGates?.[0]?.result.output).toContain("1 skip");
+  expect(state?.deliveryComplete).toBe(true);
+  expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+  for (const result of state?.verifyResults ?? []) {
+    expect(result.criteria[0]).toMatchObject({ status: "blocked", blockedReason: "environment", evidence });
+    expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+  }
+  expect(f.store.getArtifact(run.id, "verify-0.json")).toContain('"blockedReason": "environment"');
+  const report = f.store.getArtifact(run.id, "report.md") ?? "";
+  expect(report).toContain("🚧 blocked AC-1");
+  expect(report).toContain(evidence);
+  expect(report).not.toContain("Factory gate test passed");
+  expect(report).not.toContain("✅ AC-1");
+});
+
+for (const scenario of [
+  "blocked",
+  "passes",
+  "retry-unmet",
+  "initial-unmet",
+  "initial-unclear",
+  "mixed-unclear",
+  "no-alternative",
+] as const) {
   test(`environment verification retry: ${scenario}`, async () => {
     const verifierModels: string[] = [];
     const scratchPaths: string[] = [];
@@ -220,10 +295,14 @@ for (const scenario of ["blocked", "passes", "retry-unmet", "initial-unmet", "no
         verifierModels.push(s.target.modelId);
         const n = verifierModels.length;
         if (scenario === "no-alternative") f.tracker.blockModel("alpha/m", "unavailable alternative");
-        if ((scenario === "passes" && n === 2) || n === 3 || (scenario === "initial-unmet" && n === 2))
+        if (
+          (["passes", "initial-unmet", "initial-unclear", "mixed-unclear"].includes(scenario) && n === 2) ||
+          n === 3
+        )
           return { structured: pass };
         const actionable =
-          (scenario === "initial-unmet" && n === 1) || (scenario === "retry-unmet" && n === 2);
+          (["initial-unmet", "mixed-unclear"].includes(scenario) && n === 1) ||
+          (scenario === "retry-unmet" && n === 2);
         return {
           structured: {
             ...pass,
@@ -232,12 +311,23 @@ for (const scenario of ["blocked", "passes", "retry-unmet", "initial-unmet", "no
               c.id === "AC-1"
                 ? {
                     ...c,
-                    status: "blocked",
-                    evidence: "Ran bun test: EPERM creating fixture directory",
+                    status: scenario === "initial-unclear" ? "unclear" : "blocked",
+                    blockedReason: scenario === "mixed-unclear" ? "environment" : null,
+                    evidence:
+                      scenario === "initial-unclear"
+                        ? "Missing evidence: farewell.txt contents were not inspected"
+                        : scenario === "mixed-unclear"
+                          ? "Linux-only tests skipped on macOS: platform guard requires Linux"
+                          : "Ran bun test: EPERM creating fixture directory",
                     publicSummary: "",
                   }
                 : c.id === "H-1" && actionable
-                  ? { ...c, status: "unmet", evidence: "Observed wrong output", publicSummary: "" }
+                  ? {
+                      ...c,
+                      status: scenario === "mixed-unclear" ? "unclear" : "unmet",
+                      evidence: "Observed wrong output",
+                      publicSummary: "",
+                    }
                   : c,
             ),
           },
@@ -252,7 +342,9 @@ for (const scenario of ["blocked", "passes", "retry-unmet", "initial-unmet", "no
       scenario === "blocked" || scenario === "no-alternative" ? "needs_human" : "succeeded",
     );
     const state = f.store.getRunState<RunState>(run.id);
-    const actionable = scenario === "retry-unmet" || scenario === "initial-unmet";
+    const actionable = ["retry-unmet", "initial-unmet", "initial-unclear", "mixed-unclear"].includes(
+      scenario,
+    );
     expect(implementationPrompts).toHaveLength(actionable ? 2 : 1);
     expect(state?.round).toBe(actionable ? 1 : 0);
     expect(state?.roundsOnImplementer).toBe(actionable ? 1 : 0);
@@ -277,7 +369,15 @@ for (const scenario of ["blocked", "passes", "retry-unmet", "initial-unmet", "no
     }
     if (actionable) {
       const feedback = implementationPrompts[1]?.split("### Checks not met")[1] ?? "";
-      expect(feedback).toContain("H-1");
+      expect(feedback).toContain(scenario === "initial-unclear" ? "AC-1" : "H-1");
+      if (scenario === "initial-unclear" || scenario === "mixed-unclear")
+        expect(feedback).toContain("(unclear)");
+      if (scenario === "initial-unclear") expect(feedback).toContain("Missing evidence");
+      if (scenario === "mixed-unclear") {
+        expect(feedback).not.toContain("AC-1");
+        expect(feedback).not.toContain("Linux");
+        expect(state?.verifyResults?.[0]?.criteria[0]?.status).toBe("blocked");
+      }
       expect(feedback).not.toContain("EPERM");
       expect(feedback).not.toContain("cat farewell.txt");
     }
