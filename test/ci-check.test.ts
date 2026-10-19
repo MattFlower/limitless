@@ -1,6 +1,15 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { agentEnv, sh } from "../src/util/proc.ts";
@@ -110,15 +119,18 @@ linuxTest(
 );
 
 test("CI file-start markers bypass parallel Bun buffering and are opt-in", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "ci-test-start-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "ci-test-start-")));
   const marker = join(dir, "starts");
+  const pidFile = join(dir, "hang.pid");
   const setup = resolve("test/setup.ts");
   try {
     writeFileSync(join(dir, "bunfig.toml"), "");
     writeFileSync(join(dir, "ok.test.ts"), 'import { test } from "bun:test"; test("ok", () => {});');
     writeFileSync(
       join(dir, "hang.test.ts"),
-      'import { test } from "bun:test"; test("hang", () => Bun.sleep(60000), 120000);',
+      `import { test } from "bun:test"; import { writeFileSync } from "node:fs";
+       writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+       test("hang", () => Bun.sleep(60000), 120000);`,
     );
     for (const enabled of [false, true]) {
       writeFileSync(marker, "");
@@ -143,12 +155,16 @@ test("CI file-start markers bypass parallel Bun buffering and are opt-in", async
       }
     }
     if (process.platform === "linux") {
+      const stderr = join(dir, "stderr");
+      // sh() captures stderr with a socket, which Linux cannot reopen via /proc (ENXIO).
+      // Give the step shell a real log fd so the preload reaches the hang, as it does in CI.
       const result = await sh(
         [
           "bash",
           "-c",
-          'export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"; bash "$@"',
+          'exec 2>>"$1"; shift; export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"; bash "$@"',
           "fixture",
+          stderr,
           wrapper,
           "1s",
           process.execPath,
@@ -158,11 +174,16 @@ test("CI file-start markers bypass parallel Bun buffering and are opt-in", async
           setup,
           dir,
         ],
-        { cwd: dir, env: agentEnv({ CI_CHECK_GRACE: "1s" }), allowFail: true },
+        { cwd: dir, env: agentEnv({ CI_CHECK_GRACE: "1s" }), allowFail: true, timeoutMs: 10_000 },
       );
-      expect(result.exitCode).toBe(137);
-      expect(result.stderr).toContain(`[test:start] ${join(dir, "hang.test.ts")}`);
-      expect(result.stdout).toContain("CI check timed out");
+      const diagnostics = readFileSync(stderr, "utf8");
+      expect(result.exitCode, result.stdout + result.stderr + diagnostics).toBe(137);
+      expect(diagnostics).toContain(`[test:start] ${join(dir, "hang.test.ts")}`);
+      expect(diagnostics).toContain(`[test:start] ${join(dir, "ok.test.ts")}`);
+      expect(result.stdout).toContain("runner process tree (PID PPID COMMAND)");
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(result.stdout).toMatch(new RegExp(`\\b${pid}\\s+\\d+\\s+`));
+      expect(stopped(pid)).toBe(true);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
