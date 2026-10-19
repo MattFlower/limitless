@@ -184,7 +184,7 @@ export async function executeRun(
       killGraceMs: 100,
       children: new Map(),
       scratchDirs: new Set(),
-      cleanup: { store: deps.store, runId },
+      cleanup: { store: deps.store, runId, worktreePath: () => ctx.state.worktreePath },
     },
     () =>
       confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>

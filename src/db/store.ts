@@ -432,14 +432,14 @@ export class Store {
 
   recordProcessCleanup(record: ProcessCleanupRecord): void {
     this.db
-      .query("INSERT OR IGNORE INTO process_cleanups VALUES (?, ?, ?, ?, ?)")
-      .run(record.runId, record.invocation, record.cwd, record.pid, record.birth);
+      .query("INSERT OR IGNORE INTO process_cleanups VALUES (?, ?, ?, ?, ?, ?)")
+      .run(record.runId, record.invocation, record.cwd, record.pid, record.birth, record.boot);
   }
 
   pendingProcessCleanups(): ProcessCleanupRecord[] {
     return this.db
       .query<ProcessCleanupRecord, []>(
-        "SELECT run_id AS runId, invocation, cwd, pid, birth FROM process_cleanups",
+        "SELECT run_id AS runId, invocation, cwd, pid, birth, boot FROM process_cleanups",
       )
       .all();
   }

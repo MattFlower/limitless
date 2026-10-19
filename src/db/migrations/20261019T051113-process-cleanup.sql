@@ -4,5 +4,6 @@ CREATE TABLE process_cleanups (
   cwd TEXT NOT NULL,
   pid INTEGER NOT NULL,
   birth TEXT NOT NULL,
-  PRIMARY KEY (invocation, pid, birth)
+  boot TEXT NOT NULL,
+  PRIMARY KEY (invocation, pid, birth, boot)
 );

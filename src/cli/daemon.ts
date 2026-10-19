@@ -33,14 +33,6 @@ export async function startDaemon(
     if (failure?.status === "rejected") throw failure.reason;
   };
   try {
-    // An unresolved record blocks only its run and checkout; executeRun and runProcess retry recovery.
-    for (const runId of new Set(factory.store.pendingProcessCleanups().map((r) => r.runId))) {
-      await recoverProcessCleanups(factory.store, runId).catch((error: unknown) => {
-        const message = redactCredentials((error as Error).message);
-        console.error(`[cleanup] ${message}`);
-        factory.store.addEvent({ runId, type: "error", level: "error", message });
-      });
-    }
     for (const [dir, files] of [
       ["worker-tls", ["key.pem"]],
       ["worker", ["token", "key.pem", "coordinator-fingerprint"]],
@@ -61,6 +53,16 @@ export async function startDaemon(
       serve,
       credential,
     );
+    // Health is available while recovery runs; per-run barriers still guard every command.
+    void (async () => {
+      for (const runId of new Set(factory.store.pendingProcessCleanups().map((r) => r.runId))) {
+        await recoverProcessCleanups(factory.store, runId).catch((error: unknown) => {
+          const message = redactCredentials((error as Error).message);
+          console.error(`[cleanup] ${message}`);
+          factory.store.addEvent({ runId, type: "error", level: "error", message });
+        });
+      }
+    })();
     factory.start();
     return { integrations, server: { ...server, stop } };
   } catch (error) {

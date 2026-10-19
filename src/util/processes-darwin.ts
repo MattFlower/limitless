@@ -114,6 +114,16 @@ export function hiddenDarwinProcessMember(
   );
 }
 
+export function darwinBootIdentity(): string {
+  const mib = new Int32Array([1, 21]); // CTL_KERN, KERN_BOOTTIME
+  const boot = new Uint8Array(16);
+  const size = new BigUint64Array([BigInt(boot.byteLength)]);
+  if (symbols.sysctl(ptr(mib), mib.length, ptr(boot), ptr(size), null, 0) !== 0 || size[0] !== 16n)
+    throw new Error("Boot identity could not be confirmed");
+  const view = new DataView(boot.buffer);
+  return `${view.getBigInt64(0, true)}:${view.getInt32(8, true)}`;
+}
+
 export function darwinProcessBirth(pid: number, name?: (value: string) => void): string | null {
   const bsd = new Uint8Array(136);
   if (symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength) {
@@ -123,6 +133,7 @@ export function darwinProcessBirth(pid: number, name?: (value: string) => void):
     throw new Error(`Process birth time inspection failed for ${pid} (errno ${errno})`);
   }
   const view = new DataView(bsd.buffer);
+  if (view.getUint32(4, true) === 5 /* SZOMB */) return null;
   name?.(Buffer.from(bsd.subarray(48, 64)).toString("utf8").split("\0")[0] ?? "unknown");
   return `${view.getBigUint64(120, true)}:${view.getBigUint64(128, true)}`;
 }

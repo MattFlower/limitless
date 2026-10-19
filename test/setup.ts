@@ -1,7 +1,17 @@
 import "./git-preload.ts";
+import { beforeEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Confined macOS workers deny kern.boottime. Inject this external inspection for
+// factory tests; recovery failure cases override it through processBootInspection.
+if (process.platform === "darwin") {
+  const inspection = await import("../src/util/processes-darwin.ts");
+  beforeEach(() => {
+    spyOn(inspection, "darwinBootIdentity").mockReturnValue("test-boot");
+  });
+}
 
 // Git in tests sees the global config CI has: an identity and nothing else. A developer's own settings
 // (commit signing, hooks, templates) would otherwise run on every fixture and factory commit, making the

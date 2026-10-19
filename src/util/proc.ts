@@ -3,6 +3,7 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 
@@ -14,7 +15,7 @@ export const processScope = new AsyncLocalStorage<{
   killGraceMs: number;
   children: Map<ChildProcess, Promise<void>>;
   scratchDirs: Set<string>;
-  cleanup?: { store: ProcessCleanupStore; runId: string };
+  cleanup?: { store: ProcessCleanupStore; runId: string; worktreePath?: () => string | undefined };
   terminationError?: ProcessTerminationError;
 }>();
 
@@ -28,6 +29,7 @@ export interface ProcessCleanupRecord {
   cwd: string;
   pid: number;
   birth: string;
+  boot: string;
 }
 
 export interface ProcessCleanupStore {
@@ -51,30 +53,49 @@ async function cleanupLocked<T>(invocation: string, cleanup: () => Promise<T>): 
 export async function recoverProcessCleanups(
   store: ProcessCleanupStore,
   runId?: string,
-  cwd?: string,
+  worktreePath?: string,
 ): Promise<void> {
   const failures: string[] = [];
-  const records = store.pendingProcessCleanups().filter((r) => !runId || r.runId === runId || r.cwd === cwd);
+  const worktree = worktreePath ? realpathSync(worktreePath) : undefined;
+  // Recorded command directories are canonicalized before persistence.
+  const root = worktree?.endsWith(sep) ? worktree : `${worktree}${sep}`;
+  const records = store
+    .pendingProcessCleanups()
+    .filter(
+      (r) => !runId || r.runId === runId || (worktree && (r.cwd === worktree || r.cwd.startsWith(root))),
+    );
   for (const invocation of new Set(records.map((r) => r.invocation))) {
     const record = records.find((r) => r.invocation === invocation);
     try {
       await (cleanups.get(invocation) ??
         cleanupLocked(invocation, async () => {
           const readBirth = processBirthInspection.getStore()?.read ?? processBirth;
+          const boot = await readBootIdentity();
+          const started = performance.now();
+          const signalled: ProcessCleanupRecord[] = [];
+          const errors: string[] = [];
           for (const member of store.pendingProcessCleanups().filter((r) => r.invocation === invocation)) {
-            const started = performance.now();
-            if ((await readBirth(member.pid)) !== member.birth) continue;
+            if (member.boot !== boot) continue;
             try {
+              if ((await readBirth(member.pid)) !== member.birth) continue;
               process.kill(member.pid, "SIGKILL");
+              signalled.push(member);
             } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-            }
-            while ((await readBirth(member.pid)) === member.birth) {
-              if (performance.now() - started >= 10_000)
-                throw new Error(`Recorded process still alive: ${member.pid}`);
-              await Bun.sleep(10);
+              if ((error as NodeJS.ErrnoException).code !== "ESRCH") errors.push((error as Error).message);
             }
           }
+          for (const member of signalled) {
+            try {
+              while ((await readBirth(member.pid)) === member.birth) {
+                if (performance.now() - started >= 10_000)
+                  throw new Error(`Recorded process still alive: ${member.pid}`);
+                await Bun.sleep(10);
+              }
+            } catch (error) {
+              errors.push((error as Error).message);
+            }
+          }
+          if (errors.length) throw new Error(errors.join("; "));
           store.completeProcessCleanup(invocation);
         }));
       if (store.pendingProcessCleanups().some((r) => r.invocation === invocation))
@@ -102,6 +123,19 @@ export const processInspection = new AsyncLocalStorage<
 export const linuxAncestryInspection = new AsyncLocalStorage<(pid: number) => string>();
 const inspectionPlatform = process.platform;
 const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwin.ts") : undefined;
+
+export function processBootIdentity(): string {
+  if (darwin) return darwin.darwinBootIdentity();
+  if (inspectionPlatform === "linux") return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  throw new Error("Boot identity inspection is unsupported on this platform");
+}
+
+export const processBootInspection = new AsyncLocalStorage<() => string | Promise<string>>();
+async function readBootIdentity(): Promise<string> {
+  const boot = await (processBootInspection.getStore() ?? processBootIdentity)();
+  if (!boot?.trim()) throw new Error("Boot identity could not be confirmed");
+  return boot;
+}
 
 function callerAncestors(): Set<number> {
   const readStat = linuxAncestryInspection.getStore();
@@ -315,6 +349,7 @@ export async function processBirth(pid: number, name?: (value: string) => void):
         .slice(row.lastIndexOf(")") + 2)
         .trim()
         .split(/\s+/);
+      if (fields[0] === "Z") return null;
       if (!fields[19]) throw new Error(`Invalid process birth time for ${pid}`);
       return fields[19];
     } catch (error) {
@@ -587,7 +622,7 @@ export async function runProcess(opts: ProcOptions): Promise<ProcResult> {
   const scope = processScope.getStore();
   if (scope?.cleanup) {
     try {
-      await recoverProcessCleanups(scope.cleanup.store, scope.cleanup.runId, realpathSync(opts.cwd));
+      await recoverProcessCleanups(scope.cleanup.store, scope.cleanup.runId, scope.cleanup.worktreePath?.());
     } catch (error) {
       scope.terminationError =
         error instanceof ProcessTerminationError
@@ -611,13 +646,24 @@ export async function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const marker = randomUUID();
     const cleanup = scope?.cleanup;
     const cwd = cleanup ? realpathSync(opts.cwd) : opts.cwd;
-    let ownershipWriteFailed = false;
+    let boot: string | undefined;
     const recordMember = (pid: number, birth: string) => {
       try {
-        cleanup?.store.recordProcessCleanup({ runId: cleanup.runId, invocation: marker, cwd, pid, birth });
+        if (cleanup) {
+          if (!boot) throw new Error("Boot identity could not be confirmed");
+          cleanup.store.recordProcessCleanup({
+            runId: cleanup.runId,
+            invocation: marker,
+            cwd,
+            pid,
+            birth,
+            boot,
+          });
+        }
       } catch (error) {
-        ownershipWriteFailed = true;
-        throw new Error(`Could not persist cleanup ownership for ${pid}`, { cause: error });
+        throw new Error(`Could not persist cleanup ownership for ${pid}: ${(error as Error).message}`, {
+          cause: error,
+        });
       }
     };
     const scratch = invocationScratch.getStore();
@@ -678,6 +724,7 @@ export async function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const terminate = () => {
       shutdown ??= cleanupLocked(marker, async () => {
         try {
+          if (cleanup) boot = await readBootIdentity();
           if (leaderInspectionError) throw leaderInspectionError;
           if (child.pid !== undefined) {
             const killedRunningChild = await stopMarkedProcesses(
@@ -695,23 +742,23 @@ export async function runProcess(opts: ProcOptions): Promise<ProcResult> {
           cleanup?.store.completeProcessCleanup(marker);
         } catch (error) {
           let reason = (error as Error).message;
-          // The direct child is owned too; the error path must obey the same write-before-signal rule.
-          try {
-            if (
-              !ownershipWriteFailed &&
-              child.pid !== undefined &&
-              child.exitCode === null &&
-              child.signalCode === null
-            ) {
+          // The live ChildProcess handle proves ownership even if inspection or persistence failed.
+          if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+            try {
               if (cleanup) {
                 const birth = await (processBirthInspection.getStore()?.read ?? processBirth)(child.pid);
                 if (birth === null) throw new Error("Direct child identity could not be confirmed");
+                boot ??= await readBootIdentity();
                 recordMember(child.pid, birth);
               }
-              child.kill("SIGKILL");
+            } catch (failure) {
+              reason += `; ${(failure as Error).message}`;
             }
-          } catch (failure) {
-            reason += `; ${(failure as Error).message}`;
+            try {
+              if (!child.kill("SIGKILL")) throw new Error("Direct child SIGKILL could not be confirmed");
+            } catch (failure) {
+              reason += `; ${(failure as Error).message}`;
+            }
           }
           terminationError = new ProcessTerminationError(
             redactCredentials(

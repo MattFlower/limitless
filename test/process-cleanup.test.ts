@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +18,8 @@ import {
   ProcessTerminationError,
   processBirth,
   processBirthInspection,
+  processBootIdentity,
+  processBootInspection,
   processInspection,
   processScope,
   recoverProcessCleanups,
@@ -47,6 +50,7 @@ const record = (pid: number, birth = "original", invocation = "invocation"): Pro
   cwd: dir,
   pid,
   birth,
+  boot: processBootIdentity(),
 });
 const command = () => ({
   cmd: ["/bin/sh", "-c", "printf sentinel > sentinel; printf sentinel"],
@@ -90,6 +94,63 @@ test("recovery resolves reused and absent PIDs without signalling replacements",
     expect(store.pendingProcessCleanups()).toEqual([]);
     await recoverProcessCleanups(store);
     expect(kill).not.toHaveBeenCalled();
+  } finally {
+    kill.mockRestore();
+  }
+});
+
+test("a different boot retires matching live identities without signalling", async () => {
+  const writer = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+  const exit = closed(writer);
+  const kill = spyOn(process, "kill").mockImplementation(() => {
+    throw new Error("unexpected signal");
+  });
+  try {
+    const pid = writer.pid;
+    if (pid === undefined) throw new Error("Missing owned PID");
+    const birth = await processBirth(pid);
+    if (birth === null) throw new Error("Missing owned birth");
+    store.recordProcessCleanup({ ...record(pid, birth), boot: "previous-boot" });
+    reopen();
+    expect(store.pendingProcessCleanups()[0]?.boot).toBe("previous-boot");
+    await processBootInspection.run(
+      () => "current-boot",
+      () => recoverProcessCleanups(store),
+    );
+    expect(kill).not.toHaveBeenCalled();
+    expect(await processBirth(pid)).toBe(birth);
+    expect(store.pendingProcessCleanups()).toEqual([]);
+  } finally {
+    kill.mockRestore();
+    writer.kill("SIGKILL");
+    await exit;
+  }
+});
+
+test.each(["throws", "empty"])("unconfirmed boot (%s) stays durable and blocks commands", async (failure) => {
+  store.recordProcessCleanup(record(424246));
+  reopen();
+  const kill = spyOn(process, "kill").mockImplementation(() => {
+    throw new Error("unexpected signal");
+  });
+  try {
+    await processBootInspection.run(
+      () => {
+        if (failure === "throws") throw new Error("boot inspection denied");
+        return "";
+      },
+      () =>
+        processScope.run(scope(), async () => {
+          await expect(runProcess(command())).rejects.toThrow(
+            failure === "throws" ? "boot inspection denied" : "Boot identity could not be confirmed",
+          );
+          await expect(runProcess(command())).rejects.toBeInstanceOf(ProcessTerminationError);
+          expect(existsSync(join(dir, "sentinel"))).toBe(false);
+        }),
+    );
+    expect(kill).not.toHaveBeenCalled();
+    reopen();
+    expect(store.pendingProcessCleanups()).toHaveLength(1);
   } finally {
     kill.mockRestore();
   }
@@ -234,48 +295,226 @@ test.each([false, true])(
   },
 );
 
-test("a failed first ownership write cannot kill the direct child through the error path", async () => {
-  const active = scope();
-  const controller = new AbortController();
-  let pid: number | undefined;
-  const sent: number[] = [];
-  const kill = process.kill.bind(process);
-  const killSpy = spyOn(process, "kill").mockImplementation((target, signal) => {
-    sent.push(target);
-    return kill(target, signal);
-  });
-  const write = spyOn(store, "recordProcessCleanup").mockImplementation(() => {
-    throw new Error("disk unavailable");
-  });
-  try {
-    await processScope.run(active, async () => {
-      await expect(
-        runProcess({
-          cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
-          cwd: dir,
-          env: process.env as Record<string, string>,
-          signal: controller.signal,
-          onStdoutLine(line) {
-            pid = Number(line);
-            controller.abort();
-          },
-        }),
-      ).rejects.toThrow("Could not persist cleanup ownership");
-      expect(pid).toBeGreaterThan(0);
-      expect(sent).not.toContain(pid);
-      expect(await processBirth(pid ?? 0)).not.toBeNull();
-      await expect(runProcess(command())).rejects.toBeInstanceOf(ProcessTerminationError);
+test.each(["write", "null identity", "throwing identity"])(
+  "a live direct child is killed despite %s failure",
+  async (failure) => {
+    const active = scope();
+    const controller = new AbortController();
+    let pid: number | undefined;
+    let childExit: Promise<void> | undefined;
+    let childKill: ReturnType<typeof spyOn<ChildProcess, "kill">> | undefined;
+    const sent: number[] = [];
+    const kill = process.kill.bind(process);
+    const killSpy = spyOn(process, "kill").mockImplementation((target, signal) => {
+      sent.push(target);
+      return kill(target, signal);
     });
-  } finally {
-    killSpy.mockRestore();
-    write.mockRestore();
-    for (const child of active.children.keys()) {
-      const exit = closed(child);
-      child.kill("SIGKILL");
-      await exit;
+    const write = spyOn(store, "recordProcessCleanup").mockImplementation(() => {
+      throw new Error("disk unavailable");
+    });
+    try {
+      await processBirthInspection.run(
+        {
+          read: async (target) => {
+            if (failure === "null identity") return null;
+            if (failure === "throwing identity") throw new Error("birth inspection denied");
+            return processBirth(target);
+          },
+        },
+        () =>
+          processInspection.run(
+            async (environment, marker) => {
+              if (failure === "write")
+                return `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}\n${pid} ${process.getuid?.()} S writer${environment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`;
+              throw new Error("discovery unavailable");
+            },
+            () =>
+              processScope.run(active, async () => {
+                await expect(
+                  runProcess({
+                    cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+                    cwd: dir,
+                    env: process.env as Record<string, string>,
+                    signal: controller.signal,
+                    onStdoutLine(line) {
+                      pid = Number(line);
+                      const child = [...active.children.keys()][0];
+                      if (!child) throw new Error("Missing owned child handle");
+                      childExit = closed(child);
+                      childKill = spyOn(child, "kill");
+                      controller.abort();
+                    },
+                  }),
+                ).rejects.toThrow(
+                  failure === "write"
+                    ? "disk unavailable"
+                    : failure === "null identity"
+                      ? "Direct child identity could not be confirmed"
+                      : "birth inspection denied",
+                );
+                expect(pid).toBeGreaterThan(0);
+                expect(sent).not.toContain(pid);
+                expect(childKill).toHaveBeenCalledWith("SIGKILL");
+                await childExit;
+                const child = [...active.children.keys()][0];
+                if (!child) throw new Error("Missing owned child handle");
+                expect(child.signalCode).toBe("SIGKILL");
+                expect(await processBirth(pid ?? 0)).toBeNull();
+                await expect(runProcess(command())).rejects.toBeInstanceOf(ProcessTerminationError);
+                expect(existsSync(join(dir, "sentinel"))).toBe(false);
+              }),
+          ),
+      );
+    } finally {
+      childKill?.mockRestore();
+      killSpy.mockRestore();
+      write.mockRestore();
+      for (const child of active.children.keys()) {
+        const exit = child.exitCode === null && child.signalCode === null ? closed(child) : Promise.resolve();
+        child.kill("SIGKILL");
+        await exit;
+      }
     }
-  }
-});
+  },
+);
+
+const linuxRecoverySkip = process.platform !== "linux" ? "requires Linux procfs and zombie states" : null;
+test.skipIf(linuxRecoverySkip !== null)(
+  `recovery kills every frozen member before polling (${linuxRecoverySkip ?? "Linux"})`,
+  async () => {
+    const parent = spawn(
+      process.execPath,
+      [
+        "-e",
+        `
+    const { spawn } = require('node:child_process');
+    const child = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+    console.log(child.pid);
+    setInterval(() => {}, 1000);
+  `,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const exit = closed(parent);
+    let childPid: number | undefined;
+    let childBirth: string | null = null;
+    let killSpy: ReturnType<typeof spyOn<typeof process, "kill">> | undefined;
+    parent.stdout?.on("data", (chunk) => {
+      childPid = Number(String(chunk).trim());
+    });
+    try {
+      await waitFor(() => childPid !== undefined);
+      const parentPid = parent.pid;
+      if (parentPid === undefined || childPid === undefined) throw new Error("Missing owned PIDs");
+      const parentBirth = await processBirth(parentPid);
+      childBirth = await processBirth(childPid);
+      if (parentBirth === null || childBirth === null) throw new Error("Missing owned birth");
+      process.kill(parentPid, "SIGSTOP");
+      await waitFor(() => {
+        const stat = readFileSync(`/proc/${parentPid}/stat`, "utf8");
+        return stat.slice(stat.lastIndexOf(")") + 2).startsWith("T");
+      });
+      store.recordProcessCleanup(record(childPid, childBirth));
+      store.recordProcessCleanup(record(parentPid, parentBirth));
+      reopen();
+      const signals: number[] = [];
+      const kill = process.kill.bind(process);
+      killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (pid === childPid || pid === parentPid) {
+          expect(signal).toBe("SIGKILL");
+          signals.push(pid);
+        }
+        return kill(pid, signal);
+      });
+      const reads: number[] = [];
+      await processBirthInspection.run(
+        {
+          read: async (pid) => {
+            if (pid === childPid || pid === parentPid) {
+              reads.push(pid);
+              if (pid === parentPid && signals.length === 1) {
+                await waitFor(() => {
+                  const stat = readFileSync(`/proc/${childPid}/stat`, "utf8");
+                  return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+                });
+                expect(await processBirth(Number(childPid))).toBeNull();
+              }
+              if (reads.length > 2) expect(signals).toEqual([Number(childPid), parentPid]);
+            }
+            return processBirth(pid);
+          },
+        },
+        () =>
+          processScope.run(scope(), async () => {
+            expect((await runProcess(command())).stdout).toBe("sentinel");
+          }),
+      );
+      await exit;
+      expect(signals).toEqual([Number(childPid), parentPid]);
+      expect(await processBirth(childPid)).toBeNull();
+      expect(store.pendingProcessCleanups()).toEqual([]);
+      expect(readFileSync(join(dir, "sentinel"), "utf8")).toBe("sentinel");
+    } finally {
+      killSpy?.mockRestore();
+      if (parent.exitCode === null && parent.signalCode === null) parent.kill("SIGKILL");
+      await exit;
+      if (childPid !== undefined && childBirth !== null && (await processBirth(childPid)) === childBirth)
+        process.kill(childPid, "SIGKILL");
+    }
+  },
+);
+
+test.each(["own", "shared", "inside", "equal", "sibling"])(
+  "command recovery selects %s records using the current worktree",
+  async (location) => {
+    const worktree = join(dir, "worktree");
+    mkdirSync(join(worktree, "subdir"), { recursive: true });
+    const worktreeAlias = join(dir, "worktree-alias");
+    symlinkSync(worktree, worktreeAlias);
+    const sibling = `${worktree}-sibling`;
+    mkdirSync(sibling);
+    const own = location === "own";
+    const member = {
+      ...record(424247),
+      runId: own ? "run" : "other",
+      cwd:
+        location === "inside"
+          ? join(worktree, "subdir")
+          : location === "equal"
+            ? worktree
+            : location === "sibling"
+              ? sibling
+              : dir,
+    };
+    store.recordProcessCleanup(member);
+    const blocked = own || location === "inside" || location === "equal";
+    const active = scope();
+    let currentWorktree: string | undefined;
+    const cleanup = { ...active.cleanup, worktreePath: () => currentWorktree };
+    const reads: number[] = [];
+    await processBirthInspection.run(
+      {
+        read: async (pid) => {
+          if (pid === member.pid) {
+            reads.push(pid);
+            throw new Error("birth inspection denied");
+          }
+          return processBirth(pid);
+        },
+      },
+      () =>
+        processScope.run({ ...active, cleanup }, async () => {
+          // The worktree can be created after the run's process scope.
+          currentWorktree = own ? undefined : worktreeAlias;
+          if (blocked) await expect(runProcess(command())).rejects.toThrow("birth inspection denied");
+          else expect((await runProcess(command())).stdout).toBe("sentinel");
+        }),
+    );
+    expect(existsSync(join(dir, "sentinel"))).toBe(!blocked);
+    expect(reads).toEqual(blocked ? [member.pid] : []);
+    expect(store.pendingProcessCleanups()).toEqual([member]);
+  },
+);
 
 test("a fresh process recovers a crash between freeze and kill before its next command", async () => {
   const procUrl = new URL("../src/util/proc.ts", import.meta.url).href;
@@ -290,8 +529,9 @@ test("a fresh process recovers a crash between freeze and kill before its next c
     `
     import { readFileSync, writeFileSync, existsSync } from 'node:fs';
     import { Store } from ${JSON.stringify(storeUrl)};
-    import { processScope, invocationScratch, runProcess } from ${JSON.stringify(procUrl)};
-    const store = new Store(${JSON.stringify(join(dir, "db.sqlite"))});
+    import { processScope, processBootInspection, invocationScratch, runProcess } from ${JSON.stringify(procUrl)};
+    processBootInspection.enterWith(() => "test-boot");
+      const store = new Store(${JSON.stringify(join(dir, "db.sqlite"))});
     const kill = process.kill.bind(process);
     process.kill = (pid, signal) => {
       const result = kill(pid, signal);
@@ -372,7 +612,8 @@ test("a fresh process recovers a crash between freeze and kill before its next c
       `
       import { writeFileSync } from 'node:fs';
       import { Store } from ${JSON.stringify(storeUrl)};
-      import { processScope, processBirth, processBirthInspection, runProcess } from ${JSON.stringify(procUrl)};
+      import { processScope, processBirth, processBirthInspection, processBootInspection, runProcess } from ${JSON.stringify(procUrl)};
+      processBootInspection.enterWith(() => "test-boot");
       const store = new Store(${JSON.stringify(join(dir, "db.sqlite"))});
       await processBirthInspection.run({ read: async (pid) => {
         const birth = await processBirth(pid);
@@ -415,7 +656,7 @@ test("a fresh process recovers a crash between freeze and kill before its next c
   }
 }, 30_000);
 
-test("startup recovers a cancelled run before integrations and legacy runs still resume", async () => {
+test("startup serves health while cancelled-run recovery is pending and legacy runs still resume", async () => {
   const { fixture } = await import("./mcp-support.ts");
   const { startDaemon } = await import("../src/cli/daemon.ts");
   const { executeRun } = await import("../src/pipeline/engine.ts");
@@ -440,15 +681,46 @@ test("startup recovers a cancelled run before integrations and legacy runs still
     const birth = await processBirth(pid);
     if (birth === null) throw new Error("Missing owned writer identity");
     f.factory.store.recordProcessCleanup({ ...record(pid, birth), runId: run.id });
-    for (let attempt = 0; attempt < 2; attempt++) {
-      daemon = await startDaemon(f.factory, {}, async () => {
-        expect(await processBirth(pid)).toBeNull();
-        expect(f.factory.store.pendingProcessCleanups()).toEqual([]);
-        return { routes: {}, notes: [], stop: async () => {} };
-      });
-      await daemon.server.stop(true);
-      daemon = undefined;
+    const release = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    try {
+      await processBirthInspection.run(
+        {
+          read: async (target) => {
+            if (target === pid) {
+              entered.resolve();
+              await release.promise;
+            }
+            return processBirth(target);
+          },
+        },
+        async () => {
+          daemon = await startDaemon(f.factory, {}, async () => ({
+            routes: {},
+            notes: [],
+            stop: async () => {},
+          }));
+          await entered.promise;
+          expect(f.factory.store.pendingProcessCleanups()).toHaveLength(1);
+          expect((await fetch(`http://127.0.0.1:${daemon.server.port}/api/health`)).status).toBe(200);
+          expect(await processBirth(pid)).toBe(birth);
+          const guarded = processScope.run(
+            { ...scope(run.id), cleanup: { store: f.factory.store, runId: run.id } },
+            () => runProcess(command()),
+          );
+          expect(existsSync(join(dir, "sentinel"))).toBe(false);
+          release.resolve();
+          await guarded;
+          await waitFor(() => f.factory.store.pendingProcessCleanups().length === 0);
+        },
+      );
+    } finally {
+      release.resolve();
     }
+    await daemon?.server.stop(true);
+    daemon = await startDaemon(f.factory, {}, async () => ({ routes: {}, notes: [], stop: async () => {} }));
+    await daemon.server.stop(true);
+    daemon = undefined;
     expect(signals).toEqual([pid]);
     expect(f.factory.store.getRun(run.id)?.status).toBe("cancelled");
     const legacy = await f.factory.createRun({ repo: f.repo, prompt: "legacy resume" });
@@ -488,20 +760,40 @@ test("unresolved startup recovery is reported against its run without stopping t
     f.factory.store.updateRun(run.id, { status: "failed" });
     // Synthetic PID: inspection fails, so nothing is signalled.
     f.factory.store.recordProcessCleanup({ ...record(424245), runId: run.id });
-    await processBirthInspection.run(
-      {
-        read: async () => {
-          throw new Error("birth inspection denied");
+    const release = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    try {
+      await processBirthInspection.run(
+        {
+          read: async () => {
+            entered.resolve();
+            await release.promise;
+            throw new Error("birth inspection denied");
+          },
         },
-      },
-      async () => {
-        daemon = await startDaemon(f.factory, {}, async () => ({
-          routes: {},
-          notes: [],
-          stop: async () => {},
-        }));
-      },
-    );
+        async () => {
+          daemon = await startDaemon(f.factory, {}, async () => ({
+            routes: {},
+            notes: [],
+            stop: async () => {},
+          }));
+          await entered.promise;
+          expect((await fetch(`http://127.0.0.1:${daemon.server.port}/api/health`)).status).toBe(200);
+          expect(f.factory.store.listEvents(run.id).filter((e) => e.level === "error")).toEqual([]);
+          release.resolve();
+          await waitFor(() => f.factory.store.listEvents(run.id).some((e) => e.level === "error"));
+          await processScope.run(
+            { ...scope(run.id), cleanup: { store: f.factory.store, runId: run.id } },
+            async () => {
+              await expect(runProcess(command())).rejects.toThrow("birth inspection denied");
+              expect(existsSync(join(dir, "sentinel"))).toBe(false);
+            },
+          );
+        },
+      );
+    } finally {
+      release.resolve();
+    }
     expect(start).toHaveBeenCalled();
     expect(f.factory.store.pendingProcessCleanups()).toHaveLength(1);
     const events = f.factory.store.listEvents(run.id).filter((e) => e.level === "error");
@@ -511,6 +803,65 @@ test("unresolved startup recovery is reported against its run without stopping t
     await daemon?.server.stop(true);
     start.mockRestore();
     error.mockRestore();
+    await f.close();
+  }
+});
+
+test("executeRun recovers only its own run and checkout records", async () => {
+  const { fixture } = await import("./mcp-support.ts");
+  const { executeRun } = await import("../src/pipeline/engine.ts");
+  const f = await fixture();
+  const worktree = join(dir, "worktree");
+  mkdirSync(join(worktree, "nested"), { recursive: true });
+  mkdirSync(`${worktree}-sibling`);
+  try {
+    for (const location of ["own", "inside", "equal", "shared", "sibling"]) {
+      const run = await f.factory.createRun({ repo: f.repo, prompt: "resume recovery selection" });
+      f.factory.store.setRunState(run.id, {
+        phase: "done",
+        previewConfig: null,
+        slottedCommands: [],
+        answers: [],
+        round: 0,
+        roundsOnImplementer: 0,
+        triedImplementers: [],
+        feedback: null,
+        toolCommands: [],
+        ...(location === "own" ? {} : { worktreePath: worktree }),
+      });
+      const member = {
+        ...record(424248),
+        runId: location === "own" ? run.id : "other",
+        cwd:
+          location === "inside"
+            ? join(worktree, "nested")
+            : location === "equal"
+              ? worktree
+              : location === "sibling"
+                ? `${worktree}-sibling`
+                : dir,
+      };
+      f.factory.store.recordProcessCleanup(member);
+      const blocked = ["own", "inside", "equal"].includes(location);
+      let reads = 0;
+      await processBirthInspection.run(
+        {
+          read: async () => {
+            reads++;
+            throw new Error("birth inspection denied");
+          },
+        },
+        async () => {
+          expect(await executeRun(f.factory.deps, run.id, new AbortController().signal)).toBe(
+            blocked ? "failed" : "succeeded",
+          );
+        },
+      );
+      expect(reads).toBe(blocked ? 1 : 0);
+      expect(f.factory.store.pendingProcessCleanups()).toEqual([member]);
+      f.factory.store.completeProcessCleanup(member.invocation);
+    }
+  } finally {
     await f.close();
   }
 });
