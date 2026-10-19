@@ -35,7 +35,7 @@ verifies it against acceptance criteria and against scenarios the implementer ne
 
 List private hostnames, endpoints, addresses, or other strings in the optional local file `~/.config/limitless/private-strings.txt` (or `$LIMITLESS_CONFIG_DIR/private-strings.txt`), outside repositories.
 Use one literal string per line; surrounding whitespace is trimmed, blank lines and lines starting with `#` are ignored, and matching is case-insensitive.
-Audit, delivery and `land-pr.sh` block publication with redacted diagnostics naming the entry's line number. Missing files have no effect; unreadable files block.
+Audit, delivery and `land-pr.sh` block publication with redacted diagnostics naming the entry's line number. Missing files have no effect; unreadable files block. A hard-linked file blocks too, since its other name could be inside a repository; a symlink to a file outside repositories is fine.
 
 ### The pipeline
 
