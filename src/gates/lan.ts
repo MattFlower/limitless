@@ -70,7 +70,12 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
           events.push(...stored.slice(index));
           index = stored.length;
           if (job.state === "cancelled") throw new Error("LAN gate job cancelled");
-          if (job.state === "done" && job.result) return JSON.parse(job.result) as GateRun;
+          if (job.state === "done" && job.result) {
+            const run = JSON.parse(job.result) as GateRun;
+            const failed = run.setup.find((r) => !r.ok);
+            if (!run.setupOk && failed && workers.fallbackSetup(handle.id, failed.command)) continue;
+            return run;
+          }
           if (job.state === "failed") {
             const request = JSON.parse(job.request) as GateRequest;
             workers.event(handle.id, { type: "status", text: "LAN gates falling back to local execution" });
@@ -86,7 +91,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
               })();
               const [run] = await Promise.all([execution.result, stream]);
               controller.signal.throwIfAborted();
-              workers.complete(handle.id, run, true);
+              if (!workers.complete(handle.id, run, true)) throw new Error("LAN gate job cancelled");
               return workers.sanitize(run);
             };
             return start ? start.context(fallback) : fallback();

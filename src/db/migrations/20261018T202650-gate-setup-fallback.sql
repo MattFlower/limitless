@@ -1,0 +1,1 @@
+ALTER TABLE gate_jobs ADD COLUMN setup_fallback INTEGER NOT NULL DEFAULT 0;
