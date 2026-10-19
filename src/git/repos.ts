@@ -646,7 +646,6 @@ export async function blobPrivateEntries(
   env: Record<string, string> | undefined,
   blobs: string[],
   privateStrings: PrivateStrings,
-  inspect?: (text: string, id: string) => void,
 ): Promise<[string, number][]> {
   const ids = [...new Set(blobs.filter((id) => !/^0*$/.test(id)))];
   // Inspect the object that will be published, never a local replacement.
@@ -666,7 +665,6 @@ export async function blobPrivateEntries(
     at = end + size + 2;
     const lfs = lfsPointer(text);
     const content = lfs ? text + (await lfsPayload(cwd, env, lfs)) : text.includes("\0") ? text : "";
-    inspect?.(lfs ? content : text, id);
     for (const { entry } of privacy.privateMatches(content, privateStrings)) found.push([id, entry]);
   }
   return [...found];
@@ -742,7 +740,7 @@ export async function checkPrivatePublication(
     }
   }
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
-  const diagnose = async (error: unknown): Promise<never> => {
+  const diagnose = async (error: unknown, blob?: [string, number]): Promise<never> => {
     // Keep the aggregate scan authoritative; recover file context only after a refusal.
     for (const [location, args] of [
       ...revisions.map(
@@ -755,23 +753,18 @@ export async function checkPrivatePublication(
     ]) {
       const rawFlags = flags.filter((flag) => !["-p", "--text", "-U0"].includes(flag));
       const { stdout } = await worktreeGit([...args, ...rawFlags], { cwd });
-      const locations = new Map<string, string>();
-      const diagnosticBlobs: string[] = [];
-      for (const match of stdout.matchAll(/:(\d+) (\d+) (\w+) (\w+) [A-Z]\0([^\0]+)\0/g)) {
-        const path = privacy.redactPrivate(redactCredentials(match[5] ?? ""), entries);
-        checkPublicationText(match[5] ?? "", `${location}: ${path}`, []);
-        for (const [mode, id] of [
-          [match[1], match[3]],
-          [match[2], match[4]],
-        ]) {
-          if (mode === "160000" || !id) continue;
-          if (!locations.has(id)) locations.set(id, `${location}: ${path}`);
-          diagnosticBlobs.push(id);
+      for (const match of stdout.matchAll(/:\d+ \d+ \w+ (\w+) [A-Z]\0([^\0]+)\0/g)) {
+        const path = match[2] ?? "";
+        const safePath = privacy.redactPrivate(redactCredentials(path), entries);
+        if (blob) {
+          if (match[1] === blob[0])
+            throw new privacy.PrivateError(privacy.privateReason(`${location}: ${safePath}`, blob[1]));
+          continue;
         }
+        // Diagnose the same U0 patch that failed, excluding unchanged blob content.
+        const patch = await worktreeGit([...args, ...flags, "--", `:(literal)${path}`], { cwd });
+        checkPublicationText(patch.stdout, `${location}: ${safePath}`, []);
       }
-      await blobPrivateEntries(cwd, undefined, diagnosticBlobs, entries, (text, id) =>
-        checkPublicationText(text, locations.get(id) ?? location, []),
-      );
     }
     throw error;
   };
@@ -790,7 +783,7 @@ export async function checkPrivatePublication(
     for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
   }
   const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
-  if (hit) await diagnose(new privacy.PrivateError(privacy.privateReason("Published blob", hit[1])));
+  if (hit) await diagnose(new privacy.PrivateError(privacy.privateReason("Published blob", hit[1])), hit);
 }
 
 /** Checks raw commits and patches (and optionally the index), not the net diff. */

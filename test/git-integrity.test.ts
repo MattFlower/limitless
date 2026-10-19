@@ -3560,6 +3560,45 @@ test.each(["history", "squash", "staged"])(
   },
 );
 
+test.each(["history", "squash", "staged"])(
+  "decoding diagnosis ignores unchanged undecodable fixture lines: %s",
+  async (kind) => {
+    const unsafe = `%${"25".repeat(6)}72`;
+    const fixture = (value: string) => `${unsafe}\n${"context\n".repeat(10)}${value}\n`;
+    writeFileSync(join(work, "fixture.txt"), fixture("old"));
+    await commitAll(work, "existing fixture");
+    const before = await headSha(work);
+    writeFileSync(join(work, "fixture.txt"), fixture("new"));
+    await commitAll(work, "clean fixture edit");
+    const clean = await headSha(work);
+    await checkPrivateRange(work, `${before}..${clean}`, []);
+
+    // Even the offending commit has a clean patch to the existing fixture.
+    writeFileSync(join(work, "fixture.txt"), fixture("newer"));
+    writeFileSync(join(work, "scratch.txt"), unsafe);
+    await stageAll({ cwd: work });
+    if (kind !== "staged") await commitAll(work, "add scratch output");
+    const offending = await headSha(work);
+    if (kind === "history") {
+      rmSync(join(work, "scratch.txt"));
+      await commitAll(work, "delete scratch output");
+    }
+    const error = await (kind === "squash"
+      ? checkPrivatePublication(work, [], {
+          squash: { base: before, head: offending, title: "Clean title", body: "" },
+        })
+      : checkPrivateRange(work, `${before}..HEAD`, [], kind === "staged")
+    ).catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(Error);
+    const message = String(error);
+    expect(message).toContain(kind === "staged" ? "staged" : offending);
+    expect(message).toContain("scratch.txt");
+    expect(message).toContain("decoding limit");
+    expect(message).not.toContain("fixture.txt");
+    expect(message).not.toContain(clean);
+  },
+);
+
 test("squash publication ignores removed PR history with an empty or configured denylist", async () => {
   const unsafe = `%${"25".repeat(6)}72`;
   writeFileSync(join(work, "transient.txt"), unsafe);
@@ -3610,6 +3649,7 @@ test.each(["diff", "blob", "title", "body"])("squash publication checks %s", asy
       },
     });
     await expect(scan).rejects.toThrow(payload === secret ? "entry 1" : "decoding limit");
+    if (location === "blob") await expect(scan).rejects.toThrow("published.dat");
   }
 });
 
