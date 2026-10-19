@@ -54,6 +54,7 @@ import { redactCredentials } from "../util/proc.ts";
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
 class LandConflict extends LandBlocked {}
+class LandClaimLost extends Error {}
 
 /** What one observation says about the PR the entry is landing. */
 export interface LandObservation {
@@ -315,9 +316,14 @@ export class LandQueue {
       await (this.deps.confinement ? confinementScope.run(this.deps.confinement, work) : work());
     } catch (error) {
       // A cancel or a shutdown aborts on purpose: the entry keeps its state for the next start.
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || error instanceof LandClaimLost) return;
       clear(heartbeat);
-      this.block(entry.id, (error as Error).message, error instanceof LandConflict);
+      const blocked = this.store.transaction(() => {
+        if (!this.store.ownsLandClaim(entry.id, this.owner)) return false;
+        this.block(entry.id, (error as Error).message, error instanceof LandConflict);
+        return true;
+      });
+      if (!blocked) return;
       await processConflictTriggers(this.store, this.now, this.deps.gh, signal).catch((error: unknown) => {
         if (!signal.aborted) this.log(redactCredentials(`[conflict] ${String(error)}`));
       });
@@ -341,7 +347,7 @@ export class LandQueue {
     if (entry.pushedSha) {
       const fresh = await this.mergeMetadata(entry.prUrl, signal);
       signal.throwIfAborted();
-      if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) return;
+      this.assertClaim(entry.id);
       if (fresh?.url === entry.prUrl && fresh.headRefOid === entry.pushedSha && fresh.state === "CLOSED")
         throw new LandBlocked("PR was closed without merging");
       if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
@@ -358,7 +364,9 @@ export class LandQueue {
       const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);
       signal.throwIfAborted();
       // Checks recorded against the head as its own base do not cover the resolved base.
-      entry = this.store.updateLandEntry(entry.id, { baseBranch, pushedSha: null, ciRerun: null });
+      entry = this.owned(entry.id, () =>
+        this.store.updateLandEntry(entry.id, { baseBranch, pushedSha: null, ciRerun: null }),
+      );
     }
     // The claim already moved the entry into `checking` and counted this attempt.
     this.log(`[land] ${entry.id}: checking ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`);
@@ -373,12 +381,12 @@ export class LandQueue {
         await this.checkPublication(entry, run, cwd, baseSha, head);
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
-        const waiting = this.store.db.transaction(() => {
+        const waiting = this.owned(entry.id, () => {
           signal.throwIfAborted();
           if (this.store.getLandEntry(entry.id)?.state !== "checking") return false;
           this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
           return true;
-        })();
+        });
         if (!waiting) return;
       }
       if (entry.pushedSha) await this.checkPublication(entry, run, cwd, baseSha, head);
@@ -397,7 +405,7 @@ export class LandQueue {
     const at = observation?.mergedAt ? Date.parse(observation.mergedAt) : NaN;
     const mergedBy = observation?.state === "MERGED" ? (observation.mergedBy?.login ?? null) : null;
     const mergedAt = observation?.state === "MERGED" && Number.isFinite(at) ? at : null;
-    this.store.transaction(() => {
+    this.owned(entry.id, () => {
       const current = this.store.getLandEntry(entry.id);
       if (current && this.isActive(current))
         this.finish(
@@ -447,7 +455,7 @@ export class LandQueue {
       };
       const run = await executeGate(request, signal, hooks, this.deps.gateExecutor);
       signal.throwIfAborted();
-      this.store.updateLandEntry(entry.id, { logPath: log });
+      this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { logPath: log }));
       const selected = run.setupOk
         ? run.checks.flatMap((original) => {
             const check = findGateCounterpart(original, run.checks, gates.checks);
@@ -482,12 +490,14 @@ export class LandQueue {
         const reason = redactGateOutput(
           `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
         );
-        this.store.updateLandEntry(entry.id, { reason });
-        this.store.addEvent({
-          runId: entry.runId,
-          type: "gate",
-          level: "warn",
-          message: redactGateOutput(`Land ${entry.id} ${reason}`),
+        this.owned(entry.id, () => {
+          this.store.updateLandEntry(entry.id, { reason });
+          this.store.addEvent({
+            runId: entry.runId,
+            type: "gate",
+            level: "warn",
+            message: redactGateOutput(`Land ${entry.id} ${reason}`),
+          });
         });
       }
     } finally {
@@ -504,8 +514,11 @@ export class LandQueue {
     signal: AbortSignal,
   ): Promise<void> {
     const remote = await remoteBranchSha(repo, cwd, entry.headBranch, signal);
-    if (remote !== entry.approvedSha) throw new LandBlocked("head moved after approval");
-    this.store.updateLandEntry(entry.id, { pushedSha: head });
+    this.owned(entry.id, () => {
+      signal.throwIfAborted();
+      if (remote !== entry.approvedSha) throw new LandBlocked("head moved after approval");
+      this.store.updateLandEntry(entry.id, { pushedSha: head });
+    });
     await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal, undefined, head);
   }
 
@@ -525,6 +538,7 @@ export class LandQueue {
     const unexpectedHead = (head?: string) => !!head && headMoved(head, sha, entry.approvedSha);
     for (;;) {
       signal.throwIfAborted();
+      this.assertClaim(entry.id);
       const snapshot = this.store.githubPrData(entry.prUrl);
       const saved = savedSnapshot(snapshot);
       // The approved head can lag our push; any other head must block before a read can stall.
@@ -532,6 +546,7 @@ export class LandQueue {
         throw new LandBlocked("head moved after approval");
       const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
+      this.assertClaim(entry.id);
       if (seen?.state === "MERGED") return seen;
       if (unexpectedHead(seen?.head)) throw new LandBlocked("head moved after approval");
       if (rerun) {
@@ -560,14 +575,16 @@ export class LandQueue {
           .some((f) => f.outcome === "rerunning" || f.outcome === "rerun_requested");
         if (seen.ci === "SUCCESS" && !outstanding) return "green";
         if (
-          !this.store.observePrHead(entry.prUrl, sha, since) &&
+          !this.owned(entry.id, () => this.store.observePrHead(entry.prUrl, sha, since)) &&
           unexpectedHead(this.store.prHead(entry.prUrl)?.sha)
         )
           throw new LandBlocked("head moved after approval");
         const inspection = new AbortController();
         const inspectionSignal = AbortSignal.any([signal, inspection.signal]);
         const current = () =>
-          !inspectionSignal.aborted && !unexpectedHead(this.store.prHead(entry.prUrl)?.sha);
+          !inspectionSignal.aborted &&
+          this.store.ownsLandClaim(entry.id, this.owner) &&
+          !unexpectedHead(this.store.prHead(entry.prUrl)?.sha);
         const snap: PrSnapshot = {
           ...(saved?.headRefOid === sha ? saved : {}),
           id: saved?.id ?? "",
@@ -669,7 +686,7 @@ export class LandQueue {
     sha: string,
     signal: AbortSignal,
   ): Promise<void> {
-    const merging = this.store.db.transaction(() => {
+    const merging = this.owned(entry.id, () => {
       signal.throwIfAborted();
       this.store.assertNoRoundInFlight(entry.prUrl);
       // A resumed entry keeps its pushed SHA but the claim moves it back to checking.
@@ -677,7 +694,7 @@ export class LandQueue {
       if (this.store.getLandEntry(entry.id)?.state !== expected) return false;
       this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
       return true;
-    })();
+    });
     if (!merging) return;
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.
@@ -695,6 +712,7 @@ export class LandQueue {
       },
     );
     signal.throwIfAborted();
+    this.assertClaim(entry.id);
     if (outcome !== "merged") {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
@@ -703,12 +721,14 @@ export class LandQueue {
     const observed = await this.mergeMetadata(entry.prUrl, signal);
     if (observed?.state !== "MERGED" || observed.url !== entry.prUrl) return;
     const at = observed.mergedAt ? Date.parse(observed.mergedAt) : NaN;
-    this.store.resolveMergedPr(
-      run.repoId,
-      entry.prUrl,
-      observed.mergedBy?.login ?? null,
-      Number.isFinite(at) ? at : null,
-      this.now(),
+    this.owned(entry.id, () =>
+      this.store.resolveMergedPr(
+        run.repoId,
+        entry.prUrl,
+        observed.mergedBy?.login ?? null,
+        Number.isFinite(at) ? at : null,
+        this.now(),
+      ),
     );
   }
 
@@ -734,6 +754,18 @@ export class LandQueue {
   }
 
   // ---- helpers -------------------------------------------------------------
+
+  private assertClaim(id: number): void {
+    if (!this.store.ownsLandClaim(id, this.owner)) throw new LandClaimLost();
+  }
+
+  /** No await may separate ownership validation from a worker's durable write. */
+  private owned<T>(id: number, write: () => T): T {
+    return this.store.transaction(() => {
+      this.assertClaim(id);
+      return write();
+    });
+  }
 
   private reportBody(run: Run): string {
     return sanitizePublication(

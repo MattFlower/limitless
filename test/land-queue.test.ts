@@ -1614,6 +1614,165 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
   expect(merges[0]).not.toContain("--auto");
 });
 
+test.each(["merged", "failed", "exception"] as const)(
+  "a late merge result after reclaim leaves the newer claim unchanged: %s",
+  async (outcome) => {
+    const pr = delivered(1, "pr-1");
+    store.updateRun(pr.run.id, { status: "needs_human" });
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, head, "SUCCESS");
+    approve(1, head);
+    if (outcome === "failed") writeFileSync(join(root, "gh.reject"), "");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const merge = repos.mergePullRequest;
+    const boundary = spyOn(repos, "mergePullRequest").mockImplementation(async (...args) => {
+      const result = await merge(...args);
+      entered.resolve();
+      await release.promise;
+      if (outcome === "exception") throw new Error("merge response failed");
+      return result;
+    });
+    const cleanup = spyOn(repos, "disableAutoMerge");
+    const q = queue();
+    try {
+      const entry = await q.request({ target: pr.run.id });
+      await entered.promise;
+      expect(store.getLandEntry(entry.id)?.state).toBe("merging");
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const snapshot = () => ({
+        entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+        run: store.getRun(pr.run.id),
+        feed: store.readFeed({ limit: 100 }).items,
+        conflicts: store.pendingConflictTriggers(),
+        commands: ghCalls("pr "),
+      });
+      const before = snapshot();
+      release.resolve();
+      await waitWithoutClock(() => clock.pending === 0, 15_000);
+      await q.stop();
+      expect(snapshot()).toEqual(before);
+      expect(boundary).toHaveBeenCalledTimes(1);
+      expect(cleanup).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await q.stop();
+      boundary.mockRestore();
+      cleanup.mockRestore();
+    }
+  },
+);
+
+test("a resumed land cannot merge after losing its claim during a CI read", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "waiting_ci", pushedSha: head });
+  const view: GitHubPrView = {
+    url: url(1),
+    state: "OPEN",
+    headRefOid: head,
+    mergedAt: null,
+    mergedBy: null,
+    ci: "SUCCESS",
+    failing: [],
+  };
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<GitHubPrView | null>();
+  let reads = 0;
+  const q = queue({
+    polling: false,
+    client: async () => {
+      if (++reads === 1) return view; // The fresh recovery lookup confirms OPEN.
+      entered.resolve();
+      return response.promise;
+    },
+  });
+  try {
+    await entered.promise;
+    expect(reads).toBe(2);
+    expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    const snapshot = () => ({
+      entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+      run: store.getRun(pr.run.id),
+      feed: store.readFeed({ limit: 100 }).items,
+    });
+    const before = snapshot();
+    response.resolve(view);
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await q.stop();
+    expect(snapshot()).toEqual(before);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    response.resolve(null);
+    await q.stop();
+  }
+});
+
+test.each(["preparation", "completion"] as const)(
+  "a reclaim during push %s prevents further publication and checkpoints",
+  async (phase) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, head, "SUCCESS");
+    approve(1, head);
+    await advanceBase();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const remote = repos.remoteBranchSha;
+    const push = repos.pushExistingBranch;
+    const preparation = spyOn(repos, "remoteBranchSha").mockImplementation(async (...args) => {
+      const result = await remote(...args);
+      if (phase === "preparation") {
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    const completion = spyOn(repos, "pushExistingBranch").mockImplementation(async (...args) => {
+      const result = await push(...args);
+      if (phase === "completion") {
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    const q = queue();
+    try {
+      const entry = await q.request({ target: pr.run.id });
+      await entered.promise;
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const snapshot = () => ({
+        entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
+        run: store.getRun(pr.run.id),
+        feed: store.readFeed({ limit: 100 }).items,
+      });
+      const before = snapshot();
+      const pushed = await remoteHead("pr-1");
+      release.resolve();
+      await waitWithoutClock(() => clock.pending === 0, 15_000);
+      await q.stop();
+      expect(snapshot()).toEqual(before);
+      expect(await remoteHead("pr-1")).toBe(pushed);
+      expect(completion).toHaveBeenCalledTimes(phase === "preparation" ? 0 : 1);
+      expect(ghCalls("pr merge")).toEqual([]);
+    } finally {
+      release.resolve();
+      await q.stop();
+      preparation.mockRestore();
+      completion.mockRestore();
+    }
+  },
+);
+
 test("a restart during merging takes an already merged PR as landed without merging again", async () => {
   const pr = delivered(1, "pr-1");
   store.updateRun(pr.run.id, { status: "needs_human" });
