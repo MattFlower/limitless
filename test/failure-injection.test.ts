@@ -1133,6 +1133,62 @@ test("startup finalizes abandoned running rows before retrying the stage", async
   history(next, r.id);
 });
 
+// `cancel` records its reason on an active run and leaves the cancelled status to the engine; a
+// crash between the two leaves exactly this state behind.
+for (const status of ["running", "waiting_input"] as const)
+  test(`a cancel recorded before a crash stays cancelled on restart (${status})`, async () => {
+    const waiting = status === "waiting_input";
+    const f = factory();
+    const r = await f.createRun({ repo: source, prompt: "Change" });
+    // Past prepare, so a run that resumed instead would really rerun its stage (test/AGENTS.md).
+    f.store.setRunState(r.id, {
+      flow: "build",
+      phase: waiting ? "clarify" : "triage",
+      worktreePath: source,
+      previewConfig: null,
+      slottedCommands: [],
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      feedback: null,
+      toolCommands: [],
+    } satisfies RunState);
+    if (waiting) f.store.askQuestion(r.id, "Which file?");
+    const stage = f.store.startStage(r.id, waiting ? "clarify" : "triage");
+    const inv = waiting
+      ? null
+      : f.store.createInvocation({
+          runId: r.id,
+          stageId: stage.id,
+          role: "triage",
+          harness: "fake",
+          provider: "a",
+          model: "a",
+          modelId: "a",
+        });
+    f.store.updateRun(r.id, { status, stage: stage.name, error: "cancelled by tester" });
+    let calls = 0;
+    const next = await reopen(f, (s) => {
+      calls++;
+      return answer(s);
+    });
+    const after = next.store.getRun(r.id);
+    expect(after?.status).toBe("cancelled");
+    expect(after?.error).toBe("cancelled by tester");
+    expect(after?.finishedAt).toBeNumber();
+    expect(next.scheduler.activeRunIds).toEqual([]);
+    expect(next.store.getStage(stage.id)?.status).toBe("cancelled");
+    if (inv) expect(next.store.getInvocation(inv.id)?.status).toBe("cancelled");
+    next.scheduler.tick();
+    expect(next.scheduler.activeRunIds).toEqual([]);
+    expect(next.store.listStages(r.id).map((s) => s.id)).toEqual([stage.id]);
+    expect(next.store.listInvocations(r.id).map((i) => i.id)).toEqual(inv ? [inv.id] : []);
+    expect(calls).toBe(0);
+    expect(next.store.listEvents(r.id).some((e) => e.message.includes("cancellation preserved"))).toBe(true);
+    history(next, r.id);
+  });
+
 test("both cancellation failure paths reject recycled PIDs and stop an identical descendant", async () => {
   const pids = new Map<number, string>();
   const births = new Map<number, string | null>([
