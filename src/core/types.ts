@@ -465,7 +465,8 @@ export const ACTIVE_LAND_STATES: readonly LandState[] = ["queued", "checking", "
 
 export interface LandEntry {
   id: number;
-  runId: string;
+  runId: string | null;
+  title: string | null;
   repo: string;
   prUrl: string;
   baseBranch: string;
