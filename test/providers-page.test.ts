@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
-import type { ProviderStatus, QuotaAlert } from "../src/core/types.ts";
+import type { ProviderStatus, QuotaAlert, StreamMessage } from "../src/core/types.ts";
 import type { ProviderWorkload } from "../src/db/stats.ts";
 import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
@@ -83,7 +83,7 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
                   "const useNavigate = () => (_path: string) => {};",
                 );
               if (/\/(Providers|Dashboard)\.tsx$/.test(args.path))
-                source += `\nimport { setInterval, clearInterval } from ${JSON.stringify(support)};`;
+                source += `\nimport { setInterval, clearInterval, setTimeout, clearTimeout } from ${JSON.stringify(support)};`;
               const result = await transformAsync(source, {
                 filename: args.path,
                 parserOpts: { plugins: ["jsx", "typescript"] },
@@ -234,8 +234,13 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
       expect(fixture.statsRequests).toHaveLength(1);
       store.updateRun(run.id, { status: "failed" });
       publish();
+      expect(fixture.statsRequests).toHaveLength(1);
+      fixture.advanceTimers(250);
       expect(fixture.statsRequests).toHaveLength(2);
-      store.updateRun(run.id, { status: "needs_human" });
+      const stoppedAt = Date.now() - 10_000;
+      const pr = "https://github.com/owner/repo/pull/1";
+      const head = "a".repeat(40);
+      store.updateRun(run.id, { status: "needs_human", prUrl: pr, finishedAt: stoppedAt });
       publish();
       expect(fixture.statsRequests).toHaveLength(2);
       const beforeResolution = computeStats(store);
@@ -254,10 +259,66 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
         return text(kpi);
       };
       expect(attentionCount()).toContain("Needs you (14d)1");
+
+      const refresh = async (message: Parameters<typeof fixture.publishLiveUpdate>[0]) => {
+        const count = fixture.statsRequests.length;
+        fixture.publishLiveUpdate(message);
+        fixture.publishLiveUpdate(message);
+        fixture.advanceTimers(249);
+        expect(fixture.statsRequests).toHaveLength(count);
+        fixture.advanceTimers(1);
+        expect(fixture.statsRequests).toHaveLength(count + 1);
+        fixture.statsRequests[count]?.resolve(computeStats(store));
+        await flush();
+      };
+      const changes: StreamMessage[] = [];
+      const unsubscribe = store.subscribe((msg) => changes.push(msg));
+      const latestFeed = () => {
+        const msg = changes.findLast((msg) => msg.kind === "feed");
+        if (!msg) throw new Error("missing persisted feed update");
+        return msg;
+      };
+      store.observePrHead(pr, head);
+      store.recordApproval(run.id, pr, head, "reviewer");
+      store.db.query("UPDATE review_approvals SET created_at = ?").run(stoppedAt + 1);
+      await refresh(latestFeed());
+      expect(text(dashboard)).not.toContain("Dashboard work");
+      expect(attentionCount()).toContain("Needs you (14d)0");
+      const entry = store.createLandEntry({
+        runId: run.id,
+        repo: repo.slug,
+        prUrl: pr,
+        approvedSha: head,
+        baseBranch: "main",
+        headBranch: "limitless/work",
+      });
+      store.updateLandEntry(entry.id, { state: "blocked" });
+      store.landFeed("land.blocked", store.getLandEntry(entry.id) ?? entry, "Landing blocked");
+      await refresh(latestFeed());
+      expect(text(dashboard)).toContain("Dashboard work");
+      expect(attentionCount()).toContain("Needs you (14d)1");
+      const child = store.createRun(repo, { repo: repo.slug, prompt: "Retry round" });
+      store.db
+        .query(`INSERT INTO review_rounds
+        (run_id, source_run_id, pr_url, round, reviewed_sha, findings, created_at)
+        VALUES (?, ?, ?, 1, ?, '[]', ?)`)
+        .run(child.id, run.id, pr, head, Date.now());
+      // A reconnect re-reads derived attention even when the candidate's status never changed.
+      await refresh({ kind: "reconnected" });
+      expect(text(dashboard)).not.toContain("Dashboard work");
+      expect(attentionCount()).toContain("Needs you (14d)0");
+      store.updateRun(child.id, { status: "cancelled" });
+      await refresh(latestFeed());
+      expect(text(dashboard)).toContain("Dashboard work");
+      expect(attentionCount()).toContain("Needs you (14d)1");
+      expect(store.getRun(run.id)?.status).toBe("needs_human");
+      unsubscribe();
+
       store.resolveRun(run.id, { kind: "wont_do", by: "human" });
       publish();
-      expect(fixture.statsRequests).toHaveLength(3);
-      fixture.statsRequests[2]?.resolve(computeStats(store));
+      fixture.advanceTimers(250);
+      expect(fixture.statsRequests).toHaveLength(7);
+      fixture.statsRequests[6]?.resolve(computeStats(store));
       await flush();
       expect(text(dashboard)).not.toContain("Dashboard work");
       expect(attentionCount()).toContain("Needs you (14d)0");
@@ -265,15 +326,19 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
       fixture.statsRequests[0]?.resolve(beforeResolution);
       await flush();
       expect(attentionCount()).toContain("Needs you (14d)0");
-      fixture.advanceTimers(29_999);
-      expect(fixture.statsRequests).toHaveLength(3);
+      // Six coalesced refresh windows have elapsed since mounting the dashboard.
+      fixture.advanceTimers(30_000 - 6 * 250 - 1);
+      expect(fixture.statsRequests).toHaveLength(7);
       fixture.advanceTimers(1);
-      expect(fixture.statsRequests).toHaveLength(4);
+      expect(fixture.statsRequests).toHaveLength(8);
     } finally {
       store.close();
     }
+    fixture.publishLiveUpdate({ kind: "reconnected" });
     dispose();
     expect(fixture.timerCount()).toBe(0);
+    fixture.advanceTimers(250);
+    expect(fixture.statsRequests).toHaveLength(8);
 
     const nav = fixture.node();
     dispose = fixture.render(() => fixture.NavBar(), nav);

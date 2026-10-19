@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store";
 import { createRenderer } from "solid-js/universal";
-import type { AuthSession, ProviderStatus, QuotaAlert, Run } from "../src/core/types.ts";
+import type { AuthSession, ProviderStatus, QuotaAlert, Run, StreamMessage } from "../src/core/types.ts";
 import type { ProviderWorkload, Stats } from "../src/db/stats.ts";
 
 // Solid's universal renderer exercises mounted reactive components without a browser or DOM dependency.
@@ -62,6 +62,14 @@ export let liveStarts = 0;
 export function ensureLiveStore() {
   liveStarts++;
 }
+const listeners = new Set<(message: StreamMessage | { kind: "reconnected" }) => void>();
+export function subscribeLiveUpdates(listener: (message: StreamMessage | { kind: "reconnected" }) => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+export function publishLiveUpdate(message: StreamMessage | { kind: "reconnected" }) {
+  for (const listener of listeners) listener(message);
+}
 
 let workload: ProviderWorkload[] = [];
 let failure = false;
@@ -96,7 +104,15 @@ export async function setProviderFast(id: string, fast: boolean) {
 
 let elapsed = 0;
 let nextTimer = 0;
-const timers = new Map<number, { callback: () => void; ms: number; next: number }>();
+const timers = new Map<number, { callback: () => void; ms?: number; next: number }>();
+export function setTimeout(callback: () => void, ms: number) {
+  const id = ++nextTimer;
+  timers.set(id, { callback, next: elapsed + ms });
+  return id;
+}
+export function clearTimeout(id: number | undefined) {
+  if (id !== undefined) timers.delete(id);
+}
 export function setInterval(callback: () => void, ms: number) {
   const id = ++nextTimer;
   timers.set(id, { callback, ms, next: elapsed + ms });
@@ -107,10 +123,12 @@ export function clearInterval(id: number) {
 }
 export function advanceTimers(ms: number) {
   elapsed += ms;
-  for (const timer of timers.values()) {
+  for (const [id, timer] of timers) {
     while (timer.next <= elapsed) {
-      timer.next += timer.ms;
+      if (timer.ms === undefined) timers.delete(id);
+      else timer.next += timer.ms;
       timer.callback();
+      if (timer.ms === undefined) break;
     }
   }
 }
