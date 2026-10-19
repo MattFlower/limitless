@@ -167,7 +167,7 @@ export class WorkerStore {
           code: w.state === "pending" ? w.pairing_code : undefined,
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
-          setupWarning: w.setup_warning ?? undefined,
+          setupWarning: c?.updateWarning ?? w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
               ? w.state
@@ -181,16 +181,7 @@ export class WorkerStore {
   }
   heartbeat(w: WorkerRow, c: Capabilities) {
     this.sweep();
-    const previous: Capabilities | null = w.capabilities ? JSON.parse(w.capabilities) : null;
-    if (c.updateWarning === undefined && previous?.releaseSha === c.releaseSha && previous.updateWarning)
-      c = { ...c, updateWarning: previous.updateWarning };
-    if (c.updateWarning !== undefined) {
-      const warning = this.sanitize(c.updateWarning);
-      c = { ...c, updateWarning: warning };
-      this.store.db
-        .query("UPDATE workers SET setup_warning=? WHERE name=? AND state='approved'")
-        .run(warning, w.name);
-    }
+    if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
     this.store.db
       .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
       .run(this.now(), JSON.stringify(c), w.name);
@@ -371,7 +362,7 @@ export class WorkerStore {
         // Retain the order after recovery too: an older pending fallback must not re-flag it.
         this.store.db
           .query(
-            "UPDATE workers SET setup_warning=?,setup_warning_order=? WHERE name=? AND setup_warning_order<? AND json_extract(capabilities,'$.updateWarning') IS NULL",
+            "UPDATE workers SET setup_warning=?,setup_warning_order=? WHERE name=? AND setup_warning_order<?",
           )
           .run(local ? this.sanitize(j.failure_reason) : null, j.setup_order, j.worker, j.setup_order);
       }

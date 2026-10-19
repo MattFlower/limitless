@@ -17,7 +17,7 @@ import { protectPrivateFile } from "../util/private-reads.ts";
 import { agentEnv, redactCredentials, registerCredential, sh } from "../util/proc.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
-import { updateWorker } from "./update.ts";
+import { updateWorker, WorkerUpdateError } from "./update.ts";
 import { attemptBudget, requestedChecks } from "./validation.ts";
 
 export async function pairWorker(
@@ -114,6 +114,12 @@ async function machineState(): Promise<{ onAC: boolean; idleSeconds: number }> {
   return { onAC: power.stdout.includes("AC Power"), idleSeconds: Number(ns) / 1e9 };
 }
 
+class CoordinatorRefusal extends Error {
+  constructor(readonly status: number) {
+    super(`Coordinator refused worker request (${status})`);
+  }
+}
+
 export async function runWorker(
   coordinator: string,
   cfg: Config,
@@ -127,6 +133,7 @@ export async function runWorker(
     retryMs?: number;
     log?: (text: string) => void;
     update?: Parameters<typeof updateWorker>[1];
+    updateRetry?: { initialMs?: number; maxMs?: number; deadlineMs?: number; now?: () => number };
   } = {},
 ) {
   if (process.platform !== "darwin" && !options.confinement)
@@ -143,9 +150,37 @@ export async function runWorker(
     const stop = new AbortController(),
       combined = AbortSignal.any([signal, stop.signal]);
     const jobs = new Map<string, { controller: AbortController; task: Promise<void>; reported: boolean }>();
-    let updateTarget: string | undefined,
+    type UpdateEpisode = {
+      target: string;
+      deadline?: number;
+      nextAt: number;
+      attempts: number;
+      exhausted: boolean;
+      controller: AbortController;
+    };
+    let update: UpdateEpisode | undefined,
       updateWarning: string | undefined,
-      updateAttempted = false;
+      supportsUpdates = false,
+      updating = false,
+      restorationFailed = false;
+    const now = options.updateRetry?.now ?? Date.now;
+    const updateBlocked = () => update !== undefined || updating || restorationFailed;
+    const observeRelease = (target: string | undefined) => {
+      supportsUpdates = target !== undefined;
+      if (target === undefined || target === update?.target) return;
+      update?.controller.abort();
+      update =
+        target === releaseSha
+          ? undefined
+          : {
+              target,
+              nextAt: 0,
+              attempts: 0,
+              exhausted: false,
+              controller: new AbortController(),
+            };
+      if (!updating && !restorationFailed) updateWarning = undefined;
+    };
     const heldJobs = () =>
       [...jobs].filter(([, job]) => job.reported && !job.controller.signal.aborted).map(([id]) => id);
     const call = async (path: string, body?: unknown, requestSignal = combined) => {
@@ -163,7 +198,7 @@ export async function runWorker(
         });
         if (reply?.status === 200) return reply;
         if (reply && reply.status < 500) {
-          const error = new Error(`Coordinator refused worker request (${reply.status})`);
+          const error = new CoordinatorRefusal(reply.status);
           if (reply.status === 401 || reply.status === 403) stop.abort(error);
           throw error;
         }
@@ -182,20 +217,29 @@ export async function runWorker(
         osVersion: release(),
         cpuCount: cpus().length,
         ramBytes: totalmem(),
-        freeSlots:
-          updateTarget !== undefined
-            ? 0
-            : Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
-        ...(updateWarning ? { updateWarning } : {}),
+        freeSlots: updateBlocked()
+          ? 0
+          : Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
+        ...(supportsUpdates && updateWarning ? { updateWarning } : {}),
         ...state,
         jobs: heldJobs(),
       };
+      let response: Awaited<ReturnType<typeof call>>;
+      try {
+        response = await call("/worker/heartbeat", body);
+      } catch (error) {
+        // A running coordinator can roll back to the previous strict schema.
+        if (!(error instanceof CoordinatorRefusal) || error.status !== 400 || !body.updateWarning)
+          throw error;
+        supportsUpdates = false;
+        delete body.updateWarning;
+        response = await call("/worker/heartbeat", body);
+      }
       const reply = z
         .object({ cancelled: z.array(z.string()), releaseSha: z.string().optional() })
-        .parse((await call("/worker/heartbeat", body)).json());
+        .parse(response.json());
       for (const id of reply.cancelled) jobs.get(id)?.controller.abort();
-      if (reply.releaseSha !== undefined && reply.releaseSha !== releaseSha)
-        updateTarget ??= reply.releaseSha;
+      observeRelease(reply.releaseSha);
     };
     const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
       const deadline = new AbortController();
@@ -316,23 +360,58 @@ export async function runWorker(
       })();
       void beats.catch((error: unknown) => stop.abort(error));
       while (!combined.aborted) {
-        if (updateTarget !== undefined) {
+        if (updateBlocked()) {
           await Promise.all([...jobs.values()].map((job) => job.task));
-          if (!updateAttempted) {
-            updateAttempted = true;
-            try {
-              await updateWorker(updateTarget, { ...options.update, signal: combined });
-            } catch (error) {
-              updateWarning = redactCredentials(`Worker update failed: ${String(error)}`).slice(0, 4000);
+          // Heartbeats may have changed the target while jobs and cleanup drained.
+          const episode = update;
+          if (!updateBlocked()) continue;
+          if (episode && !episode.exhausted && now() >= episode.nextAt) {
+            episode.deadline ??= now() + (options.updateRetry?.deadlineMs ?? 60_000);
+            if (now() >= episode.deadline) episode.exhausted = true;
+            else {
+              updating = true;
+              episode.attempts++;
+              try {
+                await updateWorker(episode.target, {
+                  ...options.update,
+                  signal: AbortSignal.any([
+                    combined,
+                    episode.controller.signal,
+                    AbortSignal.timeout(Math.max(1, episode.deadline - now())),
+                  ]),
+                });
+                episode.exhausted = true; // Native exec never returns; injected exec can.
+              } catch (error) {
+                const restored = error instanceof WorkerUpdateError && error.restored;
+                if (!restored) restorationFailed = true;
+                else if (error.restoredRelease === releaseSha) restorationFailed = false;
+                if (update === episode || !restored) {
+                  updateWarning = redactCredentials(`Worker update failed: ${String(error)}`).slice(0, 4000);
+                  episode.exhausted =
+                    !(error instanceof WorkerUpdateError && error.retryable) || now() >= episode.deadline;
+                  const delay = Math.min(
+                    (options.updateRetry?.initialMs ?? 1000) * 2 ** (episode.attempts - 1),
+                    options.updateRetry?.maxMs ?? 10_000,
+                  );
+                  episode.nextAt = Math.min(now() + delay, episode.deadline);
+                }
+              } finally {
+                updating = false;
+                if (!update && !restorationFailed) updateWarning = undefined;
+              }
             }
           }
-          await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal: combined });
+          const delay =
+            episode && !episode.exhausted
+              ? Math.max(1, Math.min(options.heartbeatMs ?? timing.heartbeat, episode.nextAt - now()))
+              : (options.heartbeatMs ?? timing.heartbeat);
+          await sleep(delay, undefined, { signal: combined });
           continue;
         }
         const leased = Lease.parse((await call("/worker/lease", { jobs: heldJobs() })).json());
         for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
         if (!leased.job) continue;
-        if (updateTarget !== undefined) {
+        if (updateBlocked()) {
           await call(`/worker/jobs/${leased.job.id}/failure`, {}).catch(() => {});
           continue;
         }

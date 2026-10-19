@@ -45,11 +45,11 @@ import { createApiToken } from "../src/server/api-token.ts";
 import { startHttp } from "../src/server/http.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
-import { redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
+import { CommandError, redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
-import { type Capabilities, pairingCode } from "../src/workers/protocol.ts";
+import { type Capabilities, Heartbeat, pairingCode } from "../src/workers/protocol.ts";
 import { certificate, workerRequest } from "../src/workers/tls.ts";
-import { updateWorker } from "../src/workers/update.ts";
+import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -2294,7 +2294,9 @@ test("a release change drains reporting and cleanup and rejects an in-flight lea
     replaced = Promise.withResolvers<void>();
   let lock: Promise<void> | undefined,
     captured = false,
-    polls = 0;
+    polls = 0,
+    advertised = "b".repeat(40),
+    latestObserved = false;
   const commands: string[][] = [],
     bundles: string[] = [];
   const worker = await loop({
@@ -2319,7 +2321,9 @@ test("a release change drains reporting and cleanup and rejects an in-flight lea
       }
       if (path === "/worker/heartbeat" && captured) {
         if ((args[2] as Capabilities).freeSlots === 0) observed.resolve();
-        return { ...reply, json: () => ({ ...(reply.json() as object), releaseSha: target }) };
+        const coordinatorRelease = advertised;
+        if (coordinatorRelease === target) latestObserved = true;
+        return { ...reply, json: () => ({ ...(reply.json() as object), releaseSha: coordinatorRelease }) };
       }
       return reply;
     },
@@ -2347,6 +2351,9 @@ test("a release change drains reporting and cleanup and rejects an in-flight lea
     releaseLease.resolve();
     finish.resolve();
     await reported.promise;
+    expect(commands).toEqual([]);
+    advertised = target;
+    await until(() => latestObserved);
     expect(commands).toEqual([]);
     cleanup.resolve();
     await replaced.promise;
@@ -2401,9 +2408,10 @@ test.each(["malformed", "ancestry", "fetch", "install", "exec", "restore"])(
       update: {
         async command(args) {
           commands.push(args);
+          if (failure === "ancestry" && args[1] === "merge-base")
+            throw new CommandError(`injected ancestry: ${secret}`, 1, "", secret, false);
           if (
             (failure === "fetch" && args[1] === "fetch") ||
-            (failure === "ancestry" && args[1] === "merge-base") ||
             (["install", "restore"].includes(failure) && args[1] === "install") ||
             (failure === "restore" && args[1] === "checkout" && args[3] === releaseSha)
           )
@@ -2432,14 +2440,15 @@ test.each(["malformed", "ancestry", "fetch", "install", "exec", "restore"])(
       expect(warning).not.toContain(secret);
       if (failure === "restore") expect(transmittedWarning).toContain("restoring original HEAD failed");
       await worker.stop();
-      // An ordinary heartbeat must not clear the unresolved warning.
+      // A clean restart reports its current state rather than inheriting an old update warning.
       const row = workers.worker("loop-runner");
       if (!row) throw new Error("Missing worker");
       workers.heartbeat(row, caps());
       store.close();
       store = new Store(cfg.paths.db);
       workers = new WorkerStore(store, releaseSha);
-      expect(workers.list()[0]?.setupWarning).toBe(warning);
+      expect(workers.list()[0]?.setupWarning).toBeUndefined();
+      expect(workers.list()[0]?.capabilities?.updateWarning).toBeUndefined();
     } finally {
       await worker.stop();
     }
@@ -2494,7 +2503,7 @@ const updateFixture = seeded(async (dir) => {
   return { original, main, side };
 });
 
-test.each(["side", "missing", "malformed", "dirty", "install", "exec"])(
+test.each(["side", "missing", "malformed", "dirty", "install", "exec", "unavailable"])(
   "worker updater enforces fetched main ancestry and restores real HEAD after %s failure",
   async (failure) => {
     const cwd = join(home, "update-checkout");
@@ -2510,8 +2519,8 @@ test.each(["side", "missing", "malformed", "dirty", "install", "exec"])(
             ? "a".repeat(41)
             : main;
     if (failure === "dirty") writeFileSync(join(cwd, "tracked"), "local changes\n");
-    let installs = 0,
-      execs = 0;
+    const installs: string[] = [];
+    let execs = 0;
     const commands: string[][] = [];
     await expect(
       updateWorker(target, {
@@ -2520,37 +2529,547 @@ test.each(["side", "missing", "malformed", "dirty", "install", "exec"])(
           expect(opts.cwd).toBe(cwd);
           commands.push(args);
           if (args[1] === "install") {
-            installs++;
-            if (failure === "install") throw new Error("Frozen installation failed");
+            installs.push((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim());
+            if (failure === "install" && installs.length === 1) throw new Error("Frozen installation failed");
             return { stdout: "", stderr: "", exitCode: 0 };
           }
           return sh(args, opts);
         },
-        exec() {
-          execs++;
-          throw new Error("Replacement failed");
-        },
+        exec:
+          failure === "unavailable"
+            ? null
+            : () => {
+                execs++;
+                throw new Error("Replacement failed");
+              },
       }),
     ).rejects.toThrow(
-      failure === "install"
-        ? "Frozen installation failed"
-        : failure === "exec"
-          ? "Replacement failed"
-          : failure === "malformed"
-            ? "full commit SHA"
-            : failure === "dirty"
-              ? "checkout"
-              : "reachable from origin/main",
+      failure === "unavailable"
+        ? "Process replacement is unavailable"
+        : failure === "install"
+          ? "Frozen installation failed"
+          : failure === "exec"
+            ? "Replacement failed"
+            : failure === "malformed"
+              ? "full commit SHA"
+              : failure === "dirty"
+                ? "checkout"
+                : "reachable from origin/main",
     );
     expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(original);
-    expect(installs).toBe(["install", "exec"].includes(failure) ? 1 : 0);
+    expect(installs).toEqual(["install", "exec"].includes(failure) ? [main, original] : []);
     expect(execs).toBe(failure === "exec" ? 1 : 0);
     if (failure === "dirty") expect(readFileSync(join(cwd, "tracked"), "utf8")).toBe("local changes\n");
     else if (!["install", "exec"].includes(failure))
       expect(commands.some((args) => args[1] === "checkout")).toBe(false);
     // Main must be observed through a fresh fetch, not a pre-existing tracking ref.
-    if (failure !== "malformed")
+    if (!["malformed", "unavailable"].includes(failure))
       expect((await sh(["git", "rev-parse", "refs/remotes/origin/main"], { cwd })).stdout.trim()).toBe(main);
+    if (failure === "unavailable") expect(commands).toEqual([]);
   },
   30_000,
 );
+
+test.each(["HEAD", "dependencies", "cancelled"])(
+  "worker rollback after a partial installation handles %s restoration",
+  async (failure) => {
+    const cwd = join(home, "restore-checkout");
+    const {
+      value: { original, main },
+    } = await updateFixture(cwd);
+    const controller = new AbortController();
+    const installs: string[] = [];
+    let restoring = false;
+    let caught: unknown;
+    try {
+      await updateWorker(main, {
+        cwd,
+        signal: controller.signal,
+        exec() {
+          throw new Error("Unexpected replacement");
+        },
+        async command(args, opts) {
+          if (restoring) expect(opts.signal).toBeUndefined();
+          if (restoring && failure === "HEAD" && args[1] === "checkout")
+            throw new Error("restore checkout refused");
+          if (args[1] === "install") {
+            installs.push((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim());
+            if (installs.length === 1) {
+              restoring = true;
+              if (failure === "cancelled") controller.abort(new Error("cancelled installation"));
+              throw new Error(
+                `partial target installation failed${failure === "dependencies" ? "x".repeat(5000) : ""}`,
+              );
+            }
+            if (failure === "dependencies") throw new Error("original dependency installation failed");
+            return { stdout: "", stderr: "", exitCode: 0 };
+          }
+          return sh(args, opts);
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(WorkerUpdateError);
+    expect(String(caught)).toContain("partial target installation failed");
+    expect((caught as WorkerUpdateError).restored).toBe(failure === "cancelled");
+    expect((caught as WorkerUpdateError).retryable).toBe(false);
+    expect(installs).toEqual(failure === "HEAD" ? [main] : [main, original]);
+    expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(
+      failure === "HEAD" ? main : original,
+    );
+    if (failure !== "cancelled") expect(String(caught)).toContain(`restoring original ${failure} failed`);
+  },
+  30_000,
+);
+
+test("current update warnings and ordered setup warnings survive and clear independently across rollback", async () => {
+  const req = await request();
+  const first = await failedWorkerSetup(req);
+  const failed: GateRun = JSON.parse(workers.job(first.id)?.result ?? "null");
+  const passing = { setupOk: true, setup: [], checks: [] };
+  workers.fallbackSetup(first.id, "first setup");
+  workers.complete(first.id, passing, true);
+  const originalWarning = workers.worker("runner")?.setup_warning;
+  expect(originalWarning).toContain("first setup");
+  const beat = (warning?: string) => {
+    const row = workers.worker("runner");
+    if (!row) throw new Error("Missing worker");
+    workers.heartbeat(row, { ...caps(), ...(warning ? { updateWarning: warning } : {}) });
+  };
+  const warning = "Worker update failed: frozen installation failed";
+  workers = new WorkerStore(store, "a".repeat(40));
+  beat(warning);
+  expect(workers.list()[0]?.setupWarning).toBe(warning);
+  expect(workers.worker("runner")?.setup_warning).toBe(originalWarning);
+  // Coordinator rollback permits setup completions even while the update warning is active.
+  workers = new WorkerStore(store, releaseSha);
+  const success = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(success);
+  expect(workers.complete(success, passing)).toBe(true);
+  expect(workers.worker("runner")?.setup_warning).toBeNull();
+  expect(workers.list()[0]?.setupWarning).toBe(warning);
+  const later = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(later);
+  workers.complete(later, failed);
+  workers.fallbackSetup(later, "later setup");
+  workers.complete(later, passing, true);
+  expect(workers.worker("runner")?.setup_warning).toContain("later setup");
+  expect(workers.list()[0]?.setupWarning).toBe(warning);
+  // A clean worker restart omits the update warning; the independent setup warning remains.
+  beat();
+  expect(workers.list()[0]?.capabilities?.updateWarning).toBeUndefined();
+  expect(workers.list()[0]?.setupWarning).toContain("later setup");
+  const recovered = workers.enqueue(req);
+  expect(workers.lease("runner")?.id).toBe(recovered);
+  workers.complete(recovered, passing);
+  expect(workers.list()[0]?.setupWarning).toBeUndefined();
+});
+
+const fetchFailure = (attempt = 1) =>
+  new CommandError(
+    `temporary fetch failure attempt ${attempt}`,
+    128,
+    "",
+    "fatal: unable to access 'https://example.com/repo': Could not resolve host: example.com",
+    false,
+  );
+
+test.each(["fetch", "lock", "fetch lock"])(
+  "a transient %s failure retries after backoff and replaces the worker",
+  async (failure) => {
+    await listen();
+    const target = "a".repeat(40),
+      replaced = Promise.withResolvers<void>();
+    let clock = 0,
+      attempts = 0,
+      beats = 0,
+      leases = 0,
+      head = releaseSha;
+    const warnings: Capabilities[] = [];
+    const worker = await loop({
+      updateRetry: { initialMs: 100, maxMs: 200, deadlineMs: 1000, now: () => clock },
+      async request(...args) {
+        if (args[1] === "/worker/lease") leases++;
+        const reply = await workerRequest(...args);
+        if (args[1] !== "/worker/heartbeat") return reply;
+        beats++;
+        const body = args[2] as Capabilities;
+        if (body.updateWarning) warnings.push(body);
+        return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
+      },
+      update: {
+        async command(args) {
+          if (args[1] === "fetch") {
+            attempts++;
+            if (attempts === 1 && failure === "fetch") throw fetchFailure();
+            if (attempts === 1 && failure === "fetch lock")
+              throw new CommandError(
+                "fetch lock contention",
+                1,
+                "",
+                "error: cannot lock ref 'refs/remotes/origin/main': Unable to create '/checkout/.git/refs/remotes/origin/main.lock': File exists.",
+                false,
+              );
+          }
+          if (args[1] === "checkout") {
+            if (attempts === 1 && failure === "lock")
+              throw new CommandError(
+                "checkout lock contention",
+                128,
+                "",
+                "fatal: Unable to create '/checkout/.git/index.lock': File exists.",
+                false,
+              );
+            head = args[3] ?? "";
+          }
+          return { stdout: args.includes(`${target}^{commit}`) ? target : head, stderr: "", exitCode: 0 };
+        },
+        exec() {
+          replaced.resolve();
+        },
+      },
+    });
+    try {
+      await until(() => warnings.length >= 1);
+      expect(attempts).toBe(1);
+      clock = 99;
+      const before = beats;
+      await until(() => beats > before);
+      expect(attempts).toBe(1);
+      clock = 100;
+      await replaced.promise;
+      expect(attempts).toBe(2);
+      expect(head).toBe(target);
+      expect(leases).toBe(0);
+      expect(warnings.every((c) => c.freeSlots === 0 && !!c.updateWarning)).toBe(true);
+    } finally {
+      await worker.stop();
+    }
+  },
+);
+
+test.each(["transient", "message only", "ancestry", "malformed"])(
+  "%s update failures remain blocked with bounded attempts and a retained warning",
+  async (failure) => {
+    await listen();
+    const target = failure === "malformed" ? "main" : "a".repeat(40);
+    let clock = 0,
+      attempts = 0,
+      commands = 0,
+      leases = 0,
+      beats = 0;
+    const warnings: string[] = [];
+    const worker = await loop({
+      updateRetry: { initialMs: 100, maxMs: 200, deadlineMs: 600, now: () => clock },
+      async request(...args) {
+        if (args[1] === "/worker/lease") leases++;
+        const reply = await workerRequest(...args);
+        if (args[1] !== "/worker/heartbeat") return reply;
+        beats++;
+        const body = args[2] as Capabilities;
+        if (body.updateWarning) {
+          warnings.push(body.updateWarning);
+          expect(body.freeSlots).toBe(0);
+        }
+        return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
+      },
+      update: {
+        async command(args) {
+          commands++;
+          if (args[1] === "fetch") {
+            attempts++;
+            if (failure === "transient") throw fetchFailure(attempts);
+            if (failure === "message only") throw new Error("Could not resolve host: arbitrary text");
+          }
+          if (args[1] === "merge-base") throw new CommandError("ancestry rejection", 1, "", "", false);
+          return { stdout: target, stderr: "", exitCode: 0 };
+        },
+        exec() {
+          throw new Error("Unexpected replacement");
+        },
+      },
+    });
+    try {
+      await until(() => warnings.length >= 1);
+      if (failure === "transient") {
+        clock = 100;
+        await until(() => attempts === 2);
+        clock = 300;
+        await until(() => attempts === 3);
+      }
+      clock = 600;
+      const before = beats;
+      await until(() => beats >= before + 3);
+      expect(attempts).toBe(failure === "transient" ? 3 : failure === "malformed" ? 0 : 1);
+      if (failure === "malformed") expect(commands).toBe(0);
+      expect(leases).toBe(0);
+      expect(warnings.length).toBeGreaterThan(2);
+      if (failure === "transient") {
+        expect(warnings[0]).toContain("attempt 1");
+        expect(warnings.at(-1)).toContain("attempt 3");
+      } else expect(warnings.at(-1)).toBe(warnings[0]);
+    } finally {
+      await worker.stop();
+    }
+  },
+);
+
+test.each([
+  "new target",
+  "match",
+  "failed restoration",
+  "failed restoration new target",
+  "recovered restoration",
+])("after an update failure a coordinator %s resets only safe update state", async (change) => {
+  await listen();
+  const first = "a".repeat(40),
+    next = "b".repeat(40);
+  let advertised = first,
+    head = releaseSha,
+    installs = 0,
+    leases = 0,
+    warningBeats = 0;
+  let observed = "";
+  const targets: string[] = [],
+    warnings: Capabilities[] = [];
+  const replaced = Promise.withResolvers<void>();
+  const worker = await loop({
+    async request(...args) {
+      if (args[1] === "/worker/lease") leases++;
+      const reply = await workerRequest(...args);
+      if (args[1] !== "/worker/heartbeat") return reply;
+      const body = args[2] as Capabilities;
+      if (body.updateWarning) {
+        warningBeats++;
+        warnings.push(body);
+      }
+      observed = advertised;
+      return { ...reply, json: () => ({ cancelled: [], releaseSha: observed }) };
+    },
+    update: {
+      async command(args) {
+        if (args[1] === "fetch") targets.push(advertised);
+        if (args[1] === "checkout") head = args[3] ?? "";
+        if (args[1] === "install") {
+          installs++;
+          if (installs === 1 || (change === "recovered restoration" && installs === 3))
+            throw new Error("target install failed");
+          if (
+            (change.startsWith("failed restoration") || change === "recovered restoration") &&
+            installs === 2
+          )
+            throw new Error("dependency restore failed");
+        }
+        return {
+          stdout: args[1] === "rev-parse" && args[2] === "--verify" ? advertised : head,
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+      exec() {
+        replaced.resolve();
+      },
+    },
+  });
+  try {
+    await until(() => warningBeats >= 2);
+    expect(targets).toEqual([first]);
+    expect(head).toBe(releaseSha);
+    expect(installs).toBe(2);
+    expect(leases).toBe(0);
+    const before = warningBeats;
+    advertised = change.endsWith("new target") || change === "recovered restoration" ? next : releaseSha;
+    await until(() => observed === advertised);
+    if (change.endsWith("new target")) {
+      await replaced.promise;
+      expect(targets).toEqual([first, next]);
+      expect(head).toBe(next);
+      expect(leases).toBe(0);
+    } else if (change === "match" || change === "recovered restoration") {
+      if (change === "recovered restoration") {
+        await until(() => installs === 4);
+        advertised = releaseSha;
+      }
+      await until(() => leases > 0 && workers.list()[0]?.setupWarning === undefined);
+      expect(targets).toEqual(change === "recovered restoration" ? [first, next] : [first]);
+      expect(workers.list()[0]?.capabilities?.freeSlots).toBeGreaterThan(0);
+    } else {
+      await until(() => warningBeats >= before + 3);
+      expect(leases).toBe(0);
+      expect(targets).toEqual([first]);
+      expect(warnings.at(-1)?.freeSlots).toBe(0);
+      expect(warnings.at(-1)?.updateWarning).toContain("restoring original dependencies failed");
+    }
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a target change during installation restores before attempting the latest release", async () => {
+  await listen();
+  const first = "a".repeat(40),
+    next = "b".repeat(40);
+  let advertised = first,
+    observed = "",
+    head = releaseSha,
+    leases = 0;
+  const installing = Promise.withResolvers<void>(),
+    finishInstall = Promise.withResolvers<void>(),
+    replaced = Promise.withResolvers<void>();
+  const installs: string[] = [],
+    targets: string[] = [],
+    warnings: string[] = [];
+  const worker = await loop({
+    async request(...args) {
+      if (args[1] === "/worker/lease") leases++;
+      const reply = await workerRequest(...args);
+      if (args[1] !== "/worker/heartbeat") return reply;
+      const body = args[2] as Capabilities;
+      if (body.updateWarning) warnings.push(body.updateWarning);
+      const target = advertised;
+      observed = target;
+      return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
+    },
+    update: {
+      async command(args) {
+        if (args[1] === "fetch") targets.push(advertised);
+        if (args[1] === "checkout") head = args[3] ?? "";
+        if (args[1] === "install") {
+          installs.push(head);
+          if (head === first) {
+            installing.resolve();
+            await finishInstall.promise;
+          }
+        }
+        return {
+          stdout: args[1] === "rev-parse" && args[2] === "--verify" ? advertised : head,
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+      exec() {
+        replaced.resolve();
+      },
+    },
+  });
+  try {
+    await installing.promise;
+    advertised = next;
+    await until(() => observed === next);
+    expect(targets).toEqual([first]);
+    expect(leases).toBe(0);
+    finishInstall.resolve();
+    await replaced.promise;
+    expect(targets).toEqual([first, next]);
+    expect(installs).toEqual([first, releaseSha, next]);
+    expect(head).toBe(next);
+    expect(warnings).toEqual([]);
+  } finally {
+    finishInstall.resolve();
+    await worker.stop();
+  }
+});
+
+test.each(["initial", "rollback"])("the worker survives a strict legacy coordinator on %s", async (kind) => {
+  await listen();
+  const legacy = Heartbeat.omit({ updateWarning: true }).strict();
+  const target = "a".repeat(40);
+  let oldProtocol = kind === "initial",
+    accepted = 0,
+    rejected = 0,
+    attempts = 0,
+    leases = 0;
+  const worker = await loop({
+    async request(...args) {
+      if (args[1] === "/worker/lease") leases++;
+      if (args[1] !== "/worker/heartbeat") return workerRequest(...args);
+      const body = args[2] as Capabilities;
+      const reply = await workerRequest(...args);
+      if (body.updateWarning) oldProtocol = true;
+      if (oldProtocol) {
+        if (!legacy.safeParse(body).success) {
+          rejected++;
+          return { ...reply, status: 400, json: () => ({ error: "Invalid heartbeat" }) };
+        }
+        accepted++;
+        return { ...reply, json: () => ({ cancelled: [] }) };
+      }
+      expect(body.updateWarning).toBeUndefined();
+      return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
+    },
+    update: {
+      async command() {
+        attempts++;
+        throw new Error("update failed before checkout");
+      },
+      exec() {
+        throw new Error("Unexpected replacement");
+      },
+    },
+  });
+  try {
+    await until(() => accepted >= 4);
+    expect(worker.controller.signal.aborted).toBe(false);
+    expect(rejected).toBe(kind === "rollback" ? 1 : 0);
+    expect(attempts).toBe(kind === "rollback" ? 1 : 0);
+    if (kind === "rollback") {
+      expect(leases).toBe(0);
+      expect(workers.list()[0]?.capabilities?.freeSlots).toBe(0);
+    }
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("the target deadline cancels an active update while heartbeats continue", async () => {
+  await listen();
+  const target = "a".repeat(40),
+    active = Promise.withResolvers<void>();
+  let attempts = 0,
+    beats = 0,
+    leases = 0,
+    warned = false;
+  const worker = await loop({
+    updateRetry: { deadlineMs: 100 },
+    async request(...args) {
+      if (args[1] === "/worker/lease") leases++;
+      const reply = await workerRequest(...args);
+      if (args[1] !== "/worker/heartbeat") return reply;
+      beats++;
+      const body = args[2] as Capabilities;
+      if (body.updateWarning) {
+        warned = true;
+        expect(body.freeSlots).toBe(0);
+      }
+      return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
+    },
+    update: {
+      async command(_args, options) {
+        attempts++;
+        active.resolve();
+        const signal = options.signal;
+        if (!signal) throw new Error("Missing bounded update signal");
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        signal.throwIfAborted();
+        throw new Error("Update outlived its deadline");
+      },
+      exec() {
+        throw new Error("Unexpected replacement");
+      },
+    },
+  });
+  try {
+    await active.promise;
+    await until(() => warned);
+    const before = beats;
+    await until(() => beats >= before + 2);
+    expect(attempts).toBe(1);
+    expect(leases).toBe(0);
+  } finally {
+    await worker.stop();
+  }
+});
