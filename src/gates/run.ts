@@ -238,6 +238,16 @@ export interface GateRetryOptions {
 export const UNSLOTTED_RETRY_MAX_FILES = 5;
 export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
 
+function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
+  const failed = run.setup.find((r) => !r.ok);
+  return {
+    ...original,
+    firstAttempt: original,
+    output: `${original.output}\n\nRetry setup failed:\n$ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
+    confinementError: confinementFailed(original) || confinementFailed(failed),
+  };
+}
+
 /** Confirm known failing files; factory gates also require a full-suite retry after a pass. */
 export async function retryFailures(
   failures: { check: GateCommand; original: GateResult }[],
@@ -247,6 +257,7 @@ export async function retryFailures(
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
   targetedOnly = false,
+  freshCheckout = false,
 ): Promise<Map<GateResult, GateResult>> {
   const results = new Map<GateResult, GateResult>();
   const targets = new Map<GateResult, GateResult>();
@@ -276,16 +287,19 @@ export async function retryFailures(
       const timeoutSec = skipGateSlot
         ? Math.min(check.timeoutSec ?? 900, 2 * UNSLOTTED_RETRY_MAX_SECONDS)
         : check.timeoutSec;
-      const attempt = (
-        await retryChecks(
-          cwd,
-          { ...cfg, setup: [], checks: [{ ...check, run, timeoutSec }] },
-          signal,
-          onWait,
-          runner,
-          { targeted: true, skipGateSlot },
-        )
-      ).checks[0];
+      const retried = await retryChecks(
+        cwd,
+        { ...cfg, setup: freshCheckout ? cfg.setup : [], checks: [{ ...check, run, timeoutSec }] },
+        signal,
+        onWait,
+        runner,
+        { targeted: true, skipGateSlot },
+      );
+      if (!retried.setupOk) {
+        results.set(original, retrySetupFailure(original, retried));
+        continue;
+      }
+      const attempt = retried.checks[0];
       if (!attempt) continue;
       targets.set(original, attempt);
       if (targetedOnly) {
@@ -302,12 +316,19 @@ export async function retryFailures(
   if (full.length && !signal.aborted) {
     const retried = await retryChecks(
       cwd,
-      { ...cfg, setup: [], checks: full.map((entry) => entry.check) },
+      { ...cfg, setup: freshCheckout ? cfg.setup : [], checks: full.map((entry) => entry.check) },
       signal,
       onWait,
       runner,
     );
     for (const [index, { original }] of full.entries()) {
+      if (!retried.setupOk) {
+        results.set(original, {
+          ...retrySetupFailure(original, retried),
+          targetedRetry: targets.get(original),
+        });
+        continue;
+      }
       const result = retried.checks[index];
       if (result)
         results.set(original, { ...result, firstAttempt: original, targetedRetry: targets.get(original) });
@@ -324,6 +345,7 @@ export async function retryBaselineFailures(
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
+  freshCheckout = false,
 ): Promise<GateRun> {
   const selected = run.checks.flatMap((original) => {
     if (original.ok || original.timedOut || confinementFailed(original)) return [];
@@ -331,7 +353,7 @@ export async function retryBaselineFailures(
     return check?.run === original.command ? [{ check, original }] : [];
   });
   if (!run.setupOk || signal.aborted || !selected.length) return run;
-  const results = await retryFailures(selected, cwd, cfg, signal, onWait, runner);
+  const results = await retryFailures(selected, cwd, cfg, signal, onWait, runner, false, freshCheckout);
   return { ...run, checks: run.checks.map((r) => results.get(r) ?? r) };
 }
 
@@ -407,6 +429,7 @@ export async function retryRegressions(
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
+  freshCheckout = false,
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const selected = cmp.flatMap((c) => {
@@ -421,7 +444,7 @@ export async function retryRegressions(
     return check?.run === c.result.command ? [{ check, original: c.result }] : [];
   });
   if (!selected.length || signal.aborted) return cmp;
-  const results = await retryFailures(selected, cwd, cfg, signal, onWait, runner);
+  const results = await retryFailures(selected, cwd, cfg, signal, onWait, runner, false, freshCheckout);
   return cmp.map((c) => {
     const retry = results.get(c.result);
     if (!retry) return c;
