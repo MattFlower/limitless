@@ -23,14 +23,20 @@ async function mergeHead(cwd: string): Promise<string> {
   return (await mergeGit(cwd, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], true)).stdout.trim();
 }
 
-export async function validateMerge(cwd: string, head: string, base: string): Promise<string> {
-  const [sha = "", ...parents] = (await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout
+export async function validateMerge(
+  cwd: string,
+  head: string,
+  base: string,
+  commit = "HEAD",
+): Promise<string> {
+  const [sha = "", ...parents] = (await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", commit])).stdout
     .trim()
     .split(/\s+/);
   // Factory merges join exactly one base: an extra parent would bring in commits nothing checked.
   if (parents.length !== 2 || parents[0] !== head || parents[1] !== base)
     throw new Error(`Invalid merge ancestry: HEAD must have parents ${head} and ${base}`);
-  if (await mergeHead(cwd)) throw new Error("Completed merge still has MERGE_HEAD");
+  // Historical commits remain checkable while a later merge is in progress.
+  if (commit === "HEAD" && (await mergeHead(cwd))) throw new Error("Completed merge still has MERGE_HEAD");
   return sha;
 }
 
