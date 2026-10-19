@@ -502,12 +502,13 @@ exec '${gitBin}' "$@"
         cmd: [process.execPath, "-e", 'setInterval(() => {}, 60_000); console.log("scan-ready");'],
         timeoutMs: undefined,
         onStdoutLine: (line) => {
-          if (line === "scan-ready") reached.resolve(scope.signal);
+          if (line !== "scan-ready") return;
+          // Recovery may delay spawning; readiness guarantees the child is registered.
+          child = [...scope.children.keys()].find((candidate) => !existing.has(candidate));
+          if (child) closed = scope.children.get(child);
+          reached.resolve(scope.signal);
         },
       });
-      child = [...scope.children.keys()].find((candidate) => !existing.has(candidate));
-      if (!child) throw new Error("blob scan child not registered");
-      closed = scope.children.get(child);
       const result = await running;
       stopped.resolve(result);
       return result;
