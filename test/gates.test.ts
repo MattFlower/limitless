@@ -2,6 +2,7 @@ import { describe, expect, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -2249,15 +2250,19 @@ test("private policy rechecks from scratch when a path vanishes mid-check and re
       vanishing.mockRestore();
     }
     // A symlinked config is removed while it is canonicalized and restored before the read, so the
-    // check sees an unresolved spelling while the read would land inside the repository.
+    // check sees an unresolved spelling while the read would land inside the repository. It is passed
+    // through an alias of the temp root, so canonical()'s fallback spelling differs on every platform.
     const linked = join(root, "cfg");
     symlinkSync(join(repo, "config"), linked);
-    expect(() => loadPrivateStrings(linked, [repo])).toThrow("inside repository");
+    symlinkSync(root, join(root, "alias"));
+    const passed = join(root, "alias", "cfg");
+    expect(() => loadPrivateStrings(passed, [repo])).toThrow("inside repository");
     // Removed at its first realpath; restored when the final lstat reaches the fallback spelling.
-    const asPassed = join(linked, "private-strings.txt");
+    const asPassed = join(passed, "private-strings.txt");
     const fallback = join(realpath(root), "cfg", "private-strings.txt");
     let removed = false;
     let restored = false;
+    let openedFallback = false;
     const swapping = spyOn(fs, "realpathSync").mockImplementation(((path: string) => {
       if (path === asPassed && !removed) {
         removed = true;
@@ -2272,13 +2277,29 @@ test("private policy rechecks from scratch when a path vanishes mid-check and re
       }
       return lstat(path, options);
     }) as typeof fs.lstatSync);
+    const watching = spyOn(fs, "openSync").mockImplementation(((path: fs.PathLike, flags: fs.OpenMode) => {
+      if (path === fallback) openedFallback = true;
+      return open(path, flags);
+    }) as typeof fs.openSync);
     try {
-      expect(() => loadPrivateStrings(linked, [repo])).toThrow("inside repository");
-      expect({ removed, restored }).toEqual({ removed: true, restored: true });
+      expect(() => loadPrivateStrings(passed, [repo])).toThrow("inside repository");
+      // The descriptor check, not an earlier one, blocked it.
+      expect({ removed, restored, openedFallback }).toEqual({
+        removed: true,
+        restored: true,
+        openedFallback: true,
+      });
     } finally {
       swapping.mockRestore();
       restoring.mockRestore();
+      watching.mockRestore();
     }
+    // A hard link to the repository's list can report the outside name, so a second link blocks.
+    const hardened = join(root, "hard");
+    mkdirSync(hardened);
+    linkSync(join(repo, "config", "private-strings.txt"), join(hardened, "private-strings.txt"));
+    expect(() => loadPrivateStrings(hardened, [repo])).toThrow("more than one hard link");
+    rmSync(hardened, { recursive: true });
     // The config directory is swapped for a link into the repository after every check, just before
     // the file is opened (or, for a path-based check, read).
     const swapped = join(root, "swapped");

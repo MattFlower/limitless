@@ -1,5 +1,6 @@
 import {
   closeSync,
+  fstatSync,
   lstatSync,
   openSync,
   readdirSync,
@@ -100,10 +101,15 @@ function readPrivateStrings(configDir: string, roots: (string | null | undefined
   refuseInside(locations);
   if (!lstatSync(file, { throwIfNoEntry: false })) return [];
   // Check the file actually opened and read through that descriptor, so a component swapped after the
-  // checks above can't redirect the read into a repository.
+  // checks above can't redirect the read into a repository. A file with a second hard link can report
+  // either name, so only a regular file with one link is read.
   const fd = openSync(file, "r");
   let text: string;
   try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new Error("Private config is not a regular file");
+    if (opened.nlink !== 1)
+      throw new PrivateError("private-strings.txt has more than one hard link; publication blocked");
     refuseInside([descriptorPath(fd)]);
     text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(fd));
   } finally {
