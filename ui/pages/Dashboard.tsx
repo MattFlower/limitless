@@ -7,7 +7,7 @@ import { CostChart } from "../components/CostChart.tsx";
 import { FilterChips, matchesRunFilter, type RunFilter } from "../components/FilterChips.tsx";
 import { KpiStrip } from "../components/KpiStrip.tsx";
 import { RunsTable } from "../components/RunsTable.tsx";
-import { ensureLiveStore, live } from "../store.ts";
+import { ensureLiveStore, live, subscribeLiveUpdates } from "../store.ts";
 
 const STATS_REFRESH_MS = 30_000;
 
@@ -18,17 +18,29 @@ export const Dashboard: Component = () => {
   const [statusFilter, setStatusFilter] = createSignal<RunFilter | null>(null);
 
   let statsRequest = 0;
+  let statsRefresh: ReturnType<typeof setTimeout> | undefined;
   const refreshStats = () => {
+    clearTimeout(statsRefresh);
+    statsRefresh = undefined;
     const request = ++statsRequest;
     getStats(14)
       .then((next) => request === statsRequest && setStats(next))
       .catch(() => {});
   };
+  const scheduleStats = () => {
+    statsRefresh ??= setTimeout(refreshStats, 250);
+  };
   onMount(() => {
     refreshStats();
+    const close = subscribeLiveUpdates((msg) => {
+      if (["feed", "github_pr", "reconnected"].includes(msg.kind)) scheduleStats();
+    });
     const t = setInterval(refreshStats, STATS_REFRESH_MS);
     const clock = setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => {
+      close();
+      statsRequest++;
+      clearTimeout(statsRefresh);
       clearInterval(t);
       clearInterval(clock);
     });
@@ -38,10 +50,14 @@ export const Dashboard: Component = () => {
   const needsYouCount = createMemo(
     () => runs().filter((r) => matchesRunFilter(r.status, "needs_you")).length,
   );
-  createEffect(on(needsYouCount, refreshStats, { defer: true }));
+  createEffect(on(needsYouCount, scheduleStats, { defer: true }));
+  const attention = createMemo(() => {
+    const ids = stats()?.needsYouRunIds;
+    return ids ? new Set(ids) : undefined;
+  });
   const filteredRuns = createMemo(() => {
     const f = statusFilter();
-    return f ? runs().filter((r) => matchesRunFilter(r.status, f)) : runs();
+    return f ? runs().filter((r) => matchesRunFilter(r.status, f, attention()?.has(r.id))) : runs();
   });
   const alerts = createMemo(() =>
     Object.values(live.alerts).filter((a) => a.resetsAt === null || a.resetsAt > now()),
