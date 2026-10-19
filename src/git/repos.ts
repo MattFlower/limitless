@@ -741,7 +741,8 @@ export async function checkPrivatePublication(
   }
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
   const diagnose = async (error: unknown, blob?: [string, number]): Promise<never> => {
-    // Keep the aggregate scan authoritative; recover file context only after a refusal.
+    // Keep the aggregate scan authoritative; recover file context only after a decoding refusal.
+    if (!blob && (error as Error).message !== privacy.privateReason("Published content", 0)) throw error;
     for (const [location, args] of [
       ...revisions.map(
         (sha) => [`Published commit ${sha}`, [...log, "-m", "--no-walk", "--format=", sha]] as const,
@@ -751,19 +752,19 @@ export async function checkPrivatePublication(
         : []),
       ...(staged ? [["Published staged content", ["git", "diff", "--cached"]] as const] : []),
     ]) {
-      const rawFlags = flags.filter((flag) => !["-p", "--text", "-U0"].includes(flag));
-      const { stdout } = await worktreeGit([...args, ...rawFlags], { cwd });
-      for (const match of stdout.matchAll(/:\d+ \d+ \w+ (\w+) [A-Z]\0([^\0]+)\0/g)) {
-        const path = match[2] ?? "";
-        const safePath = privacy.redactPrivate(redactCredentials(path), entries);
-        if (blob) {
-          if (match[1] === blob[0])
-            throw new privacy.PrivateError(privacy.privateReason(`${location}: ${safePath}`, blob[1]));
-          continue;
-        }
-        // Diagnose the same U0 patch that failed, excluding unchanged blob content.
-        const patch = await worktreeGit([...args, ...flags, "--", `:(literal)${path}`], { cwd });
-        checkPublicationText(patch.stdout, `${location}: ${safePath}`, []);
+      // One U0 patch per revision, split per file, so diagnosis excludes unchanged blob content.
+      const { stdout } = await worktreeGit([...args, ...flags], { cwd });
+      const raw = [...stdout.matchAll(/:\d+ \d+ (\w+) (\w+) [A-Z]\0([^\0]+)\0/g)];
+      const name = (path = "") => `${location}: ${privacy.redactPrivate(redactCredentials(path), entries)}`;
+      const found = raw.find((match) => match[2] === blob?.[0]);
+      if (blob && found) throw new privacy.PrivateError(privacy.privateReason(name(found[3]), blob[1]));
+      for (const section of blob ? [] : stdout.split(/(?<=[\n\0])(?=diff --git )/).slice(1)) {
+        // The index line abbreviates both blob ids; an all-zero side is an addition or deletion.
+        const [, from = "", to = ""] = /^index (\w+)\.\.(\w+)/m.exec(section) ?? [];
+        const ids = (match: RegExpMatchArray) =>
+          [from, to].every((id, i) => /^0+$/.test(id) || match[i + 1]?.startsWith(id));
+        const path = from && raw.find(ids)?.[3];
+        if (path) checkPublicationText(section, name(path), []);
       }
     }
     throw error;
