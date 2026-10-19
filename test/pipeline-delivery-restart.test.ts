@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import * as repos from "../src/git/repos.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -155,7 +155,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     },
   );
 
-  test.each(["pass", "block", "merge still in progress"])(
+  test.each(["pass", "block", "merge still in progress", "completed merge retains MERGE_HEAD"])(
     "a pending second delivery merge resumes its own gates (%s)",
     async (scenario) => {
       const { f, run, bare, merge, cwd } = await interruptGatedMerge();
@@ -189,8 +189,30 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (scenario === "merge still in progress") {
         await sh(["git", "reset", "--hard", merge], { cwd });
         await sh(["git", "merge", "--no-ff", "--no-commit", nextBase], { cwd });
+      } else if (scenario === "completed merge retains MERGE_HEAD") {
+        const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
+        writeFileSync(resolve(cwd, path), `${nextBase}\n`);
       }
       interrupted.store.close();
+      if (scenario === "completed merge retains MERGE_HEAD") {
+        const publication = spyOn(repos, "pushBranch");
+        try {
+          const resumed = start(noAgents);
+          expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+          const finished = resumed.store.getRun(run.id);
+          expect(finished?.error).toContain("Delivery refused");
+          expect(finished?.prUrl).toBeNull();
+          expect(publication).not.toHaveBeenCalled();
+          expect(
+            (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+              .stdout,
+          ).toBe("");
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+        } finally {
+          publication.mockRestore();
+        }
+        return;
+      }
       const resumed = start(noAgents);
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
         scenario === "block" ? "needs_human" : "succeeded",

@@ -1974,12 +1974,14 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
     const base = recorded?.base ?? pending ?? (current === ctx.run.headSha ? ctx.run.baseSha : null);
     const before = recorded?.head ?? (pending ? ctx.state.preRebaseHead : expected);
     if (!base || !before) throw new DeliveryHeadError(reason);
+    // Only an uncommitted pending merge may retain MERGE_HEAD at the current HEAD.
+    const inProgress = pending && current === ctx.state.preRebaseHead;
     try {
       const sha = await validateMerge(
         ctx.state.worktreePath as string,
         before,
         base,
-        current === head && !pending ? "HEAD" : current,
+        current === head && !inProgress ? "HEAD" : current,
       );
       if (sha !== current) throw new DeliveryHeadError(reason);
     } catch {
