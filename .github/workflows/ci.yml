@@ -16,4 +16,6 @@ jobs:
           bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: git config --global user.email ci@example.com && git config --global user.name ci
-      - run: bun run check
+      - run: |
+          export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"
+          bash scripts/ci-check.sh 20m bun run check
