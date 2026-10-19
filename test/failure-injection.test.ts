@@ -51,6 +51,7 @@ import {
   sh,
 } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 import { testWaits } from "./wait-support.ts";
@@ -641,7 +642,7 @@ exec '${realGit}' "$@"
       });
       expect(result.cancelled).toBe(true);
       expect(writerPid).toBeGreaterThan(0);
-      expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      expectProcessStopped(writerPid ?? 0);
       writerPid = undefined;
       return {
         status: "stuck",

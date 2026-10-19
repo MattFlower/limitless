@@ -22,6 +22,7 @@ export const Heartbeat = z
     onAC: z.boolean(),
     idleSeconds: z.number().nonnegative(),
     jobs: z.array(z.string().uuid()).max(128),
+    updateWarning: z.string().max(4000).optional(),
   })
   .strict();
 export type Capabilities = z.infer<typeof Heartbeat>;
