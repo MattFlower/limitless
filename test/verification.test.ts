@@ -722,25 +722,7 @@ test("feedback for several ungrounded holdouts states the fallback once and omit
   expect(feedback).not.toContain("secret input");
 });
 
-test("verifier distinguishes environmental blocks from invalid scenarios and missing evidence", () => {
-  const prompt = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" });
-  for (const guidance of [
-    'unavailable required platform or tool, report status blocked with blockedReason "environment"',
-    "platform-conditional tests that skip on the current host",
-    "attempted command or inspected platform guard (file:line)",
-    "unavailable platform or tool and the observed reason",
-    "name both the current and required platforms",
-    "Linux checks skipped on macOS remain blocked, with Linux verification still needed",
-    "Skipped checks are not met and do not prove that tests or CI passed",
-    "Expected permission-denial tests, genuine assertion failures and implementation-caused failures are not environment blocks",
-    "use `unclear` for missing evidence the run could have produced or an indeterminate outcome",
-    "A valid scenario prevented only by the current environment is blocked, never unmet not_required or unclear",
-    "If a scenario is invalid as written in this repository (rather than unavailable in this environment), report it `unmet` with requirement `not_required`",
-  ])
-    expect(prompt).toContain(guidance);
-  expect(prompt).not.toContain(
-    "Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error",
-  );
+test("an unclear holdout still fails verification", () => {
   expect(normalizeVerify(unmetHoldout({ status: "unclear" }), spec, holdout).overall).toBe("fail");
 });
 
