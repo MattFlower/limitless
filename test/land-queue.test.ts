@@ -2357,6 +2357,59 @@ test("a cancel interrupts a CI read that never answers", async () => {
   expect(store.getLandEntry(entry.id)?.state).toBe("cancelled");
 });
 
+test.each(["review", "conflict", "ci"] as const)(
+  "a %s round lands with the original run's checked squash subject",
+  async (kind) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    store.updateRun(pr.run.id, { baseSha: await remoteHead("main") });
+    let round: Run | null;
+    if (kind === "review") {
+      round = roundRun(pr.run.id, url(1), head);
+      store.updateRun(round.id, { title: "Review round 1: PR 1" });
+    } else {
+      if (kind === "conflict") store.recordConflictTrigger(url(1), head, "land", clock.now());
+      else
+        store.recordCiFixTrigger(
+          url(1),
+          head,
+          "failure",
+          { check: "test", line: "FAIL", excerpt: "FAIL" },
+          clock.now(),
+        );
+      const trigger =
+        kind === "conflict" ? store.pendingConflictTriggers()[0] : store.pendingCiFixTriggers()[0];
+      if (!trigger) throw new Error("missing round trigger");
+      const observation = { state: "OPEN", headRefOid: head };
+      round =
+        kind === "conflict"
+          ? store.startConflictTrigger(trigger.id, observation, clock.now())
+          : store.startCiFixTrigger(trigger.id, observation, clock.now());
+      if (round) store.updateRun(round.id, { status: "succeeded" });
+    }
+    if (!round) throw new Error("round refused");
+    expect(store.reviewRound(round.id)?.kind).toBe(kind);
+    observe(1, head);
+    store.recordApproval(round.id, url(1), head, "orchestrator");
+    const publication = repos.checkPrivatePublication;
+    const check = spyOn(repos, "checkPrivatePublication").mockImplementation(async (...args) => {
+      await publication(...args);
+      store.updateRun(pr.run.id, { title: "Changed after publication check" });
+    });
+    try {
+      const entry = await queue().request({ target: round.id });
+      await settle();
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      expect(check.mock.calls.map(([, , input]) => input?.squash?.title)).toEqual(["PR 1 (#1)"]);
+      expect(ghCalls("pr merge")).toEqual([
+        `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${head} --subject PR 1 (#1) --body-file -`,
+      ]);
+    } finally {
+      check.mockRestore();
+    }
+  },
+);
+
 test("a review-round land merges current main into the approved head before checking", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n");
@@ -3228,6 +3281,7 @@ test("an unowned PR lands the confined base merge at exactly the pushed head", a
   const head = await pushBranch("pr-1", "one.txt", "one\n");
   await advanceBase(true);
   const push = spyOn(repos, "pushExistingBranch");
+  const publication = spyOn(repos, "checkPrivatePublication");
   try {
     const entry = await queue().request({ target: url(1), sha: head });
     expect(entry).toMatchObject({ state: "queued", runId: null, title: "Hand-made change" });
@@ -3244,6 +3298,9 @@ test("an unowned PR lands the confined base merge at exactly the pushed head", a
     expect(merges).toHaveLength(1);
     expect(merges[0]).toContain(`--match-head-commit ${pushed}`);
     expect(merges[0]).toContain("--subject Hand-made change (#1)");
+    expect(publication.mock.calls.map(([, , input]) => input?.squash?.title)).toEqual([
+      "Hand-made change (#1)",
+    ]);
     expect(merges[0]).not.toContain("--auto");
     expect(readFileSync(join(root, "gh.body-1"), "utf8")).toBe("");
     expect(store.readFeed({ limit: 100 }).items.filter((i) => i.kind.startsWith("land."))).toEqual([
@@ -3253,6 +3310,7 @@ test("an unowned PR lands the confined base merge at exactly the pushed head", a
     expect(store.listRuns()).toEqual([]);
   } finally {
     push.mockRestore();
+    publication.mockRestore();
   }
 });
 
