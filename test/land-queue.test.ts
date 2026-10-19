@@ -136,7 +136,7 @@ const flag=(n)=>args.includes(n);
 if(args[1]==="view" && args.includes("title,body,headRefOid,state")) {
  while(existsSync(file+".hold-view")) await Bun.sleep(10);
 }
-if(args[1]==="view" && args.includes("url,state,isDraft,headRefOid")) {
+if(args[1]==="view" && args.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt")) {
  if(existsSync(file+".preflight-error")){ console.error("metadata lookup denied"); process.exit(1); }
  if(existsSync(file+".preflight")){ console.log(readFileSync(file+".preflight","utf8")); process.exit(0); }
 }
@@ -1256,6 +1256,47 @@ test.each([
   expect(gateLog()).toEqual([]);
   expect(ghCalls("pr merge")).toEqual([]);
   expect(ghCalls("pr ready")).toEqual([]);
+});
+
+test("a PR merged outside the queue is recorded as landed before any check", async () => {
+  const pr = delivered(1, "pr-1");
+  store.updateRun(pr.run.id, { status: "needs_human" });
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  writeFileSync(join(root, "gh.merged-1"), "");
+  const gates = fakeLandGates((req) => retryRun(req));
+  const entry = await queue({ gateExecutor: gates.executor }).request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "landed",
+    reason: `merged ${head.slice(0, 12)}`,
+  });
+  expect(store.getRun(pr.run.id)).toMatchObject({ status: "resolved", merged: true, mergedBy: "owner" });
+  expect(gates.requests).toHaveLength(0);
+  expect(gateLog()).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a PR merged outside the queue at another head blocks before any check", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  writeFileSync(
+    join(root, "gh.preflight"),
+    JSON.stringify({ url: url(1), state: "MERGED", isDraft: false, headRefOid: "b".repeat(40) }),
+  );
+  const gates = fakeLandGates((req) => retryRun(req));
+  const entry = await queue({ gateExecutor: gates.executor }).request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: "merged PR head is missing or differs from the pushed SHA",
+  });
+  expect(store.getRun(pr.run.id)?.merged).toBe(false);
+  expect(gates.requests).toHaveLength(0);
+  expect(ghCalls("pr merge")).toEqual([]);
 });
 
 test("a rejected merge blocks, arms no auto-merge, and a later head never lands", async () => {

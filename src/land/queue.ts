@@ -365,27 +365,38 @@ export class LandQueue {
       if (headMoved(fresh.headRefOid ?? "", entry.pushedSha, entry.approvedSha))
         throw new LandBlocked("head moved after approval");
     }
-    let fresh: { url: string; state: string; isDraft: boolean; headRefOid?: string | null };
+    const preflight = z.object({
+      url: z.literal(entry.prUrl),
+      state: z.enum(["OPEN", "CLOSED", "MERGED"]),
+      isDraft: z.boolean(),
+      headRefOid: z.string().nullish(),
+      mergedBy: z.object({ login: z.string() }).nullish(),
+      mergedAt: z.string().nullish(),
+    });
+    let fresh: z.infer<typeof preflight>;
     try {
       const json = await (this.deps.gh ?? runGh)(
-        ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid"],
+        ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid,mergedBy,mergedAt"],
         signal,
       );
-      fresh = z
-        .object({
-          url: z.literal(entry.prUrl),
-          state: z.enum(["OPEN", "CLOSED", "MERGED"]),
-          isDraft: z.boolean(),
-          headRefOid: z.string().nullish(),
-        })
-        .parse(JSON.parse(String(json)));
+      fresh = preflight.parse(JSON.parse(String(json)));
     } catch (error) {
       throw new LandBlocked(`cannot inspect current GitHub PR metadata: ${String(error)}`);
     }
     signal.throwIfAborted();
     this.assertClaim(entry.id);
     if (fresh.state === "CLOSED") throw new LandBlocked("PR was closed without merging");
-    if (fresh.state !== "OPEN") throw new LandBlocked("PR is already merged");
+    // A PR merged outside the queue is recorded as landed when it merged the approved head.
+    if (fresh.state === "MERGED") {
+      this.landed(entry, run, entry.approvedSha, {
+        ...fresh,
+        head: fresh.headRefOid ?? "",
+        ci: null,
+        failing: [],
+      });
+      await this.discard(repo, this.worktreePath(entry));
+      return;
+    }
     // Approval does not publish a draft as ready for review.
     if (fresh.isDraft) throw new LandBlocked("PR is a draft");
     if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
