@@ -18,8 +18,10 @@ import { basename, dirname, join } from "node:path";
 import * as cache from "../src/evals/cache.ts";
 import type { ImplementCase } from "../src/evals/cases.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
+import { gradeImplement } from "../src/evals/implement.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
+import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { observerRoots, seatbeltBackend } from "../src/harness/sandbox.ts";
 import * as scratch from "../src/harness/scratch.ts";
@@ -182,8 +184,8 @@ for (const failure of ["setup", "timeout"] as const)
     }
   });
 
-// #556 measurement (2026-10-16): alone 21.21 s, paired load 26.07 s; sixteen real-Git trials.
-// An earlier paired run took 43.78 s, so retain a 90 s limit.
+// #556 measurement (2026-10-16), when both runs had eight trials: alone 21.21 s, paired load
+// 26.07 s, and once 43.78 s paired, so retain a 90 s limit.
 test("baseline gates are shared across repetitions and providers per case within each run", async () => {
   const f = await fixture("sh count-gates.sh", (_, observe) => ({
     "count-gates.sh": `if test -f answer; then echo candidate >> '${observe}/gate-runs'; else echo baseline >> '${observe}/gate-runs'; fi\n`,
@@ -192,29 +194,36 @@ test("baseline gates are shared across repetitions and providers per case within
     const second = { ...f.item, id: "two" };
     cpSync(f.hiddenDir, join(f.home, "hidden", second.id), { recursive: true });
     writeFileSync(f.casePath, JSON.stringify({ role: "implement", version: 1, cases: [f.item, second] }));
-    for (let run = 1; run <= 2; run++) {
-      const report = await f.run({ models: ["candidate-a", "candidate-b"], k: 2, cache: false });
-      expect(report.trials).toHaveLength(8);
+    // The second run needs only one trial per case to show it prepares its own baselines.
+    for (const [models, k, baselines, candidates] of [
+      [["candidate-a", "candidate-b"], 2, 2, 8],
+      [["candidate-a"], 1, 4, 10],
+    ] as const) {
+      const report = await f.run({ models, k, cache: false });
+      expect(report.trials).toHaveLength(models.length * k * 2);
       expect(report.trials.every((trial) => trial.pass)).toBe(true);
       const lines = readFileSync(join(f.observe, "gate-runs"), "utf8").trim().split("\n");
-      expect(lines.filter((line) => line === "baseline")).toHaveLength(2 * run);
-      expect(lines.filter((line) => line === "candidate")).toHaveLength(8 * run);
+      expect(lines.filter((line) => line === "baseline")).toHaveLength(baselines);
+      expect(lines.filter((line) => line === "candidate")).toHaveLength(candidates);
     }
   } finally {
     await f.close();
   }
 }, 90_000);
 
-for (const role of ["triage", "review", "verify", "implement"])
-  test(`implement contamination checks scope ${role} labels in base history`, async () => {
+// One history holds every other role's labels: none of them may reject the implement case.
+for (const roles of [["triage", "review", "verify"], ["implement"]])
+  test(`implement contamination checks scope ${roles.join(", ")} labels in base history`, async () => {
     const f = await fixture();
     try {
-      const dir = join(f.source, "evals", role);
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, "cases.json"), '{"labels":"unrelated bytes"}');
+      for (const role of roles) {
+        const dir = join(f.source, "evals", role);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "cases.json"), '{"labels":"unrelated bytes"}');
+      }
       await pinBase(f);
       const trial = (await f.run()).trials[0];
-      if (role === "implement") {
+      if (roles.includes("implement")) {
         expect(trial?.details.reason).toContain("pinned history contains");
         expect(f.calls).toHaveLength(0);
       } else {
@@ -430,7 +439,8 @@ for (const [kind, files, gate, reason] of [
 
 // Exit codes such as 126/127 can be caused by the candidate (a deleted or non-executable script),
 // so they are graded hidden_tests failures and the evidence is cached like any other grade.
-for (const command of ["./hidden/missing-script.sh", "sh hidden/missing-script.sh", "exit 2"])
+// Exit 126 is covered by the mode-bit test below and other nonzero exits by "implement grading: hidden".
+for (const command of ["./hidden/missing-script.sh"])
   test(`hidden command classification: ${command}`, async () => {
     const f = await fixture();
     try {
@@ -829,11 +839,16 @@ test("single-round strategies share legacy inputs and cache; multi-round identit
       keyed.mockRestore();
     }
     expect(f.calls).toHaveLength(1);
+    // Each strategy at two rounds, and a third round for one of them.
     const keys = new Set([first?.cacheKey]);
-    for (const rounds of [2, 3])
-      for (const strategy of ["retry", "effort", "switch"])
-        keys.add((await f.run({ rounds, strategy })).trials[0]?.cacheKey);
-    expect(keys.size).toBe(7);
+    for (const [rounds, strategy] of [
+      [2, "retry"],
+      [2, "effort"],
+      [2, "switch"],
+      [3, "retry"],
+    ] as const)
+      keys.add((await f.run({ rounds, strategy })).trials[0]?.cacheKey);
+    expect(keys.size).toBe(5);
     expect(f.calls.every((s) => s.prompt === f.calls[0]?.prompt && s.resumeSessionId === undefined)).toBe(
       true,
     );
@@ -842,17 +857,8 @@ test("single-round strategies share legacy inputs and cache; multi-round identit
   }
 });
 
-for (const kind of [
-  "limit",
-  "effort",
-  "default",
-  "switch",
-  "error",
-  "timeout",
-  "budget",
-  "unavailable",
-  "missing-session",
-])
+// Every reply has no session, so "limit" also shows that a retry without one starts fresh.
+for (const kind of ["limit", "effort", "default", "switch", "error", "timeout", "budget", "unavailable"])
   test(`multi-round stops correctly: ${kind}`, async () => {
     const f = await fixture();
     try {
@@ -886,7 +892,7 @@ for (const kind of [
         expect(t?.details.grade?.implement?.reason).toBe("hidden_tests");
         expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 1 });
       }
-      const repeats = kind === "limit" || kind === "missing-session";
+      const repeats = kind === "limit";
       expect(f.calls).toHaveLength(repeats ? 2 : 1);
       expect(f.calls.every((s) => s.resumeSessionId === undefined)).toBe(true);
       expect(t?.details.stopReason).toBe(
@@ -1620,9 +1626,8 @@ test("round-0 grading artifacts are gone before round 1 searches for them", asyn
   }
 });
 
+// Cleanup after a pass is covered by the read-only checkout test below; hidden_tests takes the same path.
 for (const [outcome, reason] of [
-  ["success", null],
-  ["hidden-exit", "hidden_tests"],
   ["setup", "gates"],
   ["injection", "error"],
   ["timeout", "timeout"],
@@ -1646,18 +1651,15 @@ for (const [outcome, reason] of [
       f.respond((s) => {
         if (outcome === "injection") symlinkSync(f.home, join(s.cwd, "hidden"));
         return {
-          files: {
-            answer: outcome === "hidden-exit" ? "wrong" : "correct",
-            ...(outcome === "setup" ? { broken: "yes" } : {}),
-          },
+          files: { answer: "correct", ...(outcome === "setup" ? { broken: "yes" } : {}) },
         };
       });
       const t = (await f.run()).trials[0];
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
       // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch,
-      // plus one confined scratch per gate run (baseline and grading), shared by its setup and checks.
-      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 2);
+      // plus bundle-transfer scratch and one confined scratch per gate run (baseline and grading).
+      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 3);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
@@ -1723,8 +1725,8 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     f.save();
     expect((await f.run()).trials[0]?.pass).toBe(true);
     const dirs = allocated.mock.results.map((r) => String(r.value));
-    // Harness, grading checkout and hidden scratch, plus the baseline and grading gate commands'.
-    expect(dirs).toHaveLength(5);
+    // Harness, grading checkout, bundle transfer and hidden scratch, plus both gate commands'.
+    expect(dirs).toHaveLength(6);
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();
@@ -1753,6 +1755,48 @@ test("injected confinement covers preparation, grading gates and the hidden grad
         ({ opts }) => opts.cwd === hidden?.opts.cwd && opts.env.LIMITLESS_CONFINED === "1",
       ),
     ).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("grading candidate metadata and untracked state use confined git", async () => {
+  const f = await fixture();
+  try {
+    const marker = join(f.home, "fsmonitor-marker");
+    const monitor = join(f.home, "fsmonitor");
+    writeFileSync(monitor, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    await sh(["git", "config", "core.fsmonitor", monitor], { cwd: f.source });
+    await sh(["git", "ls-files", "-z", "-o"], { cwd: f.source });
+    expect(existsSync(marker)).toBe(true);
+    rmSync(marker);
+    const calls: string[][] = [];
+    const grade = await gitConfinement.run(
+      {
+        wrap: async (cmd, opts) => {
+          if (opts.cwd === f.source) calls.push(cmd);
+          // Stop before hidden execution: this test exercises only the candidate-side git boundary.
+          if (cmd.includes("init")) throw new ConfinementError("grading init refused");
+          return cmd;
+        },
+      },
+      () =>
+        gradeImplement(
+          f.item,
+          f.source,
+          [],
+          {
+            gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+            baseline: { setup: [], checks: [], setupOk: true },
+          },
+          [],
+          new AbortController().signal,
+        ),
+    );
+    expect(grade.implement?.error).toBe("grading init refused");
+    expect(calls.some((cmd) => cmd.includes("ls-files") && cmd.includes("-o"))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes("rev-parse") && cmd.at(-1) === "HEAD")).toBe(true);
+    expect(existsSync(marker)).toBe(false);
   } finally {
     await f.close();
   }

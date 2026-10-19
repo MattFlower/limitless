@@ -200,6 +200,7 @@ export async function withGateLease<T>(
       let state: Reply | undefined;
       let first = true,
         responsive = false,
+        announced = false,
         progressAt = started,
         holder: string | undefined,
         failure: unknown,
@@ -223,6 +224,16 @@ export async function withGateLease<T>(
         opts.agentTest?.assertActive?.();
         opts.signal?.throwIfAborted();
         if (!first) {
+          // An agent's tool sees only this process's output: say once that it is waiting, not hung.
+          if (opts.agentTest && !announced) {
+            announced = true;
+            (opts.warn ?? console.warn)(
+              redactCredentials(
+                `agent-test: ${name} waiting up to ${Math.ceil(maxWait / 1000)}s for the ${opts.agentTest.lane} lane` +
+                  `${holder ? ` (holder: ${holder})` : ""}${failure ? `; last failure: ${failure}` : ""}`,
+              ),
+            );
+          }
           if (remaining() <= 0) throw pastDeadline();
           await clock.sleep(Math.min(250, remaining()));
           if (remaining() <= 0) throw pastDeadline();

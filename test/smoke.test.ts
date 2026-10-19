@@ -10,9 +10,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import {
   backendChecks,
+  bunVerifierCheck,
   type CheckResult,
   type Clock,
   catalogChecks,
@@ -33,11 +34,12 @@ import {
   verifyLiveCheck,
 } from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
+import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
 import { parseExcludeOrigins } from "../src/router/origins.ts";
-import { sh } from "../src/util/proc.ts";
+import { agentEnv, runProcess, sh } from "../src/util/proc.ts";
 
 const result: AgentResult = {
   status: "ok",
@@ -160,12 +162,14 @@ test("native smoke and Codex iteration never call excluded candidates and retain
   };
   const blocked = models.filter((m) => m.origin === "CN");
   const rows = await runChecks(nativeChecks({ providers, models: blocked }, ["CN"], check));
-  expect(rows).toHaveLength(14);
+  expect(rows).toHaveLength(15);
   expect(rows.every((r) => r.reason?.includes("origin excluded (CN; baseOrigin=CN)"))).toBe(true);
   expect(calls).toEqual([]);
   await runChecks(nativeChecks({ providers, models }, ["CN"], check));
   expect(calls).toEqual(
-    models.filter((m) => m.origin === "US").flatMap((m) => Array.from({ length: 7 }, () => m.id)),
+    models
+      .filter((m) => m.origin === "US")
+      .flatMap((m) => Array.from({ length: m.provider === "claude" ? 8 : 7 }, () => m.id)),
   );
   calls.length = 0;
   await checkCodexModels(
@@ -179,7 +183,9 @@ test("native smoke and Codex iteration never call excluded candidates and retain
   expect(calls).toEqual(models.filter((m) => m.provider === "codex" && m.origin === "US").map((m) => m.id));
   calls.length = 0;
   await runChecks(nativeChecks({ providers, models }, undefined, check));
-  expect(calls).toEqual(blocked.flatMap((m) => Array.from({ length: 7 }, () => m.id)));
+  expect(calls).toEqual(
+    blocked.flatMap((m) => Array.from({ length: m.provider === "claude" ? 8 : 7 }, () => m.id)),
+  );
 });
 
 test("explicit smoke refuses exclusions before any trial and absent configuration permits unknown ancestry", async () => {
@@ -839,6 +845,187 @@ test("deploy restores the previous checkout when injected smoke fails before res
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A factory worker may itself inherit wrappers. Model the daemon's PATH behind the probe's own
+// wrapper so the local lease integration never calls an unrelated invocation's capabilities.
+async function isolatedBunVerifierCheck(...args: Parameters<typeof bunVerifierCheck>) {
+  const path = process.env.PATH;
+  try {
+    process.env.PATH = [dirname(process.execPath), path].join(delimiter);
+    return await bunVerifierCheck(...args);
+  } finally {
+    process.env.PATH = path;
+  }
+}
+
+for (const outcome of [
+  "pass",
+  "failed-test",
+  "fabricated",
+  "missing",
+  "claim",
+  "wrong-command",
+  "error-result",
+  "timeout",
+  "cancelled",
+  "throw",
+] as const) {
+  test(`Claude verifier Bun smoke requires successful bounded execution: ${outcome}`, async () => {
+    const target: ModelTarget = {
+      modelId: "fake/m",
+      provider: "claude",
+      model: "m",
+      vendor: "fake",
+      tier: 4,
+      harness: "fake",
+      billing: "subscription",
+    };
+    const paths: string[] = [];
+    const controller = new AbortController();
+    const check = () =>
+      isolatedBunVerifierCheck(
+        async (spec) => {
+          paths.push(spec.cwd, spec.scratchDir ?? "");
+          expect(spec.mode).toBe("readonly");
+          expect(spec.confineReads).not.toBe(true);
+          expect(spec.noTools).not.toBe(true);
+          const wrapper = spec.commandPath?.split(delimiter)[0] ?? "";
+          const config = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+          expect(config.commands).toEqual([["bun", "test"]]);
+          expect(Bun.which("bun", { PATH: spec.commandPath })).toBe(join(wrapper, "bun"));
+          paths.push(wrapper, config.unix, dirname(spec.scratchDir ?? ""));
+          expect(spec.timeoutMs).toBe(90_000);
+          const scratch = spec.scratchDir ?? "";
+          const entry = readFileSync(join(scratch, "probe.ts"), "utf8");
+          expect(entry).toContain("timeoutMs: 10_000");
+          const source = readFileSync(join(scratch, "probe.test.ts"), "utf8");
+          expect(source).toContain("expect(1).toBe(1)");
+          const command = spec.prompt.split("\n")[1] ?? "";
+          const marker = entry.match(/console.log\("([^"]+)"\)/)?.[1] ?? "missing marker";
+          if (outcome === "throw") throw new Error("fake harness failure");
+          if (outcome === "failed-test")
+            writeFileSync(join(scratch, "probe.test.ts"), source.replace("toBe(1)", "toBe(2)"));
+          // A lease environment value is emitted only after traversing the real wrapper.
+          if (outcome === "pass")
+            writeFileSync(
+              join(scratch, "probe.test.ts"),
+              `${source}console.log("WRAPPER_LEASE", process.env.LIMITLESS_AGENT_TEST_LEASE);`,
+            );
+          let output = marker,
+            isError = false;
+          if (outcome === "pass" || outcome === "failed-test") {
+            const run = await runProcess({
+              cmd: ["/bin/sh", "-c", command],
+              cwd: spec.cwd,
+              env: agentEnv({ TMPDIR: scratch, PATH: spec.commandPath ?? "" }),
+              signal: spec.signal,
+              timeoutMs: 15_000,
+            });
+            output = run.stdout + run.stderr;
+            isError = run.exitCode !== 0;
+            expect(run.timedOut).toBe(false);
+            if (outcome === "pass") {
+              expect(run.exitCode).toBe(0);
+              expect(output).toMatch(/WRAPPER_LEASE [a-zA-Z0-9-]+/);
+              expect(output).not.toContain("WRAPPER_LEASE undefined");
+              expect(output).toContain("1 pass");
+              expect(output).toContain("0 fail");
+            }
+          }
+          if (!["pass", "failed-test", "fabricated"].includes(outcome)) output += "\n1 pass\n0 fail\n";
+          if (outcome === "cancelled") controller.abort();
+          if (outcome === "claim") spec.onEvent({ type: "text", text: output });
+          else {
+            spec.onEvent({
+              type: "tool_call",
+              id: "bun",
+              name: "Bash",
+              input: { command: outcome === "wrong-command" ? `echo ${command}` : command },
+            });
+            if (outcome !== "missing")
+              spec.onEvent({
+                type: "tool_result",
+                id: "bun",
+                output,
+                isError: isError || outcome === "error-result",
+              });
+          }
+          return {
+            ...result,
+            finalText: output,
+            ...(outcome === "timeout" ? { status: "timeout", error: "timed out" } : {}),
+          };
+        },
+        target,
+        controller.signal,
+      );
+    if (outcome === "throw") await expect(check()).rejects.toThrow("fake harness failure");
+    else expect((await check()).status).toBe(outcome === "pass" ? "pass" : "fail");
+    for (const path of paths) expect(existsSync(path)).toBe(false);
+  });
+}
+
+for (const stop of ["cancelled", "deadline"] as const) {
+  test(`Claude's Bun smoke ${stop} stops its owned subprocess before removing scratch`, async () => {
+    const controller = new AbortController();
+    const resources: string[] = [];
+    let scratch = "",
+      pid = 0;
+    const check = await isolatedBunVerifierCheck(
+      async (spec) => {
+        scratch = spec.scratchDir ?? "";
+        const wrapper = spec.commandPath?.split(delimiter)[0] ?? "";
+        const config = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+        resources.push(spec.cwd, dirname(scratch), wrapper, config.unix);
+        const test = join(scratch, "probe.test.ts");
+        writeFileSync(
+          test,
+          'import { test } from "bun:test"; test("hang", async () => { console.log("READY", process.pid); await new Promise(() => {}); }, 60000);',
+        );
+        const command = spec.prompt.split("\n")[1] ?? "";
+        const run = await runProcess({
+          cmd: ["/bin/sh", "-c", command],
+          cwd: spec.cwd,
+          env: agentEnv({ TMPDIR: scratch, PATH: spec.commandPath ?? "" }),
+          signal: spec.signal,
+          timeoutMs: 20_000,
+          onStdoutLine: (line) => {
+            if (line.startsWith("READY")) {
+              pid = Number(line.split(" ")[1]);
+              if (stop === "cancelled") controller.abort();
+            }
+          },
+        });
+        expect(run.cancelled).toBe(stop === "cancelled");
+        expect(run.timedOut).toBe(false);
+        expect(run.stdout).not.toContain("bun-test-passed");
+        spec.onEvent({ type: "tool_call", id: "bun", name: "Bash", input: { command } });
+        spec.onEvent({
+          type: "tool_result",
+          id: "bun",
+          output: run.stdout + run.stderr,
+          isError: run.exitCode !== 0,
+        });
+        return { ...result, status: stop === "cancelled" ? "cancelled" : "ok" };
+      },
+      {
+        modelId: "fake/m",
+        provider: "claude",
+        model: "m",
+        vendor: "fake",
+        tier: 4,
+        harness: "fake",
+        billing: "subscription",
+      },
+      controller.signal,
+    );
+    expect(check.status).toBe("fail");
+    expect(existsSync(scratch)).toBe(false);
+    for (const path of resources) expect(existsSync(path)).toBe(false);
+    expect(pid).toBeGreaterThan(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 25_000);
+}
 
 for (const outcome of [
   "pass",
@@ -1600,3 +1787,46 @@ for (const outcome of [
     }
   });
 }
+
+test("verify smoke confines git after the harness has run", async () => {
+  const root = mkdtempSync(join(tmpdir(), "smoke-git-boundary-"));
+  const marker = join(root, "marker");
+  const helper = join(root, "fsmonitor");
+  writeFileSync(helper, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+  let calls = 0;
+  try {
+    await expect(
+      gitConfinement.run(
+        {
+          wrap: async (cmd) => {
+            if (cmd.includes("status")) {
+              calls++;
+              throw new ConfinementError("smoke inspection refused");
+            }
+            return cmd;
+          },
+        },
+        () =>
+          verifyLiveCheck(
+            async (spec) => {
+              await sh(["git", "config", "core.fsmonitor", helper], { cwd: spec.cwd });
+              return result;
+            },
+            {
+              modelId: "fake/m",
+              provider: "fake",
+              model: "m",
+              vendor: "fake",
+              tier: 4,
+              harness: "fake",
+              billing: "subscription",
+            },
+          ),
+      ),
+    ).rejects.toThrow("smoke inspection refused");
+    expect(calls).toBe(1);
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

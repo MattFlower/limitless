@@ -152,18 +152,24 @@ test("abort while queued releases the lease, reports SIGTERM and never starts th
   const f = fixture(),
     waiting = Promise.withResolvers<void>();
   const requests: Record<string, unknown>[] = [];
-  const before = process.listenerCount("SIGTERM");
+  // Another caller's once listener disappears during cancellation, independently of this invocation.
+  const unrelated = () => {};
+  process.once("SIGTERM", unrelated);
+  cleanup.push(() => process.off("SIGTERM", unrelated));
+  const before = process.listeners("SIGTERM");
   const work = agentTestCommand(f.config, ["bun", "test"], async (body) => {
     requests.push(body);
     waiting.resolve();
     return { id: "lease", acquired: false };
   });
   await waiting.promise;
+  const installed = process.listeners("SIGTERM").filter((listener) => !before.includes(listener));
+  expect(installed.length).toBeGreaterThan(0);
   process.emit("SIGTERM");
   expect(await work).toBe(143);
   expect(existsSync(f.marker)).toBe(false);
   expect(requests.at(-1)).toMatchObject({ release: true });
-  expect(process.listenerCount("SIGTERM")).toBe(before);
+  for (const listener of installed) expect(process.listeners("SIGTERM")).not.toContain(listener);
 });
 
 test("resolution excludes wrapper aliases, runs once, and returns 127 when missing", async () => {
@@ -631,6 +637,10 @@ test.each([false, true])("healthy busy queue exits 75 without executing (lane bu
   expect(stderr).toMatch(/waited.*targeted/i);
   expect(stderr).toContain("gate lane");
   expect(stderr).toContain(busy ? "other command" : "full suite");
+  // The agent's tool sees one wait notice before the budget runs out, not silence (#586).
+  expect(
+    warning.mock.calls.filter(([m]) => String(m).includes("waiting up to 1s for the gate lane")),
+  ).toHaveLength(1);
   if (busy) expect(requests.every((body) => !body.id)).toBe(true);
   else expect(requests.at(-1)).toMatchObject({ release: true });
   expect(time.pending).toBe(0);
@@ -826,6 +836,42 @@ test.each([
   expect(stderr).not.toContain(f.config.token);
   expect(stderr).toContain("[redacted]");
   expect(existsSync(f.marker)).toBe(true);
+});
+
+test("a sandbox that refuses both connections runs the test at once instead of waiting silently", async () => {
+  // Claude's reader sandbox denies loopback and Unix-socket connects; Bun reports this shape (#586).
+  const f = fixture(),
+    { clock } = fakeClock();
+  f.config.token = crypto.randomUUID();
+  const denied = (transport: string) =>
+    Object.assign(new TypeError(`${transport} EPERM: ${f.config.token}`), {
+      code: "EPERM",
+    });
+  const requests: string[] = [];
+  const client = wrapperLeaseClient(
+    f.config,
+    clock,
+    async () => {
+      requests.push("http");
+      throw denied("HTTP");
+    },
+    async () => {
+      requests.push("unix");
+      throw denied("socket");
+    },
+  );
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanup.push(() => warn.mockRestore());
+  const start = clock.now();
+  expect(await agentTestCommand(f.config, ["bun", "test"], client, { clock })).toBe(3);
+  expect(clock.now()).toBe(start);
+  expect(requests).toEqual(["http", "unix"]);
+  expect(existsSync(f.marker)).toBe(true);
+  const stderr = warn.mock.calls.flat().join();
+  expect(stderr).toContain("coordination unavailable");
+  expect(stderr).toContain("EPERM");
+  expect(stderr).toContain("[redacted]");
+  expect(stderr).not.toContain(f.config.token);
 });
 
 test("an answering endpoint rejection never falls back, and socket failure rechecks HTTP", async () => {

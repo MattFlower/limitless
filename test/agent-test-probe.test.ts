@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
-import { buildClaudeArgs } from "../src/harness/claude.ts";
+import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import { editorProfile } from "../src/harness/codex.ts";
 import { seatbeltForPort } from "../src/harness/sandbox.ts";
 import {
@@ -13,8 +13,9 @@ import {
   removeScratch,
   writeRoots,
 } from "../src/harness/scratch.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import { agentEnv, runProcess } from "../src/util/proc.ts";
+import { agentEnv, redactCredentials, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
@@ -131,3 +132,101 @@ for (const sandbox of ["codex-editor", "claude-reader", "claude-editor"] as cons
     },
   );
 }
+
+test.skipIf(seatbeltSkip !== null)(
+  `Claude reader runs bun test (lease wrapper; ${seatbeltSkip ?? "available"})`,
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "verifier-bun-")));
+    const cwd = join(root, "checkout");
+    mkdirSync(cwd);
+    const scratch = createScratch(cwd);
+    const file = join(scratch, "probe.test.ts");
+    writeFileSync(file, 'import {test, expect} from "bun:test"; test("probe", () => expect(1).toBe(1));');
+    // A live HTTP endpoint the sandbox must still refuse; the wrapper must not wait for it (#586).
+    const http = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response(null, { status: 500 }),
+    });
+    const spec: AgentSpec = {
+      cwd,
+      scratchDir: scratch,
+      mode: "readonly",
+      prompt: "",
+      timeoutMs: 10_000,
+      idleTimeoutMs: 10_000,
+      maxToolCalls: 1,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+      logPath: join(root, "stream.log"),
+      target: {
+        modelId: "probe",
+        provider: "fake",
+        harness: "fake",
+        model: "probe",
+        vendor: "fake",
+        tier: 1,
+        billing: "subscription",
+      },
+    };
+    const previous = process.env.CLAUDE_CODE_TMPDIR;
+    try {
+      await withSlottedCommands(
+        [["bun", "test"]],
+        cwd,
+        scratch,
+        Number(http.port),
+        () => {},
+        (commandPath) =>
+          runClaude({ ...spec, commandPath }, async (opts) => {
+            const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+            process.env.CLAUDE_CODE_TMPDIR = opts.env.CLAUDE_CODE_TMPDIR;
+            const execute = async (filesystem: SandboxRuntimeConfig["filesystem"]) => {
+              try {
+                await SandboxManager.initialize(
+                  { filesystem, network: { allowedDomains: [], deniedDomains: [] } },
+                  undefined,
+                  false,
+                );
+                const wrapped = await SandboxManager.wrapWithSandboxArgv(
+                  `bun test '${file}'`,
+                  "/bin/bash",
+                  undefined,
+                  spec.signal,
+                  cwd,
+                );
+                const env = Object.fromEntries(
+                  Object.entries(wrapped.env).filter(
+                    (entry): entry is [string, string] => entry[1] !== undefined,
+                  ),
+                );
+                return await runProcess({
+                  cmd: wrapped.argv,
+                  cwd,
+                  env: { ...opts.env, ...env },
+                  signal: opts.signal,
+                  timeoutMs: 10_000,
+                });
+              } finally {
+                await SandboxManager.reset();
+              }
+            };
+            const filesystem: SandboxRuntimeConfig["filesystem"] = settings.sandbox.filesystem;
+            const result = await execute(filesystem);
+            console.info(redactCredentials(`Claude verifier bun test: ${JSON.stringify(result)}`));
+            expect(result.timedOut).toBe(false);
+            expect(result.exitCode).toBe(0);
+            expect(result.stdout + result.stderr).toContain("1 pass");
+            return result;
+          }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CODE_TMPDIR;
+      else process.env.CLAUDE_CODE_TMPDIR = previous;
+      http.stop(true);
+      removeScratch(scratch);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);

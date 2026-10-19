@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
@@ -1769,7 +1769,10 @@ test("worker cleanup restores locked directories without following symlinks and 
   const command = await import("../src/git/command.ts"),
     original = command.worktreeGit;
   let failRemoval = false;
+  const externalWrites: { args: string[]; roots: string[] | undefined }[] = [];
   const spy = spyOn(command, "worktreeGit").mockImplementation(async (args, options) => {
+    if ((args[1] === "worktree" && args[2] === "remove") || (args[1] === "bundle" && args[2] === "create"))
+      externalWrites.push({ args, roots: options.additionalWriteRoots });
     if (failRemoval && args[1] === "worktree" && args[2] === "remove") {
       failRemoval = false;
       throw new Error("cleanup-sensitive-diagnostic-570");
@@ -1807,6 +1810,10 @@ test("worker cleanup restores locked directories without following symlinks and 
     await until(() => readdirSync(worker.remote.paths.work).length === 0);
     expect(checkouts).toHaveLength(3);
     expect(checkouts.every((path) => !existsSync(path))).toBe(true);
+    expect(externalWrites.filter(({ args }) => args[1] === "bundle")).toHaveLength(3);
+    expect(externalWrites.filter(({ args }) => args[1] === "worktree")).toHaveLength(3);
+    for (const { args, roots } of externalWrites)
+      expect(roots).toEqual([args[1] === "bundle" ? dirname(args[3] ?? "") : (args.at(-1) ?? "")]);
     expect(workers.jobs("1=1").every((j) => j.state === "done" && j.attempt === 1)).toBe(true);
     expect(statSync(outside).mode & 0o777).toBe(0o500);
   } finally {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
 import {
   chmodSync,
   copyFileSync,
@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -26,6 +27,7 @@ import {
   readPolicyScope,
 } from "../src/harness/read-policy.ts";
 import {
+  type ConfinementBackend,
   ConfinementError,
   confinementScope,
   runConfined,
@@ -35,8 +37,17 @@ import {
   withCommandScratch,
 } from "../src/harness/sandbox.ts";
 import { writeRoots } from "../src/harness/scratch.ts";
-import { agentEnv, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import {
+  agentEnv,
+  type ProcOptions,
+  type ProcResult,
+  processBirth,
+  processBirthInspection,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { deferred } from "./evals-support.ts";
 import { test } from "./read-policy-support.ts";
 
 // Real git and sandboxed subprocesses.
@@ -938,12 +949,34 @@ test("a backend startup failure after successful verification is operational, ne
     proc({ exitCode: 71, stderr: "sandbox initialization failed" }),
     proc({ exitCode: null, timedOut: true }),
     proc({ cancelled: true }),
+    proc({ exitCode: null, signal: "SIGKILL" }),
   ]) {
     await expect(
       runConfined(
         opts,
         async () => {},
         async () => failure,
+      ),
+    ).rejects.toThrow(ConfinementError);
+  }
+  // A cancel arriving while the launch exits, times out or crashes on its own does not hide that.
+  for (const failure of [
+    proc({ cancelled: true, exitCode: 71, stderr: "sandbox initialization failed" }),
+    proc({ cancelled: true, exitCode: null, signal: "SIGKILL", timedOut: true }),
+    proc({ cancelled: true, exitCode: null, signal: "SIGKILL", idleTimedOut: true }),
+    proc({ cancelled: true, exitCode: null, signal: "SIGSEGV" }),
+    // A cancel that arrived after the launch already died does not show that the cancel killed it.
+    proc({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" }),
+  ]) {
+    const abort = new AbortController();
+    await expect(
+      runConfined(
+        { ...opts, signal: abort.signal },
+        async () => {},
+        async () => {
+          abort.abort();
+          return failure;
+        },
       ),
     ).rejects.toThrow(ConfinementError);
   }
@@ -960,6 +993,304 @@ test("a backend startup failure after successful verification is operational, ne
   );
   expect(result.exitCode).toBe(71);
   expect(result.stdout).toBe("user output");
+});
+
+test("a Seatbelt diagnostic beyond the retained stderr tail still makes a cancelled launch a confinement error", async () => {
+  // Built at runtime so the diagnostic never sits on a source line a failure report would print.
+  const diagnostic = ["sandbox-exec: sandbox_apply", "Operation not permitted"].join(": ");
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    // The diagnostic, then more stderr than runProcess keeps, then a line that triggers the cancel.
+    wrap: (cmd) => [
+      "/bin/sh",
+      "-c",
+      'echo "$1" >&2; head -c 70000 /dev/zero | tr "\\0" x >&2; echo >&2; echo held >&2; sleep 900; shift; exec "$@"',
+      "sh",
+      diagnostic,
+      ...cmd,
+    ],
+  };
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  const launch = runSandboxed(
+    {
+      cmd: ["/usr/bin/true"],
+      cwd: work,
+      env: agentEnv(),
+      signal: abort.signal,
+      onStderrLine: (line) => {
+        if (line === "held") abort.abort();
+      },
+    },
+    { write: [work], protect: [] },
+    async (opts) => {
+      seen = await runProcess(opts);
+      return seen;
+    },
+    undefined,
+    held,
+  );
+  await expect(launch).rejects.toThrow(ConfinementError);
+  // The retained tail no longer holds the diagnostic, and the cancel did kill the launch.
+  expect(seen?.stderr.includes(diagnostic)).toBe(false);
+  expect(seen).toMatchObject({ cancelled: true, cancelKilled: true, signal: "SIGKILL" });
+});
+
+test("a frozen launch killed by something else before the cancel's SIGKILL stays a confinement error", async () => {
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => ["/bin/sh", "-c", 'echo "held $$" >&2; sleep 900; exec "$@"', "sh", ...cmd],
+  };
+  const inspecting = deferred<void>();
+  const release = deferred<void>();
+  let launcher = 0;
+  let frozen = false;
+  let holding = false;
+  const kill = process.kill.bind(process);
+  const signals = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    const sent = kill(pid, signal);
+    if (pid === launcher && signal === "SIGSTOP") frozen = true;
+    return sent;
+  });
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  try {
+    const launch = processBirthInspection.run(
+      {
+        // After the freeze, the launcher's next identity check (just before our SIGKILL) waits here.
+        read: async (pid, name) => {
+          if (frozen && pid === launcher && !holding) {
+            holding = true;
+            inspecting.resolve();
+            await release.promise;
+          }
+          return processBirth(pid, name);
+        },
+        now: () => Number.MAX_SAFE_INTEGER,
+      },
+      () =>
+        runSandboxed(
+          {
+            cmd: ["/usr/bin/true"],
+            cwd: work,
+            env: agentEnv(),
+            signal: abort.signal,
+            onStderrLine: (line) => {
+              const match = /^held (\d+)$/.exec(line);
+              if (!match) return;
+              launcher = Number(match[1]);
+              abort.abort();
+            },
+          },
+          { write: [work], protect: [] },
+          async (opts) => {
+            seen = await runProcess(opts);
+            return seen;
+          },
+          undefined,
+          held,
+        ),
+    );
+    await inspecting.promise;
+    // Something else kills the frozen launcher before the cancel's own SIGKILL is sent.
+    kill(launcher, "SIGKILL");
+    for (;;) {
+      try {
+        kill(launcher, 0);
+      } catch {
+        break;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    release.resolve();
+    await expect(launch).rejects.toThrow(ConfinementError);
+    expect(seen).toMatchObject({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" });
+  } finally {
+    signals.mockRestore();
+  }
+});
+
+test("a launch that dies on its own after a cancel but before the cancel's kill stays a confinement error", async () => {
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => ["/bin/sh", "-c", 'echo "held $$" >&2; sleep 900; exec "$@"', "sh", ...cmd],
+  };
+  const inspecting = deferred<void>();
+  const release = deferred<void>();
+  let holding = false;
+  let launcher = 0;
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  const launch = processBirthInspection.run(
+    {
+      // The shutdown's first identity check, before it signals anything, waits here.
+      read: async (pid, name) => {
+        if (!holding) {
+          holding = true;
+          inspecting.resolve();
+          await release.promise;
+        }
+        return processBirth(pid, name);
+      },
+      now: () => Number.MAX_SAFE_INTEGER,
+    },
+    () =>
+      runSandboxed(
+        {
+          cmd: ["/usr/bin/true"],
+          cwd: work,
+          env: agentEnv(),
+          signal: abort.signal,
+          onStderrLine: (line) => {
+            const match = /^held (\d+)$/.exec(line);
+            if (!match) return;
+            launcher = Number(match[1]);
+            abort.abort();
+          },
+        },
+        { write: [work], protect: [] },
+        async (opts) => {
+          seen = await runProcess(opts);
+          return seen;
+        },
+        undefined,
+        held,
+      ),
+  );
+  await inspecting.promise;
+  // The launcher dies of something else while the cancel's shutdown is still inspecting.
+  process.kill(launcher, "SIGKILL");
+  for (;;) {
+    try {
+      process.kill(launcher, 0);
+    } catch {
+      break;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  release.resolve();
+  await expect(launch).rejects.toThrow(ConfinementError);
+  expect(seen).toMatchObject({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" });
+});
+
+test("a launch killed by something else before a late cancel stays a confinement error", async () => {
+  // The launcher SIGKILLs itself before the startup shell; a child keeps its pipes open, so the
+  // shutdown is still finding descendants when the cancel arrives.
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => ["/bin/sh", "-c", '(exec sleep 30) & kill -9 $$; exec "$@"', "sh", ...cmd],
+  };
+  const shuttingDown = deferred<void>();
+  const release = deferred<void>();
+  let holding = false;
+  const abort = new AbortController();
+  let seen: ProcResult | undefined;
+  const launch = processBirthInspection.run(
+    {
+      read: async (pid, name) => {
+        if (!holding) {
+          holding = true;
+          shuttingDown.resolve();
+          await release.promise;
+        }
+        return processBirth(pid, name);
+      },
+      now: () => Number.MAX_SAFE_INTEGER,
+    },
+    () =>
+      runSandboxed(
+        { cmd: ["/usr/bin/true"], cwd: work, env: agentEnv(), signal: abort.signal },
+        { write: [work], protect: [] },
+        async (opts) => {
+          seen = await runProcess(opts);
+          return seen;
+        },
+        undefined,
+        held,
+      ),
+  );
+  await shuttingDown.promise;
+  abort.abort();
+  release.resolve();
+  await expect(launch).rejects.toThrow(ConfinementError);
+  expect(seen).toMatchObject({ cancelled: true, cancelKilled: false, exitCode: null, signal: "SIGKILL" });
+});
+
+test.each([false, true])(
+  "a cancel while the sandbox starts returns the cancelled result unless startup reported a launch failure (diagnostic=%s)",
+  async (diagnostic) => {
+    const marker = join(root, "payload-ran");
+    const announce = diagnostic ? "sandbox-exec: sandbox_apply: Operation not permitted" : "launch held";
+    // Holds every launch before the trusted startup shell, so the token cannot print first.
+    const held: ConfinementBackend = {
+      verify: async () => {},
+      wrap: (cmd) => ["/bin/sh", "-c", 'echo "$1" >&2; shift; sleep 900; exec "$@"', "sh", announce, ...cmd],
+    };
+    const abort = new AbortController();
+    let started = false;
+    const launch = runSandboxed(
+      {
+        cmd: ["/usr/bin/touch", marker],
+        cwd: work,
+        env: agentEnv(),
+        signal: abort.signal,
+        onStarted: () => {
+          started = true;
+        },
+        onStderrLine: (line) => {
+          if (line === announce) abort.abort();
+        },
+      },
+      { write: [work], protect: [] },
+      runProcess,
+      undefined,
+      held,
+    );
+    if (diagnostic) await expect(launch).rejects.toThrow(ConfinementError);
+    else expect(await launch).toMatchObject({ cancelled: true, exitCode: null, signal: "SIGKILL" });
+    expect(started).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  },
+);
+
+test("a cancel during startup stays cancelled when the timeouts expire during its shutdown", async () => {
+  const abort = new AbortController();
+  // The cancel lands before the spawn, so it begins the shutdown; nothing else stops the hold.
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => {
+      abort.abort();
+      return ["/bin/sh", "-c", 'sleep 900; exec "$@"', "sh", ...cmd];
+    },
+  };
+  // The shutdown's first birth read outlasts both timeouts.
+  let delayed = false;
+  const slowBirth: typeof processBirth = async (pid, name) => {
+    if (!delayed) {
+      delayed = true;
+      await Bun.sleep(100);
+    }
+    return processBirth(pid, name);
+  };
+  const result = await processBirthInspection.run({ read: slowBirth }, () =>
+    runSandboxed(
+      {
+        cmd: ["/usr/bin/true"],
+        cwd: work,
+        env: agentEnv(),
+        signal: abort.signal,
+        timeoutMs: 40,
+        idleTimeoutMs: 20,
+      },
+      { write: [work], protect: [] },
+      runProcess,
+      undefined,
+      held,
+    ),
+  );
+  expect(result).toMatchObject({ cancelled: true, cancelKilled: true, timedOut: false, idleTimedOut: false });
+  expect(delayed).toBe(true);
+  expect(result.durationMs).toBeGreaterThanOrEqual(100);
 });
 
 test("the effective profile is probed before the native-tool process and failed probes never launch it", async () => {
@@ -982,7 +1313,16 @@ test("command scratch persists across setup, checks and retry scopes, with reada
     let scratch = "";
     // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
     const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
-    const opts = { command: "unused", cwd: work, env: { ...env, TMPPREFIX: join(home, "zsh") } };
+    const opts = {
+      command: "unused",
+      cwd: work,
+      env: {
+        ...env,
+        TMPPREFIX: join(home, "zsh"),
+        BUN_INSTALL: join(home, ".bun"),
+        BUN_INSTALL_CACHE_DIR: join(home, "bun-cache"),
+      },
+    };
     mkdirSync(join(home, ".cargo"));
     writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
     const run = async (opts: ProcOptions) => {
@@ -990,6 +1330,9 @@ test("command scratch persists across setup, checks and retry scopes, with reada
       expect(opts.env.RUSTUP_HOME).toBe(join(home, ".rustup"));
       const current = opts.env.TMPDIR ?? "";
       expect(opts.env.TMPPREFIX).toBe(join(current, "zsh"));
+      expect(opts.env.BUN_INSTALL_CACHE_DIR).toBe(join(current, "bun"));
+      expect(opts.env.BUN_INSTALL).toBe(join(home, ".bun"));
+      expect(opts.env.PATH).toBe(env.PATH);
       expect(readFileSync(join(opts.env.CARGO_HOME ?? "", "config.toml"), "utf8")).toContain("retry = 2");
       if (scratch) {
         expect(current).toBe(scratch);
@@ -1009,6 +1352,51 @@ test("command scratch persists across setup, checks and retry scopes, with reada
     });
     expect(existsSync(scratch)).toBe(false);
   }));
+
+test.skipIf(seatbeltSkip !== null)(
+  `Bun frozen install keeps its cache in scratch with an external BUN_INSTALL ${seatbeltSkip ?? ""}`,
+  async () => {
+    const pkg = join(root, "fixture", "package");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(
+      join(pkg, "package.json"),
+      JSON.stringify({ name: "cache-fixture", version: "1.0.0", main: "index.js" }),
+    );
+    writeFileSync(join(pkg, "index.js"), "module.exports = 42;\n");
+    await sh(["tar", "-czf", join(work, "fixture.tgz"), "-C", dirname(pkg), "package"], { cwd: work });
+    writeFileSync(
+      join(work, "package.json"),
+      JSON.stringify({ name: "fixture-app", dependencies: { "cache-fixture": "file:./fixture.tgz" } }),
+    );
+    const bunHome = join(home, ".bun");
+    mkdirSync(join(bunHome, "install/cache"), { recursive: true });
+    const env = agentEnv({ BUN_INSTALL: bunHome });
+    delete env.BUN_INSTALL_CACHE_DIR;
+    await sh([process.execPath, "install", "--lockfile-only"], {
+      cwd: work,
+      env: { ...env, BUN_INSTALL_CACHE_DIR: join(root, "seed-cache") },
+    });
+    const lock = readFileSync(join(work, "bun.lock"), "utf8");
+    const opts = {
+      command: `'${process.execPath}' install --frozen-lockfile`,
+      cwd: work,
+      env,
+    };
+    const unfixed = await runConfined({
+      ...opts,
+      command: `unset BUN_INSTALL_CACHE_DIR; ${opts.command}`,
+    });
+    expect(unfixed.exitCode).not.toBe(0);
+    expect(unfixed.stderr).toContain("bun is unable to write files to tempdir");
+    const result = await runConfined(opts);
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(readFileSync(join(work, "node_modules/cache-fixture/index.js"), "utf8")).toBe(
+      "module.exports = 42;\n",
+    );
+    expect(readFileSync(join(work, "bun.lock"), "utf8")).toBe(lock);
+    expect(readdirSync(join(bunHome, "install/cache"))).toEqual([]);
+  },
+);
 
 test.skipIf(seatbeltSkip !== null)(
   `installed rustup discovery survives command confinement ${seatbeltSkip ?? ""}`,

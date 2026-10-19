@@ -2,7 +2,52 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ACTIVE_LAND_STATES } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+
+function seedLandEntries(store: Store) {
+  store.db.transaction(() => {
+    for (let i = 1; i <= 120; i++) {
+      const entry = store.createLandEntry({
+        runId: `run-${i}`,
+        repo: "test/repo",
+        prUrl: `https://github.com/test/repo/pull/${i}`,
+        baseBranch: "main",
+        headBranch: `pr-${i}`,
+        approvedSha: "a".repeat(40),
+      });
+      if (i < 120) store.updateLandEntry(entry.id, { state: "landed" });
+    }
+  })();
+}
+
+test("land list returns the newest 100 entries in ascending order, including the newest active entry", () => {
+  const store = new Store(":memory:");
+  try {
+    seedLandEntries(store);
+    const expected = Array.from({ length: 100 }, (_, i) => i + 21);
+    expect(store.listLandEntries().map((entry) => entry.id)).toEqual(expected);
+    expect(store.listLandEntries({ limit: 100 }).map((entry) => entry.id)).toEqual(expected);
+  } finally {
+    store.close();
+  }
+});
+
+test.each([...ACTIVE_LAND_STATES])("land list includes an older %s entry beyond the limit", (state) => {
+  const store = new Store(":memory:");
+  try {
+    seedLandEntries(store);
+    store.updateLandEntry(1, { state });
+    const expected = [1, ...Array.from({ length: 100 }, (_, i) => i + 21)];
+    expect(store.listLandEntries({ repo: "test/repo", limit: 100 }).map((entry) => entry.id)).toEqual(
+      expected,
+    );
+    expect(store.listLandEntries({ repo: "other/repo" })).toEqual([]);
+    expect(store.listLandEntries({ active: true, limit: 1 }).map((entry) => entry.id)).toEqual([1, 120]);
+  } finally {
+    store.close();
+  }
+});
 
 test("land logPath reads back from get, list and a reopened store", () => {
   const dir = mkdtempSync(join(tmpdir(), "land-store-"));

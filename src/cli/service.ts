@@ -91,7 +91,9 @@ function plist(
   extraEnv: Record<string, string> = {},
   workingDirectory = appDir,
 ): string {
-  const env = { PATH, NODE_ENV: "production", ...extraEnv };
+  // launchd sets no locale. Without one, Homebrew git's gettext asks macOS for the preferred language
+  // on every start (about doubling each git process's cost) and git's messages follow it.
+  const env = { PATH, LANG: "C.UTF-8", NODE_ENV: "production", ...extraEnv };
   const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -666,6 +668,7 @@ export async function status(port: number): Promise<void> {
   for (const { label } of await installedUnits())
     console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
   if (existsSync(join(appDir, ".git"))) {
+    // This release repository is written only by the user/deployer, never by an agent.
     const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
     console.log(`release: ${head}`);
   }

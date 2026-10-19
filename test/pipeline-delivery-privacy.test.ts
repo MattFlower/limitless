@@ -1,8 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { Repo } from "../src/core/types.ts";
 import { checkPrivateText } from "../src/gates/private.ts";
@@ -346,22 +345,17 @@ esac
     },
   );
 
+  // Commit messages, identities, UTF-16 log config, LFS payloads and encodings are unit-tested
+  // against checkPrivateRange (git-integrity.test.ts) and privateMatches (gates.test.ts).
   test.each([
-    "commit",
     "title",
     "body",
     "draft-body",
     "unreadable",
     "branch",
     "history",
-    "message-body",
-    "encoded-body",
     "draft-history",
-    "lfs-history",
     "cache-config",
-    "author-email",
-    "utf16-author-email",
-    "utf16-message-body",
   ])("private strings stop %s delivery before any push", async (scenario) => {
     const bare = await githubFixture();
     const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
@@ -403,70 +397,19 @@ esac
             : approve,
         };
       }
-      if (scenario.startsWith("utf16-"))
-        await sh(["git", "config", "i18n.logOutputEncoding", "UTF-16"], { cwd: s.cwd });
-      if (
-        ["history", "message-body", "utf16-message-body", "draft-history", "lfs-history"].includes(scenario)
-      ) {
-        let content = scenario.endsWith("message-body") ? "safe" : entry;
-        if (scenario === "lfs-history") {
-          const oid = createHash("sha256").update(entry).digest("hex");
-          const common = (await sh(["git", "rev-parse", "--git-common-dir"], { cwd: s.cwd })).stdout.trim();
-          const object = resolve(s.cwd, common, "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
-          mkdirSync(dirname(object), { recursive: true });
-          writeFileSync(object, entry);
-          content = `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${entry.length}\n`;
-        }
-        writeFileSync(join(s.cwd, "transient.txt"), content);
+      if (["history", "draft-history"].includes(scenario)) {
+        writeFileSync(join(s.cwd, "transient.txt"), entry);
         await sh(["git", "add", "."], { cwd: s.cwd });
-        await sh(
-          [
-            "git",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            scenario.endsWith("message-body") ? `Safe subject\n\n${entry}` : "safe",
-          ],
-          { cwd: s.cwd },
-        );
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "safe"], {
+          cwd: s.cwd,
+        });
         rmSync(join(s.cwd, "transient.txt"));
         await sh(["git", "add", "."], { cwd: s.cwd });
         await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "remove transient"], {
           cwd: s.cwd,
         });
       }
-      if (["commit", "author-email", "utf16-author-email"].includes(scenario)) {
-        writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
-        await sh(["git", "add", "."], { cwd: s.cwd });
-        await sh(
-          [
-            "git",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            scenario === "commit" ? entry.toUpperCase() : "safe",
-          ],
-          {
-            cwd: s.cwd,
-            env: {
-              ...process.env,
-              ...(scenario.endsWith("author-email")
-                ? { GIT_AUTHOR_NAME: "Fake", GIT_AUTHOR_EMAIL: `fake@${entry}` }
-                : {}),
-            },
-          },
-        );
-      }
-      return {
-        files: { "farewell.txt": "goodbye\n" },
-        text: scenario === "body" ? entry : scenario === "encoded-body" ? "%73ecret-host.example" : "Done",
-      };
+      return { files: { "farewell.txt": "goodbye\n" }, text: scenario === "body" ? entry : "Done" };
     });
     f.cfg.maxRounds = 1;
     if (scenario === "cache-config") f.cfg.paths.configDir = join(f.cfg.paths.repos, "config");
@@ -493,7 +436,6 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toBeNull();
     const error = f.store.getRun(run.id)?.error ?? "";
     expect(error.toLowerCase()).not.toContain(entry);
-    if (scenario.endsWith("author-email")) expect(error).toContain("author email");
     if (scenario === "cache-config") expect(error).toContain("inside repository");
     else if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
     calls.push(
@@ -543,7 +485,11 @@ exec '${gitBin}' "$@"
     );
     const realProcess = proc.runProcess;
     const scan = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
-      if (!armed || opts.cmd.join(" ") !== "git --no-replace-objects cat-file --batch")
+      if (
+        !armed ||
+        !opts.cmd.includes("--no-replace-objects") ||
+        opts.cmd.slice(-2).join(" ") !== "cat-file --batch"
+      )
         return realProcess(opts);
       const scope = proc.processScope.getStore();
       if (!scope) throw new Error("blob scan missing run process scope");

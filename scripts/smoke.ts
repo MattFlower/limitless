@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -6,12 +7,14 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import { worktreeGit } from "../src/git/command.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
-import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
+import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveCatalog } from "../src/router/config-catalog.ts";
 import { discoversModels, servedIds } from "../src/router/discovery.ts";
@@ -468,13 +471,15 @@ function status(result: AgentResult): CheckResult {
 export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
-  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast" | "confine",
+  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast" | "confine" | "bun",
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
   if (kind === "verify") return verifyLiveCheck(harness, target, signal);
   if (kind === "confine") return confineLiveCheck(harness, target, signal);
+  if (kind === "bun") return bunVerifierCheck(harness, target, signal);
   const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-")));
   try {
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
     const token = crypto.randomUUID().replaceAll("-", "");
     if (kind === "noTools") writeFileSync(join(cwd, "secret.txt"), token);
@@ -632,8 +637,10 @@ export async function confineLiveCheck(
   // Never pre-created: it only ever exists if a write escaped into the CLI's state directory.
   const configCanary = join(configDir, `limitless-smoke-canary-${crypto.randomUUID()}`);
   try {
+    // Factory-only probe setup: no agent has written this repository yet.
     const git = (dir: string, ...args: string[]) =>
       sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", ...args], { cwd: dir });
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "init", "-q", cache], { cwd: root });
     await git(cache, "commit", "-q", "--allow-empty", "-m", "base");
     for (const dir of [cwd, sibling]) await git(cache, "worktree", "add", "-q", "--detach", dir);
@@ -720,6 +727,74 @@ for label, path in [${Object.entries({ ...canaries, config: configCanary })
   }
 }
 
+/** Exercise production readonly verifiers through their wrappers, with a ten-second test deadline. */
+export async function bunVerifierCheck(
+  harness: Harness,
+  target: ModelTarget,
+  signal = new AbortController().signal,
+): Promise<CheckResult> {
+  const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-bun-")));
+  try {
+    return await withScratch(cwd, async (scratchDir) => {
+      const token = crypto.randomUUID(),
+        events: AgentEvent[] = [];
+      const test = join(scratchDir, "probe.test.ts"),
+        entry = join(scratchDir, "probe.ts");
+      writeFileSync(
+        test,
+        'import { test, expect } from "bun:test"; test("probe", () => expect(1).toBe(1));\n',
+      );
+      writeFileSync(
+        entry,
+        `import { runProcess } from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
+const r = await runProcess({cmd: ["bun", "test", ${JSON.stringify(test)}], cwd: ${JSON.stringify(scratchDir)}, env: process.env, timeoutMs: 10_000, onStdoutLine: (line) => console.log(line)});
+process.stdout.write(r.stdout); process.stderr.write(r.stderr);
+if (r.exitCode === 0 && !r.timedOut && !r.cancelled && /1 pass/.test(r.stdout + r.stderr) && /0 fail/.test(r.stdout + r.stderr)) console.log("${token}:bun-test-passed");
+else process.exitCode = 1;
+`,
+      );
+      const bundle = await Bun.build({ entrypoints: [entry], target: "bun" });
+      if (!bundle.success || !bundle.outputs[0]) return fail("cannot build bounded Bun probe");
+      const probe = join(scratchDir, "probe.mjs");
+      writeFileSync(probe, await bundle.outputs[0].text());
+      const quote = (p: string) => `'${p.replaceAll("'", "'\\''")}'`;
+      const command = `${quote(process.execPath)} ${quote(probe)}`;
+      const spec: AgentSpec = {
+        cwd,
+        scratchDir,
+        target,
+        mode: "readonly",
+        prompt: `Execute exactly this Bash command and report its output:\n${command}`,
+        timeoutMs: 90_000,
+        idleTimeoutMs: 30_000,
+        maxToolCalls: 8,
+        signal,
+        logPath: join(cwd, "stream.log"),
+        onEvent: (event) => events.push(event),
+      };
+      // Port zero uses the invocation's Unix lease server without depending on a running daemon.
+      const result = await withSlottedCommands(
+        [["bun", "test"]],
+        cwd,
+        scratchDir,
+        0,
+        () => {},
+        (commandPath) => harness({ ...spec, commandPath }),
+      );
+      if (signal.aborted) return fail("Bun verifier probe cancelled");
+      if (result.status !== "ok") return status(result);
+      const evidence = events.filter(
+        (e) => e.type !== "tool_result" || (/\b1 pass\b/.test(e.output) && /\b0 fail\b/.test(e.output)),
+      );
+      return verifyProbeEvidence(evidence, command, token, ["bun-test-passed"])
+        ? { status: "pass" }
+        : fail("missing successful Bun test command evidence");
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
 export async function verifyLiveCheck(
   harness: Harness,
   target: ModelTarget,
@@ -728,6 +803,7 @@ export async function verifyLiveCheck(
   const root = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-verify-")));
   const cwd = join(root, "worktree");
   try {
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "init", "-q", cwd], { cwd: root });
     const token = crypto.randomUUID();
     const probe = join(cwd, "verify-probe.py");
@@ -753,7 +829,9 @@ else:
     raise RuntimeError("worktree write succeeded")
 `,
     );
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "add", "."], { cwd });
+    // Factory-only probe setup: no agent has written this repository yet.
     await sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", "commit", "-qm", "probe"], {
       cwd,
     });
@@ -774,7 +852,7 @@ else:
         onEvent: (event) => events.push(event),
       });
       // Inspect before scratch removal or worktree cleanup; cleanup cannot conceal a successful write.
-      const dirty = await sh(["git", "status", "--porcelain", "--untracked-files=all"], { cwd });
+      const dirty = await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd });
       if (dirty.stdout.trim()) return { status: "fail", reason: `worktree changed: ${dirty.stdout.trim()}` };
       if (result.status !== "ok") return status(result);
       return verifyProbeEvidence(events, command, token)
@@ -1020,7 +1098,16 @@ export function nativeChecks(
     const selectedTarget = () =>
       (target ??= targetFor(provider, cheapestModel(id, catalog.models, excludeOrigins)));
     const harness = id === "claude" ? runClaude : runCodex;
-    for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify", "confine"] as const) {
+    for (const kind of [
+      "structured",
+      "fast",
+      "noTools",
+      "edit",
+      "quota",
+      "verify",
+      "confine",
+      ...(id === "claude" ? ["bun" as const] : []),
+    ] as const) {
       checks.push({
         name: `${id} ${kind}`,
         // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
@@ -1028,7 +1115,7 @@ export function nativeChecks(
           id === "codex" && kind === "structured"
             ? 60_000 * catalog.models.filter((m) => m.provider === id && m.source !== "runtime").length +
               30_000
-            : kind === "verify" || kind === "confine"
+            : kind === "verify" || kind === "confine" || kind === "bun"
               ? 120_000
               : 90_000,
         run: async (signal) => {

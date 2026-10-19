@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { launchFailureScan } from "../gates/output.ts";
 import { agentEnv, invocationScratch, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import {
   ancestorReadPolicy,
@@ -252,8 +253,14 @@ export async function runSandboxed(
   const lineLimit = opts.maxLineLength ?? Infinity;
   const forwardLine = (line: string, onLine?: (line: string) => void) =>
     onLine?.(line.length > lineLimit ? `${line.slice(0, lineLimit)} [truncated]` : line);
+  // Raw streams, before redaction and tail cuts, as gate classification scans them.
+  const launch = launchFailureScan();
   const payload: ProcOptions = {
     ...opts,
+    onRawChunk: (chunk, stream) => {
+      launch.observe(chunk, stream);
+      opts.onRawChunk?.(chunk, stream);
+    },
     // The startup token must fit even when candidate output has a smaller cap.
     maxLineLength: Math.max(lineLimit, token.length),
     cmd: [
@@ -274,12 +281,28 @@ export async function runSandboxed(
     onStderrLine: (line) => forwardLine(line, opts.onStderrLine),
   };
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
-  if (!started)
+  if (!started) {
+    // Our cancel stopped the launch before the trusted shell ran, so the payload never did.
+    if (killedByCancel(result) && !launch.failed()) return result;
     throw new ConfinementError(
       `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
     );
+  }
   return { ...result, stdout: result.stdout.replace(`${token}\n`, "") };
 }
+
+/**
+ * A cancel's termination freezes, then SIGKILLs the invocation (`runProcess`), and `cancelKilled`
+ * records that the cancel began it while the child still ran. An exit, a timeout, another signal,
+ * a child that was already dead or a Seatbelt diagnostic is a failed launch even with a cancel.
+ */
+const killedByCancel = (result: ProcResult): boolean =>
+  result.cancelled &&
+  result.cancelKilled === true &&
+  !result.timedOut &&
+  !result.idleTimedOut &&
+  result.exitCode === null &&
+  result.signal === "SIGKILL";
 
 /** Keep installed toolchains readable; writable package caches belong to the suite scratch. */
 export async function runConfined(
@@ -314,6 +337,7 @@ export async function runConfined(
           ...scratchEnv({ scratchDir: scratch }),
           XDG_CACHE_HOME: join(scratch, "cache"),
           npm_config_cache: join(scratch, "npm"),
+          BUN_INSTALL_CACHE_DIR: join(scratch, "bun"),
           CARGO_HOME: cargo,
           RUSTUP_HOME: opts.env.RUSTUP_HOME ?? join(home, ".rustup"),
           GOCACHE: join(scratch, "go-build"),

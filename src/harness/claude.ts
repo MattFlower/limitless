@@ -2,7 +2,8 @@ import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
-import { runSandboxed } from "./sandbox.ts";
+import { homeReadPolicy } from "./read-policy.ts";
+import { ConfinementError, runSandboxed } from "./sandbox.ts";
 import {
   agentShellEnv,
   invocationCommands,
@@ -213,7 +214,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
       const commands = invocationCommands(scratch, spec.cwd);
-      const denyRead = [...(confined?.deny ?? explicit), ...commands.root];
+      const credentials = confined ? homeReadPolicy([], false, [...explicit, ...commands.root]).denyRead : [];
+      const denyRead = [...(confined?.deny ?? explicit), ...credentials, ...commands.root];
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
       denied.push(...[...explicit, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
@@ -306,8 +308,25 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const shellEnv = agentShellEnv(spec);
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
-  const runner: typeof runProcess = (opts) =>
-    roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
+  // runSandboxed returns a launch cancelled before startup only because our cancel stopped it. When
+  // the no-progress watchdog aborted first, not the caller, the sandbox hung: keep that a confinement error.
+  const runner: typeof runProcess = async (opts) => {
+    if (!roots) return processRunner(opts);
+    let started = false;
+    const result = await runSandboxed(
+      {
+        ...opts,
+        onStarted: () => {
+          started = true;
+        },
+      },
+      roots,
+      processRunner,
+    );
+    if (!started && result.cancelled && firstAbort !== "caller")
+      throw new ConfinementError(`Write confinement payload did not start: ${stuckReason ?? "stopped"}`);
+    return result;
+  };
   appendFileSync(spec.logPath, redactCredentials(`# claude ${t.model} ${new Date().toISOString()}\n`));
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   // Agent tool read isolation for this key file is tracked in #335.
@@ -324,6 +343,16 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const stuckController = new AbortController();
   let stuckReason: string | null = null;
   const signal = AbortSignal.any([spec.signal, stuckController.signal]);
+  // The first abort decides who stopped the agent; the other may follow during cleanup.
+  let firstAbort: "caller" | "watchdog" | null = spec.signal.aborted ? "caller" : null;
+  const callerAborted = () => {
+    firstAbort ??= "caller";
+  };
+  const watchdogAborted = () => {
+    firstAbort ??= "watchdog";
+  };
+  spec.signal.addEventListener("abort", callerAborted, { once: true });
+  stuckController.signal.addEventListener("abort", watchdogAborted, { once: true });
 
   // Byte-level inactivity isn't enough: a degraded stream can trickle `thinking_tokens` counters
   // for many minutes without any real progress. Only text, tool calls and tool results count.
@@ -332,8 +361,9 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     () => {
       if (stuckReason || Date.now() - lastProgress <= spec.idleTimeoutMs) return;
       stuckReason = `no progress (text or tool activity) for ${Math.round(spec.idleTimeoutMs / 1000)}s`;
-      spec.onEvent({ type: "status", text: `stopping agent: ${stuckReason}` });
+      // Abort before reporting, so the watchdog's stop is recorded ahead of anything the event triggers.
       stuckController.abort();
+      spec.onEvent({ type: "status", text: `stopping agent: ${stuckReason}` });
     },
     Math.min(spec.idleTimeoutMs, 10_000),
   );
@@ -353,8 +383,8 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
             : null;
       if (reason) {
         stuckReason = reason;
-        spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
         stuckController.abort();
+        spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
       }
     }
     spec.onEvent(ev);
@@ -387,6 +417,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     },
   }).finally(() => {
     clearInterval(progressWatch);
+    spec.signal.removeEventListener("abort", callerAborted);
     if (keyFile) rmSync(keyFile, { force: true });
   });
 
@@ -408,6 +439,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
         : null,
   };
 
+  if (proc.cancelled && firstAbort === "caller") return { ...base, status: "cancelled", error: "cancelled" };
   if (stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
   const repeatReason = loop.finish();

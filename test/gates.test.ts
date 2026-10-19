@@ -1256,6 +1256,37 @@ describe("auditDiff", () => {
     ).toEqual(["gitlink", "gitattributes", "test-skipped"]);
   });
 
+  // Only the inert image formats may name a rule that matches no files yet; git-integrity covers Git's side.
+  test.each([
+    ["*.png -diff", "warn"],
+    ["*.woff2 -diff", "block"],
+    ["*.mp4 -diff", "block"],
+    ["*.pdf binary", "block"],
+    ["*.bmp -diff", "block"],
+    ["*.psd -diff", "block"],
+    ["*.eot -diff", "block"],
+    ["*.glb -diff", "block"],
+    ["*.unknown -diff", "block"],
+  ])("an unmatched rule %s produces a %s", (line, severity) => {
+    const patch = `diff --git a/.gitattributes b/.gitattributes\n+++ b/.gitattributes\n+${line}`;
+    const keys = attributeRules(patch).map((rule) => rule.key);
+    expect(keys).toHaveLength(1);
+    const unmatched = {
+      ...diff(patch, [{ status: "A", path: ".gitattributes" }]),
+      attributePatch: patch,
+      attributeMatches: Object.fromEntries(keys.map((key) => [key, []])),
+      attributeUnmatched: keys,
+    };
+    expect(auditDiff(unmatched, { taskClass: null, protectedPaths: [] })).toEqual([
+      expect.objectContaining({
+        rule: "gitattributes",
+        severity,
+        file: ".gitattributes",
+        detail: expect.stringContaining(line.split(" ")[0] ?? ""),
+      }),
+    ]);
+  });
+
   test("blocks an empty diff", () => {
     const f = auditDiff(diff("", []), { taskClass: "feature", protectedPaths: [] });
     expect(f).toEqual([
