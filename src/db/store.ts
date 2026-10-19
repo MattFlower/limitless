@@ -2742,7 +2742,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     return (this.db.query(`${LAND_SELECT} WHERE id = ?`).get(id) as LandEntry | null) ?? null;
   }
 
-  latestLandEntry(runId: string, prUrl: string | null): LandEntry | null {
+  latestLandEntry(runId: string | null, prUrl: string | null): LandEntry | null {
     return (
       (this.db
         .query(`${LAND_SELECT} WHERE run_id = ? OR pr_url = ? ORDER BY id DESC LIMIT 1`)
