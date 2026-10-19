@@ -44,7 +44,9 @@ export interface GateRequest {
   checks?: string[];
   skipGateSlot?: boolean;
 }
-export type GateExecutor = Executor<GateRequest, GateRun>;
+export type GateExecutor = Executor<GateRequest, GateRun> & {
+  freshCheckoutFor?: (repo: string) => boolean;
+};
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */

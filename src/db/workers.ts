@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
+import type { GateRun } from "../gates/run.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registerCredential } from "../util/proc.ts";
 import {
@@ -26,6 +27,7 @@ export interface WorkerRow {
   pairing_expires_at: number;
   last_heartbeat_at: number | null;
   capabilities: string | null;
+  setup_warning: string | null;
 }
 export interface JobRow {
   id: string;
@@ -38,6 +40,8 @@ export interface JobRow {
   attempt_deadline_at: number | null;
   result: string | null;
   failure_reason: string | null;
+  setup_fallback: number;
+  setup_order: number;
   excluded: string;
   events: string;
   created_at: number;
@@ -163,6 +167,7 @@ export class WorkerStore {
           code: w.state === "pending" ? w.pairing_code : undefined,
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
+          setupWarning: w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
               ? w.state
@@ -224,9 +229,11 @@ export class WorkerStore {
       const deadline = this.now() + attemptBudget(JSON.parse(j.request));
       const changed = this.store.db
         .query(
-          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=? WHERE id=? AND state='queued'",
+          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=?,setup_order=(SELECT setup_order+1 FROM workers WHERE name=?) WHERE id=? AND state='queued'",
         )
-        .run(name, Math.min(this.now() + this.times.lease, deadline), deadline, this.now(), j.id);
+        .run(name, Math.min(this.now() + this.times.lease, deadline), deadline, this.now(), name, j.id);
+      if (changed.changes === 1)
+        this.store.db.query("UPDATE workers SET setup_order=setup_order+1 WHERE name=?").run(name);
       return changed.changes === 1 ? this.job(j.id) : null;
     })();
   }
@@ -323,9 +330,42 @@ export class WorkerStore {
       )
       .run(this.now(), id);
   }
-  complete(id: string, run: unknown, local = false) {
-    this.store.db
-      .query("UPDATE gate_jobs SET state='done',result=?,updated_at=? WHERE id=? AND state=?")
-      .run(JSON.stringify(this.sanitize(run)), this.now(), id, local ? "failed" : "leased");
+  fallbackSetup(id: string, command: string) {
+    return this.store.db.transaction(() => {
+      const j = this.job(id);
+      if (j?.state !== "done" || !j.worker || j.setup_fallback) return false;
+      const text = this.sanitize(
+        `Worker ${j.worker} setup failed: ${command}; LAN gates falling back to local execution`,
+      );
+      // Historical worker completions can retain infrastructure failure reasons; mark fallback separately.
+      this.store.db
+        .query(
+          "UPDATE gate_jobs SET state='failed',result=NULL,setup_fallback=1,failure_reason=?,updated_at=? WHERE id=? AND state='done' AND setup_fallback=0",
+        )
+        .run(text, this.now(), id);
+      this.event(id, { type: "status", text });
+      return true;
+    })();
+  }
+  complete(id: string, run: GateRun, local = false) {
+    return this.store.db.transaction(() => {
+      const j = this.job(id);
+      const changed =
+        this.store.db
+          .query(
+            "UPDATE gate_jobs SET state='done',result=?,failure_reason=CASE WHEN ? THEN failure_reason ELSE NULL END,updated_at=? WHERE id=? AND state=?",
+          )
+          .run(JSON.stringify(this.sanitize(run)), local, this.now(), id, local ? "failed" : "leased")
+          .changes === 1;
+      if (changed && j?.worker && run.setupOk && (!local || j.setup_fallback)) {
+        // Retain the order after recovery too: an older pending fallback must not re-flag it.
+        this.store.db
+          .query(
+            "UPDATE workers SET setup_warning=?,setup_warning_order=? WHERE name=? AND setup_warning_order<?",
+          )
+          .run(local ? this.sanitize(j.failure_reason) : null, j.setup_order, j.worker, j.setup_order);
+      }
+      return changed;
+    })();
   }
 }

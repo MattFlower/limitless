@@ -543,6 +543,7 @@ async function prepare(ctx: RunContext): Promise<void> {
               retry,
               { onWait, skipGateSlot: options?.skipGateSlot },
             ),
+          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
         );
         ctx.checkCancelled();
         return retried;
@@ -1261,6 +1262,7 @@ async function oneRound(
                   retry,
                   { onWait: events.onWait, skipGateSlot: options?.skipGateSlot },
                 ),
+              ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
             );
           ctx.checkCancelled();
           baseTimeout ||= after.checks.some(

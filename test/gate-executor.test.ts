@@ -236,7 +236,7 @@ test.each([false, true])("setup-dependent retries remain flaky after restart (%s
   writeFileSync(join(fixture.repoDir, ".gitignore"), "node_modules/\n");
   writeFileSync(
     join(fixture.repoDir, ".limitless.toml"),
-    `[gates]\nsetup = ["mkdir -p node_modules; touch node_modules/ready"]\nchecks = [{ name = "check", run = ${JSON.stringify(check)} }]\n`,
+    `[gates]\nsetup = ["mkdir -p node_modules; rm -f node_modules/ready"]\nchecks = [{ name = "build", run = "touch node_modules/ready" }, { name = "check", run = ${JSON.stringify(check)} }]\n`,
   );
   await sh(["git", "add", "."], { cwd: fixture.repoDir });
   await sh(["git", "commit", "-qm", "setup-dependent gate"], { cwd: fixture.repoDir });
@@ -269,7 +269,9 @@ test.each([false, true])("setup-dependent retries remain flaky after restart (%s
     finished = start(handler);
   }
   expect(await waitFor(finished, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-  expect(finished.store.getRunState<RunState>(run.id)?.lastGates?.[0]).toMatchObject({
+  expect(
+    finished.store.getRunState<RunState>(run.id)?.lastGates?.find((c) => c.name === "check"),
+  ).toMatchObject({
     verdict: "flaky",
     blocking: false,
     firstAttempt: { output: "transient" },
