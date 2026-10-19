@@ -79,7 +79,10 @@ and extend the closest case when it already exercises that behavior.
 - **Servers listen on port 0** and read the assigned port. Other suites run on the same machine at
   the same time.
 - **Temporary files** go under `os.tmpdir()` (`mkdtemp`), never a hardcoded `/tmp`: confined gates
-  point `TMPDIR` into scratch and deny the system temp directories.
+  point `TMPDIR` into scratch and deny the system temp directories. Canonicalize (`realpathSync`) a
+  temporary path before comparing it with one a subprocess reports: on macOS `os.tmpdir()` is under
+  `/var`, a symlink to `/private/var`. Confined gates use a scratch `TMPDIR` that isn't a symlink, so
+  the mismatch shows only unconfined (the deploy gate, `scripts/land-pr.sh`, a local `bun run check`).
 - **External clients are injected.** `gh`, GitHub and model clients come in through parameters or
   factory dependencies, and some default to the real one (for example the `client` parameter of
   `startGitHubNotifier`). Pass a fake every time.
