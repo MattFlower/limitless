@@ -187,6 +187,7 @@ beforeEach(async () => {
     }
     if (args[1] === "view")
       return JSON.stringify({
+        url,
         state: "OPEN",
         isDraft: draft,
         autoMergeRequest: autoMerge ? {} : null,
@@ -681,6 +682,7 @@ test("a blocked entry stops heartbeating while its conflict trigger verifies the
       clear: (id) => clock.timer.clear(id as ReturnType<typeof setInterval>),
     },
     gh: async (args, signal, stdin) => {
+      if (args.includes("url,state,isDraft,headRefOid")) return (await gh(args, signal, stdin)) ?? "";
       reached();
       await hold;
       return (await gh(args, signal, stdin)) ?? "";

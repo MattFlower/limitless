@@ -352,7 +352,7 @@ export class LandQueue {
       const fresh = await this.mergeMetadata(entry.prUrl, signal);
       signal.throwIfAborted();
       this.assertClaim(entry.id);
-      if (fresh?.url === entry.prUrl && fresh.headRefOid === entry.pushedSha && fresh.state === "CLOSED")
+      if (fresh?.url === entry.prUrl && fresh.state === "CLOSED")
         throw new LandBlocked("PR was closed without merging");
       if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
         throw new LandBlocked("cannot confirm current GitHub merge state");
@@ -361,6 +361,7 @@ export class LandQueue {
         await this.discard(repo, this.worktreePath(entry));
         return;
       }
+      if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
       if (headMoved(fresh.headRefOid ?? "", entry.pushedSha, entry.approvedSha))
         throw new LandBlocked("head moved after approval");
     }

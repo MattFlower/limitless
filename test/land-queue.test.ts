@@ -1901,56 +1901,77 @@ test("a restart during merging takes an already merged PR as landed without merg
   }
 });
 
-test.each(["different head", "missing head", "failed lookup", "missing state", "wrong URL", "closed PR"])(
-  "recovery blocks a stale green snapshot after a fresh %s",
-  async (scenario) => {
-    const pr = delivered(1, "pr-1");
-    store.updateRun(pr.run.id, { status: "needs_human" });
-    const head = await pushBranch("pr-1", "one.txt", "one\n");
-    observe(1, head, "SUCCESS");
-    const saved = store.githubPrData(url(1));
-    ci = () => null;
-    const entry = store.createLandEntry({
-      runId: pr.run.id,
-      repo: SLUG,
-      prUrl: url(1),
-      baseBranch: "main",
-      headBranch: "pr-1",
-      approvedSha: head,
-    });
-    store.updateLandEntry(entry.id, { state: "checking", pushedSha: head, attempts: 1 });
-    let reads = 0;
-    queue({
-      client: async () => {
-        reads++;
-        if (scenario === "failed lookup") throw new Error("lookup failed");
-        return {
-          url: scenario === "wrong URL" ? url(2) : url(1),
-          state: scenario === "missing state" ? "" : scenario === "closed PR" ? "CLOSED" : "MERGED",
-          headRefOid:
-            scenario === "missing head" ? undefined : scenario === "closed PR" ? head : "b".repeat(40),
-          mergedAt: null,
-          mergedBy: null,
-          ci: "SUCCESS",
-          failing: [],
-        };
-      },
-    });
-    await settle();
-    expect(reads).toBe(1);
-    expect(store.githubPrData(url(1))).toBe(saved);
-    expect(store.getLandEntry(entry.id)).toMatchObject({
-      state: "blocked",
-      reason: ["different head", "missing head"].includes(scenario)
-        ? "merged PR head is missing or differs from the pushed SHA"
-        : scenario === "closed PR"
+test.each([
+  "different head",
+  "missing head",
+  "open missing head",
+  "open empty head",
+  "failed lookup",
+  "missing state",
+  "wrong URL",
+  "closed PR",
+  "closed moved head",
+])("recovery blocks a stale green snapshot after a fresh %s", async (scenario) => {
+  const pr = delivered(1, "pr-1");
+  store.updateRun(pr.run.id, { status: "needs_human" });
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  const saved = store.githubPrData(url(1));
+  ci = () => null;
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "checking", pushedSha: head, attempts: 1 });
+  let reads = 0;
+  queue({
+    client: async () => {
+      reads++;
+      if (scenario === "failed lookup") throw new Error("lookup failed");
+      return {
+        url: scenario === "wrong URL" ? url(2) : url(1),
+        state: scenario.startsWith("open")
+          ? "OPEN"
+          : scenario === "missing state"
+            ? ""
+            : scenario.startsWith("closed")
+              ? "CLOSED"
+              : "MERGED",
+        headRefOid: scenario.includes("missing head")
+          ? undefined
+          : scenario === "open empty head"
+            ? ""
+            : scenario === "closed PR"
+              ? head
+              : "b".repeat(40),
+        mergedAt: null,
+        mergedBy: null,
+        ci: "SUCCESS",
+        failing: [],
+      };
+    },
+  });
+  await settle();
+  expect(reads).toBe(1);
+  expect(store.githubPrData(url(1))).toBe(saved);
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: ["different head", "missing head"].includes(scenario)
+      ? "merged PR head is missing or differs from the pushed SHA"
+      : scenario.startsWith("open")
+        ? "PR head is missing"
+        : scenario.startsWith("closed")
           ? "PR was closed without merging"
           : "cannot confirm current GitHub merge state",
-    });
-    expect(store.getRun(pr.run.id)).toMatchObject({ status: "needs_human", merged: false });
-    expect(ghCalls("pr merge")).toEqual([]);
-  },
-);
+  });
+  expect(store.getRun(pr.run.id)).toMatchObject({ status: "needs_human", merged: false });
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(gateLog()).toEqual([]);
+});
 
 test.each(["cancel", "shutdown", "claim lost"])(
   "a late fresh recovery observation respects %s",
