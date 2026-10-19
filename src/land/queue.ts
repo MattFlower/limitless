@@ -30,6 +30,7 @@ import {
   remoteBranchSha,
   removeWorktree,
   squashTitle,
+  withGitHubRetry,
 } from "../git/repos.ts";
 import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
@@ -425,9 +426,13 @@ export class LandQueue {
     });
     let fresh: z.infer<typeof preflight>;
     try {
-      const json = await (this.deps.gh ?? runGh)(
-        ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid,mergedBy,mergedAt"],
-        signal,
+      const json = await withGitHubRetry(
+        async () =>
+          (this.deps.gh ?? runGh)(
+            ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid,mergedBy,mergedAt"],
+            signal,
+          ),
+        { signal },
       );
       fresh = preflight.parse(JSON.parse(String(json)));
     } catch (error) {

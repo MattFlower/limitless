@@ -24,6 +24,7 @@ import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
+import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
@@ -293,6 +294,7 @@ function queue(
     ciReruns?: boolean;
     start?: boolean;
     gateExecutor?: GateExecutor;
+    gh?: GhRunner;
   } = {},
 ): LandQueue {
   const q = new LandQueue({
@@ -1260,8 +1262,137 @@ test.each([
   });
   expect(gates.requests).toHaveLength(0);
   expect(gateLog()).toEqual([]);
+  expect(
+    ghCalls("pr view").filter((call) => call.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt")),
+  ).toHaveLength(1);
   expect(ghCalls("pr merge")).toEqual([]);
   expect(ghCalls("pr ready")).toEqual([]);
+});
+
+test("a transient fresh PR preflight failure retries and lands", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  let attempts = 0;
+  const gates = fakeLandGates((req) => retryRun(req));
+  const delay = repos.githubRetry.baseDelayMs;
+  repos.githubRetry.baseDelayMs = 1;
+  const q = queue({
+    gateExecutor: gates.executor,
+    gh: async (args, signal) => {
+      if (args.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt")) {
+        attempts++;
+        expect(signal).toBeInstanceOf(AbortSignal);
+        if (attempts === 1) throw new CommandError("HTTP 502", 1, "", "HTTP 502", false);
+      }
+      return (await runGh(args, signal)) ?? "";
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await settle();
+    expect(attempts).toBe(2);
+    expect(gates.requests).toHaveLength(1);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+  } finally {
+    await q.stop();
+    repos.githubRetry.baseDelayMs = delay;
+  }
+});
+
+test("exhausted fresh PR preflight retries report sanitized GitHub unavailability", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const secret = "SYNTHETIC_PREFLIGHT_CREDENTIAL_566";
+  registerCredential("land-preflight-test", secret);
+  // Put the credential across the stored reason's truncation boundary.
+  const diagnostic = `HTTP 502: ${"x".repeat(1895)}${secret}${"y".repeat(2500)}`;
+  let attempts = 0;
+  const gates = fakeLandGates((req) => retryRun(req));
+  const policy = { ...repos.githubRetry };
+  Object.assign(repos.githubRetry, { attempts: 3, budgetMs: 5_000, baseDelayMs: 1 });
+  const q = queue({
+    gateExecutor: gates.executor,
+    gh: async () => {
+      attempts++;
+      throw new CommandError(diagnostic, 1, "", diagnostic, false);
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await settle();
+    const reason =
+      `cannot inspect current GitHub PR metadata: Error: GitHub unavailable: HTTP 502: ${"x".repeat(1895)}[redacted]${"y".repeat(2500)}`.slice(
+        0,
+        2000,
+      );
+    expect(attempts).toBe(3);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason });
+    const blocked = store.readFeed({ limit: 100 }).items.find((item) => item.kind === "land.blocked");
+    expect(blocked).toMatchObject({ summary: reason.slice(0, 500), data: { reason } });
+    expect(reason).toContain("[redacted]");
+    expect(JSON.stringify([blocked, landLog, store.getLandEntry(entry.id)])).not.toContain(secret);
+    expect(gates.requests).toHaveLength(0);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    await q.stop();
+    Object.assign(repos.githubRetry, policy);
+  }
+});
+
+test.each([
+  { action: "cancel", response: "eligible" },
+  { action: "claim lost", response: "eligible" },
+  { action: "cancel", response: "error" },
+  { action: "claim lost", response: "error" },
+])("a pending fresh PR preflight retry respects $action on $response", async ({ action, response }) => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
+  const pending = Promise.withResolvers<string>();
+  const gates = fakeLandGates((req) => retryRun(req));
+  let attempts = 0;
+  const delay = repos.githubRetry.baseDelayMs;
+  repos.githubRetry.baseDelayMs = 1;
+  const q = queue({
+    gateExecutor: gates.executor,
+    gh: async (_args, signal) => {
+      attempts++;
+      if (attempts === 1) throw new CommandError("HTTP 502", 1, "", "HTTP 502", false);
+      entered.resolve(signal);
+      return pending.promise;
+    },
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    const signal = await entered.promise;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    if (action === "cancel") {
+      expect(q.cancel(entry.id)).toBe(true);
+      expect(signal?.aborted).toBe(true);
+    } else {
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    }
+    const before = claimSnapshot(entry);
+    if (response === "error") pending.reject(new CommandError("lookup denied", 1, "", "denied", false));
+    else pending.resolve(JSON.stringify({ url: url(1), state: "OPEN", isDraft: false, headRefOid: head }));
+    await waitWithoutClock(() => clock.pending === 0);
+    expect(claimSnapshot(entry)).toEqual(before);
+    expect(attempts).toBe(2);
+    expect(gates.requests).toHaveLength(0);
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    pending.resolve("{}");
+    await q.stop();
+    repos.githubRetry.baseDelayMs = delay;
+  }
 });
 
 test("a PR merged outside the queue is recorded as landed before any check", async () => {
