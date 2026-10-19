@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store";
 import { createRenderer } from "solid-js/universal";
-import type { AuthSession, ProviderStatus, QuotaAlert, Run } from "../src/core/types.ts";
+import type { AuthSession, ProviderStatus, QuotaAlert, Run, StreamMessage } from "../src/core/types.ts";
 import type { ProviderWorkload, Stats } from "../src/db/stats.ts";
 
 // Solid's universal renderer exercises mounted reactive components without a browser or DOM dependency.
@@ -61,6 +61,14 @@ export { setAlerts, setProviders, setRuns };
 export let liveStarts = 0;
 export function ensureLiveStore() {
   liveStarts++;
+}
+const listeners = new Set<(message: StreamMessage | { kind: "reconnected" }) => void>();
+export function subscribeLiveUpdates(listener: (message: StreamMessage | { kind: "reconnected" }) => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+export function publishLiveUpdate(message: StreamMessage | { kind: "reconnected" }) {
+  for (const listener of listeners) listener(message);
 }
 
 let workload: ProviderWorkload[] = [];

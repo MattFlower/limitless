@@ -7,7 +7,7 @@ import { CostChart } from "../components/CostChart.tsx";
 import { FilterChips, matchesRunFilter, type RunFilter } from "../components/FilterChips.tsx";
 import { KpiStrip } from "../components/KpiStrip.tsx";
 import { RunsTable } from "../components/RunsTable.tsx";
-import { ensureLiveStore, live } from "../store.ts";
+import { ensureLiveStore, live, subscribeLiveUpdates } from "../store.ts";
 
 const STATS_REFRESH_MS = 30_000;
 
@@ -26,9 +26,14 @@ export const Dashboard: Component = () => {
   };
   onMount(() => {
     refreshStats();
+    const close = subscribeLiveUpdates((msg) => {
+      if (["feed", "github_pr", "reconnected"].includes(msg.kind)) refreshStats();
+    });
     const t = setInterval(refreshStats, STATS_REFRESH_MS);
     const clock = setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => {
+      close();
+      statsRequest++;
       clearInterval(t);
       clearInterval(clock);
     });
@@ -39,9 +44,13 @@ export const Dashboard: Component = () => {
     () => runs().filter((r) => matchesRunFilter(r.status, "needs_you")).length,
   );
   createEffect(on(needsYouCount, refreshStats, { defer: true }));
+  const attention = createMemo(() => {
+    const ids = stats()?.needsYouRunIds;
+    return ids ? new Set(ids) : undefined;
+  });
   const filteredRuns = createMemo(() => {
     const f = statusFilter();
-    return f ? runs().filter((r) => matchesRunFilter(r.status, f)) : runs();
+    return f ? runs().filter((r) => matchesRunFilter(r.status, f, attention()?.has(r.id))) : runs();
   });
   const alerts = createMemo(() =>
     Object.values(live.alerts).filter((a) => a.resetsAt === null || a.resetsAt > now()),

@@ -3,8 +3,10 @@ import { For } from "solid-js";
 import type { RunStatus } from "../../src/core/types.ts";
 
 export type RunFilter = RunStatus | "needs_you";
-export const matchesRunFilter = (status: RunStatus, filter: RunFilter) =>
-  filter === "needs_you" ? status === "failed" || status === "needs_human" : status === filter;
+export const matchesRunFilter = (status: RunStatus, filter: RunFilter, needsYou?: boolean) =>
+  filter === "needs_you"
+    ? (status === "failed" || status === "needs_human") && (needsYou ?? true)
+    : status === filter;
 const ALL_STATUSES: RunFilter[] = [
   "needs_you",
   "waiting",
