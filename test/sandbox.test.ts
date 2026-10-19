@@ -1255,6 +1255,46 @@ test.each([false, true])(
   },
 );
 
+test("a cancel during startup stays cancelled when the timeouts expire during its shutdown", async () => {
+  const abort = new AbortController();
+  // The cancel lands before the spawn, so it begins the shutdown; nothing else stops the hold.
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => {
+      abort.abort();
+      return ["/bin/sh", "-c", 'sleep 900; exec "$@"', "sh", ...cmd];
+    },
+  };
+  // The shutdown's first birth read outlasts both timeouts.
+  let delayed = false;
+  const slowBirth: typeof processBirth = async (pid, name) => {
+    if (!delayed) {
+      delayed = true;
+      await Bun.sleep(100);
+    }
+    return processBirth(pid, name);
+  };
+  const result = await processBirthInspection.run({ read: slowBirth }, () =>
+    runSandboxed(
+      {
+        cmd: ["/usr/bin/true"],
+        cwd: work,
+        env: agentEnv(),
+        signal: abort.signal,
+        timeoutMs: 40,
+        idleTimeoutMs: 20,
+      },
+      { write: [work], protect: [] },
+      runProcess,
+      undefined,
+      held,
+    ),
+  );
+  expect(result).toMatchObject({ cancelled: true, cancelKilled: true, timedOut: false, idleTimedOut: false });
+  expect(delayed).toBe(true);
+  expect(result.durationMs).toBeGreaterThanOrEqual(100);
+});
+
 test("the effective profile is probed before the native-tool process and failed probes never launch it", async () => {
   const roots = { write: [work], protect: [join(work, ".git")] };
   for (const behaviour of ["leaky", "timeout", "throws", "incomplete"] as const) {
