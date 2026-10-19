@@ -46,7 +46,7 @@ import {
   squashTitle,
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
-import { processScope, sh } from "../src/util/proc.ts";
+import { processScope, registerCredential, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -3498,6 +3498,67 @@ test("whole-blob classification catches a valid V7 TAR with its first NUL at 972
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
+
+test("new text sizes use complete UTF-8 blob bytes and exclude binary content", async () => {
+  const files = {
+    "at.data": "é".repeat(51_200),
+    "over.data": "é".repeat(51_201),
+    "binary.txt": `\0${"x".repeat(102_401)}`,
+    "invalid.dat": Buffer.alloc(102_401, 0xff),
+  };
+  for (const [path, content] of Object.entries(files)) writeFileSync(join(work, path), content);
+  await commitAll(work, "add generated reports");
+  const diff = await diffSince(work, base);
+  expect(diff.headTextSizes?.["at.data"]).toBe(102_400);
+  expect(diff.headTextSizes?.["over.data"]).toBe(102_402);
+  expect(diff.headTextPaths).not.toContain("binary.txt");
+  expect(diff.headTextSizes?.["invalid.dat"]).toBeUndefined();
+  expect(
+    auditDiff(diff, { taskClass: null, protectedPaths: [] })
+      .filter((f) => f.rule === "large-text-addition")
+      .map((f) => f.file),
+  ).toEqual(["over.data"]);
+});
+
+test.each(["history", "squash", "staged"])(
+  "decoding refusal identifies safe commit/revision and redacted path: %s",
+  async (kind) => {
+    const credential = "synthetic-publication-path-credential";
+    const privateValue = "synthetic-private-path";
+    registerCredential("publication-path-test", credential);
+    const path = `report-${credential}-${privateValue}.txt`;
+    const payload = `%${"25".repeat(6)}72`;
+    writeFileSync(join(work, path), payload);
+    await stageAll({ cwd: work });
+    const entries = [{ value: privateValue, entry: 1 }];
+    let sha = "";
+    if (kind !== "staged") {
+      await commitAll(work, "temporary report");
+      sha = await headSha(work);
+    }
+    if (kind === "history") {
+      rmSync(join(work, path));
+      await commitAll(work, "remove temporary report");
+    }
+    // A private path must be redacted without hiding the decoding refusal or commit context.
+    for (const denylist of [[], entries]) {
+      const error = await (kind === "squash"
+        ? checkPrivatePublication(work, denylist, { squash: { base, head: sha, title: "Report", body: "" } })
+        : checkPrivateRange(work, `${base}..HEAD`, denylist, kind === "staged")
+      ).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      const message = String(error);
+      expect(message).toContain(kind === "staged" ? "staged" : sha);
+      expect(message).toContain("report-[redacted]-");
+      expect(message).not.toContain(credential);
+      if (denylist.length) {
+        expect(message).not.toContain(privateValue);
+      }
+      expect(message).toContain("decoding limit");
+      expect(message).not.toContain(payload);
+    }
+  },
+);
 
 test("squash publication ignores removed PR history with an empty or configured denylist", async () => {
   const unsafe = `%${"25".repeat(6)}72`;

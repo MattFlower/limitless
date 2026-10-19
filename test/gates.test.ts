@@ -1040,6 +1040,50 @@ function diff(patch: string, files: { status: string; path: string }[]): DiffInf
   return { patch, files, stat: "", added: 0, removed: 0 };
 }
 
+describe("scratch output audit warnings", () => {
+  test.each([
+    ["A", ".tmp-gate/report.xml", true],
+    ["A", ".github/new.yml", true],
+    ["A", "ordinary.txt", false],
+    ["A", ".rootfile", false],
+    ["A", "src/.cache/report.xml", false],
+    ["M", ".tmp-gate/report.xml", false],
+    ["D", ".tmp-gate/report.xml", false],
+    ["R100", ".tmp-gate/report.xml", false],
+  ])("hidden directory rule: %s %s", (status, path, warns) => {
+    const findings = auditDiff(diff("", [{ status, path }]), { taskClass: null, protectedPaths: [] });
+    expect(findings.filter((f) => f.rule === "root-hidden-addition")).toEqual(
+      warns ? [expect.objectContaining({ severity: "warn", file: path })] : [],
+    );
+    if (warns) {
+      expect(findings[0]?.detail).toContain("scratch/TMPDIR");
+      expect(findings[0]?.detail).toContain("Intentional additions may remain");
+    }
+  });
+
+  test.each([
+    ["below", "a", 102_399, true, "A", false],
+    ["exact", "a", 102_400, true, "A", false],
+    ["above", "a", 102_401, true, "A", true],
+    ["multibyte exact", "é", 51_200, true, "A", false],
+    ["multibyte above", "é", 51_201, true, "A", true],
+    ["binary", "a\0", 60_000, false, "A", false],
+    ["modified", "a", 102_401, true, "M", false],
+  ])("text size rule: %s", (_label, unit, count, text, status, warns) => {
+    const content = unit.repeat(count);
+    const info = {
+      ...diff("", [{ status, path: "report.data" }]),
+      headTextPaths: text ? ["report.data"] : [],
+      headTextSizes: { "report.data": Buffer.byteLength(content, "utf8") },
+    };
+    const findings = auditDiff(info, { taskClass: null, protectedPaths: [] });
+    expect(findings.filter((f) => f.rule === "large-text-addition")).toEqual(
+      warns ? [expect.objectContaining({ severity: "warn", file: "report.data" })] : [],
+    );
+    expect(formatAuditFeedback(findings)).toBe("");
+  });
+});
+
 describe("audit allowances and attribute rules", () => {
   test("only standalone Allow lines count, each kind independently", () => {
     expect(parseAllow("Vendor it\r\n  ALLOW:  Submodules \r\nmore")).toEqual(["submodules"]);

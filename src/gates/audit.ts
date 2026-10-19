@@ -289,6 +289,23 @@ export function auditDiff(
         detail: `${file}: binary bytes, such as a NUL, hide the content from review. ${allowHint("binary")}`,
       });
   for (const f of diff.files) {
+    if (f.status.startsWith("A")) {
+      for (const [rule, applies, reason] of [
+        ["root-hidden-addition", /^\.[^/]+\//.test(f.path), "Added a file beneath a root hidden directory."],
+        [
+          "large-text-addition",
+          headText.has(f.path) && (diff.headTextSizes?.[f.path] ?? 0) > 102_400,
+          "Added a text file over 100 KiB.",
+        ],
+      ] as const)
+        if (applies)
+          findings.push({
+            rule,
+            severity: "warn",
+            file: f.path,
+            detail: `${reason} Remove accidental scratch output and write future logs or reports under scratch/TMPDIR. Intentional additions may remain.`,
+          });
+    }
     const touched = f.from ? [f.from, f.path] : [f.path];
     const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));
     if (hit) {
@@ -404,8 +421,10 @@ export function auditDiff(
   return dedupe(
     findings.map((f) => ({
       ...f,
-      ...(f.file && privateMatches(f.file, entries).length ? { file: "[redacted filename]" } : {}),
-      detail: redactPrivate(f.detail, entries),
+      ...(f.file
+        ? { file: privateMatches(f.file, entries).length ? "[redacted filename]" : redactGateOutput(f.file) }
+        : {}),
+      detail: redactPrivate(redactGateOutput(f.detail), entries),
     })),
   );
 }
