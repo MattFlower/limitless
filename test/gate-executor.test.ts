@@ -1134,7 +1134,9 @@ test.each(["injected", "local"])("landing checks log setup and check events once
       ci: "SUCCESS",
       failing: [],
     }),
-    gh: async () => {
+    gh: async (args) => {
+      if (args.includes("url,state,isDraft,headRefOid,mergedBy,mergedAt"))
+        return JSON.stringify({ url: prUrl, state: "OPEN", isDraft: false, headRefOid: sha });
       throw new Error("Unexpected GitHub call");
     },
     log: (message) => {
