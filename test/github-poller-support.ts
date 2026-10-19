@@ -57,7 +57,7 @@ export function fakeGitHub(now: () => number = Date.now) {
   const signals: AbortSignal[] = [];
   const next: (GitHubResponse | Error)[] = [];
   const restNext: (GitHubResponse | Error)[] = [];
-  const responses = new Map<string, () => GitHubResponse>();
+  const responses = new Map<string, () => GitHubResponse | Promise<GitHubResponse>>();
   const deny = new Map<string, () => GitHubResponse>();
   let inFlight = 0;
   let maxInFlight = 0;
