@@ -1043,7 +1043,8 @@ function diff(patch: string, files: { status: string; path: string }[]): DiffInf
 describe("scratch output audit warnings", () => {
   test.each([
     ["A", ".tmp-gate/report.xml", true],
-    ["A", ".github/new.yml", true],
+    ["A", ".github/workflows/x.yml", false],
+    ["A", ".github/dependabot.yml", false],
     ["A", "ordinary.txt", false],
     ["A", ".rootfile", false],
     ["A", "src/.cache/report.xml", false],
@@ -1058,6 +1059,47 @@ describe("scratch output audit warnings", () => {
     if (warns) {
       expect(findings[0]?.detail).toContain("scratch/TMPDIR");
       expect(findings[0]?.detail).toContain("Intentional additions may remain");
+    }
+  });
+
+  test("established hidden directories exempt only the hidden-directory warning", () => {
+    const path = ".config/report.txt";
+    const findings = auditDiff(
+      {
+        ...diff("", [{ status: "A", path }]),
+        baseHiddenDirs: [".config"],
+        headTextPaths: [path],
+        headTextSizes: { [path]: 102_401 },
+      },
+      { taskClass: null, protectedPaths: [] },
+    );
+    expect(findings.map((f) => f.rule)).toEqual(["large-text-addition"]);
+  });
+
+  test("terminal formatting is normalized before private filenames and details are redacted", () => {
+    const privateValue = ["secret", "host.example"].join("-");
+    const configDir = tempDir({ "private-strings.txt": privateValue });
+    try {
+      const path = `.tmp-gate/secret-${String.fromCharCode(27)}[31mhost.example.txt`;
+      const findings = auditDiff(
+        { ...diff("", [{ status: "A", path }]), binaryPaths: [path] },
+        {
+          configDir,
+          taskClass: null,
+          protectedPaths: [],
+        },
+      );
+      expect(findings.filter((f) => f.rule === "root-hidden-addition")).toEqual([
+        expect.objectContaining({
+          rule: "root-hidden-addition",
+          severity: "warn",
+          file: "[redacted filename]",
+        }),
+      ]);
+      expect(findings.find((f) => f.rule === "binary-content")?.detail).toContain("[redacted]");
+      expect(JSON.stringify(findings)).not.toContain(privateValue);
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 

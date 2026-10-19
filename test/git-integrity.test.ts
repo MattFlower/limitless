@@ -38,6 +38,7 @@ import {
   discardChanges,
   ensureCache,
   headSha,
+  publicationDiagnosisLimits,
   pushBranch,
   readFileAt,
   rebaseOnto,
@@ -3520,6 +3521,33 @@ test("new text sizes use complete UTF-8 blob bytes and exclude binary content", 
   ).toEqual(["over.data"]);
 });
 
+test("hidden directory exemptions come from the audited base, not head", async () => {
+  mkdirSync(join(work, ".config"));
+  writeFileSync(join(work, ".config/tracked.txt"), "base config");
+  await commitAll(work, "establish config directory");
+  const before = await headSha(work);
+  for (const path of [".github/workflows/x.yml", ".config/report.txt", ".tmp-gate/report.xml"]) {
+    mkdirSync(dirname(join(work, path)), { recursive: true });
+    writeFileSync(join(work, path), path.startsWith(".config/") ? "x".repeat(102_401) : "report");
+  }
+  await commitAll(work, "add reports and workflow");
+  for (const [revision, hidden] of [
+    [before, [".tmp-gate/report.xml"]],
+    [base, [".config/report.txt", ".config/tracked.txt", ".tmp-gate/report.xml"]],
+  ] as const) {
+    const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
+    expect(
+      findings
+        .filter((f) => f.rule === "root-hidden-addition")
+        .map((f) => f.file)
+        .sort(),
+    ).toEqual([...hidden]);
+    expect(findings.filter((f) => f.rule === "large-text-addition").map((f) => f.file)).toEqual([
+      ".config/report.txt",
+    ]);
+  }
+});
+
 test.each(["history", "squash", "staged"])(
   "decoding refusal identifies safe commit/revision and redacted path: %s",
   async (kind) => {
@@ -3549,13 +3577,97 @@ test.each(["history", "squash", "staged"])(
       expect(error).toBeInstanceOf(Error);
       const message = String(error);
       expect(message).toContain(kind === "staged" ? "staged" : sha);
-      expect(message).toContain("report-[redacted]-");
+      expect(message).toContain("[redacted filename]");
       expect(message).not.toContain(credential);
       if (denylist.length) {
         expect(message).not.toContain(privateValue);
       }
       expect(message).toContain("decoding limit");
       expect(message).not.toContain(payload);
+    }
+  },
+);
+
+test.each([
+  ["history", "credential"],
+  ["squash", "credential"],
+  ["staged", "credential"],
+  ["history", "private"],
+  ["squash", "private"],
+  ["staged", "private"],
+  ["staged", "html"],
+  ["staged", "undecodable"],
+])("decoding diagnosis withholds encoded filenames: %s %s", async (kind, sensitive) => {
+  const credential = ["synthetic", "encoded", "credential"].join("-");
+  const privateValue = ["synthetic", "private", "filename"].join("-");
+  registerCredential("encoded-publication-path-test", credential);
+  const value = sensitive === "credential" ? credential : privateValue;
+  const encoded =
+    sensitive === "undecodable"
+      ? `%${"25".repeat(6)}72`
+      : Array.from(value, (c) =>
+          sensitive === "html" ? `&#${c.charCodeAt(0)};` : `%${c.charCodeAt(0).toString(16)}`,
+        ).join("");
+  const path = `report-${encoded}.txt`;
+  const payload = `%${"25".repeat(6)}72`;
+  writeFileSync(join(work, path), payload);
+  await stageAll({ cwd: work });
+  if (kind !== "staged") await commitAll(work, "encoded report filename");
+  const sha = await headSha(work);
+  if (kind === "history") {
+    rmSync(join(work, path));
+    await commitAll(work, "remove report");
+  }
+  const error = await checkPrivatePublication(
+    work,
+    sensitive === "credential" ? [] : [{ value: privateValue, entry: 1 }],
+    kind === "squash"
+      ? { squash: { base, head: sha, title: "Report", body: "" } }
+      : kind === "staged"
+        ? { staged: true }
+        : { commits: `${base}..HEAD` },
+  ).catch((error: unknown) => error);
+  const message = String(error);
+  expect(error).toBeInstanceOf(Error);
+  expect(message).toContain(kind === "staged" ? "Published staged content" : sha);
+  expect(message).toContain("[redacted filename]");
+  expect(message).toContain("decoding limit");
+  for (const withheld of [credential, privateValue, encoded, payload])
+    expect(message).not.toContain(withheld);
+});
+
+test.each(["addition", "modification", "deletion"])(
+  "diagnosis indexes multiple blob pairs: %s",
+  async (change) => {
+    const unsafe = `%${"25".repeat(6)}72`;
+    writeFileSync(join(work, "a.txt"), "before");
+    if (change !== "addition")
+      for (const path of ["z.txt", "zz-copy.txt"])
+        writeFileSync(join(work, path), change === "deletion" ? unsafe : "before");
+    await commitAll(work, "diagnostic base");
+    const before = await headSha(work);
+    writeFileSync(join(work, "a.txt"), "after");
+    writeFileSync(join(work, "b.txt"), "another file");
+    for (const path of ["z.txt", "zz-copy.txt"])
+      if (change === "deletion") rmSync(join(work, path));
+      else writeFileSync(join(work, path), unsafe);
+    await commitAll(work, "multiple files");
+    const sha = await headSha(work);
+    const check = () =>
+      checkPrivatePublication(work, [], { squash: { base: before, head: sha, title: "Report", body: "" } });
+    await expect(check()).rejects.toThrow(`Published revision ${sha}: z.txt exceeds`);
+    const limits = { ...publicationDiagnosisLimits };
+    try {
+      for (const budget of [{ steps: 1 }, { steps: 5 }, { bytes: 0 }]) {
+        Object.assign(publicationDiagnosisLimits, limits, budget);
+        const error = await check().catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe(
+          "Published content exceeds the private text decoding limit; publication blocked",
+        );
+      }
+    } finally {
+      Object.assign(publicationDiagnosisLimits, limits);
     }
   },
 );

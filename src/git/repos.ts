@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
@@ -13,7 +14,7 @@ import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
-import { CommandError, redactCredentials, sh } from "../util/proc.ts";
+import { CommandError, redactCredentials, registeredCredentials, sh } from "../util/proc.ts";
 import {
   cacheGit,
   emptyTreeId,
@@ -545,6 +546,7 @@ export interface DiffInfo {
   binaryErrors?: string[];
   headTextPaths?: string[];
   headTextSizes?: Record<string, number>;
+  baseHiddenDirs?: string[];
   existingRuleKeys?: Record<string, string[]>;
   attributeUnmatched?: string[];
 }
@@ -614,6 +616,10 @@ export async function diffSince(
     });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
+  const tree = await worktreeGit(["git", "ls-tree", "-r", "--name-only", "-z", revision], { cwd, env });
+  const baseHiddenDirs = [
+    ...new Set(tree.stdout.split("\0").flatMap((path) => path.match(/^(\.[^/]+)\//)?.[1] ?? [])),
+  ];
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
   const privateHits: { path: string; entry: number }[] = [];
   if (privateStrings.length) {
@@ -637,6 +643,7 @@ export async function diffSince(
     removed,
     gitlinks,
     privateHits,
+    baseHiddenDirs,
     ...inspection,
   };
 }
@@ -689,6 +696,9 @@ async function localLfsPayload(cwd: string, env: Record<string, string> | undefi
   return undefined;
 }
 
+/** Fixed diagnostic limits; the aggregate refusal remains authoritative on exhaustion. */
+export const publicationDiagnosisLimits = { steps: 1_000, bytes: 8 * 1024 * 1024, timeoutMs: 5_000 };
+
 /** Inspect only the commits and squash content this step publishes. */
 export async function checkPrivatePublication(
   cwd: string,
@@ -739,35 +749,83 @@ export async function checkPrivatePublication(
       checkPublicationText(text, `Published commit object ${sha}`, entries);
     }
   }
-  const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
+  const flags = "--raw -z --no-abbrev --full-index -p --text --no-renames -U0 --ignore-submodules=none".split(
+    " ",
+  );
   const diagnose = async (error: unknown, blob?: [string, number]): Promise<never> => {
     // Keep the aggregate scan authoritative; recover file context only after a decoding refusal.
     if (!blob && (error as Error).message !== privacy.privateReason("Published content", 0)) throw error;
-    for (const [location, args] of [
-      ...revisions.map(
-        (sha) => [`Published commit ${sha}`, [...log, "-m", "--no-walk", "--format=", sha]] as const,
-      ),
-      ...(squash
-        ? [[`Published revision ${squash.head}`, ["git", "diff", `${squash.base}..${squash.head}`]] as const]
-        : []),
-      ...(staged ? [["Published staged content", ["git", "diff", "--cached"]] as const] : []),
-    ]) {
-      // One U0 patch per revision, split per file, so diagnosis excludes unchanged blob content.
-      const { stdout } = await worktreeGit([...args, ...flags], { cwd });
-      const raw = [...stdout.matchAll(/:\d+ \d+ (\w+) (\w+) [A-Z]\0([^\0]+)\0/g)];
-      const name = (path = "") => `${location}: ${privacy.redactPrivate(redactCredentials(path), entries)}`;
-      const found = raw.find((match) => match[2] === blob?.[0]);
-      if (blob && found) throw new privacy.PrivateError(privacy.privateReason(name(found[3]), blob[1]));
-      for (const section of blob ? [] : stdout.split(/(?<=[\n\0])(?=diff --git )/).slice(1)) {
-        // The index line abbreviates both blob ids; an all-zero side is an addition or deletion.
-        const [, from = "", to = ""] = /^index (\w+)\.\.(\w+)/m.exec(section) ?? [];
-        const ids = (match: RegExpMatchArray) =>
-          [from, to].every((id, i) => /^0+$/.test(id) || match[i + 1]?.startsWith(id));
-        const path = from && raw.find(ids)?.[3];
-        if (path) checkPublicationText(section, name(path), []);
+    let refusal = error;
+    let { steps, bytes } = publicationDiagnosisLimits;
+    const deadline = Date.now() + publicationDiagnosisLimits.timeoutMs;
+    const spend = () => {
+      if (--steps < 0 || Date.now() >= deadline) throw error;
+    };
+    const protectedNames = [...entries, ...registeredCredentials().map((value) => ({ value, entry: 1 }))];
+    const name = (path: string) => {
+      path = stripVTControlCharacters(path);
+      try {
+        checkPublicationText(path, "filename", protectedNames);
+        return privacy.redactPrivate(redactCredentials(path), entries);
+      } catch {
+        return "[redacted filename]";
       }
+    };
+    const refuse = (location: string, path: string, entry: number): never => {
+      const filename = name(path);
+      spend();
+      refusal = new privacy.PrivateError(privacy.privateReason(`${location}: ${filename}`, entry));
+      throw refusal;
+    };
+    const pair = (from = "", to = "") => `${from.replace(/^0+$/, "0")}:${to.replace(/^0+$/, "0")}`;
+    function* contexts() {
+      for (const sha of revisions)
+        yield [`Published commit ${sha}`, [...log, "-m", "--no-walk", "--format=", sha]] as const;
+      if (squash)
+        yield [
+          `Published revision ${squash.head}`,
+          ["git", "diff", `${squash.base}..${squash.head}`],
+        ] as const;
+      if (staged) yield ["Published staged content", ["git", "diff", "--cached"]] as const;
     }
-    throw error;
+    try {
+      for (const [location, args] of contexts()) {
+        spend();
+        // One U0 patch per revision excludes unchanged blob content from diagnosis.
+        const { stdout } = await worktreeGit([...args, ...flags], {
+          cwd,
+          timeoutMs: Math.max(1, deadline - Date.now()),
+        });
+        bytes -= Buffer.byteLength(stdout);
+        if (bytes < 0) throw error;
+        const paths = new Map<string, { files: string[]; next: number }>();
+        for (const match of stdout.matchAll(/:\d+ \d+ (\w+) (\w+) [A-Z]\0([^\0]+)\0/g)) {
+          spend();
+          const path = match[3] ?? "";
+          const key = pair(match[1], match[2]);
+          const group = paths.get(key) ?? { files: [], next: 0 };
+          group.files.push(path);
+          paths.set(key, group);
+          if (blob && match[2] === blob[0]) refuse(location, path, blob[1]);
+        }
+        for (const section of blob ? [] : stdout.split(/(?<=[\n\0])(?=diff --git )/).slice(1)) {
+          spend();
+          const ids = /^index (\w+)\.\.(\w+)/m.exec(section);
+          const group = ids && paths.get(pair(ids[1], ids[2]));
+          const path = group?.files[group.next++];
+          if (path) {
+            try {
+              checkPublicationText(section, "section", []);
+            } catch {
+              refuse(location, path, 0);
+            }
+          }
+        }
+      }
+    } catch {
+      // Attribution is best effort; command failures and exhausted budgets keep the original refusal.
+    }
+    throw refusal;
   };
   const blobs: string[] = [];
   for (const args of [

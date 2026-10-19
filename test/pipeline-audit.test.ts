@@ -170,6 +170,7 @@ describe("audit allowances (fake agents, real git)", () => {
         files: {
           "secret-host.example.txt": "secret-host.example\n",
           ".tmp-gate/secret-host.example.txt": "secret-host.example\n",
+          [`.tmp-gate/secret-${String.fromCharCode(27)}[31mhost.example.txt`]: "report\n",
           ".tmp-gate/synthetic-scratch-path-credential.txt": "report\n",
         },
       };
@@ -187,6 +188,7 @@ describe("audit allowances (fake agents, real git)", () => {
     expect(prompts[1]).toContain("entry 1 in private-strings.txt");
     expect(prompts[1]).not.toContain("secret-host.example");
     expect(prompts[1]).toContain("Advisory [root-hidden-addition]");
+    expect(prompts[1]).toContain("Advisory [root-hidden-addition] [redacted filename]");
     expect(prompts[1]).not.toContain("synthetic-scratch-path-credential");
     expect(JSON.stringify(events)).not.toContain("synthetic-scratch-path-credential");
   });

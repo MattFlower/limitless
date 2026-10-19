@@ -262,6 +262,7 @@ export function auditDiff(
   }
   const warnings = new Map<string, string[]>();
   const headText = new Set(diff.headTextPaths);
+  const hiddenDirs = new Set([".github", ...(diff.baseHiddenDirs ?? [])]);
   const addedPaths = new Set(diff.files.filter((f) => /^[ARC]/.test(f.status)).map((f) => f.path));
   for (const { path, base, head } of diff.attributes ?? []) {
     const added = newlyHidden(base, head).join(" ");
@@ -291,7 +292,11 @@ export function auditDiff(
   for (const f of diff.files) {
     if (f.status.startsWith("A")) {
       for (const [rule, applies, reason] of [
-        ["root-hidden-addition", /^\.[^/]+\//.test(f.path), "Added a file beneath a root hidden directory."],
+        [
+          "root-hidden-addition",
+          /^\.[^/]+\//.test(f.path) && !hiddenDirs.has(f.path.split("/")[0] ?? ""),
+          "Added a file beneath a root hidden directory.",
+        ],
         [
           "large-text-addition",
           headText.has(f.path) && (diff.headTextSizes?.[f.path] ?? 0) > 102_400,
@@ -419,13 +424,16 @@ export function auditDiff(
     }
   }
   return dedupe(
-    findings.map((f) => ({
-      ...f,
-      ...(f.file
-        ? { file: privateMatches(f.file, entries).length ? "[redacted filename]" : redactGateOutput(f.file) }
-        : {}),
-      detail: redactPrivate(redactGateOutput(f.detail), entries),
-    })),
+    findings.map((f) => {
+      const file = f.file === undefined ? undefined : redactGateOutput(f.file);
+      return {
+        ...f,
+        ...(file !== undefined
+          ? { file: privateMatches(file, entries).length ? "[redacted filename]" : file }
+          : {}),
+        detail: redactPrivate(redactGateOutput(f.detail), entries),
+      };
+    }),
   );
 }
 
