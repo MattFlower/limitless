@@ -618,6 +618,8 @@ exec '${realGit}' "$@"
       }, 5);`,
     );
     let writerPid: number | undefined;
+    const writerStop = new AbortController();
+    let background: Promise<ProcResult> | undefined;
     const attempts: { state: RunState | null; prompt: string }[] = [];
     const f = factory(undefined, async (s) => {
       if (s.mode !== "edit") return answer(s);
@@ -628,21 +630,20 @@ exec '${realGit}' "$@"
       }
       writeFileSync(active, "");
       writeFileSync(join(s.cwd, ".gitignore"), "node_modules/\n");
-      const stalled = new AbortController();
-      const result = await runProcess({
-        cmd: [process.execPath, parentScript],
-        cwd: s.cwd,
-        env: process.env as Record<string, string>,
-        signal: AbortSignal.any([s.signal, stalled.signal]),
-        onStdoutLine: () => {
-          writerPid = Number(readFileSync(pidFile, "utf8"));
-          stalled.abort();
-        },
+      await new Promise<void>((resolve, reject) => {
+        background = runProcess({
+          cmd: [process.execPath, parentScript],
+          cwd: s.cwd,
+          env: process.env as Record<string, string>,
+          signal: writerStop.signal,
+          onStdoutLine: () => {
+            writerPid = Number(readFileSync(pidFile, "utf8"));
+            resolve();
+          },
+        });
+        void background.catch(reject);
       });
-      expect(result.cancelled).toBe(true);
       expect(writerPid).toBeGreaterThan(0);
-      expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
-      writerPid = undefined;
       return {
         status: "stuck",
         error: `repeated shell call ${invocationSecret}`,
@@ -652,9 +653,12 @@ exec '${realGit}' "$@"
     const id = await run(f);
     try {
       await settled(f, id);
+      expect(existsSync(alive)).toBe(false);
+      expect((await background)?.cancelled).toBe(true);
+      expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      writerPid = undefined;
       expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
       expect(attempts.map((a) => a.state?.round)).toEqual([0, 1]);
-      expect(existsSync(alive)).toBe(false);
       expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
         "reset",
         "clean",
@@ -686,6 +690,8 @@ exec '${realGit}' "$@"
       expect(existsSync(join(cwd, "node_modules/.ci-check-final.log"))).toBe(false);
       history(f, id);
     } finally {
+      writerStop.abort();
+      await background;
       await f.stop();
       process.env.PATH = oldPath;
       if (writerPid !== undefined) {

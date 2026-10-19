@@ -9,6 +9,32 @@ import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 /** Only the innermost invocation's scratch is an ownership root. */
 export const invocationScratch = new AsyncLocalStorage<string>();
 
+const invocationProcesses = new AsyncLocalStorage<{
+  signal: AbortSignal;
+  pending: Set<Promise<ProcResult>>;
+}>();
+
+/** Stop even unawaited commands before the invocation's scratch or checkout is cleaned. */
+export async function withInvocationProcesses<T>(
+  signal: AbortSignal,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const invocation = {
+    signal: AbortSignal.any([signal, controller.signal]),
+    pending: new Set<Promise<ProcResult>>(),
+  };
+  return invocationProcesses.run(invocation, async () => {
+    try {
+      return await run(invocation.signal);
+    } finally {
+      controller.abort();
+      await Promise.all(invocation.pending);
+      assertProcessesStopped();
+    }
+  });
+}
+
 export const processScope = new AsyncLocalStorage<{
   signal: AbortSignal;
   killGraceMs: number;
@@ -515,11 +541,12 @@ function stillRunning(pid: number): boolean {
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
   assertProcessesStopped();
   const scope = processScope.getStore();
-  if (scope)
-    opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
-  if (scope) opts.signal?.throwIfAborted();
+  const invocation = invocationProcesses.getStore();
+  const signals = [scope?.signal, invocation?.signal, opts.signal].filter((signal) => signal !== undefined);
+  if (scope || invocation) opts = { ...opts, signal: AbortSignal.any(signals) };
+  if (scope || invocation) opts.signal?.throwIfAborted();
   const started = Date.now();
-  return new Promise((resolve, reject) => {
+  const result = new Promise<ProcResult>((resolve, reject) => {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
     const marker = randomUUID();
@@ -761,6 +788,14 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
   });
+  if (invocation) {
+    invocation.pending.add(result);
+    void result.then(
+      () => invocation.pending.delete(result),
+      () => invocation.pending.delete(result),
+    );
+  }
+  return result;
 }
 
 const SH_OUTPUT_LIMIT = 50_000_000;

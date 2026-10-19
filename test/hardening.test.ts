@@ -33,6 +33,7 @@ import {
   linuxBirthClock,
   linuxCallerAncestors,
   ProcessTerminationError,
+  type ProcResult,
   processBirth,
   processBirthInspection,
   processInspection,
@@ -40,6 +41,7 @@ import {
   registerCredential,
   runProcess,
   sh,
+  withInvocationProcesses,
 } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
@@ -54,6 +56,47 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
+
+test.each(["normal", "error", "cancelled"])(
+  "invocation stops unawaited commands on %s without stopping a concurrent command",
+  async (ending) => {
+    const cleanup = new AbortController();
+    const controller = new AbortController();
+    const running: Promise<ProcResult>[] = [];
+    const pids: number[] = [];
+    const start = () =>
+      new Promise<void>((resolve, reject) => {
+        const child = runProcess({
+          cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+          cwd: dir,
+          env: process.env as Record<string, string>,
+          signal: cleanup.signal,
+          onStdoutLine: (line) => {
+            pids.push(Number(line));
+            resolve();
+          },
+        });
+        running.push(child);
+        void child.catch(reject);
+      });
+    try {
+      await start();
+      const invocation = withInvocationProcesses(controller.signal, async () => {
+        await start();
+        if (ending === "error") throw new Error("agent failed");
+        if (ending === "cancelled") controller.abort();
+      });
+      if (ending === "error") await expect(invocation).rejects.toThrow("agent failed");
+      else await invocation;
+      expect(() => process.kill(pids[1] ?? 0, 0)).toThrow();
+      expect((await running[1])?.cancelled).toBe(true);
+      expect(process.kill(pids[0] ?? 0, 0)).toBe(true);
+    } finally {
+      cleanup.abort();
+      await Promise.all(running);
+    }
+  },
+);
 
 async function loadNativeInspection(directory: string) {
   const fixturePath = join(import.meta.dir, "darwin-inspection-fixture.ts");
