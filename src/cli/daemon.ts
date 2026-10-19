@@ -7,6 +7,7 @@ import { createApiToken } from "../server/api-token.ts";
 import { startHttp } from "../server/http.ts";
 import { startWorkerListener } from "../server/workers.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
+import { processCleanupStore, recoverProcessCleanups, redactCredentials } from "../util/proc.ts";
 
 /** Protect retained credentials before integrations resume the land queue or start agents. */
 export async function startDaemon(
@@ -14,6 +15,17 @@ export async function startDaemon(
   ui: Record<string, Blob>,
   mount = mountIntegrations,
   serve = Bun.serve<undefined>,
+  recover = recoverProcessCleanups,
+) {
+  return processCleanupStore.run(factory.store, () => startScopedDaemon(factory, ui, mount, serve, recover));
+}
+
+async function startScopedDaemon(
+  factory: Factory,
+  ui: Record<string, Blob>,
+  mount: typeof mountIntegrations,
+  serve: typeof Bun.serve<undefined>,
+  recover: typeof recoverProcessCleanups,
 ) {
   const credential = createApiToken(factory.cfg.paths.home);
   const privateFiles: (() => void)[] = [];
@@ -53,6 +65,9 @@ export async function startDaemon(
       credential,
     );
     factory.start();
+    void Promise.resolve()
+      .then(() => recover(factory.store))
+      .catch((error) => console.error(redactCredentials(`[process cleanup] ${(error as Error).message}`)));
     return { integrations, server: { ...server, stop } };
   } catch (error) {
     await stop(true).catch(() => {});

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { sep } from "node:path";
 import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
 import { assertExistingBranchDelivery, type FactoryBranchGrant } from "../core/delivery.ts";
@@ -56,7 +57,7 @@ import { quotedJson } from "../integrations/github.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
-import { redactCredentials } from "../util/proc.ts";
+import { type ProcessCleanup, redactCredentials } from "../util/proc.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
 
@@ -428,6 +429,34 @@ export class Store {
   close(): void {
     this.db.close();
     this.releasePrivateReads();
+  }
+
+  recordProcessCleanup(row: ProcessCleanup): void {
+    this.db
+      .query(
+        "INSERT OR REPLACE INTO process_cleanups (run_id, invocation, directory, pid, birth, boot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(row.runId, row.invocation, row.directory, row.pid, row.birth, row.boot, row.createdAt);
+  }
+
+  listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[] {
+    const prefix =
+      directory === undefined ? null : directory.endsWith(sep) ? directory : `${directory}${sep}`;
+    return this.db
+      .query<ProcessCleanup, (string | null)[]>(
+        `SELECT run_id AS runId, invocation, directory, pid, birth, boot, created_at AS createdAt
+       FROM process_cleanups WHERE (? IS NULL AND ? IS NULL) OR run_id = ?
+       OR directory = ? OR substr(directory, 1, length(?)) = ?`,
+      )
+      .all(runId ?? null, directory ?? null, runId ?? null, directory ?? null, prefix, prefix);
+  }
+
+  deleteProcessCleanup(invocation: string, pid: number): void {
+    this.db.query("DELETE FROM process_cleanups WHERE invocation = ? AND pid = ?").run(invocation, pid);
+  }
+
+  deleteInvocationCleanups(invocation: string): void {
+    this.db.query("DELETE FROM process_cleanups WHERE invocation = ?").run(invocation);
   }
 
   recordOwnerDiagnostic(

@@ -75,6 +75,7 @@ import {
   CommandError,
   ProcessTerminationError,
   processScope,
+  recoverScopedProcesses,
   redactCredentials,
 } from "../util/proc.ts";
 import {
@@ -168,7 +169,14 @@ export async function executeRun(
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
   const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
   return processScope.run(
-    { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
+    {
+      signal: ctx.signal,
+      killGraceMs: 100,
+      children: new Map(),
+      scratchDirs: new Set(),
+      runId,
+      checkout: () => ctx.state.worktreePath,
+    },
     () =>
       confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
         readPolicyScope.run(deps.cfg.readPolicy, () =>
@@ -199,6 +207,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
+    await recoverScopedProcesses();
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
     if (
@@ -323,7 +332,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const resolvingReview = !!ctx.state.reviewResolution && !ctx.state.reviewResolution.sha;
     const needsHuman =
-      e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure || resolvingReview;
+      e instanceof NeedsHumanError ||
+      e instanceof NoCapacityError ||
+      !!verifiedFailure ||
+      resolvingReview ||
+      terminationBlocked;
     let message = redactGateOutput((e as Error).message);
     if (resolvingReview) {
       message = redactGateOutput(

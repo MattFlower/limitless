@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -46,7 +47,11 @@ import {
   type ProcOptions,
   type ProcResult,
   processBirth,
+  processBootInspection,
+  processCleanupStore,
   processInspection,
+  processRecoveryInspection,
+  recoveryProcessStopped,
   runProcess,
   sh,
 } from "../src/util/proc.ts";
@@ -2655,3 +2660,65 @@ test("an invoke deadline bounds slot waits and every fallback, then gives up say
   for (const release of held) release();
   expect(timeouts).toHaveLength(1);
 });
+
+for (const refuse of [false, true]) {
+  test(`resuming a run recovers its recorded cleanup before advancing (refuse=${refuse})`, async () => {
+    const f = factory(undefined, () => {
+      throw new Error("Unexpected model invocation");
+    });
+    const run = await f.createRun({ repo: source, prompt: "Change" });
+    f.store.setRunState(run.id, {
+      flow: "build",
+      phase: "done",
+      worktreePath: source,
+      previewConfig: null,
+      slottedCommands: [],
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      feedback: null,
+      toolCommands: [],
+    } satisfies RunState);
+    const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    try {
+      await new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
+      const pid = child.pid;
+      if (pid === undefined) throw new Error("Sleeper did not start");
+      const birth = await processBirth(pid);
+      if (birth === null) throw new Error("Sleeper exited early");
+      f.store.recordProcessCleanup({
+        runId: refuse ? run.id : null,
+        invocation: "interrupted",
+        directory: realpathSync(source),
+        pid,
+        birth,
+        boot: "test-boot",
+        createdAt: Date.now(),
+      });
+      const status = await processBootInspection.run(
+        () => "test-boot",
+        () =>
+          processCleanupStore.run(f.store, () =>
+            processRecoveryInspection.run(
+              { stopped: refuse ? () => false : recoveryProcessStopped, timeoutMs: refuse ? 0 : 10_000 },
+              () => executeRun(f.deps, run.id, new AbortController().signal),
+            ),
+          ),
+      );
+      expect(status).toBe(refuse ? "needs_human" : "succeeded");
+      expect(f.store.listProcessCleanups()).toHaveLength(refuse ? 1 : 0);
+      if (refuse) expect(f.store.getRun(run.id)?.error).toContain(`Recorded processes still alive: ${pid}`);
+      const deadline = performance.now() + 5000;
+      while (!recoveryProcessStopped(pid) && performance.now() < deadline) await Bun.sleep(10);
+      expectProcessStopped(pid);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      }
+    }
+  });
+}

@@ -15,7 +15,27 @@ export const processScope = new AsyncLocalStorage<{
   children: Map<ChildProcess, Promise<void>>;
   scratchDirs: Set<string>;
   terminationError?: ProcessTerminationError;
+  runId?: string;
+  checkout?: () => string | undefined;
+  cleanups?: ProcessCleanupStore;
 }>();
+
+export interface ProcessCleanup {
+  runId: string | null;
+  invocation: string;
+  directory: string;
+  pid: number;
+  birth: string;
+  boot: string;
+  createdAt: number;
+}
+export interface ProcessCleanupStore {
+  recordProcessCleanup(record: ProcessCleanup): void;
+  listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[];
+  deleteProcessCleanup(invocation: string, pid: number): void;
+  deleteInvocationCleanups(invocation: string): void;
+}
+export const processCleanupStore = new AsyncLocalStorage<ProcessCleanupStore>();
 
 export class ProcessTerminationError extends Error {
   static readonly prefix = "Invocation termination could not be confirmed";
@@ -34,6 +54,103 @@ export const processInspection = new AsyncLocalStorage<
 export const linuxAncestryInspection = new AsyncLocalStorage<(pid: number) => string>();
 const inspectionPlatform = process.platform;
 const darwin = inspectionPlatform === "darwin" ? await import("./processes-darwin.ts") : undefined;
+
+export const processBootInspection = new AsyncLocalStorage<() => string>();
+
+export function bootIdentity(): string {
+  const boot =
+    processBootInspection.getStore()?.() ??
+    darwin?.darwinBootIdentity() ??
+    readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  if (!boot) throw new Error("Boot identity is empty");
+  return boot;
+}
+
+export function recoveryProcessStopped(pid: number): boolean {
+  if (darwin) return darwin.darwinProcessStopped(pid);
+  try {
+    const row = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return row.slice(row.lastIndexOf(")") + 2).startsWith("Z");
+  } catch (error) {
+    if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return true;
+    throw error;
+  }
+}
+
+export const processRecoveryInspection = new AsyncLocalStorage<{
+  stopped: typeof recoveryProcessStopped;
+  timeoutMs: number;
+}>();
+
+export async function recoverProcessCleanups(
+  store: ProcessCleanupStore,
+  records = store.listProcessCleanups(),
+  stopped = processRecoveryInspection.getStore()?.stopped ?? recoveryProcessStopped,
+  timeoutMs = processRecoveryInspection.getStore()?.timeoutMs ?? 10_000,
+): Promise<void> {
+  if (!records.length) return;
+  try {
+    const boot = bootIdentity();
+    const pending: ProcessCleanup[] = [];
+    const retire = (row: ProcessCleanup) => store.deleteProcessCleanup(row.invocation, row.pid);
+    for (const row of records) {
+      if (row.boot !== boot || stopped(row.pid) || (await processBirth(row.pid)) !== row.birth) {
+        retire(row);
+        continue;
+      }
+      try {
+        process.kill(row.pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        retire(row);
+        continue;
+      }
+      pending.push(row);
+    }
+    const deadline = performance.now() + timeoutMs;
+    while (pending.length) {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        const row = pending[i];
+        if (row && stopped(row.pid)) {
+          retire(row);
+          pending.splice(i, 1);
+        }
+      }
+      if (!pending.length) return;
+      if (performance.now() >= deadline)
+        throw new Error(`Recorded processes still alive: ${pending.map((row) => row.pid).join(", ")}`);
+      await Bun.sleep(10);
+    }
+  } catch (error) {
+    throw new ProcessTerminationError(
+      `${ProcessTerminationError.prefix}: ${redactCredentials((error as Error).message)}`,
+      { cause: error },
+    );
+  }
+}
+
+export async function recoverScopedProcesses(): Promise<void> {
+  const scope = processScope.getStore();
+  const store = scope?.cleanups ?? processCleanupStore.getStore();
+  if (!store || !scope?.runId) return;
+  let checkout: string | undefined;
+  try {
+    const path = scope.checkout?.();
+    if (path) checkout = realpathSync(path);
+  } catch {}
+  try {
+    await recoverProcessCleanups(store, store.listProcessCleanups(scope.runId, checkout));
+  } catch (error) {
+    scope.terminationError =
+      error instanceof ProcessTerminationError
+        ? error
+        : new ProcessTerminationError(
+            `${ProcessTerminationError.prefix}: ${redactCredentials((error as Error).message)}`,
+            { cause: error },
+          );
+    throw scope.terminationError;
+  }
+}
 
 function callerAncestors(): Set<number> {
   const readStat = linuxAncestryInspection.getStore();
@@ -290,6 +407,7 @@ async function stopMarkedProcesses(
   directories: readonly string[],
   leader: DarwinInvocationLeader | null,
   spawnedAt: bigint,
+  directory: string,
 ): Promise<boolean> {
   const group = child.pid;
   if (group === undefined) return false;
@@ -303,6 +421,8 @@ async function stopMarkedProcesses(
   const claimed = new Map<number, { birth: string; stopped: boolean; frozen: boolean }>();
   let growing = false;
   let empty = false;
+  const scope = processScope.getStore();
+  const recorder = scope?.cleanups ?? processCleanupStore.getStore();
   try {
     for (;;) {
       const pids = await markedProcesses(
@@ -327,6 +447,15 @@ async function stopMarkedProcesses(
           }
           // Allow one clock quantum: milliseconds for macOS births, USER_HZ ticks for Linux.
           growing ||= bornAt !== null && birthTime(birth) > bornAt + (birth.includes(":") ? 1000 : 1);
+          recorder?.recordProcessCleanup({
+            runId: scope?.runId ?? null,
+            invocation: marker,
+            directory,
+            pid,
+            birth,
+            boot: bootIdentity(),
+            createdAt: Date.now(),
+          });
           claimed.set(pid, { birth, stopped: false, frozen: false });
         }
       }
@@ -369,7 +498,10 @@ async function stopMarkedProcesses(
       }
       // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
       const exited = child.exitCode !== null || child.signalCode !== null;
-      if (!claimed.size && empty && exited) return killedRunningChild;
+      if (!claimed.size && empty && exited) {
+        recorder?.deleteInvocationCleanups(marker);
+        return killedRunningChild;
+      }
       empty = !claimed.size && exited;
       if (deadline && claimed.size)
         throw new Error(
@@ -515,6 +647,14 @@ function stillRunning(pid: number): boolean {
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
   assertProcessesStopped();
   const scope = processScope.getStore();
+  if (scope?.runId && (scope.cleanups ?? processCleanupStore.getStore()))
+    return recoverScopedProcesses().then(() => startProcess(opts));
+  return startProcess(opts);
+}
+
+function startProcess(opts: ProcOptions): Promise<ProcResult> {
+  assertProcessesStopped();
+  const scope = processScope.getStore();
   if (scope)
     opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
   if (scope) opts.signal?.throwIfAborted();
@@ -523,6 +663,10 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const [bin, ...args] = opts.cmd;
     if (!bin) throw new Error("runProcess: empty command");
     const marker = randomUUID();
+    let directory = opts.cwd;
+    try {
+      directory = realpathSync(directory);
+    } catch {}
     const scratch = invocationScratch.getStore();
     // Capture canonical roots before spawning: cleanup may later remove scratch paths.
     const directories =
@@ -591,17 +735,23 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
               directories,
               leader,
               spawnedAt,
+              directory,
             );
             cancelKilled = cancelStarted && killedRunningChild;
           }
         } catch (error) {
+          let message = (error as Error).message;
+          // The live ChildProcess handle proves ownership even when inspection or recording failed.
+          try {
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          } catch (signalError) {
+            message += `; ${(signalError as Error).message}`;
+          }
           terminationError = new ProcessTerminationError(
-            `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
+            `${ProcessTerminationError.prefix}: ${redactCredentials(message)}`,
             { cause: error },
           );
           if (scope) scope.terminationError = terminationError;
-          // The directly spawned child is ours even if process discovery is unavailable.
-          child.kill("SIGKILL");
           settled = true;
           finishTimers();
           reject(terminationError);

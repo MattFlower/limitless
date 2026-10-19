@@ -711,7 +711,7 @@ test("startup rotates a private 0600 token protected in every sandbox spelling",
   expect(JSON.parse(readFileSync(originPath(), "utf8")).origin).toBe(base);
 });
 
-test("startup protects a not-yet-published token before resuming queued land checks", async () => {
+test("startup protects credentials and serves health while background process recovery is pending", async () => {
   const startup = await fixture();
   startup.factory.cfg.port = 0;
   startup.factory.cfg.githubPoll = false;
@@ -749,14 +749,27 @@ test("startup protects a not-yet-published token before resuming queued land che
     expect(statSync(`${path}.origin`).mode & 0o777).toBe(0o600);
   });
   let running: Awaited<ReturnType<typeof startDaemon>> | undefined;
+  let recoveryHealth: Promise<Response> | undefined;
   try {
-    running = await startDaemon(startup.factory, {}, (factory) =>
-      mountIntegrations(factory, {
-        toolVersions: async () => [],
-        gh: async () => {},
-        prClient: async () => null,
-      }),
+    running = await startDaemon(
+      startup.factory,
+      {},
+      (factory) =>
+        mountIntegrations(factory, {
+          toolVersions: async () => [],
+          gh: async () => {},
+          prClient: async () => null,
+        }),
+      Bun.serve<undefined>,
+      async () => {
+        // startHttp publishes this only after binding its listener.
+        const { origin } = JSON.parse(readFileSync(`${path}.origin`, "utf8")) as { origin: string };
+        recoveryHealth = fetch(`${origin}/api/health`);
+        await new Promise<void>(() => {});
+      },
     );
+    expect(recoveryHealth).toBeDefined();
+    expect((await recoveryHealth)?.status).toBe(200);
     expect(land).toHaveBeenCalledTimes(1);
     expect(start).toHaveBeenCalledTimes(1);
     expect(observations[0]).toContain(`(subpath "${path}")`);
