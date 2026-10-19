@@ -175,6 +175,7 @@ export async function executeRun(
       children: new Map(),
       scratchDirs: new Set(),
       runId,
+      cleanups: deps.store,
       checkout: () => ctx.state.worktreePath,
     },
     () =>

@@ -1,7 +1,18 @@
 import "./git-preload.ts";
+import { beforeEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { processBootInspection } from "../src/util/proc.ts";
+
+// Bun isolates test callbacks' async context; supply a default without hiding explicit injections.
+// Confined macOS gates cannot read the host boot UUID.
+const readBootInspection = processBootInspection.getStore.bind(processBootInspection);
+beforeEach(() => {
+  spyOn(processBootInspection, "getStore").mockImplementation(
+    () => readBootInspection() ?? (() => "test-boot"),
+  );
+});
 
 // Git in tests sees the global config CI has: an identity and nothing else. A developer's own settings
 // (commit signing, hooks, templates) would otherwise run on every fixture and factory commit, making the
