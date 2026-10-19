@@ -41,7 +41,7 @@ export class GitHubUnavailableError extends Error {}
 /** A retryable outcome that is not a failed command, e.g. a PR lookup lagging behind its create. */
 class RetryableError extends Error {}
 /** Keep a caller guard failure out of retry and outcome classification. */
-class MergeGuardError extends Error {}
+class GitHubGuardError extends Error {}
 
 // Every pattern contains a space, which a branch name cannot, so echoed refs never look transient.
 const TRANSIENT = [
@@ -112,8 +112,23 @@ type RemoteOpts = {
   timeoutMs?: number;
   budget?: GitHubBudget;
 };
-const remoteSh = (cmd: string[], opts: RemoteOpts) =>
-  withGitHubRetry(() => (cmd[0] === "git" ? cacheGit(cmd, opts) : sh(cmd, opts)), opts);
+const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void) =>
+  withGitHubRetry(
+    () =>
+      cmd[0] === "git"
+        ? cacheGit(cmd, opts, () => {
+            try {
+              guard?.();
+            } catch (cause) {
+              throw new GitHubGuardError("Push guard refused", { cause });
+            }
+          })
+        : sh(cmd, opts),
+    opts,
+  ).catch((error) => {
+    if (error instanceof GitHubGuardError) throw error.cause;
+    throw error;
+  });
 
 export function slugify(text: string, max = 40): string {
   return (
@@ -1321,13 +1336,11 @@ export async function pushExistingBranch(
       signal,
     });
     if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-    guard?.();
-    await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, url, `${head}:${ref}`], {
-      cwd: transport,
-      timeoutMs: 300_000,
-      signal,
-      budget,
-    });
+    await remoteSh(
+      [...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, url, `${head}:${ref}`],
+      { cwd: transport, timeoutMs: 300_000, signal, budget },
+      guard,
+    );
   });
 }
 
@@ -1466,7 +1479,7 @@ export async function mergePullRequest(
         try {
           opts.guard?.();
         } catch (cause) {
-          throw new MergeGuardError("Merge guard refused", { cause });
+          throw new GitHubGuardError("Merge guard refused", { cause });
         }
         return sh(cmd, { cwd, signal, stdin: body }).then(
           () => "ok" as const,
@@ -1480,7 +1493,7 @@ export async function mergePullRequest(
       },
       { budget, signal },
     ).catch((e) => {
-      if (e instanceof MergeGuardError) throw e.cause;
+      if (e instanceof GitHubGuardError) throw e.cause;
       if (signal?.aborted) throw e;
       return e instanceof GitHubUnavailableError ? ("unavailable" as const) : ("failed" as const);
     });

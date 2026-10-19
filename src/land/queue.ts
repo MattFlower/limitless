@@ -839,10 +839,14 @@ export class LandQueue {
     const legacy = `land-${entry.id}`;
     mkdirSync(this.deps.paths.work, { recursive: true });
     for (const name of readdirSync(this.deps.paths.work)) {
-      const attempt = name.startsWith(`${legacy}-`) ? name.slice(legacy.length + 1) : "";
-      if (name !== legacy && (!/^\d+$/.test(attempt) || Number(attempt) >= entry.attempts)) continue;
+      const base = name.endsWith("-base");
+      const checkout = base ? name.slice(0, -5) : name;
+      const attempt = checkout.startsWith(`${legacy}-`) ? checkout.slice(legacy.length + 1) : "";
+      if (checkout !== legacy && (!/^\d+$/.test(attempt) || Number(attempt) >= entry.attempts)) continue;
       this.assertClaim(entry.id);
-      await this.discard(repo, join(this.deps.paths.work, name));
+      const stale = join(this.deps.paths.work, name);
+      if (base) rmSync(stale, { recursive: true, force: true });
+      else await this.discard(repo, stale);
     }
     this.assertClaim(entry.id);
     try {

@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Repo } from "../src/core/types.ts";
+import * as command from "../src/git/command.ts";
 import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
+import * as hardening from "../src/git/hardening.ts";
 import {
   githubRetry,
   mergePullRequest,
@@ -11,6 +13,7 @@ import {
   pushExistingBranch,
   remoteBranchSha,
 } from "../src/git/repos.ts";
+import * as proc from "../src/util/proc.ts";
 import { CommandError, sh } from "../src/util/proc.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -62,6 +65,69 @@ test("pushes verified descendant only to existing head and refuses moved head", 
   expect((await git(work, "ls-remote", bare, "refs/heads/main")).stdout).toBe("");
   await expect(pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base)).rejects.toThrow("moved");
 });
+
+test.each([false, true])(
+  "push guard runs after asynchronous preparation and never retries refusal (transport-like error: %s)",
+  async (transient) => {
+    const base = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const cacheGit = command.cacheGit;
+    const harden = hardening.harden;
+    const execute = proc.sh;
+    let preparingPush = false;
+    let owned = true;
+    let guards = 0;
+    const refused = transient
+      ? new CommandError("claim lost", 1, "", "HTTP 502", false)
+      : new Error("claim lost");
+    const boundary = spyOn(command, "cacheGit").mockImplementation((...args) => {
+      if (args[0].includes("push")) preparingPush = true;
+      return cacheGit(...args);
+    });
+    const preparation = spyOn(hardening, "harden").mockImplementation(async (...args) => {
+      const result = await harden(...args);
+      if (preparingPush) {
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    const transport = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
+      if (cmd.includes("push")) throw new Error("unexpected push");
+      return execute(cmd, opts);
+    });
+    const result = pushExistingBranch(
+      repo,
+      work,
+      "dependabot/npm/pkg-2",
+      base,
+      undefined,
+      undefined,
+      base,
+      () => {
+        guards++;
+        if (!owned) throw refused;
+      },
+    );
+    // Attach a rejection handler before releasing preparation.
+    const outcome = result.catch((error: unknown) => error);
+    try {
+      await entered.promise;
+      owned = false;
+      release.resolve();
+      expect(await outcome).toBe(refused);
+      expect(guards).toBe(1);
+      expect(transport.mock.calls.filter(([cmd]) => cmd.includes("push"))).toEqual([]);
+    } finally {
+      release.resolve();
+      await outcome;
+      boundary.mockRestore();
+      preparation.mockRestore();
+      transport.mockRestore();
+    }
+  },
+);
 
 test.each(["remote", "existing", "local"])("%s delivery never follows tags or notes", async (kind) => {
   const base = (await git(work, "rev-parse", "HEAD")).stdout.trim();

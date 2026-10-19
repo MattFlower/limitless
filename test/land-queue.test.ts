@@ -29,7 +29,8 @@ import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import { markReport, reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { registerCredential, sh } from "../src/util/proc.ts";
+import * as proc from "../src/util/proc.ts";
+import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -2884,6 +2885,119 @@ function claimSnapshot(entry: LandEntry) {
     events: store.listEvents(entry.runId),
   };
 }
+
+test("a reclaim during push retry backoff prevents the next push and all publication", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  await advanceBase();
+  let pushes = 0;
+  let release: (() => void) | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const set = globalThis.setTimeout;
+  const execute = proc.sh;
+  const transport = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
+    if (cmd.includes("push")) {
+      pushes++;
+      return Promise.reject(
+        new CommandError("push unavailable", 1, "", pushes === 1 ? "HTTP 502" : "rejected", false),
+      );
+    }
+    return execute(cmd, opts);
+  });
+  const pause = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: unknown[]) => void,
+    ms?: number,
+    ...args: unknown[]
+  ) => {
+    if (pushes === 1 && ms === repos.githubRetry.baseDelayMs && !release) {
+      // Keep the native timer handle for clearTimeout, but release backoff explicitly.
+      timer = set(() => {}, 60_000);
+      release = () => callback(...args);
+      return timer;
+    }
+    return set(callback, ms, ...args);
+  }) as typeof setTimeout);
+  const q = queue({ gateExecutor: fakeLandGates((req) => retryRun(req)).executor });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitWithoutClock(() => !!release, 15_000);
+    expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    const before = claimSnapshot(entry);
+    const now = clock.now();
+    release?.();
+    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    expect(pushes).toBe(1);
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(claimSnapshot(entry)).toEqual(before);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(clock.now()).toBe(now);
+  } finally {
+    release?.();
+    if (timer) clearTimeout(timer);
+    await q.stop();
+    pause.mockRestore();
+    transport.mockRestore();
+  }
+});
+
+test("a restarted land removes only older base exports as plain directories before checkout", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "checking", attempts: 2 });
+  const prefix = `land-${entry.id}`;
+  const abandoned = [prefix, `${prefix}-1`, `${prefix}-base`, `${prefix}-1-base`, `${prefix}-2-base`];
+  const preserved = [
+    `${prefix}-3-base`,
+    `${prefix}-4-base`,
+    `${prefix}-4`,
+    `land-${entry.id + 1}-1-base`,
+    `${prefix}-other-base`,
+    `${prefix}-2-base-extra`,
+    `${prefix}-2-base.git-paths`,
+  ];
+  for (const name of [...abandoned, ...preserved]) {
+    mkdirSync(join(paths.work, name));
+    writeFileSync(join(paths.work, name, "sentinel"), name);
+  }
+  let inspected = false;
+  const add = repos.addDetachedWorktree;
+  const checkout = spyOn(repos, "addDetachedWorktree").mockImplementation((...args) => {
+    expect(args[2]).toBe(join(paths.work, `${prefix}-3`));
+    for (const name of abandoned) expect(existsSync(join(paths.work, name))).toBe(false);
+    for (const name of preserved) expect(readFileSync(join(paths.work, name, "sentinel"), "utf8")).toBe(name);
+    inspected = true;
+    return add(...args);
+  });
+  const removal = spyOn(repos, "removeWorktree");
+  const q = queue({ gateExecutor: fakeLandGates((req) => retryRun(req)).executor });
+  try {
+    await settle();
+    await q.stop();
+    expect(inspected).toBe(true);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", attempts: 3 });
+    expect(removal.mock.calls.map(([, , cwd]) => cwd).sort()).toEqual(
+      [prefix, `${prefix}-1`, `${prefix}-3`].map((name) => join(paths.work, name)).sort(),
+    );
+    for (const name of preserved.filter((name) => name !== `${prefix}-3-base`))
+      expect(readFileSync(join(paths.work, name, "sentinel"), "utf8")).toBe(name);
+  } finally {
+    await q.stop();
+    checkout.mockRestore();
+    removal.mockRestore();
+  }
+});
 
 test("a reclaim during the pre-merge lookup prevents every merge command", async () => {
   const pr = delivered(1, "pr-1");
