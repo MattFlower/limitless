@@ -71,7 +71,7 @@ export interface RunState {
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   /** A review round's chosen base tip, saved before it is merged into the PR branch. */
   reviewBaseSha?: string;
-  /** Review-base resolution pending, or the checked merge used as the findings baseline. */
+  /** Checked merge used as findings baseline; while pending, needsHumanReason blocks older engines. */
   reviewResolution?: { sha?: string };
   conflictFiles?: string[];
   verdictCommentPosted?: boolean;

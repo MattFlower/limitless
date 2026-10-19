@@ -178,9 +178,14 @@ export async function executeRun(
   );
 }
 
+const REVIEW_RESOLUTION_BLOCK = "Review-base resolution requires a compatible engine to implement findings";
+
 async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
   const { deps, run } = ctx;
   const runId = run.id;
+  // Upgrade pending checkpoints from before rollback protection, before any state/run write.
+  if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
+    ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
@@ -196,7 +201,14 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
-    if (ctx.state.needsHumanReason)
+    if (
+      ctx.state.needsHumanReason &&
+      !(
+        ctx.state.needsHumanReason === REVIEW_RESOLUTION_BLOCK &&
+        ctx.state.reviewResolution &&
+        !ctx.state.reviewResolution.sha
+      )
+    )
       throw new NeedsHumanError(
         ctx.state.needsHumanReason.startsWith(ENVIRONMENT_BLOCKED) &&
           ctx.state.terminalReason &&
@@ -683,6 +695,7 @@ async function mergeReviewBase(
       await mergeGit(cwd, ["merge", "--abort"]);
       ctx.state.conflictFiles = conflicts;
       ctx.state.reviewResolution = {};
+      ctx.state.needsHumanReason = REVIEW_RESOLUTION_BLOCK;
       await ctx.save();
       return null;
     }
@@ -901,10 +914,12 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     const review = reviewRound(ctx);
     const tip = ctx.state.reviewBaseSha;
     if (!review || !tip) throw new Error("Missing review-base resolution revisions");
+    await ctx.save("review-resolution-start");
     if (ctx.state.conflictRound === undefined)
       await mergeForDelivery(ctx, ctx.state.worktreePath as string, tip, review.reviewedSha);
     if (!(await oneRound(ctx, ctx.state.round, null)))
       throw new NeedsHumanError(`Conflict resolution rejected:\n${ctx.state.feedback ?? ""}`);
+    await ctx.save("review-resolution-checked");
     const sha = await headSha(ctx.state.worktreePath as string);
     ctx.state.reviewResolution.sha = sha;
     ctx.state.conflictRound = undefined;
@@ -913,6 +928,9 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     ctx.state.preRebaseGates = undefined;
     ctx.state.feedback = null;
     ctx.state.round++;
+    // Clear the legacy block with the findings round and its baseline in one database write.
+    // The old engine must implement that round; resolution's cached checks belong to the prior one.
+    ctx.state.needsHumanReason = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: sha }, ctx.state);
     await ctx.save("review-resolution-complete");
   }

@@ -6,13 +6,14 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { ReviewFinding, Run, RunDetail } from "../src/core/types.ts";
 import { checkPrivateText } from "../src/gates/private.ts";
+import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
-import type { FaultPlan } from "../src/pipeline/faults.ts";
+import { type FaultPlan, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { ENVIRONMENT_BLOCKED } from "../src/pipeline/verification.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -917,9 +918,49 @@ test.each(["audit", "review", "empty"] as const)(
   },
 );
 
-test.each(["resolution", "findings"] as const)(
-  "a review restart after %s preserves completed work and delivers once",
-  async (checkpoint) => {
+const resolutionRestarts: { checkpoint: string; faults: FaultPlan; implementations: number }[] = [
+  {
+    checkpoint: "pending",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-start" } },
+    implementations: 0,
+  },
+  { checkpoint: "ready", faults: {}, implementations: 1 },
+  {
+    checkpoint: "merge",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "implementation-committed" } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "checks",
+    faults: { "stage:review:before": { action: "kill", when: (c) => c.round === 1 } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "checked",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-checked" } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "resolution",
+    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-complete" } },
+    implementations: 1,
+  },
+  {
+    checkpoint: "findings",
+    faults: { "stage:implement:after": { action: "kill", when: (c) => c.round === 2 } },
+    implementations: 2,
+  },
+];
+
+test.each([
+  ...resolutionRestarts,
+  ...resolutionRestarts
+    .filter((entry) => ["ready", "checked"].includes(entry.checkpoint))
+    .map((entry) => ({ ...entry, checkpoint: `prior-${entry.checkpoint}` })),
+])(
+  "a review restart at $checkpoint preserves completed work and delivers once",
+  async ({ checkpoint, faults, implementations }) => {
+    const boundary = checkpoint.replace("prior-", "");
     const original = await delivered();
     const reviewed = await remoteHead();
     const tip = await push("main", "feature.txt", "conflicting base\n");
@@ -928,39 +969,127 @@ test.each(["resolution", "findings"] as const)(
         ? { "feature.txt": "feature\nconflicting base\n" }
         : { "fix.txt": "handles empty input\n" };
     const id = (await changes(original.id)).body.round?.id as string;
-    factory.deps.faults =
-      checkpoint === "resolution"
-        ? { "store:save": { action: "kill", when: (c) => c.checkpoint === "review-resolution-complete" } }
-        : { "stage:implement:after": { action: "kill", when: (c) => c.round === 2 } };
+    factory.deps.faults = { ...faults };
+    // Kill immediately after the durable ready write, before completeMerge can consume the edits.
+    const save = factory.store.setRunState.bind(factory.store);
+    const snapshots: RunState[] = [];
+    const saving = spyOn(factory.store, "setRunState").mockImplementation((runId, state) => {
+      save(runId, state);
+      const persisted = factory.store.getRunState<RunState>(runId);
+      if (runId !== id || !persisted) return;
+      snapshots.push(persisted);
+      if (
+        boundary === "ready" &&
+        persisted.implementationReadyRound === 1 &&
+        persisted.implementedRound !== 1
+      )
+        throw new SimulatedTermination("terminated after implementation-ready");
+    });
+    const update = factory.store.updateRun.bind(factory.store);
+    const updating = spyOn(factory.store, "updateRun").mockImplementation((...args) => {
+      const result = update(...args);
+      if (args[0] === id) {
+        const state = factory.store.getRunState<RunState>(id);
+        if (state) snapshots.push(state);
+      }
+      return result;
+    });
+    const completing = spyOn(merges, "completeMerge");
     expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+    saving.mockRestore();
+    updating.mockRestore();
     expect(await remoteHead()).toBe(reviewed);
+    for (const state of snapshots) {
+      if (state.reviewResolution && !state.reviewResolution.sha) expect(state.needsHumanReason).toBeTruthy();
+    }
     const saved = factory.store.getRunState<RunState>(id);
-    const merge = saved?.reviewResolution?.sha;
-    const committed = factory.store.getRun(id)?.headSha;
-    if (!merge) throw new Error("missing resolution checkpoint");
+    if (!saved?.worktreePath) throw new Error("missing review worktree");
+    const cwd = saved.worktreePath;
+    const local = async (...args: string[]) => (await sh(["git", ...args], { cwd })).stdout.trim();
+    const committed = await local("rev-parse", "HEAD");
+    const merge = saved.reviewResolution?.sha ?? (committed !== reviewed ? committed : undefined);
+    const completedMerges = completing.mock.calls.length;
     const resolutionChecks = () =>
       factory.store
         .listStages(id)
-        .filter((s) => s.round === 1 && ["gates", "audit", "review"].includes(s.name));
+        .filter(
+          (s) => s.round === 1 && s.status === "succeeded" && ["gates", "audit", "review"].includes(s.name),
+        );
     const checked = resolutionChecks();
-    expect(saved?.reviewBaseSha).toBe(tip);
-    expect(implementPrompts).toHaveLength(checkpoint === "resolution" ? 1 : 2);
+    expect(saved.reviewBaseSha).toBe(tip);
+    expect(implementPrompts).toHaveLength(implementations);
+    if (boundary === "ready") {
+      expect(saved.implementationReadyRound).toBe(1);
+      expect(await local("diff", "--", "feature.txt")).toContain("conflicting base");
+      expect(committed).toBe(reviewed);
+      expect(completedMerges).toBe(0);
+    }
+    expect(pr.comments).toHaveLength(0);
+    expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(0);
+    if (!saved.reviewResolution?.sha) {
+      // The previous engine checks needsHumanReason before buildLoop. For an authorized review
+      // round its failure path never pushes. Even cached quick approval cannot bypass this block.
+      expect(saved.needsHumanReason).toBeTruthy();
+      if (boundary === "checked") {
+        expect(saved.implementedRound).toBe(saved.conflictRound);
+        expect(saved.completedChecks?.values.review).toMatchObject({ verdict: "approve" });
+        expect(saved.lastVerifiedSha).toBe(merge);
+        expect(checked.map((s) => s.name)).toEqual(["gates", "audit", "review"]);
+      }
+    } else if (boundary === "resolution") {
+      // Once the block is removed, the previous engine must implement findings before checks.
+      expect(saved.needsHumanReason).toBeUndefined();
+      expect(saved.implementedRound).not.toBe(saved.round);
+      expect(saved.completedChecks?.round).not.toBe(saved.round);
+    }
+    if (checkpoint.startsWith("prior-")) {
+      // The branch's original format saved this resolution evidence without a rollback block.
+      delete saved.needsHumanReason;
+      factory.store.setRunState(id, saved);
+    }
     await push("main", "later.txt", "base advanced during restart\n");
     await restart();
+    const resumeUpdate = factory.store.updateRun.bind(factory.store);
+    const resumedWrites: RunState[] = [];
+    spyOn(factory.store, "updateRun").mockImplementation((...args) => {
+      const result = resumeUpdate(...args);
+      if (args[0] === id && args[2] !== undefined) {
+        const state = factory.store.getRunState<RunState>(id);
+        if (state) resumedWrites.push(state);
+      }
+      return result;
+    });
     const pushed = spyOn(repos, "pushExistingBranch");
     const round = await settle(id);
     expect(round.status).toBe("succeeded");
+    expect(resumedWrites.length).toBeGreaterThan(0);
     const state = factory.store.getRunState<RunState>(id);
-    expect(state?.reviewResolution?.sha).toBe(merge);
+    const finalMerge = state?.reviewResolution?.sha;
+    if (!finalMerge) throw new Error("missing completed resolution");
+    if (merge) expect(finalMerge).toBe(merge);
     expect(state?.reviewBaseSha).toBe(tip);
-    expect(state?.reviewHistory?.map((r) => r.sha)).toEqual([merge, await remoteHead()]);
-    expect(resolutionChecks()).toEqual(checked);
-    if (checkpoint === "findings") {
-      if (!committed) throw new Error("missing findings commit");
-      expect(await remoteHead()).toBe(committed);
+    for (const persisted of resumedWrites) {
+      if (persisted.reviewResolution && !persisted.reviewResolution.sha)
+        expect(persisted.needsHumanReason).toBeTruthy();
     }
+    expect(state?.reviewHistory?.map((r) => r.sha)).toEqual([finalMerge, await remoteHead()]);
+    expect(resolutionChecks()).toHaveLength(3);
+    expect(resolutionChecks().filter((s) => checked.some((old) => old.id === s.id))).toEqual(checked);
+    // A completed merge is validated on resume, never committed again.
+    expect(completing).toHaveBeenCalledTimes(merge ? completedMerges : 1);
+    if (boundary === "findings") expect(await remoteHead()).toBe(committed);
+    const remoteGit = async (...args: string[]) =>
+      (await sh(["git", ...args], { cwd: remote })).stdout.trim();
+    expect(await remoteGit("rev-list", "--parents", "-n", "1", finalMerge)).toBe(
+      `${finalMerge} ${reviewed} ${tip}`,
+    );
+    expect(await remoteGit("rev-parse", `${await remoteHead()}^`)).toBe(finalMerge);
+    expect(await remoteGit("show", `${await remoteHead()}:feature.txt`)).toBe("feature\nconflicting base");
+    expect(await remoteGit("show", `${await remoteHead()}:fix.txt`)).toBe("handles empty input");
     expect(implementPrompts).toHaveLength(2);
     expect(pushed).toHaveBeenCalledTimes(1);
+    expect(pr.comments).toHaveLength(0);
+    expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
   },
 );
 
