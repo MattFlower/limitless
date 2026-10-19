@@ -364,6 +364,32 @@ export class LandQueue {
       if (headMoved(fresh.headRefOid ?? "", entry.pushedSha, entry.approvedSha))
         throw new LandBlocked("head moved after approval");
     }
+    let fresh: { url: string; state: string; isDraft: boolean; headRefOid?: string | null };
+    try {
+      const json = await (this.deps.gh ?? runGh)(
+        ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid"],
+        signal,
+      );
+      fresh = z
+        .object({
+          url: z.literal(entry.prUrl),
+          state: z.enum(["OPEN", "CLOSED", "MERGED"]),
+          isDraft: z.boolean(),
+          headRefOid: z.string().nullish(),
+        })
+        .parse(JSON.parse(String(json)));
+    } catch (error) {
+      throw new LandBlocked(`cannot inspect current GitHub PR metadata: ${String(error)}`);
+    }
+    signal.throwIfAborted();
+    this.assertClaim(entry.id);
+    if (fresh.state === "CLOSED") throw new LandBlocked("PR was closed without merging");
+    if (fresh.state !== "OPEN") throw new LandBlocked("PR is already merged");
+    // Approval does not publish a draft as ready for review.
+    if (fresh.isDraft) throw new LandBlocked("PR is a draft");
+    if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
+    if (headMoved(fresh.headRefOid, entry.pushedSha ?? entry.approvedSha, entry.approvedSha))
+      throw new LandBlocked("head moved after approval");
     if (!entry.baseBranch || entry.baseBranch === entry.headBranch) {
       const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);
       signal.throwIfAborted();
@@ -709,6 +735,7 @@ export class LandQueue {
     if (!merging) return;
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.
+    let failure: string | undefined;
     const outcome = await mergePullRequest(
       entry.prUrl,
       cwd,
@@ -721,13 +748,16 @@ export class LandQueue {
         body: this.reportBody(run),
         auto: false,
         guard: () => this.assertClaim(entry.id),
+        onFailure: (reason) => {
+          failure = reason;
+        },
       },
     );
     signal.throwIfAborted();
     this.assertClaim(entry.id);
     if (outcome !== "merged") {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
-      throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
+      throw new LandBlocked(failure ?? (outcome === "unavailable" ? "GitHub unavailable" : "merge failed"));
     }
     this.landed(entry, run, sha, null);
     const observed = await this.mergeMetadata(entry.prUrl, signal);
@@ -905,6 +935,7 @@ export class LandQueue {
   }
 
   private block(id: number, reason: string, conflict = false): void {
+    reason = redactCredentials(reason).slice(0, 2000);
     const current = this.store.getLandEntry(id);
     if (!current || !this.isActive(current)) return;
     this.log(`[land] ${id} blocked: ${reason}`);

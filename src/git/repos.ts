@@ -13,7 +13,7 @@ import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
-import { CommandError, sh } from "../util/proc.ts";
+import { CommandError, redactCredentials, sh } from "../util/proc.ts";
 import {
   cacheGit,
   emptyTreeId,
@@ -99,7 +99,7 @@ export async function withGitHubRetry<T>(
       if (!(isTransient(error) || error instanceof RetryableError) || opts.signal?.aborted) throw error;
       const delay = githubRetry.baseDelayMs * 3 ** (attempt - 1);
       if (attempt >= githubRetry.attempts || delay >= budget.leftMs)
-        throw new GitHubUnavailableError(`GitHub unavailable: ${(error as Error).message}`);
+        throw new GitHubUnavailableError(`GitHub unavailable: ${(error as Error).message}`, { cause: error });
       await charged(() => pause(delay, opts.signal));
     }
   }
@@ -1436,7 +1436,13 @@ export async function mergePullRequest(
   signal?: AbortSignal,
   budget?: GitHubBudget,
   entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
-  opts: { body?: string; title?: string; auto?: boolean; guard?: () => void } = {},
+  opts: {
+    body?: string;
+    title?: string;
+    auto?: boolean;
+    guard?: () => void;
+    onFailure?: (reason: string) => void;
+  } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
@@ -1495,6 +1501,10 @@ export async function mergePullRequest(
     ).catch((e) => {
       if (e instanceof GitHubGuardError) throw e.cause;
       if (signal?.aborted) throw e;
+      const cause = e instanceof GitHubUnavailableError ? (e.cause ?? e) : e;
+      const detail =
+        cause instanceof CommandError ? cause.stderr || cause.stdout || cause.message : String(cause);
+      opts.onFailure?.(redactCredentials(`merge failed: ${detail}`).slice(0, 2000));
       return e instanceof GitHubUnavailableError ? ("unavailable" as const) : ("failed" as const);
     });
   const now = await merge([]);
