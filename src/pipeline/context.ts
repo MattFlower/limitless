@@ -123,6 +123,8 @@ export interface RunState {
   preRebaseGates?: GateComparison[];
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;
+  /** Completed, gated delivery merges; scoped to the run and review that authorized them. */
+  deliveryMerges?: { runId: string; reviewedSha: string; sha: string; head: string; base: string }[];
   /** Commit that last passed verify, or an approving quick review after deterministic checks. */
   lastVerifiedSha?: string;
   /** Passing evidence retained if a later resolution round fails; panel runs keep the review history with it. */

@@ -1965,17 +1965,39 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
     throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
   if (head === expected) return;
   if (environmentBlockedRound(ctx)) throw new DeliveryHeadError(reason);
-  // A completed clean merge records both run SHAs only after validation and post-merge gates.
-  const base = ctx.state.pendingRebaseSha ?? (head === ctx.run.headSha ? ctx.run.baseSha : null);
-  if (base && (!ctx.state.pendingRebaseSha || ctx.state.preRebaseHead === expected)) {
+  for (let current = head; current !== expected; ) {
+    const recorded = ctx.state.deliveryMerges?.find((m) => m.sha === current);
+    if (recorded && (recorded.runId !== ctx.run.id || recorded.reviewedSha !== expected))
+      throw new DeliveryHeadError(reason);
+    const pending = current === head ? ctx.state.pendingRebaseSha : undefined;
+    // Legacy completed merges recorded their authorization in the run's head/base pair.
+    const base = recorded?.base ?? pending ?? (current === ctx.run.headSha ? ctx.run.baseSha : null);
+    const before = recorded?.head ?? (pending ? ctx.state.preRebaseHead : expected);
+    if (!base || !before) throw new DeliveryHeadError(reason);
     try {
-      await validateMerge(ctx.state.worktreePath as string, expected, base);
-      return; // Pending merges still go through post-merge gates before pushing.
+      const sha = await validateMerge(
+        ctx.state.worktreePath as string,
+        before,
+        base,
+        current === head && !pending ? "HEAD" : current,
+      );
+      if (sha !== current) throw new DeliveryHeadError(reason);
     } catch {
       ctx.checkCancelled();
+      throw new DeliveryHeadError(reason);
     }
+    if (!recorded && !pending) {
+      ctx.state.deliveryMerges ??= [];
+      ctx.state.deliveryMerges.push({
+        runId: ctx.run.id,
+        reviewedSha: expected,
+        sha: current,
+        head: before,
+        base,
+      });
+    }
+    current = before; // Pending merges still go through post-merge gates before pushing.
   }
-  throw new DeliveryHeadError(reason);
 }
 
 async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
@@ -2631,7 +2653,17 @@ async function mergeForDelivery(
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
     throw new NeedsHumanError(`post-merge gates regressed after merging onto ${fetched.slice(0, 8)}`);
   }
-  await validateMerge(cwd, before, fetched);
+  const merged = await validateMerge(cwd, before, fetched);
+  if (ctx.state.reviewedSha) {
+    ctx.state.deliveryMerges ??= [];
+    ctx.state.deliveryMerges.push({
+      runId: ctx.run.id,
+      reviewedSha: ctx.state.reviewedSha,
+      sha: merged,
+      head: before,
+      base: fetched,
+    });
+  }
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
