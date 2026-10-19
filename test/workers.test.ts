@@ -49,6 +49,7 @@ import { redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, pairingCode } from "../src/workers/protocol.ts";
 import { certificate, workerRequest } from "../src/workers/tls.ts";
+import { updateWorker } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -706,7 +707,10 @@ test.each(["releaseSha", "bunVersion"] as const)(
         (await call(`/worker/jobs/${id}/${action}`, action === "bundle" ? undefined : {}, wrong)).status,
       ).toBe(409);
     workers.cancel(id);
-    expect((await call("/worker/heartbeat", caps([id]), right)).json()).toEqual({ cancelled: [id] });
+    expect((await call("/worker/heartbeat", caps([id]), right)).json()).toEqual({
+      cancelled: [id],
+      releaseSha,
+    });
   },
   30_000,
 );
@@ -718,7 +722,10 @@ test("heartbeats record capabilities, cancel unknown jobs and become stale after
   const token = await paired();
   expect(workers.list()[0]?.state).toBe("offline");
   const id = crypto.randomUUID();
-  expect((await call("/worker/heartbeat", caps([id]), token)).json()).toEqual({ cancelled: [id] });
+  expect((await call("/worker/heartbeat", caps([id]), token)).json()).toEqual({
+    cancelled: [id],
+    releaseSha,
+  });
   expect(workers.list()[0]).toMatchObject({
     state: "available",
     lastHeartbeatAt: now,
@@ -1392,7 +1399,10 @@ test("expired leases retry once on a different worker then fall back locally wit
   now += 61;
   workers.sweep();
   expect(workers.job(handle.id)).toMatchObject({ state: "queued", attempt: 2, worker: null });
-  expect((await call("/worker/heartbeat", caps([handle.id]), a)).json()).toEqual({ cancelled: [handle.id] });
+  expect((await call("/worker/heartbeat", caps([handle.id]), a)).json()).toEqual({
+    cancelled: [handle.id],
+    releaseSha,
+  });
   expect((await call("/worker/lease", {}, a)).json()).toEqual({ job: null });
   const second = (await call("/worker/lease", {}, b)).json() as { job: { id: string } };
   expect(second.job.id).toBe(handle.id);
@@ -1616,6 +1626,7 @@ test("cancellation is durable and is returned by both lease and heartbeat replie
   });
   expect((await call("/worker/heartbeat", caps([handle.id]), token)).json()).toEqual({
     cancelled: [handle.id],
+    releaseSha,
   });
   expect((await call(`/worker/jobs/${handle.id}/result`, {}, token)).status).toBe(409);
 }, 30_000);
@@ -1670,7 +1681,10 @@ test("heartbeats renew held leases, while a disconnected worker loses them befor
     worker: null,
     failure_reason: "Worker disconnected",
   });
-  expect((await call("/worker/heartbeat", caps([id]), token)).json()).toEqual({ cancelled: [id] });
+  expect((await call("/worker/heartbeat", caps([id]), token)).json()).toEqual({
+    cancelled: [id],
+    releaseSha,
+  });
 }, 30_000);
 
 test("cancelling execution aborts the worker's running gate on a held-job reply", async () => {
@@ -1812,7 +1826,7 @@ test("registering a credential after dispatch preserves the active lease and its
   registerCredential("ACTIVE_LEASE_TEST", secret);
   workers.sweep();
   expect(workers.job(id)).toEqual(leased);
-  expect(workers.heartbeat(worker, caps([id]))).toEqual({ cancelled: [] });
+  expect(workers.heartbeat(worker, caps([id]))).toEqual({ cancelled: [], releaseSha });
   expect(workers.holds(id, worker.name)).toMatchObject({ state: "leased", attempt: 1 });
   const run: GateRun = { setupOk: true, setup: [], checks: [] };
   workers.complete(id, run);
@@ -2261,3 +2275,282 @@ test("pre-deadline leases gain one durable deadline without extending it on late
   resumed.heartbeat(w, caps([id]));
   expect(resumed.job(id)?.attempt_deadline_at).toBe(expected);
 }, 30_000);
+
+test("a release change drains reporting and cleanup and rejects an in-flight lease before re-exec", async () => {
+  await listen();
+  const req = await request(true);
+  req.gates.setup = [];
+  req.gates.checks = [{ name: "pass", run: "true" }];
+  const first = workers.enqueue(req),
+    second = workers.enqueue(req),
+    target = "a".repeat(40);
+  const started = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>(),
+    cleanup = Promise.withResolvers<void>(),
+    reported = Promise.withResolvers<void>(),
+    late = Promise.withResolvers<void>(),
+    releaseLease = Promise.withResolvers<void>(),
+    observed = Promise.withResolvers<void>(),
+    replaced = Promise.withResolvers<void>();
+  let lock: Promise<void> | undefined,
+    captured = false,
+    polls = 0;
+  const commands: string[][] = [],
+    bundles: string[] = [];
+  const worker = await loop({
+    confinement: {
+      ...fakeConfinement,
+      async verify() {
+        const cache = join(home, "remote", "repos", `${encodeURIComponent(req.repo)}.git`);
+        lock = withRepoLock(cache, () => cleanup.promise);
+        started.resolve();
+        await finish.promise;
+      },
+    },
+    async request(...args) {
+      const path = args[1];
+      if (path.endsWith("/bundle")) bundles.push(path);
+      const reply = await workerRequest(...args);
+      if (path.endsWith("/result")) reported.resolve();
+      if (path === "/worker/lease" && ++polls === 2) {
+        captured = true;
+        late.resolve();
+        await releaseLease.promise;
+      }
+      if (path === "/worker/heartbeat" && captured) {
+        if ((args[2] as Capabilities).freeSlots === 0) observed.resolve();
+        return { ...reply, json: () => ({ ...(reply.json() as object), releaseSha: target }) };
+      }
+      return reply;
+    },
+    update: {
+      async command(args) {
+        expect(readdirSync(join(home, "remote", "work"))).toEqual([]);
+        expect(workers.job(first)?.state).toBe("done");
+        expect(workers.job(second)?.state).toBe("queued");
+        commands.push(args);
+        return { stdout: args.includes(`${target}^{commit}`) ? target : releaseSha, stderr: "", exitCode: 0 };
+      },
+      exec(file, args, env) {
+        expect(file).toBe(process.execPath);
+        expect(args).toEqual([process.execPath, ...process.execArgv, ...process.argv.slice(1)]);
+        expect(env).toBe(process.env);
+        replaced.resolve();
+      },
+    },
+  });
+  try {
+    await started.promise;
+    await late.promise;
+    await observed.promise;
+    expect(commands).toEqual([]);
+    releaseLease.resolve();
+    finish.resolve();
+    await reported.promise;
+    expect(commands).toEqual([]);
+    cleanup.resolve();
+    await replaced.promise;
+    expect(commands).toEqual([
+      ["git", "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+      ["git", "rev-parse", "--verify", `${target}^{commit}`],
+      ["git", "merge-base", "--is-ancestor", target, "refs/remotes/origin/main"],
+      ["git", "rev-parse", "HEAD"],
+      ["git", "checkout", "--detach", target],
+      [process.execPath, "install", "--frozen-lockfile"],
+    ]);
+    expect(bundles).toEqual([`/worker/jobs/${first}/bundle`]);
+  } finally {
+    finish.resolve();
+    cleanup.resolve();
+    releaseLease.resolve();
+    await worker.stop();
+    await lock;
+  }
+}, 30_000);
+
+test.each(["malformed", "ancestry", "fetch", "install", "exec", "restore"])(
+  "a failed worker update (%s) remains blocked and heartbeats a durable redacted warning",
+  async (failure) => {
+    await listen();
+    const target = failure === "malformed" ? "main" : "a".repeat(40);
+    const secret = `update-credential-${failure}-632`;
+    registerCredential("WORKER_UPDATE_TEST", secret);
+    let head = releaseSha,
+      leases = 0,
+      execs = 0,
+      warningBeats = 0;
+    const commands: string[][] = [];
+    let transmittedWarning = "";
+    const worker = await loop({
+      async request(...args) {
+        if (args[1] === "/worker/lease") leases++;
+        const reply = await workerRequest(...args);
+        if (args[1] === "/worker/heartbeat") {
+          const body = args[2] as Capabilities;
+          if (body.updateWarning) {
+            transmittedWarning = body.updateWarning;
+            expect(body.updateWarning).not.toContain(secret);
+            expect(body.releaseSha).toBe(releaseSha);
+            expect(body.freeSlots).toBe(0);
+            warningBeats++;
+          }
+          return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
+        }
+        return reply;
+      },
+      update: {
+        async command(args) {
+          commands.push(args);
+          if (
+            (failure === "fetch" && args[1] === "fetch") ||
+            (failure === "ancestry" && args[1] === "merge-base") ||
+            (["install", "restore"].includes(failure) && args[1] === "install") ||
+            (failure === "restore" && args[1] === "checkout" && args[3] === releaseSha)
+          )
+            throw new Error(`injected ${failure}: ${secret}`);
+          if (args[1] === "checkout") head = args[3] ?? "";
+          return { stdout: args.includes(`${target}^{commit}`) ? target : head, stderr: "", exitCode: 0 };
+        },
+        exec() {
+          execs++;
+          throw new Error(`exec failed: ${secret}`);
+        },
+      },
+    });
+    try {
+      await until(() => warningBeats >= 2);
+      expect(leases).toBe(0);
+      expect(execs).toBe(failure === "exec" ? 1 : 0);
+      expect(head).toBe(failure === "restore" ? target : releaseSha);
+      if (["malformed", "ancestry", "fetch"].includes(failure))
+        expect(commands.some((args) => ["checkout", "install"].includes(args[1] ?? ""))).toBe(false);
+      const warning = workers.list()[0]?.setupWarning;
+      expect(transmittedWarning).toContain("Worker update failed:");
+      expect(warning).toBe(
+        ["malformed", "ancestry"].includes(failure) ? transmittedWarning : "[withheld: private text]",
+      );
+      expect(warning).not.toContain(secret);
+      if (failure === "restore") expect(transmittedWarning).toContain("restoring original HEAD failed");
+      await worker.stop();
+      // An ordinary heartbeat must not clear the unresolved warning.
+      const row = workers.worker("loop-runner");
+      if (!row) throw new Error("Missing worker");
+      workers.heartbeat(row, caps());
+      store.close();
+      store = new Store(cfg.paths.db);
+      workers = new WorkerStore(store, releaseSha);
+      expect(workers.list()[0]?.setupWarning).toBe(warning);
+    } finally {
+      await worker.stop();
+    }
+  },
+  30_000,
+);
+
+test.each(["legacy", "unchanged", "bun-only"])("%s heartbeats never invoke the updater", async (kind) => {
+  await listen();
+  let beats = 0,
+    updates = 0;
+  const worker = await loop({
+    async request(...args) {
+      if (kind === "bun-only" && args[1] === "/worker/heartbeat")
+        args[2] = { ...(args[2] as Capabilities), bunVersion: "different" };
+      const reply = await workerRequest(...args);
+      if (args[1] === "/worker/heartbeat") {
+        beats++;
+        if (kind === "legacy") return { ...reply, json: () => ({ cancelled: [] }) };
+      }
+      return reply;
+    },
+    update: {
+      async command() {
+        updates++;
+        throw new Error("Unexpected update");
+      },
+    },
+  });
+  try {
+    await until(() => beats >= 2);
+    expect(updates).toBe(0);
+    expect(workers.list()[0]?.state).toBe(kind === "bun-only" ? "needs update" : "available");
+  } finally {
+    await worker.stop();
+  }
+});
+
+const updateFixture = seeded(async (dir) => {
+  const { value: original } = await fixture(dir);
+  const git = (args: string[]) => sh(["git", ...args], { cwd: dir });
+  await git(["branch", "-M", "main"]);
+  writeFileSync(join(dir, "tracked"), "new release bytes\n");
+  await git(["add", "tracked"]);
+  await git(["commit", "-qm", "main release"]);
+  const main = (await git(["rev-parse", "HEAD"])).stdout.trim();
+  await git(["checkout", "-qb", "side", original]);
+  await git(["commit", "--allow-empty", "-qm", "unmerged release"]);
+  const side = (await git(["rev-parse", "HEAD"])).stdout.trim();
+  await git(["checkout", "--detach", original]);
+  await git(["remote", "add", "origin", "."]);
+  return { original, main, side };
+});
+
+test.each(["side", "missing", "malformed", "dirty", "install", "exec"])(
+  "worker updater enforces fetched main ancestry and restores real HEAD after %s failure",
+  async (failure) => {
+    const cwd = join(home, "update-checkout");
+    const {
+      value: { original, main, side },
+    } = await updateFixture(cwd);
+    const target =
+      failure === "side"
+        ? side
+        : failure === "missing"
+          ? "0".repeat(40)
+          : failure === "malformed"
+            ? "a".repeat(41)
+            : main;
+    if (failure === "dirty") writeFileSync(join(cwd, "tracked"), "local changes\n");
+    let installs = 0,
+      execs = 0;
+    const commands: string[][] = [];
+    await expect(
+      updateWorker(target, {
+        cwd,
+        async command(args, opts) {
+          expect(opts.cwd).toBe(cwd);
+          commands.push(args);
+          if (args[1] === "install") {
+            installs++;
+            if (failure === "install") throw new Error("Frozen installation failed");
+            return { stdout: "", stderr: "", exitCode: 0 };
+          }
+          return sh(args, opts);
+        },
+        exec() {
+          execs++;
+          throw new Error("Replacement failed");
+        },
+      }),
+    ).rejects.toThrow(
+      failure === "install"
+        ? "Frozen installation failed"
+        : failure === "exec"
+          ? "Replacement failed"
+          : failure === "malformed"
+            ? "full commit SHA"
+            : failure === "dirty"
+              ? "checkout"
+              : "reachable from origin/main",
+    );
+    expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(original);
+    expect(installs).toBe(["install", "exec"].includes(failure) ? 1 : 0);
+    expect(execs).toBe(failure === "exec" ? 1 : 0);
+    if (failure === "dirty") expect(readFileSync(join(cwd, "tracked"), "utf8")).toBe("local changes\n");
+    else if (!["install", "exec"].includes(failure))
+      expect(commands.some((args) => args[1] === "checkout")).toBe(false);
+    // Main must be observed through a fresh fetch, not a pre-existing tracking ref.
+    if (failure !== "malformed")
+      expect((await sh(["git", "rev-parse", "refs/remotes/origin/main"], { cwd })).stdout.trim()).toBe(main);
+  },
+  30_000,
+);

@@ -14,9 +14,10 @@ import { readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
-import { agentEnv, registerCredential, sh } from "../util/proc.ts";
+import { agentEnv, redactCredentials, registerCredential, sh } from "../util/proc.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
+import { updateWorker } from "./update.ts";
 import { attemptBudget, requestedChecks } from "./validation.ts";
 
 export async function pairWorker(
@@ -125,6 +126,7 @@ export async function runWorker(
     request?: typeof workerRequest;
     retryMs?: number;
     log?: (text: string) => void;
+    update?: Parameters<typeof updateWorker>[1];
   } = {},
 ) {
   if (process.platform !== "darwin" && !options.confinement)
@@ -141,6 +143,9 @@ export async function runWorker(
     const stop = new AbortController(),
       combined = AbortSignal.any([signal, stop.signal]);
     const jobs = new Map<string, { controller: AbortController; task: Promise<void>; reported: boolean }>();
+    let updateTarget: string | undefined,
+      updateWarning: string | undefined,
+      updateAttempted = false;
     const heldJobs = () =>
       [...jobs].filter(([, job]) => job.reported && !job.controller.signal.aborted).map(([id]) => id);
     const call = async (path: string, body?: unknown, requestSignal = combined) => {
@@ -177,14 +182,20 @@ export async function runWorker(
         osVersion: release(),
         cpuCount: cpus().length,
         ramBytes: totalmem(),
-        freeSlots: Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
+        freeSlots:
+          updateTarget !== undefined
+            ? 0
+            : Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
+        ...(updateWarning ? { updateWarning } : {}),
         ...state,
         jobs: heldJobs(),
       };
       const reply = z
-        .object({ cancelled: z.array(z.string()) })
+        .object({ cancelled: z.array(z.string()), releaseSha: z.string().optional() })
         .parse((await call("/worker/heartbeat", body)).json());
       for (const id of reply.cancelled) jobs.get(id)?.controller.abort();
+      if (reply.releaseSha !== undefined && reply.releaseSha !== releaseSha)
+        updateTarget ??= reply.releaseSha;
     };
     const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
       const deadline = new AbortController();
@@ -305,9 +316,26 @@ export async function runWorker(
       })();
       void beats.catch((error: unknown) => stop.abort(error));
       while (!combined.aborted) {
+        if (updateTarget !== undefined) {
+          await Promise.all([...jobs.values()].map((job) => job.task));
+          if (!updateAttempted) {
+            updateAttempted = true;
+            try {
+              await updateWorker(updateTarget, { ...options.update, signal: combined });
+            } catch (error) {
+              updateWarning = redactCredentials(`Worker update failed: ${String(error)}`).slice(0, 4000);
+            }
+          }
+          await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal: combined });
+          continue;
+        }
         const leased = Lease.parse((await call("/worker/lease", { jobs: heldJobs() })).json());
         for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
         if (!leased.job) continue;
+        if (updateTarget !== undefined) {
+          await call(`/worker/jobs/${leased.job.id}/failure`, {}).catch(() => {});
+          continue;
+        }
         const { id, request, remainingMs } = leased.job,
           controller = new AbortController();
         const task = run(
