@@ -165,6 +165,86 @@ const failed: GateResult = {
   durationMs: 10,
 };
 
+test.each([false, true])("local retries preserve setup output (executor: %s)", async (executor) => {
+  const f = fixture();
+  try {
+    const check = {
+      name: "test",
+      run: "test -f dependency || exit 2; if test -f attempted; then echo full >> checks; else touch attempted; echo transient; exit 1; fi",
+    };
+    const cfg = {
+      ...config,
+      setup: ["echo setup >> setups && rm -f dependency"],
+      checks: [{ name: "build", run: "echo ready > dependency && echo build >> builds" }, check],
+      retryFiles: "test -f dependency && printf 'targeted %s\\n' {files} >> checks",
+    };
+    await confinementScope.run(fakeConfinement, async () => {
+      const first = await runGates(f.cwd, cfg, signal);
+      const failure = first.checks[1];
+      if (!failure) throw new Error("Missing test result");
+      expect(failure).toMatchObject({ ok: false, output: "transient" });
+      const original = { ...failure, failedFiles: ["test/a.test.ts"] };
+      const retries = await retryFailures(
+        [{ check, original }],
+        f.cwd,
+        cfg,
+        signal,
+        undefined,
+        executor ? (retry) => runGates(f.cwd, retry, signal) : undefined,
+      );
+      expect(retries.get(original)).toMatchObject({
+        ok: true,
+        firstAttempt: original,
+        targetedRetry: { ok: true },
+      });
+    });
+    expect(readFileSync(join(f.cwd, "setups"), "utf8")).toBe("setup\n");
+    expect(readFileSync(join(f.cwd, "builds"), "utf8")).toBe("build\n");
+    expect(readFileSync(join(f.cwd, "checks"), "utf8")).toBe("targeted ./test/a.test.ts\nfull\n");
+  } finally {
+    f.close();
+  }
+});
+
+test.each(["targeted", "full", "targeted only"])(
+  "a failed %s retry setup preserves the original failure and setup evidence",
+  async (kind) => {
+    const f = fixture();
+    try {
+      const original = {
+        ...failed,
+        failureAttributionComplete: true,
+        ...(kind === "full" ? {} : { failedFiles: ["test/a.test.ts"] }),
+      };
+      const cfg = { ...config, setup: ["echo dependency install failed >&2; exit 1"] };
+      let calls = 0;
+      const results = await confinementScope.run(fakeConfinement, () =>
+        retryFailures(
+          [{ check: testCheck, original }],
+          f.cwd,
+          cfg,
+          signal,
+          undefined,
+          (retry) => {
+            calls++;
+            return runGates(f.cwd, retry, signal);
+          },
+          kind === "targeted only",
+          true,
+        ),
+      );
+      expect(calls).toBe(1);
+      const result = results.get(original);
+      expect(result).toMatchObject({ ok: false, command: original.command, firstAttempt: original });
+      expect(result?.output).toContain("failed\n\nRetry setup failed:");
+      expect(result?.output).toContain(`$ ${cfg.setup[0]}`);
+      expect(result?.output).toContain("dependency install failed");
+    } finally {
+      f.close();
+    }
+  },
+);
+
 const attributedSuite = suite(
   "test/a.test.ts",
   'tests="1" failures="1" errors="0"',

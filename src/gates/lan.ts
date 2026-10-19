@@ -19,6 +19,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
   >();
   return {
     kind: "lan",
+    freshCheckoutFor: (repo) => repos.includes(repo),
     discard(handle) {
       workers.cancel(handle.id);
       void live.get(handle.id)?.cancel();

@@ -1127,7 +1127,15 @@ test.each([
       const retry: GateRunner = (gates, options) =>
         runGateExecution(ctx, stage, `${kind}-retry${options?.targeted ? "-targeted" : ""}`, req.cwd, gates);
       if (kind === "baseline") {
-        const retried = await retryBaselineFailures(first, req.cwd, req.gates, ctx.signal, undefined, retry);
+        const retried = await retryBaselineFailures(
+          first,
+          req.cwd,
+          req.gates,
+          ctx.signal,
+          undefined,
+          retry,
+          ctx.deps.gateExecutor?.freshCheckoutFor?.(req.repo),
+        );
         expect(retried.checks[0]).toMatchObject({ ok: true, firstAttempt: { ok: false } });
       } else {
         const baseline = {
@@ -1142,6 +1150,7 @@ test.each([
           ctx.signal,
           undefined,
           retry,
+          ctx.deps.gateExecutor?.freshCheckoutFor?.(req.repo),
         );
         expect(retried[0]).toMatchObject({ verdict: "flaky", blocking: false, firstAttempt: { ok: false } });
       }
@@ -1314,10 +1323,31 @@ test("a worker survives connection failures, 503s and a coordinator restart with
 
 test("repos without opt-in use local execution without creating jobs", async () => {
   const req = await request();
-  const result = await confinementScope.run(fakeConfinement, () =>
-    executeGate(req, new AbortController().signal, {}, gateExecutorFor("lan", workers, [])),
-  );
-  expect(result.checks[1]?.exitCode).toBe(7);
+  req.gates.setup = ["rm -f built; echo setup >> setup-runs"];
+  req.gates.checks = [
+    { name: "pass", run: "cat tracked; touch built" },
+    {
+      name: "fail",
+      run: "test -f built || exit 2; test -f attempted || { touch attempted; echo failure; exit 7; }",
+    },
+  ];
+  const executor = gateExecutorFor("lan", workers, []);
+  const signal = new AbortController().signal;
+  await confinementScope.run(fakeConfinement, async () => {
+    const result = await executeGate(req, signal, {}, executor);
+    expect(result.checks[1]?.exitCode).toBe(7);
+    const retried = await retryBaselineFailures(
+      result,
+      req.cwd,
+      req.gates,
+      signal,
+      undefined,
+      (gates) => executeGate({ ...req, gates }, signal, {}, executor),
+      executor.freshCheckoutFor?.(req.repo),
+    );
+    expect(retried.checks[1]).toMatchObject({ ok: true, firstAttempt: { ok: false, exitCode: 7 } });
+  });
+  expect(readFileSync(join(req.cwd, "setup-runs"), "utf8")).toBe("setup\n");
   expect(workers.jobs("1=1")).toHaveLength(0);
 }, 30_000);
 
