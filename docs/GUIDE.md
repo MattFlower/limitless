@@ -1348,6 +1348,9 @@ polling, then inspect the saved head before retrying. The active states are `que
 repository works at a time, oldest first. A blocked entry is not retried automatically: resolve
 its reason, review any new head, and request a new entry. Cancel cannot undo a completed merge.
 
+Even an approved draft PR is refused before any checks run: mark it ready with `gh pr ready <pr>`
+and request landing again.
+
 The queue checks out the approved head, merges the current base when necessary, runs its own
 checks from the base commit's `.limitless.toml` under **one gate slot**, checks publication for
 private strings, and pushes any factory base merge with a lease on the approved head. It waits
@@ -1374,6 +1377,7 @@ These are the refusal/block templates from [queue.ts](../src/land/queue.ts) and
 | `a conflict round is in flight for this pull request` | Follow the conflict round; review its delivered head. |
 | `a CI fix round is in flight for this pull request` | Follow the CI fix round; review its delivered head. |
 | `PR is already in the land queue` | Inspect the active entry instead of submitting another. |
+| `PR is a draft` | Mark it ready with `gh pr ready <pr>` and request landing again. |
 | `cannot determine PR base branch: owning run and GitHub provide no valid base distinct from the head branch` | Repair the PR/base metadata; do not guess a base or approve unchecked work. |
 | `conflicts with <base>` | Follow the conflict round or resolve the conflict; approve the new head. |
 | `<check names> failed (<log path>)` | Read the land log; fix the failure, or follow the flaky-check FAQ above. |
