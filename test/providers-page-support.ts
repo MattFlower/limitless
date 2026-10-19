@@ -104,7 +104,15 @@ export async function setProviderFast(id: string, fast: boolean) {
 
 let elapsed = 0;
 let nextTimer = 0;
-const timers = new Map<number, { callback: () => void; ms: number; next: number }>();
+const timers = new Map<number, { callback: () => void; ms?: number; next: number }>();
+export function setTimeout(callback: () => void, ms: number) {
+  const id = ++nextTimer;
+  timers.set(id, { callback, next: elapsed + ms });
+  return id;
+}
+export function clearTimeout(id: number | undefined) {
+  if (id !== undefined) timers.delete(id);
+}
 export function setInterval(callback: () => void, ms: number) {
   const id = ++nextTimer;
   timers.set(id, { callback, ms, next: elapsed + ms });
@@ -115,10 +123,12 @@ export function clearInterval(id: number) {
 }
 export function advanceTimers(ms: number) {
   elapsed += ms;
-  for (const timer of timers.values()) {
+  for (const [id, timer] of timers) {
     while (timer.next <= elapsed) {
-      timer.next += timer.ms;
+      if (timer.ms === undefined) timers.delete(id);
+      else timer.next += timer.ms;
       timer.callback();
+      if (timer.ms === undefined) break;
     }
   }
 }

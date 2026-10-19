@@ -83,7 +83,7 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
                   "const useNavigate = () => (_path: string) => {};",
                 );
               if (/\/(Providers|Dashboard)\.tsx$/.test(args.path))
-                source += `\nimport { setInterval, clearInterval } from ${JSON.stringify(support)};`;
+                source += `\nimport { setInterval, clearInterval, setTimeout, clearTimeout } from ${JSON.stringify(support)};`;
               const result = await transformAsync(source, {
                 filename: args.path,
                 parserOpts: { plugins: ["jsx", "typescript"] },
@@ -234,6 +234,8 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
       expect(fixture.statsRequests).toHaveLength(1);
       store.updateRun(run.id, { status: "failed" });
       publish();
+      expect(fixture.statsRequests).toHaveLength(1);
+      fixture.advanceTimers(250);
       expect(fixture.statsRequests).toHaveLength(2);
       const stoppedAt = Date.now() - 10_000;
       const pr = "https://github.com/owner/repo/pull/1";
@@ -261,6 +263,10 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
       const refresh = async (message: Parameters<typeof fixture.publishLiveUpdate>[0]) => {
         const count = fixture.statsRequests.length;
         fixture.publishLiveUpdate(message);
+        fixture.publishLiveUpdate(message);
+        fixture.advanceTimers(249);
+        expect(fixture.statsRequests).toHaveLength(count);
+        fixture.advanceTimers(1);
         expect(fixture.statsRequests).toHaveLength(count + 1);
         fixture.statsRequests[count]?.resolve(computeStats(store));
         await flush();
@@ -310,6 +316,7 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
 
       store.resolveRun(run.id, { kind: "wont_do", by: "human" });
       publish();
+      fixture.advanceTimers(250);
       expect(fixture.statsRequests).toHaveLength(7);
       fixture.statsRequests[6]?.resolve(computeStats(store));
       await flush();
@@ -319,15 +326,19 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
       fixture.statsRequests[0]?.resolve(beforeResolution);
       await flush();
       expect(attentionCount()).toContain("Needs you (14d)0");
-      fixture.advanceTimers(29_999);
+      // Six coalesced refresh windows have elapsed since mounting the dashboard.
+      fixture.advanceTimers(30_000 - 6 * 250 - 1);
       expect(fixture.statsRequests).toHaveLength(7);
       fixture.advanceTimers(1);
       expect(fixture.statsRequests).toHaveLength(8);
     } finally {
       store.close();
     }
+    fixture.publishLiveUpdate({ kind: "reconnected" });
     dispose();
     expect(fixture.timerCount()).toBe(0);
+    fixture.advanceTimers(250);
+    expect(fixture.statsRequests).toHaveLength(8);
 
     const nav = fixture.node();
     dispose = fixture.render(() => fixture.NavBar(), nav);

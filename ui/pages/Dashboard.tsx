@@ -18,22 +18,29 @@ export const Dashboard: Component = () => {
   const [statusFilter, setStatusFilter] = createSignal<RunFilter | null>(null);
 
   let statsRequest = 0;
+  let statsRefresh: ReturnType<typeof setTimeout> | undefined;
   const refreshStats = () => {
+    clearTimeout(statsRefresh);
+    statsRefresh = undefined;
     const request = ++statsRequest;
     getStats(14)
       .then((next) => request === statsRequest && setStats(next))
       .catch(() => {});
   };
+  const scheduleStats = () => {
+    statsRefresh ??= setTimeout(refreshStats, 250);
+  };
   onMount(() => {
     refreshStats();
     const close = subscribeLiveUpdates((msg) => {
-      if (["feed", "github_pr", "reconnected"].includes(msg.kind)) refreshStats();
+      if (["feed", "github_pr", "reconnected"].includes(msg.kind)) scheduleStats();
     });
     const t = setInterval(refreshStats, STATS_REFRESH_MS);
     const clock = setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => {
       close();
       statsRequest++;
+      clearTimeout(statsRefresh);
       clearInterval(t);
       clearInterval(clock);
     });
@@ -43,7 +50,7 @@ export const Dashboard: Component = () => {
   const needsYouCount = createMemo(
     () => runs().filter((r) => matchesRunFilter(r.status, "needs_you")).length,
   );
-  createEffect(on(needsYouCount, refreshStats, { defer: true }));
+  createEffect(on(needsYouCount, scheduleStats, { defer: true }));
   const attention = createMemo(() => {
     const ids = stats()?.needsYouRunIds;
     return ids ? new Set(ids) : undefined;

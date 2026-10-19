@@ -130,8 +130,8 @@ export function computeStats(store: Store, days = 14): Stats {
     SELECT r.id, r.created_at AS createdAt FROM runs r
     LEFT JOIN review_rounds own ON own.run_id = r.id
     WHERE r.status IN ('failed', 'needs_human') AND r.merged = 0 AND r.resolution IS NULL
-      AND NOT EXISTS (SELECT 1 FROM runs merged
-        WHERE merged.pr_url = r.pr_url AND merged.merged = 1)
+      AND (r.pr_url IS NULL OR r.pr_url NOT IN (
+        SELECT pr_url FROM runs WHERE merged = 1 AND pr_url IS NOT NULL))
       AND NOT EXISTS (SELECT 1 FROM land_entries l WHERE l.pr_url = r.pr_url
         AND l.state IN ('queued', 'checking', 'waiting_ci', 'merging'))
       AND NOT EXISTS (

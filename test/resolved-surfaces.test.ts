@@ -149,6 +149,21 @@ test("attention checks later lineage rounds outside list subsets and the stats w
   }
 });
 
+test("attention excludes merged PR siblings while retaining candidates without a PR", () => {
+  const { store, repo, run, pr } = attentionFixture();
+  try {
+    const merged = store.createRun(repo, { repo: repo.slug, prompt: "Landed work" });
+    store.updateRun(merged.id, { status: "succeeded", merged: true });
+    expect(computeStats(store).needsYouRunIds).toEqual([run.id]);
+    store.updateRun(merged.id, { prUrl: pr });
+    expect(computeStats(store).needsYouRunIds).toEqual([]);
+    store.db.query("UPDATE runs SET pr_url = NULL WHERE id = ?").run(run.id);
+    expect(computeStats(store).needsYouRunIds).toEqual([run.id]);
+  } finally {
+    store.close();
+  }
+});
+
 test("attention requires a newer nonstale approval of the recorded current head", () => {
   const { store, run, pr, head, stoppedAt, approve } = attentionFixture();
   try {
