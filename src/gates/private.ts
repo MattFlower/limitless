@@ -2,9 +2,28 @@ import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-const canonical = (p: string): string =>
-  lstatSync(p, { throwIfNoEntry: false }) ? realpathSync(p) : join(canonical(dirname(p)), basename(p));
+// A path removed between lstat and realpath (another run's worktree) is canonicalized as missing.
+// A dangling symlink keeps its link, so its realpath error still stands.
+const canonical = (p: string): string => {
+  if (lstatSync(p, { throwIfNoEntry: false }))
+    try {
+      return realpathSync(p);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || lstatSync(p, { throwIfNoEntry: false }))
+        throw error;
+    }
+  return join(canonical(dirname(p)), basename(p));
+};
 export class PrivateError extends Error {}
+/** `read()`, or `fallback` when the path doesn't exist; every other error still throws. */
+function unlessMissing<T>(read: () => T, fallback: T): T {
+  try {
+    return read();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return fallback;
+    throw error;
+  }
+}
 export function loadPrivateStrings(
   configDir = process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless"),
   roots: (string | null | undefined)[] = [],
@@ -23,9 +42,13 @@ export function loadPrivateStrings(
       if (lstatSync(join(git, "commondir"), { throwIfNoEntry: false }))
         git = canonical(resolve(git, read(join(git, "commondir"))));
       const worktrees = join(git, "worktrees");
-      const linked = lstatSync(worktrees, { throwIfNoEntry: false })
-        ? readdirSync(worktrees).map((name) => dirname(read(join(worktrees, name, "gitdir"))))
-        : [];
+      // Another run's worktree that git is adding or removing has no gitdir file yet (or an empty
+      // one mid-write), or no longer, and git drops the directory with its last entry. Only those
+      // are skipped.
+      const linked = unlessMissing(() => readdirSync(worktrees), []).flatMap((name) => {
+        const target = unlessMissing(() => read(join(worktrees, name, "gitdir")), "");
+        return target ? [dirname(target)] : [];
+      });
       return [root, git, ...(basename(git) === ".git" ? [dirname(git)] : []), ...linked];
     });
     const boundaries = repositoryRoots.flatMap((root) => [resolve(root), canonical(resolve(root))]);

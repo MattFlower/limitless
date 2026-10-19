@@ -1,4 +1,5 @@
 import { describe, expect, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -2106,6 +2107,55 @@ test("private policy rejects broken lists and repository aliases; normalizes bot
     writeFileSync(join(repo, "list"), "secret-host.example");
     symlinkSync(join(repo, "list"), file);
     expect(() => loadPrivateStrings(config, [repo])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private policy skips a linked worktree that git is adding or removing, and only that", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-linked-"));
+  const config = join(root, "config");
+  const admin = join(root, "repo", ".git", "worktrees");
+  mkdirSync(config);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example\n");
+  try {
+    // git creates the entry before writing its gitdir, and removes the gitdir before the entry.
+    mkdirSync(join(admin, "adding"), { recursive: true });
+    expect(loadPrivateStrings(config, [join(root, "repo")])).toHaveLength(1);
+    // Mid-write the gitdir is empty, which must not resolve to the process's working directory.
+    writeFileSync(join(admin, "adding", "gitdir"), "");
+    const cwd = process.cwd();
+    process.chdir(root);
+    try {
+      expect(loadPrivateStrings(config, [join(root, "repo")])).toHaveLength(1);
+    } finally {
+      process.chdir(cwd);
+    }
+    // A complete entry still counts: a linked worktree holding the config blocks publication.
+    mkdirSync(join(admin, "holder"));
+    writeFileSync(join(admin, "holder", "gitdir"), `${join(root, ".git")}\n`);
+    expect(() => loadPrivateStrings(config, [join(root, "repo")])).toThrow("inside repository");
+    // git can also remove a worktree between the check that it exists and resolving its real path.
+    rmSync(join(admin, "holder"), { recursive: true });
+    const other = join(root, "other");
+    mkdirSync(other);
+    mkdirSync(join(admin, "other"));
+    writeFileSync(join(admin, "other", "gitdir"), `${join(other, ".git")}\n`);
+    const realpath = fs.realpathSync;
+    const removing = spyOn(fs, "realpathSync").mockImplementation(((path: string) => {
+      if (path === other) rmSync(other, { recursive: true });
+      return realpath(path);
+    }) as typeof fs.realpathSync);
+    try {
+      expect(loadPrivateStrings(config, [join(root, "repo")])).toHaveLength(1);
+      expect(removing.mock.calls.some(([path]) => path === other)).toBe(true);
+    } finally {
+      removing.mockRestore();
+    }
+    rmSync(join(admin, "other"), { recursive: true });
+    // Anything but a missing file still fails closed.
+    mkdirSync(join(admin, "broken", "gitdir"), { recursive: true });
+    expect(() => loadPrivateStrings(config, [join(root, "repo")])).toThrow("Cannot read");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
