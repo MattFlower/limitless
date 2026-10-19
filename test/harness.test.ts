@@ -19,7 +19,7 @@ import {
   runCodex,
 } from "../src/harness/codex.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
+import { type ConfinementBackend, confinementScope, verifySeatbelt } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
 import { parseFakeStream } from "../src/harness/stream-fault.ts";
@@ -314,8 +314,7 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
   } as unknown as CodexReaderProbe);
 
 // Holds every launch before the trusted startup shell; the optional hook runs just before the spawn.
-// A chatty hold keeps writing stderr, so only runClaude's no-progress watchdog, not the byte-level
-// idle timeout, can stop it.
+// A chatty hold emits diagnostics without reporting agent progress.
 const heldLaunch = (beforeSpawn = () => {}, chatty = false): ConfinementBackend => ({
   verify: async () => {},
   wrap: (cmd) => {
@@ -328,7 +327,8 @@ const heldEdit = (
   backend: ConfinementBackend,
   signal: AbortSignal,
   onEvent: (event: AgentEvent) => void = () => {},
-  processRunner = runProcess,
+  // Exercise the harness watchdog without racing the byte-idle timer under scheduler load.
+  processRunner: typeof runProcess = (opts) => runProcess({ ...opts, idleTimeoutMs: undefined }),
 ) =>
   confinementScope.run(backend, () =>
     withScratch(import.meta.dir, (scratchDir) => {
@@ -413,6 +413,58 @@ test("a caller cancel while a claude editor's sandbox starts ends the run cancel
     caller.signal,
   );
   expect(result.status).toBe("cancelled");
+});
+
+// The confinement probe's first step holds until the editor's signal aborts, then ends as
+// runProcess's cancel kill does; nothing may launch after it. Without the editor's roots the probe
+// keeps its files in its own temporary directory, not in this checkout.
+const heldProbe = (onProbe = () => {}): ConfinementBackend => ({
+  verify: (_roots, opts) =>
+    verifySeatbelt(
+      async (probe) => {
+        onProbe();
+        if (!probe.signal?.aborted)
+          await new Promise((resolve) => probe.signal?.addEventListener("abort", resolve, { once: true }));
+        return {
+          exitCode: null,
+          signal: "SIGKILL",
+          cancelled: true,
+          cancelKilled: true,
+          timedOut: false,
+          idleTimedOut: false,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          durationMs: 1,
+        };
+      },
+      "/bin/sh",
+      "darwin",
+      undefined,
+      opts.signal,
+    ),
+  wrap: () => {
+    throw new Error("launched before the confinement probe passed");
+  },
+});
+
+test("a claude editor whose confinement probe hangs until the no-progress watchdog fires is a confinement error", async () => {
+  const caller = new AbortController();
+  await expect(heldEdit(heldProbe(), caller.signal)).rejects.toThrow(
+    "Write confinement payload did not start: no progress",
+  );
+  expect(caller.signal.aborted).toBe(false);
+});
+
+test("a caller cancel during a claude editor's confinement probe surfaces as the caller's abort", async () => {
+  const caller = new AbortController();
+  const reason = new Error("cancelled by the caller");
+  await expect(
+    heldEdit(
+      heldProbe(() => caller.abort(reason)),
+      caller.signal,
+    ),
+  ).rejects.toBe(reason);
 });
 
 for (const harness of ["codex", "claude"] as const) {

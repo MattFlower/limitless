@@ -15,13 +15,6 @@ export async function runGateExecution(
   hooks: GateHooks = {},
 ): Promise<GateRun> {
   ctx.checkCancelled();
-  // LAN retries get a fresh checkout, so they must rebuild the original setup output.
-  if (
-    ctx.deps.gateExecutor?.kind === "lan" &&
-    ctx.deps.cfg.workers.repos.includes(ctx.repo.slug) &&
-    purpose.includes("-retry")
-  )
-    gates = { ...gates, setup: ctx.state.gatesConfig?.setup ?? gates.setup };
   const round = ctx.state.round;
   const sha = await headSha(cwd);
   const pending = ctx.state.gateExecution;

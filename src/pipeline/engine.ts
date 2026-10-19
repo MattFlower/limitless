@@ -22,7 +22,7 @@ import {
 } from "../gates/detect.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
-import { checkPublicationText } from "../gates/publication.ts";
+import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import {
   compareGates,
   confinementFailed,
@@ -543,6 +543,7 @@ async function prepare(ctx: RunContext): Promise<void> {
               retry,
               { onWait, skipGateSlot: options?.skipGateSlot },
             ),
+          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
         );
         ctx.checkCancelled();
         return retried;
@@ -1261,6 +1262,7 @@ async function oneRound(
                   retry,
                   { onWait: events.onWait, skipGateSlot: options?.skipGateSlot },
                 ),
+              ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
             );
           ctx.checkCancelled();
           baseTimeout ||= after.checks.some(
@@ -1948,6 +1950,14 @@ function privateEntries(ctx: RunContext, cwd: string) {
   return loadPrivateStrings(configDir, [cwd, ctx.repo.localPath, repos, work]);
 }
 
+function publicationText(ctx: RunContext, text: string): string {
+  return sanitizePublication(
+    redactCredentials(text),
+    publicationWorktree(ctx.state),
+    ctx.deps.cfg.paths.home,
+  );
+}
+
 /** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
@@ -2002,7 +2012,7 @@ async function deliverVerifiedDraft(
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
   const rendered = buildReportArtifacts(ctx, false, { sha, stage, reason, base });
-  const body = stripReportManifest(rendered.report);
+  const body = publicationText(ctx, stripReportManifest(rendered.report));
   saveReport(ctx, rendered);
   ctx.checkCancelled();
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
@@ -2122,24 +2132,30 @@ async function deliverReviewRound(
             .map((c, index) => {
               if (rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown")
                 return `🚧 blocked unknown-${index + 1}: private evidence withheld`;
-              const evidence = redactGateOutput(
-                redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources),
+              const evidence = publicationText(
+                ctx,
+                redactGateOutput(redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources)),
               ).slice(0, 300);
               return `🚧 blocked ${c.id}: ${evidence}`;
             });
           // Keep checked-head evidence ahead of quoted requests; the full report is a run artifact.
-          text = redactGateOutput(
-            `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+          text = publicationText(
+            ctx,
+            redactGateOutput(
+              `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+            ),
           ).slice(0, 60_000);
         }
+        text = publicationText(ctx, text);
         await checkPublication(ctx, text, { sha: head, title: ctx.run.title });
         await gh(["pr", "comment", prUrl, "--body-file", "-"], ctx.signal, text);
       }
       return;
     }
-    const { marker, text } = roundSection(ctx.run.id, review.round, redactGateData(review.findings));
+    const { marker, text: section } = roundSection(ctx.run.id, review.round, redactGateData(review.findings));
+    const text = publicationText(ctx, section);
     if (!pr.body.includes(marker)) {
-      const body = pr.body + text;
+      const body = publicationText(ctx, pr.body + text);
       await checkPublication(ctx, text, undefined, "PR round section");
       await checkPublication(ctx, body, undefined, "PR body");
       await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, body);
@@ -2282,7 +2298,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
-              const body = `${marker}\n${stripReportManifest(report)}`;
+              const body = publicationText(ctx, `${marker}\n${stripReportManifest(report)}`);
               await checkPublication(ctx, body);
               await runner([...comment, "--body", body], ctx.signal);
             },
@@ -2345,7 +2361,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         note("the branch does not contain the recorded base");
     }
     const rendered = buildReportArtifacts(ctx, success);
-    const body = stripReportManifest(rendered.report);
+    const body = publicationText(ctx, stripReportManifest(rendered.report));
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
     if (success || blocked || !(review || ctx.run.deliveryBranch))

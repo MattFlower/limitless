@@ -76,6 +76,8 @@ export interface RunState {
   verdictCommentPending?: boolean;
   phase: Phase;
   worktreePath?: string;
+  /** Worktree spellings used by report rendering, so removed worktrees stay rewritable. */
+  worktreeAliases?: string[];
   gatesConfig?: GateConfig;
   previewConfig?: PreviewConfig | null;
   slottedCommands?: SlottedCommands;

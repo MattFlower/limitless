@@ -257,10 +257,10 @@ export async function processBirth(pid: number, name?: (value: string) => void):
   throw new Error("Process birth time inspection is unsupported on this platform");
 }
 
-/** Scoped identity and matching birth-clock backend for shutdown tests. */
+/** Scoped identity and matching birth-clock backend for shutdown tests; the clock defaults to the real one. */
 export const processBirthInspection = new AsyncLocalStorage<{
   read: typeof processBirth;
-  now: () => number;
+  now?: () => number;
 }>();
 
 function birthTime(birth: string): number {
@@ -348,7 +348,9 @@ async function stopMarkedProcesses(
         else if (!freezing || !identity.stopped) {
           // Decided by our SIGKILL, not the freeze or the start of shutdown: a frozen child can still
           // be killed by something else during the checks in between. A stopped child counts as
-          // running; unreaped (exitCode null), its pid can't have been reused.
+          // running; unreaped (exitCode null), its pid can't have been reused. Residual: an external
+          // SIGKILL landing between this check and process.kill leaves a zombie that kill accepts,
+          // which userspace can't rule out; it only labels a launch already being cancelled as cancelled.
           const signal = freezing ? "SIGSTOP" : "SIGKILL";
           const killingChild = pid === group && signal === "SIGKILL" && !childKillSent;
           const running =
@@ -436,7 +438,9 @@ export interface ProcResult {
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
+  /** The overall timeout began the shutdown, not an exit or a cancel before it. */
   timedOut: boolean;
+  /** The idle timeout began the shutdown, as for timedOut. */
   idleTimedOut: boolean;
   stdout: string; // tail, bounded by tailLimit
   stderr: string; // tail, bounded by tailLimit
@@ -619,6 +623,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     if (opts.timeoutMs) {
       timers.push(
         setTimeout(() => {
+          // A timer firing after an exit or a cancel began the shutdown didn't stop the child.
+          if (shutdown !== undefined) return;
           timedOut = true;
           terminate();
         }, opts.timeoutMs),
@@ -629,7 +635,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       const limit = opts.idleTimeoutMs;
       idleTimer = setInterval(
         () => {
-          if (Date.now() - lastActivity > limit) {
+          if (shutdown === undefined && Date.now() - lastActivity > limit) {
             idleTimedOut = true;
             terminate();
           }
