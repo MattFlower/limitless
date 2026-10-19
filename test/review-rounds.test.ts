@@ -13,6 +13,7 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
+import { ENVIRONMENT_BLOCKED } from "../src/pipeline/verification.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import * as proc from "../src/util/proc.ts";
@@ -621,6 +622,56 @@ test("an oversized blocked-round report posts bounded evidence and a full-report
   const report = factory.store.getArtifact(id, "report.md") ?? "";
   expect(report.length).toBeGreaterThan(65_536);
   expect(report).toContain(largeFindings[0]?.detail ?? "missing finding");
+});
+
+test("blocked-round evidence and overall comment sanitize paths before both cuts", async () => {
+  const original = await delivered("standard");
+  const id = (await changes(original.id)).body.round?.id as string;
+  verifyStatus = "blocked";
+  factory.deps.faults = { "stage:deliver:before": { action: "kill" } };
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+  const state = factory.store.getRunState<RunState>(id);
+  if (!state?.lastVerify || !state.spec || !state.holdout || !state.worktreePath)
+    throw new Error("missing blocked state");
+  const marker = `<!-- limitless-review-round:${id} -->`;
+  const prefix = `${marker}\nRound 1 published at ${state.reviewedSha}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${factory.cfg.uiUrl}/runs/${id}\n\n`;
+  const first = `🚧 blocked AC-1: ${"x".repeat(279)} a.ts${"z".repeat(80)}`.slice(
+    0,
+    "🚧 blocked AC-1: ".length + 300,
+  );
+  // The second path begins ten characters before the overall comment cut.
+  const longId =
+    "AC-" +
+    "y".repeat(59990 - prefix.length - first.length - "\n🚧 blocked AC-".length) +
+    ` ${factory.cfg.paths.home}/logs/a`;
+  state.holdout.scenarios.push({
+    id: longId,
+    description: "Synthetic scenario",
+    steps: "inspect",
+    expected: "ok",
+    edge_case: false,
+  });
+  const evidencePath = `${realpathSync(state.worktreePath)}/a.ts${"z".repeat(80)}`;
+  state.spec.assumptions.push(`Public diagnostic path: ${evidencePath}`);
+  state.lastVerify.criteria = [
+    {
+      id: "AC-1",
+      status: "blocked",
+      evidence: `${"x".repeat(279)} ${evidencePath}`,
+      publicSummary: "",
+    },
+    { id: longId, status: "blocked", evidence: "blocked", publicSummary: "" },
+  ];
+  factory.store.setRunState(id, state);
+  await restart();
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  const comment = pr.comments[0]?.body ?? "";
+  expect(comment).toHaveLength(60_000);
+  expect(comment).toContain(first);
+  expect(comment).toContain("<data>");
+  expect(comment).not.toContain(root.slice(0, 8));
+  expect(comment).not.toContain(state.worktreePath);
+  expect(pr.comments).toHaveLength(1);
 });
 
 test.each(["unmet", "unclear"] as const)(

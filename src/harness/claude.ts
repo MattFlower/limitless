@@ -1,7 +1,7 @@
 import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
-import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import { homeReadPolicy } from "./read-policy.ts";
 import { ConfinementError, runSandboxed } from "./sandbox.ts";
 import {
@@ -308,23 +308,31 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const shellEnv = agentShellEnv(spec);
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
-  // runSandboxed returns a launch cancelled before startup only because our cancel stopped it. When
-  // the no-progress watchdog aborted first, not the caller, the sandbox hung: keep that a confinement error.
+  // runSandboxed returns a launch cancelled before startup, and rethrows the abort that stopped its
+  // probe, only because our cancel stopped it. When the no-progress watchdog aborted first, not the
+  // caller, the sandbox hung: keep that a confinement error.
   const runner: typeof runProcess = async (opts) => {
     if (!roots) return processRunner(opts);
     let started = false;
-    const result = await runSandboxed(
-      {
-        ...opts,
-        onStarted: () => {
-          started = true;
+    const hung = () =>
+      new ConfinementError(`Write confinement payload did not start: ${stuckReason ?? "stopped"}`);
+    let result: ProcResult;
+    try {
+      result = await runSandboxed(
+        {
+          ...opts,
+          onStarted: () => {
+            started = true;
+          },
         },
-      },
-      roots,
-      processRunner,
-    );
-    if (!started && result.cancelled && firstAbort !== "caller")
-      throw new ConfinementError(`Write confinement payload did not start: ${stuckReason ?? "stopped"}`);
+        roots,
+        processRunner,
+      );
+    } catch (error) {
+      if (firstAbort !== "caller" && opts.signal?.aborted && error === opts.signal.reason) throw hung();
+      throw error;
+    }
+    if (!started && result.cancelled && firstAbort !== "caller") throw hung();
     return result;
   };
   appendFileSync(spec.logPath, redactCredentials(`# claude ${t.model} ${new Date().toISOString()}\n`));

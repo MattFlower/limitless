@@ -24,6 +24,7 @@ import {
   homeReadPolicy,
   type PolicyFilesystem,
   policySpellings,
+  READ_PROBE,
   readPolicyScope,
 } from "../src/harness/read-policy.ts";
 import {
@@ -43,6 +44,7 @@ import {
   type ProcResult,
   processBirth,
   processBirthInspection,
+  processScope,
   runProcess,
   sh,
 } from "../src/util/proc.ts";
@@ -1253,6 +1255,46 @@ test.each([false, true])(
   },
 );
 
+test("a cancel during startup stays cancelled when the timeouts expire during its shutdown", async () => {
+  const abort = new AbortController();
+  // The cancel lands before the spawn, so it begins the shutdown; nothing else stops the hold.
+  const held: ConfinementBackend = {
+    verify: async () => {},
+    wrap: (cmd) => {
+      abort.abort();
+      return ["/bin/sh", "-c", 'sleep 900; exec "$@"', "sh", ...cmd];
+    },
+  };
+  // The shutdown's first birth read outlasts both timeouts.
+  let delayed = false;
+  const slowBirth: typeof processBirth = async (pid, name) => {
+    if (!delayed) {
+      delayed = true;
+      await Bun.sleep(100);
+    }
+    return processBirth(pid, name);
+  };
+  const result = await processBirthInspection.run({ read: slowBirth }, () =>
+    runSandboxed(
+      {
+        cmd: ["/usr/bin/true"],
+        cwd: work,
+        env: agentEnv(),
+        signal: abort.signal,
+        timeoutMs: 40,
+        idleTimeoutMs: 20,
+      },
+      { write: [work], protect: [] },
+      runProcess,
+      undefined,
+      held,
+    ),
+  );
+  expect(result).toMatchObject({ cancelled: true, cancelKilled: true, timedOut: false, idleTimedOut: false });
+  expect(delayed).toBe(true);
+  expect(result.durationMs).toBeGreaterThanOrEqual(100);
+});
+
 test("the effective profile is probed before the native-tool process and failed probes never launch it", async () => {
   const roots = { write: [work], protect: [join(work, ".git")] };
   for (const behaviour of ["leaky", "timeout", "throws", "incomplete"] as const) {
@@ -1267,6 +1309,123 @@ test("the effective profile is probed before the native-tool process and failed 
     expect(fake.calls.flat()).not.toContain("native-tool");
   }
 });
+
+type ProbeStep = "write" | "read" | "signal";
+const probeStep = (cmd: string[]): ProbeStep =>
+  cmd[1] === "-c" ? "signal" : cmd.includes(READ_PROBE) ? "read" : "write";
+/** What each probe step reports when the profile holds. */
+function enforcedStep(opts: ProcOptions): ProcResult {
+  const step = probeStep(opts.cmd);
+  if (step === "signal") return proc({ stdout: "signals-verified" });
+  if (step === "read") return proc({ exitCode: 1, stderr: "head: Operation not permitted" });
+  writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+  return proc({ stdout: "verified" });
+}
+// runProcess's result when our cancel killed a step whose child was still running.
+const cancelKill = proc({ cancelled: true, cancelKilled: true, exitCode: null, signal: "SIGKILL" });
+const probeRoots = () => ({ write: [work], protect: [], denyRead: [join(home, "canary")] });
+
+/** A Seatbelt backend whose probe holds one step until the test ends it; the other steps pass. */
+function heldProbe(held: ProbeStep) {
+  const reached = deferred<void>();
+  const ending = deferred<(opts: ProcOptions) => ProcResult>();
+  const launched: string[][] = [];
+  const run = async (opts: ProcOptions): Promise<ProcResult> => {
+    if (probeStep(opts.cmd) !== held) return enforcedStep(opts);
+    reached.resolve();
+    return (await ending.promise)(opts);
+  };
+  const backend: ConfinementBackend = {
+    verify: (roots, opts) => verifySeatbelt(run, "/bin/sh", "darwin", roots, opts.signal),
+    wrap: (cmd) => {
+      launched.push(cmd);
+      return cmd;
+    },
+  };
+  const launch = (signal: AbortSignal) =>
+    runSandboxed(
+      { cmd: ["/usr/bin/touch", join(root, "payload-ran")], cwd: work, env: agentEnv(), signal },
+      probeRoots(),
+      runProcess,
+      undefined,
+      backend,
+    );
+  return { launch, reached: reached.promise, end: ending.resolve, launched };
+}
+
+test.each(["write", "read", "signal"] as const)(
+  "a cancel that kills the %s probe step surfaces as that cancel and launches nothing",
+  async (step) => {
+    const probe = heldProbe(step);
+    const abort = new AbortController();
+    const launch = probe.launch(abort.signal);
+    await probe.reached;
+    const reason = new Error("cancelled by the test");
+    abort.abort(reason);
+    probe.end(() => cancelKill);
+    await expect(launch).rejects.toBe(reason);
+    expect(probe.launched).toEqual([]);
+    expect(existsSync(join(root, "payload-ran"))).toBe(false);
+  },
+);
+
+test("a cancel between probe steps inside a run's process scope surfaces as the probe's own cancel", async () => {
+  // As the local gate executor does, the run's abort aborts the gate's own signal with its own reason.
+  const run = new AbortController();
+  const gate = new AbortController();
+  run.signal.addEventListener("abort", () => gate.abort(), { once: true });
+  const scope = { signal: run.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set<string>() };
+  // The write step finishes cleanly as the run is cancelled; the next step reaches runProcess.
+  const probe = async (opts: ProcOptions) => {
+    if (probeStep(opts.cmd) !== "write") return runProcess(opts);
+    run.abort(new Error("shutdown"));
+    return enforcedStep(opts);
+  };
+  await expect(
+    processScope.run(scope, () => verifySeatbelt(probe, "/bin/sh", "darwin", probeRoots(), gate.signal)),
+  ).rejects.toBe(gate.signal.reason);
+});
+
+// Built at runtime: AGENTS.md keeps this diagnostic out of test titles and printed strings.
+const seatbeltDiagnostic = ["sandbox_apply", "Operation not permitted"].join(": ");
+const ownFailures: Record<string, [ProbeStep, (opts: ProcOptions) => ProcResult]> = {
+  "wrote outside its profile before our cancel killed it": [
+    "write",
+    (opts) => {
+      writeFileSync(opts.cmd.at(-1) ?? "", "no");
+      return cancelKill;
+    },
+  ],
+  "timed out": ["write", () => proc({ cancelled: true, exitCode: null, signal: "SIGKILL", timedOut: true })],
+  "exited with incomplete output": ["write", () => proc({ cancelled: true, exitCode: 0, stdout: "" })],
+  "reported a Seatbelt failure before our cancel killed it": [
+    "read",
+    (opts) => {
+      opts.onRawChunk?.(`sandbox-exec: ${seatbeltDiagnostic}\n`, "stderr");
+      return cancelKill;
+    },
+  ],
+  "exited nonzero": ["signal", () => proc({ cancelled: true, exitCode: 1 })],
+  threw: [
+    "signal",
+    () => {
+      throw new Error("spawn failed");
+    },
+  ],
+};
+test.each(Object.entries(ownFailures))(
+  "a probe step that %s stays a confinement error despite a coincident cancel",
+  async (_, [step, failure]) => {
+    const probe = heldProbe(step);
+    const abort = new AbortController();
+    const launch = probe.launch(abort.signal);
+    await probe.reached;
+    abort.abort(new Error("cancelled by the test"));
+    probe.end(failure);
+    await expect(launch).rejects.toThrow(ConfinementError);
+    expect(probe.launched).toEqual([]);
+  },
+);
 
 test("command scratch persists across setup, checks and retry scopes, with readable toolchains", async () =>
   readPolicyScope.run({ home }, async () => {
