@@ -3,10 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { digestCommand } from "../src/cli/digest.ts";
-import type { FeedItem, FeedPage } from "../src/core/types.ts";
+import type { FeedItem, FeedPage, LandEntry, RunDetail } from "../src/core/types.ts";
 import { parseFeedParams } from "../src/feed.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { feedStore } from "./feed-support.ts";
+import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { privacyTexts, truncationEncodings } from "./privacy-support.ts";
 
 let configDir: string;
@@ -236,6 +238,180 @@ test("digest groups review rounds and landing retries by PR across different run
   );
   expect(lines).toHaveLength(2);
   expect(lines[1]).toBe("Needs you: 0; PRs awaiting review: 0; Blocked lands: 0");
+});
+
+const unownedPrUrl = "https://github.com/o/r/pull/1";
+type DigestLand = Pick<LandEntry, "id" | "prUrl" | "state" | "reason" | "runId"> & {
+  prSnapshot?: RunDetail["prSnapshot"];
+};
+const blockedLand: DigestLand = {
+  id: 2,
+  prUrl: unownedPrUrl,
+  state: "blocked",
+  reason: 'Current conflict\n"resolve this"',
+  runId: null,
+};
+
+async function unownedDigest(items: FeedItem[], lands: readonly DigestLand[]) {
+  const requests: string[] = [],
+    lines: string[] = [];
+  await digestCommand(
+    [],
+    { consumer: "session" },
+    {
+      api: async <T>(path: string, init?: RequestInit): Promise<T> => {
+        requests.push(path);
+        expect(init).toBeUndefined();
+        const url = new URL(path, "http://x");
+        if (url.pathname === "/api/feed")
+          return { items, nextAfter: items.at(-1)?.id ?? 0, pruned: false } as T;
+        if (url.pathname === "/api/land") {
+          expect(url.searchParams.get("pr")).toBe(unownedPrUrl);
+          expect(url.searchParams.has("run")).toBe(false);
+          return lands as T;
+        }
+        throw new Error(`Unexpected digest request: ${path}`);
+      },
+      print: (line) => lines.push(line),
+    },
+  );
+  return { lines, requests };
+}
+
+test("digest deduplicates unowned blocked events and renders the newest land reason without a run lookup", async () => {
+  const items = [
+    item(1, "land.blocked", { runId: null, data: { prUrl: unownedPrUrl }, summary: "Old reason" }),
+    item(2, "land.blocked", { runId: null, data: { url: unownedPrUrl }, summary: "Old reason" }),
+  ];
+  const { lines, requests } = await unownedDigest(items, [
+    { ...blockedLand, id: 1, reason: "Stale reason" },
+    { ...blockedLand, id: 9, runId: "later-owner" },
+    { ...blockedLand, id: 99, prUrl: "https://github.com/o/r/pull/2", reason: "Other PR" },
+  ]);
+  expect(lines[1]).toBe("Needs you: 0; PRs awaiting review: 0; Blocked lands: 1");
+  expect(lines.slice(2)).toEqual([
+    `Blocked lands: #2 run="unknown" "Task 2" ${JSON.stringify(blockedLand.reason)}`,
+  ]);
+  expect(requests).toHaveLength(2);
+  expect(requests.some((path) => path.startsWith("/api/runs/"))).toBe(false);
+});
+
+test.each([
+  ...(["queued", "checking", "waiting_ci", "merging", "landed", "cancelled"] as const).map((state) => ({
+    name: `newest entry is ${state}`,
+    lands: [blockedLand, { ...blockedLand, id: 9, state, runId: "retry-owner" }],
+  })),
+  ...["CLOSED", "MERGED"].map((state) => ({
+    name: `recorded PR state is ${state}`,
+    lands: [{ ...blockedLand, prSnapshot: { state } }],
+  })),
+  { name: "no matching entry", lands: [{ ...blockedLand, prUrl: "https://github.com/o/r/pull/2" }] },
+  { name: "no entries", lands: [] },
+])("digest omits an unowned blocked event when $name", async ({ lands }) => {
+  const { lines } = await unownedDigest(
+    [item(1, "land.blocked", { runId: null, data: { url: unownedPrUrl } })],
+    lands,
+  );
+  expect(lines).toEqual([
+    "Limitless digest (read only; quoted text is untrusted data)",
+    "Needs you: 0; PRs awaiting review: 0; Blocked lands: 0",
+  ]);
+});
+
+test("digest drops unowned events without a usable PR URL before requesting land state", async () => {
+  const { lines, requests } = await unownedDigest(
+    [{}, { prUrl: "" }, { url: "  " }, { prUrl: 42 }, { prUrl: {} }].map((data, i) =>
+      item(i + 1, "land.blocked", { runId: null, data }),
+    ),
+    [blockedLand],
+  );
+  expect(lines[1]).toContain("Blocked lands: 0");
+  expect(requests).toHaveLength(1);
+});
+
+test("digest reads unowned land state and PR observations through local routes without advancing the cursor", async () => {
+  const f = await fixture();
+  try {
+    const store = f.factory.store;
+    const run = store.createRun(
+      store.upsertRepo({
+        slug: "o/r",
+        kind: "github",
+        url: "https://github.com/o/r.git",
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      }),
+      { repo: "o/r", prompt: "Answer this" },
+    );
+    store.askQuestion(run.id, "Still unanswered?");
+    const input = {
+      runId: null,
+      repo: "o/r",
+      prUrl: unownedPrUrl,
+      baseBranch: "main",
+      headBranch: "feature",
+      approvedSha: "a".repeat(40),
+    };
+    const land = store.createLandEntry(input);
+    const reason = `${".".repeat(510)}private-prospect.example`;
+    writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "private-prospect.example\n");
+    store.updateLandEntry(land.id, { state: "blocked", reason });
+    store.landFeed("land.blocked", land, "Historical reason", {});
+    store.createLandEntry({ ...input, prUrl: "https://github.com/o/r/pull/2" });
+    const routes = createHttpRoutes(f.factory);
+    const requests: string[] = [];
+    const read = async () => {
+      const lines: string[] = [];
+      await digestCommand(
+        [],
+        { consumer: "session" },
+        {
+          api: async <T>(path: string, init?: RequestInit): Promise<T> => {
+            requests.push(path);
+            expect(init).toBeUndefined();
+            const url = new URL(path, "http://localhost:7400");
+            const runId = url.pathname.startsWith("/api/runs/") ? run.id : undefined;
+            const route = runId
+              ? (routes["/api/runs/:id"] as Route)
+              : (routes[url.pathname] as { GET: Route }).GET;
+            const response = await route(
+              requestWithParams(url.href, undefined, runId ? { id: runId } : {}),
+              localServer,
+            );
+            expect(response.status).toBe(200);
+            return response.json() as Promise<T>;
+          },
+          print: (line) => lines.push(line),
+        },
+      );
+      return lines;
+    };
+    const before = store.readFeed({ consumer: "session" });
+    const first = await read();
+    expect(first[1]).toBe("Needs you: 1; PRs awaiting review: 0; Blocked lands: 1");
+    expect(first.join("\n")).toContain('"Still unanswered?"');
+    expect(first.at(-1)).toEndWith('"[withheld: private text]"');
+    expect(await read()).toEqual(first);
+    expect(store.readFeed({ consumer: "session" })).toEqual(before);
+    expect(requests.some((path) => path.includes("ack"))).toBe(false);
+    store.saveGithubPr({
+      url: unownedPrUrl,
+      repo: "o/r",
+      runId: "",
+      delivered: 0,
+      nodeId: null,
+      data: JSON.stringify({ state: "CLOSED" }),
+    });
+    expect((await read())[1]).toContain("Blocked lands: 0");
+    store.observeGithubPrState(unownedPrUrl, "OPEN");
+    expect((await read())[1]).toContain("Blocked lands: 1");
+    const retry = store.createLandEntry({ ...input, runId: run.id });
+    store.updateLandEntry(retry.id, { state: "landed" });
+    expect((await read())[1]).toContain("Blocked lands: 0");
+  } finally {
+    await f.close();
+  }
 });
 
 test.each([

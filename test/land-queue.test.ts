@@ -31,7 +31,7 @@ import { markReport, reportStructure, reportText } from "../src/pipeline/report-
 import { createHttpRoutes } from "../src/server/http.ts";
 import * as proc from "../src/util/proc.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
-import { fakeConfinement } from "./confinement.ts";
+import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
@@ -54,6 +54,7 @@ let clock: ReturnType<typeof waitClock>;
 let originalPath: string | undefined;
 let slots: number;
 let github: ReturnType<typeof fakeGitHub>;
+let landConfinement: ReturnType<typeof recordingConfinement>;
 const pendingPrReads = new Set<object>();
 const queues: LandQueue[] = [];
 
@@ -74,8 +75,11 @@ beforeEach(async () => {
   ci = () => ({ ci: "SUCCESS" });
   landLog.length = 0;
   pendingPrReads.clear();
+  observers.clear();
+  runs.clear();
   clock = waitClock();
   github = fakeGitHub(clock.now);
+  landConfinement = recordingConfinement();
   slots = gateSlots.limit;
   gateSlots.setLimit(1);
   bare = join(root, "remote.git");
@@ -132,6 +136,7 @@ const pr=args[2].match(/pull\\/(\\d+)/)?.[1]??"0", merged=existsSync(file+".merg
 const branch=existsSync(file+".branch-"+pr)?readFileSync(file+".branch-"+pr,"utf8").trim():"";
 const baseRefName=existsSync(file+".base-"+pr)?readFileSync(file+".base-"+pr,"utf8").trim():undefined;
 const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
+const extra=existsSync(file+".view-"+pr)?JSON.parse(readFileSync(file+".view-"+pr,"utf8")):{};
 const flag=(n)=>args.includes(n);
 if(args[1]==="view" && args.includes("title,body,headRefOid,state")) {
  while(existsSync(file+".hold-view")) await Bun.sleep(10);
@@ -141,7 +146,7 @@ if(args[1]==="view" && args.includes("url,state,isDraft,headRefOid,mergedBy,merg
  if(existsSync(file+".preflight")){ console.log(readFileSync(file+".preflight","utf8")); process.exit(0); }
 }
 if(args[0]!=="pr"||args[1]!=="merge"){
- if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({url:args[2],title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",isDraft:false,mergedBy:merged&&!existsSync(file+".no-metadata")?{login:"owner"}:null,mergedAt:merged&&!existsSync(file+".no-metadata")?"2026-10-13T12:00:00Z":null,statusCheckRollup:[]}));
+ if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({url:args[2],title:"PR text",body:"PR body",baseRefName,headRefOid:head(),state:merged?"MERGED":"OPEN",isDraft:false,mergedBy:merged&&!existsSync(file+".no-metadata")?{login:"owner"}:null,mergedAt:merged&&!existsSync(file+".no-metadata")?"2026-10-13T12:00:00Z":null,statusCheckRollup:[],headRefName:branch,isCrossRepository:false,...extra}));
  process.exit(0);
 }
 if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
@@ -285,6 +290,7 @@ function queue(
     client?: LandPrClient;
     ciPollMs?: number;
     ciTimeoutMs?: number;
+    ciReruns?: boolean;
     start?: boolean;
     gateExecutor?: GateExecutor;
   } = {},
@@ -294,7 +300,7 @@ function queue(
     paths,
     readPolicy: testReadPolicy,
     github: github.client,
-    confinement: fakeConfinement,
+    confinement: landConfinement.backend,
     clock: {
       now: clock.now,
       set: (fn, ms) => clock.timer.set(fn, ms),
@@ -749,7 +755,7 @@ test("two approved entries on one repository land in order, never checking at on
   observe(2, head2);
   approve(2, head2);
   const q = queue();
-  await q.request({ target: first.run.id });
+  expect((await q.request({ target: first.run.id })).runId).toBe(first.run.id);
   await q.request({ target: second.run.id });
   await waitFor(() => store.getRun(first.run.id)?.merged === true);
   await waitWithoutClock(() => store.getRun(first.run.id)?.mergedBy === "owner", 15_000);
@@ -2674,6 +2680,7 @@ test("a request needs a review approval, or an explicit head that is the PR's", 
   const pr = delivered(1, "pr-1");
   const q = queue({ start: false });
   await expect(q.request({ target: "missing" })).rejects.toThrow("run not found");
+  await expect(q.request({ target: "77" })).rejects.toThrow("run not found");
   await expect(q.request({ target: pr.run.id })).rejects.toThrow("no review approval");
   await expect(q.request({ target: pr.run.id, sha: "c".repeat(40) })).rejects.toThrow(
     "not the pull request's current head",
@@ -2797,6 +2804,17 @@ test("the API queues, lists and cancels lands behind the loopback and content-ty
         )
       ).status,
     ).toBe(404);
+    unowned();
+    const head = await pushBranch("pr-1", "one.txt", "one\n");
+    const manual = (await (await post({ target: url(1), sha: head })).json()) as LandEntry;
+    expect(manual).toMatchObject({ runId: null, title: "Hand-made change", state: "queued" });
+    const withManual = (await (
+      await land.GET(requestWithParams("http://localhost:7400/api/land"), localServer)
+    ).json()) as LandEntry[];
+    expect(withManual.find((e) => e.id === manual.id)).toMatchObject({
+      runId: null,
+      title: "Hand-made change",
+    });
     const remote = {
       timeout: () => {},
       requestIP: () => ({ address: "10.0.0.9", family: "IPv4", port: 40000 }),
@@ -3056,6 +3074,7 @@ test.each(["clean", "final", "merge"])(
 );
 
 function claimSnapshot(entry: LandEntry) {
+  if (!entry.runId) throw new Error("expected a factory entry");
   return {
     entry: store.db.query("SELECT * FROM land_entries WHERE id = ?").get(entry.id),
     run: store.getRun(entry.runId),
@@ -3362,4 +3381,222 @@ test("replacement checkout survives the stale worker's cleanup", async () => {
     await replacementWork;
     boundary.mockRestore();
   }
+});
+
+/** A hand-made PR, never registered with a run or the GitHub poller. */
+function unowned(view: Record<string, unknown> = {}) {
+  store.upsertRepo({
+    slug: SLUG,
+    kind: "github",
+    url: bare,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  writeFileSync(
+    join(root, "gh.view-1"),
+    JSON.stringify({
+      baseRefName: "main",
+      title: "Hand-made change",
+      statusCheckRollup: [{ name: "build", status: "COMPLETED", conclusion: "SUCCESS" }],
+      ...view,
+    }),
+  );
+}
+
+test("an unowned PR lands the confined base merge at exactly the pushed head", async () => {
+  unowned();
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  await advanceBase(true);
+  const push = spyOn(repos, "pushExistingBranch");
+  const publication = spyOn(repos, "checkPrivatePublication");
+  try {
+    const entry = await queue().request({ target: url(1), sha: head });
+    expect(entry).toMatchObject({ state: "queued", runId: null, title: "Hand-made change" });
+    await settle();
+    const pushed = await remoteHead("pr-1");
+    expect(pushed).not.toBe(head);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", runId: null, pushedSha: pushed });
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(push.mock.calls[0]?.[3]).toBe(head); // lease on the approved head
+    expect(gateLog()).toEqual(["moved"]);
+    expect(landConfinement.calls.length).toBeGreaterThan(0);
+    expect(store.getLandEntry(entry.id)?.logPath).toBe(join(paths.home, "land", `land-${entry.id}.log`));
+    const merges = ghCalls("pr merge");
+    expect(merges).toHaveLength(1);
+    expect(merges[0]).toContain(`--match-head-commit ${pushed}`);
+    expect(merges[0]).toContain("--subject Hand-made change (#1)");
+    expect(publication.mock.calls.map(([, , input]) => input?.squash?.title)).toEqual([
+      "Hand-made change (#1)",
+    ]);
+    expect(merges[0]).not.toContain("--auto");
+    expect(readFileSync(join(root, "gh.body-1"), "utf8")).toBe("");
+    expect(store.readFeed({ limit: 100 }).items.filter((i) => i.kind.startsWith("land."))).toEqual([
+      expect.objectContaining({ kind: "land.queued", runId: null, repo: SLUG }),
+      expect.objectContaining({ kind: "land.landed", runId: null, repo: SLUG }),
+    ]);
+    expect(store.listRuns()).toEqual([]);
+  } finally {
+    push.mockRestore();
+    publication.mockRestore();
+  }
+});
+
+test("a push after approval blocks an unowned PR", async () => {
+  unowned();
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  const q = queue({ start: false });
+  await q.stop();
+  const entry = await q.request({ target: url(1), sha: head });
+  await pushBranch("pr-1", "one.txt", "two\n");
+  q.start();
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: "head moved after approval",
+  });
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(store.readFeed({ limit: 100 }).items.find((i) => i.kind === "land.blocked")).toMatchObject({
+    runId: null,
+    repo: SLUG,
+  });
+});
+
+test.each([
+  { view: { state: "CLOSED" }, reason: "pull request is CLOSED" },
+  { view: { state: "MERGED" }, reason: "pull request is MERGED" },
+  { view: { isCrossRepository: true }, reason: "cross-repository" },
+  { view: {}, sha: undefined, reason: "--sha" },
+  { view: {}, sha: "b".repeat(40), reason: "sha is not the pull request's current head" },
+  { view: {}, sha: "short", reason: "sha must be a full commit id" },
+  { view: { title: " " }, reason: "missing merge subject" },
+  { view: { baseRefName: "pr-1" }, reason: "no valid base distinct from the head" },
+  { view: { baseRefName: "bad..branch" }, reason: "no valid base distinct from the head" },
+  { view: { headRefName: "bad..branch" }, reason: "invalid PR head branch" },
+])("refuses an unowned PR: $reason", async (scenario) => {
+  unowned(scenario.view);
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  const sha = "sha" in scenario ? scenario.sha : head;
+  await expect(queue().request({ target: url(1), sha })).rejects.toThrow(scenario.reason);
+  expect(store.listLandEntries()).toEqual([]);
+  expect(store.readFeed({ limit: 100 }).items).toEqual([]);
+});
+
+test.each(["absent", "local"])("refuses an unconfigured GitHub repository (%s)", async (kind) => {
+  if (kind === "local")
+    store.upsertRepo({
+      slug: "other/repo",
+      kind: "local",
+      url: null,
+      localPath: seed,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+  await expect(
+    queue().request({ target: "https://github.com/other/repo/pull/5", sha: "a".repeat(40) }),
+  ).rejects.toThrow("repository other/repo is not a configured GitHub repository");
+  expect(store.listLandEntries()).toEqual([]);
+  expect(store.readFeed({ limit: 100 }).items).toEqual([]);
+  expect(ghCalls("pr view")).toEqual([]);
+});
+
+test.each(["checking", "waiting_ci"])("an unowned PR resumes after stopping during %s", async (state) => {
+  unowned();
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  await advanceBase();
+  if (state === "checking") rmSync(gateReleasePath());
+  else unowned({ statusCheckRollup: [{ name: "build", status: "IN_PROGRESS" }] });
+  const push = spyOn(repos, "pushExistingBranch");
+  try {
+    const first = queue();
+    const entry = await first.request({ target: url(1), sha: head });
+    await waitFor(() =>
+      state === "checking" ? gateLog().length === 1 : store.getLandEntry(entry.id)?.state === state,
+    );
+    await first.stop();
+    expect(store.getLandEntry(entry.id)?.state).toBe(state);
+    const pushed = store.getLandEntry(entry.id)?.pushedSha;
+    const pushes = push.mock.calls.length;
+    writeFileSync(gateReleasePath(), "");
+    unowned();
+    // Reopen the database too: title and progress must survive without an in-memory run.
+    store.close();
+    store = new Store(paths.db);
+    queue();
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", runId: null, attempts: 2 });
+    expect(gateLog()).toEqual(state === "checking" ? ["start", "start", "end"] : ["start", "end"]);
+    expect(push).toHaveBeenCalledTimes(1);
+    if (state === "waiting_ci") {
+      expect(push.mock.calls.length).toBe(pushes);
+      expect(store.getLandEntry(entry.id)?.pushedSha).toBe(pushed);
+    }
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain("--subject Hand-made change (#1)");
+  } finally {
+    push.mockRestore();
+  }
+});
+
+test("a conflict on an unowned PR blocks without pushing or starting a round", async () => {
+  unowned();
+  const head = await pushBranch("pr-1", "shared.txt", "from the PR\n");
+  await pushBranch("main", "shared.txt", "from the base\n", 0);
+  const entry = await queue().request({ target: url(1), sha: head });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "conflicts with main" });
+  expect(await remoteHead("pr-1")).toBe(head);
+  expect(ghCalls("pr merge")).toEqual([]);
+  await processConflictTriggers(store, clock.now);
+  expect(store.listRuns()).toEqual([]);
+  expect(store.pendingConflictTriggers()).toEqual([]);
+});
+
+test("an unowned PR already merged before restart is recorded without another merge", async () => {
+  unowned();
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  const q = queue();
+  unowned({ statusCheckRollup: [{ name: "build", status: "IN_PROGRESS" }] });
+  const entry = await q.request({ target: url(1), sha: head });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  await q.stop();
+  store.updateLandEntry(entry.id, { state: "merging" });
+  writeFileSync(join(root, "gh.merged-1"), "");
+  queue();
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", runId: null });
+  expect(gateLog()).toEqual(["start", "end"]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test.each(["push", "merge"])("an unowned PR's private subject blocks before %s", async (boundary) => {
+  const privateText = "synthetic-private-land-subject";
+  mkdirSync(paths.configDir, { recursive: true });
+  writeFileSync(join(paths.configDir, "private-strings.txt"), privateText);
+  unowned({ title: privateText });
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  if (boundary === "push") await advanceBase();
+  const push = spyOn(repos, "pushExistingBranch");
+  try {
+    const entry = await queue().request({ target: url(1), sha: head });
+    await settle();
+    expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+    expect(push).not.toHaveBeenCalled();
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(await remoteHead("pr-1")).toBe(head);
+  } finally {
+    push.mockRestore();
+  }
+});
+
+test("red CI on an unowned PR blocks without a CI fix round", async () => {
+  unowned({ statusCheckRollup: [{ name: "network", status: "COMPLETED", conclusion: "FAILURE" }] });
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  workflow(head, 1, "failure");
+  const entry = await queue({ ciReruns: false }).request({ target: url(1), sha: head });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "CI failed: network" });
+  expect(store.pendingCiFixTriggers()).toEqual([]);
+  expect(store.listRuns()).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
 });

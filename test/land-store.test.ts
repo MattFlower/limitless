@@ -75,3 +75,31 @@ test("land logPath reads back from get, list and a reopened store", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("land entries preserve previous inserts and persist unowned PRs without a nullable run_id", () => {
+  const store = new Store(":memory:");
+  try {
+    const old = store.db
+      .query(`INSERT INTO land_entries
+      (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`)
+      .run("run", "test/repo", "https://github.com/test/repo/pull/1", "main", "pr-1", "a".repeat(40), 1, 1);
+    expect(store.getLandEntry(Number(old.lastInsertRowid))).toMatchObject({ runId: "run", title: null });
+    const entry = store.createLandEntry({
+      runId: null,
+      title: "T",
+      repo: "test/repo",
+      prUrl: "https://github.com/test/repo/pull/2",
+      baseBranch: "main",
+      headBranch: "pr-2",
+      approvedSha: "b".repeat(40),
+    });
+    expect(store.db.query("SELECT run_id FROM land_entries WHERE id = ?").get(entry.id)).toEqual({
+      run_id: "",
+    });
+    expect(store.getLandEntry(entry.id)).toMatchObject({ runId: null, title: "T" });
+    expect(store.listLandEntries().find((e) => e.id === entry.id)).toMatchObject({ runId: null, title: "T" });
+  } finally {
+    store.close();
+  }
+});

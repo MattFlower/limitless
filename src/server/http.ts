@@ -650,7 +650,14 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     ),
     "/api/github/access": handle(() => json(store.githubAccessProblems())),
     "/api/land": {
-      GET: handle((req) => json(factory.land.list(new URL(req.url).searchParams.get("run") ?? undefined))),
+      GET: handle((req) => {
+        const params = new URL(req.url).searchParams;
+        const prUrl = params.get("pr");
+        if (prUrl === null) return json(factory.land.list(params.get("run") ?? undefined));
+        const entry = store.latestLandEntry(null, prUrl);
+        const prSnapshot: unknown = JSON.parse(store.githubPrData(prUrl) ?? "null");
+        return json(entry ? [{ ...entry, prSnapshot }] : []);
+      }),
       POST: handle(async (req) => {
         const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
         const target = typeof input.target === "string" ? input.target : input.runId;
