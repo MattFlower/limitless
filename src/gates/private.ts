@@ -2,68 +2,99 @@ import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-// A path removed between lstat and realpath (another run's worktree) is canonicalized as missing.
-// A dangling symlink keeps its link, so its realpath error still stands.
-const canonical = (p: string): string => {
-  if (lstatSync(p, { throwIfNoEntry: false }))
-    try {
-      return realpathSync(p);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || lstatSync(p, { throwIfNoEntry: false }))
-        throw error;
-    }
-  return join(canonical(dirname(p)), basename(p));
-};
+const canonical = (p: string): string =>
+  lstatSync(p, { throwIfNoEntry: false }) ? realpathSync(p) : join(canonical(dirname(p)), basename(p));
+const absent = (path: string) => !lstatSync(path, { throwIfNoEntry: false });
+const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
+/** `path` is `root` or below it; the filesystem root contains every path. */
+const within = (path: string, root: string) => `${path}/`.startsWith(root.endsWith("/") ? root : `${root}/`);
 export class PrivateError extends Error {}
-/** `read()`, or `fallback` when the path doesn't exist; every other error still throws. */
-function unlessMissing<T>(read: () => T, fallback: T): T {
+
+/**
+ * Checkouts of the linked worktrees listed in `worktrees`. Another run's worktree that git is adding or
+ * removing is skipped only in git's own transient states, judged by lstat: an entry or gitdir file that
+ * no longer (or doesn't yet) exist, or an empty gitdir file while git's "initializing" lock is held.
+ * A symlink, an unreadable file, or an empty gitdir without the lock (`worktree move` rewrites it) is read
+ * strictly and blocks.
+ */
+function linkedCheckouts(worktrees: string): string[] {
+  let names: string[];
   try {
-    return read();
+    names = readdirSync(worktrees);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return fallback;
+    // git drops the directory with its last entry.
+    if (missing(error) && absent(worktrees)) return [];
     throw error;
   }
+  return names.flatMap((name) => {
+    const entry = join(worktrees, name);
+    const stat = lstatSync(entry, { throwIfNoEntry: false });
+    if (!stat) return [];
+    const gitdir = join(entry, "gitdir");
+    const file = lstatSync(gitdir, { throwIfNoEntry: false });
+    // git creates the entry before it writes gitdir, and removes gitdir before the entry.
+    if (stat.isDirectory() && !file) return [];
+    const plain = stat.isDirectory() && file?.isFile() === true;
+    let target: string;
+    try {
+      target = readFileSync(gitdir, "utf8").trim();
+    } catch (error) {
+      if (plain && missing(error) && absent(gitdir)) return [];
+      throw error;
+    }
+    if (!target) {
+      if (plain && !absent(join(entry, "locked"))) return [];
+      throw new Error(`Empty gitdir in ${entry}`);
+    }
+    // git can write the checkout's path relative to the entry.
+    return [dirname(resolve(entry, target))];
+  });
 }
-export function loadPrivateStrings(
-  configDir = process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless"),
-  roots: (string | null | undefined)[] = [],
-): { value: string; entry: number }[] {
-  let text: string;
-  try {
-    const file = canonical(join(configDir, "private-strings.txt"));
-    const locations = [resolve(configDir), canonical(configDir), file];
-    const read = (path: string) => readFileSync(path, "utf8").trim();
-    const repositoryRoots = roots.flatMap((root) => {
-      if (!root) return [];
-      let git = canonical(join(root, ".git"));
-      const stat = lstatSync(git, { throwIfNoEntry: false });
-      if (stat?.isFile()) git = resolve(root, read(git).replace(/^gitdir: /, ""));
-      else if (!stat) git = root;
-      if (lstatSync(join(git, "commondir"), { throwIfNoEntry: false }))
-        git = canonical(resolve(git, read(join(git, "commondir"))));
-      const worktrees = join(git, "worktrees");
-      // Another run's worktree that git is adding or removing has no gitdir file yet (or an empty
-      // one mid-write), or no longer, and git drops the directory with its last entry. Only those
-      // are skipped.
-      const linked = unlessMissing(() => readdirSync(worktrees), []).flatMap((name) => {
-        const target = unlessMissing(() => read(join(worktrees, name, "gitdir")), "");
-        return target ? [dirname(target)] : [];
-      });
-      return [root, git, ...(basename(git) === ".git" ? [dirname(git)] : []), ...linked];
-    });
-    const boundaries = repositoryRoots.flatMap((root) => [resolve(root), canonical(resolve(root))]);
-    if (boundaries.some((root) => locations.some((path) => `${path}/`.startsWith(`${root}/`))))
-      throw new PrivateError("Private config is inside repository; publication blocked");
-    if (!lstatSync(file, { throwIfNoEntry: false })) return [];
-    text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
-  } catch (error) {
-    if (error instanceof PrivateError) throw error;
-    throw new PrivateError("Cannot read private-strings.txt; publication blocked");
-  }
+
+function readPrivateStrings(configDir: string, roots: (string | null | undefined)[]) {
+  const file = canonical(join(configDir, "private-strings.txt"));
+  const locations = [resolve(configDir), canonical(configDir), file];
+  const read = (path: string) => readFileSync(path, "utf8").trim();
+  const repositoryRoots = roots.flatMap((root) => {
+    if (!root) return [];
+    let git = canonical(join(root, ".git"));
+    const stat = lstatSync(git, { throwIfNoEntry: false });
+    if (stat?.isFile()) git = resolve(root, read(git).replace(/^gitdir: /, ""));
+    else if (!stat) git = root;
+    if (lstatSync(join(git, "commondir"), { throwIfNoEntry: false }))
+      git = canonical(resolve(git, read(join(git, "commondir"))));
+    const worktrees = join(git, "worktrees");
+    const linked = absent(worktrees) ? [] : linkedCheckouts(worktrees);
+    return [root, git, ...(basename(git) === ".git" ? [dirname(git)] : []), ...linked];
+  });
+  const boundaries = repositoryRoots.flatMap((root) => [resolve(root), canonical(resolve(root))]);
+  if (boundaries.some((root) => locations.some((path) => within(path, root))))
+    throw new PrivateError("Private config is inside repository; publication blocked");
+  if (!lstatSync(file, { throwIfNoEntry: false })) return [];
+  // Read only the path that was checked: a symlinked component restored since then could lead elsewhere.
+  if (realpathSync(file) !== file) throw new Error("Private config moved during the check");
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
   return text.split(/\r?\n/).flatMap((line, i) => {
     const value = line.trim();
     return value && !value.startsWith("#") ? [{ value, entry: i + 1 }] : [];
   });
+}
+
+export function loadPrivateStrings(
+  configDir = process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless"),
+  roots: (string | null | undefined)[] = [],
+): { value: string; entry: number }[] {
+  // Another run's worktree can vanish between canonicalization's lstat and realpath. Each attempt is a
+  // whole check that fails closed, so only a missing path is retried, and three failures block.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return readPrivateStrings(configDir, roots);
+    } catch (error) {
+      if (error instanceof PrivateError) throw error;
+      if (missing(error) && attempt < 3) continue;
+      throw new PrivateError("Cannot read private-strings.txt; publication blocked");
+    }
+  }
 }
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();

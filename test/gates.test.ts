@@ -2112,50 +2112,134 @@ test("private policy rejects broken lists and repository aliases; normalizes bot
   }
 });
 
-test("private policy skips a linked worktree that git is adding or removing, and only that", () => {
+test("private policy skips only git's own transient worktree states", () => {
   const root = mkdtempSync(join(tmpdir(), "private-linked-"));
   const config = join(root, "config");
-  const admin = join(root, "repo", ".git", "worktrees");
+  const repo = join(root, "repo");
+  const admin = join(repo, ".git", "worktrees");
+  const entry = (name: string) => join(admin, name);
+  const load = () => loadPrivateStrings(config, [repo]);
+  const reset = () => {
+    rmSync(admin, { recursive: true, force: true });
+    mkdirSync(admin, { recursive: true });
+  };
   mkdirSync(config);
   writeFileSync(join(config, "private-strings.txt"), "secret-host.example\n");
   try {
-    // git creates the entry before writing its gitdir, and removes the gitdir before the entry.
-    mkdirSync(join(admin, "adding"), { recursive: true });
-    expect(loadPrivateStrings(config, [join(root, "repo")])).toHaveLength(1);
-    // Mid-write the gitdir is empty, which must not resolve to the process's working directory.
-    writeFileSync(join(admin, "adding", "gitdir"), "");
-    const cwd = process.cwd();
-    process.chdir(root);
-    try {
-      expect(loadPrivateStrings(config, [join(root, "repo")])).toHaveLength(1);
-    } finally {
-      process.chdir(cwd);
+    // git creates the entry (and its "initializing" lock) before writing gitdir, removes gitdir
+    // before the entry, and truncates gitdir before writing it.
+    reset();
+    mkdirSync(entry("adding"));
+    expect(load()).toHaveLength(1);
+    writeFileSync(join(entry("adding"), "locked"), "initializing");
+    writeFileSync(join(entry("adding"), "gitdir"), "");
+    expect(load()).toHaveLength(1);
+    // Without the lock an empty gitdir is `worktree move` or damage, not an add.
+    rmSync(join(entry("adding"), "locked"));
+    expect(load).toThrow("Cannot read");
+    // A complete entry holding the config blocks, also when git wrote the path relative to the entry.
+    for (const target of [join(root, ".git"), "../../../../.git"]) {
+      reset();
+      mkdirSync(entry("holder"));
+      writeFileSync(join(entry("holder"), "gitdir"), `${target}\n`);
+      expect(load).toThrow("inside repository");
     }
-    // A complete entry still counts: a linked worktree holding the config blocks publication.
-    mkdirSync(join(admin, "holder"));
-    writeFileSync(join(admin, "holder", "gitdir"), `${join(root, ".git")}\n`);
-    expect(() => loadPrivateStrings(config, [join(root, "repo")])).toThrow("inside repository");
-    // git can also remove a worktree between the check that it exists and resolving its real path.
-    rmSync(join(admin, "holder"), { recursive: true });
+    // A partly written gitdir naming the filesystem root contains everything.
+    writeFileSync(join(entry("holder"), "gitdir"), "/\n");
+    expect(load).toThrow("inside repository");
+    // A dangling symlink is not an absent entry: gitdir, the entry and the worktrees directory.
+    reset();
+    mkdirSync(entry("linked"));
+    symlinkSync(join(root, "gone"), join(entry("linked"), "gitdir"));
+    expect(load).toThrow("Cannot read");
+    reset();
+    symlinkSync(join(root, "gone"), entry("linked"));
+    expect(load).toThrow("Cannot read");
+    rmSync(admin, { recursive: true });
+    symlinkSync(join(root, "gone"), admin);
+    expect(load).toThrow("Cannot read");
+    // Any other unreadable gitdir blocks too.
+    reset();
+    mkdirSync(join(entry("broken"), "gitdir"), { recursive: true });
+    expect(load).toThrow("Cannot read");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private policy rechecks from scratch when a path vanishes mid-check and reads only what it checked", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-race-"));
+  const repo = join(root, "repo");
+  const admin = join(repo, ".git", "worktrees");
+  mkdirSync(join(repo, "config"), { recursive: true });
+  writeFileSync(join(repo, "config", "private-strings.txt"), "repo-controlled\n");
+  const config = join(root, "config");
+  mkdirSync(config);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example\n");
+  const realpath = fs.realpathSync;
+  const lstat = fs.lstatSync;
+  try {
+    // Another run removes its worktree between canonicalization's lstat and realpath.
     const other = join(root, "other");
     mkdirSync(other);
-    mkdirSync(join(admin, "other"));
+    mkdirSync(join(admin, "other"), { recursive: true });
     writeFileSync(join(admin, "other", "gitdir"), `${join(other, ".git")}\n`);
-    const realpath = fs.realpathSync;
     const removing = spyOn(fs, "realpathSync").mockImplementation(((path: string) => {
-      if (path === other) rmSync(other, { recursive: true });
+      if (path === other) rmSync(other, { recursive: true, force: true });
       return realpath(path);
     }) as typeof fs.realpathSync);
     try {
-      expect(loadPrivateStrings(config, [join(root, "repo")])).toHaveLength(1);
+      expect(loadPrivateStrings(config, [repo])).toHaveLength(1);
       expect(removing.mock.calls.some(([path]) => path === other)).toBe(true);
     } finally {
       removing.mockRestore();
     }
-    rmSync(join(admin, "other"), { recursive: true });
-    // Anything but a missing file still fails closed.
-    mkdirSync(join(admin, "broken", "gitdir"), { recursive: true });
-    expect(() => loadPrivateStrings(config, [join(root, "repo")])).toThrow("Cannot read");
+    // A path that keeps vanishing blocks after three whole attempts.
+    const spellings = new Set([
+      join(config, "private-strings.txt"),
+      join(realpath(config), "private-strings.txt"),
+    ]);
+    const vanishing = spyOn(fs, "realpathSync").mockImplementation(((path: string) => {
+      if (spellings.has(path)) throw Object.assign(new Error(`ENOENT: ${path}`), { code: "ENOENT" });
+      return realpath(path);
+    }) as typeof fs.realpathSync);
+    try {
+      expect(() => loadPrivateStrings(config, [repo])).toThrow("Cannot read");
+      expect(vanishing.mock.calls.filter(([path]) => spellings.has(String(path)))).toHaveLength(3);
+    } finally {
+      vanishing.mockRestore();
+    }
+    // A symlinked config is removed while it is canonicalized and restored before the read, so the
+    // check sees an unresolved spelling while the read would land inside the repository.
+    const linked = join(root, "cfg");
+    symlinkSync(join(repo, "config"), linked);
+    expect(() => loadPrivateStrings(linked, [repo])).toThrow("inside repository");
+    // Removed at its first realpath; restored when the final lstat reaches the fallback spelling.
+    const asPassed = join(linked, "private-strings.txt");
+    const fallback = join(realpath(root), "cfg", "private-strings.txt");
+    let removed = false;
+    let restored = false;
+    const swapping = spyOn(fs, "realpathSync").mockImplementation(((path: string) => {
+      if (path === asPassed && !removed) {
+        removed = true;
+        rmSync(linked);
+      }
+      return realpath(path);
+    }) as typeof fs.realpathSync);
+    const restoring = spyOn(fs, "lstatSync").mockImplementation(((path: string, options?: fs.StatOptions) => {
+      if (path === fallback && removed && !restored) {
+        restored = true;
+        symlinkSync(join(repo, "config"), linked);
+      }
+      return lstat(path, options);
+    }) as typeof fs.lstatSync);
+    try {
+      expect(() => loadPrivateStrings(linked, [repo])).toThrow("Cannot read");
+      expect({ removed, restored }).toEqual({ removed: true, restored: true });
+    } finally {
+      swapping.mockRestore();
+      restoring.mockRestore();
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
