@@ -129,18 +129,12 @@ export async function recoverProcessCleanups(
   }
 }
 
-export async function recoverScopedProcesses(): Promise<void> {
+/** Undefined when nothing is recorded, so runProcess still registers its child synchronously. */
+export function recoverScopedProcesses(): Promise<void> | undefined {
   const scope = processScope.getStore();
   const store = scope?.cleanups ?? processCleanupStore.getStore();
   if (!store || !scope?.runId) return;
-  let checkout: string | undefined;
-  try {
-    const path = scope.checkout?.();
-    if (path) checkout = realpathSync(path);
-  } catch {}
-  try {
-    await recoverProcessCleanups(store, store.listProcessCleanups(scope.runId, checkout));
-  } catch (error) {
+  const refuse = (error: unknown) => {
     scope.terminationError =
       error instanceof ProcessTerminationError
         ? error
@@ -148,7 +142,18 @@ export async function recoverScopedProcesses(): Promise<void> {
             `${ProcessTerminationError.prefix}: ${redactCredentials((error as Error).message)}`,
             { cause: error },
           );
-    throw scope.terminationError;
+    return Promise.reject(scope.terminationError);
+  };
+  let checkout: string | undefined;
+  try {
+    const path = scope.checkout?.();
+    if (path) checkout = realpathSync(path);
+  } catch {}
+  try {
+    const records = store.listProcessCleanups(scope.runId, checkout);
+    return records.length ? recoverProcessCleanups(store, records).catch(refuse) : undefined;
+  } catch (error) {
+    return refuse(error);
   }
 }
 
@@ -646,10 +651,8 @@ function stillRunning(pid: number): boolean {
  */
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
   assertProcessesStopped();
-  const scope = processScope.getStore();
-  if (scope?.runId && (scope.cleanups ?? processCleanupStore.getStore()))
-    return recoverScopedProcesses().then(() => startProcess(opts));
-  return startProcess(opts);
+  const recovering = recoverScopedProcesses();
+  return recovering ? recovering.then(() => startProcess(opts)) : startProcess(opts);
 }
 
 function startProcess(opts: ProcOptions): Promise<ProcResult> {
