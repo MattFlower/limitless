@@ -20,6 +20,7 @@ import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 let home: string;
@@ -537,7 +538,7 @@ exec '${gitBin}' "$@"
       expect(result.cancelled).toBe(true);
       expect(result.signal === "SIGTERM" || result.signal === "SIGKILL").toBe(true);
       expect(child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL").toBe(true);
-      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      expectProcessStopped(pid);
       expect(await waitFor(f, run.id, ["cancelled", "failed", "needs_human", "succeeded"])).toBe("cancelled");
       expect(f.store.getStage(activeStage.id)?.status).toBe("cancelled");
       expect(f.store.getRun(run.id)?.status).toBe("cancelled");

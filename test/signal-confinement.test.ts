@@ -16,6 +16,7 @@ import { withScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { agentEnv, type ProcOptions, runProcess } from "../src/util/proc.ts";
 import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { test } from "./read-policy-support.ts";
 
 const payload = join(import.meta.dir, "fixtures/signal-payload.ts");
@@ -206,7 +207,7 @@ exec "${process.execPath}" "${gatePayload(cwd)}"`,
       expect(owned).toBeDefined();
       expect(result[action === "timeout" ? "timedOut" : "cancelled"]).toBe(true);
       // Retained test-owned PID, never a process-name lookup.
-      expect(() => process.kill(owned ?? 0, 0)).toThrow();
+      expectProcessStopped(owned ?? 0);
     } catch (error) {
       if (seatbeltSkip === null) throw error;
       expect(error).toBeInstanceOf(ConfinementError);
