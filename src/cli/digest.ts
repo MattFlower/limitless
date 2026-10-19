@@ -9,6 +9,10 @@ import { FeedQuerySchema } from "../feed.ts";
 import { loadOutputPrivacy, type OutputPrivacy } from "../util/private-output.ts";
 
 type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
+const itemPrUrl = (item: FeedItem) =>
+  [item.data.prUrl, item.data.url].find(
+    (url): url is string => typeof url === "string" && url.trim().length > 0,
+  );
 const quote = (value: string) =>
   JSON.stringify(value).replace(
     /[\u007f-\u009f\u2028\u2029]/g,
@@ -74,8 +78,13 @@ async function printDigest(
     pruned ||= page.pruned;
     for (const item of page.items)
       for (const [index, group] of groups.entries()) {
+        if (index === 2 && !item.runId && !itemPrUrl(item)) continue;
         const key = String(
-          (index === 0 ? item.runId : (item.data.prUrl ?? item.data.url ?? item.runId)) ?? item.id,
+          (index === 2 && !item.runId
+            ? itemPrUrl(item)
+            : index === 0
+              ? item.runId
+              : (item.data.prUrl ?? item.data.url ?? item.runId)) ?? item.id,
         );
         if (group.kinds.includes(item.kind)) group.items.set(key, item);
       }
@@ -84,10 +93,25 @@ async function printDigest(
     after = page.nextAfter;
   }
   const current = new Map<string, { detail: RunDetail; land: LandEntry | undefined }>();
+  const unowned = new Map<FeedItem, LandEntry>();
   for (const [index, group] of groups.entries())
     for (const [key, item] of group.items) {
       if (!item.runId) {
-        group.items.delete(key);
+        const prUrl = itemPrUrl(item);
+        const lands =
+          index === 2 && prUrl
+            ? await deps.api<(LandEntry & { prSnapshot?: RunDetail["prSnapshot"] })[]>(
+                `/api/land?pr=${encodeURIComponent(prUrl)}`,
+              )
+            : [];
+        const land = lands.filter((entry) => entry.prUrl === prUrl).sort((a, b) => b.id - a.id)[0];
+        if (
+          land?.state === "blocked" &&
+          land.prSnapshot?.state !== "MERGED" &&
+          land.prSnapshot?.state !== "CLOSED"
+        )
+          unowned.set(item, land);
+        else group.items.delete(key);
         continue;
       }
       let state = current.get(item.runId);
@@ -146,7 +170,7 @@ async function printDigest(
           : item.kind === "run.failed" || item.kind === "run.needs_human"
             ? run?.error
             : item.kind === "land.blocked"
-              ? state?.land?.reason
+              ? (state?.land ?? unowned.get(item))?.reason
               : item.kind === "run.pr_opened" && typeof item.data.prUrl === "string"
                 ? item.data.prUrl
                 : undefined;

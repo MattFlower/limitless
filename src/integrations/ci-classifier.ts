@@ -83,7 +83,7 @@ const quote = (s: string) => `> ${redactCredentials(s).replace(/\r?\n/g, "\n> ")
 /** Serial REST inspection. False retains the persisted pending inspection for a later poll. */
 async function inspectCi(
   store: Store,
-  pr: TrackedPr,
+  pr: Omit<TrackedPr, "runId"> & { runId: string | null },
   snap: PrSnapshot,
   call: Call,
   reruns: boolean,
@@ -207,7 +207,7 @@ async function inspectCi(
   ) => {
     const evidence = redactCredentials(excerpt).trim().slice(0, 2000);
     write(() => {
-      if (kind === "ci.needs_fix" && !repository && !unsafe && !state.get(f.check)?.red)
+      if (kind === "ci.needs_fix" && pr.runId && !repository && !unsafe && !state.get(f.check)?.red)
         store.recordCiFixTrigger(pr.url, snap.headRefOid, key, { ...f, excerpt: evidence }, Date.now());
       store.saveGithubPr(null, false, [
         {
@@ -502,7 +502,7 @@ const inspections = new WeakMap<Store, Map<string, Promise<CiDecision>>>();
 /** Both CI consumers use the same inspection and durable head-wide claim, including after restart. */
 export function ciDecision(
   store: Store,
-  pr: TrackedPr,
+  pr: Omit<TrackedPr, "runId"> & { runId: string | null },
   snap: PrSnapshot,
   call: Call,
   reruns: boolean,

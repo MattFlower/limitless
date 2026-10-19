@@ -181,7 +181,7 @@ export class LandQueue {
    */
   async request(input: { target: string; sha?: string }): Promise<LandEntry> {
     const run = this.store.getRun(input.target) ?? this.store.runForPr(this.prRef(input.target));
-    if (!run) throw new Error("run not found");
+    if (!run) return this.requestUnowned(input);
     const repo = this.store.getRepoBySlug(run.repoSlug);
     if (repo?.kind !== "github") throw new Error("run is not on a GitHub repository");
     if (!run.prUrl) throw new Error("run has no pull request");
@@ -222,10 +222,60 @@ export class LandQueue {
     return entry;
   }
 
+  private async requestUnowned(input: { target: string; sha?: string }): Promise<LandEntry> {
+    const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9]\d*$/.exec(input.target);
+    if (!match) throw new Error("run not found");
+    const repo = this.store.getRepoBySlug(match[1] ?? "");
+    if (repo?.kind !== "github")
+      throw new Error(`repository ${match[1]} is not a configured GitHub repository`);
+    if (!input.sha?.trim()) throw new Error("a pull request no factory run opened needs --sha <full sha>");
+    const json = await (this.deps.gh ?? runGh)([
+      "pr",
+      "view",
+      input.target,
+      "--json",
+      "url,state,headRefOid,headRefName,baseRefName,title,isCrossRepository",
+    ]);
+    const pr = z
+      .object({
+        url: z.string(),
+        state: z.string(),
+        headRefOid: z.string(),
+        headRefName: z.string(),
+        baseRefName: z.string(),
+        title: z.string(),
+        isCrossRepository: z.boolean(),
+      })
+      .parse(JSON.parse(String(json)));
+    if (pr.url !== input.target) throw new Error("pull request URL differs from the requested URL");
+    if (pr.state !== "OPEN") throw new Error(`pull request is ${pr.state}`);
+    if (pr.isCrossRepository) throw new Error("cross-repository pull requests cannot be landed");
+    if (!pr.title.trim()) throw new Error("missing merge subject");
+    if (!isBranchName(pr.headRefName)) throw new Error("invalid PR head branch");
+    if (!isBranchName(pr.baseRefName) || pr.baseRefName === pr.headRefName)
+      throw new Error("cannot determine PR base branch: no valid base distinct from the head branch");
+    this.store.assertNoRoundInFlight(pr.url);
+    const approved = this.approval(pr.url, input.sha, pr.headRefOid);
+    const entry = this.store.createLandEntry({
+      runId: null,
+      title: pr.title,
+      repo: repo.slug,
+      prUrl: pr.url,
+      baseBranch: pr.baseRefName,
+      headBranch: pr.headRefName,
+      approvedSha: approved,
+    });
+    this.store.landFeed("land.queued", entry, `land queued at ${approved.slice(0, 12)}`, {
+      state: entry.state,
+    });
+    this.pump(entry.repo);
+    return entry;
+  }
+
   /** Round delivery targets the PR head; only its owning run can supply the PR base. */
-  private async resolveBase(run: Run, prUrl: string, headBranch: string, signal?: AbortSignal) {
-    const round = this.store.reviewRound(run.id);
-    const owner = round?.owner ?? (run.sourceRef?.kind === "review-round" ? null : run);
+  private async resolveBase(run: Run | null, prUrl: string, headBranch: string, signal?: AbortSignal) {
+    const round = run && this.store.reviewRound(run.id);
+    const owner = round?.owner ?? (run?.sourceRef?.kind === "review-round" ? null : run);
     const valid = (branch: unknown): branch is string =>
       typeof branch === "string" && isBranchName(branch) && branch !== headBranch;
     if (owner?.sourceRef?.kind !== "review-round" && valid(owner?.baseBranch)) return owner.baseBranch;
@@ -357,7 +407,7 @@ export class LandQueue {
       if (!fresh || fresh.url !== entry.prUrl || !["OPEN", "MERGED"].includes(fresh.state))
         throw new LandBlocked("cannot confirm current GitHub merge state");
       if (fresh.state === "MERGED") {
-        this.landed(entry, run, entry.pushedSha, { ...fresh, head: fresh.headRefOid ?? "" });
+        this.landed(entry, repo, entry.pushedSha, { ...fresh, head: fresh.headRefOid ?? "" });
         await this.discard(repo, this.worktreePath(entry));
         return;
       }
@@ -372,10 +422,11 @@ export class LandQueue {
         this.store.updateLandEntry(entry.id, { baseBranch, pushedSha: null, ciRerun: null }),
       );
     }
-    const ownerId = run.sourceRef?.kind === "review-round" ? run.sourceRef.runId : run.id;
+    const ownerId = run?.sourceRef?.kind === "review-round" ? run.sourceRef.runId : run?.id;
     const owner = typeof ownerId === "string" ? this.store.getRun(ownerId) : null;
-    if (!owner?.title?.trim()) throw new LandBlocked("missing merge subject");
-    const subject = squashTitle(owner.title, entry.prUrl);
+    const title = run ? owner?.title : entry.title;
+    if (!title?.trim()) throw new LandBlocked("missing merge subject");
+    const subject = squashTitle(title, entry.prUrl);
     // The claim already moved the entry into `checking` and counted this attempt.
     this.log(`[land] ${entry.id}: checking ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`);
     const cache = await ensureCache(this.deps.paths, repo, signal);
@@ -399,15 +450,15 @@ export class LandQueue {
       }
       if (entry.pushedSha) await this.checkPublication(entry, run, cwd, baseSha, head, subject);
       const ci = await this.awaitCi(entry, head, signal);
-      if (ci !== "green") return this.landed(entry, run, head, ci);
-      await this.merge(entry, run, cwd, head, subject, signal);
+      if (ci !== "green") return this.landed(entry, repo, head, ci);
+      await this.merge(entry, run, repo, cwd, head, subject, signal);
     } finally {
       await this.discard(repo, cwd);
     }
   }
 
   /** A PR that already merged is recorded, never merged again. */
-  private landed(entry: LandEntry, run: Run, sha: string, observation: LandObservation | null): void {
+  private landed(entry: LandEntry, repo: Repo, sha: string, observation: LandObservation | null): void {
     if (observation?.state === "MERGED" && observation.head !== sha)
       throw new LandBlocked("merged PR head is missing or differs from the pushed SHA");
     const at = observation?.mergedAt ? Date.parse(observation.mergedAt) : NaN;
@@ -421,7 +472,7 @@ export class LandQueue {
           "landed",
           `${current.reason?.startsWith("flaky:") ? `${current.reason}; ` : ""}merged ${sha.slice(0, 12)}`,
         );
-      this.store.resolveMergedPr(run.repoId, entry.prUrl, mergedBy, mergedAt, this.now());
+      this.store.resolveMergedPr(repo.id, entry.prUrl, mergedBy, mergedAt, this.now());
     });
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
   }
@@ -436,7 +487,9 @@ export class LandQueue {
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */
   private async checks(entry: LandEntry, cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
-    const log = join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`);
+    const log = entry.runId
+      ? join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`)
+      : join(this.deps.paths.home, "land", `land-${entry.id}.log`);
     const base = `${cwd}-base`;
     try {
       rmSync(base, { recursive: true, force: true });
@@ -500,12 +553,13 @@ export class LandQueue {
         );
         this.owned(entry.id, () => {
           this.store.updateLandEntry(entry.id, { reason });
-          this.store.addEvent({
-            runId: entry.runId,
-            type: "gate",
-            level: "warn",
-            message: redactGateOutput(`Land ${entry.id} ${reason}`),
-          });
+          if (entry.runId)
+            this.store.addEvent({
+              runId: entry.runId,
+              type: "gate",
+              level: "warn",
+              message: redactGateOutput(`Land ${entry.id} ${reason}`),
+            });
         });
       }
     } finally {
@@ -696,7 +750,8 @@ export class LandQueue {
 
   private async merge(
     entry: LandEntry,
-    run: Run,
+    run: Run | null,
+    repo: Repo,
     cwd: string,
     sha: string,
     subject: string,
@@ -723,7 +778,7 @@ export class LandQueue {
       this.publication(entry, cwd),
       {
         subject,
-        body: this.reportBody(run),
+        body: run ? this.reportBody(run) : "",
         auto: false,
         guard: () => this.assertClaim(entry.id),
       },
@@ -734,13 +789,13 @@ export class LandQueue {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
     }
-    this.landed(entry, run, sha, null);
+    this.landed(entry, repo, sha, null);
     const observed = await this.mergeMetadata(entry.prUrl, signal);
     if (observed?.state !== "MERGED" || observed.url !== entry.prUrl) return;
     const at = observed.mergedAt ? Date.parse(observed.mergedAt) : NaN;
     this.owned(entry.id, () =>
       this.store.resolveMergedPr(
-        run.repoId,
+        repo.id,
         entry.prUrl,
         observed.mergedBy?.login ?? null,
         Number.isFinite(at) ? at : null,
@@ -797,7 +852,7 @@ export class LandQueue {
 
   private async checkPublication(
     entry: LandEntry,
-    run: Run,
+    run: Run | null,
     cwd: string,
     base: string,
     head: string,
@@ -808,7 +863,7 @@ export class LandQueue {
         base,
         head,
         title: subject,
-        body: this.reportBody(run),
+        body: run ? this.reportBody(run) : "",
       },
       // Select the factory's merge itself, never traverse either parent's existing history.
       ...(head !== entry.approvedSha ? { commits: `${head}^!` } : {}),
@@ -826,10 +881,10 @@ export class LandQueue {
     return entries;
   }
 
-  private context(entry: LandEntry): { repo: Repo; run: Run } {
-    const run = this.store.getRun(entry.runId);
+  private context(entry: LandEntry): { repo: Repo; run: Run | null } {
+    const run = entry.runId ? this.store.getRun(entry.runId) : null;
     const repo = this.store.getRepoBySlug(entry.repo);
-    if (!run) throw new Error(`run ${entry.runId} is gone`);
+    if (entry.runId && !run) throw new Error(`run ${entry.runId} is gone`);
     if (!repo) throw new Error(`repository ${entry.repo} is gone`);
     return { repo, run };
   }
@@ -921,7 +976,7 @@ export class LandQueue {
     this.log(`[land] ${id} blocked: ${reason}`);
     const entry = this.store.db.transaction(() => {
       const blocked = this.finish(id, "blocked", reason);
-      if (conflict)
+      if (conflict && blocked.runId)
         this.store.recordConflictTrigger(blocked.prUrl, blocked.approvedSha, "land", this.now(), id);
       return blocked;
     })();

@@ -97,7 +97,7 @@ const FEED_OWNERSHIP = `EXISTS (SELECT 1 FROM runs WHERE runs.id = COALESCE(
   AND source = 'mcp' AND requested_by = ?)`;
 type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
-const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
+const LAND_SELECT = `SELECT id, NULLIF(run_id, '') AS runId, title, repo, pr_url AS prUrl, base_branch AS baseBranch,
   head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
   log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
   finished_at AS finishedAt FROM land_entries`;
@@ -2699,7 +2699,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   // ---- land queue ----------------------------------------------------------
 
   createLandEntry(entry: {
-    runId: string;
+    runId: string | null;
+    title?: string;
     repo: string;
     prUrl: string;
     baseBranch: string;
@@ -2713,11 +2714,11 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
         this.assertNoRoundInFlight(entry.prUrl);
         const res = this.db
           .query(
-            `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+            `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at, title)
+           VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)`,
           )
           .run(
-            entry.runId,
+            entry.runId ?? "",
             entry.repo,
             entry.prUrl,
             entry.baseBranch,
@@ -2725,6 +2726,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
             entry.approvedSha,
             now,
             now,
+            entry.title === undefined ? null : redactCredentials(entry.title),
           );
         return Number(res.lastInsertRowid);
       })();
@@ -2740,7 +2742,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     return (this.db.query(`${LAND_SELECT} WHERE id = ?`).get(id) as LandEntry | null) ?? null;
   }
 
-  latestLandEntry(runId: string, prUrl: string | null): LandEntry | null {
+  latestLandEntry(runId: string | null, prUrl: string | null): LandEntry | null {
     return (
       (this.db
         .query(`${LAND_SELECT} WHERE run_id = ? OR pr_url = ? ORDER BY id DESC LIMIT 1`)
