@@ -155,8 +155,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
     },
   );
 
-  test.each(["pass", "block", "merge still in progress", "completed merge retains MERGE_HEAD"])(
-    "a pending second delivery merge resumes its own gates (%s)",
+  test.each([
+    "pass",
+    "block",
+    "merge still in progress",
+    "wrong MERGE_HEAD",
+    "completed merge retains MERGE_HEAD",
+  ])(
+    "a pending second delivery merge resumes its own gates or refuses inconsistent state (%s)",
     async (scenario) => {
       const { f, run, bare, merge, cwd } = await interruptGatedMerge();
       const nextBase = await advanceBase(bare, "again.txt", scenario === "block" ? "BAD\n" : "second base\n");
@@ -186,15 +192,19 @@ describe("pipeline (fake agents, real git + gates)", () => {
           .stdout,
       ).toBe("");
       expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
-      if (scenario === "merge still in progress") {
+      if (scenario === "merge still in progress" || scenario === "wrong MERGE_HEAD") {
         await sh(["git", "reset", "--hard", merge], { cwd });
         await sh(["git", "merge", "--no-ff", "--no-commit", nextBase], { cwd });
+        if (scenario === "wrong MERGE_HEAD") {
+          const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
+          writeFileSync(resolve(cwd, path), `${pending.reviewedSha}\n`);
+        }
       } else if (scenario === "completed merge retains MERGE_HEAD") {
         const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
         writeFileSync(resolve(cwd, path), `${nextBase}\n`);
       }
       interrupted.store.close();
-      if (scenario === "completed merge retains MERGE_HEAD") {
+      if (scenario === "completed merge retains MERGE_HEAD" || scenario === "wrong MERGE_HEAD") {
         const publication = spyOn(repos, "pushBranch");
         try {
           const resumed = start(noAgents);
@@ -401,6 +411,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "post-rebase-gates",
     "post-rebase-gates-fail",
     "interrupted-merge",
+    "interrupted-merge wrong MERGE_HEAD",
     "base-moved",
     "base-moved-during-gates",
     "conflict-implement",
@@ -508,7 +519,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getRun(run.id)?.baseSha).not.toBe(baseTip);
       }
       await assertUnpublished(bare);
-      if (checkpoint === "interrupted-merge") {
+      if (checkpoint.startsWith("interrupted-merge")) {
         const cwd = state?.worktreePath;
         if (!cwd || !state?.preRebaseHead) throw new Error("missing delivery checkpoint");
         await sh(["git", "reset", "--hard", state.preRebaseHead], { cwd });
@@ -516,6 +527,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
           ["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "--no-ff", "--no-commit", baseTip],
           { cwd },
         );
+        if (checkpoint === "interrupted-merge wrong MERGE_HEAD") {
+          expect(state.reviewedSha).toBe(state.preRebaseHead);
+          const path = (await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd })).stdout.trim();
+          writeFileSync(resolve(cwd, path), `${state.preRebaseHead}\n`);
+        }
       }
       if (checkpoint === "conflict-committed" && state) {
         // Also exercise the crash window after git commit but before implementedRound is saved.
@@ -526,6 +542,25 @@ describe("pipeline (fake agents, real git + gates)", () => {
       restarting = true;
       if (checkpoint === "base-moved" || conflict) await advanceBase(bare, "again.txt", "newer base\n");
       writeFileSync(release, "resume");
+      if (checkpoint === "interrupted-merge wrong MERGE_HEAD") {
+        const publication = spyOn(repos, "pushBranch");
+        try {
+          const resumed = start(handler);
+          expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+          const finished = resumed.store.getRun(run.id);
+          expect(finished?.error).toContain("Delivery refused");
+          expect(finished?.prUrl).toBeNull();
+          expect(publication).not.toHaveBeenCalled();
+          expect(
+            (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+              .stdout,
+          ).toBe("");
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+        } finally {
+          publication.mockRestore();
+        }
+        return;
+      }
       const resumed = start(handler);
       if (checkpoint === "post-rebase-gates-fail") {
         expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");

@@ -1963,6 +1963,13 @@ async function assertDeliveryHead(ctx: RunContext, head: string): Promise<void> 
     ctx.state.lastAudit.some((f) => f.severity === "block")
   )
     throw new DeliveryHeadError(`${reason}; missing or inconsistent passing round evidence`);
+  if (ctx.state.pendingRebaseSha && head === ctx.state.preRebaseHead) {
+    const mergeHead = (
+      await mergeGit(ctx.state.worktreePath as string, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], true)
+    ).stdout.trim();
+    if (mergeHead && mergeHead !== ctx.state.pendingRebaseSha)
+      throw new DeliveryHeadError(`${reason}; unexpected MERGE_HEAD ${mergeHead}`);
+  }
   if (head === expected) return;
   if (environmentBlockedRound(ctx)) throw new DeliveryHeadError(reason);
   for (let current = head; current !== expected; ) {
