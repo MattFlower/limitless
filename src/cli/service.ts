@@ -91,7 +91,9 @@ function plist(
   extraEnv: Record<string, string> = {},
   workingDirectory = appDir,
 ): string {
-  const env = { PATH, NODE_ENV: "production", ...extraEnv };
+  // launchd sets no locale. Without one, Homebrew git's gettext asks macOS for the preferred language
+  // on every start (about doubling each git process's cost) and git's messages follow it.
+  const env = { PATH, LANG: "C.UTF-8", NODE_ENV: "production", ...extraEnv };
   const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

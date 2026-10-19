@@ -61,7 +61,10 @@ Releases before panel review rosters (#136) refuse to start when `config.toml` s
 or `[review.rosters]`. Leave both unset until the release that added them is known good: a rollback
 to an older release fails at startup until they are removed.
 
-Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
+Changing the launchd units themselves (PATH, LANG, arguments) needs `limitless service install`.
+The units set `LANG=C.UTF-8`: launchd sets no locale, and without one every git start asks macOS for
+the preferred language. Agents and gates inherit it, so each repository's cached gate baseline misses
+once after the reinstall (LANG is part of the cache key).
 An interrupted deploy logs `interrupted, rolling back...`. Before restart begins, it attempts
 to restore the previous checkout and resume the scheduler. After restart begins, an interrupt
 leaves the new version starting and exits; ordinary startup/health failures still attempt rollback.
