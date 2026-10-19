@@ -23,6 +23,8 @@ export interface ModelStats {
 }
 
 export interface Stats {
+  /** Across all runs, independently of the statistics window and UI list limit. */
+  needsYouRunIds?: string[];
   days: DayStats[];
   models: ModelStats[];
   totals: {
@@ -118,6 +120,38 @@ function addWorkload(
 
 export function computeStats(store: Store, days = 14): Stats {
   const since = Date.now() - days * 86_400_000;
+  const attention = store.db
+    .query(`
+    WITH RECURSIVE descendants(source, child) AS (
+      SELECT source_run_id, run_id FROM review_rounds
+      UNION
+      SELECT d.source, rr.run_id FROM descendants d JOIN review_rounds rr ON rr.source_run_id = d.child
+    )
+    SELECT r.id, r.created_at AS createdAt FROM runs r
+    LEFT JOIN review_rounds own ON own.run_id = r.id
+    WHERE r.status IN ('failed', 'needs_human') AND r.merged = 0 AND r.resolution IS NULL
+      AND (r.pr_url IS NULL OR r.pr_url NOT IN (
+        SELECT pr_url FROM runs WHERE merged = 1 AND pr_url IS NOT NULL))
+      AND NOT EXISTS (SELECT 1 FROM land_entries l WHERE l.pr_url = r.pr_url
+        AND l.state IN ('queued', 'checking', 'waiting_ci', 'merging'))
+      AND NOT EXISTS (
+        SELECT 1 FROM review_approvals a JOIN pr_heads h ON h.pr_url = a.pr_url AND h.sha = a.sha
+        WHERE a.pr_url = r.pr_url AND a.stale_reason IS NULL
+          AND a.id = (SELECT MAX(id) FROM review_approvals WHERE pr_url = r.pr_url)
+          AND a.created_at > r.finished_at
+          AND NOT EXISTS (SELECT 1 FROM land_entries l WHERE l.pr_url = r.pr_url
+            AND l.id = (SELECT MAX(id) FROM land_entries WHERE pr_url = r.pr_url)
+            AND l.state = 'blocked' AND l.updated_at >= a.created_at)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM review_rounds rr JOIN runs next ON next.id = rr.run_id
+        WHERE next.status IN ('queued', 'running') AND (
+          rr.run_id IN (SELECT child FROM descendants WHERE source = r.id)
+          OR (rr.pr_url = COALESCE(own.pr_url, r.pr_url) AND rr.round > COALESCE(own.round, 0)))
+      )
+  `)
+    .all() as { id: string; createdAt: number }[];
+  const openNeedsHuman = attention.filter((r) => r.createdAt >= since).length;
   const dayRows = store.db
     .query(
       `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day,
@@ -143,12 +177,12 @@ export function computeStats(store: Store, days = 14): Stats {
     .query(
       `SELECT COUNT(*) AS runs, SUM(status = 'succeeded') AS succeeded, SUM(cost_usd) AS cost_usd,
               SUM(cost_equiv_usd) AS cost_equiv_usd,
-              SUM(status IN ('running','waiting_input')) AS active, SUM(status = 'queued') AS queued,
-              SUM(status IN ('failed','needs_human')) AS open_needs_human
+              SUM(status IN ('running','waiting_input')) AS active, SUM(status = 'queued') AS queued
          FROM runs WHERE created_at >= ?`,
     )
     .get(since) as Record<string, number>;
   return {
+    needsYouRunIds: attention.map((r) => r.id),
     days: dayRows.map((r) => ({
       day: String(r.day),
       runs: Number(r.runs),
@@ -176,8 +210,8 @@ export function computeStats(store: Store, days = 14): Stats {
       costEquivUsd: Number(totals.cost_equiv_usd ?? 0),
       active: Number(totals.active ?? 0),
       queued: Number(totals.queued ?? 0),
-      openNeedsHuman: Number(totals.open_needs_human ?? 0),
-      openNeedsHumanRate: totals.runs ? Number(totals.open_needs_human ?? 0) / Number(totals.runs) : 0,
+      openNeedsHuman,
+      openNeedsHumanRate: totals.runs ? openNeedsHuman / Number(totals.runs) : 0,
     },
   };
 }
