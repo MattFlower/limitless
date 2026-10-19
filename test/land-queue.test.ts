@@ -2476,6 +2476,36 @@ test("squash publication strips report metadata and preserves the stored manifes
   expect(reportStructure(store.getArtifact(pr.run.id, "report.md") ?? "")).toBeTruthy();
 });
 
+test("squash privacy checks and merge use paths relative to the originating worktree", async () => {
+  mkdirSync(paths.configDir, { recursive: true });
+  writeFileSync(join(paths.configDir, "private-strings.txt"), paths.home);
+  const pr = delivered(1, "pr-1");
+  const origin = join(paths.work, "originating-run");
+  store.setRunState(pr.run.id, { worktreePath: origin });
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  const secret = "SYNTHETIC_SQUASH_CREDENTIAL_582";
+  const report = markReport([
+    reportText(
+      "implementer",
+      `[one](${origin}/one.txt) \`${origin}/one.txt\` [log](${paths.runs}/log.txt) ${secret}`,
+    ),
+  ]);
+  store.putArtifact(pr.run.id, "report.md", "report", report);
+  // Register after storing to exercise credential redaction at the land boundary itself.
+  registerCredential("squash-publication-test", secret);
+  const entry = await queue().request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  const body = readFileSync(join(root, "gh.body-1"), "utf8");
+  expect(body).toContain("[one.txt](one.txt) `one.txt` <data>/runs/log.txt [redacted]");
+  expect(body).not.toContain(paths.home);
+  expect(body).not.toContain(secret);
+  expect(body).not.toContain("limitless-report:");
+  expect(reportStructure(store.getArtifact(pr.run.id, "report.md") ?? "")).toBeTruthy();
+});
+
 test("an empty report sends an explicit empty merge body", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n");

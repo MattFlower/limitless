@@ -12,6 +12,7 @@ import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { findGateCounterpart, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
+import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
 import { cacheGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
@@ -688,7 +689,7 @@ export class LandQueue {
       this.publication(entry, run, cwd),
       {
         title: run.title ?? "",
-        body: stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? ""),
+        body: this.reportBody(run),
         auto: false,
       },
     );
@@ -733,13 +734,21 @@ export class LandQueue {
 
   // ---- helpers -------------------------------------------------------------
 
+  private reportBody(run: Run): string {
+    return sanitizePublication(
+      redactCredentials(stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? "")),
+      publicationWorktree(this.store.getRunState<{ worktreePath?: string }>(run.id) ?? {}),
+      this.deps.paths.home,
+    );
+  }
+
   private async checkPublication(entry: LandEntry, run: Run, cwd: string, base: string, head: string) {
     await checkPrivatePublication(cwd, this.publication(entry, run, cwd), {
       squash: {
         base,
         head,
         title: squashTitle(run.title ?? "", entry.prUrl),
-        body: stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? ""),
+        body: this.reportBody(run),
       },
       // Select the factory's merge itself, never traverse either parent's existing history.
       ...(head !== entry.approvedSha ? { commits: `${head}^!` } : {}),

@@ -2,6 +2,7 @@ import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { redactGateData } from "../gates/output.ts";
+import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import type { RunContext, RunState } from "./context.ts";
 import {
   markReportArtifacts,
@@ -96,8 +97,18 @@ export function renderReport(input: ReportInput): string {
   return renderReportArtifacts(input).report;
 }
 
-export function renderReportArtifacts(input: ReportInput): ReportArtifacts {
+export function renderReportArtifacts(
+  input: ReportInput,
+  publication?: (text: string) => string,
+): ReportArtifacts {
   input = redactGateData(input);
+  // Normalize complete strings before display cuts, spans and clipped-source metadata.
+  if (publication)
+    input = JSON.parse(
+      JSON.stringify(input, (_key, value: unknown) =>
+        typeof value === "string" ? publication(value) : value,
+      ),
+    );
   const { state } = input;
   const blocks: ReportPart[] = [
     input.success
@@ -388,20 +399,29 @@ export function buildReportArtifacts(
   verifiedFailure?: ReportInput["verifiedFailure"],
 ): ReportArtifacts {
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
-  return renderReportArtifacts({
-    success,
-    signalWarnings: ctx.store.countEvents(ctx.run.id, "signal_attempt"),
-    runId: ctx.run.id,
-    prompt: ctx.run.prompt,
-    state: verifiedFailure ? verifiedFailureState(ctx.state) : ctx.state,
-    verifiedFailure,
-    invocations: ctx.store.listInvocations(ctx.run.id),
-    totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },
-    runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
-    freeFirstRouting: ctx.freeFirstRouting,
-    models: ctx.run.models,
-    ...(issueClosedBy(ctx) ? { closesIssue: issueClosedBy(ctx) as number } : {}),
-  });
+  // Report privacy matches historical reports with the spellings rewritten here.
+  const worktree = publicationWorktree(ctx.state);
+  if (worktree.length && worktree.join("\0") !== ctx.state.worktreeAliases?.join("\0")) {
+    ctx.state.worktreeAliases = worktree;
+    ctx.store.setRunState(ctx.run.id, ctx.state);
+  }
+  return renderReportArtifacts(
+    {
+      success,
+      signalWarnings: ctx.store.countEvents(ctx.run.id, "signal_attempt"),
+      runId: ctx.run.id,
+      prompt: ctx.run.prompt,
+      state: verifiedFailure ? verifiedFailureState(ctx.state) : ctx.state,
+      verifiedFailure,
+      invocations: ctx.store.listInvocations(ctx.run.id),
+      totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },
+      runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
+      freeFirstRouting: ctx.freeFirstRouting,
+      models: ctx.run.models,
+      ...(issueClosedBy(ctx) ? { closesIssue: issueClosedBy(ctx) as number } : {}),
+    },
+    (text) => sanitizePublication(text, worktree, ctx.deps.cfg.paths.home),
+  );
 }
 
 function issueClosedBy(ctx: RunContext): number | null {
