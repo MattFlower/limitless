@@ -4,8 +4,9 @@ import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import * as repos from "../src/git/repos.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { NeedsHumanError, NoCapacityError, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
@@ -693,7 +694,177 @@ for (const [reject, status] of [
   });
 }
 
-for (const failure of ["review", "verify", "both", "cancel"] as const) {
+for (const failure of ["capacity", "needs-human", "structured", "approved"] as const) {
+  test(`concurrent review rejection takes precedence over ordinary verify failure: ${failure}`, async () => {
+    const outcomes: unknown[] = [];
+    for (const first of ["review", "verify"] as const) {
+      const started = { review: deferred<void>(), verify: deferred<void>() };
+      const release = { review: deferred<void>(), verify: deferred<void>() };
+      const secret = "synthetic-suppressed-verifier-659";
+      const privateStep = "inspect hidden-verifier-fixture";
+      registerCredential("suppressed-verifier-test", secret);
+      let implementations = 0;
+      let feedback = "";
+      const f = start(async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout")
+          return {
+            structured: {
+              scenarios: holdout.scenarios.map((h) => ({ ...h, steps: privateStep })),
+            },
+          };
+        if (role === "review" || role === "verify") {
+          if (implementations === 1) {
+            started[role].resolve();
+            await release[role].promise;
+            if (failure === "structured" && role === "verify") return { structured: {} };
+            return {
+              structured: role === "review" ? (failure === "approved" ? approve : rejectedReview) : pass,
+            };
+          }
+          return { structured: role === "review" ? approve : pass };
+        }
+        implementations++;
+        if (implementations === 2) feedback = f.store.getRunState<RunState>(run.id)?.feedback ?? "";
+        return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+      });
+      await f.stop();
+      if (failure !== "structured")
+        f.deps.faults = {
+          "stage:verify:after": {
+            action: "throw",
+            onHit: () => {
+              const message = `Verifier unavailable: ${secret}; ${privateStep}`;
+              throw failure === "needs-human" ? new NeedsHumanError(message) : new NoCapacityError(message);
+            },
+          },
+        };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+      const execution = executeRun(f.deps, run.id, new AbortController().signal);
+      try {
+        await Promise.all([started.review.promise, started.verify.promise]);
+        release[first].resolve();
+        await wait(() => f.store.listStages(run.id).some((s) => s.name === first && s.status !== "running"), {
+          timeoutMs: 5000,
+        });
+        expect(f.store.getRunState<RunState>(run.id)?.feedback).toBeNull();
+        release[first === "review" ? "verify" : "review"].resolve();
+        expect(await execution).toBe(failure === "approved" ? "needs_human" : "succeeded");
+        expect(implementations).toBe(failure === "approved" ? 1 : 2);
+        expect(feedback).toBe(failure === "approved" ? "" : reviewFeedback);
+        const diagnostic = f.store
+          .listEvents(run.id)
+          .find((e) => e.message.startsWith("Verification failure ignored"));
+        if (failure === "approved") expect(diagnostic).toBeUndefined();
+        else {
+          expect(diagnostic?.level).toBe("warn");
+          if (failure !== "structured") {
+            expect(diagnostic?.message).toContain("[redacted]");
+            expect(diagnostic?.message).toContain("[private detail]");
+            expect(diagnostic?.message).not.toContain(secret);
+            expect(diagnostic?.message).not.toContain(privateStep);
+          }
+        }
+        expect(f.store.listStages(run.id).find((s) => s.name === "verify")?.status).toBe("failed");
+        expect(f.store.listStages(run.id).some((s) => s.status === "running")).toBe(false);
+        expect(f.store.listInvocations(run.id).some((i) => i.status === "running")).toBe(false);
+        expect(
+          f.store.getRunState<RunState>(run.id)?.verifyResults?.some((v) => v.round === 0 && v.attempt === 1),
+        ).toBe(false);
+        outcomes.push({ feedback, implementations, status: f.store.getRun(run.id)?.status });
+      } finally {
+        release.review.resolve();
+        release.verify.resolve();
+        await execution;
+        await f.stop();
+        f.store.close();
+        factory = null;
+      }
+    }
+    expect(outcomes[0]).toEqual(outcomes[1]);
+  });
+}
+
+test("final panel rejection retains its own limit reason over a verifier failure", async () => {
+  let implementations = 0;
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier"))
+      return {
+        structured: {
+          results: [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map(([, id]) => ({
+            id,
+            verdict: "CONFIRMED",
+            severity: "critical",
+            category: "correctness",
+            evidence: "farewell.txt:1 `bye`",
+            trigger: "reading the file -> wrong farewell",
+          })),
+        },
+      };
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review")
+      return {
+        structured: {
+          ...rejectedReview,
+          findings: rejectedReview.findings.map((f) => ({
+            ...f,
+            title: `Bug ${implementations}`,
+            label: "new",
+            prior: "",
+          })),
+        },
+      };
+    if (role === "verify") return { structured: pass };
+    implementations++;
+    return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+  });
+  await f.stop();
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  f.deps.faults = {
+    "stage:verify:after": {
+      action: "throw",
+      when: ({ round }) => round === 2,
+      onHit: () => {
+        throw new NeedsHumanError("Verifier cannot proceed");
+      },
+    },
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+  expect(implementations).toBe(3);
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(state?.reviewHistory?.map((r) => r.panelReview)).toEqual([1, 2, 3]);
+  expect(f.store.getRun(run.id)?.error).toContain("Still blocking after panel review R3");
+  expect(f.store.getRun(run.id)?.error).not.toContain("Verifier cannot proceed");
+  expect(state?.feedback).toContain("Bug 3");
+  expect(f.store.listEvents(run.id).some((e) => e.message.includes("Verification failure ignored"))).toBe(
+    true,
+  );
+  expect(f.store.listStages(run.id).find((s) => s.name === "verify" && s.round === 2)?.status).toBe("failed");
+});
+
+for (const failure of [
+  "review",
+  "verify",
+  "both",
+  "cancel",
+  "reject-cancelled",
+  "reject-termination",
+  "reject-abort",
+  "reject-head",
+  "reject-integrity",
+] as const) {
   test(`concurrent error joins the sibling before propagation and cleanup: ${failure}`, async () => {
     let readers = 0;
     const started = { review: deferred<void>(), verify: deferred<void>() };
@@ -707,7 +878,12 @@ for (const failure of ["review", "verify", "both", "cancel"] as const) {
         readers++;
         started[role].resolve();
         await release[role].promise;
-        return { structured: role === "review" ? approve : pass };
+        if (role === "verify" && (failure === "reject-head" || failure === "reject-cancelled"))
+          await sh(["git", "commit", "--allow-empty", "-qm", "advance during verification"], { cwd: s.cwd });
+        if (role === "verify" && failure === "reject-cancelled") return { status: "cancelled" };
+        return {
+          structured: role === "review" ? (failure.startsWith("reject-") ? rejectedReview : approve) : pass,
+        };
       }
       return { files: { "farewell.txt": "goodbye\n" } };
     });
@@ -718,6 +894,20 @@ for (const failure of ["review", "verify", "both", "cancel"] as const) {
         : {}),
       ...(failure === "verify" || failure === "both"
         ? { "stage:verify:after": { action: "throw" as const } }
+        : {}),
+      ...(["reject-termination", "reject-integrity"].includes(failure)
+        ? {
+            "stage:verify:after": {
+              action: "throw" as const,
+              onHit: () => {
+                if (failure === "reject-termination")
+                  throw new SimulatedTermination("verification interrupted");
+                throw new NeedsHumanError(
+                  "Commit changed during verification; gate evidence cannot cover the new HEAD",
+                );
+              },
+            },
+          }
         : {}),
     };
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
@@ -748,7 +938,7 @@ for (const failure of ["review", "verify", "both", "cancel"] as const) {
     try {
       await wait(() => readers === 2, { timeoutMs: 5000 });
       await Promise.all([started.review.promise, started.verify.promise]);
-      if (failure === "cancel") controller.abort();
+      if (failure === "cancel" || failure === "reject-abort") controller.abort();
       const first = failure === "review" ? "review" : "verify";
       release[first].resolve();
       await wait(() => f.store.listStages(run.id).some((s) => s.name === first && s.status !== "running"), {
@@ -759,11 +949,21 @@ for (const failure of ["review", "verify", "both", "cancel"] as const) {
         f.store.listStages(run.id).find((s) => s.name === (first === "review" ? "verify" : "review"))?.status,
       ).toBe("running");
       release[first === "review" ? "verify" : "review"].resolve();
-      expect(await execution).toBe(failure === "cancel" ? "cancelled" : "queued");
+      expect(await execution).toBe(
+        ["cancel", "reject-cancelled", "reject-abort"].includes(failure)
+          ? "cancelled"
+          : failure === "reject-termination"
+            ? "running"
+            : failure === "reject-head" || failure === "reject-integrity"
+              ? "needs_human"
+              : "queued",
+      );
+      if (failure === "reject-head" || failure === "reject-integrity")
+        expect(f.store.getRun(run.id)?.error).toContain("Commit changed during verification");
       expect(mutations).toEqual([]);
       expect(f.store.listStages(run.id).some((s) => s.status === "running")).toBe(false);
       expect(f.store.listInvocations(run.id).some((i) => i.status === "running")).toBe(false);
-      if (failure !== "cancel")
+      if (["review", "verify", "both"].includes(failure))
         expect(
           f.store
             .listEvents(run.id)
@@ -781,7 +981,7 @@ for (const failure of ["review", "verify", "both", "cancel"] as const) {
 }
 
 for (const changedHead of [false, true]) {
-  test(`resuming a recorded blocked retry cannot grant another: changed HEAD=${changedHead}`, async () => {
+  test(`resuming a recorded blocked retry scopes the limit to its SHA: changed HEAD=${changedHead}`, async () => {
     let verifies = 0;
     const f = start((s) => {
       const role = roleOf(s);
@@ -811,11 +1011,56 @@ for (const changedHead of [false, true]) {
     }
     f.deps.faults = undefined;
     expect(await execute()).toBe("needs_human");
-    expect(verifies).toBe(3); // Fresh initial verification; the round's retry was already consumed.
+    expect(verifies).toBe(changedHead ? 4 : 3);
     expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
-    expect(f.store.getRunState<RunState>(run.id)?.verifyResults?.map((v) => v.attempt)).toEqual([0, 1, 0]);
+    const results = f.store.getRunState<RunState>(run.id)?.verifyResults;
+    expect(results?.map((v) => v.attempt)).toEqual(changedHead ? [0, 1, 0, 1] : [0, 1, 0]);
+    expect(results?.at(-1)?.sha).toBe(results?.[2]?.sha);
+    if (changedHead) expect(results?.at(-1)?.sha).not.toBe(results?.[0]?.sha);
   });
 }
+
+test("resumed concurrent blocked retry excludes the fresh verifier, not the historical model", async () => {
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: verification("blocked") };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  await f.stop();
+  const policy = f.deps.router.getPolicy();
+  f.deps.router.setPolicy({ ...policy, verify: { default: ["alpha/m"] } });
+  f.deps.faults = { "stage:verify:after": { action: "kill" } };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+  expect(await execute()).toBe("running");
+  expect(f.store.getRunState<RunState>(run.id)?.verifyResults?.map((v) => v.modelId)).toEqual(["alpha/m"]);
+  f.deps.router.setPolicy(policy);
+  f.deps.faults = undefined;
+  const route = spyOn(f.deps.router, "route");
+  try {
+    expect(await execute()).toBe("needs_human");
+    expect(f.store.getRunState<RunState>(run.id)?.verifyResults?.map((v) => [v.attempt, v.modelId])).toEqual([
+      [0, "alpha/m"],
+      [0, "beta/m"],
+      [1, "alpha/m"],
+    ]);
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "verify")
+        .map((i) => i.modelId),
+    ).toEqual(["alpha/m", "beta/m", "alpha/m"]);
+    expect(route.mock.calls.filter(([role]) => role === "verify").map(([, , c]) => c?.excludeModels)).toEqual(
+      [[], ["beta/m"]],
+    );
+  } finally {
+    route.mockRestore();
+  }
+});
 
 test("missing holdout prevents both concurrent stages on resume", async () => {
   const calls: string[] = [];

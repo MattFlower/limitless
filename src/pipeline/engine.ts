@@ -1939,11 +1939,35 @@ async function oneRound(
       }
       // Fixed error precedence, independent of completion order. Both stages have settled.
       if (results[0].status === "rejected") throw results[0].reason;
-      if (results[1].status === "rejected") throw results[1].reason;
+      ctx.checkCancelled();
+      if (results[1].status === "rejected") {
+        const error: unknown = results[1].reason;
+        if (
+          results[0].value.verdict !== "request_changes" ||
+          error instanceof CancelledError ||
+          error instanceof SimulatedTermination ||
+          (error instanceof Error && error.message.startsWith("Commit changed during verification"))
+        )
+          throw error;
+      }
       if ((await headSha(cwd)) !== verifiedSha)
         throw new NeedsHumanError(
           "Commit changed during verification; gate evidence cannot cover the new HEAD",
         );
+      if (results[1].status === "rejected") {
+        ctx.log(
+          redactHoldoutText(
+            redactCredentials(
+              `Verification failure ignored after review requested changes: ${results[1].reason}`,
+            ),
+            ctx.state.holdout,
+            await ctx.publicHoldoutSources(),
+          ),
+          "warn",
+        );
+        await rejectReview(results[0].value);
+        return false;
+      }
       verify = results[1].value;
       const feedback = formatVerifyFeedback(
         verify,
@@ -2001,14 +2025,15 @@ async function oneRound(
         await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      const retryHistory = concurrent ? (ctx.state.verifyResults ?? []) : previous;
-      if (retryHistory.some((v) => v.round === round && v.attempt === 1)) await stop();
+      if (previous.some((v) => v.attempt === 1)) await stop();
       // A reserved retry that never recorded a result was interrupted; resume it, don't grant another.
       if (ctx.state.environmentRetryRound === round)
         ctx.log("Resuming interrupted verification retry", "warn");
       ctx.state.environmentRetryRound = round;
       await ctx.save();
-      const firstModel = (previous.find((v) => v.attempt !== 1) ?? ctx.state.lastVerify)?.modelId;
+      const firstModel = concurrent
+        ? ctx.state.lastVerify?.modelId
+        : (previous.find((v) => v.attempt !== 1) ?? ctx.state.lastVerify)?.modelId;
       try {
         verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
       } catch (error) {
