@@ -47,7 +47,7 @@ import { startWorkerListener } from "../src/server/workers.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
 import { CommandError, redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
-import { type Capabilities, Heartbeat, pairingCode } from "../src/workers/protocol.ts";
+import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
 import { certificate, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
@@ -59,6 +59,57 @@ let home: string, cfg: Config, store: Store, workers: WorkerStore;
 let listener: Awaited<ReturnType<typeof startWorkerListener>>;
 let restoreConfig: string | undefined;
 const releaseSha = "f".repeat(40);
+test("strict worker results and check events accept optional bounded skipped-test identities", () => {
+  const check = { name: "tests", command: "bun test", ok: true, exitCode: 0, durationMs: 1, output: "" };
+  for (const skippedTests of [
+    undefined,
+    [{ file: "test/one.test.ts", name: "suite > skipped" }],
+    [{ file: "test/one.test.ts", name: "suite > skipped", line: 12 }],
+    [{ file: "test/one.test.ts", name: "suite > skipped", line: Number.MAX_SAFE_INTEGER }],
+    Array.from({ length: 2 }, () => ({ file: "test/one.test.ts", name: "duplicate" })),
+  ]) {
+    const result = {
+      ...check,
+      testCoverage: {
+        passedFiles: [],
+        skippedFiles: ["test/one.test.ts"],
+        ...(skippedTests ? { skippedTests, skippedTestsIncomplete: false } : {}),
+      },
+    };
+    const decoded = Result.parse({ sha: releaseSha, run: { setupOk: true, setup: [], checks: [result] } });
+    expect(decoded.run.checks[0]?.testCoverage?.skippedTests).toEqual(skippedTests);
+    expect(
+      CheckEvent.parse({ type: "check", phase: "check", result }).result.testCoverage?.skippedTests,
+    ).toEqual(skippedTests);
+  }
+  for (const sha of [undefined, releaseSha, "f".repeat(64)]) {
+    expect(
+      Result.safeParse({ sha: releaseSha, run: { sha, setupOk: true, setup: [], checks: [] } }).success,
+    ).toBe(true);
+  }
+  expect(
+    Result.safeParse({ sha: releaseSha, run: { sha: "short", setupOk: true, setup: [], checks: [] } })
+      .success,
+  ).toBe(false);
+  for (const skippedTests of [
+    ["test/one.test.ts"],
+    [{ file: "test/one.test.ts" }],
+    [{ file: "", name: "skip" }],
+    [{ file: "test/one.test.ts", name: 1 }],
+    [{ file: "test/one.test.ts", name: "skip", extra: true }],
+    [{ file: "test/one.test.ts", name: "x".repeat(2001) }],
+    ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, "1", null].map((line) => [
+      { file: "test/one.test.ts", name: "skip", line },
+    ]),
+    Array.from({ length: 1001 }, () => ({ file: "test/one.test.ts", name: "skip" })),
+  ]) {
+    const result = { ...check, testCoverage: { passedFiles: [], skippedFiles: [], skippedTests } };
+    expect(
+      Result.safeParse({ sha: releaseSha, run: { setupOk: true, setup: [], checks: [result] } }).success,
+    ).toBe(false);
+    expect(CheckEvent.safeParse({ type: "check", phase: "check", result }).success).toBe(false);
+  }
+});
 const fixture = seeded(async (dir) => {
   await sh(["git", "init", "-q", "--template=", dir], { cwd: dir });
   writeFileSync(join(dir, "tracked"), "gate bytes\n");

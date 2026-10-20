@@ -1,6 +1,8 @@
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import { type AttributedTestCounts, attributedJUnitCounts } from "./attribution.ts";
+import { redactGateOutput } from "./output.ts";
+import { MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH, type TestCoverage } from "./test-coverage.ts";
 
 export const MAX_RETRY_FILES = 50;
 const MAX_REPORT_BYTES = 16 * 1024 * 1024;
@@ -120,11 +122,113 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
   }
 }
 
-export function readJUnit(path: string, cwd: string): FailedTestFiles | undefined {
+function readReport(path: string): string | undefined {
   try {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.size > MAX_REPORT_BYTES) return undefined;
-    return parseJUnit(readFileSync(path, "utf8"), cwd);
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+export function readJUnit(path: string, cwd: string): FailedTestFiles | undefined {
+  const xml = readReport(path);
+  return xml === undefined ? undefined : parseJUnit(xml, cwd);
+}
+
+/** Canonical checkout-relative identities shared by reports and the factory diff. */
+export function canonicalTestFile(file: string, cwd: string): string | undefined {
+  try {
+    if (
+      !file ||
+      (win32.isAbsolute(file) && !isAbsolute(file)) ||
+      file.includes("\\") ||
+      file.split("/").some((part) => part === ".." || part === "node_modules") ||
+      [...file].some(
+        (char) => char.charCodeAt(0) < 32 || (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159),
+      )
+    )
+      return undefined;
+    const root = realpathSync(cwd);
+    const path = realpathSync(resolve(root, file));
+    const rel = relative(root, path);
+    return rel &&
+      !isAbsolute(rel) &&
+      rel !== ".." &&
+      !rel.startsWith(`..${sep}`) &&
+      !rel.split(sep).includes("node_modules") &&
+      statSync(path).isFile()
+      ? rel
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Successful skip evidence uses the same counter/structure validation as failure attribution. */
+export function readJUnitSkips(
+  path: string,
+  cwd: string,
+):
+  | {
+      counts: AttributedTestCounts;
+      skippedTests: NonNullable<TestCoverage["skippedTests"]>;
+    }
+  | undefined {
+  try {
+    const xml = readReport(path);
+    if (xml === undefined || /<!DOCTYPE/i.test(xml)) return undefined;
+    const root = Bun.XML.parse(xml, { compact: false });
+    if (root.name !== "testsuites" && root.name !== "testsuite") return undefined;
+    const skippedTests: NonNullable<TestCoverage["skippedTests"]> = [];
+    const counts = attributedJUnitCounts(
+      root,
+      new Set(),
+      cwd,
+      (file) => {
+        const canonical = canonicalTestFile(file, cwd);
+        if (!canonical) throw new Error("Unsafe report path");
+        return canonical;
+      },
+      (node, rawFile, describes = []) => {
+        const children = elements(node);
+        const outcomes = children.filter((child) => ["failure", "error", "skipped"].includes(child.name));
+        if (outcomes.some((child) => elements(child).length > 0) || outcomes.length > 1)
+          throw new Error("Ambiguous testcase");
+        if (outcomes[0]?.name !== "skipped") return;
+        // Bun's console row (`outer > inner > test`); classname lists describes innermost first.
+        const parts = [...describes, node.attributes.name];
+        const name = parts.join(" > ");
+        const file = rawFile && canonicalTestFile(rawFile, cwd);
+        const rawLine = node.attributes.line;
+        const line = Number(rawLine);
+        if (
+          !file ||
+          !rawLine ||
+          !/^[1-9]\d*$/.test(rawLine) ||
+          !Number.isSafeInteger(line) ||
+          !node.attributes.name?.trim() ||
+          [...name].some(
+            (char) => char.charCodeAt(0) < 32 || (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159),
+          ) ||
+          redactGateOutput(rawFile ?? "") !== rawFile ||
+          redactGateOutput(file) !== file ||
+          redactGateOutput(name) !== name
+        )
+          throw new Error("Unusable testcase identity");
+        // A separator inside one component would let different describe paths compare equal.
+        if (parts.some((part) => !part?.trim() || part.includes(" > ")))
+          throw new Error("Ambiguous skip identity");
+        if (
+          skippedTests.length >= MAX_SKIPPED_TESTS ||
+          Math.max(file.length, name.length) > MAX_TEST_IDENTITY_LENGTH
+        )
+          throw new Error("Skip identity limit");
+        skippedTests.push({ file, name, line });
+      },
+    );
+    return counts && counts.failures === 0 && counts.errors === 0 ? { counts, skippedTests } : undefined;
   } catch {
     return undefined;
   }
