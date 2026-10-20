@@ -1096,7 +1096,7 @@ describe("scratch output audit warnings", () => {
           file: "[redacted filename]",
         }),
       ]);
-      expect(findings.find((f) => f.rule === "binary-content")?.detail).toBe("[redacted diagnostic]");
+      expect(findings.find((f) => f.rule === "binary-content")?.detail).toContain("[redacted]");
       expect(JSON.stringify(findings)).not.toContain(privateValue);
       expect(formatAuditFeedback(findings)).toContain("[redacted filename]");
       expect(formatAuditFeedback(findings)).not.toContain(privateValue);
@@ -1223,6 +1223,8 @@ describe("private strings", () => {
     expect(privateMatches(Buffer.from(wide).toString("base64"), policy)).toEqual(policy);
     // Its ASCII normalization is shorter than the protected value's UTF-8 eligibility floor.
     expect(privateMatches(Buffer.from("AAAA").toString("base64"), policy)).toEqual([]);
+    // Padding does not supply bytes toward that floor either.
+    expect(privateMatches(Buffer.from("A").toString("base64"), [{ value: "Ａ", entry: 7 }])).toEqual([]);
   });
 
   test.each(["percent", "HTML", "base64", "unpadded base64"])(
@@ -1245,7 +1247,12 @@ describe("private strings", () => {
           const path = `vendor-${encoded}`;
           const findings = auditDiff(
             { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
-            { configDir, taskClass: null, protectedPaths: [] },
+            {
+              configDir,
+              taskClass: null,
+              protectedPaths: [],
+              toolCommands: [`git commit --no-verify -m '${value} ${encoded}'`],
+            },
           );
           expect(findings.find((f) => f.rule === "gitlink")).toEqual({
             rule: "gitlink",
@@ -1254,6 +1261,7 @@ describe("private strings", () => {
             detail: "[redacted diagnostic]",
           });
           expect(JSON.stringify(findings)).not.toContain(encoded);
+          expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
         }
         const path = `vendor-${String.fromCharCode(27)}[31mclean`;
         expect(
@@ -1267,6 +1275,17 @@ describe("private strings", () => {
       }
     },
   );
+
+  test("audit preserves raw decoding-limit refusals when literal redaction breaks an escape", () => {
+    const repeated = "25".repeat(6);
+    proc.registerCredential("audit-decoding-limit-test", repeated);
+    const findings = auditDiff(diff("", []), {
+      taskClass: "question",
+      protectedPaths: [],
+      toolCommands: [`git commit --no-verify -m '%${repeated}72'`],
+    });
+    expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+  });
 
   test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {
     const entries = [{ value: "private-prospect.example", entry: 3 }];

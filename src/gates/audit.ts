@@ -431,6 +431,9 @@ export function auditDiff(
     findings.map((f) => {
       const file = f.file === undefined ? undefined : stripVTControlCharacters(f.file);
       const detail = stripVTControlCharacters(f.detail);
+      // Keep raw decoding refusals even if literal redaction breaks an escape; retain safe context.
+      const matches = publicationMatches(detail, protectedText);
+      const cleanDetail = redactPrivate(redactGateOutput(detail), entries);
       return {
         ...f,
         ...(file !== undefined
@@ -440,9 +443,10 @@ export function auditDiff(
                 : redactGateOutput(file),
             }
           : {}),
-        detail: publicationMatches(detail, protectedText).length
-          ? "[redacted diagnostic]"
-          : redactPrivate(redactGateOutput(detail), entries),
+        detail:
+          matches.some(({ entry }) => entry === 0) || publicationMatches(cleanDetail, protectedText).length
+            ? "[redacted diagnostic]"
+            : cleanDetail,
       };
     }),
   );

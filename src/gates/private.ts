@@ -154,7 +154,7 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
       if (run.length < minimum) return run;
       // Slash is both base64 alphabet and a filename component boundary.
       for (const candidate of new Set([run, ...run.split("/")])) {
-        if (candidate.length < minimum) continue;
+        if (candidate.replace(/=+$/, "").length < minimum) continue;
         const bytes = Buffer.from(candidate, "base64");
         const canonical = bytes.toString("base64");
         if (

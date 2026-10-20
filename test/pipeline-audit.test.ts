@@ -144,7 +144,7 @@ describe("audit allowances (fake agents, real git)", () => {
       prompts[1],
       f.store.getRun(run.id)?.error,
     ]) {
-      expect(output).toContain("[redacted diagnostic]");
+      expect(output).toContain("true # [redacted]");
       expect(output).not.toContain(secret);
       expect(output).not.toContain("\x1b");
       expect(output).not.toContain("\\u001b");
