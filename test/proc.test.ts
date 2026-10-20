@@ -1,12 +1,28 @@
 import { expect, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { Store } from "../src/db/store.ts";
 import { compareGates, runGates } from "../src/gates/run.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
-import { type ProcOptions, registerCredential, runProcess, sh } from "../src/util/proc.ts";
+import {
+  ProcessTerminationError,
+  type ProcOptions,
+  processBirthInspection,
+  processBootInspection,
+  processInspection,
+  processScope,
+  recoveryProcessStopped,
+  registerCredential,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { expectProcessStopped } from "./process-support.ts";
 import { test } from "./read-policy-support.ts";
 
 type Chunk = { stream: "stdout" | "stderr"; text: string | Buffer };
@@ -258,7 +274,11 @@ test("runner does not reprocess redaction markers in its carry", async () => {
     import { spyOn } from "bun:test";
     import * as subprocess from "node:child_process";
     import { EventEmitter } from "node:events";
-    import { PassThrough } from "node:stream";
+    import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Store } from "../src/db/store.ts";
+import { PassThrough } from "node:stream";
     import { registerCredential, runProcess } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).href)};
     registerCredential("MARKER_TEXT_TEST_TOKEN", "redacted");
     const secret = "synthetic-marker-[redacted]-" + "x".repeat(100);
@@ -475,3 +495,126 @@ test("runner releases an unterminated terminal sequence instead of holding the s
   expect(seenAtChunk[1]).toBeGreaterThanOrEqual(1);
   expect(lines.at(-1)).toBe("after");
 });
+
+test("cleanup records ownership before the first signal and deletes it after confirmation", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "limitless-record-")));
+  const store = new Store(":memory:");
+  const signal = process.kill.bind(process);
+  let marker = "";
+  let member = 0;
+  let signalled = false;
+  const kill = spyOn(process, "kill").mockImplementation((pid, sig) => {
+    if (sig === "SIGSTOP" || sig === "SIGKILL") {
+      const row = store.listProcessCleanups().find((row) => row.pid === pid);
+      expect(row).toMatchObject({ runId: "recorded", invocation: marker, directory, pid, boot: "test-boot" });
+      expect(row?.birth).toBeTruthy();
+      expect(row?.createdAt).toBeGreaterThan(0);
+      signalled = true;
+    }
+    return signal(pid, sig);
+  });
+  try {
+    await processBootInspection.run(
+      () => "test-boot",
+      () =>
+        processScope.run(
+          {
+            signal: new AbortController().signal,
+            killGraceMs: 0,
+            children: new Map(),
+            scratchDirs: new Set(),
+            runId: "recorded",
+            cleanups: store,
+          },
+          async () => {
+            const result = await runProcess({
+              cmd: [
+                process.execPath,
+                "-e",
+                `
+          const child = require('node:child_process').spawn(process.execPath,
+            ['-e', "console.log('ready'); setInterval(() => {}, 1000)"], {detached: true, stdio: ['ignore','pipe','ignore']});
+          child.stdout.once('data', () => { console.log(JSON.stringify({pid:child.pid, marker:process.env.LIMITLESS_INVOCATION})); process.exit(0); });
+        `,
+              ],
+              cwd: directory,
+              env: {},
+              onStdoutLine: (line) => {
+                const data = JSON.parse(line) as { pid: number; marker: string };
+                member = data.pid;
+                marker = data.marker;
+              },
+            });
+            expect(result.exitCode).toBe(0);
+            expect(signalled).toBe(true);
+            expectProcessStopped(member);
+            expect(store.listProcessCleanups()).toEqual([]);
+          },
+        ),
+    );
+  } finally {
+    kill.mockRestore();
+    if (member > 0 && !recoveryProcessStopped(member)) {
+      try {
+        signal(member, "SIGKILL");
+      } catch {}
+    }
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const failure of ["discovery", "birth", "recording", "boot"] as const) {
+  test(`a cleanup ${failure} failure still kills the live direct child and preserves the reason`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "limitless-child-kill-"));
+    const store = new Store(":memory:");
+    const controller = new AbortController();
+    const scope = {
+      signal: controller.signal,
+      killGraceMs: 0,
+      children: new Map<subprocess.ChildProcess, Promise<void>>(),
+      scratchDirs: new Set<string>(),
+      cleanups: store,
+    };
+    const fail = () => {
+      throw new Error(`injected ${failure} failure`);
+    };
+    const recorder =
+      failure === "recording" ? spyOn(store, "recordProcessCleanup").mockImplementation(fail) : undefined;
+    let member = 0;
+    try {
+      const invoke = () =>
+        processBootInspection.run(failure === "boot" ? fail : () => "test-boot", () =>
+          processScope.run(scope, () =>
+            runProcess({
+              cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+              cwd: directory,
+              env: {},
+              onStdoutLine: (line) => {
+                member = Number(line);
+                controller.abort();
+              },
+            }),
+          ),
+        );
+      const pending =
+        failure === "discovery"
+          ? processInspection.run(fail, invoke)
+          : failure === "birth"
+            ? processBirthInspection.run({ read: fail }, invoke)
+            : invoke();
+      await expect(pending).rejects.toThrow(`injected ${failure} failure`);
+      await expect(pending).rejects.toBeInstanceOf(ProcessTerminationError);
+      const deadline = performance.now() + 5000;
+      while (!recoveryProcessStopped(member) && performance.now() < deadline) await Bun.sleep(10);
+      expectProcessStopped(member);
+    } finally {
+      recorder?.mockRestore();
+      for (const child of scope.children.keys()) {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
