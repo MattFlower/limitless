@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -46,7 +47,10 @@ import {
   type ProcOptions,
   type ProcResult,
   processBirth,
+  processBootInspection,
   processInspection,
+  processRecoveryInspection,
+  recoveryProcessStopped,
   runProcess,
   sh,
 } from "../src/util/proc.ts";
@@ -2654,4 +2658,162 @@ test("an invoke deadline bounds slot waits and every fallback, then gives up say
   expect(Date.now() - started).toBeLessThan(5_000);
   for (const release of held) release();
   expect(timeouts).toHaveLength(1);
+});
+
+for (const refuse of [false, true]) {
+  test(`resuming a run recovers its recorded cleanup before advancing (refuse=${refuse})`, async () => {
+    const f = factory(undefined, () => {
+      throw new Error("Unexpected model invocation");
+    });
+    const run = await f.createRun({ repo: source, prompt: "Change" });
+    f.store.setRunState(run.id, {
+      flow: "build",
+      phase: "done",
+      worktreePath: source,
+      previewConfig: null,
+      slottedCommands: [],
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      feedback: null,
+      toolCommands: [],
+    } satisfies RunState);
+    const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    try {
+      await new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
+      const pid = child.pid;
+      if (pid === undefined) throw new Error("Sleeper did not start");
+      const birth = await processBirth(pid);
+      if (birth === null) throw new Error("Sleeper exited early");
+      f.store.recordProcessCleanup({
+        runId: refuse ? run.id : null,
+        invocation: "interrupted",
+        directory: realpathSync(source),
+        pid,
+        birth,
+        boot: "test-boot",
+        createdAt: Date.now(),
+        discovery: {
+          group: pid,
+          started: Date.now(),
+          directories: [realpathSync(source)],
+          leader: null,
+          spawnedAt: "0",
+        },
+      });
+      await processBootInspection.run(
+        () => "test-boot",
+        () =>
+          processRecoveryInspection.run(
+            { stopped: refuse ? () => false : recoveryProcessStopped, timeoutMs: refuse ? 0 : 10_000 },
+            async () => {
+              f.scheduler.start();
+              await settled(f, run.id);
+            },
+          ),
+      );
+      expect(f.store.getRun(run.id)?.status).toBe(refuse ? "needs_human" : "succeeded");
+      expect(f.store.listProcessCleanups()).toHaveLength(refuse ? 1 : 0);
+      if (refuse) expect(f.store.getRun(run.id)?.error).toContain(`Recorded processes still alive: ${pid}`);
+      const deadline = performance.now() + 5000;
+      while (!recoveryProcessStopped(pid) && performance.now() < deadline) await Bun.sleep(10);
+      expectProcessStopped(pid);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      }
+    }
+  });
+}
+
+test("scheduler-started commands record and gate cleanups without ambient storage", async () => {
+  const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const sentinel = join(root, "should-not-spawn");
+  const f = factory(undefined, async () => {
+    const controller = new AbortController();
+    await runProcess({
+      cmd: [process.execPath, "-e", "console.log('first'); setInterval(() => {}, 1000)"],
+      cwd: source,
+      env: {},
+      signal: controller.signal,
+      onStdoutLine: () => controller.abort(),
+    });
+    const recorded = record.mock.calls.map(([row]) => row);
+    expect(recorded.length).toBeGreaterThan(0);
+    expect(recorded).toContainEqual(
+      expect.objectContaining({ runId: run.id, directory: realpathSync(source), boot: "test-boot" }),
+    );
+    expect(f.store.listProcessCleanups()).toEqual([]);
+    const pid = child.pid;
+    if (pid === undefined) throw new Error("Sleeper did not start");
+    const birth = await processBirth(pid);
+    if (birth === null) throw new Error("Sleeper exited early");
+    f.store.recordProcessCleanup({
+      runId: run.id,
+      invocation: "interrupted",
+      directory: realpathSync(source),
+      pid,
+      birth,
+      boot: "test-boot",
+      createdAt: Date.now(),
+      discovery: {
+        group: pid,
+        started: Date.now(),
+        directories: [realpathSync(source)],
+        leader: null,
+        spawnedAt: "0",
+      },
+    });
+    await processRecoveryInspection.run({ stopped: () => false, timeoutMs: 0 }, () =>
+      runProcess({
+        cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+        cwd: source,
+        env: {},
+      }),
+    );
+    throw new Error("Command gate did not refuse");
+  });
+  const run = await f.createRun({ repo: source, prompt: "Change" });
+  f.store.setRunState(run.id, {
+    flow: "build",
+    phase: "triage",
+    worktreePath: source,
+    previewConfig: null,
+    slottedCommands: [],
+    answers: [],
+    round: 0,
+    roundsOnImplementer: 0,
+    triedImplementers: [],
+    feedback: null,
+    toolCommands: [],
+  } satisfies RunState);
+  const record = spyOn(f.store, "recordProcessCleanup");
+  try {
+    await new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
+    await processBootInspection.run(
+      () => "test-boot",
+      async () => {
+        f.scheduler.start();
+        await settled(f, run.id);
+      },
+    );
+    expect(f.store.getRun(run.id)?.status).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.error).toContain(`Recorded processes still alive: ${child.pid}`);
+    expect(f.store.listProcessCleanups()).toHaveLength(1);
+    expect(existsSync(sentinel)).toBe(false);
+    await wait(() => recoveryProcessStopped(child.pid ?? 0));
+    expectProcessStopped(child.pid ?? 0);
+  } finally {
+    record.mockRestore();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    }
+  }
 });

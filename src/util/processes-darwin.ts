@@ -22,6 +22,10 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
     args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64],
     returns: FFIType.i32,
   },
+  sysctlbyname: {
+    args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64],
+    returns: FFIType.i32,
+  },
   sandbox_check: {
     // Darwin arm64 passes variadic arguments on the stack, after the eight register slots.
     args: [
@@ -34,6 +38,24 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
     returns: FFIType.i32,
   },
 });
+
+export function darwinBootIdentity(): string {
+  const value = Buffer.alloc(128);
+  const size = new BigUint64Array([BigInt(value.length)]);
+  if (symbols.sysctlbyname(ptr(Buffer.from("kern.bootsessionuuid\0")), ptr(value), ptr(size), null, 0))
+    throw new Error("Boot identity inspection failed");
+  return value.toString("utf8", 0, Number(size[0])).replaceAll("\0", "").trim();
+}
+
+/** Recovery alone accepts zombies as stopped; live cleanup retains its identity semantics. */
+export function darwinProcessStopped(pid: number): boolean {
+  const info = new Uint32Array(16);
+  if (symbols.proc_pidinfo(pid, 13, 0, ptr(info), info.byteLength) === info.byteLength) return info[3] === 5; // SZOMB
+  const address = symbols.__error();
+  const errno = address === null ? 0 : new Int32Array(toArrayBuffer(address, 0, 4))[0];
+  if (errno === 3) return true; // ESRCH
+  throw new Error(`Recovery liveness inspection failed for ${pid} (errno ${errno})`);
+}
 
 function readAllowlistConfined(directories: readonly string[]): boolean {
   const check = (operation: string, filter: number, value: string) =>

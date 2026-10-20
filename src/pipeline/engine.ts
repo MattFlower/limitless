@@ -32,6 +32,7 @@ import {
   gateEnv,
   retryBaselineFailures,
   retryRegressions,
+  runLocalGates,
 } from "../gates/run.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
@@ -75,6 +76,7 @@ import {
   CommandError,
   ProcessTerminationError,
   processScope,
+  recoverScopedProcesses,
   redactCredentials,
 } from "../util/proc.ts";
 import {
@@ -168,7 +170,15 @@ export async function executeRun(
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
   const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
   return processScope.run(
-    { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
+    {
+      signal: ctx.signal,
+      killGraceMs: 100,
+      children: new Map(),
+      scratchDirs: new Set(),
+      runId,
+      cleanups: deps.store,
+      checkout: () => ctx.state.worktreePath,
+    },
     () =>
       confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
         readPolicyScope.run(deps.cfg.readPolicy, () =>
@@ -199,6 +209,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
+    await recoverScopedProcesses();
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
     if (
@@ -323,7 +334,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const resolvingReview = !!ctx.state.reviewResolution && !ctx.state.reviewResolution.sha;
     const needsHuman =
-      e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure || resolvingReview;
+      e instanceof NeedsHumanError ||
+      e instanceof NoCapacityError ||
+      !!verifiedFailure ||
+      resolvingReview ||
+      terminationBlocked;
     let message = redactGateOutput((e as Error).message);
     if (resolvingReview) {
       message = redactGateOutput(
@@ -420,7 +435,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 // ---------------------------------------------------------------------------
 // prepare: repo cache, worktree, gate detection, baseline
 
-function gateEvents(ctx: RunContext): Required<GateHooks> {
+function gateEvents(ctx: RunContext, label?: string): Required<Omit<GateHooks, "onLocalSetup">> {
   return {
     priority: "finish",
     skipGateSlot: false,
@@ -430,7 +445,7 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
         runId: ctx.run.id,
         type: "gate",
         level: r.ok ? "info" : "warn",
-        message: `${r.name}: ${r.ok ? "pass" : r.timedOut ? "timed out" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
+        message: `${label ?? r.name}: ${r.ok ? "pass" : r.timedOut ? "timed out" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
         data: r,
       }),
     onWait: (slots) =>
@@ -1265,11 +1280,18 @@ async function oneRound(
   }
 
   // --- gates
+  // Reused round results and resumed runs need fresh evidence of local setup.
+  let localSetupReady = false;
   const checks = ctx.stage(
     "gates",
     (stage) =>
       commandScope(cwd, async () => {
-        const events = gateEvents(ctx);
+        const events = {
+          ...gateEvents(ctx),
+          onLocalSetup: () => {
+            localSetupReady = true;
+          },
+        };
         const checkedSha = await headSha(cwd);
         let cmp: GateComparison[];
         let testScripts: Record<string, string> = {};
@@ -1293,6 +1315,7 @@ async function oneRound(
               "warn",
             );
             // The re-run starts from the committed tree too, not from what the first attempt left behind.
+            localSetupReady = false;
             await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
             after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
             ctx.checkCancelled();
@@ -1325,7 +1348,11 @@ async function oneRound(
                   options?.targeted ? "regression-retry-targeted" : "regression-retry",
                   cwd,
                   retry,
-                  { onWait: events.onWait, skipGateSlot: options?.skipGateSlot },
+                  {
+                    onWait: events.onWait,
+                    skipGateSlot: options?.skipGateSlot,
+                    onLocalSetup: retry.setup.length === gates.setup.length ? events.onLocalSetup : undefined,
+                  },
                 ),
               ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
             );
@@ -1782,6 +1809,24 @@ async function oneRound(
         preview = await ctx.stage(
           "preview",
           async () => {
+            if (!localSetupReady && gates.setup.length) {
+              const setup = await runLocalGates(
+                cwd,
+                { ...gates, checks: [] },
+                ctx.signal,
+                gateEvents(ctx, "preview setup"),
+              );
+              ctx.checkCancelled();
+              if (!setup.setupOk) {
+                const failed = setup.setup.find((result) => !result.ok);
+                throw new Error(
+                  redactGateOutput(
+                    `Preview setup failed: $ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
+                  ),
+                );
+              }
+              localSetupReady = true;
+            }
             const server = await startPreview(cwd, previewConfig, ctx.signal);
             preview = server; // Retain ownership if the stage completion checkpoint is interrupted.
             ctx.log(`Preview ready at ${server.url}`);
