@@ -1121,7 +1121,19 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             baseSha: ctx.state.verification?.baseSha ?? baseSha,
             externalChange: ctx.state.flow === "verify-change",
             round: !merge && ctx.state.reviewResolution?.sha ? round - 2 : round,
-            feedback: ctx.state.feedback,
+            feedback:
+              [
+                ctx.state.feedback,
+                ...(ctx.state.lastAudit ?? [])
+                  .filter(
+                    (f) =>
+                      f.severity === "warn" &&
+                      ["root-hidden-addition", "large-text-addition"].includes(f.rule),
+                  )
+                  .map((f) => `Advisory [${f.rule}] ${f.file}: ${f.detail}`),
+              ]
+                .filter(Boolean)
+                .join("\n\n") || null,
             hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
             resolution: merge,
           }),

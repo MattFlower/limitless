@@ -262,6 +262,7 @@ export function auditDiff(
   }
   const warnings = new Map<string, string[]>();
   const headText = new Set(diff.headTextPaths);
+  const hiddenDirs = new Set([".github", ...(diff.baseHiddenDirs ?? [])]);
   const addedPaths = new Set(diff.files.filter((f) => /^[ARC]/.test(f.status)).map((f) => f.path));
   for (const { path, base, head } of diff.attributes ?? []) {
     const added = newlyHidden(base, head).join(" ");
@@ -289,6 +290,27 @@ export function auditDiff(
         detail: `${file}: binary bytes, such as a NUL, hide the content from review. ${allowHint("binary")}`,
       });
   for (const f of diff.files) {
+    if (f.status.startsWith("A")) {
+      for (const [rule, applies, reason] of [
+        [
+          "root-hidden-addition",
+          /^\.[^/]+\//.test(f.path) && !hiddenDirs.has(f.path.split("/")[0] ?? ""),
+          "Added a file beneath a root hidden directory.",
+        ],
+        [
+          "large-text-addition",
+          headText.has(f.path) && (diff.headTextSizes?.[f.path] ?? 0) > 102_400,
+          "Added a text file over 100 KiB.",
+        ],
+      ] as const)
+        if (applies)
+          findings.push({
+            rule,
+            severity: "warn",
+            file: f.path,
+            detail: `${reason} Remove accidental scratch output and write future logs or reports under scratch/TMPDIR. Intentional additions may remain.`,
+          });
+    }
     const touched = f.from ? [f.from, f.path] : [f.path];
     const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));
     if (hit) {
@@ -402,11 +424,16 @@ export function auditDiff(
     }
   }
   return dedupe(
-    findings.map((f) => ({
-      ...f,
-      ...(f.file && privateMatches(f.file, entries).length ? { file: "[redacted filename]" } : {}),
-      detail: redactPrivate(f.detail, entries),
-    })),
+    findings.map((f) => {
+      const file = f.file === undefined ? undefined : redactGateOutput(f.file);
+      return {
+        ...f,
+        ...(file !== undefined
+          ? { file: privateMatches(file, entries).length ? "[redacted filename]" : file }
+          : {}),
+        detail: redactPrivate(redactGateOutput(f.detail), entries),
+      };
+    }),
   );
 }
 
