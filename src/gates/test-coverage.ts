@@ -6,6 +6,7 @@ export const MAX_SKIPPED_TESTS = 1000;
 export const MAX_TEST_IDENTITY_LENGTH = 2000;
 
 export interface TestCoverage {
+  /** Files with at least one passing row and no failures; may also contain skipped tests. */
   passedFiles: string[];
   skippedFiles: string[];
   skippedTests?: { file: string; name: string }[];
@@ -17,7 +18,7 @@ export interface TestCoverage {
 /** Bun's file headers and result rows, captured before the process output tail is truncated. */
 export class BunTestCoverage {
   private current: string | undefined;
-  private files = new Map<string, { passed: boolean; skipped: boolean }>();
+  private files = new Map<string, { passed: boolean; skipped: boolean; failed: boolean }>();
   private passed: number | undefined;
   private failed: number | undefined;
   private sawFailure = false;
@@ -71,19 +72,19 @@ export class BunTestCoverage {
         isAbsolute(file) && this.cwd
           ? relative(this.canonical(this.cwd), this.canonical(file))
           : file.replace(/^\.\//, "");
-      if (!this.files.has(this.current)) this.files.set(this.current, { passed: false, skipped: false });
+      if (!this.files.has(this.current))
+        this.files.set(this.current, { passed: false, skipped: false, failed: false });
     }
     const entry = this.current ? this.files.get(this.current) : undefined;
     if (!entry) return;
     if (/^\(pass\)/.test(line)) entry.passed = true;
+    if (/^\(fail\)/.test(line)) entry.failed = true;
     if (/^\((?:skip|todo|fail)\)/.test(line)) entry.skipped = true;
   }
 
   result(): TestCoverage {
     return {
-      passedFiles: [...this.files]
-        .filter(([, value]) => value.passed && !value.skipped)
-        .map(([file]) => file),
+      passedFiles: [...this.files].filter(([, value]) => value.passed && !value.failed).map(([file]) => file),
       skippedFiles: [...this.files].filter(([, value]) => value.skipped).map(([file]) => file),
       ...(this.incomplete || this.sawFailure || this.skipRows !== this.skipSummary + this.todoSummary
         ? { skippedTestsIncomplete: true }

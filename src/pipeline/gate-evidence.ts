@@ -38,8 +38,7 @@ function verificationCommands(instructions: string): string[] {
 function covers(check: GateEvidence["checks"][number], requestedCommand: string): boolean {
   const command = check.testCommand;
   if (!command || !/^bun test(?: [\w./-]+)*$/.test(command)) return false;
-  // File headers and passing rows prove that the broad suite actually discovered and ran the file.
-  // Inherited skip identities also prove discovery; flags/filters and unsupported runners refuse.
+  // Targeted coverage needs passing rows in each requested file, even with inherited skips.
   const expanded = requestedCommand === check.result.command ? command : requestedCommand;
   if (!/^bun test(?: [\w./-]+)*$/.test(expanded)) return false;
   const requested = expanded
@@ -59,7 +58,7 @@ function covers(check: GateEvidence["checks"][number], requestedCommand: string)
   for (const line of check.result.output.split(/\r?\n/)) recorded.observe(line);
   const coverage = check.result.testCoverage ?? recorded.result();
   if (!coverage.summary || coverage.summary.passed < 1 || coverage.summary.failed !== 0) return false;
-  const ran = [...coverage.passedFiles, ...(coverage.skippedTests ?? []).map((test) => test.file)];
+  const ran = coverage.passedFiles;
   if (!requested.length) return command === "bun test" && ran.length > 0;
   return requested.every((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file) && ran.includes(file));
 }

@@ -147,20 +147,20 @@ function inheritedFixture() {
   return { evidence, check, base, baseline };
 }
 
-test.each(["broad", "targeted", "truncated"])(
+test.each(["broad", "targeted", "truncated", "targeted-truncated"])(
   "factory baseline permits inherited skips for %s verification",
   (kind) => {
     const { evidence, check, baseline } = inheritedFixture();
     // Duplicate rows count once per identity in a cited check.
     check.result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
-    if (kind === "truncated") check.result.output = "x".repeat(6000);
+    if (kind.endsWith("truncated")) check.result.output = "x".repeat(6000);
     const publicSpec = {
       ...spec,
       acceptance_criteria: [
         {
           id: "AC-1",
           criterion: "all tests pass",
-          how_to_verify: kind === "targeted" ? "bun test test/loopback.test.ts" : "bun test",
+          how_to_verify: kind.startsWith("targeted") ? "bun test test/loopback.test.ts" : "bun test",
         },
       ],
     };
@@ -175,6 +175,31 @@ test.each(["broad", "targeted", "truncated"])(
       check: "tests",
       command: "bun run test",
     });
+  },
+);
+
+test.each(["broad", "targeted", "targeted-truncated"])(
+  "fully skipped files provide only broad-suite evidence: %s",
+  (kind) => {
+    const { evidence, check, base, baseline } = inheritedFixture();
+    for (const result of [check.result, base]) {
+      result.output = `test/other.test.ts:\n(pass) other\n${result.output.replace("(pass) loopback [0.06ms]\n", "")}`;
+      result.testCoverage = coverage(result.output);
+    }
+    if (kind === "targeted-truncated") check.result.output = "x".repeat(6000);
+    const publicSpec = {
+      ...spec,
+      acceptance_criteria: [
+        {
+          id: "AC-1",
+          criterion: "all tests pass",
+          how_to_verify: kind === "broad" ? "bun test" : "bun test test/loopback.test.ts",
+        },
+      ],
+    };
+    const result = applyGateEvidence(blocked, publicSpec, holdout, sha, evidence, baseline);
+    expect(result.criteria[0]?.status).toBe(kind === "broad" ? "met" : "blocked");
+    if (kind !== "broad") expect(result.criteria[0]?.gateEvidence).toBeUndefined();
   },
 );
 
@@ -733,7 +758,7 @@ test.each(["relative", "linux-absolute", "macos-absolute", "colored-crlf", "gith
     }
     for (const line of lines) coverage.observe(format === "colored-crlf" ? `\x1b[32m${line}\x1b[0m\r` : line);
     expect(coverage.result()).toEqual({
-      passedFiles: format === "skipped" ? [] : ["test/loopback.test.ts"],
+      passedFiles: ["test/loopback.test.ts"],
       skippedFiles: format === "skipped" ? ["test/loopback.test.ts"] : [],
       skippedTests: format === "skipped" ? [{ file: "test/loopback.test.ts", name: "unavailable" }] : [],
       summary: { passed: 1, failed: 0 },
@@ -791,6 +816,7 @@ test("skip identities retain full names, distinct files and redacted terminal-no
   ]);
   expect(JSON.stringify(parser.result())).not.toContain(secret);
   parser.observe("(fail) distinct failure");
+  expect(parser.result().passedFiles).toEqual([]);
   expect(parser.result().skippedTests).toHaveLength(3);
   expect(parser.result().skippedTests?.some((skip) => skip.name === "distinct failure")).toBe(false);
   expect(parser.result().summary?.failed).toBe(1);
