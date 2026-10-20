@@ -189,6 +189,11 @@ describe("audit allowances (fake agents, real git)", () => {
     expect(prompts[1]).not.toContain("secret-host.example");
     expect(prompts[1]).toContain("Advisory [root-hidden-addition]");
     expect(prompts[1]).toContain("Advisory [root-hidden-addition] [redacted filename]");
+    const persisted = f.store.getRunState<RunState>(run.id)?.lastAudit;
+    expect(persisted).toContainEqual(
+      expect.objectContaining({ rule: "root-hidden-addition", file: "[redacted filename]" }),
+    );
+    expect(JSON.stringify(persisted)).not.toContain("secret-host.example");
     expect(prompts[1]).not.toContain("synthetic-scratch-path-credential");
     expect(JSON.stringify(events)).not.toContain("synthetic-scratch-path-credential");
   });

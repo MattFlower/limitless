@@ -1098,6 +1098,8 @@ describe("scratch output audit warnings", () => {
       ]);
       expect(findings.find((f) => f.rule === "binary-content")?.detail).toContain("[redacted]");
       expect(JSON.stringify(findings)).not.toContain(privateValue);
+      expect(formatAuditFeedback(findings)).toContain("[redacted filename]");
+      expect(formatAuditFeedback(findings)).not.toContain(privateValue);
     } finally {
       rmSync(configDir, { recursive: true, force: true });
     }

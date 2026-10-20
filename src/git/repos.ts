@@ -616,7 +616,10 @@ export async function diffSince(
     });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
-  const tree = await worktreeGit(["git", "ls-tree", "-r", "--name-only", "-z", revision], { cwd, env });
+  // Most rounds add no hidden paths; avoid another tree walk on every ordinary audit.
+  const tree = files.some((f) => f.status.startsWith("A") && /^\.(?!github\/)[^/]+\//.test(f.path))
+    ? await worktreeGit(["git", "ls-tree", "-r", "--name-only", "-z", revision], { cwd, env })
+    : { stdout: "" };
   const baseHiddenDirs = [
     ...new Set(tree.stdout.split("\0").flatMap((path) => path.match(/^(\.[^/]+)\//)?.[1] ?? [])),
   ];
