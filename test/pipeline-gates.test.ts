@@ -1,5 +1,5 @@
 import { describe, expect, spyOn } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { gateSlots } from "../src/gates/slots.ts";
@@ -15,7 +15,7 @@ import { waitClock } from "./wait-clock.ts";
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start } = pipelineSetup({
+const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup({
   get home() {
     return home;
   },
@@ -334,6 +334,217 @@ describe("pipeline (fake agents, real git + gates)", () => {
           ).toMatchObject([{ summary: "Timeout-caused gate re-runs: 1", data: { gateTimeoutReruns: 1 } }]);
         }
       }
+    } finally {
+      release?.();
+      if (held) (await held)();
+      await f.stop();
+      processSpy.mockRestore();
+      eventSpy.mockRestore();
+      gateSlots.setLimit(previous);
+    }
+  });
+
+  test.each([
+    "slot",
+    "twice",
+    "failure",
+    "mixed",
+    "retry failure",
+    "setup",
+    "retry setup",
+    "confinement",
+    "unflagged",
+    "cancel slot",
+    "cancel retry",
+  ])("post-merge gate timeout: %s", async (scenario) => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nsetup = ["fake-setup"]\nchecks = [{ name = "test", run = "fake-test", timeoutSec = 37 }, { name = "lint", run = "fake-lint" }]\n',
+    );
+    await sh(
+      ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "post-merge timeout fixture"],
+      {
+        cwd: repoDir,
+      },
+    );
+    const bare = await githubFixture();
+    const originalBase = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    let approvedSha = "";
+    let baseTip = "";
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        approvedSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        baseTip = await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const clock = waitClock();
+    const scheduled = [deferred<void>(), deferred<void>()];
+    const queued = deferred<void>();
+    const previous = gateSlots.limit;
+    gateSlots.setLimit(1);
+    let held: Promise<() => void> | undefined;
+    let release: (() => void) | undefined;
+    let attempts = 0;
+    let waits = 0;
+    let mergedHead = "";
+    const commands: string[] = [];
+    const realProcess = proc.runProcess;
+    const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+      opts.signal?.throwIfAborted();
+      opts.onStdoutLine?.(opts.cmd[4] ?? "");
+      const command = opts.cmd.at(-1) ?? "";
+      const cwd = opts.cwd ?? repoDir;
+      const postMerge = existsSync(join(cwd, "base.txt"));
+      if (postMerge) {
+        commands.push(command);
+        if (command === "fake-setup") {
+          attempts++;
+          const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+          if (attempts === 1) mergedHead = sha;
+          else {
+            expect(sha).toBe(mergedHead);
+            expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+            expect(existsSync(join(cwd, "timeout-debris"))).toBe(false);
+          }
+        }
+      }
+      const timeout =
+        postMerge &&
+        ((command === "fake-test" &&
+          (attempts === 1 || scenario === "twice" || scenario === "cancel retry") &&
+          !["failure", "setup", "unflagged"].includes(scenario)) ||
+          (command === "fake-setup" && scenario === "setup"));
+      const fail =
+        postMerge &&
+        ((command === "fake-test" &&
+          (scenario === "failure" ||
+            scenario === "unflagged" ||
+            (scenario === "retry failure" && attempts === 2))) ||
+          (command === "fake-lint" && scenario === "mixed") ||
+          (command === "fake-setup" && scenario === "retry setup" && attempts === 2));
+      if (timeout) {
+        if (scenario === "slot" || scenario === "cancel slot")
+          held = gateSlots.acquire(new AbortController().signal);
+        writeFileSync(join(cwd, "greeting.txt"), "gate dirt\n");
+        writeFileSync(join(cwd, "timeout-debris"), "gate dirt\n");
+        writeFileSync(join(cwd, ".limitless.toml"), "untrusted gate configuration\n");
+        await new Promise<void>((resolve, reject) => {
+          const timer = clock.timer.set(resolve, opts.timeoutMs ?? 900_000);
+          opts.signal?.addEventListener(
+            "abort",
+            () => {
+              clock.timer.clear(timer);
+              reject(opts.signal?.reason);
+            },
+            { once: true },
+          );
+          scheduled[waits++]?.resolve();
+        });
+        opts.signal?.throwIfAborted();
+      }
+      const stderr =
+        timeout && scenario === "confinement" ? ["sandbox_apply:", "Operation not permitted"].join(" ") : "";
+      opts.onRawChunk?.(stderr, "stderr");
+      return {
+        exitCode: timeout ? null : fail ? 1 : 0,
+        signal: null,
+        cancelled: false,
+        timedOut: timeout,
+        idleTimedOut: false,
+        truncated: false,
+        stdout: timeout || fail ? "[timed out] from nested tool" : "passed",
+        stderr,
+        durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
+      };
+    });
+    const addEvent = f.store.addEvent.bind(f.store);
+    const eventSpy = spyOn(f.store, "addEvent").mockImplementation((event) => {
+      if (event.message?.startsWith("Waiting for a gate slot")) queued.resolve();
+      return addEvent(event);
+    });
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      if (!["failure", "unflagged"].includes(scenario)) {
+        await scheduled[0]?.promise;
+        await clock.advance(900_000);
+      }
+      if (scenario === "slot" || scenario === "cancel slot") {
+        await queued.promise;
+        release = await held;
+        expect(attempts).toBe(1);
+        expect(commands).toEqual(["fake-setup", "fake-test", "fake-lint"]);
+        if (scenario === "cancel slot") f.cancelRun(run.id);
+        release?.();
+      }
+      if (scenario === "twice" || scenario === "cancel retry") {
+        await scheduled[1]?.promise;
+        if (scenario === "cancel retry") f.cancelRun(run.id);
+        else await clock.advance(900_000);
+      }
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
+      const state = f.store.getRunState<RunState>(run.id);
+      const retries = ["slot", "twice", "retry failure", "retry setup", "cancel retry"].includes(scenario);
+      expect(attempts).toBe(retries ? 2 : 1);
+      expect(clock.pending).toBe(0);
+      if (scenario.startsWith("cancel")) {
+        expect(status).toBe("cancelled");
+        return;
+      }
+      const evidence = JSON.parse(f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "[]");
+      const stage = f.store
+        .listStages(run.id)
+        .filter((s) => s.name === "gates")
+        .at(-1);
+      if (retries) {
+        expect(f.store.getArtifact(run.id, "gates-rebase-timeout-0.json")).toContain('"timedOut":true');
+        expect(state?.gateTimeoutReruns).toBe(1);
+        if (scenario !== "retry setup")
+          expect(evidence[0]?.firstAttempt).toMatchObject({ timedOut: true, exitCode: null });
+      }
+      if (scenario === "slot") {
+        expect(status).toBe("succeeded");
+        expect(stage?.status).toBe("succeeded");
+        expect(state?.lastGates?.[0]?.firstAttempt?.timedOut).toBe(true);
+        expect(commands).toEqual([
+          "fake-setup",
+          "fake-test",
+          "fake-lint",
+          "fake-setup",
+          "fake-test",
+          "fake-lint",
+        ]);
+        expect(f.store.getRun(run.id)).toMatchObject({ baseSha: baseTip, headSha: mergedHead });
+      } else {
+        expect(status).toBe("needs_human");
+        const reason = f.store.getRun(run.id)?.error ?? "";
+        if (scenario === "twice") {
+          expect(reason).toContain("post-merge gate timed out");
+          expect(reason).not.toContain("regressed");
+          expect(stage).toMatchObject({ status: "failed", summary: "post-merge gate timed out" });
+          expect(evidence[0]?.result).toMatchObject({ timedOut: true, exitCode: null });
+          expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gate timed out");
+        } else {
+          expect(reason).toContain("post-merge gates regressed");
+          expect(stage).toMatchObject({ status: "failed", summary: "post-merge gates regressed" });
+          expect(evidence.some((c: { blocking: boolean }) => c.blocking)).toBe(true);
+        }
+        expect(f.store.getRun(run.id)).toMatchObject({ baseSha: originalBase, headSha: approvedSha });
+        if (!state?.worktreePath) throw new Error("Missing post-merge worktree");
+        expect((await sh(["git", "rev-parse", "HEAD"], { cwd: state.worktreePath })).stdout.trim()).toBe(
+          approvedSha,
+        );
+        expect(state?.lastGates?.every((c) => c.result.ok && !c.blocking)).toBe(true);
+      }
+      expect(state?.pendingRebaseSha).toBeUndefined();
+      expect(state?.preRebaseHead).toBeUndefined();
+      expect(state?.preRebaseGates).toBeUndefined();
+      expect(state?.gateExecution).toBeUndefined();
     } finally {
       release?.();
       if (held) (await held)();
