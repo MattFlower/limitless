@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, test as bunTest, expect, spyOn } from "bun:test";
+import { afterEach, beforeEach, test as bunTest, expect, mock, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import {
   existsSync,
@@ -17,6 +17,7 @@ import {
   type ProcessCleanup,
   ProcessTerminationError,
   processBirth,
+  processBirthInspection,
   processBootInspection,
   processRecoveryInspection,
   processScope,
@@ -25,6 +26,7 @@ import {
   recoveryProcessStopped,
   runProcess,
 } from "../src/util/proc.ts";
+import { seatbeltSkip } from "./confinement.ts";
 import { expectProcessStopped } from "./process-support.ts";
 
 const test = (name: string, run: () => Promise<void>, timeout?: number) =>
@@ -109,6 +111,178 @@ function scope() {
     cleanups: store,
     terminationError: undefined as ProcessTerminationError | undefined,
   };
+}
+
+bunTest.skipIf(process.platform !== "linux")("real Linux boot identity is stable", () => {
+  const inspection = spyOn(processBootInspection, "getStore").mockReturnValue(undefined);
+  try {
+    const boot = bootIdentity();
+    expect(boot.length).toBeGreaterThan(0);
+    expect(bootIdentity()).toBe(boot);
+  } finally {
+    inspection.mockRestore();
+  }
+});
+
+bunTest.skipIf(seatbeltSkip !== null)(
+  `real macOS boot identity is stable (${seatbeltSkip ?? "unconfined"})`,
+  () => {
+    const inspection = spyOn(processBootInspection, "getStore").mockReturnValue(undefined);
+    try {
+      const boot = bootIdentity();
+      expect(boot.length).toBeGreaterThan(0);
+      expect(bootIdentity()).toBe(boot);
+    } finally {
+      inspection.mockRestore();
+    }
+  },
+);
+
+test("pre-command recovery waits for live cleanup paused after freezing a member", async () => {
+  const frozen = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  const current = scope();
+  const signal = process.kill.bind(process);
+  let member = 0;
+  let paused = false;
+  const kill = spyOn(process, "kill").mockImplementation((pid, sig) => {
+    const result = signal(pid, sig);
+    if (pid === member && sig === "SIGSTOP") paused = true;
+    return result;
+  });
+  const deletion = spyOn(store, "deleteProcessCleanup");
+  const invocationDeletion = spyOn(store, "deleteInvocationCleanups");
+  const recoveryBirth = mock(async () => processBirth(member));
+  const running = processBirthInspection.run(
+    {
+      read: async (pid, name) => {
+        if (pid === member && paused) {
+          frozen.resolve();
+          await resume.promise;
+        }
+        return processBirth(pid, name);
+      },
+    },
+    () =>
+      processScope.run(current, () =>
+        runProcess({
+          cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+          cwd: directory,
+          env: {},
+          signal: controller.signal,
+          onStdoutLine: (line) => {
+            member = Number(line);
+            controller.abort();
+          },
+        }),
+      ),
+  );
+  let next: ReturnType<typeof runProcess> | undefined;
+  let background: Promise<void> | undefined;
+  try {
+    await frozen.promise;
+    expect(await processState(member)).toBe("T");
+    const records = store.listProcessCleanups();
+    expect(records).toHaveLength(1);
+    const birth = records[0]?.birth;
+    if (!birth) throw new Error("Missing recorded member");
+    recoveryBirth.mockImplementation(async () => birth);
+    next = processRecoveryInspection.run(
+      { stopped: recoveryProcessStopped, timeoutMs: 10_000, birth: recoveryBirth },
+      () =>
+        processScope.run(current, () =>
+          runProcess({
+            cmd: [process.execPath, "-e", "console.log('next')"],
+            cwd: directory,
+            env: {},
+            onStdoutLine: () => {
+              expectProcessStopped(member);
+              expect(store.listProcessCleanups()).toEqual([]);
+            },
+          }),
+        ),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(recoveryBirth).not.toHaveBeenCalled();
+    expect(kill.mock.calls.filter(([pid, sig]) => pid === member && sig === "SIGKILL")).toEqual([]);
+    expect(deletion).not.toHaveBeenCalled();
+    expect(invocationDeletion).not.toHaveBeenCalled();
+    expect(store.listProcessCleanups()).toEqual(records);
+    // An unrelated invocation can still recover while this one holds ownership.
+    const other = await sleeper();
+    store.recordProcessCleanup(other);
+    background = recoverProcessCleanups(store);
+    await recoverProcessCleanups(store, [other]);
+    expectProcessStopped(other.pid);
+    resume.resolve();
+    await running;
+    expect((await next).exitCode).toBe(0);
+    await background;
+    expect(store.listProcessCleanups()).toEqual([]);
+  } finally {
+    resume.resolve();
+    controller.abort();
+    await Promise.allSettled([running, next, background]);
+    kill.mockRestore();
+    deletion.mockRestore();
+    invocationDeletion.mockRestore();
+  }
+});
+
+for (const fail of [false, true]) {
+  test(`concurrent recoveries re-read ownership after ${fail ? "failure" : "completion"}`, async () => {
+    const row = await sleeper();
+    store.recordProcessCleanup(row);
+    const records = store.listProcessCleanups();
+    const inspecting = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const kill = spyOn(process, "kill");
+    const deletion = spyOn(store, "deleteProcessCleanup");
+    const retryInspection = mock(processBirth);
+    const first = processRecoveryInspection.run(
+      {
+        stopped: recoveryProcessStopped,
+        timeoutMs: 10_000,
+        birth: async (pid) => {
+          inspecting.resolve();
+          await resume.promise;
+          if (fail) throw new Error("injected recovery inspection failure");
+          return processBirth(pid);
+        },
+      },
+      () => recoverProcessCleanups(store, records),
+    );
+    let results: Promise<PromiseSettledResult<void>[]> | undefined;
+    try {
+      await inspecting.promise;
+      const second = processRecoveryInspection.run(
+        { stopped: recoveryProcessStopped, timeoutMs: 10_000, birth: retryInspection },
+        () => recoverProcessCleanups(store, records),
+      );
+      results = Promise.allSettled([first, second]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(retryInspection).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+      expect(store.listProcessCleanups()).toEqual(records);
+      resume.resolve();
+      const [initial, retry] = await results;
+      expect(initial?.status).toBe(fail ? "rejected" : "fulfilled");
+      if (initial?.status === "rejected")
+        expect(initial.reason).toHaveProperty("message", expect.stringContaining("injected recovery"));
+      expect(retry?.status).toBe("fulfilled");
+      expect(retryInspection).toHaveBeenCalledTimes(fail ? 1 : 0);
+      expect(kill.mock.calls).toEqual([[row.pid, "SIGKILL"]]);
+      expect(deletion.mock.calls).toEqual([[row.invocation, row.pid]]);
+      expectProcessStopped(row.pid);
+      expect(store.listProcessCleanups()).toEqual([]);
+    } finally {
+      resume.resolve();
+      await (results ?? Promise.allSettled([first]));
+      deletion.mockRestore();
+      kill.mockRestore();
+    }
+  });
 }
 
 for (const mismatch of ["birth", "boot"] as const) {

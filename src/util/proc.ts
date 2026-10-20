@@ -37,6 +37,19 @@ export interface ProcessCleanupStore {
 }
 export const processCleanupStore = new AsyncLocalStorage<ProcessCleanupStore>();
 
+const invocationCleanups = new Map<string, Promise<void>>();
+
+async function ownInvocationCleanup(invocation: string): Promise<() => void> {
+  const previous = invocationCleanups.get(invocation);
+  const { promise, resolve } = Promise.withResolvers<void>();
+  invocationCleanups.set(invocation, promise);
+  await previous;
+  return () => {
+    if (invocationCleanups.get(invocation) === promise) invocationCleanups.delete(invocation);
+    resolve();
+  };
+}
+
 export class ProcessTerminationError extends Error {
   static readonly prefix = "Invocation termination could not be confirmed";
 }
@@ -80,6 +93,7 @@ export function recoveryProcessStopped(pid: number): boolean {
 export const processRecoveryInspection = new AsyncLocalStorage<{
   stopped: typeof recoveryProcessStopped;
   timeoutMs: number;
+  birth?: typeof processBirth;
 }>();
 
 export async function recoverProcessCleanups(
@@ -89,12 +103,24 @@ export async function recoverProcessCleanups(
   timeoutMs = processRecoveryInspection.getStore()?.timeoutMs ?? 10_000,
 ): Promise<void> {
   if (!records.length) return;
+  const invocations = new Set(records.map((row) => row.invocation));
+  // Waiting for one invocation must not reserve unrelated invocations in this batch.
+  for (;;) {
+    const active = [...invocations].flatMap((invocation) => invocationCleanups.get(invocation) ?? []);
+    if (!active.length) break;
+    await Promise.all(active);
+  }
+  // Reserve the entire batch synchronously so overlapping recovery batches cannot deadlock.
+  const release = await Promise.all([...invocations].map(ownInvocationCleanup));
   try {
+    records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
+    if (!records.length) return;
     const boot = bootIdentity();
+    const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
     const pending: ProcessCleanup[] = [];
     const retire = (row: ProcessCleanup) => store.deleteProcessCleanup(row.invocation, row.pid);
     for (const row of records) {
-      if (row.boot !== boot || stopped(row.pid) || (await processBirth(row.pid)) !== row.birth) {
+      if (row.boot !== boot || stopped(row.pid) || (await readBirth(row.pid)) !== row.birth) {
         retire(row);
         continue;
       }
@@ -126,6 +152,8 @@ export async function recoverProcessCleanups(
       `${ProcessTerminationError.prefix}: ${redactCredentials((error as Error).message)}`,
       { cause: error },
     );
+  } finally {
+    for (const unlock of release) unlock();
   }
 }
 
@@ -727,6 +755,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let terminationError: ProcessTerminationError | undefined;
     const terminate = () => {
       shutdown ??= (async () => {
+        const release = await ownInvocationCleanup(marker);
         try {
           if (leaderInspectionError) throw leaderInspectionError;
           if (child.pid !== undefined) {
@@ -759,12 +788,16 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
           finishTimers();
           reject(terminationError);
         } finally {
-          child.stdin.destroy();
-          // Confirmed shutdown closes inherited pipes naturally. Let their buffered output
-          // drain before close; only a failed shutdown must bypass still-open descendants.
-          if (terminationError) {
-            child.stdout.destroy();
-            child.stderr.destroy();
+          try {
+            child.stdin.destroy();
+            // Confirmed shutdown closes inherited pipes naturally. Let their buffered output
+            // drain before close; only a failed shutdown must bypass still-open descendants.
+            if (terminationError) {
+              child.stdout.destroy();
+              child.stderr.destroy();
+            }
+          } finally {
+            release();
           }
         }
       })();
