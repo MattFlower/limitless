@@ -7,6 +7,7 @@ import { NavBar } from "./components/NavBar.tsx";
 import { Chat } from "./pages/Chat.tsx";
 import { Dashboard } from "./pages/Dashboard.tsx";
 import { EvalDetail, Evals } from "./pages/Evals.tsx";
+import { Land } from "./pages/Land.tsx";
 import { Models } from "./pages/Models.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { Providers } from "./pages/Providers.tsx";
@@ -39,6 +40,7 @@ render(
       <Route path="/" component={Dashboard} />
       <Route path="/runs/:id" component={RunDetail} />
       <Route path="/new" component={NewRun} />
+      <Route path="/land" component={Land} />
       <Route path="/evals" component={Evals} />
       <Route path="/evals/:id" component={EvalDetail} />
       <Route path="/setup" component={Setup} />

@@ -4,6 +4,7 @@ import type {
   AuthSession,
   CreateRunRequest,
   HealthResponse,
+  LandEntry,
   ProviderStatus,
   Question,
   QuotaAlert,
@@ -281,3 +282,15 @@ export const updateCatalog = (method: "POST" | "PATCH" | "DELETE", id?: string, 
     method,
     ...(value ? { body: JSON.stringify(value) } : {}),
   });
+
+export function listLand(): Promise<LandEntry[]> {
+  return request("/api/land");
+}
+
+export function cancelLand(id: number): Promise<{ cancelled: boolean }> {
+  return request(`/api/land/${id}/cancel`, { method: "POST" });
+}
+
+export function landLogUrl(id: number): string {
+  return `/api/land/${id}/log`;
+}

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFile, realpath } from "node:fs/promises";
+import { join, sep } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
@@ -667,6 +668,29 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return json(await factory.land.request({ target, sha: input.sha as string | undefined }), 201);
       }, true),
     },
+    "/api/land/:id/log": handle(async (req) => {
+      const entry = store.getLandEntry(Number(req.params.id as string));
+      if (!entry?.logPath) return error("land log not found", 404);
+      try {
+        const path = await realpath(entry.logPath);
+        const roots = await Promise.all(
+          [factory.cfg.paths.runs, join(factory.cfg.paths.home, "land")].map(async (root) => {
+            try {
+              return await realpath(root);
+            } catch {
+              return null;
+            }
+          }),
+        );
+        if (!roots.some((root) => root && path.startsWith(`${root}${sep}`)))
+          return error("land log not found", 404);
+        return new Response(redactGateArtifact(await readFile(path, "utf8")), {
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      } catch {
+        return error("land log not found", 404);
+      }
+    }),
     "/api/land/:id/cancel": {
       POST: handle((req) => {
         const cancelled = factory.land.cancel(Number(req.params.id as string));
@@ -759,6 +783,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         "/models",
         "/providers",
         "/chat",
+        "/land",
         "/evals",
         "/evals/*",
       ])
