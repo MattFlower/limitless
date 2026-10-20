@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { type GateExecutor, localExecutor } from "../src/gates/executor.ts";
@@ -157,6 +157,27 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
       const preview = f.store.getRunDetail(run.id)?.stages.find((stage) => stage.name === "preview");
       expect(preview?.status).toBe(executor === "setup failure" ? "failed" : "succeeded");
+      const events = f.store.listEvents(run.id).filter((event) => event.type === "gate");
+      const previewSetup = events.filter((event) => event.message.startsWith("preview setup:"));
+      expect(previewSetup).toMatchObject(
+        executor === "remote"
+          ? setup.map((command) => ({
+              level: "info",
+              message: expect.stringContaining("preview setup: pass"),
+              data: { command, ok: true },
+            }))
+          : executor === "setup failure"
+            ? [
+                {
+                  level: "warn",
+                  message: expect.stringContaining("preview setup: FAIL"),
+                  data: { command: setup[0], ok: false },
+                },
+              ]
+            : [],
+      );
+      if (executor === "local")
+        expect(events.some((event) => event.message.startsWith("setup-1: pass"))).toBe(true);
       if (executor === "setup failure") {
         expect(preview?.summary).toContain(`Preview setup failed: $ ${setup[0]}`);
         expect(preview?.summary).toContain("coordinator setup diagnostic");
@@ -169,7 +190,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           readFileSync(calls, "utf8")
             .trim()
             .split("\n")
-            .every((path) => path === cwd),
+            .every((path) => realpathSync(path) === realpathSync(cwd)),
         ).toBe(true);
         expect(readFileSync(join(home, "preview-steps"), "utf8")).toBe("build\nseed\nserve\n");
       }

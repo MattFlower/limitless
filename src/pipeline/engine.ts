@@ -435,7 +435,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 // ---------------------------------------------------------------------------
 // prepare: repo cache, worktree, gate detection, baseline
 
-function gateEvents(ctx: RunContext): Required<Omit<GateHooks, "onLocalSetup">> {
+function gateEvents(ctx: RunContext, label?: string): Required<Omit<GateHooks, "onLocalSetup">> {
   return {
     priority: "finish",
     skipGateSlot: false,
@@ -445,7 +445,7 @@ function gateEvents(ctx: RunContext): Required<Omit<GateHooks, "onLocalSetup">> 
         runId: ctx.run.id,
         type: "gate",
         level: r.ok ? "info" : "warn",
-        message: `${r.name}: ${r.ok ? "pass" : r.timedOut ? "timed out" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
+        message: `${label ?? r.name}: ${r.ok ? "pass" : r.timedOut ? "timed out" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
         data: r,
       }),
     onWait: (slots) =>
@@ -1810,7 +1810,12 @@ async function oneRound(
           "preview",
           async () => {
             if (!localSetupReady && gates.setup.length) {
-              const setup = await runLocalGates(cwd, { ...gates, checks: [] }, ctx.signal, gateEvents(ctx));
+              const setup = await runLocalGates(
+                cwd,
+                { ...gates, checks: [] },
+                ctx.signal,
+                gateEvents(ctx, "preview setup"),
+              );
               ctx.checkCancelled();
               if (!setup.setupOk) {
                 const failed = setup.setup.find((result) => !result.ok);
