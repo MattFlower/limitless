@@ -34,6 +34,7 @@ export function compareTrace(cases: ReviewCase[], baseline: EvalTrial[], variant
       const b = outputs[0];
       const v = outputs[1];
       const panel = v?.success ? v.data.panel : undefined;
+      const mainReport = panel?.reports?.[0];
       if (
         !b?.success ||
         !v?.success ||
@@ -41,6 +42,7 @@ export function compareTrace(cases: ReviewCase[], baseline: EvalTrial[], variant
         panel.finders[0]?.prompt !== "standard" ||
         panel.finders[1]?.prompt !== "trace" ||
         panel.reports?.length !== 2 ||
+        !mainReport ||
         panel.candidates.some((c) => !c.raisedBy?.length)
       ) {
         missing.push(`${item.id}/${trial}`);
@@ -70,7 +72,9 @@ export function compareTrace(cases: ReviewCase[], baseline: EvalTrial[], variant
       }
       const added = panel.candidates.filter((c) => c.raisedBy?.includes(1) && !c.raisedBy.includes(0));
       trace.added += added.length;
-      trace.addedOnGold += matchedReviewDefects(item, added, false).caught.size;
+      const { required, caught } = matchedReviewDefects(item, mainReport.findings);
+      const remaining = { ...item, defects: required.filter((_, i) => !caught.has(i)) };
+      trace.addedOnGold += matchedReviewDefects(remaining, added).caught.size;
       if (item.kind === "clean") {
         trace.cleanTrials++;
         const blocked = panel.reports[1] && blockingReviewFindings(panel.reports[1]).length > 0;

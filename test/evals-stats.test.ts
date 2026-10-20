@@ -678,7 +678,7 @@ test("trace comparison counts paired category recall, merged additions and newly
     missing: [],
     improvement: 0.5,
     additionalCleanBlocks: 1,
-    trace: { added: 5, addedOnGold: 3, cleanBlocked: 2, newlyBlocked: 1, cleanTrials: 4 },
+    trace: { added: 5, addedOnGold: 2, cleanBlocked: 2, newlyBlocked: 1, cleanTrials: 4 },
     decision: { pass: true },
   });
   expect(result.arms).toMatchObject([
@@ -762,6 +762,83 @@ test("trace comparison counts paired category recall, merged additions and newly
   bothClean.push({ ...source, caseId: secondClean.id, trial: 0 });
   expect(compareTrace(allCases, baseRows, bothClean, 1).additionalCleanBlocks).toBe(2);
   expect(compareTrace(allCases, baseRows, bothClean, 1).decision.pass).toBe(false);
+});
+
+test("trace gold credit uses required defects missed by each paired main report", async () => {
+  const { compareTrace } = await import("../src/evals/trace.ts");
+  const { reviewCase, reviewOutput } = await import("./evals-reading-support.ts");
+  const defect = reviewCase.defects[0];
+  const finding = reviewOutput().findings[0];
+  if (!defect || !finding) throw new Error("fixture");
+  const item = {
+    ...reviewCase,
+    defects: [
+      defect,
+      { ...defect, lines: [100, 100] as [number, number], required: false },
+      { ...defect, lines: [200, 200] as [number, number] },
+      { ...defect, lines: [300, 300] as [number, number] },
+    ],
+  };
+  const main = { ...finding, severity: "minor" as const, title: "Main found the missing guard" };
+  const trace = [
+    { ...finding, title: "An entry point bypasses the guard" },
+    { ...finding, title: "Another description of the bypass" },
+    { ...finding, line: 100, title: "Optional improvement" },
+    // One claim with aliases can credit only one of the two remaining required defects.
+    {
+      ...finding,
+      file: "././src/a.ts",
+      line: 500,
+      title: "A separate unguarded path",
+      duplicates: [200, 300].map((line) => ({ ...finding, finder: 1, line })),
+    },
+  ];
+  const baseline = [0, 1].map((i) => ({
+    ...trial("a", item.id, i, false),
+    output: reviewOutput(),
+  }));
+  const variant = [0, 1].map((i) => {
+    const mainFindings = i ? [] : [main];
+    return {
+      ...trial("a", item.id, i, false),
+      output: {
+        ...reviewOutput(),
+        findings: [...mainFindings, ...trace],
+        panel: {
+          finders: [
+            { prompt: "standard", vendor: null },
+            { prompt: "trace", vendor: null },
+          ],
+          reports: [{ findings: mainFindings }, { findings: trace }],
+          candidates: [...mainFindings, ...trace].map((f, index) => ({
+            ...f,
+            id: `candidate-${index}`,
+            finder: index < mainFindings.length ? 0 : 1,
+            vendor: null,
+            raisedBy: [index < mainFindings.length ? 0 : 1],
+          })),
+          verdicts: [],
+          refuted: [],
+          capped: [],
+        },
+      },
+    };
+  });
+  const duplicateOnly = {
+    ...item,
+    defects: [defect],
+  };
+  // Different titles remain separate additions, but the main report already matched this gold.
+  expect(compareTrace([duplicateOnly], baseline, variant, 1).trace).toMatchObject({
+    added: 4,
+    addedOnGold: 0,
+  });
+  expect(compareTrace([item], baseline, variant).trace).toMatchObject({
+    added: 8,
+    addedOnGold: 3,
+  });
+  // The second repetition earns credit even though the stored baseline caught the same defect.
+  expect(compareTrace([duplicateOnly], baseline, variant).trace.addedOnGold).toBe(1);
 });
 
 test("registered trace reporting selects standard-medium, regrades labels and rejects substitute or incomplete evidence", async () => {
