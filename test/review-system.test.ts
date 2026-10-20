@@ -7,6 +7,7 @@ import type { EvalTrial, ReviewSystem } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
+import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
 import { pickVerifier } from "../src/pipeline/review.ts";
 import {
   checkRosterTargets,
@@ -462,6 +463,7 @@ test("eval policy counts only standard systems matching the daemon's [review] im
         }),
       ),
       system(),
+      system({ name: "two-samples", samples: 2 }),
       system({ name: "without", implementerReport: "omit" }),
     ] as ReviewSystem[];
     const trial = (name: string): EvalTrial => ({
@@ -656,5 +658,54 @@ test("an eval system can name a configured roster; it expands to exactly the pro
     ).toThrow('review system "standard-roster": local finder candidate-a is not a free model');
   } finally {
     await f.close();
+  }
+});
+
+test("two samples are limited to eval single systems, with unchanged legacy hashes", () => {
+  const sampled = system({ samples: 2, finders: [{ target: "candidate-a@medium", prompt: "adversarial" }] });
+  expect(parseEvalReviewSystems(file(sampled), "systems.json")).toEqual([sampled] as EvalReviewSystem[]);
+  for (const samples of [1, 3, null, "2"])
+    expect(() => parseEvalReviewSystems(file(system({ samples })), "systems.json")).toThrow(
+      "samples must be 2",
+    );
+  for (const value of [panel({ samples: 2 }), system({ samples: 2, replayFrom: "previous" })])
+    expect(() => parseEvalReviewSystems(file(value), "systems.json")).toThrow(
+      "samples requires a single system without replayFrom",
+    );
+  expect(() =>
+    parseEvalReviewSystems(
+      file({
+        name: "roster",
+        roster: "standard",
+        targets: ["candidate-a"],
+        verifier: { target: "candidate-b" },
+        implementerReport: "include",
+        samples: 2,
+      }),
+      "systems.json",
+    ),
+  ).toThrow("samples is not supported on roster references");
+  expect(() => ReviewSystemSchema.parse(system({ samples: 2 }))).toThrow("eval-only until adopted");
+  const base = system() as ReviewSystem;
+  // The original hash was the canonical config alone (no name or union policy).
+  const original = new Bun.CryptoHasher("sha256")
+    .update(
+      JSON.stringify({
+        finders: [{ prompt: "standard", target: "candidate-a" }],
+        implementerReport: "include",
+        mode: "single",
+      }),
+    )
+    .digest("hex");
+  expect(reviewSystemHash(base)).toBe(original);
+  expect(reviewSystemHash({ ...base, samples: 2 })).not.toBe(original);
+  const unionHash = reviewSystemHash({ ...base, samples: 2 });
+  const version = MERGE_RULES.version;
+  try {
+    MERGE_RULES.version++;
+    expect(reviewSystemHash({ ...base, samples: 2 })).not.toBe(unionHash);
+    expect(reviewSystemHash(base)).toBe(original);
+  } finally {
+    MERGE_RULES.version = version;
   }
 });
