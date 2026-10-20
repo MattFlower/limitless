@@ -90,13 +90,24 @@ test("publication checks standard base64 with caller-selected private entries an
   ).toThrow("entry 3");
 });
 
-test("publication decodes once and permits clean text and unrecognized references", () => {
+test("publication repeatedly decodes HTML and permits clean text and unrecognized references", () => {
   const phrase = ["private", "&", "value"].join(" ");
   expect(() =>
-    checkPublicationText("Use & <tag> &unknown; &#65; &#x42; private &amp;amp; value", "PR text", [
-      { value: phrase, entry: 1 },
-    ]),
+    checkPublicationText("Use & <tag> &unknown; &#65; &#x42;", "PR text", [{ value: phrase, entry: 1 }]),
   ).not.toThrow();
+  expect(() =>
+    checkPublicationText("private &amp;amp; value", "PR text", [{ value: phrase, entry: 1 }]),
+  ).toThrow("entry 1");
+  const percent = (value: string) => Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+  const html = (value: string) => Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("");
+  const encoded = Buffer.from(phrase).toString("base64");
+  for (const text of [percent(html(phrase)), html(percent(phrase)), percent(encoded), html(encoded)])
+    expect(() => checkPublicationText(text, "PR text", [{ value: phrase, entry: 1 }])).toThrow("entry 1");
+  // Base64 of an encoded spelling alone remains outside scope.
+  for (const text of [percent(phrase), html(phrase)])
+    expect(() =>
+      checkPublicationText(Buffer.from(text).toString("base64"), "PR text", [{ value: phrase, entry: 1 }]),
+    ).not.toThrow();
 });
 
 test("labels and titles are sanitized independently of relative and case-insensitive web destinations", () => {

@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { decodeHTML } from "entities";
 
 const darwin = process.platform === "darwin" ? await import("../util/processes-darwin.ts") : undefined;
 
@@ -149,6 +150,7 @@ export const base64Runs = /[A-Za-z0-9+/]+=*/g;
 export function base64Match(run: string, entries: PrivateStrings): string | undefined {
   const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
   if (run.replace(/=+$/, "").length < minimum) return undefined;
+  // Encodings nested inside decoded base64 (such as percent or HTML) are outside scope.
   // One of four alignments decodes any encoding inside the run (a directory prefix or "/" included),
   // and later characters never change bytes already decoded, so this stays linear in the run.
   for (let offset = 0; offset < 4; offset++) {
@@ -163,7 +165,9 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   const layers = [text];
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
-    const next = decoded(text).replace(base64Runs, (run) => base64Match(run, entries) ?? run);
+    const next = decodeHTML(decoded(text))
+      .replace(/\s+/g, " ")
+      .replace(base64Runs, (run) => base64Match(run, entries) ?? run);
     if (next === text) return layers.map(normalize);
     layers.push(next);
     text = next;

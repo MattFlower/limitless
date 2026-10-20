@@ -144,7 +144,7 @@ describe("audit allowances (fake agents, real git)", () => {
       prompts[1],
       f.store.getRun(run.id)?.error,
     ]) {
-      expect(output).toContain("true # [redacted]");
+      expect(output).toContain("[redacted diagnostic]");
       expect(output).not.toContain(secret);
       expect(output).not.toContain("\x1b");
       expect(output).not.toContain("\\u001b");
@@ -154,11 +154,15 @@ describe("audit allowances (fake agents, real git)", () => {
   test("private-string audit events and retry feedback redact filenames and values", async () => {
     const credential = ["synthetic", "scratch", "path", "credential"].join("-");
     const privateValue = ["secret", "host.example"].join("-");
+    const percent = (value: string) => Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+    const html = (value: string) => Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("");
     const encodedNames = [
-      Array.from(credential, (c) => `%${c.charCodeAt(0).toString(16)}`).join(""),
-      Array.from(privateValue, (c) => `&#${c.charCodeAt(0)};`).join(""),
+      percent(credential),
+      html(privateValue),
       Buffer.from(credential).toString("base64"),
       Buffer.from(privateValue).toString("base64").replace(/=+$/, ""),
+      percent(Buffer.from(credential).toString("base64")),
+      html(Buffer.from(privateValue).toString("base64")),
     ];
     writeFileSync(
       join(repoDir, ".limitless.toml"),

@@ -2,17 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
 import { registeredCredentials } from "../util/proc.ts";
-import { redactGateOutput } from "./output.ts";
-import {
-  base64Match,
-  base64Runs,
-  loadPrivateStrings,
-  privateMatches,
-  privateReason,
-  redactLiteral,
-  redactPrivate,
-} from "./private.ts";
-import { publicationMatches } from "./publication.ts";
+import { loadPrivateStrings, privateMatches, privateReason } from "./private.ts";
 
 export interface AuditFinding {
   rule: string;
@@ -439,27 +429,14 @@ export function auditDiff(
     findings.map((f) => {
       const file = f.file === undefined ? undefined : stripVTControlCharacters(f.file);
       const detail = stripVTControlCharacters(f.detail);
-      // Literal redaction can break an escape or an encoding (one value inside another's base64), so the raw
-      // detail decides refusals and each value is sought with only its own literal spellings removed. A base64
-      // encoding can contain its own value literally, so raw base64 runs are decoded before any removal.
-      const encoded =
-        publicationMatches(detail, []).length > 0 ||
-        (detail.match(base64Runs) ?? []).some((run) => base64Match(run, protectedText) !== undefined) ||
-        protectedText.some((entry) => publicationMatches(redactLiteral(detail, [entry]), [entry]).length > 0);
-      const cleanDetail = redactPrivate(redactGateOutput(detail), entries);
       return {
         ...f,
         ...(file !== undefined
           ? {
-              file: publicationMatches(file, protectedText).length
-                ? "[redacted filename]"
-                : redactGateOutput(file),
+              file: privateMatches(file, protectedText).length ? "[redacted filename]" : file,
             }
           : {}),
-        detail:
-          encoded || publicationMatches(cleanDetail, protectedText).length
-            ? "[redacted diagnostic]"
-            : cleanDetail,
+        detail: privateMatches(detail, protectedText).length ? "[redacted diagnostic]" : detail,
       };
     }),
   );

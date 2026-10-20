@@ -1,5 +1,4 @@
 import { realpathSync } from "node:fs";
-import { decodeHTML } from "entities";
 import { PrivateError, type PrivateStrings, privateMatches, privateReason } from "./private.ts";
 
 /** Configured and canonical spellings of roots; removed roots keep their known spellings. */
@@ -70,11 +69,8 @@ export function sanitizePublication(
   );
 }
 
-/** Check both the outgoing Markdown and the text exposed by HTML character references. */
-export const publicationMatches = (text: string, entries: PrivateStrings): PrivateStrings => [
-  ...privateMatches(text, entries),
-  ...privateMatches(decodeHTML(text).replace(/\s+/g, " "), entries),
-];
+/** Match outgoing text and its supported decoded layers. */
+export const publicationMatches = privateMatches;
 
 export function checkPublicationText(text: string, location: string, entries: PrivateStrings): void {
   const hit = publicationMatches(text, entries)[0];

@@ -1096,7 +1096,7 @@ describe("scratch output audit warnings", () => {
           file: "[redacted filename]",
         }),
       ]);
-      expect(findings.find((f) => f.rule === "binary-content")?.detail).toContain("[redacted]");
+      expect(findings.find((f) => f.rule === "binary-content")?.detail).toBe("[redacted diagnostic]");
       expect(JSON.stringify(findings)).not.toContain(privateValue);
       expect(formatAuditFeedback(findings)).toContain("[redacted filename]");
       expect(formatAuditFeedback(findings)).not.toContain(privateValue);
@@ -1248,49 +1248,69 @@ describe("private strings", () => {
       expect(JSON.stringify(findings)).not.toContain(part);
   });
 
-  test.each(["percent", "HTML", "base64", "unpadded base64"])(
-    "every audit rule withholds %s filenames and detail references before literal redaction",
-    (encoding) => {
+  const percent = (value: string) => Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+  const html = (value: string) => Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("");
+  const base64 = (value: string) => Buffer.from(value).toString("base64");
+  const encodings: [string, (value: string) => string, boolean][] = [
+    ["percent", percent, true],
+    ["HTML", html, true],
+    ["base64", base64, true],
+    ["unpadded base64", (value) => base64(value).replace(/=+$/, ""), true],
+    ["percent(HTML)", (value) => percent(html(value)), true],
+    ["HTML(percent)", (value) => html(percent(value)), true],
+    ["percent(base64)", (value) => percent(base64(value)), true],
+    ["HTML(base64)", (value) => html(base64(value)), true],
+    ["base64 with byte offset", (value) => base64(`user:${value}`), true],
+    [
+      "unrelated base64",
+      () => {
+        let text = "ordinary unrelated text";
+        for (let round = 0; round < 8; round++) text = base64(text);
+        return text;
+      },
+      false,
+    ],
+  ];
+  test.each(encodings)(
+    "every audit rule checks %s filenames and detail references before literal redaction",
+    (_encoding, encode, protectedValue) => {
       const credential = ["synthetic", "audit", "credential"].join("-");
       const privateValue = ["private", "audit", "entry"].join("-");
       proc.registerCredential("audit-encoded-test", credential);
       const configDir = tempDir({ "private-strings.txt": privateValue });
       try {
         for (const value of [credential, privateValue]) {
-          const encoded =
-            encoding === "percent"
-              ? Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("")
-              : encoding === "HTML"
-                ? Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("")
-                : Buffer.from(value)
-                    .toString("base64")
-                    .replace(encoding === "base64" ? /$/ : /=+$/, "");
-          const path = `vendor-${encoded}`;
+          const encoded = encode(value);
+          const path = `vendor-${String.fromCharCode(27)}[31m${encoded}`;
+          const cleanPath = `vendor-${encoded}`;
+          const diagnostic = `git commit --no-verify -m '${String.fromCharCode(27)}[31m${encoded}'`;
           const findings = auditDiff(
             { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
             {
               configDir,
               taskClass: null,
               protectedPaths: [],
-              toolCommands: [`git commit --no-verify -m '${value} ${encoded}'`],
+              toolCommands: [diagnostic],
             },
           );
           expect(findings.find((f) => f.rule === "gitlink")).toEqual({
             rule: "gitlink",
             severity: "block",
-            file: "[redacted filename]",
-            detail: "[redacted diagnostic]",
+            file: protectedValue ? "[redacted filename]" : cleanPath,
+            detail: protectedValue
+              ? "[redacted diagnostic]"
+              : `${cleanPath}: nested repository contents are absent from the diff, so they cannot be reviewed. Remove the nested repository unless the request asks for it. If this is intended, add \`Allow: submodules\` to the request.`,
           });
-          expect(JSON.stringify(findings)).not.toContain(encoded);
-          expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+          expect(findings.find((f) => f.rule === "no-verify")).toEqual({
+            rule: "no-verify",
+            severity: "warn",
+            detail: protectedValue
+              ? "[redacted diagnostic]"
+              : `Agent ran a command with --no-verify: git commit --no-verify -m '${encoded}'`,
+          });
+          if (protectedValue) expect(JSON.stringify(findings)).not.toContain(encoded);
+          else expect(findings).toHaveLength(2);
         }
-        const path = `vendor-${String.fromCharCode(27)}[31mclean`;
-        expect(
-          auditDiff(
-            { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
-            { configDir, taskClass: null, protectedPaths: [] },
-          ).find((f) => f.rule === "gitlink"),
-        ).toMatchObject({ file: "vendor-clean", detail: expect.stringContaining("vendor-clean") });
       } finally {
         rmSync(configDir, { recursive: true, force: true });
       }
@@ -1306,6 +1326,23 @@ describe("private strings", () => {
       toolCommands: [`git commit --no-verify -m '%${repeated}72'`],
     });
     expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+    let unsafe = "%61 harmless";
+    for (let round = 0; round < 5; round++) unsafe = encodeURIComponent(unsafe);
+    const refused = auditDiff(
+      { ...diff("", [{ status: "A", path: unsafe }]), gitlinks: [unsafe], binaryErrors: [unsafe] },
+      { taskClass: null, protectedPaths: [] },
+    );
+    expect(refused.find((f) => f.rule === "gitlink")).toEqual({
+      rule: "gitlink",
+      severity: "block",
+      file: "[redacted filename]",
+      detail: "[redacted diagnostic]",
+    });
+    expect(refused.find((f) => f.rule === "binary-content")).toEqual({
+      rule: "binary-content",
+      severity: "block",
+      detail: "[redacted diagnostic]",
+    });
   });
 
   test("audit withholds an encoded credential that another credential's literal redaction breaks", () => {
@@ -1313,18 +1350,17 @@ describe("private strings", () => {
     const encoded = Buffer.from(credential).toString("base64");
     proc.registerCredential("audit-nested-outer-test", credential);
     proc.registerCredential("audit-nested-inner-test", encoded.slice(0, 12));
-    const findings = auditDiff(diff("", []), {
-      taskClass: "question",
-      protectedPaths: [],
-      toolCommands: [
-        `git commit --no-verify -m ${encoded}`,
-        `git commit --no-verify -m '${credential}' # literal`,
-      ],
-    });
-    expect(findings.filter((f) => f.rule === "no-verify").map((f) => f.detail)).toEqual([
-      "[redacted diagnostic]",
-      "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]' # literal",
-    ]);
+    for (const command of [
+      `git commit --no-verify -m ${encoded}`,
+      `git commit --no-verify -m '${credential}' # literal`,
+    ]) {
+      const findings = auditDiff(diff("", []), {
+        taskClass: "question",
+        protectedPaths: [],
+        toolCommands: [command],
+      });
+      expect(findings).toEqual([{ rule: "no-verify", severity: "warn", detail: "[redacted diagnostic]" }]);
+    }
   });
 
   test("audit withholds a base64 encoding that contains its own credential literally", () => {
@@ -1335,18 +1371,17 @@ describe("private strings", () => {
     const encoded = Buffer.from(credential).toString("base64");
     expect(encoded.startsWith(credential)).toBe(true);
     proc.registerCredential("audit-self-encoding-test", credential);
-    const findings = auditDiff(diff("", []), {
-      taskClass: "question",
-      protectedPaths: [],
-      toolCommands: [
-        `git commit --no-verify -m ${encoded}`,
-        `git commit --no-verify -m '${credential}' # literal`,
-      ],
-    });
-    expect(findings.filter((f) => f.rule === "no-verify").map((f) => f.detail)).toEqual([
-      "[redacted diagnostic]",
-      "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]' # literal",
-    ]);
+    for (const command of [
+      `git commit --no-verify -m ${encoded}`,
+      `git commit --no-verify -m '${credential}' # literal`,
+    ]) {
+      const findings = auditDiff(diff("", []), {
+        taskClass: "question",
+        protectedPaths: [],
+        toolCommands: [command],
+      });
+      expect(findings).toEqual([{ rule: "no-verify", severity: "warn", detail: "[redacted diagnostic]" }]);
+    }
   });
 
   test("base64 matching stays linear on slash-heavy runs", () => {
