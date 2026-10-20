@@ -91,13 +91,17 @@ const ReviewSystemBaseSchema = z
       ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "panel" needs a verifier' });
   }) satisfies z.ZodType<ReviewSystem>;
 
-export const ReviewSystemSchema = ReviewSystemBaseSchema.refine(
-  (system) => system.finders.every((f) => f.prompt !== "probe"),
-  { path: ["finders"], message: 'the "probe" prompt is eval-only' },
-).refine((system) => system.mode !== "single" || system.finders.every((f) => f.prompt === "standard"), {
-  path: ["finders"],
-  message: 'mode "single" uses the "standard" prompt',
-});
+export const ReviewSystemSchema = ReviewSystemBaseSchema.safeExtend({
+  samples: z.never({ error: "samples is eval-only until adopted" }).optional(),
+})
+  .refine((system) => system.finders.every((f) => f.prompt !== "probe"), {
+    path: ["finders"],
+    message: 'the "probe" prompt is eval-only',
+  })
+  .refine((system) => system.mode !== "single" || system.finders.every((f) => f.prompt === "standard"), {
+    path: ["finders"],
+    message: 'mode "single" uses the "standard" prompt',
+  });
 
 /**
  * An eval candidate built from the daemon's configured roster for a profile: `targets` pins each of
@@ -107,6 +111,7 @@ const RosterReferenceSchema = z.strictObject({
   name: z.string().trim().min(1, "system name must not be empty"),
   setup: z.literal(true).optional(),
   replayFrom: z.string().trim().min(1).optional(),
+  samples: z.never({ error: "samples is not supported on roster references" }).optional(),
   roster: z.enum(["quick", "standard", "deep"]),
   causalAttribution: z.literal(true).optional(),
   targets: z.array(TargetSchema).min(1),
@@ -118,10 +123,15 @@ const RosterReferenceSchema = z.strictObject({
 });
 export type RosterReference = z.infer<typeof RosterReferenceSchema>;
 export type EvalReviewSystem = ReviewSystem | RosterReference;
-const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
+export const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
+  samples: z.literal(2, { error: "samples must be 2" }).optional(),
   setup: z.literal(true).optional(),
   replayFrom: z.string().trim().min(1).optional(),
 })
+  .refine((system) => system.samples === undefined || (system.mode === "single" && !system.replayFrom), {
+    path: ["samples"],
+    message: "samples requires a single system without replayFrom",
+  })
   .refine((system) => system.mode !== "single" || system.finders.every((f) => f.local === undefined), {
     path: ["finders"],
     message: 'mode "single" takes no local finder option',

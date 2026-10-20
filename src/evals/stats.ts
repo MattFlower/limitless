@@ -346,12 +346,39 @@ export function summarize(
       .map((t) => t.durationMs)
       .sort((a, b) => a - b);
     const middle = Math.floor(latency.length / 2);
+    const singleSample = system?.samples
+      ? roleMetrics(
+          run,
+          rows.flatMap((trial) =>
+            (trial.details.samples ?? []).map((sample) => ({
+              ...trial,
+              trial: sample.index,
+              output: sample.output,
+              status: sample.error !== undefined ? ("error" as const) : ("ok" as const),
+              details: { ...trial.details, grade: sample.grade },
+            })),
+          ),
+          labeledCases,
+          reviewGrader,
+        ).review
+      : null;
     return {
       candidate,
       modelId: first ? evidenceTarget(first) : (system?.finders[0]?.target ?? candidate),
       system,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows, labeledCases, reviewGrader),
+      ...(singleSample
+        ? {
+            singleSample: {
+              ...singleSample,
+              bySeverity: singleSample.bySeverity.map((g) => ({
+                ...g,
+                ci: wilson(g.numerator, g.denominator),
+              })),
+            },
+          }
+        : {}),
       ...(run.role === "implement"
         ? {
             implement: {
