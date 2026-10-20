@@ -1100,7 +1100,7 @@ describe("scratch output audit warnings", () => {
           file: "[redacted filename]",
         }),
       ]);
-      expect(findings.find((f) => f.rule === "binary-content")?.detail).toContain("[redacted]");
+      expect(findings.find((f) => f.rule === "binary-content")?.detail).toBe("[redacted diagnostic]");
       expect(JSON.stringify(findings)).not.toContain(privateValue);
       expect(formatAuditFeedback(findings)).toContain("[redacted filename]");
       expect(formatAuditFeedback(findings)).not.toContain(privateValue);
@@ -1194,6 +1194,244 @@ describe("audit allowances and attribute rules", () => {
 });
 
 describe("private strings", () => {
+  test("base64 matches protected UTF-8 values in padded, unpadded and surrounding text runs", () => {
+    const value = ["synthetic", "é", "credential"].join("-");
+    const entries = [{ value, entry: 3 }];
+    for (const text of [value, `prefix:${value}:suffix`]) {
+      const encoded = Buffer.from(text).toString("base64");
+      for (const run of [encoded, encoded.replace(/=+$/, "")]) {
+        expect(privateMatches(`payload: ${run}`, entries)).toEqual(entries);
+        expect(privateMatches(`logs/${run}.txt`, entries)).toEqual(entries);
+        expect(() => checkPrivateText(run, "body", entries)).toThrow("entry 3");
+        expect(redactPrivate(run, entries)).toBe("[redacted diagnostic]");
+      }
+    }
+    const encoded = Buffer.from(value).toString("base64");
+    // Runs whose bytes still hold the whole value are withheld even with stray padding or a binary prefix.
+    for (const run of [
+      `${encoded}==`,
+      Buffer.concat([Buffer.from([255]), Buffer.from(value)]).toString("base64"),
+    ])
+      expect(privateMatches(run, entries)).toEqual(entries);
+    for (const run of [encoded.slice(0, -4), encoded.toLowerCase(), "YQ==", "abcd!"]) {
+      expect(privateMatches(run, entries)).toEqual([]);
+      expect(() => checkPrivateText(run, "body", entries)).not.toThrow();
+    }
+    let unrelated = "ordinary unrelated text";
+    for (let round = 0; round < 8; round++) unrelated = Buffer.from(unrelated).toString("base64");
+    expect(privateMatches(unrelated, entries)).toEqual([]);
+    expect(privateMatches(Buffer.from(value).toString("base64"), [])).toEqual([]);
+    const wide = "Ａ".repeat(4);
+    const policy = [{ value: wide, entry: 7 }];
+    expect(privateMatches(Buffer.from(wide).toString("base64"), policy)).toEqual(policy);
+    // Its ASCII normalization is shorter than the protected value's UTF-8 eligibility floor.
+    expect(privateMatches(Buffer.from("AAAA").toString("base64"), policy)).toEqual([]);
+    // Padding does not supply bytes toward that floor either.
+    expect(privateMatches(Buffer.from("A").toString("base64"), [{ value: "Ａ", entry: 7 }])).toEqual([]);
+  });
+
+  test("base64 whose alphabet slash follows a directory prefix still matches", () => {
+    // One of three "?" bytes always ends a base64 group as "/".
+    const value = ["synthetic", "slashed", "credential???"].join("-");
+    const entries = [{ value, entry: 4 }];
+    const encoded = Buffer.from(value).toString("base64");
+    expect(encoded).toContain("/");
+    for (const run of [encoded, encoded.replace(/=+$/, "")]) {
+      for (const text of [`notes/${run}.txt`, `a/b/${run}`, `dir/${run}/more.txt`, `x/${run}/y/z`])
+        expect(privateMatches(text, entries)).toEqual(entries);
+      expect(privateMatches(`notes/${run.slice(0, -4)}.txt`, entries)).toEqual([]);
+    }
+    proc.registerCredential("audit-slashed-base64-test", value);
+    const path = `vendor/${encoded}`;
+    const findings = auditDiff(
+      { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+      { taskClass: null, protectedPaths: [] },
+    );
+    expect(findings.find((f) => f.rule === "gitlink")).toMatchObject({ file: "[redacted filename]" });
+    for (const part of [value, ...encoded.split("/").filter((part) => part.length >= 8)])
+      expect(JSON.stringify(findings)).not.toContain(part);
+  });
+
+  const percent = (value: string) => Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+  const html = (value: string) => Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("");
+  const base64 = (value: string) => Buffer.from(value).toString("base64");
+  const encodings: [string, (value: string) => string, boolean][] = [
+    ["percent", percent, true],
+    ["HTML", html, true],
+    ["base64", base64, true],
+    ["unpadded base64", (value) => base64(value).replace(/=+$/, ""), true],
+    ["percent(HTML)", (value) => percent(html(value)), true],
+    ["HTML(percent)", (value) => html(percent(value)), true],
+    ["percent(base64)", (value) => percent(base64(value)), true],
+    ["HTML(base64)", (value) => html(base64(value)), true],
+    ["base64 with byte offset", (value) => base64(`user:${value}`), true],
+    [
+      "unrelated base64",
+      () => {
+        let text = "ordinary unrelated text";
+        for (let round = 0; round < 8; round++) text = base64(text);
+        return text;
+      },
+      false,
+    ],
+  ];
+  test.each(encodings)(
+    "every audit rule checks %s filenames and detail references before literal redaction",
+    (_encoding, encode, protectedValue) => {
+      const credential = ["synthetic", "audit", "credential"].join("-");
+      const privateValue = ["private", "audit", "entry"].join("-");
+      proc.registerCredential("audit-encoded-test", credential);
+      const configDir = tempDir({ "private-strings.txt": privateValue });
+      try {
+        for (const value of [credential, privateValue]) {
+          const encoded = encode(value);
+          const path = `vendor-${String.fromCharCode(27)}[31m${encoded}`;
+          const cleanPath = `vendor-${encoded}`;
+          const diagnostic = `git commit --no-verify -m '${String.fromCharCode(27)}[31m${encoded}'`;
+          const findings = auditDiff(
+            { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+            {
+              configDir,
+              taskClass: null,
+              protectedPaths: [],
+              toolCommands: [diagnostic],
+            },
+          );
+          expect(findings.find((f) => f.rule === "gitlink")).toEqual({
+            rule: "gitlink",
+            severity: "block",
+            file: protectedValue ? "[redacted filename]" : cleanPath,
+            detail: protectedValue
+              ? "[redacted diagnostic]"
+              : `${cleanPath}: nested repository contents are absent from the diff, so they cannot be reviewed. Remove the nested repository unless the request asks for it. If this is intended, add \`Allow: submodules\` to the request.`,
+          });
+          expect(findings.find((f) => f.rule === "no-verify")).toEqual({
+            rule: "no-verify",
+            severity: "warn",
+            detail: protectedValue
+              ? "[redacted diagnostic]"
+              : `Agent ran a command with --no-verify: git commit --no-verify -m '${encoded}'`,
+          });
+          if (protectedValue) expect(JSON.stringify(findings)).not.toContain(encoded);
+          else expect(findings).toHaveLength(2);
+        }
+      } finally {
+        rmSync(configDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("audit preserves raw decoding-limit refusals when literal redaction breaks an escape", () => {
+    const repeated = "25".repeat(6);
+    proc.registerCredential("audit-decoding-limit-test", repeated);
+    const findings = auditDiff(diff("", []), {
+      taskClass: "question",
+      protectedPaths: [],
+      toolCommands: [`git commit --no-verify -m '%${repeated}72'`],
+    });
+    expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+    let unsafe = "%61 harmless";
+    for (let round = 0; round < 5; round++) unsafe = encodeURIComponent(unsafe);
+    const refused = auditDiff(
+      { ...diff("", [{ status: "A", path: unsafe }]), gitlinks: [unsafe], binaryErrors: [unsafe] },
+      { taskClass: null, protectedPaths: [] },
+    );
+    expect(refused.find((f) => f.rule === "gitlink")).toEqual({
+      rule: "gitlink",
+      severity: "block",
+      file: "[redacted filename]",
+      detail: "[redacted diagnostic]",
+    });
+    expect(refused.find((f) => f.rule === "binary-content")).toEqual({
+      rule: "binary-content",
+      severity: "block",
+      detail: "[redacted diagnostic]",
+    });
+  });
+
+  test("audit withholds an encoded credential that another credential's literal redaction breaks", () => {
+    const credential = ["synthetic", "nested", "credential"].join("-");
+    const encoded = Buffer.from(credential).toString("base64");
+    proc.registerCredential("audit-nested-outer-test", credential);
+    proc.registerCredential("audit-nested-inner-test", encoded.slice(0, 12));
+    for (const command of [
+      `git commit --no-verify -m ${encoded}`,
+      `git commit --no-verify -m '${credential}' # literal`,
+    ]) {
+      const findings = auditDiff(diff("", []), {
+        taskClass: "question",
+        protectedPaths: [],
+        toolCommands: [command],
+      });
+      expect(findings).toEqual([{ rule: "no-verify", severity: "warn", detail: "[redacted diagnostic]" }]);
+    }
+  });
+
+  test("audit withholds an encoded credential that contains a literal HTML reference", () => {
+    const credential = ["synthetic", "&copy;", "credential"].join("-");
+    proc.registerCredential("audit-html-literal-test", credential);
+    const encoded = encodeURIComponent(credential);
+    const findings = auditDiff(
+      { ...diff("", [{ status: "A", path: encoded }]), gitlinks: [encoded] },
+      { taskClass: null, protectedPaths: [], toolCommands: [`git commit --no-verify -m ${encoded}`] },
+    );
+    expect(findings.find((f) => f.rule === "gitlink")).toMatchObject({
+      file: "[redacted filename]",
+      detail: "[redacted diagnostic]",
+    });
+    expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+  });
+
+  test("audit withholds a base64 encoding that contains its own credential literally", () => {
+    // Repeated base64 converges on a prefix that its own encoding begins with.
+    let seed = "synthetic-self-encoding";
+    for (let round = 0; round < 24; round++) seed = Buffer.from(seed).toString("base64");
+    const credential = seed.slice(0, 16);
+    const encoded = Buffer.from(credential).toString("base64");
+    expect(encoded.startsWith(credential)).toBe(true);
+    proc.registerCredential("audit-self-encoding-test", credential);
+    for (const command of [
+      `git commit --no-verify -m ${encoded}`,
+      `git commit --no-verify -m '${credential}' # literal`,
+    ]) {
+      const findings = auditDiff(diff("", []), {
+        taskClass: "question",
+        protectedPaths: [],
+        toolCommands: [command],
+      });
+      expect(findings).toEqual([{ rule: "no-verify", severity: "warn", detail: "[redacted diagnostic]" }]);
+    }
+  });
+
+  test("audit withholds the JSON-escaped spelling of a credential containing a quote or backslash", () => {
+    const credential = ['synthetic"escaped', "credential\\value"].join("-");
+    const escaped = JSON.stringify(credential).slice(1, -1);
+    expect(escaped).not.toContain(credential);
+    proc.registerCredential("audit-escaped-credential-test", credential);
+    const path = `vendor-${escaped}`;
+    const findings = auditDiff(
+      { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+      { taskClass: null, protectedPaths: [], toolCommands: [`git commit --no-verify -m "${escaped}"`] },
+    );
+    expect(findings.find((f) => f.rule === "gitlink")).toEqual({
+      rule: "gitlink",
+      severity: "block",
+      file: "[redacted filename]",
+      detail: "[redacted diagnostic]",
+    });
+    expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+    expect(JSON.stringify(findings)).not.toContain(escaped);
+  });
+
+  test("base64 matching stays linear on slash-heavy runs", () => {
+    const value = ["synthetic", "slash", "run"].join("-");
+    const run = `${"/".repeat(200_000)}${Buffer.from(value).toString("base64")}`;
+    const started = performance.now();
+    expect(privateMatches(run, [{ value, entry: 2 }])).toEqual([{ value, entry: 2 }]);
+    expect(privateMatches(`${"/".repeat(200_000)}YWJjZA==`, [{ value, entry: 2 }])).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
   test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {
     const entries = [{ value: "private-prospect.example", entry: 3 }];
     const text = encode(entries[0]?.value ?? "");

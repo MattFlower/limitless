@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { decodeHTML } from "entities";
 
 const darwin = process.platform === "darwin" ? await import("../util/processes-darwin.ts") : undefined;
 
@@ -144,12 +145,35 @@ const decoded = (text: string) =>
     .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
     // Diagnostics may JSON-quote a field's literal Unicode escapes.
     .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+export const base64Runs = /[A-Za-z0-9+/]+=*/g;
+/** The decoded text of a base64 run that holds a protected value; undefined for unrelated runs. */
+export function base64Match(run: string, entries: PrivateStrings): string | undefined {
+  const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
+  if (run.replace(/=+$/, "").length < minimum) return undefined;
+  // Encodings nested inside decoded base64 (such as percent or HTML) are outside scope.
+  // One of four alignments decodes any encoding inside the run (a directory prefix or "/" included),
+  // and later characters never change bytes already decoded, so this stays linear in the run.
+  for (let offset = 0; offset < 4; offset++) {
+    const plain = Buffer.from(run.slice(offset), "base64").toString();
+    const found = normalize(plain);
+    if (entries.some(({ value }) => found.includes(normalize(value)))) return plain;
+  }
+  return undefined;
+}
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
-export function normalizedLayers(text: string): string[] | null {
+export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
+  const decodeBase64 = (layer: string) =>
+    layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
   for (let round = 0; round < 5; round++) {
-    const next = decoded(text);
-    if (next === text) return layers.map(normalize);
+    // Unrelated runs must not change decoding convergence or cause a refusal.
+    // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
+    const unescaped = decoded(text);
+    const expanded = decodeHTML(unescaped);
+    // Keep line breaks too: report quotations and multiline credentials depend on them.
+    layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+    const next = decodeBase64(expanded);
+    if (next === text) return [...layers, next].map(normalize);
     layers.push(next);
     text = next;
   }
@@ -157,7 +181,7 @@ export function normalizedLayers(text: string): string[] | null {
 }
 /** A clipped value also protects any trailing fragment of a private string. */
 export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
-  const normalized = normalizedLayers(text);
+  const normalized = normalizedLayers(text, entries);
   if (normalized)
     return entries.filter(({ value }) => {
       const protectedText = normalize(value);
@@ -180,9 +204,14 @@ export const privateReason = (location: string, entry: number) =>
   entry === 0
     ? `${location} exceeds the private text decoding limit; publication blocked`
     : `${location} contains a private string (entry ${entry} in private-strings.txt)`;
+export const redactLiteral = (text: string, entries: PrivateStrings) =>
+  entries.reduce(
+    (out, { value }) =>
+      out.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"),
+    text,
+  );
 export function redactPrivate(text: string, entries: PrivateStrings): string {
-  for (const { value } of entries)
-    text = text.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]");
+  text = redactLiteral(text, entries);
   return privateMatches(text, entries).length ? "[redacted diagnostic]" : text;
 }
 export function checkPrivateText(text: string, location: string, entries: PrivateStrings): void {

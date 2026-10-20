@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkPublicationText, sanitizePublication } from "../src/gates/publication.ts";
+import { registerCredential, registeredCredentials } from "../src/util/proc.ts";
 
 test("publication rewrites local report links and bare paths without changing ordinary links", () => {
   const data = "/factory/data";
@@ -55,20 +56,74 @@ test.each(["&amp;", "&#38;", "&#x26;"])(
   },
 );
 
-test("publication still checks exact outgoing text before decoding or collapsing it", () => {
+test("publication retains exact raw and decoded text before collapsing whitespace", () => {
   const phrase = ["private", "&amp;", "value"].join("\t");
   expect(() => checkPublicationText(phrase, "PR text", [{ value: phrase, entry: 1 }])).toThrow(
     "PR text contains a private string (entry 1 in private-strings.txt)",
   );
+  for (const separator of ["\t", "\n"]) {
+    const value = ["private", "value"].join(separator);
+    for (const text of [encodeURIComponent(value), encodeURIComponent(encodeURIComponent(value))])
+      expect(() => checkPublicationText(text, "PR text", [{ value, entry: 1 }])).toThrow(
+        "PR text contains a private string (entry 1 in private-strings.txt)",
+      );
+  }
+  // A value holding a literal reference keeps matching after another encoding's decoding exposes it.
+  const value = ["synthetic", "&copy;", "credential"].join("-");
+  const html = (text: string) => Array.from(text, (c) => `&#${c.charCodeAt(0)};`).join("");
+  for (const text of [
+    encodeURIComponent(value),
+    html(encodeURIComponent(value)),
+    value.replace("&", "\\u0026"),
+  ])
+    expect(() => checkPublicationText(text, "PR text", [{ value, entry: 1 }])).toThrow("entry 1");
 });
 
-test("publication decodes once and permits clean text and unrecognized references", () => {
+test("publication checks standard base64 with caller-selected private entries and credentials", () => {
+  const credential = ["synthetic", "publication", "credential"].join("-");
+  const privateValue = ["private", "publication", "entry"].join("-");
+  registerCredential("publication-content-test", credential);
+  const entries = [
+    ...registeredCredentials()
+      .filter((value) => value === credential)
+      .map((value) => ({ value, entry: 1 })),
+    { value: privateValue, entry: 2 },
+  ];
+  for (const { value, entry } of entries) {
+    const encoded = Buffer.from(value).toString("base64");
+    for (const run of [encoded, encoded.replace(/=+$/, "")]) {
+      expect(() => checkPublicationText(`Report: ${run}`, "PR text", entries)).toThrow(`entry ${entry}`);
+      expect(() => checkPublicationText(run, "PR text", [])).not.toThrow();
+    }
+    for (const run of [encoded.slice(0, -4), encoded.slice(1), "ordinary text YWJjZA=="])
+      expect(() => checkPublicationText(run, "PR text", entries)).not.toThrow();
+  }
+  const slashed = ["private", "slashed", "entry???"].join("-");
+  const encoded = Buffer.from(slashed).toString("base64");
+  expect(encoded).toContain("/");
+  expect(() =>
+    checkPublicationText(`See reports/${encoded}.txt`, "PR text", [{ value: slashed, entry: 3 }]),
+  ).toThrow("entry 3");
+});
+
+test("publication repeatedly decodes HTML and permits clean text and unrecognized references", () => {
   const phrase = ["private", "&", "value"].join(" ");
   expect(() =>
-    checkPublicationText("Use & <tag> &unknown; &#65; &#x42; private &amp;amp; value", "PR text", [
-      { value: phrase, entry: 1 },
-    ]),
+    checkPublicationText("Use & <tag> &unknown; &#65; &#x42;", "PR text", [{ value: phrase, entry: 1 }]),
   ).not.toThrow();
+  expect(() =>
+    checkPublicationText("private &amp;amp; value", "PR text", [{ value: phrase, entry: 1 }]),
+  ).toThrow("entry 1");
+  const percent = (value: string) => Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+  const html = (value: string) => Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("");
+  const encoded = Buffer.from(phrase).toString("base64");
+  for (const text of [percent(html(phrase)), html(percent(phrase)), percent(encoded), html(encoded)])
+    expect(() => checkPublicationText(text, "PR text", [{ value: phrase, entry: 1 }])).toThrow("entry 1");
+  // Base64 of an encoded spelling alone remains outside scope.
+  for (const text of [percent(phrase), html(phrase)])
+    expect(() =>
+      checkPublicationText(Buffer.from(text).toString("base64"), "PR text", [{ value: phrase, entry: 1 }]),
+    ).not.toThrow();
 });
 
 test("labels and titles are sanitized independently of relative and case-insensitive web destinations", () => {

@@ -144,7 +144,7 @@ describe("audit allowances (fake agents, real git)", () => {
       prompts[1],
       f.store.getRun(run.id)?.error,
     ]) {
-      expect(output).toContain("true # [redacted]");
+      expect(output).toContain("[redacted diagnostic]");
       expect(output).not.toContain(secret);
       expect(output).not.toContain("\x1b");
       expect(output).not.toContain("\\u001b");
@@ -152,6 +152,18 @@ describe("audit allowances (fake agents, real git)", () => {
   });
 
   test("private-string audit events and retry feedback redact filenames and values", async () => {
+    const credential = ["synthetic", "scratch", "path", "credential"].join("-");
+    const privateValue = ["secret", "host.example"].join("-");
+    const percent = (value: string) => Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+    const html = (value: string) => Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("");
+    const encodedNames = [
+      percent(credential),
+      html(privateValue),
+      Buffer.from(credential).toString("base64"),
+      Buffer.from(privateValue).toString("base64").replace(/=+$/, ""),
+      percent(Buffer.from(credential).toString("base64")),
+      html(Buffer.from(privateValue).toString("base64")),
+    ];
     writeFileSync(
       join(repoDir, ".limitless.toml"),
       `[gates]\nchecks = [{ name = "test", run = 'for file in *.txt; do if test "$file" != greeting.txt; then echo "$file"; exit 1; fi; done' }]\n`,
@@ -172,11 +184,12 @@ describe("audit allowances (fake agents, real git)", () => {
           ".tmp-gate/secret-host.example.txt": "secret-host.example\n",
           [`.tmp-gate/secret-${String.fromCharCode(27)}[31mhost.example.txt`]: "report\n",
           ".tmp-gate/synthetic-scratch-path-credential.txt": "report\n",
+          ...Object.fromEntries(encodedNames.map((name) => [`.tmp-gate/${name}.txt`, "report\n"])),
         },
       };
     });
     f.cfg.maxRounds = 1;
-    registerCredential("scratch-path-test", "synthetic-scratch-path-credential");
+    registerCredential("scratch-path-test", credential);
     mkdirSync(f.cfg.paths.configDir, { recursive: true });
     writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
@@ -196,6 +209,10 @@ describe("audit allowances (fake agents, real git)", () => {
     expect(JSON.stringify(persisted)).not.toContain("secret-host.example");
     expect(prompts[1]).not.toContain("synthetic-scratch-path-credential");
     expect(JSON.stringify(events)).not.toContain("synthetic-scratch-path-credential");
+    for (const output of [JSON.stringify(persisted), JSON.stringify(events), prompts[1]]) {
+      expect(output).toContain("[redacted filename]");
+      for (const value of [credential, privateValue, ...encodedNames]) expect(output).not.toContain(value);
+    }
   });
 
   /** Commits a nested repository into the implementer's worktree, which Git records as a gitlink. */

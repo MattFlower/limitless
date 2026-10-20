@@ -191,7 +191,9 @@ esac
           : scenario === "named"
             ? phrase.replaceAll(" ", "&nbsp;\n\t")
             : phrase.replace("v", scenario === "decimal" ? "&#118;" : "&#x76;");
-      expect(() => checkPrivateText(report, "Raw report", [{ value: phrase, entry: 1 }])).not.toThrow();
+      const checkRaw = () => checkPrivateText(report, "Raw report", [{ value: phrase, entry: 1 }]);
+      if (scenario === "clean") expect(checkRaw).not.toThrow();
+      else expect(checkRaw).toThrow("Raw report contains a private string (entry 1");
       const f = start((s) => {
         if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
         if (roleOf(s) === "review") return { structured: approve };
