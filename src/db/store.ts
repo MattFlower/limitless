@@ -2737,6 +2737,46 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
 
   // ---- land queue ----------------------------------------------------------
 
+  latestMainLandings(): Record<string, number> {
+    const rows = this.db
+      .query(
+        "SELECT repo, max(id) AS id FROM land_entries WHERE base_branch = 'main' AND state = 'landed' GROUP BY repo",
+      )
+      .all() as { repo: string; id: number }[];
+    return Object.fromEntries(rows.map((row) => [row.repo, row.id]));
+  }
+
+  latestSelfLanding(repo: string): number {
+    const row = this.db
+      .query(
+        "SELECT max(id) AS id FROM land_entries WHERE repo = ? AND base_branch = 'main' AND state = 'landed'",
+      )
+      .get(repo) as { id: number | null };
+    return row.id ?? 0;
+  }
+
+  deployFeed(
+    kind: "deploy.started" | "deploy.failed",
+    repo: string,
+    sha: string,
+    landId: number,
+    summary: string,
+  ): void {
+    this.db.transaction(() =>
+      this.addFeedItems([
+        {
+          kind,
+          repo,
+          runId: null,
+          summary: redactCredentials(summary),
+          data: { sha },
+          key: `${repo}:${landId}`,
+        },
+      ]),
+    )();
+    this.publishFeed();
+  }
+
   createLandEntry(entry: {
     runId: string | null;
     title?: string;

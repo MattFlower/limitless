@@ -57,6 +57,34 @@ Only requested tunnel and mtplx agents migrate; they restart with rollback witho
    (the worktree and run state are persisted; a round whose implementation already committed
    goes straight to its checks).
 
+Self-hosting can opt in to automatic deployment in `config.toml`:
+
+```toml
+[deploy]
+after_land = "when_idle" # default: "off"; older releases ignore the table/key
+# Needs the macOS launchd service (limitless service install); refused elsewhere.
+```
+
+Only new landings on `main` in the daemon release checkout's `origin` GitHub repository count.
+Every 15 seconds, the daemon checks for pending landings and waits until no land entry in any
+repository is active and no scheduler run is active; parked runs and evals do not delay it.
+Landings during the wait coalesce; landings during a deploy stay pending for the next idle check.
+If main differs from the running boot SHA and the last successfully deployed SHA, a separate launchd
+job runs the existing `limitless deploy <sha> --smoke` path, with checks, live smoke quota, default
+drain wait, restart and rollback. Redacted output is under `~/.limitless/logs/dev.limitless.deploy.*.log`.
+
+The feed records `deploy.started` and `deploy.failed`, including the SHA and failure reason.
+A failure blocks automatic deployment until a newer self-repository `main` landing clears it;
+there are no automatic retries. At boot and on later ticks, an interrupted attempt is judged only
+from its job's exit status file. A rollback after the target boots still counts as failure, with
+the redacted log tail in the feed. A job that disappears without a status or exceeds the three-hour
+deadline also blocks with a clear reason and is removed. Job ids stay saved until removal succeeds;
+cleanup retries on later ticks. Older releases ignore this optional table/key and still start
+after rollback, without auto-deploying.
+The UI's **Land** page lists queue state, approved SHAs, reasons and logs, and cancels active entries;
+it refreshes after cancellation, every 15 seconds and on event-stream reconnect, coalescing
+reconnects during a refresh. `GET /api/land/<id>/log` serves redacted check logs.
+
 Releases before panel review rosters (#136) refuse to start when `config.toml` sets `[review] mode`
 or `[review.rosters]`. Leave both unset until the release that added them is known good: a rollback
 to an older release fails at startup until they are removed.
