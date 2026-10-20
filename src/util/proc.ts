@@ -128,76 +128,81 @@ export async function recoverProcessCleanups(
     for (const row of records) if (row.boot !== boot) store.deleteProcessCleanup(row.invocation, row.pid);
     if (!records.some((row) => row.boot === boot)) return;
     const protectedPids = callerAncestors();
-    const groups = [...invocations].flatMap((invocation) => {
-      const members = records.filter((row) => row.invocation === invocation && row.boot === boot);
-      if (!members.length) return [];
-      const anchor = members.find((row) => row.discovery);
-      const context = anchor?.discovery;
-      if (!anchor || !context) throw new Error(`Missing process discovery context for ${invocation}`);
-      return [{ anchor, context, claimed: new Map(members.map((row) => [row.pid, row])) }];
-    });
-    const killed = new Set<ProcessCleanup>();
-    let empty = false;
-    for (;;) {
-      let discovered = false;
-      const pending: number[] = [];
-      for (const { anchor, context, claimed } of groups) {
-        const pids = await markedProcesses(
-          anchor.invocation,
-          context.group,
-          context.started,
-          context.directories,
-          context.leader,
-          protectedPids,
-          BigInt(context.spawnedAt),
-        );
-        for (const pid of pids) {
-          if (protectedPids.has(pid) || claimed.has(pid)) continue;
-          const birth = await readBirth(pid);
-          if (birth === null) {
-            if (!stopped(pid)) throw new Error(`Process identity could not be confirmed for ${pid}`);
-            continue;
+    const results = await Promise.allSettled(
+      [...invocations].map(async (invocation) => {
+        const members = records.filter((row) => row.invocation === invocation && row.boot === boot);
+        if (!members.length) return;
+        const anchor = members.find((row) => row.discovery);
+        const context = anchor?.discovery;
+        if (!anchor || !context) throw new Error(`Missing process discovery context for ${invocation}`);
+        const claimed = new Map(members.map((row) => [row.pid, row]));
+        const killed = new Set<ProcessCleanup>();
+        let empty = false;
+        for (;;) {
+          let discovered = false;
+          const pending: number[] = [];
+          const pids = await markedProcesses(
+            anchor.invocation,
+            context.group,
+            context.started,
+            context.directories,
+            context.leader,
+            protectedPids,
+            BigInt(context.spawnedAt),
+          );
+          for (const pid of pids) {
+            if (protectedPids.has(pid) || claimed.has(pid)) continue;
+            const birth = await readBirth(pid);
+            if (birth === null) {
+              if (!stopped(pid)) throw new Error(`Process identity could not be confirmed for ${pid}`);
+              continue;
+            }
+            const row = { ...anchor, pid, birth, createdAt: Date.now() };
+            store.recordProcessCleanup(row);
+            claimed.set(pid, row);
+            discovered = true;
           }
-          const row = { ...anchor, pid, birth, createdAt: Date.now() };
-          store.recordProcessCleanup(row);
-          claimed.set(pid, row);
-          discovered = true;
-        }
-        for (const row of claimed.values()) {
-          if (protectedPids.has(row.pid)) throw new Error(`Protected cleanup process ${row.pid}`);
-          if (stopped(row.pid)) continue;
-          if (killed.has(row)) {
+          for (const row of claimed.values()) {
+            if (protectedPids.has(row.pid)) throw new Error(`Protected cleanup process ${row.pid}`);
+            if (stopped(row.pid)) continue;
+            if (killed.has(row)) {
+              pending.push(row.pid);
+              continue;
+            }
+            const birth = await readBirth(row.pid);
+            if (birth === null && !stopped(row.pid))
+              throw new Error(`Process identity could not be confirmed for ${row.pid}`);
+            if (birth !== row.birth && pids.includes(row.pid) && !stopped(row.pid))
+              throw new Error(`Process identity changed during recovery for ${row.pid}`);
+            if (birth !== row.birth) continue;
+            try {
+              process.kill(row.pid, "SIGKILL");
+              killed.add(row);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
+              throw error;
+            }
             pending.push(row.pid);
-            continue;
           }
-          const birth = await readBirth(row.pid);
-          if (birth === null && !stopped(row.pid))
-            throw new Error(`Process identity could not be confirmed for ${row.pid}`);
-          if (birth !== row.birth && pids.includes(row.pid) && !stopped(row.pid))
-            throw new Error(`Process identity changed during recovery for ${row.pid}`);
-          if (birth !== row.birth) continue;
-          try {
-            process.kill(row.pid, "SIGKILL");
-            killed.add(row);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
-            throw error;
+          // Keep exited members' context until another empty scan rules out a fork during inspection.
+          if (!pending.length && !discovered && empty) {
+            store.deleteInvocationCleanups(invocation);
+            return;
           }
-          pending.push(row.pid);
+          empty = !pending.length && !discovered;
+          if (performance.now() >= deadline)
+            throw new Error(
+              `Recorded processes still alive: ${pending.join(", ")}; process rediscovery did not quiesce`,
+            );
+          await Bun.sleep(10);
         }
-      }
-      // Keep exited members' context until another empty scan rules out a fork during inspection.
-      if (!pending.length && !discovered && empty) {
-        for (const { anchor } of groups) store.deleteInvocationCleanups(anchor.invocation);
-        return;
-      }
-      empty = !pending.length && !discovered;
-      if (performance.now() >= deadline)
-        throw new Error(
-          `Recorded processes still alive: ${pending.join(", ")}; process rediscovery did not quiesce`,
-        );
-      await Bun.sleep(10);
-    }
+      }),
+    );
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason as Error] : [],
+    );
+    if (failures.length)
+      throw new AggregateError(failures, failures.map((error) => error.message).join("; "));
   } catch (error) {
     throw new ProcessTerminationError(
       `${ProcessTerminationError.prefix}: ${redactCredentials((error as Error).message)}`,

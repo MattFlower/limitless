@@ -142,6 +142,7 @@ async function expectRecoveryRefusal(reason: string) {
       Promise.resolve().then(() => runProcess({ cmd: ["unused"], cwd: directory, env: {} })),
     ).rejects.toBe(current.terminationError);
   });
+  return current.terminationError;
 }
 
 test("discovery context survives reopening and legacy-column inserts remain compatible", async () => {
@@ -179,6 +180,36 @@ test("discovery context survives reopening and legacy-column inserts remain comp
     kill.mockRestore();
   }
 });
+
+for (const failure of ["legacy", "discovery"] as const) {
+  test(`batch recovery isolates ${failure} failures and aggregates refusals`, async () => {
+    const failed = [await sleeper(), await sleeper()].map((row) =>
+      failure === "legacy" ? { ...row, discovery: null } : row,
+    );
+    const healthy = await sleeper();
+    const unrecorded = await sleeper();
+    const [first, last] = failed;
+    if (!first || !last) throw new Error("Missing failed invocations");
+    for (const row of [first, healthy, last]) store.recordProcessCleanup(row);
+    const reason = (invocation: string) =>
+      failure === "legacy"
+        ? `Missing process discovery context for ${invocation}`
+        : `Discovery unavailable for ${invocation}`;
+    await processInspection.run(
+      async (environment, marker) => {
+        if (failed.some((row) => row.invocation === marker)) throw new Error(reason(marker));
+        return snapshot(recoveryProcessStopped(unrecorded.pid) ? [] : [unrecorded.pid], environment, marker);
+      },
+      async () => {
+        const error = await expectRecoveryRefusal(reason(first.invocation));
+        expect(error?.message).toContain(reason(last.invocation));
+      },
+    );
+    expectProcessStopped(healthy.pid);
+    expectProcessStopped(unrecorded.pid);
+    expect(store.listProcessCleanups()).toEqual(failed);
+  });
+}
 
 for (const stopped of [false, true]) {
   test(`rediscovery records later members before signalling (original stopped=${stopped})`, async () => {
