@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import {
   closeSync,
   fstatSync,
@@ -145,10 +146,28 @@ const decoded = (text: string) =>
     // Diagnostics may JSON-quote a field's literal Unicode escapes.
     .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
-export function normalizedLayers(text: string): string[] | null {
+export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
+  const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
   for (let round = 0; round < 5; round++) {
-    const next = decoded(text);
+    const next = decoded(text).replace(/[A-Za-z0-9+/]+=*/g, (run) => {
+      if (run.length < minimum) return run;
+      // Slash is both base64 alphabet and a filename component boundary.
+      for (const candidate of new Set([run, ...run.split("/")])) {
+        if (candidate.length < minimum) continue;
+        const bytes = Buffer.from(candidate, "base64");
+        const canonical = bytes.toString("base64");
+        if (
+          (candidate.includes("=") ? canonical : canonical.replace(/=+$/, "")) !== candidate ||
+          !isUtf8(bytes)
+        )
+          continue;
+        const value = bytes.toString();
+        if (entries.some((entry) => normalize(value).includes(normalize(entry.value)))) return value;
+      }
+      // Unrelated runs must not change decoding convergence or cause a refusal.
+      return run;
+    });
     if (next === text) return layers.map(normalize);
     layers.push(next);
     text = next;
@@ -157,7 +176,7 @@ export function normalizedLayers(text: string): string[] | null {
 }
 /** A clipped value also protects any trailing fragment of a private string. */
 export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
-  const normalized = normalizedLayers(text);
+  const normalized = normalizedLayers(text, entries);
   if (normalized)
     return entries.filter(({ value }) => {
       const protectedText = normalize(value);

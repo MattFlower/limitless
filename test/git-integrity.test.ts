@@ -3597,17 +3597,26 @@ test.each([
   ["staged", "private"],
   ["staged", "html"],
   ["staged", "undecodable"],
+  ["staged", "base64 credential"],
+  ["squash", "base64 private"],
+  ["history", "unpadded base64 credential"],
+  ["staged", "unpadded base64 private"],
 ])("decoding diagnosis withholds encoded filenames: %s %s", async (kind, sensitive) => {
   const credential = ["synthetic", "encoded", "credential"].join("-");
   const privateValue = ["synthetic", "private", "filename"].join("-");
   registerCredential("encoded-publication-path-test", credential);
-  const value = sensitive === "credential" ? credential : privateValue;
+  const isCredential = sensitive.includes("credential");
+  const value = isCredential ? credential : privateValue;
   const encoded =
     sensitive === "undecodable"
       ? `%${"25".repeat(6)}72`
-      : Array.from(value, (c) =>
-          sensitive === "html" ? `&#${c.charCodeAt(0)};` : `%${c.charCodeAt(0).toString(16)}`,
-        ).join("");
+      : sensitive.includes("base64")
+        ? Buffer.from(value)
+            .toString("base64")
+            .replace(sensitive.startsWith("unpadded") ? /=+$/ : /$/, "")
+        : Array.from(value, (c) =>
+            sensitive === "html" ? `&#${c.charCodeAt(0)};` : `%${c.charCodeAt(0).toString(16)}`,
+          ).join("");
   const path = `report-${encoded}.txt`;
   const payload = `%${"25".repeat(6)}72`;
   writeFileSync(join(work, path), payload);
@@ -3620,7 +3629,7 @@ test.each([
   }
   const error = await checkPrivatePublication(
     work,
-    sensitive === "credential" ? [] : [{ value: privateValue, entry: 1 }],
+    isCredential ? [] : [{ value: privateValue, entry: 1 }],
     kind === "squash"
       ? { squash: { base, head: sha, title: "Report", body: "" } }
       : kind === "staged"

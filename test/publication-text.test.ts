@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkPublicationText, sanitizePublication } from "../src/gates/publication.ts";
+import { registerCredential, registeredCredentials } from "../src/util/proc.ts";
 
 test("publication rewrites local report links and bare paths without changing ordinary links", () => {
   const data = "/factory/data";
@@ -60,6 +61,27 @@ test("publication still checks exact outgoing text before decoding or collapsing
   expect(() => checkPublicationText(phrase, "PR text", [{ value: phrase, entry: 1 }])).toThrow(
     "PR text contains a private string (entry 1 in private-strings.txt)",
   );
+});
+
+test("publication checks standard base64 with caller-selected private entries and credentials", () => {
+  const credential = ["synthetic", "publication", "credential"].join("-");
+  const privateValue = ["private", "publication", "entry"].join("-");
+  registerCredential("publication-content-test", credential);
+  const entries = [
+    ...registeredCredentials()
+      .filter((value) => value === credential)
+      .map((value) => ({ value, entry: 1 })),
+    { value: privateValue, entry: 2 },
+  ];
+  for (const { value, entry } of entries) {
+    const encoded = Buffer.from(value).toString("base64");
+    for (const run of [encoded, encoded.replace(/=+$/, "")]) {
+      expect(() => checkPublicationText(`Report: ${run}`, "PR text", entries)).toThrow(`entry ${entry}`);
+      expect(() => checkPublicationText(run, "PR text", [])).not.toThrow();
+    }
+    for (const run of [encoded.slice(0, -4), `${encoded}===`, "ordinary text YWJjZA=="])
+      expect(() => checkPublicationText(run, "PR text", entries)).not.toThrow();
+  }
 });
 
 test("publication decodes once and permits clean text and unrecognized references", () => {

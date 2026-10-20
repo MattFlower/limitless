@@ -1096,7 +1096,7 @@ describe("scratch output audit warnings", () => {
           file: "[redacted filename]",
         }),
       ]);
-      expect(findings.find((f) => f.rule === "binary-content")?.detail).toContain("[redacted]");
+      expect(findings.find((f) => f.rule === "binary-content")?.detail).toBe("[redacted diagnostic]");
       expect(JSON.stringify(findings)).not.toContain(privateValue);
       expect(formatAuditFeedback(findings)).toContain("[redacted filename]");
       expect(formatAuditFeedback(findings)).not.toContain(privateValue);
@@ -1190,6 +1190,84 @@ describe("audit allowances and attribute rules", () => {
 });
 
 describe("private strings", () => {
+  test("base64 matches protected UTF-8 values in padded, unpadded and surrounding text runs", () => {
+    const value = ["synthetic", "é", "credential"].join("-");
+    const entries = [{ value, entry: 3 }];
+    for (const text of [value, `prefix:${value}:suffix`]) {
+      const encoded = Buffer.from(text).toString("base64");
+      for (const run of [encoded, encoded.replace(/=+$/, "")]) {
+        expect(privateMatches(`payload: ${run}`, entries)).toEqual(entries);
+        expect(privateMatches(`logs/${run}.txt`, entries)).toEqual(entries);
+        expect(() => checkPrivateText(run, "body", entries)).toThrow("entry 3");
+        expect(redactPrivate(run, entries)).toBe("[redacted diagnostic]");
+      }
+    }
+    const encoded = Buffer.from(value).toString("base64");
+    for (const run of [
+      encoded.slice(0, -4),
+      `${encoded}=`,
+      encoded.toLowerCase(),
+      Buffer.concat([Buffer.from([255]), Buffer.from(value)]).toString("base64"),
+      "YQ==",
+      "abcd!",
+    ]) {
+      expect(privateMatches(run, entries)).toEqual([]);
+      expect(() => checkPrivateText(run, "body", entries)).not.toThrow();
+    }
+    let unrelated = "ordinary unrelated text";
+    for (let round = 0; round < 8; round++) unrelated = Buffer.from(unrelated).toString("base64");
+    expect(privateMatches(unrelated, entries)).toEqual([]);
+    expect(privateMatches(Buffer.from(value).toString("base64"), [])).toEqual([]);
+    const wide = "Ａ".repeat(4);
+    const policy = [{ value: wide, entry: 7 }];
+    expect(privateMatches(Buffer.from(wide).toString("base64"), policy)).toEqual(policy);
+    // Its ASCII normalization is shorter than the protected value's UTF-8 eligibility floor.
+    expect(privateMatches(Buffer.from("AAAA").toString("base64"), policy)).toEqual([]);
+  });
+
+  test.each(["percent", "HTML", "base64", "unpadded base64"])(
+    "every audit rule withholds %s filenames and detail references before literal redaction",
+    (encoding) => {
+      const credential = ["synthetic", "audit", "credential"].join("-");
+      const privateValue = ["private", "audit", "entry"].join("-");
+      proc.registerCredential("audit-encoded-test", credential);
+      const configDir = tempDir({ "private-strings.txt": privateValue });
+      try {
+        for (const value of [credential, privateValue]) {
+          const encoded =
+            encoding === "percent"
+              ? Array.from(value, (c) => `%${c.charCodeAt(0).toString(16)}`).join("")
+              : encoding === "HTML"
+                ? Array.from(value, (c) => `&#${c.charCodeAt(0)};`).join("")
+                : Buffer.from(value)
+                    .toString("base64")
+                    .replace(encoding === "base64" ? /$/ : /=+$/, "");
+          const path = `vendor-${encoded}`;
+          const findings = auditDiff(
+            { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+            { configDir, taskClass: null, protectedPaths: [] },
+          );
+          expect(findings.find((f) => f.rule === "gitlink")).toEqual({
+            rule: "gitlink",
+            severity: "block",
+            file: "[redacted filename]",
+            detail: "[redacted diagnostic]",
+          });
+          expect(JSON.stringify(findings)).not.toContain(encoded);
+        }
+        const path = `vendor-${String.fromCharCode(27)}[31mclean`;
+        expect(
+          auditDiff(
+            { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+            { configDir, taskClass: null, protectedPaths: [] },
+          ).find((f) => f.rule === "gitlink"),
+        ).toMatchObject({ file: "vendor-clean", detail: expect.stringContaining("vendor-clean") });
+      } finally {
+        rmSync(configDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {
     const entries = [{ value: "private-prospect.example", entry: 3 }];
     const text = encode(entries[0]?.value ?? "");
