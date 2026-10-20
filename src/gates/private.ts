@@ -167,9 +167,11 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
     layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
-    const expanded = decodeHTML(decoded(text));
+    // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
+    const unescaped = decoded(text);
+    const expanded = decodeHTML(unescaped);
     // Keep line breaks too: report quotations and multiline credentials depend on them.
-    layers.push(decodeBase64(expanded.replace(/\s+/g, " ")));
+    layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
     const next = decodeBase64(expanded);
     if (next === text) return [...layers, next].map(normalize);
     layers.push(next);

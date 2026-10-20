@@ -1363,6 +1363,21 @@ describe("private strings", () => {
     }
   });
 
+  test("audit withholds an encoded credential that contains a literal HTML reference", () => {
+    const credential = ["synthetic", "&copy;", "credential"].join("-");
+    proc.registerCredential("audit-html-literal-test", credential);
+    const encoded = encodeURIComponent(credential);
+    const findings = auditDiff(
+      { ...diff("", [{ status: "A", path: encoded }]), gitlinks: [encoded] },
+      { taskClass: null, protectedPaths: [], toolCommands: [`git commit --no-verify -m ${encoded}`] },
+    );
+    expect(findings.find((f) => f.rule === "gitlink")).toMatchObject({
+      file: "[redacted filename]",
+      detail: "[redacted diagnostic]",
+    });
+    expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+  });
+
   test("audit withholds a base64 encoding that contains its own credential literally", () => {
     // Repeated base64 converges on a prefix that its own encoding begins with.
     let seed = "synthetic-self-encoding";

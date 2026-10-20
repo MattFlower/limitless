@@ -68,6 +68,15 @@ test("publication retains exact raw and decoded text before collapsing whitespac
         "PR text contains a private string (entry 1 in private-strings.txt)",
       );
   }
+  // A value holding a literal reference keeps matching after another encoding's decoding exposes it.
+  const value = ["synthetic", "&copy;", "credential"].join("-");
+  const html = (text: string) => Array.from(text, (c) => `&#${c.charCodeAt(0)};`).join("");
+  for (const text of [
+    encodeURIComponent(value),
+    html(encodeURIComponent(value)),
+    value.replace("&", "\\u0026"),
+  ])
+    expect(() => checkPublicationText(text, "PR text", [{ value, entry: 1 }])).toThrow("entry 1");
 });
 
 test("publication checks standard base64 with caller-selected private entries and credentials", () => {
