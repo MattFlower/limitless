@@ -2820,6 +2820,109 @@ const skipJUnit = `<?xml version="1.0" encoding="UTF-8"?>
 
 const skipSummary = ["1 pass", "2 skip", "1 todo", "0 fail", "Ran 4 tests across 1 file."];
 
+test.each([
+  ["3 tests skipped:", false],
+  ["3 tests skipped", false],
+  ["1 test skipped:", false],
+  ["1 test skipped", false],
+  ["3 tests todo:", false],
+  ["3 tests todo", false],
+  ["1 test todo:", false],
+  ["1 test todo", false],
+  ["3 tests skipped:", true],
+])("JUnit skip evidence survives recap %s (extra inline row: %s)", (header, extra) => {
+  const cwd = tempDir({ "one.test.ts": "" });
+  try {
+    const report = join(cwd, "report.xml");
+    writeFileSync(report, skipJUnit);
+    const parsed = readJUnitSkips(report, cwd);
+    const coverage = new BunTestCoverage(cwd);
+    const runner = new RunnerFailureEvidence();
+    const rows = ["(skip) suite > same", "(skip) suite > same", "(todo) suite > pending"];
+    for (const line of [
+      "one.test.ts:",
+      "(pass) suite > runs",
+      ...rows,
+      ...(extra ? ["(skip) missing from JUnit"] : []),
+      `  \u001b[33m${header}\u001b[0m  `,
+      ...rows,
+      ...skipSummary,
+    ]) {
+      coverage.observe(line);
+      runner.observe(line);
+    }
+    expect(runner.agrees(parsed?.counts)).toBe(true);
+    const result = coverage.result(parsed, runner.agrees(parsed?.counts));
+    expect(result.summary).toEqual({ passed: 1, failed: 0 });
+    if (extra) {
+      expect(result.skippedTestsIncomplete).toBe(true);
+      expect(result.skippedTests).toBeUndefined();
+    } else {
+      expect(result.skippedTests).toEqual([
+        { file: "one.test.ts", name: "suite > same", line: 1 },
+        { file: "one.test.ts", name: "suite > same", line: 1 },
+        { file: "one.test.ts", name: "suite > pending", line: 1 },
+      ]);
+      expect(result.skippedTestsIncomplete).toBeUndefined();
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("real parallel Bun gate records skips despite its scrubbed-environment recap", async () => {
+  // Bun 1.4.3 omits the recap for small file counts, even with many skipped tests.
+  const names = Array.from({ length: 50 }, (_, i) => `file-${i}`);
+  const cwd = tempDir({
+    "package.json": "{}",
+    ...Object.fromEntries(
+      names.map((name) => [
+        `${name}.test.ts`,
+        [
+          'import { expect, test } from "bun:test";',
+          `test.skip("${name} deferred", () => {});`,
+          'test("runs", () => expect(true).toBe(true));',
+        ].join("\n"),
+      ]),
+    ),
+  });
+  try {
+    const result = await sandbox.confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        cwd,
+        {
+          source: "detected",
+          setup: [],
+          checks: [
+            {
+              name: "test",
+              run: `${process.execPath} test --parallel=4 --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"`,
+            },
+          ],
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      ),
+    );
+    const gate = result.checks[0];
+    expect(gate?.output).toMatch(/^50 tests skipped:?\s*$/m);
+    expect(gate).toMatchObject({
+      ok: true,
+      exitCode: 0,
+      testCoverage: { summary: { passed: 50, failed: 0 } },
+    });
+    expect(gate?.testCoverage?.skippedTests).toHaveLength(50);
+    expect(gate?.testCoverage?.skippedTests).toEqual(
+      expect.arrayContaining(
+        names.map((name) => ({ file: `${name}.test.ts`, name: `${name} deferred`, line: 2 })),
+      ),
+    );
+    expect(gate?.testCoverage?.skippedTestsIncomplete).toBeUndefined();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("real Bun gate report retains skips beside a passing test.each title with a newline", async () => {
   const cwd = tempDir({
     "package.json": "{}",
