@@ -79,7 +79,7 @@ test("publication checks standard base64 with caller-selected private entries an
       expect(() => checkPublicationText(`Report: ${run}`, "PR text", entries)).toThrow(`entry ${entry}`);
       expect(() => checkPublicationText(run, "PR text", [])).not.toThrow();
     }
-    for (const run of [encoded.slice(0, -4), `${encoded}===`, "ordinary text YWJjZA=="])
+    for (const run of [encoded.slice(0, -4), encoded.slice(1), "ordinary text YWJjZA=="])
       expect(() => checkPublicationText(run, "PR text", entries)).not.toThrow();
   }
   const slashed = ["private", "slashed", "entry???"].join("-");

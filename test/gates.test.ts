@@ -1203,14 +1203,13 @@ describe("private strings", () => {
       }
     }
     const encoded = Buffer.from(value).toString("base64");
+    // Runs whose bytes still hold the whole value are withheld even with stray padding or a binary prefix.
     for (const run of [
-      encoded.slice(0, -4),
-      `${encoded}=`,
-      encoded.toLowerCase(),
+      `${encoded}==`,
       Buffer.concat([Buffer.from([255]), Buffer.from(value)]).toString("base64"),
-      "YQ==",
-      "abcd!",
-    ]) {
+    ])
+      expect(privateMatches(run, entries)).toEqual(entries);
+    for (const run of [encoded.slice(0, -4), encoded.toLowerCase(), "YQ==", "abcd!"]) {
       expect(privateMatches(run, entries)).toEqual([]);
       expect(() => checkPrivateText(run, "body", entries)).not.toThrow();
     }
@@ -1307,6 +1306,34 @@ describe("private strings", () => {
       toolCommands: [`git commit --no-verify -m '%${repeated}72'`],
     });
     expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+  });
+
+  test("audit withholds an encoded credential that another credential's literal redaction breaks", () => {
+    const credential = ["synthetic", "nested", "credential"].join("-");
+    const encoded = Buffer.from(credential).toString("base64");
+    proc.registerCredential("audit-nested-outer-test", credential);
+    proc.registerCredential("audit-nested-inner-test", encoded.slice(0, 12));
+    const findings = auditDiff(diff("", []), {
+      taskClass: "question",
+      protectedPaths: [],
+      toolCommands: [
+        `git commit --no-verify -m ${encoded}`,
+        `git commit --no-verify -m '${credential}' # literal`,
+      ],
+    });
+    expect(findings.filter((f) => f.rule === "no-verify").map((f) => f.detail)).toEqual([
+      "[redacted diagnostic]",
+      "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]' # literal",
+    ]);
+  });
+
+  test("base64 matching stays linear on slash-heavy runs", () => {
+    const value = ["synthetic", "slash", "run"].join("-");
+    const run = `${"/".repeat(200_000)}${Buffer.from(value).toString("base64")}`;
+    const started = performance.now();
+    expect(privateMatches(run, [{ value, entry: 2 }])).toEqual([{ value, entry: 2 }]);
+    expect(privateMatches(`${"/".repeat(200_000)}YWJjZA==`, [{ value, entry: 2 }])).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(2000);
   });
 
   test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {

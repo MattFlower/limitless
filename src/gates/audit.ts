@@ -3,7 +3,13 @@ import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
 import { registeredCredentials } from "../util/proc.ts";
 import { redactGateOutput } from "./output.ts";
-import { loadPrivateStrings, privateMatches, privateReason, redactPrivate } from "./private.ts";
+import {
+  loadPrivateStrings,
+  privateMatches,
+  privateReason,
+  redactLiteral,
+  redactPrivate,
+} from "./private.ts";
 import { publicationMatches } from "./publication.ts";
 
 export interface AuditFinding {
@@ -431,8 +437,11 @@ export function auditDiff(
     findings.map((f) => {
       const file = f.file === undefined ? undefined : stripVTControlCharacters(f.file);
       const detail = stripVTControlCharacters(f.detail);
-      // Keep raw decoding refusals even if literal redaction breaks an escape; retain safe context.
-      const matches = publicationMatches(detail, protectedText);
+      // Literal redaction can break an escape or an encoding (one value inside another's base64), so the raw
+      // detail decides refusals and each value is sought with only its own literal spellings removed.
+      const encoded =
+        publicationMatches(detail, []).length > 0 ||
+        protectedText.some((entry) => publicationMatches(redactLiteral(detail, [entry]), [entry]).length > 0);
       const cleanDetail = redactPrivate(redactGateOutput(detail), entries);
       return {
         ...f,
@@ -444,7 +453,7 @@ export function auditDiff(
             }
           : {}),
         detail:
-          matches.some(({ entry }) => entry === 0) || publicationMatches(cleanDetail, protectedText).length
+          encoded || publicationMatches(cleanDetail, protectedText).length
             ? "[redacted diagnostic]"
             : cleanDetail,
       };

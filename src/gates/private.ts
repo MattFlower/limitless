@@ -1,4 +1,3 @@
-import { isUtf8 } from "node:buffer";
 import {
   closeSync,
   fstatSync,
@@ -149,34 +148,16 @@ const decoded = (text: string) =>
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
   const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
-  const contains = (value: string) => {
-    const found = normalize(value);
-    return entries.some((entry) => found.includes(normalize(entry.value)));
-  };
   for (let round = 0; round < 5; round++) {
     const next = decoded(text).replace(/[A-Za-z0-9+/]+=*/g, (run) => {
-      // Decoding from each offset aligns any encoding in the run, so only a likely hit pays for exact spans.
-      if (
-        run.length < minimum ||
-        ![0, 1, 2, 3].some((o) => contains(Buffer.from(run.slice(o), "base64").toString()))
-      )
-        return run;
-      // Slash is both base64 alphabet and a filename component boundary, so try every slash-delimited span.
-      const starts = [0, ...Array.from(run.matchAll(/\//g), ({ index }) => index + 1)];
-      const ends = [...starts.slice(1).map((start) => start - 1), run.length];
-      for (const start of starts)
-        for (const end of ends) {
-          const candidate = run.slice(start, end);
-          if (candidate.replace(/=+$/, "").length < minimum) continue;
-          const bytes = Buffer.from(candidate, "base64");
-          const canonical = bytes.toString("base64");
-          if (
-            (candidate.includes("=") ? canonical : canonical.replace(/=+$/, "")) !== candidate ||
-            !isUtf8(bytes)
-          )
-            continue;
-          if (contains(bytes.toString())) return bytes.toString();
-        }
+      if (run.replace(/=+$/, "").length < minimum) return run;
+      // One of four alignments decodes any encoding inside the run (a directory prefix or "/" included),
+      // and later characters never change bytes already decoded, so this stays linear in the run.
+      for (let offset = 0; offset < 4; offset++) {
+        const plain = Buffer.from(run.slice(offset), "base64").toString();
+        const found = normalize(plain);
+        if (entries.some(({ value }) => found.includes(normalize(value)))) return plain;
+      }
       // Unrelated runs must not change decoding convergence or cause a refusal.
       return run;
     });
@@ -211,9 +192,14 @@ export const privateReason = (location: string, entry: number) =>
   entry === 0
     ? `${location} exceeds the private text decoding limit; publication blocked`
     : `${location} contains a private string (entry ${entry} in private-strings.txt)`;
+export const redactLiteral = (text: string, entries: PrivateStrings) =>
+  entries.reduce(
+    (out, { value }) =>
+      out.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"),
+    text,
+  );
 export function redactPrivate(text: string, entries: PrivateStrings): string {
-  for (const { value } of entries)
-    text = text.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]");
+  text = redactLiteral(text, entries);
   return privateMatches(text, entries).length ? "[redacted diagnostic]" : text;
 }
 export function checkPrivateText(text: string, location: string, entries: PrivateStrings): void {
