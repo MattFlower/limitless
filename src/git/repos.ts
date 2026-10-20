@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
@@ -13,7 +14,7 @@ import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
-import { CommandError, redactCredentials, sh } from "../util/proc.ts";
+import { CommandError, redactCredentials, registeredCredentials, sh } from "../util/proc.ts";
 import {
   cacheGit,
   emptyTreeId,
@@ -544,6 +545,8 @@ export interface DiffInfo {
   binaryPaths?: string[];
   binaryErrors?: string[];
   headTextPaths?: string[];
+  headTextSizes?: Record<string, number>;
+  baseHiddenDirs?: string[];
   existingRuleKeys?: Record<string, string[]>;
   attributeUnmatched?: string[];
 }
@@ -613,6 +616,13 @@ export async function diffSince(
     });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
+  // Most rounds add no hidden paths; avoid another tree walk on every ordinary audit.
+  const tree = files.some((f) => f.status.startsWith("A") && /^\.(?!github\/)[^/]+\//.test(f.path))
+    ? await worktreeGit(["git", "ls-tree", "-r", "--name-only", "-z", revision], { cwd, env })
+    : { stdout: "" };
+  const baseHiddenDirs = [
+    ...new Set(tree.stdout.split("\0").flatMap((path) => path.match(/^(\.[^/]+)\//)?.[1] ?? [])),
+  ];
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
   const privateHits: { path: string; entry: number }[] = [];
   if (privateStrings.length) {
@@ -636,6 +646,7 @@ export async function diffSince(
     removed,
     gitlinks,
     privateHits,
+    baseHiddenDirs,
     ...inspection,
   };
 }
@@ -688,6 +699,9 @@ async function localLfsPayload(cwd: string, env: Record<string, string> | undefi
   return undefined;
 }
 
+/** Fixed diagnostic limits; the aggregate refusal remains authoritative on exhaustion. */
+export const publicationDiagnosisLimits = { steps: 1_000, bytes: 8 * 1024 * 1024, timeoutMs: 5_000 };
+
 /** Inspect only the commits and squash content this step publishes. */
 export async function checkPrivatePublication(
   cwd: string,
@@ -699,6 +713,7 @@ export async function checkPrivatePublication(
   },
 ) {
   const { commits: range, squash, staged } = input;
+  let revisions: string[] = [];
   if (squash) checkPublicationText(`${squash.title}\n${squash.body}`, "PR text", entries);
   const log = [
     "git",
@@ -716,8 +731,11 @@ export async function checkPrivatePublication(
     identities.stdout.split("\0").forEach((value, i) => {
       checkPublicationText(value, `Published commit ${fields[i % 4]}`, entries);
     });
-    const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
-    for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
+    const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", "--reverse", range], {
+      cwd,
+    });
+    revisions = commits.stdout.trim().split("\n").filter(Boolean);
+    for (const sha of revisions) {
       const raw = await worktreeGit(["git", "--no-replace-objects", "cat-file", "commit", sha], {
         cwd,
         encoding: "latin1",
@@ -731,10 +749,87 @@ export async function checkPrivatePublication(
       const headers = text.slice(0, text.indexOf("\n\n"));
       if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
         throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
-      checkPublicationText(text, "Published commit object", entries);
+      checkPublicationText(text, `Published commit object ${sha}`, entries);
     }
   }
-  const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
+  const flags = "--raw -z --no-abbrev --full-index -p --text --no-renames -U0 --ignore-submodules=none".split(
+    " ",
+  );
+  const diagnose = async (error: unknown, blob?: [string, number]): Promise<never> => {
+    // Keep the aggregate scan authoritative; recover file context only after a decoding refusal.
+    if (!blob && (error as Error).message !== privacy.privateReason("Published content", 0)) throw error;
+    let refusal = error;
+    let { steps, bytes } = publicationDiagnosisLimits;
+    const deadline = Date.now() + publicationDiagnosisLimits.timeoutMs;
+    const spend = () => {
+      if (--steps < 0 || Date.now() >= deadline) throw error;
+    };
+    const protectedNames = [...entries, ...registeredCredentials().map((value) => ({ value, entry: 1 }))];
+    const name = (path: string) => {
+      path = stripVTControlCharacters(path);
+      try {
+        checkPublicationText(path, "filename", protectedNames);
+        return privacy.redactPrivate(redactCredentials(path), entries);
+      } catch {
+        return "[redacted filename]";
+      }
+    };
+    const refuse = (location: string, path: string, entry: number): never => {
+      const filename = name(path);
+      spend();
+      refusal = new privacy.PrivateError(privacy.privateReason(`${location}: ${filename}`, entry));
+      throw refusal;
+    };
+    const pair = (from = "", to = "") => `${from.replace(/^0+$/, "0")}:${to.replace(/^0+$/, "0")}`;
+    function* contexts() {
+      for (const sha of revisions)
+        yield [`Published commit ${sha}`, [...log, "-m", "--no-walk", "--format=", sha]] as const;
+      if (squash)
+        yield [
+          `Published revision ${squash.head}`,
+          ["git", "diff", `${squash.base}..${squash.head}`],
+        ] as const;
+      if (staged) yield ["Published staged content", ["git", "diff", "--cached"]] as const;
+    }
+    try {
+      for (const [location, args] of contexts()) {
+        spend();
+        // One U0 patch per revision excludes unchanged blob content from diagnosis.
+        const { stdout } = await worktreeGit([...args, ...flags], {
+          cwd,
+          timeoutMs: Math.max(1, deadline - Date.now()),
+        });
+        bytes -= Buffer.byteLength(stdout);
+        if (bytes < 0) throw error;
+        const paths = new Map<string, { files: string[]; next: number }>();
+        for (const match of stdout.matchAll(/:\d+ \d+ (\w+) (\w+) [A-Z]\0([^\0]+)\0/g)) {
+          spend();
+          const path = match[3] ?? "";
+          const key = pair(match[1], match[2]);
+          const group = paths.get(key) ?? { files: [], next: 0 };
+          group.files.push(path);
+          paths.set(key, group);
+          if (blob && match[2] === blob[0]) refuse(location, path, blob[1]);
+        }
+        for (const section of blob ? [] : stdout.split(/(?<=[\n\0])(?=diff --git )/).slice(1)) {
+          spend();
+          const ids = /^index (\w+)\.\.(\w+)/m.exec(section);
+          const group = ids && paths.get(pair(ids[1], ids[2]));
+          const path = group?.files[group.next++];
+          if (path) {
+            try {
+              checkPublicationText(section, "section", []);
+            } catch {
+              refuse(location, path, 0);
+            }
+          }
+        }
+      }
+    } catch {
+      // Attribution is best effort; command failures and exhausted budgets keep the original refusal.
+    }
+    throw refusal;
+  };
   const blobs: string[] = [];
   for (const args of [
     ...(range ? [[...log, "-m", "--format=%B", range]] : []),
@@ -742,11 +837,15 @@ export async function checkPrivatePublication(
     ...(staged ? [["git", "diff", "--cached"]] : []),
   ]) {
     const { stdout } = await worktreeGit([...args, ...flags], { cwd });
-    checkPublicationText(stdout, "Published content", entries);
+    try {
+      checkPublicationText(stdout, "Published content", entries);
+    } catch (error) {
+      await diagnose(error);
+    }
     for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
   }
   const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
-  if (hit) throw new privacy.PrivateError(privacy.privateReason("Published blob", hit[1]));
+  if (hit) await diagnose(new privacy.PrivateError(privacy.privateReason("Published blob", hit[1])), hit);
 }
 
 /** Checks raw commits and patches (and optionally the index), not the net diff. */
@@ -868,7 +967,7 @@ async function attributeInfo(
   const headPointers = new Map<string, string>();
   const contents = new Map<
     string,
-    { pointer: string | null; forbidden: boolean; binary: boolean; reviewable: boolean }
+    { pointer: string | null; forbidden: boolean; binary: boolean; reviewable: boolean; size: number }
   >();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
@@ -953,6 +1052,7 @@ async function attributeInfo(
           throw new Error("Cannot inspect complete blob");
         const bytes = Buffer.from(result.stdout.slice(end + 1, end + 1 + size), "latin1");
         contents.set(oid, {
+          size,
           pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
           forbidden: isForbiddenFormat("", bytes),
           // Hex avoids classifying this source as the PDF signature it detects.
@@ -1106,6 +1206,11 @@ async function attributeInfo(
       attributes,
       textPaths,
       headTextPaths: [...afterText.text],
+      headTextSizes: Object.fromEntries(
+        [...afterText.text]
+          .filter((path) => contents.get(afterText.blobs.get(path) ?? "")?.reviewable)
+          .map((path) => [path, contents.get(afterText.blobs.get(path) ?? "")?.size ?? 0]),
+      ),
       existingRuleKeys,
       attributeMatches,
       binaryPaths,

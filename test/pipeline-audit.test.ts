@@ -36,6 +36,82 @@ const { start } = pipelineSetup({
 });
 
 describe("audit allowances (fake agents, real git)", () => {
+  test.each(["approve", "gate", "review", "verify"])(
+    "scratch warnings stay advisory and survive %s feedback",
+    async (cause) => {
+      const prompts: string[] = [];
+      const reviews: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") {
+          reviews.push(s.prompt);
+          return {
+            structured:
+              cause === "review" && prompts.length === 1
+                ? {
+                    ...approve,
+                    verdict: "request_changes",
+                    findings: [
+                      {
+                        severity: "major",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Fix farewell",
+                        detail: "Use goodbye",
+                        suggestion: "Update farewell",
+                        security: false,
+                        ...findingEvidence,
+                      },
+                    ],
+                  }
+                : approve,
+          };
+        }
+        if (role === "verify")
+          return {
+            structured:
+              cause === "verify" && prompts.length === 1
+                ? {
+                    ...pass,
+                    overall: "fail",
+                    criteria: pass.criteria.map((c) =>
+                      c.id === "AC-1" ? { ...c, status: "unmet", evidence: "Farewell needs repair" } : c,
+                    ),
+                  }
+                : pass,
+          };
+        prompts.push(s.prompt);
+        return {
+          files: {
+            ".tmp-gate/report.xml": "<report/>\n",
+            "farewell.txt": cause === "gate" && prompts.length === 1 ? "BAD\n" : "goodbye\n",
+          },
+        };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(prompts.length).toBe(cause === "approve" ? 1 : 2);
+      expect(reviews[0]).toContain("root-hidden-addition");
+      expect(
+        f.store
+          .listEvents(run.id)
+          .some(
+            (e) => e.type === "audit" && e.level === "warn" && e.message.includes(".tmp-gate/report.xml"),
+          ),
+      ).toBe(true);
+      if (cause !== "approve") {
+        expect(prompts[1]).toContain("Advisory [root-hidden-addition] .tmp-gate/report.xml");
+        expect(prompts[1]).toContain("scratch/TMPDIR");
+        expect(prompts[1]).toContain(
+          cause === "review" ? "Fix farewell" : cause === "verify" ? "Farewell needs repair" : "no-bad",
+        );
+      }
+    },
+  );
+
   test("quoted gate scripts redact credentials and escapes in audit events and retry feedback", async () => {
     const secret = "synthetic-audit-script-credential-494";
     registerCredential("audit-script-test", secret);
@@ -90,9 +166,17 @@ describe("audit allowances (fake agents, real git)", () => {
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") return { structured: approve };
       prompts.push(s.prompt);
-      return { files: { "secret-host.example.txt": "secret-host.example\n" } };
+      return {
+        files: {
+          "secret-host.example.txt": "secret-host.example\n",
+          ".tmp-gate/secret-host.example.txt": "secret-host.example\n",
+          [`.tmp-gate/secret-${String.fromCharCode(27)}[31mhost.example.txt`]: "report\n",
+          ".tmp-gate/synthetic-scratch-path-credential.txt": "report\n",
+        },
+      };
     });
     f.cfg.maxRounds = 1;
+    registerCredential("scratch-path-test", "synthetic-scratch-path-credential");
     mkdirSync(f.cfg.paths.configDir, { recursive: true });
     writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
@@ -103,6 +187,15 @@ describe("audit allowances (fake agents, real git)", () => {
     expect(JSON.stringify(events)).not.toContain("secret-host.example");
     expect(prompts[1]).toContain("entry 1 in private-strings.txt");
     expect(prompts[1]).not.toContain("secret-host.example");
+    expect(prompts[1]).toContain("Advisory [root-hidden-addition]");
+    expect(prompts[1]).toContain("Advisory [root-hidden-addition] [redacted filename]");
+    const persisted = f.store.getRunState<RunState>(run.id)?.lastAudit;
+    expect(persisted).toContainEqual(
+      expect.objectContaining({ rule: "root-hidden-addition", file: "[redacted filename]" }),
+    );
+    expect(JSON.stringify(persisted)).not.toContain("secret-host.example");
+    expect(prompts[1]).not.toContain("synthetic-scratch-path-credential");
+    expect(JSON.stringify(events)).not.toContain("synthetic-scratch-path-credential");
   });
 
   /** Commits a nested repository into the implementer's worktree, which Git records as a gitlink. */
