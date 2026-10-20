@@ -25,6 +25,7 @@ export class BunTestCoverage {
   private failed: number | undefined;
   private sawFailure = false;
   private skipRows = 0;
+  private skipRecap = false;
   private skipSummary = 0;
   private todoSummary = 0;
 
@@ -41,7 +42,9 @@ export class BunTestCoverage {
   observe(line: string): void {
     const raw = stripVTControlCharacters(line).trim();
     if (/^\(fail\)/.test(raw)) this.sawFailure = true;
-    if (/^\((?:skip|todo)\)/.test(raw)) this.skipRows++;
+    // Bun repeats inline skip/todo rows in its final recap.
+    if (/^\d+ tests? (skipped|todo):?$/.test(raw)) this.skipRecap = true;
+    if (!this.skipRecap && /^\((?:skip|todo)\)/.test(raw)) this.skipRows++;
     // Bun's GitHub Actions reporter groups file headers; presentation is not part of the path.
     line = redactGateOutput(line)
       .trim()
