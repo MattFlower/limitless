@@ -75,6 +75,8 @@ export interface GateHooks {
   /** Only bounded targeted retries may bypass the full-suite queue. */
   skipGateSlot?: boolean;
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
+  /** Evidence from this process, never from a remote result or cache. */
+  onLocalSetup?: () => void;
   /** Fires once when every gate slot is busy and this call has to queue. */
   onWait?: (slots: number) => void;
 }
@@ -166,7 +168,9 @@ export async function runLocalGates(
     hooks.skipGateSlot ? undefined : hooks.priority,
   );
   try {
-    return await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
+    const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
+    if (result.setupOk && !signal.aborted) hooks.onLocalSetup?.();
+    return result;
   } finally {
     release();
   }
