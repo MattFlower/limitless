@@ -457,6 +457,11 @@ export class ProviderTracker {
 
   // ---- concurrency ---------------------------------------------------------
 
+  isBusy(id: string): boolean {
+    const p = this.providers.get(id);
+    return !p || p.inFlight + p.waking >= p.def.maxConcurrent;
+  }
+
   /** Race providers in preference order, releasing every unused reservation. */
   async acquireFirst(
     ids: string[],
@@ -466,14 +471,19 @@ export class ProviderTracker {
   ): Promise<{ provider: string; release: () => void } | null> {
     const cancel = new AbortController();
     const combined = AbortSignal.any([signal, cancel.signal]);
+    const waiting: [string, number][] = [];
     const pending = ids.map(async (provider) => ({
       provider,
-      release: await this.acquire(provider, combined, waitMs, (ahead) => onWait(provider, ahead)),
+      release: await this.acquire(provider, combined, waitMs, (ahead) => waiting.push([provider, ahead])),
     }));
     let failure: unknown;
-    await Promise.race(pending).catch((error: unknown) => {
+    try {
+      // Acquisitions notify synchronously; an immediate winner suppresses losing wait messages.
+      if (waiting.length === ids.length) for (const [provider, ahead] of waiting) onWait(provider, ahead);
+      await Promise.race(pending);
+    } catch (error) {
       failure = error;
-    });
+    }
     cancel.abort();
     const results = await Promise.allSettled(pending);
     let chosen: { provider: string; release: () => void } | null = null;
@@ -506,12 +516,12 @@ export class ProviderTracker {
     let notified = false;
     while (p.inFlight + p.waking >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
+      if (this.clock() >= end) return null;
       if (!notified) {
         onWait?.(p.waiters.length);
         notified = true;
       }
       if (signal.aborted) throw new Error("cancelled");
-      if (this.clock() >= end) return null;
       // Production never waits behind a shadow call: abort one, and take its slot ahead of the queue.
       const shadow = [...p.shadows].find((s) => !s.heir);
       const woken = await new Promise<boolean>((resolve) => {

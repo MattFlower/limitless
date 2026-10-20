@@ -536,9 +536,7 @@ export class RunContext {
         ...decision.candidates.map((target) => ({
           modelId: target.targetId ?? target.modelId,
           reason:
-            busy.has(target.provider) ||
-            (tracker.status(target.provider)?.inFlight ?? 0) >=
-              (tracker.status(target.provider)?.maxConcurrent ?? Infinity)
+            busy.has(target.provider) || tracker.isBusy(target.provider)
               ? "busy until the deadline"
               : "invocation deadline expired",
         })),
@@ -580,10 +578,7 @@ export class RunContext {
       if (chain && left() <= 0) exhaustPinned(decision, true);
       const candidates = decision.candidates;
       let target =
-        candidates.find((t) => {
-          const status = tracker.status(t.provider);
-          return !busy.has(t.provider) || (status && status.inFlight < status.maxConcurrent);
-        }) ?? candidates[0];
+        candidates.find((t) => !busy.has(t.provider) || !tracker.isBusy(t.provider)) ?? candidates[0];
       if (!target && lastResort && !chain)
         return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
@@ -633,18 +628,18 @@ export class RunContext {
       } else {
         const provider = target.provider;
         const admissionSignal = AbortSignal.any([this.signal, revision]);
-        admission = await (allBusy
-          ? tracker.acquireFirst(providers, admissionSignal, limit, onWait)
-          : tracker
-              .acquire(provider, admissionSignal, busy.has(provider) ? 0 : limit, (ahead) =>
-                onWait(provider, ahead),
-              )
-              .then((release) => release && { provider, release })
-        ).catch((error: unknown) => {
-          this.checkCancelled();
-          if (revision.aborted) return null;
-          throw error;
-        });
+        admission = await tracker
+          .acquireFirst(
+            providers.filter((id) => allBusy || busy.has(id) || id === provider),
+            admissionSignal,
+            !allBusy && busy.has(provider) ? 0 : limit,
+            onWait,
+          )
+          .catch((error: unknown) => {
+            this.checkCancelled();
+            if (revision.aborted) return null;
+            throw error;
+          });
       }
       const release = admission?.release;
       if (admission) target = candidates.find((t) => t.provider === admission.provider) ?? target;
@@ -731,6 +726,7 @@ export class RunContext {
         modelId: target.modelId,
         effort: recordEffort(target.effort),
       });
+      waitMs = 0;
       guard?.ids.push(invocation.id);
       this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,
