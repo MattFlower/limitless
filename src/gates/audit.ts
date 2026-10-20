@@ -4,6 +4,8 @@ import type { DiffInfo } from "../git/repos.ts";
 import { registeredCredentials } from "../util/proc.ts";
 import { redactGateOutput } from "./output.ts";
 import {
+  base64Match,
+  base64Runs,
   loadPrivateStrings,
   privateMatches,
   privateReason,
@@ -438,9 +440,11 @@ export function auditDiff(
       const file = f.file === undefined ? undefined : stripVTControlCharacters(f.file);
       const detail = stripVTControlCharacters(f.detail);
       // Literal redaction can break an escape or an encoding (one value inside another's base64), so the raw
-      // detail decides refusals and each value is sought with only its own literal spellings removed.
+      // detail decides refusals and each value is sought with only its own literal spellings removed. A base64
+      // encoding can contain its own value literally, so raw base64 runs are decoded before any removal.
       const encoded =
         publicationMatches(detail, []).length > 0 ||
+        (detail.match(base64Runs) ?? []).some((run) => base64Match(run, protectedText) !== undefined) ||
         protectedText.some((entry) => publicationMatches(redactLiteral(detail, [entry]), [entry]).length > 0);
       const cleanDetail = redactPrivate(redactGateOutput(detail), entries);
       return {

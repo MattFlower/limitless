@@ -1327,6 +1327,28 @@ describe("private strings", () => {
     ]);
   });
 
+  test("audit withholds a base64 encoding that contains its own credential literally", () => {
+    // Repeated base64 converges on a prefix that its own encoding begins with.
+    let seed = "synthetic-self-encoding";
+    for (let round = 0; round < 24; round++) seed = Buffer.from(seed).toString("base64");
+    const credential = seed.slice(0, 16);
+    const encoded = Buffer.from(credential).toString("base64");
+    expect(encoded.startsWith(credential)).toBe(true);
+    proc.registerCredential("audit-self-encoding-test", credential);
+    const findings = auditDiff(diff("", []), {
+      taskClass: "question",
+      protectedPaths: [],
+      toolCommands: [
+        `git commit --no-verify -m ${encoded}`,
+        `git commit --no-verify -m '${credential}' # literal`,
+      ],
+    });
+    expect(findings.filter((f) => f.rule === "no-verify").map((f) => f.detail)).toEqual([
+      "[redacted diagnostic]",
+      "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]' # literal",
+    ]);
+  });
+
   test("base64 matching stays linear on slash-heavy runs", () => {
     const value = ["synthetic", "slash", "run"].join("-");
     const run = `${"/".repeat(200_000)}${Buffer.from(value).toString("base64")}`;
