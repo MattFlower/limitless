@@ -988,6 +988,28 @@ runs at a time. Then it:
    resume the scheduler. An interrupt after restart begins leaves the new version starting;
    before that point it attempts rollback. See the interrupted-deploy FAQ.
 
+To deploy automatically after self-hosting landings, opt in in `config.toml`:
+
+```toml
+[deploy]
+after_land = "when_idle" # default: "off"; older releases ignore this table/key
+```
+
+This covers only the daemon release checkout's `origin` GitHub repository and its `main` branch.
+Landings from before enabling it are ignored. After a new landing, a 15-second check waits until
+no entry in any repository's landing queue is active and the scheduler has no active runs (parked
+runs and evals do not count). Several landings during that wait produce one deploy of the current
+main SHA, only if it differs from the running release. It runs `limitless deploy <sha> --smoke`
+with the same checks, live smoke quota, default drain wait, restart and rollback described above.
+The deploy runs as a separate launchd job, with output in `~/.limitless/logs/dev.limitless.deploy.*.log`.
+
+`deploy.started` and `deploy.failed` feed items identify the target SHA. A failure, including a
+concurrent manual deploy holding the lock, blocks further automatic deploys; the feed says why.
+Only a newer landing in the self repository's `main` clears that block. On restart, an unfinished
+attempt succeeds if the boot SHA matches its target; otherwise it is recorded as failed and blocks
+in the same way. Older releases ignore `[deploy]` and continue to start after rollback, without
+automatic deployment.
+
 If the daemon already reports the target SHA, deploy returns `already deployed <sha>` without
 restarting or running checks, unless `--smoke` requests the checks and smoke suite.
 
@@ -1338,8 +1360,12 @@ Use `limitless land <run|pr> --sha <head>` (a run ID, PR number or PR URL). An e
 approves that head for this land request; omit `--sha` to use a recorded non-stale review approval.
 `limitless land list` shows entries, states and reasons; `limitless land cancel <id>` cancels a
 queued or in-flight entry. MCP `limitless_land` takes `{run, sha?}`; `limitless_status` reports
-its progress. For list/cancel use CLI or HTTP: `GET /api/land`,
-`POST /api/land` `{target, sha?}`, `POST /api/land/<id>/cancel`. There is no MCP land-cancel tool.
+its progress. The UI's **Land** page (`/land`) lists newest entries first, with state, PR,
+approved SHA, reason, check log and cancellation for active entries. For list/cancel use CLI or
+HTTP: `GET /api/land`,
+`POST /api/land` `{target, sha?}`, `POST /api/land/<id>/cancel`. `GET /api/land/<id>/log`
+serves the entry's recorded log as redacted plain text, or 404 when absent or outside the runs and
+land log directories. There is no MCP land-cancel tool.
 
 Explicit SHA requests are refused until the saved GitHub observation contains that head;
 a live PR head or review approval alone does not replace **polling's observation**. Wait for

@@ -231,6 +231,28 @@ async function serve(): Promise<void> {
   });
   const ui = await (await import("../server/ui.ts")).buildUi();
   const { integrations, server } = await startDaemon(factory, ui);
+  let autoDeploy: import("../land/auto-deploy.ts").AutoDeploy | undefined;
+  if (cfg.deploy.afterLand === "when_idle") {
+    const { AutoDeploy } = await import("../land/auto-deploy.ts");
+    const { deployProcess, mainSha, selfRepository } = await import("../land/deploy-process.ts");
+    const release = join(import.meta.dir, "../..");
+    autoDeploy = new AutoDeploy({
+      store: factory.store,
+      afterLand: cfg.deploy.afterLand,
+      activeRunIds: () => factory.scheduler.activeRunIds,
+      selfRepo: () => selfRepository(release),
+      mainSha: () => mainSha(release),
+      bootSha: factory.bootSha,
+      deploy: (sha) => deployProcess(release, sha),
+      now: Date.now,
+      timer: {
+        set: (tick, ms) => setInterval(tick, ms),
+        clear: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+      },
+      log: (reason) => console.error(reason),
+    });
+    autoDeploy.start();
+  }
   console.log(`Limitless listening on http://${cfg.host}:${server.port}  (data: ${cfg.paths.home})`);
   if (cfg.listenLan) console.log(`LAN proxy listener: http://${cfg.listenLan}:${cfg.port}`);
   for (const line of integrations.notes) console.log(`  ${line}`);
@@ -239,6 +261,7 @@ async function serve(): Promise<void> {
     if (stopping) process.exit(1);
     stopping = true;
     console.log(`\n${sig}: stopping (active runs will resume on restart)...`);
+    autoDeploy?.stop();
     await integrations.stop();
     await factory.stop();
     await server.stop(true);

@@ -57,6 +57,28 @@ Only requested tunnel and mtplx agents migrate; they restart with rollback witho
    (the worktree and run state are persisted; a round whose implementation already committed
    goes straight to its checks).
 
+Self-hosting can opt in to automatic deployment in `config.toml`:
+
+```toml
+[deploy]
+after_land = "when_idle" # default: "off"; older releases ignore the table/key
+```
+
+Only new landings on `main` in the daemon release checkout's `origin` GitHub repository count.
+Every 15 seconds, the daemon checks for pending landings and waits until no land entry in any
+repository is active and no scheduler run is active; parked runs and evals do not delay it.
+Landings during the wait coalesce. If main differs from the running boot SHA, a separate launchd
+job runs the existing `limitless deploy <sha> --smoke` path, with checks, live smoke quota, default
+drain wait, restart and rollback. Output is under `~/.limitless/logs/dev.limitless.deploy.*.log`.
+
+The feed records `deploy.started` and `deploy.failed`, including the SHA and failure reason.
+A failure blocks automatic deployment until a newer self-repository `main` landing clears it;
+there are no automatic retries. Restart reconciles an interrupted attempt against the boot SHA,
+so rollback is a failure and a successful restart does not redeploy the same landing. Older
+releases ignore this optional table/key and still start after rollback, without auto-deploying.
+The UI's **Land** page lists queue state, approved SHAs, reasons and logs, and cancels active entries;
+`GET /api/land/<id>/log` serves redacted check logs.
+
 Releases before panel review rosters (#136) refuse to start when `config.toml` sets `[review] mode`
 or `[review.rosters]`. Leave both unset until the release that added them is known good: a rollback
 to an older release fails at startup until they are removed.

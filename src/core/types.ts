@@ -452,6 +452,7 @@ export type FeedKind =
   | `conflict.${"round_started" | "round_delivered"}`
   | "run.warning"
   | "run.gate_timeout_retry"
+  | `deploy.${"started" | "failed"}`
   | LandFeedKind
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"

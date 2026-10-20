@@ -36,6 +36,7 @@ export interface Reserves {
 export interface Config {
   readonly readPolicy: ReadPolicyOptions;
   paths: Paths;
+  deploy: { afterLand: "off" | "when_idle" };
   retention: { worktreeDays: number; failedWorktreeDays: number; logDays: number; debugEventDays: number };
   port: number;
   host: string;
@@ -247,6 +248,15 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     catalog.models,
     catalog.providers,
   );
+  const rawDeploy = raw.deploy === undefined ? {} : raw.deploy;
+  if (Object.prototype.toString.call(rawDeploy) !== "[object Object]")
+    throw new Error("deploy.after_land must be in a table");
+  const deploy = rawDeploy as Record<string, unknown>;
+  for (const key of Object.keys(deploy))
+    if (key !== "after_land") throw new Error(`deploy.${key}: unknown key (allowed: after_land)`);
+  const afterLand = deploy.after_land === undefined ? "off" : deploy.after_land;
+  if (afterLand !== "off" && afterLand !== "when_idle")
+    throw new Error('deploy.after_land must be "off" or "when_idle"');
   const rawReview = raw.review ?? {};
   if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
     throw new Error("review must be a table");
@@ -358,6 +368,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   };
 
   return {
+    deploy: { afterLand },
     readPolicy: configureReadPolicy(raw.sandbox, configDir),
     paths,
     listenLan,
