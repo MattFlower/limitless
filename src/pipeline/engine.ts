@@ -20,6 +20,7 @@ import {
   pickScripts,
   readRetryFiles,
 } from "../gates/detect.ts";
+import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
@@ -560,6 +561,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
+      const baselineSha = await headSha(wt.path);
       const runBaseline = commandScope(wt.path, async (): Promise<GateRun> => {
         const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
         ctx.checkCancelled();
@@ -582,7 +584,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
         );
         ctx.checkCancelled();
-        return retried;
+        return { ...retried, sha: (await headSha(wt.path)) === baselineSha ? baselineSha : undefined };
       });
       ctx.state.baselineCached = false;
       const buildSha = ctx.deps.buildSha;
@@ -1379,12 +1381,24 @@ async function oneRound(
           });
         }
         ctx.state.lastGates = cmp;
+        const paths = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+        const canonicalPaths = paths.flatMap((path) => {
+          const canonical = canonicalTestFile(path, cwd);
+          return canonical && canonical !== path ? [path, canonical] : [path];
+        });
+        const changedFiles =
+          canonicalPaths.length <= 10_000 &&
+          canonicalPaths.every((path) => path.length <= 2000 && redactGateOutput(path) === path)
+            ? canonicalPaths
+            : undefined;
         // A gate may have changed HEAD itself; those results cannot attest to the checked commit.
         ctx.state.gateEvidence =
           (await headSha(cwd)) === checkedSha
             ? {
                 stageId: stage.id,
                 sha: checkedSha,
+                baseSha,
+                changedFiles,
                 checks: cmp.map((check) => ({
                   ...check,
                   testCommand: gateTestCommand(check.result.command, testScripts),
@@ -1799,6 +1813,7 @@ async function oneRound(
           ctx.state.holdout as Holdout,
           verifiedSha,
           usableGates(),
+          ctx.state.baseline,
         ),
         ctx.state.spec as Spec,
         ctx.state.holdout as Holdout,
