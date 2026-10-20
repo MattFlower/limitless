@@ -1525,6 +1525,7 @@ async function oneRound(
     return false;
   }
 
+  const concurrent = profile(ctx) !== "quick" && ctx.state.flow !== "verify-change" && !resolution;
   // --- review (a different vendor than the implementer)
   if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
@@ -1575,7 +1576,8 @@ async function oneRound(
         ),
       )
     : undefined;
-  const review: Review = await ctx.stage(
+  const reviewStage = (ctx.stage<Review>).bind(
+    ctx,
     "review",
     async (stage) => {
       // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
@@ -1614,8 +1616,7 @@ async function oneRound(
           ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
-      // TODO: parallel panel finders share this worktree, and each call discards changes when it ends,
-      // possibly while another finder still runs. Readers are read-only; single mode runs one finder.
+      // The concurrent pair owns cleanup of the production worktree; shadows own their checkout.
       const call = async (
         request: ReviewRequest | VerifierRequest,
         constraints: RouteConstraints,
@@ -1633,7 +1634,8 @@ async function oneRound(
           shadow: invokeGuard.getStore(),
           requireStructured: true,
         });
-        await discardChanges(invokeGuard.getStore()?.cwd ?? cwd);
+        if (!ctx.parallelChecks || invokeGuard.getStore())
+          await discardChanges(invokeGuard.getStore()?.cwd ?? cwd);
         return invoked;
       };
       const reviewDeps: ShadowDeps = (system) => {
@@ -1758,23 +1760,32 @@ async function oneRound(
     round,
   );
 
-  const reviewFeedback =
-    review.verdict === "request_changes"
-      ? formatReviewFeedback(
-          blockingReviewFindings(review, previousReview?.findings, panelRules, system.causalAttribution),
-          review.mode === "panel",
-        )
-      : "";
-  if (review.verdict === "request_changes") {
-    ctx.state.feedback = redactGateOutput(
-      reviewFeedback || `### Code review requested changes\n${review.summary}`,
-    );
-    await ctx.save();
-    // Never a fourth panel review: what still blocks goes to a human with a draft PR.
-    if (panelReview && panelReview >= PANEL_REVIEWS)
-      throw new NeedsHumanError(`Still blocking after panel review R${panelReview}:\n${ctx.state.feedback}`);
-    return false;
-  }
+  const rejectReview = async (review: Review, verifyFeedback = ""): Promise<boolean> => {
+    const reviewFeedback =
+      review.verdict === "request_changes"
+        ? formatReviewFeedback(
+            blockingReviewFindings(review, previousReview?.findings, panelRules, system.causalAttribution),
+            review.mode === "panel",
+          )
+        : "";
+    if (review.verdict === "request_changes") {
+      ctx.state.feedback = redactGateOutput(
+        [reviewFeedback || `### Code review requested changes\n${review.summary}`, verifyFeedback]
+          .filter(Boolean)
+          .join("\n\n"),
+      );
+      await ctx.save();
+      // Never a fourth panel review: what still blocks goes to a human with a draft PR.
+      if (panelReview && panelReview >= PANEL_REVIEWS)
+        throw new NeedsHumanError(
+          `Still blocking after panel review R${panelReview}:\n${ctx.state.feedback}`,
+        );
+      return false;
+    }
+
+    return true;
+  };
+  if (!concurrent && !(await rejectReview(await reviewStage()))) return false;
 
   // --- verify acceptance criteria (standard/deep)
   if (
@@ -1819,7 +1830,7 @@ async function oneRound(
         ctx.state.holdout as Holdout,
         ctx.run.prompt,
       );
-    const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
+    const preparePreview = async () => {
       if (!preview && previewConfig && needsPreview(previewConfig, diff)) {
         preview = await ctx.stage(
           "preview",
@@ -1851,6 +1862,9 @@ async function oneRound(
         );
         ctx.previewUrl = preview.url;
       }
+    };
+    const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
+      await preparePreview();
       return ctx.stage(
         "verify",
         async (stage) => {
@@ -1874,7 +1888,7 @@ async function oneRound(
             privateSession: true,
             redactHoldout: true,
           });
-          await discardChanges(cwd);
+          if (!ctx.parallelChecks) await discardChanges(cwd);
           if ((await headSha(cwd)) !== verifiedSha)
             throw new NeedsHumanError(
               "Commit changed during verification; gate evidence cannot cover the new HEAD",
@@ -1910,9 +1924,62 @@ async function oneRound(
     const previous = (ctx.state.verifyResults ?? []).filter(
       (v) => v.round === round && (!v.sha || v.sha === verifiedSha),
     );
-    const recorded = previous.at(-1);
+    const recorded = concurrent ? undefined : previous.at(-1);
     const original = recorded?.modelOutput ?? recorded;
-    let verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
+    let verify: Verify;
+    if (concurrent) {
+      await preparePreview();
+      ctx.parallelChecks = true;
+      let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
+      try {
+        results = await Promise.allSettled([reviewStage(), verifyAttempt(0)]);
+      } finally {
+        ctx.parallelChecks = false;
+        await discardChanges(cwd);
+      }
+      // Fixed error precedence, independent of completion order. Both stages have settled.
+      if (results[0].status === "rejected") throw results[0].reason;
+      ctx.checkCancelled();
+      if (results[1].status === "rejected") {
+        const error: unknown = results[1].reason;
+        if (
+          results[0].value.verdict !== "request_changes" ||
+          error instanceof CancelledError ||
+          error instanceof SimulatedTermination ||
+          (error instanceof Error && error.message.startsWith("Commit changed during verification"))
+        )
+          throw error;
+      }
+      if ((await headSha(cwd)) !== verifiedSha)
+        throw new NeedsHumanError(
+          "Commit changed during verification; gate evidence cannot cover the new HEAD",
+        );
+      if (results[1].status === "rejected") {
+        ctx.log(
+          redactHoldoutText(
+            redactCredentials(
+              `Verification failure ignored after review requested changes: ${results[1].reason}`,
+            ),
+            ctx.state.holdout,
+            await ctx.publicHoldoutSources(),
+          ),
+          "warn",
+        );
+        await rejectReview(results[0].value);
+        return false;
+      }
+      verify = results[1].value;
+      const feedback = formatVerifyFeedback(
+        verify,
+        ctx.state.spec ?? null,
+        ctx.state.holdout,
+        await ctx.publicHoldoutSources(),
+        ctx.run.prompt,
+      ).replace("### Checks not met", "### Acceptance criteria not yet met (verify)");
+      if (!(await rejectReview(results[0].value, feedback))) return false;
+    } else {
+      verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
+    }
     if (recorded) {
       Object.assign(recorded, verify);
       ctx.state.lastVerify = { ...verify, modelId: recorded.modelId };
@@ -1964,7 +2031,9 @@ async function oneRound(
         ctx.log("Resuming interrupted verification retry", "warn");
       ctx.state.environmentRetryRound = round;
       await ctx.save();
-      const firstModel = (previous.find((v) => v.attempt !== 1) ?? ctx.state.lastVerify)?.modelId;
+      const firstModel = concurrent
+        ? ctx.state.lastVerify?.modelId
+        : (previous.find((v) => v.attempt !== 1) ?? ctx.state.lastVerify)?.modelId;
       try {
         verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
       } catch (error) {

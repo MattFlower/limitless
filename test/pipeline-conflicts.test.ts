@@ -307,13 +307,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
         if (role === "verify") {
           verifies++;
-          if (verifies === 2) {
+          if (verifies === normalRounds + 1) {
             expect(s.prompt).toContain(baseTip);
             if (outcome === "base-moved") await advanceBase(bare, "again.txt", "another advance\n");
           }
           return {
             structured:
-              outcome === "verify" && verifies === 2
+              outcome === "verify" && verifies === normalRounds + 1
                 ? { ...pass, criteria: pass.criteria.map((c) => ({ ...c, status: "unmet" })) }
                 : pass,
           };
@@ -340,7 +340,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(f.store.getRunState<RunState>(run.id)?.conflictRound).toBe(normalRounds);
       if (outcome === "exhausted") {
         expect(reviews).toBe(4);
-        expect(verifies).toBe(2);
+        expect(verifies).toBe(normalRounds + 1);
         expect(
           f.store
             .listStages(run.id)

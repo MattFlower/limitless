@@ -296,6 +296,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(worktree).not.toBe("");
     expect(existsSync(join(worktree, "greeting.txt"))).toBe(true);
     expect(f.store.getRunState<RunState>(runId)?.holdout).toBeUndefined();
+    expect(await waitFor(f, runId, ["failed", "needs_human"])).toBe("needs_human");
+    expect(f.store.listStages(runId).some((s) => ["review", "verify"].includes(s.name))).toBe(false);
+    expect(f.store.listStages(runId).some((s) => s.status === "running")).toBe(false);
   });
 
   test("holdout uses same-vendor fallback and invalid output routes to another model", async () => {

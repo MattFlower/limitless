@@ -417,7 +417,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
     expect(implementations).toBe(3);
     expect(finders).toBe(3);
-    expect(verifies).toBe(1);
+    expect(verifies).toBe(3);
     expect(f.store.listStages(run.id).filter((stage) => stage.name === "implement")).toHaveLength(3);
     expect(f.store.getArtifact(run.id, "implement-3.md")).toBeNull();
     const state = f.store.getRunState<RunState>(run.id);
