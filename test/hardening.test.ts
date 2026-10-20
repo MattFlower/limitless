@@ -2299,10 +2299,10 @@ describe("pipeline hardening", () => {
           }
           if (r === "verify") {
             verifies++;
-            // First verifier only reports AC-1 and claims "pass"; second covers both.
+            // Incomplete verification overlaps the rejected review, then fails an approved round too.
             return {
               structured:
-                verifies === 1
+                verifies <= 2
                   ? {
                       criteria: [{ id: "AC-1", status: "met", evidence: "e", publicSummary: "" }],
                       overall: "pass",
@@ -2330,7 +2330,9 @@ describe("pipeline hardening", () => {
       const run = await f.createRun({ repo, prompt: "change a" });
       expect(await waitDone(f, run.id)).toBe("succeeded");
       expect(reviews).toBe(3); // round 0 rejected (blocker), round 1 approved, round 2 approved
-      expect(verifies).toBe(2); // round 1 verify incomplete → fail, round 2 pass
+      expect(verifies).toBe(3); // round 0 overlaps rejection, round 1 incomplete → fail, round 2 pass
+      const review0 = JSON.parse(f.store.getArtifact(run.id, "review-0.json") as string);
+      expect(review0.verdict).toBe("request_changes");
       const verify1 = JSON.parse(f.store.getArtifact(run.id, "verify-1.json") as string);
       expect(verify1.overall).toBe("fail");
       expect(verify1.criteria.find((c: { id: string }) => c.id === "AC-2").status).toBe("unclear");

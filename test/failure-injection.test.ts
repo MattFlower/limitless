@@ -428,7 +428,10 @@ for (const stage of ["implement", "gates", "review", "verify", "deliver"] as con
       .listStages(id)
       .slice(stages.length)
       .map((s) => s.name);
-    expect(resumed[0]).toBe(stage);
+    if (stage === "review") {
+      // Verify starts afresh on resume even when it finished beside the interrupted review.
+      expect(resumed.slice(0, 2).sort()).toEqual(["review", "verify"]);
+    } else expect(resumed[0]).toBe(stage);
     for (const earlier of [
       "prepare",
       "triage",
@@ -1544,7 +1547,7 @@ test("PR creation window reconciles a stateful fake after Factory replacement", 
 test("restart during the environment verification retry resumes that retry", async () => {
   let verifies = 0;
   const handler = (s: AgentSpec): FakeReply =>
-    s.prompt.startsWith("You are the acceptance") && verifies++ === 0 ? { structured: blocked } : answer(s);
+    s.prompt.startsWith("You are the acceptance") && verifies++ < 2 ? { structured: blocked } : answer(s);
   let reached = false;
   const f = factory(
     {
@@ -1565,10 +1568,11 @@ test("restart during the environment verification retry resumes that retry", asy
   expect(next.store.getRun(id)?.status).toBe("succeeded");
   const verifiers = next.store.listInvocations(id).filter((i) => i.role === "verify");
   expect(verifiers.map((i) => [i.modelId, i.status])).toEqual([
+    ["b", "ok"], // The initial attempt is rerun beside the cached review on resume.
     ["b", "ok"],
     ["a", "ok"],
   ]);
-  expect(next.store.getRunState<RunState>(id)?.verifyResults?.map((v) => v.attempt)).toEqual([0, 1]);
+  expect(next.store.getRunState<RunState>(id)?.verifyResults?.map((v) => v.attempt)).toEqual([0, 0, 1]);
   history(next, id);
 });
 
