@@ -137,6 +137,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
           holder: slotHooks.holder,
           skipGateSlot: req.skipGateSlot,
           priority: req.priority,
+          onLocalSetup: slotHooks.onLocalSetup,
           onResult(r, phase) {
             results.push({ type: "check", phase, result: r });
             notify();

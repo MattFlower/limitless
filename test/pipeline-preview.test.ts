@@ -1,7 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { type GateExecutor, localExecutor } from "../src/gates/executor.ts";
+import type { GateRun } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { sh } from "../src/util/proc.ts";
@@ -16,6 +18,7 @@ import {
   triage,
   waitFor,
 } from "./pipeline-support.ts";
+import { test } from "./read-policy-support.ts";
 
 let home: string;
 let repoDir: string;
@@ -42,6 +45,137 @@ const { start, previewFixture } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["remote", "local", "local fallback", "local retry", "setup failure"] as const)(
+    "preview prepares coordinator setup: %s",
+    async (executor) => {
+      await previewFixture();
+      const calls = join(home, "setup-calls");
+      const count = () => (existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n").length : 0);
+      const setup = [
+        executor === "setup failure"
+          ? "bun setup-failure.ts"
+          : `mkdir -p .setup; echo first >> .setup/order; pwd >> '${calls}'`,
+        "mkdir -p .setup; echo second >> .setup/order",
+      ];
+      const baseConfig = readFileSync(join(repoDir, ".limitless.toml"), "utf8")
+        .replace("[gates]", `[gates]\nsetup = ${JSON.stringify(setup)}`)
+        .replace('build = "', 'build = "test -f .setup/order && test $(wc -l < .setup/order) -eq 2 && ');
+      writeFileSync(join(repoDir, ".limitless.toml"), baseConfig);
+      writeFileSync(join(repoDir, ".gitignore"), ".setup/\n");
+      writeFileSync(
+        join(repoDir, "setup-failure.ts"),
+        'console.error("coordinator setup diagnostic"); process.exit(1);',
+      );
+      await sh(["git", "add", "."], { cwd: repoDir });
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "setup fixture"], {
+        cwd: repoDir,
+      });
+      const local = localExecutor();
+      let executions = 0;
+      const remote: GateExecutor = {
+        kind: "lan",
+        freshCheckoutFor: () => true,
+        async start(request, signal) {
+          if (++executions > 2 && executor === "local retry") return local.start(request, signal);
+          return { kind: "lan", id: "remote", startedAt: Date.now() };
+        },
+        attach(handle, signal, request, hooks) {
+          if (handle.kind === "local") return local.attach(handle, signal, request, hooks);
+          if (!request) throw new Error("Missing gate request");
+          const ok = executor !== "local retry" || executions !== 2;
+          const result: GateRun = {
+            setupOk: true,
+            setup: request.gates.setup.map((command) => ({
+              name: "setup",
+              command,
+              ok: true,
+              exitCode: 0,
+              durationMs: 0,
+              output: "",
+            })),
+            checks: request.gates.checks.map(({ name, run }) => ({
+              name,
+              command: run,
+              ok,
+              exitCode: ok ? 0 : 1,
+              durationMs: 0,
+              output: "",
+            })),
+          };
+          return {
+            result: Promise.resolve(result),
+            events: { async *[Symbol.asyncIterator]() {} },
+            async cancel() {},
+          };
+        },
+      };
+      // LAN routing may execute locally; readiness must follow the execution evidence.
+      const gateExecutor =
+        executor === "local"
+          ? undefined
+          : executor === "local fallback"
+            ? { ...localExecutor(), kind: "lan" as const }
+            : remote;
+      let cwd = "";
+      let beforePreview = -1;
+      let verified = false;
+      const f = start(
+        (agent) => {
+          const role = roleOf(agent);
+          if (role === "triage") return { structured: triage() };
+          if (role === "spec") return { structured: spec };
+          if (role === "holdout") return { structured: holdout };
+          if (role === "review") {
+            beforePreview = count();
+            return { structured: approve };
+          }
+          if (role === "verify") {
+            verified = true;
+            expect(readFileSync(join(cwd, ".setup/order"), "utf8")).toBe("first\nsecond\n");
+            expect(count()).toBe(beforePreview + (executor === "remote" ? 1 : 0));
+            expect(existsSync(join(cwd, ".setup/untrusted"))).toBe(false);
+            return { structured: pass };
+          }
+          cwd = agent.cwd;
+          return {
+            files: {
+              "ui/change.txt": "visible\n",
+              ".limitless.toml": baseConfig.replace(
+                `setup = ${JSON.stringify(setup)}`,
+                'setup = ["mkdir -p .setup; touch .setup/untrusted"]',
+              ),
+            },
+          };
+        },
+        false,
+        false,
+        { gateExecutor },
+      );
+      const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        executor === "setup failure" ? "failed" : "succeeded",
+      );
+      const preview = f.store.getRunDetail(run.id)?.stages.find((stage) => stage.name === "preview");
+      expect(preview?.status).toBe(executor === "setup failure" ? "failed" : "succeeded");
+      if (executor === "setup failure") {
+        expect(preview?.summary).toContain(`Preview setup failed: $ ${setup[0]}`);
+        expect(preview?.summary).toContain("coordinator setup diagnostic");
+        expect(existsSync(join(cwd, ".setup/order"))).toBe(false);
+        expect(existsSync(join(home, "preview-steps"))).toBe(false);
+        expect(verified).toBe(false);
+      } else {
+        expect(verified).toBe(true);
+        expect(
+          readFileSync(calls, "utf8")
+            .trim()
+            .split("\n")
+            .every((path) => path === cwd),
+        ).toBe(true);
+        expect(readFileSync(join(home, "preview-steps"), "utf8")).toBe("build\nseed\nserve\n");
+      }
+    },
+  );
+
   test.each(["pass", "unmet", "error", "legacy"] as const)(
     "base preview survives config edits and cleans up after verify %s",
     async (outcome) => {
