@@ -434,21 +434,31 @@ export class Store {
   recordProcessCleanup(row: ProcessCleanup): void {
     this.db
       .query(
-        "INSERT OR REPLACE INTO process_cleanups (run_id, invocation, directory, pid, birth, boot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO process_cleanups (run_id, invocation, directory, pid, birth, boot, created_at, discovery) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(row.runId, row.invocation, row.directory, row.pid, row.birth, row.boot, row.createdAt);
+      .run(
+        row.runId,
+        row.invocation,
+        row.directory,
+        row.pid,
+        row.birth,
+        row.boot,
+        row.createdAt,
+        row.discovery ? JSON.stringify(row.discovery) : null,
+      );
   }
 
   listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[] {
     const prefix =
       directory === undefined ? null : directory.endsWith(sep) ? directory : `${directory}${sep}`;
     return this.db
-      .query<ProcessCleanup, (string | null)[]>(
-        `SELECT run_id AS runId, invocation, directory, pid, birth, boot, created_at AS createdAt
+      .query<Omit<ProcessCleanup, "discovery"> & { discovery: string | null }, (string | null)[]>(
+        `SELECT run_id AS runId, invocation, directory, pid, birth, boot, created_at AS createdAt, discovery
        FROM process_cleanups WHERE (? IS NULL AND ? IS NULL) OR run_id = ?
        OR directory = ? OR substr(directory, 1, length(?)) = ?`,
       )
-      .all(runId ?? null, directory ?? null, runId ?? null, directory ?? null, prefix, prefix);
+      .all(runId ?? null, directory ?? null, runId ?? null, directory ?? null, prefix, prefix)
+      .map((row) => ({ ...row, discovery: row.discovery ? JSON.parse(row.discovery) : null }));
   }
 
   deleteProcessCleanup(invocation: string, pid: number): void {
