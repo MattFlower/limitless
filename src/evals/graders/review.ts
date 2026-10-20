@@ -30,14 +30,9 @@ function assign(defects: Defect[], findings: Finding[], lands: (f: Finding, d: D
   return new Set(owner.values());
 }
 
-/**
- * Grades what production would block in round 1: a required defect is caught only by a blocking
- * finding, and the case verdict is derived from findings exactly as the engine does. The model's
- * verdict is never graded, so stored output without one is still evidence.
- */
-export function gradeReview(item: ReviewCase, output: StoredReview, causalAttribution = false): EvalGrade {
+/** Match distinct claims once, retaining merged location aliases. */
+export function matchedReviewDefects(item: ReviewCase, findings: Finding[], requiredOnly = true) {
   const normalize = (file: string) => file.replace(/^(\.\/)+/, "");
-  const blocking = blockingReviewFindings(output, undefined, undefined, causalAttribution);
   const atLine = (line: number, defect: Defect) =>
     line === 0
       ? defect.category === "completeness"
@@ -59,15 +54,25 @@ export function gradeReview(item: ReviewCase, output: StoredReview, causalAttrib
   };
   // Most severe first, so an ambiguous assignment credits the defect that matters most.
   const required = item.defects
-    .filter((defect) => defect.required)
+    .filter((defect) => !requiredOnly || defect.required)
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
-  const caught = assign(required, distinct(blocking), lands);
+  const caught = assign(required, distinct(findings), lands);
+  return { required, caught };
+}
+
+/**
+ * Grades what production would block in round 1: a required defect is caught only by a blocking
+ * finding, and the case verdict is derived from findings exactly as the engine does. The model's
+ * verdict is never graded, so stored output without one is still evidence.
+ */
+export function gradeReview(item: ReviewCase, output: StoredReview, causalAttribution = false): EvalGrade {
+  const blocking = blockingReviewFindings(output, undefined, undefined, causalAttribution);
+  const { required, caught } = matchedReviewDefects(item, blocking);
   const missed = required.filter((_, index) => !caught.has(index));
-  const underRated = assign(
-    missed,
-    distinct(output.findings.filter((f) => !blocking.includes(f))),
-    lands,
-  ).size;
+  const underRated = matchedReviewDefects(
+    { ...item, defects: missed },
+    output.findings.filter((f) => !blocking.includes(f)),
+  ).caught.size;
   const bySeverity = {
     high: { caught: 0, total: 0 },
     medium: { caught: 0, total: 0 },

@@ -68,7 +68,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial", "careful" or "probe"',
+    'finder prompt must be "standard", "adversarial", "careful", "probe" or "trace"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -461,6 +461,13 @@ test("eval policy counts only standard systems matching the daemon's [review] im
           finders: [{ target: "candidate-a", prompt }],
         }),
       ),
+      system({
+        name: "trace",
+        finders: [
+          { target: "candidate-a", prompt: "standard" },
+          { target: "candidate-a", prompt: "trace" },
+        ],
+      }),
       system(),
       system({ name: "without", implementerReport: "omit" }),
     ] as ReviewSystem[];
@@ -657,4 +664,62 @@ test("an eval system can name a configured roster; it expands to exactly the pro
   } finally {
     await f.close();
   }
+});
+
+test("trace is a pinned eval-only second finder after the standard reviewer", () => {
+  const main = { target: "codex/sol-6.1@medium", prompt: "standard" };
+  const trace = { ...main, prompt: "trace" };
+  const variant = system({ finders: [main, trace] });
+  expect(parseEvalReviewSystems(file(variant), "trace.json")).toEqual([variant] as ReviewSystem[]);
+  expect(reviewSystemHash(variant as ReviewSystem)).not.toBe(reviewSystemHash(system() as ReviewSystem));
+  for (const finders of [
+    [trace],
+    [trace, main],
+    [main, trace, trace],
+    [trace, trace],
+    [{ prompt: "standard" }, trace],
+  ])
+    expect(() => parseEvalReviewSystems(file(system({ finders })), "trace.json")).toThrow();
+  for (const extra of [{ verifier: {} }, { causalAttribution: true }])
+    expect(() => parseEvalReviewSystems(file({ ...variant, ...extra }), "trace.json")).toThrow();
+  expect(() => parseEvalReviewSystems(file(panel({ finders: [trace] })), "trace.json")).toThrow();
+  expect(ReviewSystemSchema.safeParse(variant).success).toBe(false);
+  expect(ReviewSystemSchema.safeParse(panel({ finders: [trace] })).success).toBe(false);
+  for (const profile of ["quick", "standard", "deep"])
+    expect(() => parseReviewRosters({ [profile]: [trace] })).toThrow("eval-only");
+});
+
+test("registered trace experiment pins 35 dev cases, production E1, targets and the decision rule", async () => {
+  const registration = await Bun.file(
+    new URL("../evals/review/trace-experiment.json", import.meta.url),
+  ).json();
+  const definitions = await Bun.file(new URL("../evals/review/trace-systems.json", import.meta.url)).text();
+  const systems = parseEvalReviewSystems(definitions, "trace-systems.json");
+  const dataset = await Bun.file(new URL("../evals/review/cases.json", import.meta.url)).json();
+  expect(registration.caseIds).toHaveLength(35);
+  expect(new Set(registration.caseIds).size).toBe(35);
+  expect(registration.k).toBe(2);
+  expect(registration.baseline).toBe("eval-mv7igcxy1tl7bg203warej");
+  expect(registration.decision).toEqual({
+    minimumPooledRecallGain: 0.08,
+    maximumAdditionalCleanBlockedTrials: 1,
+  });
+  const cases = (
+    dataset.cases as { id: string; split: string; defects: { required: boolean }[]; kind: string }[]
+  ).filter((c) => registration.caseIds.includes(c.id));
+  expect(cases).toHaveLength(35);
+  expect(cases.every((c) => c.split === "dev")).toBe(true);
+  expect(cases.reduce((n, c) => n + c.defects.filter((d) => d.required).length, 0)).toBe(49);
+  expect(cases.filter((c) => c.kind === "clean")).toHaveLength(4);
+  expect(systems).toEqual([
+    {
+      name: "E",
+      mode: "single",
+      implementerReport: "include",
+      finders: [
+        { target: "codex/sol-6.1@medium", prompt: "standard" },
+        { target: "codex/sol-6.1@medium", prompt: "trace" },
+      ],
+    },
+  ]);
 });

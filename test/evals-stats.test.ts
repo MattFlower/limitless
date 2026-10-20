@@ -593,3 +593,261 @@ test("review reports current and original label views from stored output without
     originalLabels: { falseBlock: { numerator: 3, denominator: 4 } },
   });
 });
+
+test("trace comparison counts paired category recall, merged additions and newly blocked clean trials", async () => {
+  const { compareTrace } = await import("../src/evals/trace.ts");
+  const { reviewCase, reviewOutput } = await import("./evals-reading-support.ts");
+  const { runReview } = await import("../src/pipeline/review.ts");
+  const { emptyUsage } = await import("../src/harness/types.ts");
+  const first = reviewCase.defects[0];
+  if (!first) throw new Error("fixture");
+  const cases = [
+    {
+      ...reviewCase,
+      defects: [
+        first,
+        {
+          ...first,
+          lines: [100, 100] as [number, number],
+          category: "security",
+          severity: "blocker" as const,
+        },
+        { ...first, lines: [200, 200] as [number, number], category: "test-gap", required: false },
+      ],
+    },
+    ...["new", "existing"].map((id) => ({ ...reviewCase, id, kind: "clean" as const, defects: [] })),
+  ];
+  const claim = (line: number, severity: "major" | "minor" = "major") => {
+    const f = reviewOutput(line, severity).findings[0];
+    if (!f) throw new Error("fixture");
+    return f;
+  };
+  const baseline: EvalTrial[] = [],
+    variant: EvalTrial[] = [];
+  for (const c of cases)
+    for (let i = 0; i < 2; i++) {
+      const main = c.id === "existing" || (c.id === reviewCase.id && i === 0) ? [claim(10)] : [];
+      const trace =
+        c.id === "existing"
+          ? i
+            ? []
+            : [claim(10)]
+          : c.id === "new"
+            ? [claim(500, i ? "minor" : "major")]
+            : i
+              ? [claim(10), claim(200, "minor")]
+              : [claim(10), claim(100)];
+      const report = (findings: typeof main) => ({
+        summary: "Inspected entry points against every request clause.",
+        verdict: "approve" as const,
+        findings,
+      });
+      const outcome = await runReview(
+        {
+          invoke: async (_, finder) => ({
+            result: {
+              status: "ok",
+              structured: report(finder ? trace : main),
+              finalText: "",
+              sessionId: null,
+              usage: emptyUsage(),
+              costUsd: 0,
+              costEquivUsd: 0,
+              numTurns: 1,
+              error: null,
+              quota: null,
+            },
+          }),
+        },
+        {
+          timeoutMs: 100,
+          prompt: { ...c.input, baseSha: c.base, stat: "", audit: [] },
+          system: { mode: "single", finders: [{ prompt: "standard" }, { prompt: "trace" }] },
+        },
+      );
+      baseline.push({ ...trial("a", c.id, i, false), output: report(main) });
+      variant.push({
+        ...trial("a", c.id, i, false),
+        output: JSON.parse(JSON.stringify(outcome.result.structured)),
+      });
+    }
+  const result = compareTrace(cases, baseline, variant);
+  expect(result).toMatchObject({
+    expectedPairs: 6,
+    pairedTrials: 6,
+    missing: [],
+    improvement: 0.5,
+    additionalCleanBlocks: 1,
+    trace: { added: 5, addedOnGold: 3, cleanBlocked: 2, newlyBlocked: 1, cleanTrials: 4 },
+    decision: { pass: true },
+  });
+  expect(result.arms).toMatchObject([
+    {
+      pooled: { caught: 1, total: 4, rate: 0.25 },
+      cleanBlocks: { caught: 2, total: 4 },
+      repetitionUnion: { caught: 1, total: 2 },
+    },
+    {
+      pooled: { caught: 3, total: 4, rate: 0.75 },
+      cleanBlocks: { caught: 3, total: 4 },
+      findings: 8,
+      repetitionUnion: { caught: 2, total: 2 },
+      byCategory: {
+        correctness: { caught: 2, total: 2, rate: 1 },
+        security: { caught: 1, total: 2, rate: 0.5 },
+        "test-gap": { caught: 0, total: 0, rate: null },
+      },
+    },
+  ]);
+  const firstVariant = variant[0];
+  if (!firstVariant) throw new Error("fixture");
+  for (const broken of [
+    variant.slice(1),
+    [firstVariant, ...variant],
+    variant.map((t, i) => (i ? t : { ...t, status: "error" as const })),
+    variant.map((t, i) => (i ? t : { ...t, output: reviewOutput() })),
+  ])
+    expect(compareTrace(cases, baseline, broken).decision.pass).toBe(false);
+  expect(compareTrace([], [], []).decision.pass).toBe(false);
+  // Exactly eight points is inclusive; the decision uses integer counts, avoiding floating subtraction.
+  const many = Array.from({ length: 25 }, (_, i) => ({ ...reviewCase, id: `d${i}` }));
+  const clean = cases[1];
+  if (!clean) throw new Error("fixture");
+  const allCases = [...many, clean];
+  const baseRows: EvalTrial[] = allCases.map((c) => ({
+    ...trial("a", c.id, 0, false),
+    output: { ...reviewOutput(), summary: "No unguarded paths were found in this inspection.", findings: [] },
+  }));
+  const source = variant[0];
+  if (!source) throw new Error("fixture");
+  const { StoredReviewSchema } = await import("../src/pipeline/schemas.ts");
+  const empty = StoredReviewSchema.parse(
+    variant.find((t) => t.caseId === "existing" && t.trial === 1)?.output,
+  );
+  const variants = (caught: number) =>
+    allCases.map((c, i) => ({
+      ...source,
+      caseId: c.id,
+      trial: 0,
+      output:
+        i < caught
+          ? source.output
+          : {
+              ...empty,
+              findings: [],
+              panel: {
+                finders: [
+                  { prompt: "standard", vendor: null },
+                  { prompt: "trace", vendor: null },
+                ],
+                reports: [{ findings: [] }, { findings: [] }],
+                candidates: [],
+                verdicts: [],
+                refuted: [],
+                capped: [],
+                omitted: [],
+              },
+            },
+    }));
+  expect(compareTrace(allCases, baseRows, variants(2), 1).decision.pass).toBe(true);
+  expect(compareTrace(allCases, baseRows, variants(1), 1).decision.pass).toBe(false);
+  const bothClean = variants(2);
+  const last = bothClean.find((t) => t.caseId === clean.id);
+  if (!last) throw new Error("fixture");
+  last.output = source.output;
+  expect(compareTrace(allCases, baseRows, bothClean, 1).decision.pass).toBe(true);
+  const secondClean = { ...clean, id: "second-clean" };
+  allCases.push(secondClean);
+  baseRows.push({ ...trial("a", secondClean.id, 0, false), output: { ...empty, findings: [] } });
+  bothClean.push({ ...source, caseId: secondClean.id, trial: 0 });
+  expect(compareTrace(allCases, baseRows, bothClean, 1).additionalCleanBlocks).toBe(2);
+  expect(compareTrace(allCases, baseRows, bothClean, 1).decision.pass).toBe(false);
+});
+
+test("registered trace reporting selects standard-medium, regrades labels and rejects substitute or incomplete evidence", async () => {
+  const { traceExperimentReport } = await import("../src/evals/trace.ts");
+  const { reviewCase, reviewOutput } = await import("./evals-reading-support.ts");
+  const { EvalReviewSystemsSchema } = await import("../src/pipeline/review-system.ts");
+  const { ReviewCaseFileSchema, loadRoleCases } = await import("../src/evals/cases.ts");
+  const registration = await Bun.file(
+    new URL("../evals/review/trace-experiment.json", import.meta.url),
+  ).json();
+  const systemFile = await Bun.file(new URL("../evals/review/trace-systems.json", import.meta.url)).json();
+  const systems = EvalReviewSystemsSchema.parse(systemFile.systems);
+  const system = systems[0];
+  if (!system || "roster" in system) throw new Error("fixture");
+  const cases = ReviewCaseFileSchema.parse(loadRoleCases("review")).cases;
+  const selected = cases.filter((c) => registration.caseIds.includes(c.id));
+  const blank = {
+    ...reviewOutput(),
+    summary: "Inspected requirements and found no unguarded paths.",
+    findings: [],
+  };
+  const trace = {
+    ...blank,
+    panel: {
+      finders: [
+        { prompt: "standard", vendor: "openai" },
+        { prompt: "trace", vendor: "openai" },
+      ],
+      reports: [blank, blank],
+      candidates: [],
+      verdicts: [],
+      refuted: [],
+      capped: [],
+      omitted: [],
+    },
+  };
+  const baseRun = {
+    ...run,
+    role: "review" as const,
+    models: [registration.target],
+    id: registration.baseline,
+  };
+  const baseTrials = selected.flatMap((c) =>
+    [0, 1].map((i) => ({
+      ...trial("codex/sol-6.1", c.id, i, true),
+      effort: "medium" as const,
+      output: blank,
+      details: { grade: { pass: true, score: 1, fields: {}, riskUnderCall: null } },
+    })),
+  );
+  const baseline = { run: baseRun, trials: baseTrials, summaries: [] };
+  const variant = {
+    run: { ...baseRun, id: "variant", systems: [system] },
+    trials: baseTrials.map((t) => ({ ...t, output: trace, details: { ...t.details, system: "E" } })),
+    summaries: [],
+  };
+  const report = traceExperimentReport(baseline, variant, cases);
+  expect(report.comparison).toMatchObject({
+    pairedTrials: 70,
+    missing: [],
+    arms: [
+      { pooled: { caught: 0, total: 98 }, cleanBlocks: { caught: 0, total: 8 } },
+      { pooled: { caught: 0, total: 98 }, cleanBlocks: { caught: 0, total: 8 } },
+    ],
+    decision: { pass: false },
+  });
+  expect(report.measures[0]?.summaries[0]?.review?.defectRecall.denominator).toBe(98);
+  expect(report.measures[0]?.tokensOut).toBe(140);
+  expect(baseline.trials.every((t) => t.details.grade.pass)).toBe(true);
+  const partial = { ...variant, trials: variant.trials.slice(1) };
+  expect(traceExperimentReport(baseline, partial, cases).comparison).toMatchObject({
+    pairedTrials: 69,
+    decision: { pass: false },
+  });
+  expect(() =>
+    traceExperimentReport({ ...baseline, run: { ...baseRun, id: "adversarial" } }, variant, cases),
+  ).toThrow("registered E1");
+  const wrongPrompt = {
+    ...system,
+    finders: [{ ...system.finders[0], target: registration.target, prompt: "adversarial" as const }],
+  };
+  expect(() =>
+    traceExperimentReport({ ...baseline, run: { ...baseRun, systems: [wrongPrompt] } }, variant, cases),
+  ).toThrow("Wrong prompt");
+  expect(() => traceExperimentReport(baseline, { ...variant, run: { ...variant.run, k: 1 } }, cases)).toThrow(
+    "k=2",
+  );
+  expect(() => traceExperimentReport(baseline, variant, [reviewCase])).toThrow("Missing registered cases");
+});

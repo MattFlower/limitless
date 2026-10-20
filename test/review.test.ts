@@ -14,6 +14,7 @@ import {
   reviewRequest,
   reviewVerdict,
   runReview,
+  traceIdentity,
   type VerifierRequest,
 } from "../src/pipeline/review.ts";
 import {
@@ -1994,4 +1995,148 @@ Inspect the latest-change diff with \`git diff fixbase..head\`. Compare it with 
     expect(stored.panel?.refuted).toEqual(["C1"]);
     expect(stored.panel?.candidates.map((c) => [c.id, c.line])).toEqual([["C1", 1]]);
   });
+});
+
+describe("trace single review", () => {
+  const input = {
+    prompt: {
+      prompt: "Every entry point must validate",
+      spec: null,
+      baseSha: "base",
+      stat: "src/changed.ts | 1 +",
+      gates: [],
+      audit: [],
+      implementerReport: "Done",
+    },
+    timeoutMs: 100,
+    system: {
+      mode: "single" as const,
+      finders: [{ prompt: "standard" as const }, { prompt: "trace" as const }],
+    },
+  };
+  const report = (findings: Review["findings"]) => ({
+    verdict: "approve" as const,
+    summary: "Inspected all applicable entry points against the request.",
+    findings,
+  });
+  const result = (structured: unknown, status: "ok" | "error" | "cancelled" | "timeout" = "ok") => ({
+    result: {
+      structured,
+      status,
+      finalText: "",
+      usage: emptyUsage(),
+      costUsd: 1,
+      costEquivUsd: 2,
+      numTurns: 1,
+      sessionId: null,
+      error: null,
+      quota: null,
+    },
+  });
+  test("merges duplicates with provenance, keeps out-of-diff findings, and never verifies", async () => {
+    const calls: number[] = [];
+    const main = finding("major");
+    const outside = { ...finding("minor"), file: "src/resume.ts", title: "Resume bypasses guard" };
+    const outcome = await runReview(
+      {
+        invoke: async (request, i) => {
+          calls.push(i);
+          if (i === 0) expect(request.prompt).toBe(reviewPrompt(input.prompt));
+          return result(report(i ? [main, outside] : [main]));
+        },
+        verify: async () => {
+          throw new Error("No verifier allowed");
+        },
+      },
+      input,
+    );
+    expect(calls).toEqual([0, 1]);
+    expect(outcome.decision?.review.findings).toHaveLength(2);
+    expect(outcome.panel?.candidates.map((c) => [c.file, c.agreement, c.raisedBy])).toEqual([
+      [main.file, 2, [0, 1]],
+      [outside.file, 1, [1]],
+    ]);
+    expect(outcome.decision?.review.mode).toBeUndefined();
+    expect(outcome.decision?.review.verdict).toBe("request_changes");
+    expect(outcome.decision?.blocking).toHaveLength(1);
+    expect(outcome.decision?.review.findings.every((f) => !f.verification)).toBe(true);
+    expect(outcome.result.costUsd).toBe(2);
+    const stored = StoredReviewSchema.parse(JSON.parse(JSON.stringify(outcome.result.structured)));
+    expect(stored.panel?.reports?.[1]?.findings).toHaveLength(2);
+    expect(stored.panel?.candidates[0]?.raisedBy).toEqual([0, 1]);
+  });
+  test("an empty trace preserves main findings and verdict", async () => {
+    const outcome = await runReview(
+      { invoke: async (_, i) => result(report(i ? [] : [finding("minor")])) },
+      input,
+    );
+    expect(outcome.decision?.review.verdict).toBe("approve");
+    expect(outcome.decision?.review.findings).toMatchObject([
+      { severity: "minor", file: "src/example.ts", line: 1, title: "Observed issue" },
+    ]);
+  });
+  test("agreement on minor findings does not confirm or promote them", async () => {
+    const outcome = await runReview({ invoke: async () => result(report([finding("minor")])) }, input);
+    expect(outcome.panel?.candidates[0]?.agreement).toBe(2);
+    expect(outcome.decision?.blocking).toHaveLength(0);
+    expect(outcome.decision?.review.verdict).toBe("approve");
+  });
+  test.each(["malformed", "error", "cancelled", "timeout", "throw", "skip"])(
+    "required trace %s cannot succeed main-only",
+    async (failure) => {
+      const calls: number[] = [];
+      const pending = runReview(
+        {
+          invoke: async (_, i) => {
+            calls.push(i);
+            if (!i) return result(report([finding("major")]));
+            if (failure === "throw") throw new Error("trace failed");
+            if (failure === "skip") throw new FinderSkipped("trace failed");
+            return result(
+              failure === "malformed" ? {} : report([]),
+              failure === "error"
+                ? "error"
+                : failure === "cancelled"
+                  ? "cancelled"
+                  : failure === "timeout"
+                    ? "timeout"
+                    : "ok",
+            );
+          },
+          skipAny: true,
+        },
+        input,
+      );
+      if (["throw", "skip"].includes(failure)) await expect(pending).rejects.toThrow("trace failed");
+      else {
+        const outcome = await pending;
+        expect(outcome.result.status).not.toBe("ok");
+        expect(outcome.result.structured).toBeNull();
+        expect(outcome.result.finalText).toBe("");
+        expect(outcome.output.success).toBe(false);
+        expect(outcome.result.costUsd).toBe(2);
+      }
+      expect(calls).toEqual([0, 1]);
+    },
+  );
+});
+
+test("trace cache identity includes its generated prompt and merge rules", () => {
+  const before = traceIdentity();
+  const original = prompts.reviewPrompt;
+  const spy = spyOn(prompts, "reviewPrompt").mockImplementation(
+    (input) => `${original(input)} trace revision`,
+  );
+  try {
+    expect(traceIdentity()).not.toBe(before);
+  } finally {
+    spy.mockRestore();
+  }
+  const version = MERGE_RULES.version;
+  try {
+    MERGE_RULES.version++;
+    expect(traceIdentity()).not.toBe(before);
+  } finally {
+    MERGE_RULES.version = version;
+  }
 });

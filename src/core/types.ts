@@ -627,11 +627,11 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 /** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
-/** Finder prompts: `standard`, `adversarial`, `careful`, or eval-only `probe` reproduction. */
-export type FinderPrompt = "standard" | "adversarial" | "careful" | "probe";
+/** Finder prompts: `standard`, `adversarial`, `careful`, or eval-only `probe` reproduction and `trace` entry-point search. */
+export type FinderPrompt = "standard" | "adversarial" | "careful" | "probe" | "trace";
 /**
- * One review finder; production may omit `target` (routed), evals may not. A single-mode review
- * always uses the reviewer prompt, named `standard`.
+ * One review finder; production may omit `target` (routed), evals may not. Production single-mode
+ * reviews use the reviewer prompt, named `standard`; evals may add a second `trace` finder.
  */
 export interface ReviewFinder {
   target?: string;
@@ -651,7 +651,7 @@ export interface ReviewLens {
 export interface RepoReviewLens extends ReviewLens {
   profiles: ResolvedProfile[];
 }
-/** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
+/** One reviewer (evals may add trace) in `single`, or verifier-checked finders in `panel`. */
 export interface ReviewSystem {
   /** Eval only: run base-commit gate setup before reviewing. */
   setup?: true;
