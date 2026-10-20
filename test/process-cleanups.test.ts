@@ -78,6 +78,12 @@ async function processState(pid: number): Promise<string> {
   }
 }
 
+async function expectProcessFrozen(pid: number) {
+  const deadline = performance.now() + 2_000;
+  while ((await processState(pid)) !== "T" && performance.now() < deadline) await Bun.sleep(10);
+  expect(await processState(pid)).toBe("T");
+}
+
 async function sleeper(): Promise<ProcessCleanup> {
   const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
     cwd: directory,
@@ -182,7 +188,7 @@ test("pre-command recovery waits for live cleanup paused after freezing a member
   let background: Promise<void> | undefined;
   try {
     await frozen.promise;
-    expect(await processState(member)).toBe("T");
+    await expectProcessFrozen(member);
     const records = store.listProcessCleanups();
     expect(records).toHaveLength(1);
     const birth = records[0]?.birth;
@@ -466,7 +472,7 @@ test("a supervisor killed after freeze leaves a durable member recovered before 
       birth: await processBirth(member),
       boot: bootIdentity(),
     });
-    expect(await processState(member)).toBe("T");
+    await expectProcessFrozen(member);
     supervisor.kill("SIGKILL");
     await new Promise<void>((resolve) => supervisor.once("exit", () => resolve()));
     store.close();
