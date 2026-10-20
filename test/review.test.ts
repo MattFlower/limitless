@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { emptyUsage } from "../src/harness/types.ts";
+import { gradeReview } from "../src/evals/graders/review.ts";
+import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
 import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
 import * as prompts from "../src/pipeline/prompts.ts";
 import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
@@ -27,6 +28,8 @@ import {
   type Verification,
   VerifierSchema,
 } from "../src/pipeline/schemas.ts";
+import { reviewCase } from "./evals-reading-support.ts";
+import { deferred } from "./evals-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
@@ -1994,4 +1997,128 @@ Inspect the latest-change diff with \`git diff fixbase..head\`. Compare it with 
     expect(stored.panel?.refuted).toEqual(["C1"]);
     expect(stored.panel?.candidates.map((c) => [c.id, c.line])).toEqual([["C1", 1]]);
   });
+});
+
+describe("two-sample single review", () => {
+  const input = {
+    prompt,
+    timeoutMs: 1234,
+    system: { mode: "single" as const, samples: 2 as const, finders: [{ prompt: "adversarial" as const }] },
+  };
+  const result = (structured: unknown, costUsd = 0): AgentResult => ({
+    status: "ok",
+    finalText: "",
+    structured,
+    sessionId: "fresh",
+    usage: { ...emptyUsage(), input: 10 },
+    numTurns: 1,
+    costUsd,
+    costEquivUsd: costUsd,
+    error: null,
+    quota: null,
+  });
+  const output = (findings: Review["findings"]): Review => ({
+    verdict: "request_changes",
+    summary: "Inspected every changed branch and found no other issues.",
+    findings,
+  });
+  test("both calls start on the same request before either settles; default remains one", async () => {
+    const pending = [deferred<{ result: AgentResult }>(), deferred<{ result: AgentResult }>()];
+    const calls: { request: ReviewRequest; sample?: number }[] = [];
+    const invoke = (request: ReviewRequest, _finder: number, sample?: number) => {
+      calls.push({ request, sample });
+      const wait = pending[sample ?? 0];
+      if (!wait) throw new Error("unexpected sample");
+      return wait.promise;
+    };
+    const running = runReview({ invoke }, input);
+    expect(calls.map((c) => c.sample)).toEqual([0, 1]);
+    expect(calls[0]?.request).toBe(calls[1]?.request);
+    for (const p of pending) p.resolve({ result: result(output([finding("minor")])) });
+    const union = await running;
+    expect(union.decision?.review.verdict).toBe("approve");
+    calls.length = 0;
+    const single = await runReview({ invoke }, { ...input, system: { ...input.system, samples: undefined } });
+    expect(calls.map((c) => c.sample)).toEqual([undefined]);
+    expect(single.decision?.review.verdict).toBe(union.decision?.review.verdict);
+  });
+  test("union keeps severity, agreement and alias locations under single-mode verdict rules", async () => {
+    const shared = { ...finding("major"), file: "src/a.ts", line: 10 };
+    const samples = [
+      output([shared, { ...finding("minor"), file: "minor.ts" }]),
+      output([
+        { ...shared, line: 14, severity: "minor" },
+        { ...finding("major"), file: "other.ts" },
+      ]),
+    ];
+    const union = await runReview(
+      { invoke: async (_r, _f, sample) => ({ result: result(samples[sample ?? 0]) }) },
+      input,
+    );
+    const findings = union.decision?.review.findings;
+    expect(findings).toHaveLength(3);
+    expect(findings?.[0]).toMatchObject({
+      line: 10,
+      severity: "major",
+      agreement: 2,
+      duplicates: [{ line: 14 }],
+    });
+    expect(findings?.slice(1).map((f) => f.agreement)).toEqual([1, 1]);
+    expect(findings?.[0]).not.toHaveProperty("finder");
+    expect(findings?.[0]).not.toHaveProperty("raisedBy");
+    expect(union.decision?.blocking).toHaveLength(2);
+    expect(union.decision?.review.verdict).toBe("request_changes");
+    expect(union.decision?.review.mode).toBeUndefined();
+    const defect = reviewCase.defects[0];
+    if (!defect || !union.decision) throw new Error("missing review");
+    expect(
+      gradeReview({ ...reviewCase, defects: [{ ...defect, lines: [18, 20] }] }, union.decision.review).review
+        ?.requiredMatched,
+    ).toBe(1);
+    expect(union.result.structured).toMatchObject({ samples: [{ index: 0 }, { index: 1 }] });
+  });
+  test.each(["invalid", "reject", "timeout", "both reject"])(
+    "sample failure (%s) waits and keeps spend",
+    async (failure) => {
+      const held = deferred<void>();
+      let finished = false;
+      const running = runReview(
+        {
+          invoke: async (_r, _f, sample) => {
+            if (sample === 0) {
+              await held.promise;
+              finished = true;
+              if (failure === "both reject") throw new Error("first failed");
+              return { result: result(output([finding("major")]), 0.1) };
+            }
+            if (failure === "reject" || failure === "both reject") throw new Error("second failed");
+            return {
+              result: {
+                ...result(null, 0.05),
+                ...(failure === "timeout" ? { status: "timeout" as const } : {}),
+              },
+            };
+          },
+        },
+        input,
+      );
+      let returned = false;
+      void running.then(() => {
+        returned = true;
+      });
+      await Promise.resolve();
+      expect(returned).toBe(false);
+      held.resolve();
+      const union = await running;
+      expect(finished).toBe(true);
+      expect(union.output.success).toBe(false);
+      expect(union.result.status).toBe("error");
+      expect(union.result.costUsd).toBeCloseTo(
+        failure === "both reject" ? 0 : failure === "reject" ? 0.1 : 0.15,
+      );
+      expect(union.result.usage.input).toBe(failure === "both reject" ? 0 : failure === "reject" ? 10 : 20);
+      expect(union.result.finalText).toBe("");
+      expect(union.decision).toBeUndefined();
+    },
+  );
 });
