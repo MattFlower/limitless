@@ -1,6 +1,6 @@
 import "./git-preload.ts";
 import { beforeEach, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { processBootInspection } from "../src/util/proc.ts";
@@ -13,6 +13,11 @@ beforeEach(() => {
     () => readBootInspection() ?? (() => "test-boot"),
   );
 });
+
+// Parallel Bun workers buffer stderr until a test finishes; CI writes starts to the step directly.
+if (process.env.LIMITLESS_CI_TEST_LOG) {
+  appendFileSync(process.env.LIMITLESS_CI_TEST_LOG, `[test:start] ${process.argv[1]}\n`);
+}
 
 // Git in tests sees the global config CI has: an identity and nothing else. A developer's own settings
 // (commit signing, hooks, templates) would otherwise run on every fixture and factory commit, making the
