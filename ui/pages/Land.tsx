@@ -2,6 +2,7 @@ import { type Component, createSignal, For, onCleanup, onMount, Show } from "sol
 import { ACTIVE_LAND_STATES, type LandEntry } from "../../src/core/types.ts";
 import { cancelLand, landLogUrl, listLand } from "../api.ts";
 import { createLandController, type LandListState, newestLand } from "../lib/land.ts";
+import { subscribeLiveUpdates } from "../store.ts";
 
 export const LandList: Component<{
   entries: readonly LandEntry[];
@@ -73,7 +74,11 @@ export const LandList: Component<{
 
 export const Land: Component = () => {
   const [state, setState] = createSignal<LandListState>({ entries: [], error: "", cancelling: [] });
-  const controller = createLandController({ list: listLand, cancel: cancelLand }, setState);
+  const controller = createLandController(
+    { list: listLand, cancel: cancelLand },
+    setState,
+    subscribeLiveUpdates,
+  );
   onMount(() => {
     void controller.load();
     const timer = setInterval(() => void controller.load(), 15_000);

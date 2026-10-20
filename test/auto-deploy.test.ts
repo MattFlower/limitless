@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { Store } from "../src/db/store.ts";
 import { AutoDeploy, type AutoDeployDeps, type DeployResult } from "../src/land/auto-deploy.ts";
+import type { DeployJobStatus } from "../src/land/deploy-process.ts";
 import { registerCredential } from "../src/util/proc.ts";
 
 const BOOT = "a".repeat(40);
@@ -37,6 +38,8 @@ function fixture(overrides: Partial<AutoDeployDeps> = {}) {
       calls.push(sha);
       return { ok: true };
     },
+    jobStatus: async () => ({ kind: "running" }),
+    cleanup: async () => true,
     now: () => 1234,
     log: (reason) => logs.push(reason),
     timer: {
@@ -168,61 +171,126 @@ test("failure redacts its reason and blocks across restart until a newer self la
   expect(calls).toHaveLength(2);
 });
 
+const KEY = "deploy.after_land:test/self";
+function state(store: Store) {
+  return store.getSetting<{
+    attempt: { job: string } | null;
+    blocked: { reason: string } | null;
+    pendingRemoval?: string[];
+  }>(KEY, { attempt: null, blocked: null });
+}
+
 for (const bootSha of [MAIN, BOOT]) {
-  test(`restart reconciles an attempt with running SHA ${bootSha.slice(0, 1)}`, async () => {
+  test(`restart waits for job status with running SHA ${bootSha.slice(0, 1)}`, async () => {
     const pending = Promise.withResolvers<DeployResult>();
-    const jobs: string[] = [];
-    const f = fixture({
-      deploy: (_sha, job) => {
-        jobs.push(job);
-        return pending.promise;
-      },
-    });
+    const f = fixture({ deploy: () => pending.promise });
     await f.module.tick();
     land(f.store);
     const inflight = f.module.tick();
     await flush();
-    const persisted = f.store.getSetting<{ attempt: { job?: string } | null }>(
-      "deploy.after_land:test/self",
-      {
-        attempt: null,
-      },
-    );
-    expect(jobs).toHaveLength(1);
-    expect(persisted.attempt?.job).toBe(jobs[0]);
+    const job = state(f.store).attempt?.job;
+    expect(job).toBeString();
+    if (!job) throw new Error("Missing persisted deploy job");
     f.module.stop();
+    const secret = `rollback-${crypto.randomUUID()}`;
+    registerCredential("ROLLBACK_TEST", secret);
+    let status: DeployJobStatus = { kind: "running" };
     const cleaned: string[] = [];
     const restarted = fixture({
       store: f.store,
       bootSha,
+      jobStatus: async () => status,
       cleanup: async (job) => {
         cleaned.push(job);
+        return true;
       },
     });
     await restarted.module.tick();
+    expect(state(f.store).attempt?.job).toBe(job);
+    expect(state(f.store).blocked).toBeNull();
+    expect(feed(f.store).filter((item) => item.kind === "deploy.failed")).toEqual([]);
+    // A landing during a still-running job belongs to the same batch.
+    land(f.store);
+    await restarted.module.tick();
+    await restarted.module.tick();
     expect(restarted.calls).toEqual([]);
-    // The restarted daemon removes the job the interrupted attempt left behind.
-    expect(cleaned).toEqual(jobs);
-    const state = f.store.getSetting<{ attempt: unknown; blocked: unknown }>("deploy.after_land:test/self", {
-      attempt: null,
-      blocked: null,
-    });
-    expect(state.attempt).toBeNull();
-    if (bootSha === MAIN) expect(state.blocked).toBeNull();
-    else {
-      expect(state.blocked).not.toBeNull();
-      expect(feed(f.store).find((item) => item.kind === "deploy.failed")?.summary).toContain(MAIN);
-      expect(feed(f.store).find((item) => item.kind === "deploy.failed")?.summary).toContain(BOOT);
-      land(f.store);
-      await restarted.module.tick();
-      expect(restarted.calls).toEqual([MAIN]);
-    }
-    // A late result from the old instance cannot replace the reconciled state.
+    expect(cleaned).toEqual([]);
+    status = { kind: "done", exitCode: bootSha === MAIN ? 1 : 0, tail: `rollback ${secret}` };
+    await restarted.module.tick();
+    expect(state(f.store).attempt).toBeNull();
+    expect(cleaned).toEqual([job]);
+    if (bootSha === MAIN) {
+      expect(state(f.store).blocked?.reason).toContain("[redacted]");
+      const failed = feed(f.store).filter((item) => item.kind === "deploy.failed");
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.summary).toContain(MAIN);
+      expect(failed[0]?.summary).toContain("rollback [redacted]");
+      expect(JSON.stringify(state(f.store))).not.toContain(secret);
+    } else expect(state(f.store).blocked).toBeNull();
+    await restarted.module.tick();
+    await restarted.module.tick();
+    expect(restarted.calls).toEqual([]);
+    expect(feed(f.store).filter((item) => item.kind === "deploy.failed")).toHaveLength(
+      bootSha === MAIN ? 1 : 0,
+    );
     pending.resolve({ ok: false, reason: "late failure" });
     await inflight;
     expect(JSON.stringify(feed(f.store))).not.toContain("late failure");
+    if (bootSha === MAIN) {
+      restarted.deps.mainSha = async () => "c".repeat(40);
+      land(f.store);
+      await restarted.module.tick();
+      expect(restarted.calls).toEqual(["c".repeat(40)]);
+    }
   });
 }
+
+for (const kind of ["missing", "expired"] as const) {
+  test(`${kind} job blocks and removal is durable until successful`, async () => {
+    const f = fixture();
+    await f.module.tick();
+    const row = land(f.store);
+    f.store.setSetting(KEY, {
+      handled: row.id,
+      attempt: { sha: MAIN, landId: row.id, time: 100, job: "stalled" },
+      blocked: null,
+    });
+    const reason =
+      kind === "missing"
+        ? "deploy job dev.limitless.deploy.stalled disappeared without reporting a status"
+        : "deploy job dev.limitless.deploy.stalled did not finish within 10800000ms";
+    f.deps.jobStatus = async () => ({ kind, reason });
+    let removes = 0;
+    f.deps.cleanup = async () => ++removes > 1;
+    await f.module.tick();
+    expect(state(f.store).blocked?.reason).toBe(reason);
+    expect(state(f.store).attempt).toBeNull();
+    expect(state(f.store).pendingRemoval).toEqual(["stalled"]);
+    expect(feed(f.store).filter((item) => item.kind === "deploy.failed")).toHaveLength(1);
+    await f.module.tick();
+    expect(removes).toBe(2);
+    expect(state(f.store).pendingRemoval).toEqual([]);
+    expect(f.calls).toEqual([]);
+    land(f.store);
+    await f.module.tick();
+    expect(f.calls).toEqual([MAIN]);
+  });
+}
+
+test("tick and in-process completion record a terminal outcome once", async () => {
+  const pending = Promise.withResolvers<DeployResult>();
+  const f = fixture({ deploy: () => pending.promise });
+  await f.module.tick();
+  land(f.store);
+  const inflight = f.module.tick();
+  await flush();
+  f.deps.jobStatus = async () => ({ kind: "done", exitCode: 1, tail: "failure" });
+  await f.module.tick();
+  pending.resolve({ ok: false, reason: "duplicate failure" });
+  await inflight;
+  expect(feed(f.store).filter((item) => item.kind === "deploy.failed")).toHaveLength(1);
+  expect(state(f.store).blocked?.reason).toBe("Deploy exited 1: failure");
+});
 
 test("resolver errors stay pending and redact logs; work arriving across resolution delays deployment", async () => {
   const main = Promise.withResolvers<string>();

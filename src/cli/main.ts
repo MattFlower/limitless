@@ -234,7 +234,7 @@ async function serve(): Promise<void> {
   let autoDeploy: import("../land/auto-deploy.ts").AutoDeploy | undefined;
   if (cfg.deploy.afterLand === "when_idle") {
     const { AutoDeploy } = await import("../land/auto-deploy.ts");
-    const { deployProcess, mainSha, removeDeployJob, selfRepository } = await import(
+    const { deployJobStatus, deployProcess, mainSha, removeDeployJob, selfRepository } = await import(
       "../land/deploy-process.ts"
     );
     const release = join(import.meta.dir, "../..");
@@ -245,8 +245,9 @@ async function serve(): Promise<void> {
       selfRepo: () => selfRepository(release),
       mainSha: () => mainSha(release),
       bootSha: factory.bootSha,
-      deploy: (sha, job) => deployProcess(release, sha, job),
-      cleanup: (job) => removeDeployJob(job),
+      deploy: (sha, job) => deployProcess(release, sha, job, undefined, undefined, undefined, server.port),
+      jobStatus: (job, time) => deployJobStatus(job, time),
+      cleanup: (job) => removeDeployJob(job, undefined, undefined, undefined, { recorded: true }),
       now: Date.now,
       timer: {
         set: (tick, ms) => setInterval(tick, ms),

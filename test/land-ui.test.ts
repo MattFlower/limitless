@@ -141,3 +141,51 @@ test("controller ignores stale successes and errors, and rereads after successfu
   }
   controller.dispose();
 });
+
+test("reconnect refreshes coalesce during loads and disposing unsubscribes", async () => {
+  const requests: ReturnType<typeof Promise.withResolvers<LandEntry[]>>[] = [];
+  let listener: Parameters<NonNullable<Parameters<typeof createLandController>[2]>>[0] = () => {};
+  let unsubscribed = false;
+  let state: LandListState | undefined;
+  const controller = createLandController(
+    {
+      list: () => {
+        const request = Promise.withResolvers<LandEntry[]>();
+        requests.push(request);
+        return request.promise;
+      },
+      cancel: async () => {},
+    },
+    (next) => {
+      state = next;
+    },
+    (callback) => {
+      listener = callback;
+      return () => {
+        unsubscribed = true;
+      };
+    },
+  );
+  listener({ kind: "catalog" });
+  expect(requests).toHaveLength(0);
+  listener({ kind: "reconnected" });
+  listener({ kind: "reconnected" });
+  listener({ kind: "reconnected" });
+  expect(requests).toHaveLength(1);
+  requests[0]?.resolve([entry(1)]);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(requests).toHaveLength(2);
+  requests[1]?.resolve([entry(3), entry(2)]);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(requests).toHaveLength(2);
+  expect(state?.entries.map((row) => row.id)).toEqual([3, 2]);
+  listener({ kind: "reconnected" });
+  expect(requests).toHaveLength(3);
+  controller.dispose();
+  expect(unsubscribed).toBe(true);
+  requests[2]?.resolve([entry(4)]);
+  listener({ kind: "reconnected" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(requests).toHaveLength(3);
+  expect(state?.entries.map((row) => row.id)).toEqual([3, 2]);
+});

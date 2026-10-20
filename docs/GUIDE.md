@@ -993,6 +993,7 @@ To deploy automatically after self-hosting landings, opt in in `config.toml`:
 ```toml
 [deploy]
 after_land = "when_idle" # default: "off"; older releases ignore this table/key
+# Needs the macOS launchd service (limitless service install); refused elsewhere.
 ```
 
 This covers only the daemon release checkout's `origin` GitHub repository and its `main` branch.
@@ -1001,16 +1002,20 @@ no entry in any repository's landing queue is active and the scheduler has no ac
 runs and evals do not count). Several landings during that wait produce one deploy of the current
 main SHA, only if it differs from the running release. It runs `limitless deploy <sha> --smoke`
 with the same checks, live smoke quota, default drain wait, restart and rollback described above.
-The deploy runs as a separate launchd job, with output in `~/.limitless/logs/dev.limitless.deploy.*.log`.
-The job runs the deploy once and then removes itself; a restarted daemon removes a finished job
-that is still loaded.
+The deploy runs once as a separate launchd job, with redacted output in
+`~/.limitless/logs/dev.limitless.deploy.*.log`. The daemon keeps its job id until removal succeeds
+and retries cleanup on later ticks.
 
 `deploy.started` and `deploy.failed` feed items identify the target SHA. A failure, including a
 concurrent manual deploy holding the lock, blocks further automatic deploys; the feed says why.
-Only a newer landing in the self repository's `main` clears that block. On restart, an unfinished
-attempt succeeds if the boot SHA matches its target; otherwise it is recorded as failed and blocks
-in the same way. Older releases ignore `[deploy]` and continue to start after rollback, without
-automatic deployment.
+Only a newer landing in the self repository's `main` clears that block. At boot and on later ticks,
+an unfinished attempt is judged only from its job's exit status file. Booting the target SHA does
+not establish success: a subsequent health-check failure and rollback still counts as failure and
+blocks, with the redacted log tail in the feed. A job that disappears without reporting a status,
+or exceeds the three-hour deadline, also blocks with a clear reason and is removed. Older releases
+ignore `[deploy]` and continue to start after rollback, without automatic deployment.
+The UI's **Land** page refreshes after cancellation, every 15 seconds and on event-stream reconnect;
+reconnect refreshes coalesce while a request is in flight.
 
 If the daemon already reports the target SHA, deploy returns `already deployed <sha>` without
 restarting or running checks, unless `--smoke` requests the checks and smoke suite.

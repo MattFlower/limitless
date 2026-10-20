@@ -156,7 +156,12 @@ function str(v: unknown, fallback: string | null): string | null {
   return typeof v === "string" && v.length > 0 ? v : fallback;
 }
 
-type LoadOptions = Partial<Paths> & { port?: number; readOnly?: boolean; raw?: Record<string, unknown> };
+type LoadOptions = Partial<Paths> & {
+  port?: number;
+  readOnly?: boolean;
+  raw?: Record<string, unknown>;
+  platform?: NodeJS.Platform;
+};
 export function loadConfig(overrides: LoadOptions = {}): Config {
   const home = overrides.home ?? process.env.LIMITLESS_HOME ?? join(homedir(), ".limitless");
   const configDir =
@@ -257,6 +262,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   const afterLand = deploy.after_land === undefined ? "off" : deploy.after_land;
   if (afterLand !== "off" && afterLand !== "when_idle")
     throw new Error('deploy.after_land must be "off" or "when_idle"');
+  if (afterLand === "when_idle" && (overrides.platform ?? process.platform) !== "darwin")
+    throw new Error("deploy.after_land needs the macOS launchd service (limitless service install)");
   const rawReview = raw.review ?? {};
   if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
     throw new Error("review must be a table");

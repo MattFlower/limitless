@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Store } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
+import type { DeployJobStatus } from "./deploy-process.ts";
 
 export type DeployResult = { ok: true } | { ok: false; reason: string };
 /** `job` names the deploy process so a restarted daemon can remove a finished one it left behind. */
@@ -9,6 +10,7 @@ type DeployState = {
   handled: number;
   attempt: Attempt | null;
   blocked: (Attempt & { reason: string }) | null;
+  pendingRemoval?: string[];
 };
 export interface AutoDeployDeps {
   store: Store;
@@ -18,8 +20,9 @@ export interface AutoDeployDeps {
   mainSha: () => Promise<string>;
   bootSha: string;
   deploy: (sha: string, job: string) => Promise<DeployResult>;
-  /** Removes a deploy process left by an interrupted attempt, if it has finished. */
-  cleanup?: (job: string) => Promise<void>;
+  jobStatus: (job: string, time: number) => Promise<DeployJobStatus>;
+  /** Called after recording the outcome; false leaves the job queued for removal. */
+  cleanup: (job: string) => Promise<boolean>;
   now: () => number;
   timer: { set: (tick: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
   log: (reason: string) => void;
@@ -29,7 +32,6 @@ export interface AutoDeployDeps {
 export class AutoDeploy {
   private running = false;
   private stopped = false;
-  private reconciled = false;
   private interval: unknown;
   private repo: string | undefined;
   private initialLandings: Record<string, number> | undefined;
@@ -52,15 +54,19 @@ export class AutoDeploy {
   async tick(): Promise<void> {
     if (this.deps.afterLand === "off" || this.running || this.stopped) return;
     this.running = true;
+    let pending: { completion: Promise<void> } | undefined;
     try {
       // Snapshot before resolving origin: landings during a slow or failed lookup remain pending.
       this.initialLandings ??= this.deps.store.latestMainLandings();
-      await this.evaluate();
+      pending = await this.evaluate();
     } catch (error) {
       this.deps.log(redactCredentials(`Automatic deploy: ${String(error)}`));
     } finally {
       this.running = false;
     }
+    await pending?.completion.catch((error: unknown) => {
+      this.deps.log(redactCredentials(`Automatic deploy: ${String(error)}`));
+    });
   }
 
   private idle(): boolean {
@@ -69,7 +75,7 @@ export class AutoDeploy {
     );
   }
 
-  private async evaluate(): Promise<void> {
+  private async evaluate(): Promise<{ completion: Promise<void> } | undefined> {
     const d = this.deps;
     const repo = this.repo ?? (await d.selfRepo());
     if (this.stopped) return;
@@ -84,29 +90,70 @@ export class AutoDeploy {
       });
     const save = (state: DeployState) => d.store.setSetting(key, state);
     let state = read();
-    if (!this.reconciled) {
-      const attempt = state.attempt;
-      if (attempt) {
-        state.attempt = null;
-        if (d.bootSha !== attempt.sha) {
-          const reason = redactCredentials(
-            `Deploy of ${attempt.sha} did not restart successfully; running ${d.bootSha}`,
+    const matches = (current: Attempt | null, attempt: Attempt) =>
+      current?.sha === attempt.sha &&
+      current.landId === attempt.landId &&
+      current.time === attempt.time &&
+      current.job === attempt.job;
+    const finish = (attempt: Attempt, result: DeployResult) => {
+      const current = read();
+      if (this.stopped || current.blocked || !matches(current.attempt, attempt)) return;
+      current.attempt = null;
+      // Landings observed during the job belong to this batch, even across restarts.
+      current.handled = Math.max(current.handled, latest());
+      if (attempt.job)
+        current.pendingRemoval = [...new Set([...(current.pendingRemoval ?? []), attempt.job])];
+      if (!result.ok) {
+        const reason = redactCredentials(result.reason);
+        current.blocked = { ...attempt, landId: current.handled, time: d.now(), reason };
+        d.store.transaction(() => {
+          save(current);
+          d.store.deployFeed(
+            "deploy.failed",
+            repo,
+            attempt.sha,
+            attempt.landId,
+            `Deploy of ${attempt.sha} failed: ${reason}`,
           );
-          state.blocked = { ...attempt, time: d.now(), reason };
-          save(state);
-          d.store.deployFeed("deploy.failed", repo, attempt.sha, attempt.landId, reason);
+        });
+      } else save(current);
+    };
+    const cleanup = async () => {
+      for (const job of read().pendingRemoval ?? []) {
+        try {
+          const removed = await d.cleanup(job);
+          if (this.stopped) return;
+          if (removed) {
+            const current = read();
+            current.pendingRemoval = (current.pendingRemoval ?? []).filter((value) => value !== job);
+            save(current);
+          }
+        } catch (error) {
+          d.log(redactCredentials(`Automatic deploy cleanup: ${String(error)}`));
         }
       }
-      save(state);
-      this.reconciled = true;
-      if (attempt?.job && d.cleanup) {
-        await d
-          .cleanup(attempt.job)
-          .catch((error: unknown) => d.log(redactCredentials(`Automatic deploy cleanup: ${String(error)}`)));
-        if (this.stopped) return;
-        state = read();
-      }
+    };
+    const attempt = state.attempt;
+    if (attempt) {
+      const status = attempt.job
+        ? await d.jobStatus(attempt.job, attempt.time)
+        : { kind: "missing" as const, reason: "Deploy attempt has no recorded job id" };
+      if (this.stopped) return;
+      if (status.kind === "done") {
+        finish(
+          attempt,
+          status.exitCode === 0
+            ? { ok: true }
+            : {
+                ok: false,
+                reason: `Deploy exited ${status.exitCode}: ${status.tail}`,
+              },
+        );
+      } else if (status.kind !== "running") finish(attempt, { ok: false, reason: status.reason });
     }
+    await cleanup();
+    if (this.stopped) return;
+    state = read();
     const landId = latest();
     if (state.blocked && landId > state.blocked.landId) {
       state.blocked = null;
@@ -125,31 +172,21 @@ export class AutoDeploy {
       save(state);
       return;
     }
-    const attempt = { sha, landId, time: d.now(), job: randomUUID() };
-    state.attempt = attempt;
+    const nextAttempt = { sha, landId, time: d.now(), job: randomUUID() };
+    state.attempt = nextAttempt;
     save(state);
     d.store.deployFeed("deploy.started", repo, sha, landId, `Deploying ${sha} after landing`);
-    let result: DeployResult;
-    try {
-      result = await d.deploy(sha, attempt.job);
-    } catch (error) {
-      result = { ok: false, reason: String(error) };
-    }
-    if (this.stopped) return;
-    state = read();
-    if (
-      state.blocked ||
-      state.attempt?.sha !== sha ||
-      state.attempt.landId !== landId ||
-      state.attempt.time !== attempt.time
-    )
-      return;
-    state.attempt = null;
-    if (!result.ok) {
-      const reason = redactCredentials(result.reason);
-      state.blocked = { ...attempt, time: d.now(), reason };
-      save(state);
-      d.store.deployFeed("deploy.failed", repo, sha, landId, `Deploy failed: ${reason}`);
-    } else save(state);
+    // Let later ticks reconcile the durable attempt while the launching daemon waits for its job.
+    const completion = (async () => {
+      let result: DeployResult;
+      try {
+        result = await d.deploy(sha, nextAttempt.job);
+      } catch (error) {
+        result = { ok: false, reason: String(error) };
+      }
+      finish(nextAttempt, result);
+      if (!this.stopped) await cleanup();
+    })();
+    return { completion };
   }
 }

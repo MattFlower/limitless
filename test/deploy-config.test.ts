@@ -14,7 +14,9 @@ for (const [toml, expected] of [
     const root = mkdtempSync(join(tmpdir(), "limitless-deploy-config-"));
     try {
       writeFileSync(join(root, "config.toml"), toml);
-      expect(loadConfig({ home: join(root, "data"), configDir: root }).deploy.afterLand).toBe(expected);
+      expect(
+        loadConfig({ home: join(root, "data"), configDir: root, platform: "darwin" }).deploy.afterLand,
+      ).toBe(expected);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -39,3 +41,17 @@ for (const [toml, key] of [
     }
   });
 }
+
+test("Linux refuses when_idle but accepts off and unset", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-deploy-config-"));
+  try {
+    const options = { home: join(root, "data"), configDir: root, platform: "linux" as const };
+    for (const raw of [{}, { deploy: { after_land: "off" } }])
+      expect(loadConfig({ ...options, raw }).deploy.afterLand).toBe("off");
+    expect(() => loadConfig({ ...options, raw: { deploy: { after_land: "when_idle" } } })).toThrow(
+      /deploy.after_land.*macOS launchd service.*limitless service install/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
