@@ -10,6 +10,7 @@ import { compareGates, runGates } from "../src/gates/run.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import {
+  CommandError,
   ProcessTerminationError,
   type ProcOptions,
   processBirthInspection,
@@ -436,6 +437,29 @@ test("sh forwards opt-in redaction to the runner", async () => {
     sh(["fixture"], { cwd: process.cwd(), redactOutput: true }),
   );
   expect(result.stdout).toBe("[redacted]");
+});
+
+test("sh redacts command errors before truncation and preserves raw output", async () => {
+  const secret = "synthetic-sh-error-boundary-credential";
+  registerCredential("SH_ERROR_BOUNDARY_TEST_TOKEN", secret);
+  const cmd = [
+    process.execPath,
+    "-e",
+    'process.stdout.write("raw stdout"); process.stderr.write(await Bun.stdin.text()); process.exit(1);',
+  ];
+  const prefix = `Command failed (1): ${cmd.join(" ")}\n`;
+  const stderr = `${"x".repeat(4000 - prefix.length - 12)}${secret}${"z".repeat(100)}`;
+  const error: unknown = await sh(cmd, { cwd: process.cwd(), stdin: stderr }).catch(
+    (error: unknown) => error,
+  );
+  expect(error).toBeInstanceOf(CommandError);
+  if (!(error instanceof CommandError)) throw error;
+  expect(error.message).not.toContain(secret.slice(0, 12));
+  expect(error.message).toContain("[redacted]");
+  expect(error.message).toHaveLength(4000);
+  expect(error.stdout).toBe("raw stdout");
+  expect(error.stderr).toBe(stderr);
+  expect(error.exitCode).toBe(1);
 });
 
 test("runner without redaction retains raw callbacks, empty-line framing, tails and encoding", async () => {
