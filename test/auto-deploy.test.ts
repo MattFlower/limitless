@@ -1,8 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Store } from "../src/db/store.ts";
 import { AutoDeploy, type AutoDeployDeps, type DeployResult } from "../src/land/auto-deploy.ts";
-import type { DeployJobStatus } from "../src/land/deploy-process.ts";
-import { registerCredential } from "../src/util/proc.ts";
+import {
+  type DeployJobStatus,
+  deployCredentialsDir,
+  deployJobStatus,
+  removeDeployJob,
+} from "../src/land/deploy-process.ts";
+import { registerCredential, type sh } from "../src/util/proc.ts";
 
 const BOOT = "a".repeat(40);
 const MAIN = "b".repeat(40);
@@ -178,6 +186,7 @@ function state(store: Store) {
     attempt: { job: string } | null;
     blocked: { landId: number; reason: string } | null;
     lastDeployed?: string;
+    lastOutcome?: DeployResult;
     pendingRemoval?: string[];
   }>(KEY, { handled: 0, attempt: null, blocked: null });
 }
@@ -441,3 +450,137 @@ test("a late hook result cannot overwrite a newer persisted attempt", async () =
   expect(f.store.getSetting(key, {})).toEqual(newer);
   expect(feed(f.store).some((item) => item.kind === "deploy.failed")).toBe(false);
 });
+
+for (const inspection of [null, 1, "throw"] as const) {
+  test(`inconclusive inspection ${inspection} preserves attempt and pending removal across restart`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "auto-deploy-inspection-"));
+    const database = join(root, "store.db");
+    let store = new Store(database);
+    let observed: typeof inspection | 113 = inspection;
+    const status = join(root, "dev.limitless.deploy.tracked.status");
+    const credentials = join(deployCredentialsDir(root), "dev.limitless.deploy.tracked.credentials");
+    const command: typeof sh = async (args) => {
+      if (args[1] === "remove") return { stdout: "", stderr: "", exitCode: null };
+      if (observed === "throw") throw new Error("inspection failed");
+      return { stdout: "", stderr: "", exitCode: observed };
+    };
+    const deps = () => ({
+      store,
+      jobStatus: (job: string, time: number) => deployJobStatus(job, time, command, root, "fake-launchctl"),
+      cleanup: (job: string) =>
+        removeDeployJob(job, command, root, "fake-launchctl", { home: root, recorded: true }),
+    });
+    try {
+      const f = fixture(deps());
+      await f.module.tick();
+      const row = land(store);
+      store.setSetting(KEY, {
+        handled: row.id,
+        attempt: { sha: MAIN, landId: row.id, time: 0, job: "tracked" },
+        blocked: null,
+      });
+      mkdirSync(deployCredentialsDir(root), { recursive: true });
+      writeFileSync(credentials, "[]");
+      writeFileSync(`${status}.started`, "");
+      await f.module.tick();
+      expect(state(store).attempt?.job).toBe("tracked");
+      expect(state(store).blocked).toBeNull();
+      expect(f.calls).toEqual([]);
+      f.module.stop();
+      store.close();
+      store = new Store(database);
+      const restarted = fixture(deps());
+      await restarted.module.tick();
+      expect(state(store).attempt?.job).toBe("tracked");
+      // Completion becomes observable, but failed cleanup must remain durable too.
+      writeFileSync(status, "0 0\n");
+      await restarted.module.tick();
+      expect(state(store).attempt).toBeNull();
+      expect(state(store).pendingRemoval).toEqual(["tracked"]);
+      for (const file of [status, `${status}.started`, credentials]) expect(existsSync(file)).toBe(true);
+      restarted.module.stop();
+      store.close();
+      store = new Store(database);
+      const reconciled = fixture(deps());
+      await reconciled.module.tick();
+      expect(state(store).pendingRemoval).toEqual(["tracked"]);
+      observed = 113;
+      await reconciled.module.tick();
+      expect(state(store).pendingRemoval).toEqual([]);
+      for (const file of [status, `${status}.started`, credentials]) expect(existsSync(file)).toBe(false);
+      expect(restarted.calls).toEqual([]);
+      expect(reconciled.calls).toEqual([]);
+      expect(state(store).lastDeployed).toBe(MAIN);
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const exitCode of [0, 7]) {
+  for (const restart of [false, true]) {
+    test(`filter failure records log unavailable independently of deploy ${exitCode}, restart ${restart}`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "auto-deploy-log-"));
+      const database = join(root, "store.db");
+      let store = new Store(database);
+      const pending = Promise.withResolvers<DeployResult>();
+      const f = fixture({ store, deploy: () => pending.promise });
+      let inflight: Promise<void> | undefined;
+      try {
+        await f.module.tick();
+        land(store);
+        inflight = f.module.tick();
+        await flush();
+        const job = state(store).attempt?.job;
+        if (!job) throw new Error("Missing deploy attempt");
+        const result: DeployResult = {
+          ok: exitCode === 0,
+          exitCode,
+          filterExitCode: 1,
+          reason: "log unavailable",
+        };
+        if (restart) {
+          f.module.stop();
+          store.close();
+          store = new Store(database);
+          writeFileSync(join(root, `dev.limitless.deploy.${job}.status`), `${exitCode} 1\n`);
+          const restarted = fixture({
+            store,
+            jobStatus: (id, time) =>
+              deployJobStatus(
+                id,
+                time,
+                async () => {
+                  throw new Error("status should avoid inspection");
+                },
+                root,
+              ),
+          });
+          await restarted.module.tick();
+          expect(restarted.calls).toEqual([]);
+        } else {
+          pending.resolve(result);
+          await inflight;
+        }
+        expect(state(store).lastOutcome).toMatchObject({
+          ok: exitCode === 0,
+          exitCode,
+          filterExitCode: 1,
+          reason: expect.stringContaining("log unavailable"),
+        });
+        expect(state(store).blocked === null).toBe(exitCode === 0);
+        if (exitCode === 0) expect(state(store).lastDeployed).toBe(MAIN);
+        else
+          expect(feed(store).find((item) => item.kind === "deploy.failed")?.summary).toContain(
+            "log unavailable",
+          );
+      } finally {
+        pending.resolve({ ok: true });
+        await inflight;
+        store.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+}

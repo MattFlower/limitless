@@ -29,17 +29,21 @@ const DEFAULT_LOGS = join(homedir(), ".limitless", "logs");
 export const DEPLOY_DEADLINE_MS = 3 * 60 * 60 * 1000;
 export type DeployJobStatus =
   | { kind: "running" }
-  | { kind: "done"; exitCode: number; tail: string }
+  | { kind: "done"; exitCode: number; filterExitCode?: number; tail: string }
   | { kind: "missing" | "expired"; reason: string };
-type WaitOptions = { deadlineMs?: number; pollMs?: number; now?: () => number };
+type WaitOptions = { deadlineMs?: number; pollMs?: number; now?: () => number; home?: string };
 
-function deployJob(job: string, logs: string) {
+// This subtree is already denied by the shared gate/editor policy and reader private roots.
+export const deployCredentialsDir = (home = homedir()) =>
+  join(home, ".config", "limitless", "deploy-credentials");
+
+function deployJob(job: string, logs: string, home?: string) {
   const label = `dev.limitless.deploy.${job}`;
   return {
     label,
     log: join(logs, `${label}.log`),
     status: join(logs, `${label}.status`),
-    credentials: join(logs, `${label}.credentials`),
+    credentials: join(deployCredentialsDir(home), `${label}.credentials`),
   };
 }
 
@@ -52,6 +56,20 @@ async function optionalRead(path: string): Promise<string> {
   }
 }
 
+async function launchctlJob(
+  command: typeof sh,
+  launchctl: string,
+  action: "list" | "remove",
+  label: string,
+  cwd: string,
+) {
+  try {
+    return await command([launchctl, action, label], { cwd, allowFail: true, timeoutMs: 10_000 });
+  } catch {
+    return null;
+  }
+}
+
 export async function deployJobStatus(
   job: string,
   time: number,
@@ -61,28 +79,28 @@ export async function deployJobStatus(
   options: WaitOptions = {},
 ): Promise<DeployJobStatus> {
   const { label, log, status } = deployJob(job, logs);
-  const code = await optionalRead(status);
-  if (/^\d+\s*$/.test(code))
+  const completion = async (): Promise<DeployJobStatus | undefined> => {
+    // Numeric status files from the previous release remain readable.
+    const codes = /^(\d+)(?:[ \t]+(\d+))?\s*$/.exec(await optionalRead(status));
+    if (!codes) return;
     return {
       kind: "done",
-      exitCode: Number(code),
+      exitCode: Number(codes[1]),
+      ...(codes[2] === undefined ? {} : { filterExitCode: Number(codes[2]) }),
       tail: redactCredentials(await optionalRead(log)).slice(-4000),
     };
-  const listed = await command([launchctl, "list", label], {
-    cwd: logs,
-    allowFail: true,
-    timeoutMs: 10_000,
-  });
+  };
+  const done = await completion();
+  if (done) return done;
+  const listed = await launchctlJob(command, launchctl, "list", label, logs);
   // The wrapper can finish and remove itself between the first read and launchctl list.
-  if (listed.exitCode !== 0) {
-    const finished = await optionalRead(status);
-    if (/^\d+\s*$/.test(finished))
-      return {
-        kind: "done",
-        exitCode: Number(finished),
-        tail: redactCredentials(await optionalRead(log)).slice(-4000),
-      };
-    return { kind: "missing", reason: `deploy job ${label} disappeared without reporting a status` };
+  if (listed?.exitCode !== 0) {
+    const finished = await completion();
+    if (finished) return finished;
+    if (listed?.exitCode === 113)
+      return { kind: "missing", reason: `deploy job ${label} disappeared without reporting a status` };
+    // An inconclusive inspection cannot end the durable attempt, even past its deadline.
+    return { kind: "running" };
   }
   const deadline = options.deadlineMs ?? DEPLOY_DEADLINE_MS;
   if ((options.now ?? Date.now)() >= time + deadline)
@@ -99,10 +117,10 @@ const WRAPPER = [
   "else",
   '  : > "$status.started"',
   '  "$@" 2>&1 | "$bun" "$filter" "$credentials" > "$log"',
-  `  code=\${PIPESTATUS[0]}`,
-  '  rm -f "$credentials"',
-  '  printf "%s\\n" "$code" > "$status"',
+  `  codes=("\${PIPESTATUS[@]}")`,
+  `  printf "%s %s\\n" "\${codes[0]}" "\${codes[1]}" > "$status"`,
   "fi",
+  'rm -f "$credentials"',
   'exec "$launchctl" remove "$label"',
 ].join("\n");
 
@@ -119,7 +137,8 @@ export async function deployProcess(
 ): Promise<DeployResult> {
   mkdirSync(logs, { recursive: true, mode: 0o700 });
   chmodSync(logs, 0o700);
-  const { label, log, status, credentials } = deployJob(job, logs);
+  const { label, log, status, credentials } = deployJob(job, logs, options.home);
+  mkdirSync(deployCredentialsDir(options.home), { recursive: true, mode: 0o700 });
   const time = (options.now ?? Date.now)();
   writeFileSync(credentials, JSON.stringify(registeredCredentials()), { mode: 0o600, flag: "wx" });
   try {
@@ -167,14 +186,8 @@ export async function deployProcess(
     const state = await deployJobStatus(job, time, command, logs, launchctl, options);
     if (state.kind !== "running") {
       // Do not delete the status/marker here: the daemon must first persist the outcome.
-      await command([launchctl, "remove", label], { cwd, allowFail: true, timeoutMs: 10_000 }).catch(() => {
-        /* Removal is retried after the daemon records the outcome. */
-      });
-      return state.kind === "done"
-        ? state.exitCode === 0
-          ? { ok: true }
-          : { ok: false, reason: `Deploy exited ${state.exitCode}: ${state.tail}` }
-        : { ok: false, reason: state.reason };
+      await launchctlJob(command, launchctl, "remove", label, cwd);
+      return state.kind === "done" ? completedDeployResult(state) : { ok: false, reason: state.reason };
     }
     await new Promise<void>((resolve) => setTimeout(resolve, options.pollMs ?? 1000));
   }
@@ -192,20 +205,30 @@ export async function removeDeployJob(
     const state = await deployJobStatus(job, options.time ?? Date.now(), command, logs, launchctl, options);
     if (state.kind === "running") return false;
   }
-  const { label, status, credentials } = deployJob(job, logs);
-  const removed = await command([launchctl, "remove", label], {
-    cwd: logs,
-    allowFail: true,
-    timeoutMs: 10_000,
-  });
-  if (removed.exitCode !== 0) {
-    const listed = await command([launchctl, "list", label], {
-      cwd: logs,
-      allowFail: true,
-      timeoutMs: 10_000,
-    });
-    if (listed.exitCode === 0) return false;
+  const { label, status, credentials } = deployJob(job, logs, options.home);
+  const removed = await launchctlJob(command, launchctl, "remove", label, logs);
+  if (removed?.exitCode !== 0) {
+    const listed = await launchctlJob(command, launchctl, "list", label, logs);
+    // launchctl list reports an unknown service with 113. Other errors prove nothing.
+    if (listed?.exitCode !== 113) return false;
   }
-  await Promise.all([status, `${status}.started`, credentials].map((path) => rm(path, { force: true })));
+  await rm(credentials, { force: true });
+  await Promise.all([status, `${status}.started`].map((path) => rm(path, { force: true })));
   return true;
+}
+
+/** Keep log availability independent of the deploy outcome, including boot reconciliation. */
+export function completedDeployResult(state: Extract<DeployJobStatus, { kind: "done" }>): DeployResult {
+  const unavailable = state.filterExitCode !== undefined && state.filterExitCode !== 0;
+  const codes = {
+    exitCode: state.exitCode,
+    ...(state.filterExitCode === undefined ? {} : { filterExitCode: state.filterExitCode }),
+  };
+  if (state.exitCode === 0)
+    return { ok: true, ...codes, ...(unavailable ? { reason: "log unavailable" } : {}) };
+  return {
+    ok: false,
+    ...codes,
+    reason: `Deploy exited ${state.exitCode}: ${unavailable ? "log unavailable" : state.tail}`,
+  };
 }

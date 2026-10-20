@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { Store } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
-import type { DeployJobStatus } from "./deploy-process.ts";
+import { completedDeployResult, type DeployJobStatus } from "./deploy-process.ts";
 
-export type DeployResult = { ok: true } | { ok: false; reason: string };
+export type DeployResult = ({ ok: true; reason?: string } | { ok: false; reason: string }) & {
+  exitCode?: number;
+  filterExitCode?: number;
+};
 /** `job` names the deploy process so a restarted daemon can remove a finished one it left behind. */
 type Attempt = { sha: string; landId: number; time: number; job?: string };
 type DeployState = {
@@ -11,6 +14,7 @@ type DeployState = {
   attempt: Attempt | null;
   blocked: (Attempt & { reason: string }) | null;
   lastDeployed?: string;
+  lastOutcome?: DeployResult;
   pendingRemoval?: string[];
 };
 export interface AutoDeployDeps {
@@ -100,6 +104,10 @@ export class AutoDeploy {
       const current = read();
       if (this.stopped || current.blocked || !matches(current.attempt, attempt)) return;
       current.attempt = null;
+      current.lastOutcome = {
+        ...result,
+        ...(result.reason ? { reason: redactCredentials(result.reason) } : {}),
+      };
       if (attempt.job)
         current.pendingRemoval = [...new Set([...(current.pendingRemoval ?? []), attempt.job])];
       if (!result.ok) {
@@ -142,15 +150,7 @@ export class AutoDeploy {
         : { kind: "missing" as const, reason: "Deploy attempt has no recorded job id" };
       if (this.stopped) return;
       if (status.kind === "done") {
-        finish(
-          attempt,
-          status.exitCode === 0
-            ? { ok: true }
-            : {
-                ok: false,
-                reason: `Deploy exited ${status.exitCode}: ${status.tail}`,
-              },
-        );
+        finish(attempt, completedDeployResult(status));
       } else if (status.kind !== "running") finish(attempt, { ok: false, reason: status.reason });
     }
     await cleanup();
