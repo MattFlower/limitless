@@ -170,44 +170,172 @@ test("discovery context survives reopening and legacy-column inserts remain comp
   expect(store.listProcessCleanups().find((record) => record.invocation === row.invocation)).toEqual(row);
   expect(store.listProcessCleanups().find((record) => record.invocation === "legacy")?.discovery).toBeNull();
   store.deleteInvocationCleanups(row.invocation);
-  children[0]?.kill("SIGKILL");
-  await waitFor(() => recoveryProcessStopped(row.pid));
   const kill = spyOn(process, "kill");
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  const discover = mock(async () => {
+    throw new Error("Legacy recovery must not rediscover");
+  });
   try {
-    await expectRecoveryRefusal("Missing process discovery context for legacy");
-    expect(kill.mock.calls.filter(([pid]) => pid === row.pid)).toHaveLength(0);
+    await processRecoveryInspection.run(
+      { stopped: recoveryProcessStopped, timeoutMs: 10_000, discover },
+      () =>
+        processScope.run(scope(), async () => {
+          const result = await runProcess({
+            cmd: [process.execPath, "-e", "console.log('next')"],
+            cwd: directory,
+            env: {},
+            onStdoutLine: () => {
+              expectProcessStopped(row.pid);
+              expect(store.listProcessCleanups()).toEqual([]);
+            },
+          });
+          expect(result.stdout.trim()).toBe("next");
+          expect(result.exitCode).toBe(0);
+        }),
+    );
+    expect(kill.mock.calls).toContainEqual([row.pid, "SIGKILL"]);
+    expect(discover).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "Cleanup recovery for legacy: legacy record; skipping process rediscovery",
+    );
   } finally {
     kill.mockRestore();
+    warn.mockRestore();
   }
 });
 
-for (const failure of ["legacy", "discovery"] as const) {
+for (const failure of ["identity", "discovery"] as const) {
   test(`batch recovery isolates ${failure} failures and aggregates refusals`, async () => {
     const failed = [await sleeper(), await sleeper()].map((row) =>
-      failure === "legacy" ? { ...row, discovery: null } : row,
+      failure === "identity" ? { ...row, discovery: null } : row,
     );
     const healthy = await sleeper();
     const unrecorded = await sleeper();
     const [first, last] = failed;
     if (!first || !last) throw new Error("Missing failed invocations");
     for (const row of [first, healthy, last]) store.recordProcessCleanup(row);
-    const reason = (invocation: string) =>
-      failure === "legacy"
-        ? `Missing process discovery context for ${invocation}`
-        : `Discovery unavailable for ${invocation}`;
-    await processInspection.run(
-      async (environment, marker) => {
-        if (failed.some((row) => row.invocation === marker)) throw new Error(reason(marker));
-        return snapshot(recoveryProcessStopped(unrecorded.pid) ? [] : [unrecorded.pid], environment, marker);
+    const secret = crypto.randomUUID();
+    registerCredential("TEST_CLEANUP_BATCH_SECRET", secret);
+    const reason = (invocation: string, credential = "[redacted]") =>
+      `${failure} unavailable for ${invocation} ${credential}`;
+    await processRecoveryInspection.run(
+      {
+        stopped: recoveryProcessStopped,
+        timeoutMs: 10_000,
+        birth: async (pid) => {
+          const row = failed.find((row) => row.pid === pid);
+          if (failure === "identity" && row) throw new Error(reason(row.invocation, secret));
+          return processBirth(pid);
+        },
       },
-      async () => {
-        const error = await expectRecoveryRefusal(reason(first.invocation));
-        expect(error?.message).toContain(reason(last.invocation));
-      },
+      () =>
+        processInspection.run(
+          async (environment, marker) => {
+            if (failed.some((row) => row.invocation === marker)) throw new Error(reason(marker, secret));
+            return snapshot(
+              recoveryProcessStopped(unrecorded.pid) ? [] : [unrecorded.pid],
+              environment,
+              marker,
+            );
+          },
+          async () => {
+            const error = await expectRecoveryRefusal(reason(first.invocation));
+            expect(error?.message).toContain(reason(last.invocation));
+            expect(error?.message).not.toContain(secret);
+          },
+        ),
     );
     expectProcessStopped(healthy.pid);
     expectProcessStopped(unrecorded.pid);
     expect(store.listProcessCleanups()).toEqual(failed);
+  });
+}
+
+for (const state of ["gone", "reused", "unconfirmed", "lost", "confirmed"] as const) {
+  test(`recovery checks saved Darwin leader continuity on every scan (${state})`, async () => {
+    const original = await sleeper();
+    const unrelated = await sleeper();
+    const leaderProcess = await sleeper();
+    const leader = {
+      pid: leaderProcess.pid,
+      birth: leaderProcess.birth,
+      group: leaderProcess.pid,
+      session: leaderProcess.pid,
+    };
+    if (!original.discovery) throw new Error("Missing discovery fixture");
+    original.discovery = { ...original.discovery, group: leader.pid, leader };
+    if (state === "gone") {
+      children[0]?.kill("SIGKILL");
+      children[2]?.kill("SIGKILL");
+      await waitFor(() => recoveryProcessStopped(original.pid) && recoveryProcessStopped(leader.pid));
+    }
+    store.recordProcessCleanup(original);
+    let scans = 0;
+    const observedLeaders: (typeof leader | null)[] = [];
+    const kill = spyOn(process, "kill");
+    try {
+      await processRecoveryInspection.run(
+        {
+          stopped: (pid) =>
+            pid === leader.pid
+              ? state === "gone" || (state === "lost" && scans > 0)
+              : recoveryProcessStopped(pid),
+          timeoutMs: 10_000,
+          birth: async (pid) =>
+            pid === leader.pid && state === "reused"
+              ? "different-birth"
+              : pid === leader.pid && state === "unconfirmed"
+                ? null
+                : processBirth(pid),
+          discover: async (_marker, group, _started, _directories, savedLeader) => {
+            scans++;
+            expect(group).toBe(leader.pid);
+            observedLeaders.push(savedLeader);
+            const continuous = state === "confirmed" || (state === "lost" && scans === 1);
+            // Simulate an unrelated survivor in a reused numeric group after continuity ends.
+            return savedLeader && !continuous ? [unrelated.pid] : [];
+          },
+        },
+        () => recoverProcessCleanups(store),
+      );
+      expect(scans).toBeGreaterThanOrEqual(2);
+      expect(kill.mock.calls).toEqual(state === "gone" ? [] : [[original.pid, "SIGKILL"]]);
+      expect(observedLeaders[0]).toEqual(state === "confirmed" || state === "lost" ? leader : null);
+      for (const observed of observedLeaders.slice(1))
+        expect(observed).toEqual(state === "confirmed" ? leader : null);
+      expect(recoveryProcessStopped(unrelated.pid)).toBe(false);
+      expect(store.listProcessCleanups()).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+}
+
+for (const state of ["gone", "reused"] as const) {
+  test(`legacy recovery retires ${state} members without signalling and redacts its diagnostic`, async () => {
+    const row = await sleeper();
+    const secret = crypto.randomUUID();
+    registerCredential("TEST_LEGACY_CLEANUP_SECRET", secret);
+    const legacy = { ...row, invocation: secret, discovery: null };
+    if (state === "gone") {
+      children[0]?.kill("SIGKILL");
+      await waitFor(() => recoveryProcessStopped(row.pid));
+    } else legacy.birth = "different-birth";
+    store.recordProcessCleanup(legacy);
+    const kill = spyOn(process, "kill");
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await recoverProcessCleanups(store);
+      expect(kill).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        "Cleanup recovery for [redacted]: legacy record; skipping process rediscovery",
+      );
+      expect(store.listProcessCleanups()).toEqual([]);
+      if (state === "reused") expect(recoveryProcessStopped(row.pid)).toBe(false);
+    } finally {
+      kill.mockRestore();
+      warn.mockRestore();
+    }
   });
 }
 
@@ -609,7 +737,7 @@ test("an unavailable boot identity refuses recovery without signalling or retiri
 });
 
 test("one deadline covers every killed member; refusal retains rows and blocks subsequent commands", async () => {
-  const rows = [await sleeper(), await sleeper()];
+  const rows = [await sleeper(), { ...(await sleeper()), discovery: null }];
   for (const row of rows) store.recordProcessCleanup(row);
   const current = scope();
   const sentinel = join(directory, "spawned");
@@ -791,6 +919,10 @@ test("an interrupted sweep rediscovers a frozen parent's unrecorded child before
     store.close();
     rmSync(scratch, { recursive: true });
     store = new Store(database);
+    for (const row of store.listProcessCleanups()) {
+      if (!row.discovery) throw new Error("Missing interrupted discovery context");
+      store.recordProcessCleanup({ ...row, discovery: { ...row.discovery, leader: null } });
+    }
     await processScope.run(scope(), async () => {
       const result = await runProcess({
         cmd: [process.execPath, "-e", "console.log('next')"],

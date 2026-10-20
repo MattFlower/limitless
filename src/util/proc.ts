@@ -101,6 +101,7 @@ export const processRecoveryInspection = new AsyncLocalStorage<{
   stopped: typeof recoveryProcessStopped;
   timeoutMs: number;
   birth?: typeof processBirth;
+  discover?: typeof markedProcesses;
 }>();
 
 export async function recoverProcessCleanups(
@@ -134,22 +135,36 @@ export async function recoverProcessCleanups(
         if (!members.length) return;
         const anchor = members.find((row) => row.discovery);
         const context = anchor?.discovery;
-        if (!anchor || !context) throw new Error(`Missing process discovery context for ${invocation}`);
+        if (!context)
+          console.warn(
+            redactCredentials(
+              `Cleanup recovery for ${invocation}: legacy record; skipping process rediscovery`,
+            ),
+          );
         const claimed = new Map(members.map((row) => [row.pid, row]));
         const killed = new Set<ProcessCleanup>();
         let empty = false;
         for (;;) {
           let discovered = false;
           const pending: number[] = [];
-          const pids = await markedProcesses(
-            anchor.invocation,
-            context.group,
-            context.started,
-            context.directories,
-            context.leader,
-            protectedPids,
-            BigInt(context.spawnedAt),
-          );
+          // Numeric membership can be reused during downtime. Prove continuity on every scan.
+          let leader = context?.leader ?? null;
+          if (
+            leader &&
+            (stopped(leader.pid) || (await readBirth(leader.pid)) !== leader.birth || stopped(leader.pid))
+          )
+            leader = null;
+          const pids = context
+            ? await (processRecoveryInspection.getStore()?.discover ?? markedProcesses)(
+                invocation,
+                context.group,
+                context.started,
+                context.directories,
+                leader,
+                protectedPids,
+                BigInt(context.spawnedAt),
+              )
+            : [];
           for (const pid of pids) {
             if (protectedPids.has(pid) || claimed.has(pid)) continue;
             const birth = await readBirth(pid);
@@ -157,6 +172,7 @@ export async function recoverProcessCleanups(
               if (!stopped(pid)) throw new Error(`Process identity could not be confirmed for ${pid}`);
               continue;
             }
+            if (!anchor) throw new Error(`Missing process discovery context for ${invocation}`);
             const row = { ...anchor, pid, birth, createdAt: Date.now() };
             store.recordProcessCleanup(row);
             claimed.set(pid, row);
@@ -184,8 +200,8 @@ export async function recoverProcessCleanups(
             }
             pending.push(row.pid);
           }
-          // Keep exited members' context until another empty scan rules out a fork during inspection.
-          if (!pending.length && !discovered && empty) {
+          // With discovery context, another empty scan rules out a fork during inspection.
+          if (!pending.length && (!context || (!discovered && empty))) {
             store.deleteInvocationCleanups(invocation);
             return;
           }
