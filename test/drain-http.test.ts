@@ -35,6 +35,9 @@ test("admin drain uses real loopback peers and existing mutation protections", a
       parked: [],
     });
     expect(typeof (await read()).uptimeMs).toBe("number");
+    const lag = (await read()).eventLoopLagMaxMs;
+    expect(Number.isFinite(lag)).toBe(true);
+    expect(lag).toBeGreaterThanOrEqual(0);
     for (const address of [
       "127.0.0.1",
       "127.2.3.4",

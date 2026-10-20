@@ -19,7 +19,11 @@ import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { createApiToken, matchesApiToken } from "./api-token.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
+import { EventLoopLag } from "./event-loop-lag.ts";
 import { Passkeys } from "./passkeys.ts";
+
+const eventLoopLag = new EventLoopLag();
+setInterval(() => eventLoopLag.sample(), 1000).unref();
 
 export interface HttpExtras {
   apiToken?: string;
@@ -439,6 +443,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       json({
         ok: true,
         uptimeMs: Date.now() - factory.startedAt,
+        eventLoopLagMaxMs: eventLoopLag.maxMs(),
         sha: factory.bootSha,
         gateSlots: gateSlots.snapshot(),
         agentTestSlots: agentTestSlots.snapshot(),

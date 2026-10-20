@@ -651,7 +651,17 @@ export async function deploy(
       await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
     });
     if (restartAttempted) await cleanup("restart previous release", restart);
-    if (drainAttempted) await cleanup("resume scheduler", () => requestAdmin(client, clock, "resume"));
+    if (drainAttempted) {
+      try {
+        await requestAdmin(client, clock, "resume");
+      } catch (resume) {
+        const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
+        const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
+        cleanupErrors.push(
+          `resume scheduler: ${String(resume)}\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`,
+        );
+      }
+    }
     throw new Error(
       `${gatesPassed ? "deploy failed; rollback attempted to" : "deploy gate failed; staying on"} ${previous.slice(0, 8)}\n${String(error)}` +
         (cleanupErrors.length ? `\nCleanup failures:\n${cleanupErrors.join("\n")}` : ""),
