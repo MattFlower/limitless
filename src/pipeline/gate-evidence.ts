@@ -1,11 +1,14 @@
-import { confinementFailed, type GateComparison } from "../gates/run.ts";
-import { BunTestCoverage } from "../gates/test-coverage.ts";
+import { redactGateOutput } from "../gates/output.ts";
+import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
+import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
 
 /** Factory provenance, saved with the completed candidate gate stage (never baseline checks). */
 export interface GateEvidence {
   stageId: number;
   sha: string;
+  baseSha?: string;
+  changedFiles?: string[];
   checks: (GateComparison & { testCommand: string | null })[];
 }
 
@@ -18,7 +21,8 @@ export function gateTestCommand(command: string, scripts: Record<string, string>
 
 // Runner status rows and summaries, not words inside passing test names or diagnostic prose.
 const incompleteTestOutput =
-  /^\s*(?:\((?:skip|todo|fail)\)(?:\s|$)|(?:[1-9]\d* (?:skip(?:ped)?|todo|fail(?:ed)?|not run)|0 pass)\s*$|not run:\s)/im;
+  /^\s*(?:\(fail\)(?:\s|$)|(?:[1-9]\d* (?:fail(?:ed)?|not run)|0 pass)\s*$|not run:\s)/im;
+const skippedTestOutput = /^\s*(?:\((?:skip|todo)\)(?:\s|$)|[1-9]\d* (?:skip(?:ped)?|todo)\s*$)/im;
 
 /** Each nonempty line must be a complete simple command; prose/inspections fail closed. */
 function verificationCommands(instructions: string): string[] {
@@ -37,8 +41,7 @@ function verificationCommands(instructions: string): string[] {
 function covers(check: GateEvidence["checks"][number], requestedCommand: string): boolean {
   const command = check.testCommand;
   if (!command || !/^bun test(?: [\w./-]+)*$/.test(command)) return false;
-  // File headers and passing rows prove that the broad suite actually discovered and ran the file.
-  // A tail without its header, a skipped file, flags/filters and unsupported runners fail closed.
+  // Targeted coverage needs passing rows in each requested file, even with inherited skips.
   const expanded = requestedCommand === check.result.command ? command : requestedCommand;
   if (!/^bun test(?: [\w./-]+)*$/.test(expanded)) return false;
   const requested = expanded
@@ -59,26 +62,94 @@ function covers(check: GateEvidence["checks"][number], requestedCommand: string)
   const coverage = check.result.testCoverage ?? recorded.result();
   if (!coverage.summary || coverage.summary.passed < 1 || coverage.summary.failed !== 0) return false;
   const ran = coverage.passedFiles;
-  if (!requested.length)
-    return command === "bun test" && ran.length > 0 && coverage.skippedFiles.length === 0;
+  if (!requested.length) return command === "bun test" && ran.length > 0;
   return requested.every((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file) && ran.includes(file));
 }
 
-function passed(check: GateEvidence["checks"][number]): boolean {
-  const clean = (result: GateComparison["result"]): boolean =>
-    result.ok &&
-    result.exitCode === 0 &&
-    !result.timedOut &&
-    !confinementFailed(result) &&
-    !result.testCoverage?.skippedFiles.length &&
-    !incompleteTestOutput.test(result.output) &&
-    !result.firstAttempt;
+const clean = (result: GateComparison["result"]): boolean =>
+  result.ok &&
+  result.exitCode === 0 &&
+  !result.timedOut &&
+  !confinementFailed(result) &&
+  !result.testCoverage?.summary?.failed &&
+  !incompleteTestOutput.test(result.output) &&
+  !result.firstAttempt;
+
+function completeSkips(result: GateComparison["result"]): boolean {
+  const coverage = result.testCoverage;
+  const skips = coverage?.skippedTests;
   return (
-    ["pass", "fixed", "new_pass"].includes(check.verdict) &&
-    !check.blocking &&
-    clean(check.result) &&
-    !check.firstAttempt
+    !!coverage?.summary &&
+    coverage.summary.passed > 0 &&
+    !coverage.skippedTestsIncomplete &&
+    !!skips?.length &&
+    skips.length <= MAX_SKIPPED_TESTS &&
+    skips.every(
+      ({ file, name, line }) =>
+        line !== undefined &&
+        Number.isSafeInteger(line) &&
+        line > 0 &&
+        file.length > 0 &&
+        name.trim().length > 0 &&
+        Math.max(file.length, name.length) <= MAX_TEST_IDENTITY_LENGTH &&
+        !file.startsWith("/") &&
+        !file.includes("\\") &&
+        !file.split("/").some((p) => !p || p === "." || p === "..") &&
+        ![...(file + name)].some(
+          (char) => char.charCodeAt(0) < 32 || (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159),
+        ) &&
+        redactGateOutput(file) === file &&
+        redactGateOutput(name) === name,
+    ) &&
+    coverage.skippedFiles.every((file) => skips.some((skip) => skip.file === file))
   );
+}
+
+function refusal(
+  check: GateEvidence["checks"][number],
+  gates: GateEvidence,
+  baseline?: GateRun | null,
+): string | undefined {
+  if (
+    !["pass", "fixed", "new_pass"].includes(check.verdict) ||
+    check.blocking ||
+    !clean(check.result) ||
+    check.firstAttempt
+  )
+    return "candidate gate checks did not all pass cleanly without retries or skipped tests";
+  const coverage = check.result.testCoverage;
+  if (coverage?.skippedTestsIncomplete) return "candidate skip evidence is incomplete";
+  if (
+    !coverage?.skippedTests?.length &&
+    !coverage?.skippedFiles.length &&
+    !skippedTestOutput.test(check.result.output)
+  )
+    return undefined;
+  if (!completeSkips(check.result)) return "candidate skip identities unavailable or incomplete";
+  if (!baseline?.sha || !gates.baseSha || !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(gates.baseSha))
+    return "baseline commit provenance unavailable";
+  if (baseline.sha !== gates.baseSha) return "baseline commit does not match the checked base";
+  const base = baseline.checks.find((r) => r.name === check.name);
+  if (!base) return "baseline skip identities unavailable for this check";
+  if (base.command !== check.result.command) return "baseline check command does not match";
+  if (!baseline.setupOk || !clean(base)) return "baseline check failed or was retried";
+  if (!completeSkips(base)) return "baseline skip identities unavailable or incomplete";
+  if (!gates.changedFiles) return "candidate changed-file provenance unavailable";
+  const skips = coverage?.skippedTests ?? [];
+  if (skips.some((skip) => gates.changedFiles?.includes(skip.file)))
+    return "skipped-test files changed in the candidate diff";
+  const remaining = new Map<string, number>();
+  for (const skip of base.testCoverage?.skippedTests ?? []) {
+    const key = JSON.stringify([skip.file, skip.name, skip.line]);
+    remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  }
+  for (const skip of skips) {
+    const key = JSON.stringify([skip.file, skip.name, skip.line]);
+    const count = remaining.get(key) ?? 0;
+    if (!count) return "skipped-test occurrences not inherited from the baseline";
+    remaining.set(key, count - 1);
+  }
+  return undefined;
 }
 
 /** Only structured sandbox blocks qualify; provenance and coverage come from factory records. */
@@ -88,6 +159,7 @@ export function applyGateEvidence(
   holdout: Holdout,
   sha: string,
   gates?: GateEvidence,
+  baseline?: GateRun | null,
 ): Verify {
   return {
     ...verify,
@@ -95,13 +167,15 @@ export function applyGateEvidence(
       if (blocked.status !== "blocked" || blocked.blockedReason !== "sandbox") return blocked;
       const refuse = (reason: string) => ({
         ...blocked,
-        evidence: `Factory gate substitution unavailable: ${reason}.`,
+        evidence: redactGateOutput(`Factory gate substitution unavailable: ${reason}.`),
       });
       if (!gates) return refuse("no completed candidate gate stage for this run");
       if (gates.sha !== sha || !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha))
         return refuse("candidate gates did not check the exact verified SHA");
-      if (!gates.checks.length || !gates.checks.every(passed))
+      if (!gates.checks.length)
         return refuse("candidate gate checks did not all pass cleanly without retries or skipped tests");
+      const reason = gates.checks.map((check) => refusal(check, gates, baseline)).find(Boolean);
+      if (reason) return refuse(reason);
       const definitions = [
         ...spec.acceptance_criteria
           .filter((ac) => ac.id === blocked.id)
@@ -127,11 +201,15 @@ export function applyGateEvidence(
       const checks = [...new Set(covering)].filter((check) => check !== undefined);
       const checkNames = checks.map((check) => check.name).join(", ");
       const checkCommands = checks.map((check) => check.result.command).join("; ");
-      const citation = `Factory gate ${checkNames} passed at ${sha} (stage ${gates.stageId}); commands: ${checkCommands}`;
+      const inheritedSkips = checks.reduce(
+        (count, check) => count + (check.result.testCoverage?.skippedTests?.length ?? 0),
+        0,
+      );
+      const citation = `Factory gate ${checkNames} passed at ${sha} (stage ${gates.stageId}); commands: ${checkCommands}${inheritedSkips ? `; ${inheritedSkips} inherited skips` : ""}`;
       return {
         ...blocked,
         status: "met" as const,
-        evidence: citation,
+        evidence: redactGateOutput(citation),
         gateEvidence: {
           stageId: gates.stageId,
           sha,

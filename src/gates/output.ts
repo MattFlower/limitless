@@ -47,6 +47,23 @@ export const redactGateData = <T>(value: T): T =>
             return Object.fromEntries(
               Object.entries(v).map(([file, time]) => [redactGateOutput(file), time]),
             );
+          if (
+            v &&
+            typeof v === "object" &&
+            "skippedTests" in v &&
+            Array.isArray(v.skippedTests) &&
+            v.skippedTests.some(
+              (skip: unknown) =>
+                skip &&
+                typeof skip === "object" &&
+                "file" in skip &&
+                typeof skip.file === "string" &&
+                "name" in skip &&
+                typeof skip.name === "string" &&
+                (redactGateOutput(skip.file) !== skip.file || redactGateOutput(skip.name) !== skip.name),
+            )
+          )
+            return { ...v, skippedTestsIncomplete: true };
           if (typeof v === "string") return redactGateOutput(v);
           if (v && typeof v === "object" && "ok" in v && "output" in v && typeof v.output === "string") {
             if ("confinementError" in v && v.confinementError != null) return v;
@@ -61,6 +78,7 @@ export const redactGateDiagnostics = <T extends GateResult>(result: T): T => ({
   ...result,
   confinementError: result.confinementError ?? launchFailure(result.output),
   output: redactGateOutput(result.output),
+  ...(result.testCoverage ? { testCoverage: redactGateData(result.testCoverage) } : {}),
   ...(result.failures !== undefined ? { failures: redactGateOutput(result.failures) } : {}),
   ...(result.firstAttempt ? { firstAttempt: redactGateDiagnostics(result.firstAttempt) } : {}),
 });

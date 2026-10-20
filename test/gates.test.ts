@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { Store } from "../src/db/store.ts";
+import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
   baselineCacheKey,
@@ -26,6 +27,7 @@ import {
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import { extractFailures, FailureExcerpts, formatGateOutput } from "../src/gates/failures.ts";
+import { readJUnitSkips } from "../src/gates/junit.ts";
 import {
   canonical,
   checkPrivateText,
@@ -39,8 +41,10 @@ import {
   retryBaselineFailures as productionBaselineRetry,
   runGates as productionGates,
   retryRegressions as productionRetry,
+  runLocalGates,
 } from "../src/gates/run.ts";
 import { defaultGateSlots, type GatePriority, gateSlots, Semaphore } from "../src/gates/slots.ts";
+import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
@@ -2792,5 +2796,303 @@ test("gate subprocess excludes an arbitrary unselected provider credential", asy
     if (saved === undefined) delete process.env.MAC_MLX_KEY;
     else process.env.MAC_MLX_KEY = saved;
     fixture.close();
+  }
+});
+
+// Captured from Bun 1.4.3; hostname replaced with a public placeholder.
+const skipJUnit = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="4" assertions="1" failures="0" skipped="3" time="0.003437">
+  <testsuite name="one.test.ts" file="one.test.ts" tests="4" assertions="1" failures="0" skipped="3" time="0.00072" hostname="example.com">
+    <testsuite name="suite" file="one.test.ts" line="1" tests="4" assertions="1" failures="0" skipped="3" time="0" hostname="example.com">
+      <testcase name="runs" classname="suite" time="0.000016" file="one.test.ts" line="1" assertions="1" />
+      <testcase name="same" classname="suite" time="0" file="one.test.ts" line="1" assertions="0">
+        <skipped />
+      </testcase>
+      <testcase name="same" classname="suite" time="0" file="one.test.ts" line="1" assertions="0">
+        <skipped />
+      </testcase>
+      <testcase name="pending" classname="suite" time="0" file="one.test.ts" line="1" assertions="0">
+        <skipped message="TODO" />
+      </testcase>
+    </testsuite>
+  </testsuite>
+</testsuites>`;
+
+const skipSummary = ["1 pass", "2 skip", "1 todo", "0 fail", "Ran 4 tests across 1 file."];
+
+test("real Bun gate report retains skips beside a passing test.each title with a newline", async () => {
+  const cwd = tempDir({
+    "package.json": "{}",
+    "one.test.ts": [
+      'import { expect, test } from "bun:test";',
+      'test.skip("confined", () => {});',
+      'test.each(["first\\nsecond"])("passing %s", value => expect(value).toContain("second"));',
+    ].join("\n"),
+  });
+  try {
+    const result = await sandbox.confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        cwd,
+        {
+          source: "detected",
+          setup: [],
+          checks: [
+            {
+              name: "test",
+              run: `${process.execPath} test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"`,
+            },
+          ],
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      ),
+    );
+    expect(result.checks[0]).toMatchObject({
+      ok: true,
+      exitCode: 0,
+      testCoverage: {
+        skippedTests: [{ file: "one.test.ts", name: "confined", line: 2 }],
+        summary: { passed: 1, failed: 0 },
+      },
+    });
+    expect(result.checks[0]?.testCoverage?.skippedTestsIncomplete).toBeUndefined();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([undefined, "", "bad", "0", "-1", "1.5", "9007199254740992", "1e2", "0x10"])(
+  "skipped testcase requires its own positive safe source line: %s",
+  (line) => {
+    const cwd = tempDir({ "one.test.ts": "" });
+    try {
+      const report = join(cwd, "report.xml");
+      // Keep the enclosing suite's valid line: it must never supply a missing testcase line.
+      writeFileSync(
+        report,
+        skipJUnit.replace(
+          'file="one.test.ts" line="1" assertions="0"',
+          `file="one.test.ts" ${line === undefined ? "" : `line="${line}"`} assertions="0"`,
+        ),
+      );
+      const parsed = readJUnitSkips(report, cwd);
+      expect(parsed).toBeUndefined();
+      const coverage = new BunTestCoverage(cwd);
+      for (const row of skipSummary) coverage.observe(row);
+      expect(coverage.result(parsed, false).skippedTestsIncomplete).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["newline", "redacted", "redacted-passing-file", "missing-name", "long", "failure"])(
+  "non-skipped identity text does not invalidate skip evidence: %s",
+  (kind) => {
+    const cwd = tempDir({ "one.test.ts": "" });
+    const secret = ["passing", "identity", "credential"].join("-").repeat(3);
+    proc.registerCredential("non-skipped-identity", secret);
+    try {
+      const report = join(cwd, "report.xml");
+      const name = kind === "redacted" ? secret : kind === "long" ? "x".repeat(2001) : "a&#10;b";
+      let xml = skipJUnit.replace('name="runs"', `name="${name}"`);
+      if (kind === "missing-name") xml = xml.replace(`name="${name}"`, "");
+      if (kind === "redacted-passing-file") {
+        writeFileSync(join(cwd, `${secret}.test.ts`), "");
+        xml = xml.replace(
+          'file="one.test.ts" line="1" assertions="1" />',
+          `file="${secret}.test.ts" line="1" assertions="1" />`,
+        );
+      }
+      if (kind === "failure")
+        xml = xml
+          .replaceAll('failures="0"', 'failures="1"')
+          .replace('assertions="1" />', 'assertions="1"><failure /></testcase>');
+      writeFileSync(report, xml);
+      const parsed = readJUnitSkips(report, cwd);
+      if (kind === "failure") expect(parsed).toBeUndefined();
+      else expect(parsed?.skippedTests).toHaveLength(3);
+      expect(JSON.stringify(parsed) ?? "").not.toContain(secret);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["absent", "headerless", "interleaved"])(
+  "JUnit attributes skips despite %s console rows",
+  async (kind) => {
+    const cwd = mkdtempSync(join(tmpdir(), "junit-skips-"));
+    try {
+      writeFileSync(join(cwd, "one.test.ts"), "");
+      const report = join(cwd, "report.xml");
+      writeFileSync(report, skipJUnit);
+      const parsed = readJUnitSkips(report, cwd);
+      const coverage = new BunTestCoverage(cwd);
+      const runner = new RunnerFailureEvidence();
+      const lines = [
+        "one.test.ts:",
+        "(pass) suite > runs",
+        ...(kind === "absent"
+          ? []
+          : [
+              "other.test.ts:",
+              "(skip) suite > same",
+              ...(kind === "interleaved" ? ["one.test.ts:", "other.test.ts:"] : []),
+              "(skip) suite > same",
+              "(todo) suite > pending",
+            ]),
+        ...skipSummary,
+      ];
+      for (const line of lines) {
+        coverage.observe(line);
+        runner.observe(line);
+      }
+      const expected = [
+        { file: "one.test.ts", name: "suite > same", line: 1 },
+        { file: "one.test.ts", name: "suite > same", line: 1 },
+        { file: "one.test.ts", name: "suite > pending", line: 1 },
+      ];
+      expect(parsed?.skippedTests).toEqual(expected);
+      expect(coverage.result(parsed, runner.agrees(parsed?.counts))).toMatchObject({
+        skippedTests: expected,
+        skippedFiles: ["one.test.ts"],
+      });
+      expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTestsIncomplete).toBeUndefined();
+      // Exercise the actual gate-report boundary with the captured XML and representative console.
+      const script = join(cwd, "runner.ts");
+      writeFileSync(
+        script,
+        `await Bun.write(process.env.LIMITLESS_GATE_REPORT ?? "", ${JSON.stringify(skipJUnit)}); console.error(${JSON.stringify(lines.join("\n"))});`,
+      );
+      const result = await sandbox.confinementScope.run(fakeConfinement, () =>
+        productionGates(
+          cwd,
+          {
+            source: ".limitless.toml",
+            setup: [],
+            checks: [{ name: "test", run: `${process.execPath} runner.ts` }],
+            protectedPaths: [],
+          },
+          new AbortController().signal,
+        ),
+      );
+      expect(result.checks[0]?.testCoverage?.skippedTests).toEqual(expected);
+      expect(result.checks[0]?.testCoverage?.skippedTestsIncomplete).toBeUndefined();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([
+  "missing",
+  "malformed",
+  "suite-count",
+  "case-count",
+  "unsafe",
+  "symlink-escape",
+  "report-symlink",
+  "oversized",
+  "nested-skip",
+  "duplicate-outcome",
+  "unknown-case",
+  "missing-name",
+  "count-boundary",
+  "count-overflow",
+  "length-boundary",
+  "name-overflow",
+  "file-overflow",
+  "console-excess",
+  "summary-mismatch",
+  "summary-missing",
+  "redacted-name",
+  "redacted-file",
+  "separator-name",
+  "empty-describe",
+  "xml-path",
+])("skip reports fail closed or preserve exact bounds: %s", (kind) => {
+  const cwd = mkdtempSync(join(tmpdir(), "junit-skip-invalid-"));
+  try {
+    writeFileSync(join(cwd, "one.test.ts"), "");
+    const report = join(cwd, "report.xml");
+    let xml = skipJUnit;
+    if (kind === "malformed") xml = "<broken";
+    if (kind === "suite-count") xml = xml.replace('tests="4"', 'tests="5"');
+    if (kind === "case-count") xml = xml.replace("<skipped />", "");
+    if (kind === "unsafe") xml = xml.replaceAll('file="one.test.ts"', 'file="../one.test.ts"');
+    if (kind === "symlink-escape") {
+      symlinkSync(process.execPath, join(cwd, "escape.test.ts"));
+      xml = xml.replaceAll('file="one.test.ts"', 'file="escape.test.ts"');
+    }
+    if (kind === "nested-skip") xml = xml.replace("<skipped />", "<skipped><testcase /></skipped>");
+    if (kind === "duplicate-outcome") xml = xml.replace("<skipped />", "<skipped /><skipped />");
+    if (kind === "unknown-case") xml = xml.replace("<skipped />", "<unknown />");
+    if (kind === "missing-name") xml = xml.replace('name="same"', 'name=""');
+    if (kind === "oversized") xml += " ".repeat(16 * 1024 * 1024);
+    if (kind.startsWith("count-")) {
+      const count = MAX_SKIPPED_TESTS + Number(kind === "count-overflow");
+      xml = `<testsuite tests="${count + 1}" failures="0" skipped="${count}"><testcase file="one.test.ts" name="runs"/>${'<testcase file="one.test.ts" name="same" line="1"><skipped/></testcase>'.repeat(count)}</testsuite>`;
+    }
+    if (kind === "length-boundary" || kind === "name-overflow")
+      xml = xml.replaceAll(
+        'name="same"',
+        `name="${"x".repeat(MAX_TEST_IDENTITY_LENGTH - "suite > ".length + Number(kind === "name-overflow"))}"`,
+      );
+    if (kind === "separator-name") xml = xml.replaceAll('name="same"', 'name="same &gt; name"');
+    if (kind === "empty-describe") xml = xml.replace('name="suite"', 'name=" "');
+    if (kind === "file-overflow")
+      xml = xml.replaceAll('file="one.test.ts"', `file="${"x".repeat(MAX_TEST_IDENTITY_LENGTH + 1)}"`);
+    const secret = ["skip", "credential", kind].join("-").repeat(3);
+    if (kind.startsWith("redacted-")) {
+      proc.registerCredential("skip-report-fixture", secret);
+      if (kind === "redacted-name") xml = xml.replaceAll('name="same"', `name="${secret}"`);
+      else {
+        writeFileSync(join(cwd, `${secret}.test.ts`), "");
+        xml = xml.replaceAll('file="one.test.ts"', `file="${secret}.test.ts"`);
+      }
+    }
+    if (kind === "xml-path") {
+      writeFileSync(join(cwd, "one&two.test.ts"), "");
+      xml = xml
+        .replaceAll('file="one.test.ts"', 'file="./one&amp;two.test.ts"')
+        .replaceAll('name="same"', 'name="same &amp; name"');
+    }
+    if (kind !== "missing") writeFileSync(report, xml);
+    if (kind === "report-symlink") {
+      const alias = join(cwd, "alias.xml");
+      symlinkSync(report, alias);
+      expect(readJUnitSkips(alias, cwd)).toBeUndefined();
+    }
+    const parsed = kind === "report-symlink" ? undefined : readJUnitSkips(report, cwd);
+    const runner = new RunnerFailureEvidence();
+    const coverage = new BunTestCoverage(cwd);
+    const summary =
+      kind === "summary-mismatch"
+        ? [...skipSummary, "4 skip"]
+        : kind === "summary-missing"
+          ? skipSummary.slice(0, -1)
+          : skipSummary;
+    if (kind === "console-excess") for (let i = 0; i < 4; i++) coverage.observe("(skip) omitted testcase");
+    for (const line of summary) {
+      runner.observe(line);
+      coverage.observe(line);
+    }
+    const valid = kind.endsWith("boundary") || kind === "xml-path";
+    if (valid) {
+      expect(parsed?.skippedTests).toHaveLength(kind === "count-boundary" ? MAX_SKIPPED_TESTS : 3);
+      if (kind === "xml-path")
+        expect(parsed?.skippedTests[0]).toEqual({
+          file: "one&two.test.ts",
+          name: "suite > same & name",
+          line: 1,
+        });
+    } else {
+      expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTestsIncomplete).toBe(true);
+      expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTests).toBeUndefined();
+    }
+    expect(JSON.stringify(parsed) ?? "").not.toContain(secret);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
