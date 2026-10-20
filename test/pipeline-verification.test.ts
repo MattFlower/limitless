@@ -42,6 +42,11 @@ for (const evidence of [
   "resume",
   "resume-redacted",
   "resume-failed-stage",
+  "matching-skips",
+  "resume-skips",
+  "resume-stale-skips",
+  "resume-changed-skips",
+  "resume-legacy-skips",
 ] as const) {
   test(`loopback verification uses confined gate evidence: ${evidence}`, async () => {
     // Fixture gates use this runtime, independently of the agent's slotted command shims.
@@ -62,6 +67,22 @@ test("loopback server", () => {
   ${evidence === "suite" ? 'console.error("x".repeat(8000));' : ""}
 });\n`,
     );
+    if (evidence.includes("skips")) {
+      const file = join(repoDir, "test/loopback.test.ts");
+      writeFileSync(
+        file,
+        readFileSync(file, "utf8") +
+          `
+// Supply the gate's existing report artifact while keeping its simple test command.
+test.skip("confined", () => {});
+import { afterAll } from "bun:test";
+afterAll(async () => {
+  if (process.env.LIMITLESS_GATE_REPORT) await Bun.write(process.env.LIMITLESS_GATE_REPORT,
+    '<testsuites tests="2" failures="0" skipped="1"><testsuite tests="2" failures="0" skipped="1" file="test/loopback.test.ts"><testcase name="loopback server"/><testcase name="confined"><skipped/></testcase></testsuite></testsuites>');
+});
+`,
+      );
+    }
     const command = evidence === "suite" ? "bun run test" : "bun test test/loopback.test.ts";
     writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "bun test" } }));
     writeFileSync(
@@ -146,6 +167,16 @@ test("loopback server", () => {
           gateEvidence: { stageId: state.gateEvidence?.stageId },
         });
         expect(f.store.getArtifact(run.id, "verify-0.json")).not.toContain("modelOutput");
+        if (evidence.includes("skips")) {
+          expect(state.baseline?.sha).toBe(f.store.getRun(run.id)?.baseSha ?? undefined);
+          expect(state.gateEvidence?.baseSha).toBe(state.baseline?.sha);
+          expect(state.gateEvidence?.changedFiles).toEqual(["farewell.txt"]);
+          if (evidence === "resume-stale-skips" && state.gateEvidence)
+            state.gateEvidence.baseSha = "b".repeat(40);
+          if (evidence === "resume-legacy-skips" && state.baseline) delete state.baseline.sha;
+          if (evidence === "resume-changed-skips" && state.gateEvidence)
+            state.gateEvidence.changedFiles = ["test/loopback.test.ts"];
+        }
         if (evidence === "resume-failed-stage")
           f.store.finishStage(state.gateEvidence?.stageId ?? -1, "failed", "gate record invalidated");
         f.store.setRunState(run.id, state);
@@ -154,7 +185,14 @@ test("loopback server", () => {
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     unsubscribe();
-    const succeeds = ["matching", "suite", "resume", "resume-redacted"].includes(evidence);
+    const succeeds = [
+      "matching",
+      "suite",
+      "resume",
+      "resume-redacted",
+      "matching-skips",
+      "resume-skips",
+    ].includes(evidence);
     expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
@@ -163,7 +201,7 @@ test("loopback server", () => {
       expect(result?.status).toBe("met");
       expect(gate?.sha).toMatch(/^[a-f0-9]{40}$/);
       expect(result?.evidence).toContain(
-        `Factory gate ${gateName} passed at ${gate?.sha} (stage ${gate?.stageId})`,
+        `Factory gate ${evidence === "resume-redacted" ? "[redacted]" : gateName} passed at ${gate?.sha} (stage ${gate?.stageId})`,
       );
       expect(result?.gateEvidence?.stageId).toBe(gate?.stageId);
       expect(f.store.getStage(gate?.stageId ?? -1)?.status).toBe("succeeded");
@@ -177,6 +215,10 @@ test("loopback server", () => {
         expect(JSON.stringify(artifact)).not.toContain("\\u001b");
         expect(result?.gateEvidence?.check).toBe(gateName);
         expect(state?.gatesConfig?.checks[0]?.name).toBe(gateName);
+      }
+      if (evidence.includes("skips")) {
+        expect(result?.evidence).toContain("1 inherited skips");
+        expect(state?.gateEvidence?.changedFiles).toEqual(["farewell.txt"]);
       }
       expect(attempts).toBe(1);
     } else {

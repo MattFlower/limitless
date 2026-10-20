@@ -104,6 +104,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       // Baseline and the post-implement gates.
       expect(lines(count)).toBe(2);
       expect(first.state?.baselineCached).toBe(false);
+      expect(first.state?.baseline?.sha).toBe(f.store.getRun(first.run.id)?.baseSha ?? undefined);
       expect(cacheRows(f).map((r) => r.run_id)).toEqual([first.run.id]);
       const second = await finish(f);
       // Only the post-implement gates executed.

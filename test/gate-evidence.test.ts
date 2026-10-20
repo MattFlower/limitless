@@ -1,9 +1,12 @@
 import { expect } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
+import { readJUnitSkips } from "../src/gates/junit.ts";
+import { redactGateData, redactGateDiagnostics } from "../src/gates/output.ts";
 import { compareGates, type GateRun, runGates } from "../src/gates/run.ts";
-import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
+import { BunTestCoverage, MAX_SKIPPED_TESTS } from "../src/gates/test-coverage.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
@@ -126,14 +129,44 @@ test("coverage uses full commit IDs for SHA-256 repositories too", () => {
   expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.status).toBe("blocked");
 });
 
+// Synthetic console fixtures below also provide a corresponding report; real Bun XML is
+// exercised separately through readJUnitSkips and through gate execution.
 function coverage(output: string) {
-  const parser = new BunTestCoverage();
-  for (const line of output.split("\n")) parser.observe(line);
-  return parser.result();
+  const cwd = mkdtempSync(join(tmpdir(), "skip-evidence-"));
+  try {
+    const parser = new BunTestCoverage();
+    const runner = new RunnerFailureEvidence();
+    let file = "";
+    const cases: string[] = [];
+    const xmlEscape = (value: string) =>
+      value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
+    for (const line of output.split("\n")) {
+      parser.observe(line);
+      runner.observe(line);
+      const header = /^(.*\.test.ts):$/.exec(line)?.[1];
+      if (header) {
+        file = header;
+        mkdirSync(dirname(join(cwd, file)), { recursive: true });
+        writeFileSync(join(cwd, file), "");
+      }
+      const row = /^\((pass|skip|todo)\) (.+)$/.exec(line);
+      if (row)
+        cases.push(
+          `<testcase file="${xmlEscape(file)}" name="${xmlEscape(row[2] ?? "")}">${row[1] === "pass" ? "" : "<skipped />"}</testcase>`,
+        );
+    }
+    runner.observe(`Ran ${cases.length} tests across 1 file.`);
+    const report = join(cwd, "report.xml");
+    writeFileSync(report, `<testsuite tests="${cases.length}">${cases.join("")}</testsuite>`);
+    const parsed = readJUnitSkips(report, cwd);
+    return parser.result(parsed, runner.agrees(parsed?.counts));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 function inheritedFixture() {
-  const evidence = gates();
+  const evidence = { ...gates(), baseSha: sha, changedFiles: [] as string[] };
   const check = evidence.checks[0];
   if (!check) throw new Error("missing fixture check");
   check.result.output =
@@ -143,7 +176,7 @@ function inheritedFixture() {
     .replace("(todo) pending", "(todo) pending\n(skip) former skip")
     .replace("1 skip", "2 skip");
   const base = { ...check.result, output, testCoverage: coverage(output) };
-  const baseline: GateRun = { setupOk: true, setup: [], checks: [base] };
+  const baseline: GateRun = { sha, setupOk: true, setup: [], checks: [base] };
   return { evidence, check, base, baseline };
 }
 
@@ -151,8 +184,6 @@ test.each(["broad", "targeted", "truncated", "targeted-truncated"])(
   "factory baseline permits inherited skips for %s verification",
   (kind) => {
     const { evidence, check, baseline } = inheritedFixture();
-    // Duplicate rows count once per identity in a cited check.
-    check.result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
     if (kind.endsWith("truncated")) check.result.output = "x".repeat(6000);
     const publicSpec = {
       ...spec,
@@ -428,7 +459,9 @@ test.each([
   expect(result.overall).toBe("fail");
   expect(result.criteria[0]?.status).toBe("blocked");
   expect(result.criteria[0]?.gateEvidence).toBeUndefined();
-  expect(result.criteria[0]?.evidence).toContain("did not all pass cleanly");
+  expect(result.criteria[0]?.evidence).toContain(
+    reason.includes("skipped") ? "skip identities unavailable" : "did not all pass cleanly",
+  );
 });
 
 test.each([
@@ -665,6 +698,7 @@ test.each([
 test.each(["wrong-content", "zero-tests-truncated", "noisy-pass"])(
   "real gate execution preserves the proof boundary: %s",
   async (kind) => {
+    process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
     const cwd = mkdtempSync(join(tmpdir(), "limitless-gate-evidence-"));
     try {
       writeFileSync(join(cwd, "farewell.txt"), "hello\n");
@@ -760,7 +794,7 @@ test.each(["relative", "linux-absolute", "macos-absolute", "colored-crlf", "gith
     expect(coverage.result()).toEqual({
       passedFiles: ["test/loopback.test.ts"],
       skippedFiles: format === "skipped" ? ["test/loopback.test.ts"] : [],
-      skippedTests: format === "skipped" ? [{ file: "test/loopback.test.ts", name: "unavailable" }] : [],
+      ...(format === "skipped" ? { skippedTestsIncomplete: true } : {}),
       summary: { passed: 1, failed: 0 },
     });
   },
@@ -782,7 +816,6 @@ test("Bun absolute file headers and checkout roots use the same realpath", () =>
       expect(coverage.result()).toEqual({
         passedFiles: ["loopback.test.ts"],
         skippedFiles: [],
-        skippedTests: [],
         summary: { passed: 1, failed: 0 },
       });
     }
@@ -791,73 +824,13 @@ test("Bun absolute file headers and checkout roots use the same realpath", () =>
   }
 });
 
-test("skip identities retain full names, distinct files and redacted terminal-normalized text", () => {
-  const secret = ["fixture", "credential", "skip"].join("-").repeat(100);
-  registerCredential("skip-fixture", secret);
-  const parser = new BunTestCoverage("/workspace/project");
-  for (const line of [
-    "::group::/workspace/project/test/one.test.ts:",
-    "\x1b[33m(skip) suite > identical name\x1b[0m\r",
-    `(todo) suite > ${secret}`,
-    "::endgroup::",
-    "./test/two.test.ts:",
-    "(skip) suite > identical name",
-    "(pass) runs [0.06ms]",
-    "1 pass",
-    "2 skip",
-    "1 todo",
-    "0 fail",
-  ])
+test("console failure rows survive tail truncation without a report", () => {
+  const parser = new BunTestCoverage();
+  for (const line of ["one.test.ts:", "(pass) runs", "(fail) fails", "1 pass", "0 fail"])
     parser.observe(line);
-  expect(parser.result().skippedTests).toEqual([
-    { file: "test/one.test.ts", name: "suite > identical name" },
-    { file: "test/one.test.ts", name: "suite > [redacted]" },
-    { file: "test/two.test.ts", name: "suite > identical name" },
-  ]);
-  expect(JSON.stringify(parser.result())).not.toContain(secret);
-  parser.observe("(fail) distinct failure");
   expect(parser.result().passedFiles).toEqual([]);
-  expect(parser.result().skippedTests).toHaveLength(3);
-  expect(parser.result().skippedTests?.some((skip) => skip.name === "distinct failure")).toBe(false);
   expect(parser.result().summary?.failed).toBe(1);
-});
-
-test.each([
-  "count-boundary",
-  "count-overflow",
-  "length-boundary",
-  "name-overflow",
-  "file-overflow",
-  "missing-header",
-  "missing-name",
-  "malformed-row",
-])("skip identity capture fails closed at %s", (kind) => {
-  const count =
-    kind === "count-boundary" ? MAX_SKIPPED_TESTS : kind === "count-overflow" ? MAX_SKIPPED_TESTS + 1 : 1;
-  const file =
-    kind === "file-overflow" ? `${"x".repeat(MAX_TEST_IDENTITY_LENGTH)}.test.ts` : "test/one.test.ts";
-  const name =
-    kind === "length-boundary"
-      ? "x".repeat(MAX_TEST_IDENTITY_LENGTH)
-      : kind === "name-overflow"
-        ? "x".repeat(MAX_TEST_IDENTITY_LENGTH + 1)
-        : "skip";
-  const output = [
-    ...(kind === "missing-header" ? [] : [`${file}:`]),
-    ...Array.from({ length: count }, (_, i) =>
-      kind === "missing-name"
-        ? "(skip)"
-        : kind === "malformed-row"
-          ? "(skip)no space"
-          : `(skip) ${count > 1 ? i : name}`,
-    ),
-    "1 pass",
-    `${count} skip`,
-    "0 fail",
-  ].join("\n");
-  const result = coverage(output);
-  if (kind.endsWith("boundary")) expect(result.skippedTests).toHaveLength(count);
-  else expect(result.skippedTests).toBeUndefined();
+  expect(parser.result().skippedTestsIncomplete).toBe(true);
 });
 
 test.each(["no-header", "no-summary", "partial-summary", "zero-tests", "truncated", "retained-pass"])(
@@ -959,4 +932,61 @@ test("holdout artifacts retain factory citations when their test command is priv
   expect(artifact.criteria[0]?.gateEvidence?.sha).toBe(sha);
   expect(JSON.stringify(artifact)).not.toContain("test/loopback.test.ts");
   expect(artifact).not.toHaveProperty("modelOutput");
+});
+
+test.each([
+  ["new occurrence", "occurrences not inherited"],
+  ["missing base commit", "commit provenance unavailable"],
+  ["stale base", "does not match the checked base"],
+  ["missing diff", "changed-file provenance unavailable"],
+  ["command", "command does not match"],
+  ["identities", "baseline skip identities unavailable"],
+  ...["added", "modified", "deleted", "rename-source", "rename-destination"].map((kind) => [
+    kind,
+    "files changed",
+  ]),
+])("inheritance refuses %s with a specific reason", (kind, reason) => {
+  const { evidence, check, baseline, base } = inheritedFixture();
+  if (kind === "new occurrence")
+    check.result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
+  else if (kind === "missing base commit") delete baseline.sha;
+  else if (kind === "stale base") evidence.baseSha = "b".repeat(40);
+  else if (kind === "missing diff") delete (evidence as GateEvidence).changedFiles;
+  else if (kind === "command") base.command = "bun test";
+  else if (kind === "identities") delete base.testCoverage?.skippedTests;
+  else
+    evidence.changedFiles =
+      kind === "rename-source"
+        ? ["renamed.test.ts", "test/loopback.test.ts"]
+        : ["test/loopback.test.ts", "old.test.ts"];
+  const result = applyGateEvidence(blocked, spec, holdout, sha, evidence, baseline);
+  expect(result.criteria[0]?.status).toBe("blocked");
+  expect(result.criteria[0]?.evidence).toContain(reason ?? "");
+});
+
+test("inherited duplicate occurrences are counted in the citation", () => {
+  const { evidence, check, baseline, base } = inheritedFixture();
+  for (const result of [check.result, base])
+    result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
+  expect(applyGateEvidence(blocked, spec, holdout, sha, evidence, baseline).criteria[0]?.evidence).toContain(
+    "3 inherited skips",
+  );
+});
+
+test("redaction collisions cannot authorize inherited skips at cache or resume boundaries", () => {
+  const secret = ["credential", "skip", "collision"].join("-").repeat(4);
+  const { evidence, check, baseline, base } = inheritedFixture();
+  if (!base.testCoverage?.skippedTests || !check.result.testCoverage?.skippedTests)
+    throw new Error("missing skips");
+  base.testCoverage.skippedTests[0] = { file: "test/loopback.test.ts", name: secret };
+  check.result.testCoverage.skippedTests[0] = { file: "test/loopback.test.ts", name: "[redacted]" };
+  registerCredential("collision-fixture", secret);
+  for (const stored of [redactGateData(baseline), { ...baseline, checks: [redactGateDiagnostics(base)] }]) {
+    expect(stored.checks[0]?.testCoverage?.skippedTestsIncomplete).toBe(true);
+    expect(JSON.stringify(stored)).not.toContain(secret);
+    const result = applyGateEvidence(blocked, spec, holdout, sha, evidence, stored);
+    expect(result.criteria[0]?.status).toBe("blocked");
+    expect(result.criteria[0]?.evidence).toContain("baseline skip identities unavailable");
+    expect(JSON.stringify(result)).not.toContain(secret);
+  }
 });

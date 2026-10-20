@@ -1,5 +1,6 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { redactGateOutput } from "./output.ts";
 
 export const MAX_SKIPPED_TESTS = 1000;
@@ -9,6 +10,7 @@ export interface TestCoverage {
   /** Files with at least one passing row and no failures; may also contain skipped tests. */
   passedFiles: string[];
   skippedFiles: string[];
+  /** Validated JUnit occurrences; duplicate file/name pairs are significant. */
   skippedTests?: { file: string; name: string }[];
   /** Unusable evidence survives tail truncation, including unattributed skips and failure rows. */
   skippedTestsIncomplete?: boolean;
@@ -22,11 +24,9 @@ export class BunTestCoverage {
   private passed: number | undefined;
   private failed: number | undefined;
   private sawFailure = false;
-  private skipped = new Map<string, { file: string; name: string }>();
   private skipRows = 0;
   private skipSummary = 0;
   private todoSummary = 0;
-  private incomplete = false;
 
   constructor(private cwd?: string) {}
 
@@ -39,6 +39,9 @@ export class BunTestCoverage {
   }
 
   observe(line: string): void {
+    const raw = stripVTControlCharacters(line).trim();
+    if (/^\(fail\)/.test(raw)) this.sawFailure = true;
+    if (/^\((?:skip|todo)\)/.test(raw)) this.skipRows++;
     // Bun's GitHub Actions reporter groups file headers; presentation is not part of the path.
     line = redactGateOutput(line)
       .trim()
@@ -50,22 +53,6 @@ export class BunTestCoverage {
     const skippedSummary = /^(\d+) (skip(?:ped)?|todo)$/.exec(line);
     if (skippedSummary?.[2] === "todo") this.todoSummary = Number(skippedSummary[1]);
     else if (skippedSummary) this.skipSummary = Number(skippedSummary[1]);
-    if (/^\(fail\)/.test(line)) this.sawFailure = true;
-    const skipped = /^\((?:skip|todo)\)(.*)$/.exec(line);
-    if (skipped) {
-      this.skipRows++;
-      const name = /^\s+(.+)$/.exec(skipped[1] ?? "")?.[1] ?? "";
-      const file = this.current ?? "";
-      const key = JSON.stringify([file, name]);
-      if (
-        !file ||
-        !name ||
-        Math.max(file.length, name.length) > MAX_TEST_IDENTITY_LENGTH ||
-        (!this.skipped.has(key) && this.skipped.size >= MAX_SKIPPED_TESTS)
-      )
-        this.incomplete = true;
-      else this.skipped.set(key, { file, name });
-    }
     const file = /^(.+\.(?:test|spec)\.[cm]?[jt]sx?):$/.exec(line)?.[1];
     if (file) {
       this.current =
@@ -82,19 +69,18 @@ export class BunTestCoverage {
     if (/^\((?:skip|todo|fail)\)/.test(line)) entry.skipped = true;
   }
 
-  result(): TestCoverage {
+  result(report?: { skippedTests: NonNullable<TestCoverage["skippedTests"]> }, agrees = false): TestCoverage {
+    const skippedTests =
+      agrees && this.skipRows <= (report?.skippedTests.length ?? 0) ? report?.skippedTests : undefined;
+    const hasSkips =
+      this.skipRows > 0 || this.skipSummary + this.todoSummary > 0 || !!report?.skippedTests.length;
     return {
       passedFiles: [...this.files].filter(([, value]) => value.passed && !value.failed).map(([file]) => file),
-      skippedFiles: [...this.files].filter(([, value]) => value.skipped).map(([file]) => file),
-      ...(this.incomplete || this.sawFailure || this.skipRows !== this.skipSummary + this.todoSummary
-        ? { skippedTestsIncomplete: true }
-        : {}),
-      ...(!this.incomplete &&
-      this.skipRows === this.skipSummary + this.todoSummary &&
-      this.passed !== undefined &&
-      this.failed !== undefined
-        ? { skippedTests: [...this.skipped.values()] }
-        : {}),
+      skippedFiles: skippedTests
+        ? [...new Set(skippedTests.map((skip) => skip.file))]
+        : [...this.files].filter(([, value]) => value.skipped).map(([file]) => file),
+      ...(this.sawFailure || (hasSkips && !skippedTests) ? { skippedTestsIncomplete: true } : {}),
+      ...(skippedTests ? { skippedTests } : {}),
       ...(this.passed !== undefined && this.failed !== undefined
         ? { summary: { passed: this.passed, failed: Math.max(this.failed, Number(this.sawFailure)) } }
         : {}),

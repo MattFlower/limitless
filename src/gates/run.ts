@@ -7,7 +7,7 @@ import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
-import { type FailedTestFiles, readJUnit, validRetryFiles } from "./junit.ts";
+import { type FailedTestFiles, readJUnit, readJUnitSkips, validRetryFiles } from "./junit.ts";
 import {
   findGateCounterpart,
   launchFailure,
@@ -40,6 +40,8 @@ export interface GateResult {
 }
 
 export interface GateRun {
+  /** Actual baseline checkout commit; absent in legacy records. */
+  sha?: string;
   setupOk: boolean;
   setup: GateResult[];
   checks: GateResult[];
@@ -101,8 +103,8 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const evidence = new RunnerFailureEvidence();
   const observe = (line: string) => {
     evidence.observe(line);
-    line = redactGateOutput(line);
     coverage.observe(line);
+    line = redactGateOutput(line);
     excerpts.observe(line);
   };
   const scratch = invocationScratch.getStore();
@@ -121,7 +123,8 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   });
   const output = redactGateStreams(res.stdout, res.stderr);
   const combined = `${output.stdout}\n${output.stderr}`.trim();
-  const testCoverage = coverage.result();
+  const skipReport = readJUnitSkips(report, cwd);
+  const testCoverage = coverage.result(skipReport, evidence.agrees(skipReport?.counts));
   const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();

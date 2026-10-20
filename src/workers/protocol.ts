@@ -84,7 +84,15 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
     ),
 );
 export const GateRunSchema = z
-  .object({ setupOk: z.boolean(), setup: z.array(Check), checks: z.array(Check) })
+  .object({
+    sha: z
+      .string()
+      .regex(/^(?:[a-f\d]{40}|[a-f\d]{64})$/i)
+      .optional(),
+    setupOk: z.boolean(),
+    setup: z.array(Check),
+    checks: z.array(Check),
+  })
   .strict();
 export const Result = z.object({ sha: z.string(), run: GateRunSchema }).strict();
 export const CheckEvent = z

@@ -61,7 +61,11 @@ let restoreConfig: string | undefined;
 const releaseSha = "f".repeat(40);
 test("strict worker results and check events accept optional bounded skipped-test identities", () => {
   const check = { name: "tests", command: "bun test", ok: true, exitCode: 0, durationMs: 1, output: "" };
-  for (const skippedTests of [undefined, [{ file: "test/one.test.ts", name: "suite > skipped" }]]) {
+  for (const skippedTests of [
+    undefined,
+    [{ file: "test/one.test.ts", name: "suite > skipped" }],
+    Array.from({ length: 2 }, () => ({ file: "test/one.test.ts", name: "duplicate" })),
+  ]) {
     const result = {
       ...check,
       testCoverage: {
@@ -75,6 +79,15 @@ test("strict worker results and check events accept optional bounded skipped-tes
     ).toBe(true);
     expect(CheckEvent.safeParse({ type: "check", phase: "check", result }).success).toBe(true);
   }
+  for (const sha of [undefined, releaseSha, "f".repeat(64)]) {
+    expect(
+      Result.safeParse({ sha: releaseSha, run: { sha, setupOk: true, setup: [], checks: [] } }).success,
+    ).toBe(true);
+  }
+  expect(
+    Result.safeParse({ sha: releaseSha, run: { sha: "short", setupOk: true, setup: [], checks: [] } })
+      .success,
+  ).toBe(false);
   for (const skippedTests of [
     ["test/one.test.ts"],
     [{ file: "test/one.test.ts" }],

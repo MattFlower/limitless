@@ -15,6 +15,7 @@ export function attributedJUnitCounts(
   files: ReadonlySet<string>,
   checkout: string,
   canonicalFile: (file: string) => string | undefined,
+  onTestcase?: (node: Bun.XML.Node, file?: string) => void,
 ): AttributedTestCounts | undefined {
   const canonicalCheckout = realpathSync(checkout);
   const reportFiles = new Map<string, Set<string>>();
@@ -37,6 +38,7 @@ export function attributedJUnitCounts(
       (child): child is Bun.XML.Node => typeof child === "object" && "name" in child,
     );
     if (node.name === "testcase") {
+      onTestcase?.(node, file);
       counts.tests = 1;
       for (const child of children) {
         if (child.name === "failure") counts.failures = 1;
@@ -86,7 +88,7 @@ export function attributedJUnitCounts(
   };
   try {
     const counts = visit(root);
-    return counts.failures + counts.errors > 0 ? counts : undefined;
+    return onTestcase || counts.failures + counts.errors > 0 ? counts : undefined;
   } catch {
     return undefined;
   }
