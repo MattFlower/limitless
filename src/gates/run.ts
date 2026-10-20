@@ -139,7 +139,10 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
     confinementError,
-    ...(testCoverage.summary || testCoverage.passedFiles.length || testCoverage.skippedFiles.length
+    ...(testCoverage.summary ||
+    testCoverage.passedFiles.length ||
+    testCoverage.skippedFiles.length ||
+    testCoverage.skippedTestsIncomplete
       ? { testCoverage }
       : {}),
   };

@@ -1786,6 +1786,7 @@ async function oneRound(
           ctx.state.holdout as Holdout,
           verifiedSha,
           usableGates(),
+          ctx.state.baseline,
         ),
         ctx.state.spec as Spec,
         ctx.state.holdout as Holdout,

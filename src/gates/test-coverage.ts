@@ -1,10 +1,16 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-import { stripVTControlCharacters } from "node:util";
+import { redactGateOutput } from "./output.ts";
+
+export const MAX_SKIPPED_TESTS = 1000;
+export const MAX_TEST_IDENTITY_LENGTH = 2000;
 
 export interface TestCoverage {
   passedFiles: string[];
   skippedFiles: string[];
+  skippedTests?: { file: string; name: string }[];
+  /** Unusable evidence survives tail truncation, including unattributed skips and failure rows. */
+  skippedTestsIncomplete?: boolean;
   summary?: { passed: number; failed: number };
 }
 
@@ -14,6 +20,12 @@ export class BunTestCoverage {
   private files = new Map<string, { passed: boolean; skipped: boolean }>();
   private passed: number | undefined;
   private failed: number | undefined;
+  private sawFailure = false;
+  private skipped = new Map<string, { file: string; name: string }>();
+  private skipRows = 0;
+  private skipSummary = 0;
+  private todoSummary = 0;
+  private incomplete = false;
 
   constructor(private cwd?: string) {}
 
@@ -27,13 +39,32 @@ export class BunTestCoverage {
 
   observe(line: string): void {
     // Bun's GitHub Actions reporter groups file headers; presentation is not part of the path.
-    line = stripVTControlCharacters(line)
+    line = redactGateOutput(line)
       .trim()
       .replace(/^::group::/, "");
     if (line === "::endgroup::") this.current = undefined;
     const summary = /^(\d+) (pass(?:ed)?|fail(?:ed)?)$/.exec(line);
     if (summary?.[2]?.startsWith("pass")) this.passed = Number(summary[1]);
     if (summary?.[2]?.startsWith("fail")) this.failed = Number(summary[1]);
+    const skippedSummary = /^(\d+) (skip(?:ped)?|todo)$/.exec(line);
+    if (skippedSummary?.[2] === "todo") this.todoSummary = Number(skippedSummary[1]);
+    else if (skippedSummary) this.skipSummary = Number(skippedSummary[1]);
+    if (/^\(fail\)/.test(line)) this.sawFailure = true;
+    const skipped = /^\((?:skip|todo)\)(.*)$/.exec(line);
+    if (skipped) {
+      this.skipRows++;
+      const name = /^\s+(.+)$/.exec(skipped[1] ?? "")?.[1] ?? "";
+      const file = this.current ?? "";
+      const key = JSON.stringify([file, name]);
+      if (
+        !file ||
+        !name ||
+        Math.max(file.length, name.length) > MAX_TEST_IDENTITY_LENGTH ||
+        (!this.skipped.has(key) && this.skipped.size >= MAX_SKIPPED_TESTS)
+      )
+        this.incomplete = true;
+      else this.skipped.set(key, { file, name });
+    }
     const file = /^(.+\.(?:test|spec)\.[cm]?[jt]sx?):$/.exec(line)?.[1];
     if (file) {
       this.current =
@@ -54,8 +85,17 @@ export class BunTestCoverage {
         .filter(([, value]) => value.passed && !value.skipped)
         .map(([file]) => file),
       skippedFiles: [...this.files].filter(([, value]) => value.skipped).map(([file]) => file),
+      ...(this.incomplete || this.sawFailure || this.skipRows !== this.skipSummary + this.todoSummary
+        ? { skippedTestsIncomplete: true }
+        : {}),
+      ...(!this.incomplete &&
+      this.skipRows === this.skipSummary + this.todoSummary &&
+      this.passed !== undefined &&
+      this.failed !== undefined
+        ? { skippedTests: [...this.skipped.values()] }
+        : {}),
       ...(this.passed !== undefined && this.failed !== undefined
-        ? { summary: { passed: this.passed, failed: this.failed } }
+        ? { summary: { passed: this.passed, failed: Math.max(this.failed, Number(this.sawFailure)) } }
         : {}),
     };
   }

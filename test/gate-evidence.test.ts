@@ -2,12 +2,13 @@ import { expect } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { compareGates, runGates } from "../src/gates/run.ts";
-import { BunTestCoverage } from "../src/gates/test-coverage.ts";
+import { compareGates, type GateRun, runGates } from "../src/gates/run.ts";
+import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
 import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
@@ -123,6 +124,173 @@ test("coverage uses full commit IDs for SHA-256 repositories too", () => {
   expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.gateEvidence?.sha).toBe(evidence.sha);
   evidence.sha = "abcd";
   expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.status).toBe("blocked");
+});
+
+function coverage(output: string) {
+  const parser = new BunTestCoverage();
+  for (const line of output.split("\n")) parser.observe(line);
+  return parser.result();
+}
+
+function inheritedFixture() {
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw new Error("missing fixture check");
+  check.result.output =
+    "test/loopback.test.ts:\n(pass) loopback [0.06ms]\n(skip) confined\n(todo) pending\n1 pass\n1 skip\n1 todo\n0 fail";
+  check.result.testCoverage = coverage(check.result.output);
+  const output = check.result.output
+    .replace("(todo) pending", "(todo) pending\n(skip) former skip")
+    .replace("1 skip", "2 skip");
+  const base = { ...check.result, output, testCoverage: coverage(output) };
+  const baseline: GateRun = { setupOk: true, setup: [], checks: [base] };
+  return { evidence, check, base, baseline };
+}
+
+test.each(["broad", "targeted", "truncated"])(
+  "factory baseline permits inherited skips for %s verification",
+  (kind) => {
+    const { evidence, check, baseline } = inheritedFixture();
+    // Duplicate rows count once per identity in a cited check.
+    check.result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
+    if (kind === "truncated") check.result.output = "x".repeat(6000);
+    const publicSpec = {
+      ...spec,
+      acceptance_criteria: [
+        {
+          id: "AC-1",
+          criterion: "all tests pass",
+          how_to_verify: kind === "targeted" ? "bun test test/loopback.test.ts" : "bun test",
+        },
+      ],
+    };
+    const result = applyGateEvidence(blocked, publicSpec, holdout, sha, evidence, baseline);
+    expect(result.criteria[0]?.status).toBe("met");
+    expect(result.criteria[0]?.evidence).toBe(
+      `Factory gate tests passed at ${sha} (stage 12); commands: bun run test; 2 inherited skips`,
+    );
+    expect(result.criteria[0]?.gateEvidence).toEqual({
+      stageId: 12,
+      sha,
+      check: "tests",
+      command: "bun run test",
+    });
+  },
+);
+
+test.each([
+  "new-name",
+  "new-file",
+  "missing-baseline",
+  "legacy-baseline",
+  "legacy-candidate",
+  "different-name",
+  "different-command",
+  "partial-identities",
+  "identity-limit",
+  "baseline-identity-limit",
+  "unexplained-summary",
+  "unexplained-summary-outside-tail",
+  "orphan-row-outside-tail",
+  "missing-summary",
+  "zero-pass",
+  "failure",
+  "failure-outside-tail",
+  "retry",
+  "comparison-retry",
+  "timeout",
+  "confinement",
+  "baseline-retry",
+  "baseline-timeout",
+  "baseline-failure",
+  "baseline-confinement",
+])("inherited skips do not excuse %s", (kind) => {
+  const { evidence, check, base, baseline } = inheritedFixture();
+  switch (kind) {
+    case "new-name":
+      check.result.output = check.result.output.replace("(skip) confined", "(skip) newly skipped");
+      break;
+    case "new-file":
+      check.result.output = check.result.output.replace("test/loopback.test.ts:", "test/other.test.ts:");
+      break;
+    case "different-name":
+      base.name = "other";
+      break;
+    case "different-command":
+      base.command = "bun test";
+      break;
+    case "identity-limit":
+      check.result.output = `test/loopback.test.ts:\n(pass) loopback\n${Array.from({ length: MAX_SKIPPED_TESTS + 1 }, (_, i) => `(skip) skip ${i}`).join("\n")}\n1 pass\n${MAX_SKIPPED_TESTS + 1} skip\n0 fail`;
+      base.output = check.result.output;
+      base.testCoverage = coverage(base.output);
+      break;
+    case "baseline-identity-limit":
+      base.output = base.output
+        .replace(
+          "(skip) former skip",
+          Array.from({ length: MAX_SKIPPED_TESTS }, (_, i) => `(skip) skip ${i}`).join("\n"),
+        )
+        .replace("2 skip", `${MAX_SKIPPED_TESTS + 1} skip`);
+      base.testCoverage = coverage(base.output);
+      break;
+    case "unexplained-summary":
+      check.result.output = check.result.output.replace("1 skip", "2 skip");
+      break;
+    case "unexplained-summary-outside-tail":
+    case "orphan-row-outside-tail":
+      check.result.output = `${kind === "orphan-row-outside-tail" ? "(skip) confined\n" : ""}test/loopback.test.ts:\n(pass) loopback\n1 pass\n1 skip\n0 fail`;
+      break;
+    case "missing-summary":
+      check.result.output = check.result.output.replace("0 fail", "");
+      break;
+    case "zero-pass":
+      check.result.output = check.result.output.replace("1 pass", "0 pass");
+      break;
+    case "failure":
+    case "failure-outside-tail":
+      check.result.output += "\n(fail) confined";
+      break;
+    case "retry":
+      check.result.firstAttempt = { ...check.result };
+      break;
+    case "comparison-retry":
+      check.firstAttempt = { ...check.result };
+      break;
+    case "timeout":
+      check.result.timedOut = true;
+      break;
+    case "confinement":
+      check.result.confinementError = true;
+      break;
+    case "baseline-retry":
+      base.firstAttempt = { ...base };
+      break;
+    case "baseline-timeout":
+      base.timedOut = true;
+      break;
+    case "baseline-failure":
+      base.ok = false;
+      base.exitCode = 1;
+      break;
+    case "baseline-confinement":
+      base.confinementError = true;
+      break;
+  }
+  check.result.testCoverage = coverage(check.result.output);
+  if (kind.endsWith("outside-tail") || kind === "identity-limit") check.result.output = "x".repeat(6000);
+  if (kind === "legacy-baseline") delete base.testCoverage?.skippedTests;
+  if (kind === "legacy-candidate") delete check.result.testCoverage.skippedTests;
+  if (kind === "partial-identities") check.result.testCoverage.skippedFiles.push("test/unrecorded.test.ts");
+  const result = applyGateEvidence(
+    blocked,
+    spec,
+    holdout,
+    sha,
+    evidence,
+    kind === "missing-baseline" ? undefined : baseline,
+  );
+  expect(result.criteria[0]?.status).toBe("blocked");
+  expect(result.criteria[0]?.gateEvidence).toBeUndefined();
 });
 
 test.each(["suite", "targeted", "retained-coverage"])(
@@ -567,6 +735,7 @@ test.each(["relative", "linux-absolute", "macos-absolute", "colored-crlf", "gith
     expect(coverage.result()).toEqual({
       passedFiles: format === "skipped" ? [] : ["test/loopback.test.ts"],
       skippedFiles: format === "skipped" ? ["test/loopback.test.ts"] : [],
+      skippedTests: format === "skipped" ? [{ file: "test/loopback.test.ts", name: "unavailable" }] : [],
       summary: { passed: 1, failed: 0 },
     });
   },
@@ -588,12 +757,81 @@ test("Bun absolute file headers and checkout roots use the same realpath", () =>
       expect(coverage.result()).toEqual({
         passedFiles: ["loopback.test.ts"],
         skippedFiles: [],
+        skippedTests: [],
         summary: { passed: 1, failed: 0 },
       });
     }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("skip identities retain full names, distinct files and redacted terminal-normalized text", () => {
+  const secret = ["fixture", "credential", "skip"].join("-").repeat(100);
+  registerCredential("skip-fixture", secret);
+  const parser = new BunTestCoverage("/workspace/project");
+  for (const line of [
+    "::group::/workspace/project/test/one.test.ts:",
+    "\x1b[33m(skip) suite > identical name\x1b[0m\r",
+    `(todo) suite > ${secret}`,
+    "::endgroup::",
+    "./test/two.test.ts:",
+    "(skip) suite > identical name",
+    "(pass) runs [0.06ms]",
+    "1 pass",
+    "2 skip",
+    "1 todo",
+    "0 fail",
+  ])
+    parser.observe(line);
+  expect(parser.result().skippedTests).toEqual([
+    { file: "test/one.test.ts", name: "suite > identical name" },
+    { file: "test/one.test.ts", name: "suite > [redacted]" },
+    { file: "test/two.test.ts", name: "suite > identical name" },
+  ]);
+  expect(JSON.stringify(parser.result())).not.toContain(secret);
+  parser.observe("(fail) distinct failure");
+  expect(parser.result().skippedTests).toHaveLength(3);
+  expect(parser.result().skippedTests?.some((skip) => skip.name === "distinct failure")).toBe(false);
+  expect(parser.result().summary?.failed).toBe(1);
+});
+
+test.each([
+  "count-boundary",
+  "count-overflow",
+  "length-boundary",
+  "name-overflow",
+  "file-overflow",
+  "missing-header",
+  "missing-name",
+  "malformed-row",
+])("skip identity capture fails closed at %s", (kind) => {
+  const count =
+    kind === "count-boundary" ? MAX_SKIPPED_TESTS : kind === "count-overflow" ? MAX_SKIPPED_TESTS + 1 : 1;
+  const file =
+    kind === "file-overflow" ? `${"x".repeat(MAX_TEST_IDENTITY_LENGTH)}.test.ts` : "test/one.test.ts";
+  const name =
+    kind === "length-boundary"
+      ? "x".repeat(MAX_TEST_IDENTITY_LENGTH)
+      : kind === "name-overflow"
+        ? "x".repeat(MAX_TEST_IDENTITY_LENGTH + 1)
+        : "skip";
+  const output = [
+    ...(kind === "missing-header" ? [] : [`${file}:`]),
+    ...Array.from({ length: count }, (_, i) =>
+      kind === "missing-name"
+        ? "(skip)"
+        : kind === "malformed-row"
+          ? "(skip)no space"
+          : `(skip) ${count > 1 ? i : name}`,
+    ),
+    "1 pass",
+    `${count} skip`,
+    "0 fail",
+  ].join("\n");
+  const result = coverage(output);
+  if (kind.endsWith("boundary")) expect(result.skippedTests).toHaveLength(count);
+  else expect(result.skippedTests).toBeUndefined();
 });
 
 test.each(["no-header", "no-summary", "partial-summary", "zero-tests", "truncated", "retained-pass"])(

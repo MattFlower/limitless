@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { launchFailure } from "../gates/output.ts";
 import type { GateResult } from "../gates/run.ts";
+import { MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
 
 export function pairingCode(coordinator: string, worker: string, nonce: string): string {
   const digest = createHash("sha256")
@@ -55,6 +56,18 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
         .object({
           passedFiles: z.array(z.string()),
           skippedFiles: z.array(z.string()),
+          skippedTestsIncomplete: z.boolean().optional(),
+          skippedTests: z
+            .array(
+              z
+                .object({
+                  file: z.string().min(1).max(MAX_TEST_IDENTITY_LENGTH),
+                  name: z.string().min(1).max(MAX_TEST_IDENTITY_LENGTH),
+                })
+                .strict(),
+            )
+            .max(MAX_SKIPPED_TESTS)
+            .optional(),
           summary: z
             .object({ passed: z.number().int().nonnegative(), failed: z.number().int().nonnegative() })
             .strict()
