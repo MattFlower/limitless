@@ -381,7 +381,7 @@ function gateTable(cmp: GateComparison[]): string {
 const PATCH_LIMIT = 40_000;
 
 /** How each panel finder prompt frames the review; a separate verifier checks every finding. */
-const FINDER_FRAMING: Record<FinderPrompt, string> = {
+const FINDER_FRAMING: Record<Exclude<FinderPrompt, "adversarial-checklist">, string> = {
   standard:
     "Report every issue you believe is real, with your confidence and a severity estimate. Do not filter by importance or certainty: a separate step verifies each finding against the code before anything is acted on.",
   adversarial:
@@ -455,7 +455,7 @@ export function reviewPrompt(input: {
     : "A different AI model implemented the change below.";
   return `${
     input.finder
-      ? `You are ${input.finder === "adversarial" ? "an adversarial" : "a"} code reviewer. ${author} ${FINDER_FRAMING[input.finder]}`
+      ? `You are ${input.finder.startsWith("adversarial") ? "an adversarial" : "a"} code reviewer. ${author} ${FINDER_FRAMING[input.finder === "adversarial-checklist" ? "adversarial" : input.finder]}`
       : `You are an adversarial code reviewer. ${author} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.`
   }
 ${

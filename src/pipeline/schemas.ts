@@ -163,6 +163,12 @@ const rejectDegenerate =
   };
 
 export const ReviewSchema = reviewBase.superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
+export const ChecklistEntrySchema = z.object({
+  item: z.string(),
+  applies: z.string(),
+  checked: z.string(),
+  finding: z.string().nullable(),
+});
 export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate(MIN_LATER_REVIEW_SUMMARY));
 
 /** A panel verifier's ruling on one finder candidate; its severity, not the finder's, is authoritative. */
@@ -269,6 +275,7 @@ export interface ReviewScope {
  * (`security` was added later). The degenerate-summary rule still applies.
  */
 const StoredFindingSchema = reviewBase.shape.findings.element.extend({
+  id: z.string().optional(),
   security: z.boolean().default(false),
   title: z.string().default(""),
   detail: z.string().default(""),
@@ -314,6 +321,7 @@ export const StoredReviewSchema = reviewBase
     summary: z.string().default(""),
     findings: z.array(StoredFindingSchema),
     panel: StoredPanelSchema.optional(),
+    checklist: z.array(ChecklistEntrySchema).optional(),
   })
   .superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
 export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdict">>;

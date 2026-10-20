@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { CHECKLIST_CAP, checklistPrompt } from "../src/evals/checklist.ts";
 import { reviewPrompt } from "../src/pipeline/prompts.ts";
 import { registerCredential } from "../src/util/proc.ts";
 
@@ -65,4 +66,55 @@ test("large first-parent excerpts are bounded after redaction with full diff com
   expect(prompt).toContain("[redacted]");
   expect(prompt).not.toContain("review-patch-cutoff");
   expect(prompt).not.toContain("TAIL_HUNK");
+});
+
+const privacyRule =
+  "## Privacy\n- Decode: decode before you redact and redact before you truncate.\n  Keep this continuation.\n";
+const defectHeading = "## Defects reviews keep finding\n";
+
+test("checklist extracts whole source-ordered bullets and fences embedded delimiters", () => {
+  const source = `${privacyRule}- Unrelated privacy rule.\n${defectHeading}Intro, not a rule.\n- **First.** Trace the path.\n  Continued detail.\n  \`\`\`\`text\n  - fenced bullet\n  ## Privacy\n  \`\`\`\`\n- **Second.** Check input.\n## Other\n- Excluded rule.\n`;
+  const prompt = checklistPrompt(source.replace(/\n/g, "\r\n"));
+  expect(prompt).toContain("[privacy-1] Decode:");
+  expect(prompt).toContain("Keep this continuation.");
+  expect(prompt).toContain("[defect-1] **First.**");
+  expect(prompt).toContain("Continued detail.");
+  expect(prompt).toContain("[defect-2] **Second.**");
+  expect(prompt.indexOf("[privacy-1]")).toBeLessThan(prompt.indexOf("[defect-1]"));
+  expect(prompt).toContain("\n`````text\n");
+  expect(prompt).toContain("\n`````\n");
+  expect(prompt).toContain("omitted 0 whole items");
+  for (const excluded of ["Intro, not a rule", "Unrelated privacy", "Excluded rule", "[defect-3]"])
+    expect(prompt).not.toContain(excluded);
+});
+
+test("checklist cap retains whole items without skipping ahead and redacts before bounding", () => {
+  const secret = "checklist-fixture-credential";
+  registerCredential("CHECKLIST_FIXTURE", secret);
+  const source = `${privacyRule}${defectHeading}- First ${secret}\n- ${"x".repeat(CHECKLIST_CAP)}\n- LAST_ITEM\n`;
+  const prompt = checklistPrompt(source);
+  expect(prompt).toContain("[defect-1] First [redacted]");
+  expect(prompt).not.toContain(secret);
+  expect(prompt).not.toContain("[defect-2]");
+  expect(prompt).not.toContain("LAST_ITEM");
+  expect(prompt).toContain("omitted 2 whole items");
+  const content = prompt.split("```text\n")[1]?.split("\n```")[0];
+  expect(content?.length).toBeLessThanOrEqual(CHECKLIST_CAP);
+  const prefix =
+    "[privacy-1] Decode: decode before you redact and redact before you truncate.\n  Keep this continuation.\n\n[defect-1] ";
+  const exact = `${privacyRule}${defectHeading}- ${"a".repeat(CHECKLIST_CAP - prefix.length)}\n- over\n`;
+  const bounded = checklistPrompt(exact).split("```text\n")[1]?.split("\n```")[0];
+  expect(bounded?.length).toBe(CHECKLIST_CAP);
+  expect(checklistPrompt(exact)).toContain("omitted 1 whole items");
+});
+
+test.each([
+  null,
+  "",
+  `${privacyRule}${defectHeading}No bullets.`,
+  `${defectHeading}- Rule.`,
+  `${defectHeading}- Rule.\n## Privacy\n- decode before you redact only`,
+  `## Other\n- decode before you redact and redact before you truncate.\n${defectHeading}- Rule.`,
+])("checklist fails explicitly for missing required base content (%s)", (source) => {
+  expect(() => checklistPrompt(source)).toThrow(/adversarial-checklist: .*base AGENTS.md/);
 });

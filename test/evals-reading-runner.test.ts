@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { evalCommand } from "../src/cli/eval.ts";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema, validateRequest } from "../src/evals/cases.ts";
+import * as checklist from "../src/evals/checklist.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import * as preparation from "../src/evals/prepare.ts";
@@ -1599,6 +1600,108 @@ test("eval regrade of locally seeded eval-musve313u2w9 preserves original 17/30 
     ).toHaveLength(13);
     expect(after?.trials.map((t) => t.output)).toEqual(before.map((t) => t.output));
     expect(f.factory.evals.regrade(id)).toMatchObject({ regraded: 31, changed: 0, skipped: [] });
+    expect(f.calls).toHaveLength(0);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("checklist eval pins base rules, preserves evidence and keys caches on the assembled request", async () => {
+  const f = await fixture();
+  const rules = (label: string) =>
+    `## Privacy\n- decode before you redact and redact before you truncate.\n## Defects reviews keep finding\n- ${label}\n  Trace every entry point.\n## Other\n- unrelated rule\n`;
+  const prepare = preparation.prepareCase;
+  const prepared = spyOn(preparation, "prepareCase").mockImplementation(async (...args) => {
+    const result = await prepare(...args);
+    writeFileSync(join(args[1], "AGENTS.md"), rules("WORKTREE_ONLY_RULE"));
+    return result;
+  });
+  const assemble = checklist.checklistPrompt;
+  const assembly = spyOn(checklist, "checklistPrompt");
+  try {
+    writeFileSync(join(f.source, "AGENTS.md"), rules("PINNED_BASE_RULE"));
+    await sh(["git", "add", "AGENTS.md"], { cwd: f.source });
+    await sh(["git", "commit", "-qm", "base rules"], { cwd: f.source });
+    f.item.base = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    writeFileSync(join(f.source, "AGENTS.md"), rules("HEAD_ONLY_RULE"));
+    await sh(["git", "add", "AGENTS.md"], { cwd: f.source });
+    await sh(["git", "commit", "-qm", "head rules"], { cwd: f.source });
+    f.item.head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    f.save();
+    const output = {
+      ...reviewOutput(),
+      findings: reviewOutput().findings.map((finding) => ({ ...finding, id: "F1" })),
+      checklist: [
+        { item: "privacy-1", applies: "non-applicable", checked: "none", finding: null },
+        {
+          item: "defect-1",
+          applies: "src/a.ts:10",
+          checked: "input: cancel while push is pending",
+          finding: "F1",
+        },
+      ],
+    };
+    const run = (prompt: string) =>
+      f.run({
+        models: undefined,
+        systems: [{ ...setupSystem(prompt, false), finders: [{ target: "candidate-a", prompt }] }],
+      });
+    f.respond((s) => {
+      if (s.schema === checklist.ChecklistReviewSchema) {
+        expect(s.jsonSchema).toEqual(toStrictJsonSchema(checklist.ChecklistReviewSchema));
+        expect(s.jsonSchema?.required).toContain("checklist");
+        expect(s.jsonSchema?.additionalProperties).toBe(false);
+        expect(s.prompt).toStartWith("You are an adversarial code reviewer.");
+        expect(s.prompt).toContain("Assume the change can fail, and find out how.");
+        expect(s.prompt).toContain("[defect-1] PINNED_BASE_RULE");
+        expect(s.prompt).toContain("decode before you redact and redact before you truncate");
+        expect(s.prompt).not.toContain("HEAD_ONLY_RULE");
+        expect(s.prompt).not.toContain("WORKTREE_ONLY_RULE");
+        expect(s.prompt).not.toContain("unrelated rule");
+        expect(readFileSync(join(s.cwd, "AGENTS.md"), "utf8")).toContain("WORKTREE_ONLY_RULE");
+      }
+      return { structured: output };
+    });
+    expect(checklist.ChecklistReviewSchema.safeParse(reviewOutput()).success).toBe(false);
+    for (const prompt of ["standard", "adversarial", "adversarial-checklist"]) {
+      const fresh = await run(prompt);
+      expect(fresh.summaries[0]?.cached).toBe(0);
+      expect((await run(prompt)).summaries[0]?.cached).toBe(1);
+      if (prompt === "adversarial-checklist") {
+        expect(f.factory.evals.report(fresh.run.id)?.trials[0]?.output).toMatchObject(output);
+        expect(f.factory.evals.regrade(fresh.run.id)?.regraded).toBe(1);
+        expect(f.factory.evals.report(fresh.run.id)?.trials[0]?.output).toMatchObject(output);
+        expect((await run(prompt)).trials[0]?.output).toMatchObject(output);
+      }
+    }
+    expect(f.calls).toHaveLength(3);
+    assembly.mockImplementation((source) => `${assemble(source)}Changed assembly instruction.\n`);
+    expect((await run("adversarial-checklist")).summaries[0]?.cached).toBe(0);
+    expect((await run("adversarial-checklist")).summaries[0]?.cached).toBe(1);
+    expect(f.calls).toHaveLength(4);
+    await f.clean();
+  } finally {
+    prepared.mockRestore();
+    assembly.mockRestore();
+    await f.close();
+  }
+});
+
+test("missing base checklist content fails preparation without an ordinary review", async () => {
+  const f = await fixture();
+  try {
+    const report = await f.run({
+      models: undefined,
+      systems: [
+        {
+          ...setupSystem("checklist", false),
+          finders: [{ target: "candidate-a", prompt: "adversarial-checklist" }],
+        },
+      ],
+    });
+    expect(report.trials[0]).toMatchObject({ status: "error", details: { preparationFailed: true } });
+    expect(report.trials[0]?.details.reason).toContain("adversarial-checklist: missing base AGENTS.md");
     expect(f.calls).toHaveLength(0);
     await f.clean();
   } finally {

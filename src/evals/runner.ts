@@ -3,7 +3,13 @@ import { join } from "node:path";
 import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
 import { Semaphore } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
-import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
+import {
+  createEvalWorktree,
+  type EvalLabels,
+  pinnedTree,
+  readFileAt,
+  snapshotTopLevel,
+} from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
@@ -44,6 +50,7 @@ import {
   type TriageCase,
   validateRequest,
 } from "./cases.ts";
+import { ChecklistReviewSchema, checklistPrompt } from "./checklist.ts";
 import { gradeReview } from "./graders/review.ts";
 import {
   failedImplement,
@@ -703,6 +710,9 @@ export class EvalRunner {
         reviewInput.prompt = { ...reviewInput.prompt, finder };
         prompt = reviewRequest(reviewInput).prompt;
       }
+      const checklist = finder === "adversarial-checklist";
+      if (checklist && "defects" in effective)
+        prompt += checklistPrompt(await readFileAt(cwd, effective.base, "AGENTS.md"));
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
       // Panel targets beyond the trial's own (its first finder) are pinned in the system. A bare
       // target is an unset effort, which today's model default must not restore (as for the trial).
@@ -725,7 +735,7 @@ export class EvalRunner {
         typeof replayId === "string"
           ? ((panelTargets?.verifiers ?? []).map(unavailable).find(Boolean) ?? null)
           : eligible();
-      const schema = "hidden" in item ? undefined : schemaFor(item);
+      const schema = "hidden" in item ? undefined : checklist ? ChecklistReviewSchema : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
         "gold" in item && "prompt" in item
@@ -999,8 +1009,9 @@ export class EvalRunner {
                 releaseEval();
               }
             };
-            // First-round review cases go through the pipeline's review entry point.
-            result = reviewInput
+            // The eval-only checklist keeps its own output schema; other reviews use the pipeline.
+            const pipelineReview = !checklist && reviewInput;
+            result = pipelineReview
               ? (
                   await runReview(
                     {
@@ -1048,7 +1059,7 @@ export class EvalRunner {
                         return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },
-                    reviewInput,
+                    pipelineReview,
                   )
                 ).result
               : await send();

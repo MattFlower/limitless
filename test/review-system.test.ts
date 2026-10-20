@@ -68,7 +68,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial", "careful" or "probe"',
+    'finder prompt must be "standard", "adversarial", "careful", "probe" or "adversarial-checklist"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -103,7 +103,16 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
 });
 
 test("single prompt variants are eval-only and retain the single-mode restrictions", () => {
-  for (const prompt of ["adversarial", "careful", "probe"] as const) {
+  for (const prompt of ["adversarial", "careful", "probe", "adversarial-checklist"] as const) {
+    if (prompt === "adversarial-checklist") {
+      expect(() => parseReviewRosters({ quick: [{ prompt }] })).toThrow("eval-only");
+      expect(
+        ReviewSystemSchema.safeParse(panel({ finders: [{ target: "candidate-a", prompt }] })).success,
+      ).toBe(false);
+      expect(() =>
+        parseEvalReviewSystems(file(panel({ finders: [{ target: "candidate-a", prompt }] })), "s.json"),
+      ).toThrow('require mode "single"');
+    }
     const finder = { target: "candidate-a", prompt };
     const variant = system({ finders: [finder] });
     expect(parseEvalReviewSystems(file(variant), "s.json")).toEqual([variant] as ReviewSystem[]);
