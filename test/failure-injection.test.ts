@@ -2696,6 +2696,13 @@ for (const refuse of [false, true]) {
         birth,
         boot: "test-boot",
         createdAt: Date.now(),
+        discovery: {
+          group: pid,
+          started: Date.now(),
+          directories: [realpathSync(source)],
+          leader: null,
+          spawnedAt: "0",
+        },
       });
       await processBootInspection.run(
         () => "test-boot",
@@ -2755,6 +2762,13 @@ test("scheduler-started commands record and gate cleanups without ambient storag
       birth,
       boot: "test-boot",
       createdAt: Date.now(),
+      discovery: {
+        group: pid,
+        started: Date.now(),
+        directories: [realpathSync(source)],
+        leader: null,
+        spawnedAt: "0",
+      },
     });
     await processRecoveryInspection.run({ stopped: () => false, timeoutMs: 0 }, () =>
       runProcess({
