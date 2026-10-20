@@ -47,13 +47,14 @@ describe("routing bounded slot waits", () => {
     routing = policy,
     reply?: (s: AgentSpec) => FakeReply | Promise<FakeReply>,
     runModels?: CreateRunRequest["models"],
+    definitions = providers,
   ) {
     const clock = waitClock();
     const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
     const calls: AgentSpec[] = [];
     factory = new Factory(cfg, {
       confinement: fakeConfinement,
-      providers,
+      providers: definitions,
       models: catalog,
       policy: routing,
       harnesses: {
@@ -67,7 +68,7 @@ describe("routing bounded slot waits", () => {
       },
     });
     const tracker = new ProviderTracker(
-      providers,
+      definitions,
       factory.store,
       cfg.reserves,
       {},
@@ -385,6 +386,23 @@ describe("routing bounded slot waits", () => {
     slots[1]?.();
   });
 
+  test("an immediate watched alternative suppresses losing wait messages and zero-budget probes", async () => {
+    const f = fixture();
+    f.cfg.waitBudgetS.triage = 0;
+    const slots = await Promise.all(["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)));
+    try {
+      const outcome = await f.invoke();
+      expect(outcome.target.provider).toBe("beta");
+      expect(outcome.invocation.waitMs).toBe(0);
+      expect(f.events()).toEqual([]);
+      expect(f.clock.pending).toBe(0);
+    } finally {
+      for (const release of slots) release();
+    }
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+  });
+
   test("cancelled waiting stays cancellation without fallback or an invocation", async () => {
     const f = fixture();
     const slots = await Promise.all(
@@ -415,8 +433,13 @@ describe("routing bounded slot waits", () => {
     expect(f.calls).toHaveLength(0);
     expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
     expect(f.events().map((e) => e.message)).toEqual([
-      `waiting for alpha slot (0 ahead), up to ${seconds}s`,
-      `waiting for beta slot (0 ahead), up to ${seconds}s`,
+      ...(seconds
+        ? [
+            `waiting for alpha slot (0 ahead), up to ${seconds}s`,
+            `waiting for alpha slot (0 ahead), up to ${seconds}s`,
+            `waiting for beta slot (0 ahead), up to ${seconds}s`,
+          ]
+        : []),
       "waiting for alpha slot (0 ahead), up to unbounded",
       "waiting for beta slot (0 ahead), up to unbounded",
     ]);
@@ -426,12 +449,205 @@ describe("routing bounded slot waits", () => {
     expect(f.calls.map((s) => s.target.provider)).toEqual(["alpha"]);
     expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
     expect(f.context.store.getInvocation(outcome.invocation.id)?.waitMs).toBe(seconds * 2000 + 60_000);
-    expect(f.events()).toHaveLength(4);
+    expect(f.events()).toHaveLength(seconds ? 5 : 2);
     // Losing reservations and waiters must be gone: beta remains occupied only by the fixture.
     expect(f.tracker.status("beta")?.inFlight).toBe(2);
     for (const release of slots) release();
     expect(f.tracker.status("alpha")?.inFlight).toBe(0);
     expect(f.tracker.status("beta")?.inFlight).toBe(0);
+  });
+
+  test.each(["alpha", "beta", "both"])(
+    "expired providers remain watched when %s frees at 25s",
+    async (free) => {
+      const alpha = models[0];
+      if (!alpha) throw new Error("missing alpha");
+      const catalog = [...models, { ...alpha, id: "alpha/second" }];
+      const f = fixture(
+        catalog,
+        { ...policy, triage: { default: ["alpha/second", "beta/m", "alpha/m"] } },
+        () => ({ structured: {} }),
+      );
+      const slots = await Promise.all(
+        ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke();
+        await f.clock.advance(20_000);
+        const queued = f.events().map((e) => e.message);
+        await f.clock.advance(5_000);
+        if (free !== "alpha") slots[2]?.();
+        if (free !== "beta") slots[0]?.();
+        await f.clock.flush();
+        const dispatchedAt25s = f.calls.map((s) => s.target.modelId);
+        // Drain the old implementation's later budget too, so a regression fails without hanging.
+        await f.clock.advance(15_000);
+        const outcome = await pending;
+        expect(dispatchedAt25s).toEqual([free === "beta" ? "beta/m" : "alpha/second"]);
+        expect(outcome.target.modelId).toBe(free === "beta" ? "beta/m" : "alpha/second");
+        expect(outcome.invocation.waitMs).toBe(25_000);
+        expect(queued).toEqual([
+          "waiting for alpha slot (0 ahead), up to 20s",
+          "waiting for alpha slot (0 ahead), up to 20s",
+          "waiting for beta slot (0 ahead), up to 20s",
+        ]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(f.clock.pending).toBe(0);
+      } finally {
+        for (const release of slots) release();
+      }
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+      expect(f.tracker.status("beta")?.inFlight).toBe(0);
+      expect((await f.invoke()).target.modelId).toBe("alpha/second");
+    },
+  );
+
+  test.each(["cancel", "deadline", "cancel after release"])(
+    "overlapping waits clean up on %s",
+    async (end) => {
+      const f = fixture();
+      const now = spyOn(Date, "now").mockImplementation(f.clock.now);
+      const slots = await Promise.all(
+        ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(end === "deadline" ? f.clock.now() + 25_000 : undefined);
+        const settled = pending.catch((error: unknown) => error);
+        await f.clock.advance(20_000);
+        if (end === "deadline") await f.clock.advance(5_000);
+        else {
+          if (end === "cancel after release") {
+            slots[2]?.();
+            slots[0]?.();
+          }
+          f.controller.abort();
+        }
+        expect(await settled).toBeInstanceOf(end === "deadline" ? NoCapacityError : CancelledError);
+        expect(f.clock.pending).toBe(0);
+        expect(f.calls).toHaveLength(0);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+      } finally {
+        now.mockRestore();
+        for (const release of slots) release();
+      }
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+      expect(f.tracker.status("beta")?.inFlight).toBe(0);
+      // An abandoned queue must not strand a new waiter.
+      const release = await f.tracker.acquire("beta", new AbortController().signal);
+      release();
+    },
+  );
+
+  test("later providers remain unwatched until their exclusive budget starts", async () => {
+    const beta = models[1];
+    if (!beta) throw new Error("missing beta");
+    const catalog = [...models, { ...beta, id: "gamma/m", provider: "gamma" }];
+    const f = fixture(
+      catalog,
+      { ...policy, triage: { default: catalog.map((m) => m.id) } },
+      () => ({ structured: {} }),
+      undefined,
+      [
+        ...providers,
+        {
+          id: "gamma",
+          label: "Gamma",
+          harness: "fake",
+          billing: "subscription",
+          maxConcurrent: 2,
+        },
+      ],
+    );
+    const slots = await Promise.all(
+      ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+    );
+    try {
+      const pending = f.invoke();
+      await f.clock.advance(20_000);
+      await f.clock.advance(19_000);
+      expect(f.calls).toHaveLength(0);
+      expect(f.events().some((e) => e.message.includes("gamma"))).toBe(false);
+      await f.clock.advance(1_000);
+      expect((await pending).target.provider).toBe("gamma");
+      expect(f.context.store.listInvocations(f.run.id)[0]?.waitMs).toBe(40_000);
+      expect(f.events()).toHaveLength(3);
+      expect(f.clock.pending).toBe(0);
+    } finally {
+      for (const release of slots) release();
+    }
+  });
+
+  test("a failed overlapping wait notice removes every queued acquisition", async () => {
+    const f = fixture();
+    const slots = await Promise.all(
+      ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+    );
+    const log = f.context.log.bind(f.context);
+    const notice = spyOn(f.context, "log").mockImplementation((...args) => {
+      if (args[0].startsWith("waiting for beta")) throw new Error("wait logging failed");
+      log(...args);
+    });
+    try {
+      const pending = f.invoke();
+      const settled = pending.catch((error: unknown) => error);
+      await f.clock.advance(20_000);
+      expect(await settled).toEqual(new Error("wait logging failed"));
+      expect(f.clock.pending).toBe(0);
+      expect(f.calls).toHaveLength(0);
+    } finally {
+      notice.mockRestore();
+      for (const release of slots) release();
+    }
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+    expect((await f.invoke()).target.provider).toBe("alpha");
+  });
+
+  test("metered target selection checks concurrency without status or spend queries", async () => {
+    const f = fixture(
+      models,
+      policy,
+      undefined,
+      undefined,
+      providers.map((p) => ({ ...p, billing: "metered" })),
+    );
+    const slots = await Promise.all(["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)));
+    const status = spyOn(f.tracker, "status");
+    const spend = spyOn(f.context.store, "providerSpendSince");
+    const route = f.router.route.bind(f.router);
+    let beforeSelection = [0, 0];
+    const routing = spyOn(f.router, "route").mockImplementation((...args) => {
+      const result = route(...args);
+      beforeSelection = [status.mock.calls.length, spend.mock.calls.length];
+      return result;
+    });
+    const acquire = f.tracker.acquireFirst.bind(f.tracker);
+    let selections = 0;
+    const admission = spyOn(f.tracker, "acquireFirst").mockImplementation((...args) => {
+      expect([status.mock.calls.length, spend.mock.calls.length]).toEqual(beforeSelection);
+      selections++;
+      return acquire(...args);
+    });
+    try {
+      expect(f.tracker.isBusy("alpha")).toBe(true);
+      expect(f.tracker.isBusy("beta")).toBe(false);
+      const pending = f.invoke();
+      await f.clock.advance(20_000);
+      expect((await pending).target.provider).toBe("beta");
+      slots[0]?.();
+      expect(f.tracker.isBusy("alpha")).toBe(false);
+      expect((await f.invoke()).target.provider).toBe("alpha");
+      expect(selections).toBe(3);
+      // Normal routing/admission still publishes metered status and checks quota.
+      expect(status.mock.calls.length).toBeGreaterThan(0);
+      expect(spend.mock.calls.length).toBeGreaterThan(0);
+    } finally {
+      admission.mockRestore();
+      routing.mockRestore();
+      status.mockRestore();
+      spend.mockRestore();
+      for (const release of slots) release();
+    }
   });
 
   test.each(["alpha", "beta", "both"])("all busy providers select %s when its slot frees", async (free) => {
@@ -472,7 +688,7 @@ describe("routing bounded slot waits", () => {
       const outcome = await pending;
       expect(outcome.target.provider).toBe("alpha");
       expect(f.calls.map((s) => s.target.provider)).toEqual(["beta", "alpha"]);
-      expect(f.context.store.listInvocations(f.run.id).map((i) => i.waitMs)).toEqual([20_000, 25_000]);
+      expect(f.context.store.listInvocations(f.run.id).map((i) => i.waitMs)).toEqual([20_000, 5_000]);
       expect(f.events().map((e) => e.message)).toEqual([
         "waiting for alpha slot (0 ahead), up to 20s",
         "waiting for alpha slot (0 ahead), up to unbounded",
@@ -502,7 +718,8 @@ describe("routing bounded slot waits", () => {
     const outcome = await pending;
     expect(outcome.target.provider).toBe("alpha");
     // The five seconds beta spent executing are not slot waiting.
-    expect(outcome.invocation.waitMs).toBe(20_000);
+    expect(outcome.invocation.waitMs).toBe(0);
+    expect(f.context.store.listInvocations(f.run.id).map((i) => i.waitMs)).toEqual([20_000, 0]);
     expect(f.events()).toHaveLength(1);
     slots[1]?.();
   });
@@ -606,7 +823,7 @@ describe("routing bounded slot waits", () => {
     expect(f.calls.map((s) => s.target.modelId)).toEqual(Array.from({ length: 6 }, (_, i) => `beta/${i}`));
     expect(f.context.store.listInvocations(f.run.id)).toHaveLength(6);
     expect(f.events()).toHaveLength(1);
-    expect(f.context.store.listInvocations(f.run.id).map((i) => i.waitMs)).toEqual(Array(6).fill(20_000));
+    expect(f.context.store.listInvocations(f.run.id).map((i) => i.waitMs)).toEqual([20_000, 0, 0, 0, 0, 0]);
     for (const release of slots) release();
   });
 
