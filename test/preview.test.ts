@@ -263,7 +263,13 @@ test.each(["build", "readiness"])("abort during %s kills the process and removes
     () => new Error("Unexpected preview success"),
     (error: unknown) => error,
   );
-  await until(() => existsSync(join(dir, "server-pid")) && existsSync(join(dir, "scratch")));
+  const pidFile = join(dir, "server-pid");
+  await until(
+    () =>
+      existsSync(pidFile) &&
+      /^[1-9]\d*$/.test(readFileSync(pidFile, "utf8").trim()) &&
+      existsSync(join(dir, "scratch")),
+  );
   controller.abort();
   expect(String(await rejected)).toContain("Preview cancelled");
   await expectCleaned(dir);

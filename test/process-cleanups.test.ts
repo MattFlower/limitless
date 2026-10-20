@@ -899,7 +899,7 @@ test("an interrupted sweep rediscovers a frozen parent's unrecorded child before
   });
   let omittedBirth: string | null = null;
   try {
-    await waitFor(() => existsSync(ready));
+    await waitFor(() => existsSync(ready) && /^[1-9]\d*$/.test(readFileSync(ready, "utf8").trim()));
     [member, omitted] = JSON.parse(readFileSync(memberFile, "utf8"));
     if (member === undefined || omitted === undefined) throw new Error("Missing invocation members");
     omittedBirth = await processBirth(omitted);
