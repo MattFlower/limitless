@@ -74,7 +74,7 @@ test("loopback server", () => {
         readFileSync(file, "utf8") +
           `
 // Supply the gate's existing report artifact while keeping its simple test command.
-test.skip("confined", () => {});
+test.skipIf(process.env.LIMITLESS_CONFINED === "1")("confined", () => {});
 import { afterAll } from "bun:test";
 afterAll(async () => {
   if (process.env.LIMITLESS_GATE_REPORT) await Bun.write(process.env.LIMITLESS_GATE_REPORT,
