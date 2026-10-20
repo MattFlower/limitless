@@ -56,11 +56,18 @@ test.each(["&amp;", "&#38;", "&#x26;"])(
   },
 );
 
-test("publication still checks exact outgoing text before decoding or collapsing it", () => {
+test("publication retains exact raw and decoded text before collapsing whitespace", () => {
   const phrase = ["private", "&amp;", "value"].join("\t");
   expect(() => checkPublicationText(phrase, "PR text", [{ value: phrase, entry: 1 }])).toThrow(
     "PR text contains a private string (entry 1 in private-strings.txt)",
   );
+  for (const separator of ["\t", "\n"]) {
+    const value = ["private", "value"].join(separator);
+    for (const text of [encodeURIComponent(value), encodeURIComponent(encodeURIComponent(value))])
+      expect(() => checkPublicationText(text, "PR text", [{ value, entry: 1 }])).toThrow(
+        "PR text contains a private string (entry 1 in private-strings.txt)",
+      );
+  }
 });
 
 test("publication checks standard base64 with caller-selected private entries and credentials", () => {

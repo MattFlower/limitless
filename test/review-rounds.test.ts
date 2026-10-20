@@ -459,7 +459,9 @@ test.each(["finding newline", "finding spaces", "finding ampersand", "existing b
       " ",
       ["finding newline", "finding ampersand"].includes(scenario) ? "\n" : "   ",
     );
-    expect(() => checkPrivateText(title, "Raw finding", entries)).not.toThrow();
+    expect(() => checkPrivateText(title, "Raw finding", entries)).toThrow(
+      "Raw finding contains a private string (entry 1",
+    );
     mkdirSync(factory.cfg.paths.configDir, { recursive: true });
     writeFileSync(join(factory.cfg.paths.configDir, "private-strings.txt"), phrase);
     if (scenario === "existing body") pr.body += `\n${phrase}`;

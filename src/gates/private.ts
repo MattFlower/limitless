@@ -163,12 +163,15 @@ export function base64Match(run: string, entries: PrivateStrings): string | unde
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
+  const decodeBase64 = (layer: string) =>
+    layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
-    const next = decodeHTML(decoded(text))
-      .replace(/\s+/g, " ")
-      .replace(base64Runs, (run) => base64Match(run, entries) ?? run);
-    if (next === text) return layers.map(normalize);
+    const expanded = decodeHTML(decoded(text));
+    // Keep line breaks too: report quotations and multiline credentials depend on them.
+    layers.push(decodeBase64(expanded.replace(/\s+/g, " ")));
+    const next = decodeBase64(expanded);
+    if (next === text) return [...layers, next].map(normalize);
     layers.push(next);
     text = next;
   }
