@@ -171,15 +171,38 @@ test("failure redacts its reason and blocks across restart until a newer self la
 for (const bootSha of [MAIN, BOOT]) {
   test(`restart reconciles an attempt with running SHA ${bootSha.slice(0, 1)}`, async () => {
     const pending = Promise.withResolvers<DeployResult>();
-    const f = fixture({ deploy: () => pending.promise });
+    const jobs: string[] = [];
+    const f = fixture({
+      deploy: (_sha, job) => {
+        jobs.push(job);
+        return pending.promise;
+      },
+    });
     await f.module.tick();
     land(f.store);
     const inflight = f.module.tick();
     await flush();
+    const persisted = f.store.getSetting<{ attempt: { job?: string } | null }>(
+      "deploy.after_land:test/self",
+      {
+        attempt: null,
+      },
+    );
+    expect(jobs).toHaveLength(1);
+    expect(persisted.attempt?.job).toBe(jobs[0]);
     f.module.stop();
-    const restarted = fixture({ store: f.store, bootSha });
+    const cleaned: string[] = [];
+    const restarted = fixture({
+      store: f.store,
+      bootSha,
+      cleanup: async (job) => {
+        cleaned.push(job);
+      },
+    });
     await restarted.module.tick();
     expect(restarted.calls).toEqual([]);
+    // The restarted daemon removes the job the interrupted attempt left behind.
+    expect(cleaned).toEqual(jobs);
     const state = f.store.getSetting<{ attempt: unknown; blocked: unknown }>("deploy.after_land:test/self", {
       attempt: null,
       blocked: null,

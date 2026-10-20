@@ -1002,6 +1002,8 @@ runs and evals do not count). Several landings during that wait produce one depl
 main SHA, only if it differs from the running release. It runs `limitless deploy <sha> --smoke`
 with the same checks, live smoke quota, default drain wait, restart and rollback described above.
 The deploy runs as a separate launchd job, with output in `~/.limitless/logs/dev.limitless.deploy.*.log`.
+The job runs the deploy once and then removes itself; a restarted daemon removes a finished job
+that is still loaded.
 
 `deploy.started` and `deploy.failed` feed items identify the target SHA. A failure, including a
 concurrent manual deploy holding the lock, blocks further automatic deploys; the feed says why.

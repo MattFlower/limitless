@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import type { Store } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 
 export type DeployResult = { ok: true } | { ok: false; reason: string };
-type Attempt = { sha: string; landId: number; time: number };
+/** `job` names the deploy process so a restarted daemon can remove a finished one it left behind. */
+type Attempt = { sha: string; landId: number; time: number; job?: string };
 type DeployState = {
   handled: number;
   attempt: Attempt | null;
@@ -15,7 +17,9 @@ export interface AutoDeployDeps {
   selfRepo: () => Promise<string>;
   mainSha: () => Promise<string>;
   bootSha: string;
-  deploy: (sha: string) => Promise<DeployResult>;
+  deploy: (sha: string, job: string) => Promise<DeployResult>;
+  /** Removes a deploy process left by an interrupted attempt, if it has finished. */
+  cleanup?: (job: string) => Promise<void>;
   now: () => number;
   timer: { set: (tick: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
   log: (reason: string) => void;
@@ -81,8 +85,8 @@ export class AutoDeploy {
     const save = (state: DeployState) => d.store.setSetting(key, state);
     let state = read();
     if (!this.reconciled) {
-      if (state.attempt) {
-        const attempt = state.attempt;
+      const attempt = state.attempt;
+      if (attempt) {
         state.attempt = null;
         if (d.bootSha !== attempt.sha) {
           const reason = redactCredentials(
@@ -95,6 +99,13 @@ export class AutoDeploy {
       }
       save(state);
       this.reconciled = true;
+      if (attempt?.job && d.cleanup) {
+        await d
+          .cleanup(attempt.job)
+          .catch((error: unknown) => d.log(redactCredentials(`Automatic deploy cleanup: ${String(error)}`)));
+        if (this.stopped) return;
+        state = read();
+      }
     }
     const landId = latest();
     if (state.blocked && landId > state.blocked.landId) {
@@ -114,13 +125,13 @@ export class AutoDeploy {
       save(state);
       return;
     }
-    const attempt = { sha, landId, time: d.now() };
+    const attempt = { sha, landId, time: d.now(), job: randomUUID() };
     state.attempt = attempt;
     save(state);
     d.store.deployFeed("deploy.started", repo, sha, landId, `Deploying ${sha} after landing`);
     let result: DeployResult;
     try {
-      result = await d.deploy(sha);
+      result = await d.deploy(sha, attempt.job);
     } catch (error) {
       result = { ok: false, reason: String(error) };
     }
