@@ -82,6 +82,12 @@ test("publication checks standard base64 with caller-selected private entries an
     for (const run of [encoded.slice(0, -4), `${encoded}===`, "ordinary text YWJjZA=="])
       expect(() => checkPublicationText(run, "PR text", entries)).not.toThrow();
   }
+  const slashed = ["private", "slashed", "entry???"].join("-");
+  const encoded = Buffer.from(slashed).toString("base64");
+  expect(encoded).toContain("/");
+  expect(() =>
+    checkPublicationText(`See reports/${encoded}.txt`, "PR text", [{ value: slashed, entry: 3 }]),
+  ).toThrow("entry 3");
 });
 
 test("publication decodes once and permits clean text and unrecognized references", () => {

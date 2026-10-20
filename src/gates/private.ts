@@ -149,22 +149,34 @@ const decoded = (text: string) =>
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
   const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
+  const contains = (value: string) => {
+    const found = normalize(value);
+    return entries.some((entry) => found.includes(normalize(entry.value)));
+  };
   for (let round = 0; round < 5; round++) {
     const next = decoded(text).replace(/[A-Za-z0-9+/]+=*/g, (run) => {
-      if (run.length < minimum) return run;
-      // Slash is both base64 alphabet and a filename component boundary.
-      for (const candidate of new Set([run, ...run.split("/")])) {
-        if (candidate.replace(/=+$/, "").length < minimum) continue;
-        const bytes = Buffer.from(candidate, "base64");
-        const canonical = bytes.toString("base64");
-        if (
-          (candidate.includes("=") ? canonical : canonical.replace(/=+$/, "")) !== candidate ||
-          !isUtf8(bytes)
-        )
-          continue;
-        const value = bytes.toString();
-        if (entries.some((entry) => normalize(value).includes(normalize(entry.value)))) return value;
-      }
+      // Decoding from each offset aligns any encoding in the run, so only a likely hit pays for exact spans.
+      if (
+        run.length < minimum ||
+        ![0, 1, 2, 3].some((o) => contains(Buffer.from(run.slice(o), "base64").toString()))
+      )
+        return run;
+      // Slash is both base64 alphabet and a filename component boundary, so try every slash-delimited span.
+      const starts = [0, ...Array.from(run.matchAll(/\//g), ({ index }) => index + 1)];
+      const ends = [...starts.slice(1).map((start) => start - 1), run.length];
+      for (const start of starts)
+        for (const end of ends) {
+          const candidate = run.slice(start, end);
+          if (candidate.replace(/=+$/, "").length < minimum) continue;
+          const bytes = Buffer.from(candidate, "base64");
+          const canonical = bytes.toString("base64");
+          if (
+            (candidate.includes("=") ? canonical : canonical.replace(/=+$/, "")) !== candidate ||
+            !isUtf8(bytes)
+          )
+            continue;
+          if (contains(bytes.toString())) return bytes.toString();
+        }
       // Unrelated runs must not change decoding convergence or cause a refusal.
       return run;
     });

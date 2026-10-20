@@ -3601,9 +3601,13 @@ test.each([
   ["squash", "base64 private"],
   ["history", "unpadded base64 credential"],
   ["staged", "unpadded base64 private"],
+  ["staged", "slashed base64 credential"],
+  ["history", "slashed base64 private"],
 ])("decoding diagnosis withholds encoded filenames: %s %s", async (kind, sensitive) => {
-  const credential = ["synthetic", "encoded", "credential"].join("-");
-  const privateValue = ["synthetic", "private", "filename"].join("-");
+  // One of three "?" bytes ends a base64 group as "/", nesting the file under parts of the encoding.
+  const suffix = sensitive.startsWith("slashed") ? "-???" : "";
+  const credential = `${["synthetic", "encoded", "credential"].join("-")}${suffix}`;
+  const privateValue = `${["synthetic", "private", "filename"].join("-")}${suffix}`;
   registerCredential("encoded-publication-path-test", credential);
   const isCredential = sensitive.includes("credential");
   const value = isCredential ? credential : privateValue;
@@ -3617,8 +3621,10 @@ test.each([
         : Array.from(value, (c) =>
             sensitive === "html" ? `&#${c.charCodeAt(0)};` : `%${c.charCodeAt(0).toString(16)}`,
           ).join("");
-  const path = `report-${encoded}.txt`;
+  if (suffix) expect(encoded).toContain("/");
+  const path = sensitive.startsWith("slashed") ? `reports/${encoded}.txt` : `report-${encoded}.txt`;
   const payload = `%${"25".repeat(6)}72`;
+  mkdirSync(dirname(join(work, path)), { recursive: true });
   writeFileSync(join(work, path), payload);
   await stageAll({ cwd: work });
   if (kind !== "staged") await commitAll(work, "encoded report filename");

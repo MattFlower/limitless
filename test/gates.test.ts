@@ -1227,6 +1227,28 @@ describe("private strings", () => {
     expect(privateMatches(Buffer.from("A").toString("base64"), [{ value: "Ａ", entry: 7 }])).toEqual([]);
   });
 
+  test("base64 whose alphabet slash follows a directory prefix still matches", () => {
+    // One of three "?" bytes always ends a base64 group as "/".
+    const value = ["synthetic", "slashed", "credential???"].join("-");
+    const entries = [{ value, entry: 4 }];
+    const encoded = Buffer.from(value).toString("base64");
+    expect(encoded).toContain("/");
+    for (const run of [encoded, encoded.replace(/=+$/, "")]) {
+      for (const text of [`notes/${run}.txt`, `a/b/${run}`, `dir/${run}/more.txt`, `x/${run}/y/z`])
+        expect(privateMatches(text, entries)).toEqual(entries);
+      expect(privateMatches(`notes/${run.slice(0, -4)}.txt`, entries)).toEqual([]);
+    }
+    proc.registerCredential("audit-slashed-base64-test", value);
+    const path = `vendor/${encoded}`;
+    const findings = auditDiff(
+      { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+      { taskClass: null, protectedPaths: [] },
+    );
+    expect(findings.find((f) => f.rule === "gitlink")).toMatchObject({ file: "[redacted filename]" });
+    for (const part of [value, ...encoded.split("/").filter((part) => part.length >= 8)])
+      expect(JSON.stringify(findings)).not.toContain(part);
+  });
+
   test.each(["percent", "HTML", "base64", "unpadded base64"])(
     "every audit rule withholds %s filenames and detail references before literal redaction",
     (encoding) => {
