@@ -424,7 +424,9 @@ export function auditDiff(
       });
     }
   }
-  const protectedText = [...entries, ...registeredCredentials().map((value) => ({ value, entry: 1 }))];
+  // Include the JSON-escaped spelling redactCredentials also removes, since lastAudit is persisted unredacted.
+  const credentials = registeredCredentials().flatMap((value) => [value, JSON.stringify(value).slice(1, -1)]);
+  const protectedText = [...entries, ...credentials.map((value) => ({ value, entry: 1 }))];
   return dedupe(
     findings.map((f) => {
       const file = f.file === undefined ? undefined : stripVTControlCharacters(f.file);

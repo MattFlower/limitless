@@ -1384,6 +1384,26 @@ describe("private strings", () => {
     }
   });
 
+  test("audit withholds the JSON-escaped spelling of a credential containing a quote or backslash", () => {
+    const credential = ['synthetic"escaped', "credential\\value"].join("-");
+    const escaped = JSON.stringify(credential).slice(1, -1);
+    expect(escaped).not.toContain(credential);
+    proc.registerCredential("audit-escaped-credential-test", credential);
+    const path = `vendor-${escaped}`;
+    const findings = auditDiff(
+      { ...diff("", [{ status: "A", path }]), gitlinks: [path] },
+      { taskClass: null, protectedPaths: [], toolCommands: [`git commit --no-verify -m "${escaped}"`] },
+    );
+    expect(findings.find((f) => f.rule === "gitlink")).toEqual({
+      rule: "gitlink",
+      severity: "block",
+      file: "[redacted filename]",
+      detail: "[redacted diagnostic]",
+    });
+    expect(findings.find((f) => f.rule === "no-verify")?.detail).toBe("[redacted diagnostic]");
+    expect(JSON.stringify(findings)).not.toContain(escaped);
+  });
+
   test("base64 matching stays linear on slash-heavy runs", () => {
     const value = ["synthetic", "slash", "run"].join("-");
     const run = `${"/".repeat(200_000)}${Buffer.from(value).toString("base64")}`;
