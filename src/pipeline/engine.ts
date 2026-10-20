@@ -351,7 +351,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     const failureStage =
       ctx.state.conflictRound !== undefined
         ? "conflict resolution"
-        : message.includes("post-merge gates")
+        : message.includes("post-merge gate")
           ? "post-merge gates"
           : ctx.run.stage === "deliver"
             ? "delivery merge"
@@ -2698,7 +2698,12 @@ async function mergeForDelivery(
     await ctx.stage(
       "gates",
       async () => {
-        const after = await runGateExecution(
+        const timeoutOnly = (run: GateRun) =>
+          run.setupOk &&
+          ![...run.setup, ...run.checks].some(confinementFailed) &&
+          run.checks.some((r) => !r.ok) &&
+          run.checks.every((r) => r.ok || r.timedOut);
+        let after = await runGateExecution(
           ctx,
           "gates",
           "rebase",
@@ -2707,6 +2712,28 @@ async function mergeForDelivery(
           gateEvents(ctx),
         );
         ctx.checkCancelled();
+        if (timeoutOnly(after)) {
+          const first = after;
+          ctx.artifact(
+            `gates-rebase-timeout-${ctx.state.round}.json`,
+            "gates",
+            JSON.stringify(redactGateData(first)),
+          );
+          await checkoutCommitted(cwd);
+          after = await runGateExecution(
+            ctx,
+            "gates",
+            "timeout",
+            cwd,
+            ctx.state.gatesConfig as GateConfig,
+            gateEvents(ctx),
+          );
+          ctx.checkCancelled();
+          after.checks = after.checks.map((r) => ({
+            ...r,
+            firstAttempt: findGateCounterpart(r, after.checks, first.checks),
+          }));
+        }
         await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
         await mergeGit(cwd, ["clean", "-fdq"]);
         // A check fixed by the implementation must stay fixed after merging, even when
@@ -2716,7 +2743,7 @@ async function mergeForDelivery(
             ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
             : (ctx.state.baseline ?? null),
           after,
-        );
+        ).map((c) => ({ ...c, firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt }));
         ctx.state.lastGates = comparison;
         await ctx.save();
         ctx.artifact(
@@ -2728,7 +2755,10 @@ async function mergeForDelivery(
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
           previous.some((c) => c.result.ok && !findGateCounterpart(c, previous, after.checks)?.ok);
-        if (regressed) throw new MergeRegressedError("post-merge gates regressed");
+        if (regressed)
+          throw new MergeRegressedError(
+            timeoutOnly(after) ? "post-merge gate timed out" : "post-merge gates regressed",
+          );
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       },
       ctx.state.round,
@@ -2742,7 +2772,7 @@ async function mergeForDelivery(
     ctx.state.preRebaseGates = undefined;
     ctx.state.preRebaseHead = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    throw new NeedsHumanError(`post-merge gates regressed after merging onto ${fetched.slice(0, 8)}`);
+    throw new NeedsHumanError(`${error.message} after merging onto ${fetched.slice(0, 8)}`);
   }
   const merged = await validateMerge(cwd, before, fetched);
   if (ctx.state.reviewedSha) {
