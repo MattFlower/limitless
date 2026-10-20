@@ -78,7 +78,7 @@ test.skipIf(process.env.LIMITLESS_CONFINED === "1")("confined", () => {});
 import { afterAll } from "bun:test";
 afterAll(async () => {
   if (process.env.LIMITLESS_GATE_REPORT) await Bun.write(process.env.LIMITLESS_GATE_REPORT,
-    '<testsuites tests="2" failures="0" skipped="1"><testsuite tests="2" failures="0" skipped="1" file="test/loopback.test.ts"><testcase name="loopback server"/><testcase name="confined"><skipped/></testcase></testsuite></testsuites>');
+    '<testsuites tests="2" failures="0" skipped="1"><testsuite tests="2" failures="0" skipped="1" file="test/loopback.test.ts"><testcase name="loopback server"/><testcase name="confined" line="9"><skipped/></testcase></testsuite></testsuites>');
 });
 `,
       );
@@ -196,6 +196,12 @@ afterAll(async () => {
     expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
+    if (evidence.includes("skips")) {
+      for (const check of [state?.baseline?.checks[0], state?.gateEvidence?.checks[0]?.result])
+        expect(check?.testCoverage?.skippedTests).toEqual([
+          { file: "test/loopback.test.ts", name: "confined", line: 9 },
+        ]);
+    }
     if (succeeds) {
       const gate = state?.gateEvidence;
       expect(result?.status).toBe("met");
