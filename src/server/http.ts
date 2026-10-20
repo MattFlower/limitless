@@ -783,6 +783,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         "/models",
         "/providers",
         "/chat",
+        "/land",
         "/evals",
         "/evals/*",
       ])
