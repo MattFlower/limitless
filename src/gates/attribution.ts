@@ -15,7 +15,7 @@ export function attributedJUnitCounts(
   files: ReadonlySet<string>,
   checkout: string,
   canonicalFile: (file: string) => string | undefined,
-  onTestcase?: (node: Bun.XML.Node, file?: string) => void,
+  onTestcase?: (node: Bun.XML.Node, file?: string, describes?: (string | undefined)[]) => void,
 ): AttributedTestCounts | undefined {
   const canonicalCheckout = realpathSync(checkout);
   const reportFiles = new Map<string, Set<string>>();
@@ -31,14 +31,19 @@ export function attributedJUnitCounts(
     for (const child of node.children) if (typeof child === "object" && "name" in child) collect(child);
   };
   collect(root);
-  const visit = (node: Bun.XML.Node, inheritedFile?: string): AttributedTestCounts => {
+  // Suites nested below a file's suite are Bun describe blocks, outermost first.
+  const visit = (
+    node: Bun.XML.Node,
+    inheritedFile?: string,
+    describes: (string | undefined)[] = [],
+  ): AttributedTestCounts => {
     const file = node.attributes.file ?? inheritedFile;
     const counts = { tests: 0, failures: 0, errors: 0, skipped: 0 };
     const children = node.children.filter(
       (child): child is Bun.XML.Node => typeof child === "object" && "name" in child,
     );
     if (node.name === "testcase") {
-      onTestcase?.(node, file);
+      onTestcase?.(node, file, describes);
       counts.tests = 1;
       for (const child of children) {
         if (child.name === "failure") counts.failures = 1;
@@ -73,7 +78,13 @@ export function attributedJUnitCounts(
     } else {
       for (const child of children) {
         if (child.name === "testsuite" || child.name === "testcase") {
-          const nested = visit(child, file);
+          const nested = visit(
+            child,
+            file,
+            node.name === "testsuite" && inheritedFile !== undefined
+              ? [...describes, node.attributes.name]
+              : describes,
+          );
           for (const key of Object.keys(counts) as (keyof AttributedTestCounts)[]) counts[key] += nested[key];
         } else if (child.name !== "system-out" && child.name !== "system-err" && child.name !== "properties")
           throw new Error("Unknown suite evidence");

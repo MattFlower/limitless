@@ -973,6 +973,94 @@ test("inherited duplicate occurrences are counted in the citation", () => {
   );
 });
 
+// Captured from Bun 1.4.3; hostname replaced. A `test.skipIf` flag moves the skip between two
+// tests named `x`: `describe("outer") > describe("inner")` and `describe("b")`.
+const swapJUnit = {
+  inner: `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="3" assertions="2" failures="0" skipped="1" time="0.002826">
+  <testsuite name="test/swap.test.ts" file="test/swap.test.ts" tests="3" assertions="2" failures="0" skipped="1" time="0.000669" hostname="example.com">
+    <testsuite name="outer" file="test/swap.test.ts" line="3" tests="1" assertions="0" failures="0" skipped="1" time="0" hostname="example.com">
+      <testsuite name="inner" file="test/swap.test.ts" line="4" tests="1" assertions="0" failures="0" skipped="1" time="0" hostname="example.com">
+        <testcase name="x" classname="inner &gt; outer" time="0" file="test/swap.test.ts" line="5" assertions="0">
+          <skipped />
+        </testcase>
+      </testsuite>
+    </testsuite>
+    <testsuite name="b" file="test/swap.test.ts" line="8" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="example.com">
+      <testcase name="x" classname="b" time="0.000011" file="test/swap.test.ts" line="9" assertions="1" />
+    </testsuite>
+    <testcase name="runs" classname="" time="0.000004" file="test/swap.test.ts" line="11" assertions="1" />
+  </testsuite>
+</testsuites>`,
+  b: `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="3" assertions="2" failures="0" skipped="1" time="0.002052">
+  <testsuite name="test/swap.test.ts" file="test/swap.test.ts" tests="3" assertions="2" failures="0" skipped="1" time="0.000478" hostname="example.com">
+    <testsuite name="outer" file="test/swap.test.ts" line="3" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="example.com">
+      <testsuite name="inner" file="test/swap.test.ts" line="4" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="example.com">
+        <testcase name="x" classname="inner &gt; outer" time="0.000008" file="test/swap.test.ts" line="5" assertions="1" />
+      </testsuite>
+    </testsuite>
+    <testsuite name="b" file="test/swap.test.ts" line="8" tests="1" assertions="0" failures="0" skipped="1" time="0" hostname="example.com">
+      <testcase name="x" classname="b" time="0" file="test/swap.test.ts" line="9" assertions="0">
+        <skipped />
+      </testcase>
+    </testsuite>
+    <testcase name="runs" classname="" time="0.000003" file="test/swap.test.ts" line="11" assertions="1" />
+  </testsuite>
+</testsuites>`,
+};
+
+test.each([
+  ["inner", "met"],
+  ["b", "blocked"],
+] as const)("skip identities include the describe path (candidate skips %s)", (skipped, status) => {
+  const cwd = mkdtempSync(join(tmpdir(), "skip-describe-"));
+  try {
+    mkdirSync(join(cwd, "test"));
+    writeFileSync(join(cwd, "test/swap.test.ts"), "");
+    // A changed helper behind `skipIf` can swap which same-named test skips without editing the file.
+    const output = "test/swap.test.ts:\n(pass) runs\n2 pass\n1 skip\n0 fail\nRan 3 tests across 1 file.";
+    const result = (variant: keyof typeof swapJUnit) => {
+      writeFileSync(join(cwd, "report.xml"), swapJUnit[variant]);
+      const parsed = readJUnitSkips(join(cwd, "report.xml"), cwd);
+      const parser = new BunTestCoverage(cwd);
+      const runner = new RunnerFailureEvidence();
+      for (const line of output.split("\n")) {
+        parser.observe(line);
+        runner.observe(line);
+      }
+      const template = gates().checks[0];
+      if (!template) throw new Error("missing fixture check");
+      return {
+        ...template.result,
+        output,
+        testCoverage: parser.result(parsed, runner.agrees(parsed?.counts)),
+      };
+    };
+    const base = result("inner");
+    expect(base.testCoverage.skippedTests).toEqual([
+      { file: "test/swap.test.ts", name: "outer > inner > x" },
+    ]);
+    expect(result("b").testCoverage.skippedTests).toEqual([{ file: "test/swap.test.ts", name: "b > x" }]);
+    const evidence = { ...gates(), baseSha: sha, changedFiles: ["src/helper.ts"] };
+    const check = evidence.checks[0];
+    if (!check) throw new Error("missing fixture check");
+    check.result = result(skipped);
+    const baseline: GateRun = { sha, setupOk: true, setup: [], checks: [base] };
+    const broad = {
+      ...spec,
+      acceptance_criteria: [{ id: "AC-1", criterion: "all tests pass", how_to_verify: "bun test" }],
+    };
+    const verdict = applyGateEvidence(blocked, broad, holdout, sha, evidence, baseline).criteria[0];
+    expect(verdict?.status).toBe(status);
+    expect(verdict?.evidence).toContain(
+      skipped === "inner" ? "1 inherited skips" : "skipped-test occurrences not inherited from the baseline",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("redaction collisions cannot authorize inherited skips at cache or resume boundaries", () => {
   const secret = ["credential", "skip", "collision"].join("-").repeat(4);
   const { evidence, check, baseline, base } = inheritedFixture();

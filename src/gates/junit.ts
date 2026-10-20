@@ -192,12 +192,14 @@ export function readJUnitSkips(
           throw new Error("Unsafe report path");
         return canonical;
       },
-      (node, rawFile) => {
-        const name = node.attributes.name;
+      (node, rawFile, describes = []) => {
+        // Bun's console row (`outer > inner > test`); classname lists describes innermost first.
+        const parts = [...describes, node.attributes.name];
+        const name = parts.join(" > ");
         const file = rawFile && canonicalTestFile(rawFile, cwd);
         if (
           !file ||
-          !name?.trim() ||
+          !node.attributes.name?.trim() ||
           [...name].some(
             (char) => char.charCodeAt(0) < 32 || (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159),
           ) ||
@@ -211,6 +213,9 @@ export function readJUnitSkips(
         if (outcomes.some((child) => elements(child).length > 0) || outcomes.length > 1)
           throw new Error("Ambiguous testcase");
         if (outcomes[0]?.name === "skipped") {
+          // A separator inside one component would let different describe paths compare equal.
+          if (parts.some((part) => !part?.trim() || part.includes(" > ")))
+            throw new Error("Ambiguous skip identity");
           if (
             skippedTests.length >= MAX_SKIPPED_TESTS ||
             Math.max(file.length, name.length) > MAX_TEST_IDENTITY_LENGTH

@@ -2611,9 +2611,9 @@ test.each(["absent", "headerless", "interleaved"])(
         runner.observe(line);
       }
       const expected = [
-        { file: "one.test.ts", name: "same" },
-        { file: "one.test.ts", name: "same" },
-        { file: "one.test.ts", name: "pending" },
+        { file: "one.test.ts", name: "suite > same" },
+        { file: "one.test.ts", name: "suite > same" },
+        { file: "one.test.ts", name: "suite > pending" },
       ];
       expect(parsed?.skippedTests).toEqual(expected);
       expect(coverage.result(parsed, runner.agrees(parsed?.counts))).toMatchObject({
@@ -2670,6 +2670,8 @@ test.each([
   "summary-missing",
   "redacted-name",
   "redacted-file",
+  "separator-name",
+  "empty-describe",
   "xml-path",
 ])("skip reports fail closed or preserve exact bounds: %s", (kind) => {
   const cwd = mkdtempSync(join(tmpdir(), "junit-skip-invalid-"));
@@ -2697,8 +2699,10 @@ test.each([
     if (kind === "length-boundary" || kind === "name-overflow")
       xml = xml.replaceAll(
         'name="same"',
-        `name="${"x".repeat(MAX_TEST_IDENTITY_LENGTH + Number(kind === "name-overflow"))}"`,
+        `name="${"x".repeat(MAX_TEST_IDENTITY_LENGTH - "suite > ".length + Number(kind === "name-overflow"))}"`,
       );
+    if (kind === "separator-name") xml = xml.replaceAll('name="same"', 'name="same &gt; name"');
+    if (kind === "empty-describe") xml = xml.replace('name="suite"', 'name=" "');
     if (kind === "file-overflow")
       xml = xml.replaceAll('file="one.test.ts"', `file="${"x".repeat(MAX_TEST_IDENTITY_LENGTH + 1)}"`);
     const secret = ["skip", "credential", kind].join("-").repeat(3);
@@ -2714,7 +2718,7 @@ test.each([
       writeFileSync(join(cwd, "one&two.test.ts"), "");
       xml = xml
         .replaceAll('file="one.test.ts"', 'file="./one&amp;two.test.ts"')
-        .replaceAll('name="same"', 'name="same &gt; name"');
+        .replaceAll('name="same"', 'name="same &amp; name"');
     }
     if (kind !== "missing") writeFileSync(report, xml);
     if (kind === "report-symlink") {
@@ -2740,7 +2744,7 @@ test.each([
     if (valid) {
       expect(parsed?.skippedTests).toHaveLength(kind === "count-boundary" ? MAX_SKIPPED_TESTS : 3);
       if (kind === "xml-path")
-        expect(parsed?.skippedTests[0]).toEqual({ file: "one&two.test.ts", name: "same > name" });
+        expect(parsed?.skippedTests[0]).toEqual({ file: "one&two.test.ts", name: "suite > same & name" });
     } else {
       expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTestsIncomplete).toBe(true);
       expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTests).toBeUndefined();
