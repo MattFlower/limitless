@@ -432,11 +432,11 @@ test("changed baseline script diagnostics stay redacted after gate-started resta
   expect(state?.baselineScripts).toEqual({ check: script });
   expect(state?.lastAudit?.find((finding) => finding.rule === "gate-script-changed")).toMatchObject({
     severity: "block",
-    detail: 'Changed the "check" script that a factory check runs ("true # [redacted]" → "true").',
+    detail: "[redacted diagnostic]",
   });
   const events = resumed.store.listEvents(run.id).filter((event) => event.type === "audit");
   expect(events.length).toBeGreaterThan(0);
-  expect(state?.feedback).toContain("true # [redacted]");
+  expect(state?.feedback).toContain("[redacted diagnostic]");
   expect(resumed.store.getRun(run.id)?.error).toContain("Last feedback:");
   expect(JSON.stringify([events, state?.feedback, resumed.store.getRun(run.id)?.error])).not.toContain(
     secret,
@@ -451,7 +451,7 @@ test("changed baseline script diagnostics stay redacted after gate-started resta
     totals: { costUsd: 0, costEquivUsd: 0 },
     runUrl: "https://example.com/run",
   });
-  expect(report).toContain("true # [redacted]");
+  expect(report).toContain("[redacted diagnostic]");
   expect(report).not.toContain(secret);
   const colored = `${secret.slice(0, 12)}\x1b[31m${secret.slice(12)}\x1b[0m`;
   const fresh = auditDiff(
@@ -463,10 +463,7 @@ test("changed baseline script diagnostics stay redacted after gate-started resta
       toolCommands: [`git commit --no-verify -m '${colored}'`],
     },
   );
-  expect(fresh.map((finding) => finding.detail)).toEqual([
-    'Changed the "check" script that a factory check runs ("true # [redacted]" → "true # [redacted] changed").',
-    "Agent ran a command with --no-verify: git commit --no-verify -m '[redacted]'",
-  ]);
+  expect(fresh.map((finding) => finding.detail)).toEqual(["[redacted diagnostic]", "[redacted diagnostic]"]);
 });
 
 test.each([

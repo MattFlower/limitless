@@ -1,7 +1,8 @@
+import { stripVTControlCharacters } from "node:util";
 import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
-import { redactGateOutput } from "./output.ts";
-import { loadPrivateStrings, privateMatches, privateReason, redactPrivate } from "./private.ts";
+import { registeredCredentials } from "../util/proc.ts";
+import { loadPrivateStrings, privateMatches, privateReason } from "./private.ts";
 
 export interface AuditFinding {
   rule: string;
@@ -409,8 +410,8 @@ export function auditDiff(
         file: "package.json",
         detail:
           after === undefined
-            ? `Removed the "${redactGateOutput(name)}" script that a factory check runs.`
-            : `Changed the "${redactGateOutput(name)}" script that a factory check runs ("${redactGateOutput(before)}" → "${redactGateOutput(after)}").`,
+            ? `Removed the "${name}" script that a factory check runs.`
+            : `Changed the "${name}" script that a factory check runs ("${before}" → "${after}").`,
       });
     }
   }
@@ -419,19 +420,25 @@ export function auditDiff(
       findings.push({
         rule: "no-verify",
         severity: "warn",
-        detail: `Agent ran a command with --no-verify: ${redactGateOutput(cmd)}`,
+        detail: `Agent ran a command with --no-verify: ${cmd}`,
       });
     }
   }
+  // Include the JSON-escaped spelling redactCredentials also removes, since lastAudit is persisted unredacted.
+  const credentials = registeredCredentials().flatMap((value) => [value, JSON.stringify(value).slice(1, -1)]);
+  const protectedText = [...entries, ...credentials.map((value) => ({ value, entry: 1 }))];
   return dedupe(
     findings.map((f) => {
-      const file = f.file === undefined ? undefined : redactGateOutput(f.file);
+      const file = f.file === undefined ? undefined : stripVTControlCharacters(f.file);
+      const detail = stripVTControlCharacters(f.detail);
       return {
         ...f,
         ...(file !== undefined
-          ? { file: privateMatches(file, entries).length ? "[redacted filename]" : file }
+          ? {
+              file: privateMatches(file, protectedText).length ? "[redacted filename]" : file,
+            }
           : {}),
-        detail: redactPrivate(redactGateOutput(f.detail), entries),
+        detail: privateMatches(detail, protectedText).length ? "[redacted diagnostic]" : detail,
       };
     }),
   );
