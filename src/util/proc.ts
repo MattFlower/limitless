@@ -1071,10 +1071,9 @@ export async function sh(
   }
   if ((res.exitCode !== 0 || res.timedOut) && !opts.allowFail) {
     throw new CommandError(
-      `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
-        0,
-        4000,
-      ),
+      redactCredentials(
+        `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`,
+      ).slice(0, 4000),
       res.exitCode,
       res.stdout,
       res.stderr,
