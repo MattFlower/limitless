@@ -19,11 +19,13 @@ import {
   processBirth,
   processBirthInspection,
   processBootInspection,
+  processInspection,
   processRecoveryInspection,
   processScope,
   recoverProcessCleanups,
   recoverScopedProcesses,
   recoveryProcessStopped,
+  registerCredential,
   runProcess,
 } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
@@ -97,6 +99,7 @@ async function sleeper(): Promise<ProcessCleanup> {
     birth,
     boot: bootIdentity(),
     createdAt: Date.now(),
+    discovery: { group: pid, started: Date.now(), directories: [directory], leader: null, spawnedAt: "0" },
   };
 }
 
@@ -111,6 +114,242 @@ function scope() {
     cleanups: store,
     terminationError: undefined as ProcessTerminationError | undefined,
   };
+}
+
+function snapshot(pids: readonly number[], withEnvironment: boolean, marker: string): string {
+  const uid = process.getuid?.();
+  return [
+    `${process.pid} ${uid} S scanner LIMITLESS_PROCESS_SCAN=${marker}`,
+    ...pids.map((pid) => `${pid} ${uid} S member${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`),
+  ].join("\n");
+}
+
+async function expectRecoveryRefusal(reason: string) {
+  const current = scope();
+  const sentinel = join(directory, "must-not-start");
+  await processScope.run(current, async () => {
+    await expect(
+      runProcess({
+        cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+        cwd: directory,
+        env: {},
+      }),
+    ).rejects.toThrow(reason);
+    expect(current.terminationError).toBeInstanceOf(ProcessTerminationError);
+    expect(store.listProcessCleanups().length).toBeGreaterThan(0);
+    expect(existsSync(sentinel)).toBe(false);
+    await expect(
+      Promise.resolve().then(() => runProcess({ cmd: ["unused"], cwd: directory, env: {} })),
+    ).rejects.toBe(current.terminationError);
+  });
+}
+
+test("discovery context survives reopening and legacy-column inserts remain compatible", async () => {
+  const row = await sleeper();
+  const scratch = join(directory, "scratch");
+  mkdirSync(scratch);
+  row.discovery = {
+    group: row.pid,
+    started: 1234,
+    directories: [realpathSync(directory), realpathSync(scratch)],
+    leader: { pid: row.pid, birth: row.birth, session: row.pid, group: row.pid },
+    spawnedAt: "12345678901234567890",
+  };
+  store.close();
+  const database = join(directory, "store.db");
+  store = new Store(database);
+  store.recordProcessCleanup(row);
+  store.db
+    .query(`INSERT INTO process_cleanups
+    (run_id, invocation, directory, pid, birth, boot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.runId, "legacy", directory, row.pid, row.birth, row.boot, row.createdAt);
+  store.close();
+  rmSync(scratch, { recursive: true });
+  store = new Store(database);
+  expect(store.listProcessCleanups().find((record) => record.invocation === row.invocation)).toEqual(row);
+  expect(store.listProcessCleanups().find((record) => record.invocation === "legacy")?.discovery).toBeNull();
+  store.deleteInvocationCleanups(row.invocation);
+  children[0]?.kill("SIGKILL");
+  await waitFor(() => recoveryProcessStopped(row.pid));
+  const kill = spyOn(process, "kill");
+  try {
+    await expectRecoveryRefusal("Missing process discovery context for legacy");
+    expect(kill.mock.calls.filter(([pid]) => pid === row.pid)).toHaveLength(0);
+  } finally {
+    kill.mockRestore();
+  }
+});
+
+for (const stopped of [false, true]) {
+  test(`rediscovery records later members before signalling (original stopped=${stopped})`, async () => {
+    const original = await sleeper();
+    const first = await sleeper();
+    const later = await sleeper();
+    store.recordProcessCleanup(original);
+    if (stopped) {
+      children[0]?.kill("SIGKILL");
+      await waitFor(() => recoveryProcessStopped(original.pid));
+    }
+    let scans = 0;
+    const signal = process.kill.bind(process);
+    const kill = spyOn(process, "kill").mockImplementation((pid, sig) => {
+      if (sig === "SIGKILL") {
+        const expected = [original, first, later].find((row) => row.pid === pid);
+        expect(expected).toBeDefined();
+        expect(store.listProcessCleanups()).toContainEqual(
+          expect.objectContaining({
+            invocation: original.invocation,
+            pid,
+            birth: expected?.birth,
+            discovery: original.discovery,
+          }),
+        );
+      }
+      return signal(pid, sig);
+    });
+    try {
+      await processInspection.run(
+        async (environment, marker) => {
+          if (environment) scans++;
+          const round = scans - Number(stopped);
+          if (environment && round === 2) await waitFor(() => recoveryProcessStopped(first.pid));
+          const members = round === 1 ? [first.pid] : round === 2 ? [later.pid] : [];
+          return snapshot(members, environment, marker);
+        },
+        () =>
+          processScope.run(scope(), async () => {
+            const result = await runProcess({
+              cmd: [process.execPath, "-e", "console.log('next')"],
+              cwd: directory,
+              env: {},
+              onStdoutLine: () => {
+                for (const row of [original, first, later]) expectProcessStopped(row.pid);
+                expect(store.listProcessCleanups()).toEqual([]);
+              },
+            });
+            expect(result.exitCode).toBe(0);
+          }),
+      );
+      for (const row of [first, later]) expect(kill.mock.calls).toContainEqual([row.pid, "SIGKILL"]);
+      expect(scans).toBeGreaterThanOrEqual(3);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+}
+
+for (const afterKill of [false, true]) {
+  test(`unavailable discovery retains context and blocks commands (after kill=${afterKill})`, async () => {
+    const row = await sleeper();
+    store.recordProcessCleanup(row);
+    let scans = 0;
+    const secret = crypto.randomUUID();
+    registerCredential("TEST_CLEANUP_DISCOVERY_SECRET", secret);
+    await processInspection.run(
+      async (environment, marker) => {
+        if (environment && ++scans > (afterKill ? 1 : 0)) {
+          if (afterKill) {
+            await waitFor(() => recoveryProcessStopped(row.pid));
+            expectProcessStopped(row.pid);
+          }
+          throw new Error(`injected recovery discovery unavailable ${secret}`);
+        }
+        return snapshot([], environment, marker);
+      },
+      () => expectRecoveryRefusal("injected recovery discovery unavailable [redacted]"),
+    );
+    expect(store.listProcessCleanups()).toEqual([row]);
+  });
+}
+
+test("continued rediscovery shares one recovery deadline and retains newly recorded members", async () => {
+  const original = await sleeper();
+  const later = await sleeper();
+  const latest = await sleeper();
+  store.recordProcessCleanup(original);
+  let scans = 0;
+  const now = performance.now();
+  let elapsed = 0;
+  const clock = spyOn(performance, "now").mockImplementation(() => now + elapsed);
+  try {
+    await processRecoveryInspection.run({ stopped: recoveryProcessStopped, timeoutMs: 100 }, () =>
+      processInspection.run(
+        async (environment, marker) => {
+          if (environment && ++scans === 2) elapsed = 100;
+          return snapshot([scans === 1 ? later.pid : latest.pid], environment, marker);
+        },
+        () => expectRecoveryRefusal("process rediscovery did not quiesce"),
+      ),
+    );
+    expect(scans).toBe(2);
+    for (const row of [later, latest])
+      expect(store.listProcessCleanups()).toContainEqual(
+        expect.objectContaining({
+          invocation: original.invocation,
+          pid: row.pid,
+          birth: row.birth,
+        }),
+      );
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+for (const failure of ["unconfirmed", "reused", "protected", "persistence"] as const) {
+  test(`rediscovery never signals a ${failure} member`, async () => {
+    const original = await sleeper();
+    const found = await sleeper();
+    children[0]?.kill("SIGKILL");
+    await waitFor(() => recoveryProcessStopped(original.pid));
+    store.recordProcessCleanup(original);
+    const persist = spyOn(store, "recordProcessCleanup");
+    if (failure === "persistence")
+      persist.mockImplementation(() => {
+        throw new Error("record unavailable");
+      });
+    const kill = spyOn(process, "kill");
+    let births = 0;
+    try {
+      await processRecoveryInspection.run(
+        {
+          stopped: recoveryProcessStopped,
+          timeoutMs: 10_000,
+          birth: async (pid) =>
+            pid === found.pid
+              ? failure === "unconfirmed"
+                ? null
+                : failure === "reused" && ++births > 1
+                  ? "reused"
+                  : found.birth
+              : processBirth(pid),
+        },
+        () =>
+          processInspection.run(
+            async (environment, marker) =>
+              snapshot([failure === "protected" ? process.pid : found.pid], environment, marker),
+            async () => {
+              if (failure !== "protected")
+                await expectRecoveryRefusal(
+                  failure === "unconfirmed"
+                    ? "identity could not be confirmed"
+                    : failure === "reused"
+                      ? "identity changed during recovery"
+                      : "record unavailable",
+                );
+              else await recoverProcessCleanups(store);
+            },
+          ),
+      );
+      expect(kill).not.toHaveBeenCalled();
+      if (failure === "unconfirmed" || failure === "persistence")
+        expect(store.listProcessCleanups()).toEqual([original]);
+      else if (failure === "reused") expect(store.listProcessCleanups()).toHaveLength(2);
+      else expect(store.listProcessCleanups()).toEqual([]);
+    } finally {
+      persist.mockRestore();
+      kill.mockRestore();
+    }
+  });
 }
 
 bunTest.skipIf(process.platform !== "linux")("real Linux boot identity is stable", () => {
@@ -238,8 +477,11 @@ for (const fail of [false, true]) {
     const inspecting = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     const kill = spyOn(process, "kill");
-    const deletion = spyOn(store, "deleteProcessCleanup");
+    const deletion = spyOn(store, "deleteInvocationCleanups");
     const retryInspection = mock(processBirth);
+    const retryDiscovery = mock(async (environment: boolean, marker: string) =>
+      snapshot([], environment, marker),
+    );
     const first = processRecoveryInspection.run(
       {
         stopped: recoveryProcessStopped,
@@ -256,13 +498,16 @@ for (const fail of [false, true]) {
     let results: Promise<PromiseSettledResult<void>[]> | undefined;
     try {
       await inspecting.promise;
-      const second = processRecoveryInspection.run(
-        { stopped: recoveryProcessStopped, timeoutMs: 10_000, birth: retryInspection },
-        () => recoverProcessCleanups(store, records),
+      const second = processInspection.run(retryDiscovery, () =>
+        processRecoveryInspection.run(
+          { stopped: recoveryProcessStopped, timeoutMs: 10_000, birth: retryInspection },
+          () => recoverProcessCleanups(store, records),
+        ),
       );
       results = Promise.allSettled([first, second]);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(retryInspection).not.toHaveBeenCalled();
+      expect(retryDiscovery).not.toHaveBeenCalled();
       expect(kill).not.toHaveBeenCalled();
       expect(store.listProcessCleanups()).toEqual(records);
       resume.resolve();
@@ -272,8 +517,10 @@ for (const fail of [false, true]) {
         expect(initial.reason).toHaveProperty("message", expect.stringContaining("injected recovery"));
       expect(retry?.status).toBe("fulfilled");
       expect(retryInspection).toHaveBeenCalledTimes(fail ? 1 : 0);
+      if (fail) expect(retryDiscovery).toHaveBeenCalled();
+      else expect(retryDiscovery).not.toHaveBeenCalled();
       expect(kill.mock.calls).toEqual([[row.pid, "SIGKILL"]]);
-      expect(deletion.mock.calls).toEqual([[row.invocation, row.pid]]);
+      expect(deletion.mock.calls).toEqual([[row.invocation]]);
       expectProcessStopped(row.pid);
       expect(store.listProcessCleanups()).toEqual([]);
     } finally {
@@ -288,7 +535,11 @@ for (const fail of [false, true]) {
 for (const mismatch of ["birth", "boot"] as const) {
   test(`recovery retires a different ${mismatch} without signalling a live PID`, async () => {
     const row = await sleeper();
-    store.recordProcessCleanup({ ...row, [mismatch]: `different-${row[mismatch]}` });
+    store.recordProcessCleanup({
+      ...row,
+      [mismatch]: `different-${row[mismatch]}`,
+      discovery: mismatch === "boot" ? null : row.discovery,
+    });
     const kill = spyOn(process, "kill");
     try {
       await recoverProcessCleanups(store);
@@ -411,21 +662,36 @@ test("records inside the checkout are recovered even when owned by another run",
   });
 });
 
-test("a supervisor killed after freeze leaves a durable member recovered before the next command", async () => {
+test("an interrupted sweep rediscovers a frozen parent's unrecorded child before the next command", async () => {
   store.close();
   const database = join(directory, "store.db");
   store = new Store(database);
   const ready = join(directory, "frozen");
+  const scratch = join(directory, "scratch");
+  mkdirSync(scratch);
   const memberFile = join(directory, "member");
   const script = join(directory, "supervisor.ts");
+  const parentScript = join(directory, "parent.cjs");
+  writeFileSync(
+    parentScript,
+    `
+    const {spawn} = require('node:child_process');
+    const child = spawn(process.execPath, ['-e', "console.log('ready'); setInterval(() => {}, 1000)"], { detached: true, stdio: ['ignore','pipe','ignore'] });
+    child.stdout.once('data', () => {
+      require('fs').writeFileSync(${JSON.stringify(memberFile)}, JSON.stringify([process.pid, child.pid]));
+      console.log('ready');
+    });
+    setInterval(() => {}, 1000);
+  `,
+  );
   const proc = new URL("../src/util/proc.ts", import.meta.url).pathname;
   const db = new URL("../src/db/store.ts", import.meta.url).pathname;
   writeFileSync(
     script,
     `
     import { Store } from ${JSON.stringify(db)};
-    import { processBirth, processBirthInspection, processBootInspection, processScope, runProcess } from ${JSON.stringify(proc)};
-    import { writeFileSync } from 'node:fs';
+    import { invocationScratch, processBirth, processBirthInspection, processBootInspection, processInspection, processScope, runProcess } from ${JSON.stringify(proc)};
+    import { readFileSync, writeFileSync } from 'node:fs';
     const store = new Store(${JSON.stringify(database)});
     let frozen;
     const kill = process.kill.bind(process);
@@ -434,7 +700,11 @@ test("a supervisor killed after freeze leaves a durable member recovered before 
       if (signal === 'SIGSTOP') frozen = pid;
       return result;
     };
-    await processBootInspection.run(() => "test-boot", () => processBirthInspection.run({ read: async (pid, name) => {
+    await invocationScratch.run(${JSON.stringify(scratch)}, () => processInspection.run(async (environment, marker) => {
+      // The child exists, but the interrupted sweep's last snapshot missed it.
+      const [pid] = JSON.parse(readFileSync(${JSON.stringify(memberFile)}, 'utf8'));
+      return ${snapshot.toString()}([pid], environment, marker);
+    }, () => processBootInspection.run(() => "test-boot", () => processBirthInspection.run({ read: async (pid, name) => {
       if (pid === frozen) {
         writeFileSync(${JSON.stringify(ready)}, String(pid));
         await new Promise(() => {});
@@ -444,32 +714,51 @@ test("a supervisor killed after freeze leaves a durable member recovered before 
       children: new Map(), scratchDirs: new Set(), runId: 'a', cleanups: store }, () => runProcess({
         cmd: [process.execPath, '-e', ${JSON.stringify(`
           const {spawn} = require('node:child_process');
-          const child = spawn(process.execPath, ['-e', "console.log('ready'); setInterval(() => {}, 1000)"], { detached: true, stdio: ['ignore','pipe','ignore'] });
-          child.stdout.once('data', () => { require('fs').writeFileSync(${JSON.stringify(memberFile)}, String(child.pid)); process.exit(0); });
+          const child = spawn(process.execPath, [${JSON.stringify(parentScript)}], { detached: true, stdio: ['ignore','pipe','ignore'] });
+          child.stdout.once('data', () => process.exit(0));
         `)}], cwd: ${JSON.stringify(directory)}, env: process.env
-      }))));
+      }))))));
   `,
   );
   const supervisor = spawn(process.execPath, [script], { cwd: directory, stdio: "ignore" });
   children.push(supervisor);
   let member: number | undefined;
+  let omitted: number | undefined;
+  const signal = process.kill.bind(process);
+  const kill = spyOn(process, "kill").mockImplementation((pid, sig) => {
+    if (pid === omitted && sig === "SIGKILL")
+      expect(store.listProcessCleanups()).toContainEqual(
+        expect.objectContaining({ pid, birth: omittedBirth }),
+      );
+    return signal(pid, sig);
+  });
+  let omittedBirth: string | null = null;
   try {
     await waitFor(() => existsSync(ready));
-    member = Number(readFileSync(memberFile, "utf8"));
+    [member, omitted] = JSON.parse(readFileSync(memberFile, "utf8"));
+    if (member === undefined || omitted === undefined) throw new Error("Missing invocation members");
+    omittedBirth = await processBirth(omitted);
     expect(Number(readFileSync(ready, "utf8"))).toBe(member);
     const rows = store.listProcessCleanups();
     expect(rows).toHaveLength(1);
+    expect(recoveryProcessStopped(omitted)).toBe(false);
     expect(rows[0]).toMatchObject({
       runId: "a",
       directory,
       pid: member,
       birth: await processBirth(member),
       boot: bootIdentity(),
+      discovery: expect.objectContaining({
+        directories: process.platform === "darwin" ? [directory, scratch] : [],
+        group: expect.any(Number),
+        spawnedAt: expect.any(String),
+      }),
     });
     expect(await processState(member)).toBe("T");
     supervisor.kill("SIGKILL");
     await new Promise<void>((resolve) => supervisor.once("exit", () => resolve()));
     store.close();
+    rmSync(scratch, { recursive: true });
     store = new Store(database);
     await processScope.run(scope(), async () => {
       const result = await runProcess({
@@ -478,17 +767,22 @@ test("a supervisor killed after freeze leaves a durable member recovered before 
         env: {},
         onStdoutLine: () => {
           expectProcessStopped(member ?? 0);
+          expectProcessStopped(omitted ?? 0);
           expect(store.listProcessCleanups()).toEqual([]);
         },
       });
       expect(result.exitCode).toBe(0);
     });
+    expect(kill.mock.calls).toContainEqual([omitted, "SIGKILL"]);
   } finally {
-    if (member === undefined && existsSync(memberFile)) member = Number(readFileSync(memberFile, "utf8"));
-    if (member !== undefined && !recoveryProcessStopped(member)) {
-      try {
-        process.kill(member, "SIGKILL");
-      } catch {}
-    }
+    kill.mockRestore();
+    if (member === undefined && existsSync(memberFile))
+      [member, omitted] = JSON.parse(readFileSync(memberFile, "utf8"));
+    for (const pid of [member, omitted])
+      if (pid !== undefined && !recoveryProcessStopped(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
   }
 }, 20_000);

@@ -28,6 +28,13 @@ export interface ProcessCleanup {
   birth: string;
   boot: string;
   createdAt: number;
+  discovery?: {
+    group: number;
+    started: number;
+    directories: readonly string[];
+    leader: DarwinInvocationLeader | null;
+    spawnedAt: string;
+  } | null;
 }
 export interface ProcessCleanupStore {
   recordProcessCleanup(record: ProcessCleanup): void;
@@ -117,34 +124,78 @@ export async function recoverProcessCleanups(
     if (!records.length) return;
     const boot = bootIdentity();
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
-    const pending: ProcessCleanup[] = [];
-    const retire = (row: ProcessCleanup) => store.deleteProcessCleanup(row.invocation, row.pid);
-    for (const row of records) {
-      if (row.boot !== boot || stopped(row.pid) || (await readBirth(row.pid)) !== row.birth) {
-        retire(row);
-        continue;
-      }
-      try {
-        process.kill(row.pid, "SIGKILL");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        retire(row);
-        continue;
-      }
-      pending.push(row);
-    }
     const deadline = performance.now() + timeoutMs;
-    while (pending.length) {
-      for (let i = pending.length - 1; i >= 0; i--) {
-        const row = pending[i];
-        if (row && stopped(row.pid)) {
-          retire(row);
-          pending.splice(i, 1);
+    for (const row of records) if (row.boot !== boot) store.deleteProcessCleanup(row.invocation, row.pid);
+    if (!records.some((row) => row.boot === boot)) return;
+    const protectedPids = callerAncestors();
+    const groups = [...invocations].flatMap((invocation) => {
+      const members = records.filter((row) => row.invocation === invocation && row.boot === boot);
+      if (!members.length) return [];
+      const anchor = members.find((row) => row.discovery);
+      const context = anchor?.discovery;
+      if (!anchor || !context) throw new Error(`Missing process discovery context for ${invocation}`);
+      return [{ anchor, context, claimed: new Map(members.map((row) => [row.pid, row])) }];
+    });
+    const killed = new Set<ProcessCleanup>();
+    let empty = false;
+    for (;;) {
+      let discovered = false;
+      const pending: number[] = [];
+      for (const { anchor, context, claimed } of groups) {
+        const pids = await markedProcesses(
+          anchor.invocation,
+          context.group,
+          context.started,
+          context.directories,
+          context.leader,
+          protectedPids,
+          BigInt(context.spawnedAt),
+        );
+        for (const pid of pids) {
+          if (protectedPids.has(pid) || claimed.has(pid)) continue;
+          const birth = await readBirth(pid);
+          if (birth === null) {
+            if (!stopped(pid)) throw new Error(`Process identity could not be confirmed for ${pid}`);
+            continue;
+          }
+          const row = { ...anchor, pid, birth, createdAt: Date.now() };
+          store.recordProcessCleanup(row);
+          claimed.set(pid, row);
+          discovered = true;
+        }
+        for (const row of claimed.values()) {
+          if (protectedPids.has(row.pid)) throw new Error(`Protected cleanup process ${row.pid}`);
+          if (stopped(row.pid)) continue;
+          if (killed.has(row)) {
+            pending.push(row.pid);
+            continue;
+          }
+          const birth = await readBirth(row.pid);
+          if (birth === null && !stopped(row.pid))
+            throw new Error(`Process identity could not be confirmed for ${row.pid}`);
+          if (birth !== row.birth && pids.includes(row.pid) && !stopped(row.pid))
+            throw new Error(`Process identity changed during recovery for ${row.pid}`);
+          if (birth !== row.birth) continue;
+          try {
+            process.kill(row.pid, "SIGKILL");
+            killed.add(row);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
+            throw error;
+          }
+          pending.push(row.pid);
         }
       }
-      if (!pending.length) return;
+      // Keep exited members' context until another empty scan rules out a fork during inspection.
+      if (!pending.length && !discovered && empty) {
+        for (const { anchor } of groups) store.deleteInvocationCleanups(anchor.invocation);
+        return;
+      }
+      empty = !pending.length && !discovered;
       if (performance.now() >= deadline)
-        throw new Error(`Recorded processes still alive: ${pending.map((row) => row.pid).join(", ")}`);
+        throw new Error(
+          `Recorded processes still alive: ${pending.join(", ")}; process rediscovery did not quiesce`,
+        );
       await Bun.sleep(10);
     }
   } catch (error) {
@@ -488,6 +539,7 @@ async function stopMarkedProcesses(
             birth,
             boot: bootIdentity(),
             createdAt: Date.now(),
+            discovery: { group, started: invokedAt, directories, leader, spawnedAt: String(spawnedAt) },
           });
           claimed.set(pid, { birth, stopped: false, frozen: false });
         }
