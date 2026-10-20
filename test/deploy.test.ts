@@ -20,6 +20,7 @@ import {
   DrainUnsupportedError,
   parseMaxWait,
   requestAdmin,
+  validateHealth,
   waitForDrain,
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
@@ -477,6 +478,67 @@ test("malformed health fails closed and never restarts", async () => {
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("invalid or unhealthy");
   expect(f.calls).not.toContain("restart");
   expect(f.calls).not.toContain("resume");
+});
+
+test("health validation accepts older daemons without the lag metric", () => {
+  expect(validateHealth({ ok: true, uptimeMs: 10, sha: "previous", draining: false, active: [] })).toEqual({
+    ok: true,
+    uptimeMs: 10,
+    sha: "previous",
+    draining: false,
+    active: [],
+  });
+});
+
+test("cleanup prints a safely quoted recovery command only after resume retries fail", async () => {
+  const previousHome = process.env.LIMITLESS_HOME;
+  const dir = mkdtempSync(join(tmpdir(), "limitless-recovery-"));
+  dirs.push(dir);
+  const configuredHome = join(dir, "operator's home $(unused)");
+  mkdirSync(configuredHome);
+  const token = crypto.randomUUID();
+  writeFileSync(join(configuredHome, "api-token"), token);
+  process.env.LIMITLESS_HOME = configuredHome;
+  try {
+    for (const stalls of [0, 1, 3]) {
+      const f = setup();
+      const admin = f.client.admin;
+      const signals: AbortSignal[] = [];
+      let attempts = 0;
+      f.client.admin = async (action, signal) => {
+        if (action === "drain") throw new Error("original drain failure");
+        if (++attempts <= stalls) {
+          signals.push(signal);
+          queueMicrotask(() => {
+            for (const timeout of [...f.pending]) timeout();
+          });
+          return new Promise<never>(() => {});
+        }
+        return admin(action, signal);
+      };
+      const diagnostic = await deploy(8123, "feature", false, f.opts).then(
+        () => "unexpected success",
+        (error: unknown) => String(error),
+      );
+      expect(diagnostic).toContain("original drain failure");
+      expect(attempts).toBe(stalls === 3 ? 3 : stalls + 1);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      expect(f.timeouts.filter((ms) => ms === 15_000)).toHaveLength(attempts);
+      expect(diagnostic).not.toContain(token);
+      if (stalls < 3) {
+        expect(diagnostic).not.toContain("curl");
+        expect(diagnostic).not.toContain("Cleanup failures:");
+      } else {
+        expect(diagnostic).toContain("Cleanup failures:\nresume scheduler: Error: daemon request timed out");
+        expect(diagnostic).toContain(
+          `curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- '${dir}/operator'"'"'s home $(unused)/api-token')" http://127.0.0.1:8123/api/admin/resume`,
+        );
+      }
+    }
+  } finally {
+    if (previousHome === undefined) delete process.env.LIMITLESS_HOME;
+    else process.env.LIMITLESS_HOME = previousHome;
+  }
 });
 
 test("--now and zero-wait drains don't retry a stalled health poll", async () => {

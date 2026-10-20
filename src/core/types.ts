@@ -540,6 +540,7 @@ export interface DrainState {
 }
 
 export interface HealthResponse extends DrainState {
+  eventLoopLagMaxMs?: number;
   gateSlots?: { occupied: number; limit: number; holders: string[] };
   agentTestSlots?: { occupied: number; limit: number; holders: string[] };
   ok: boolean;
