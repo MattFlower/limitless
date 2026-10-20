@@ -10,6 +10,7 @@ type DeployState = {
   handled: number;
   attempt: Attempt | null;
   blocked: (Attempt & { reason: string }) | null;
+  lastDeployed?: string;
   pendingRemoval?: string[];
 };
 export interface AutoDeployDeps {
@@ -99,13 +100,11 @@ export class AutoDeploy {
       const current = read();
       if (this.stopped || current.blocked || !matches(current.attempt, attempt)) return;
       current.attempt = null;
-      // Landings observed during the job belong to this batch, even across restarts.
-      current.handled = Math.max(current.handled, latest());
       if (attempt.job)
         current.pendingRemoval = [...new Set([...(current.pendingRemoval ?? []), attempt.job])];
       if (!result.ok) {
         const reason = redactCredentials(result.reason);
-        current.blocked = { ...attempt, landId: current.handled, time: d.now(), reason };
+        current.blocked = { ...attempt, time: d.now(), reason };
         d.store.transaction(() => {
           save(current);
           d.store.deployFeed(
@@ -116,7 +115,10 @@ export class AutoDeploy {
             `Deploy of ${attempt.sha} failed: ${reason}`,
           );
         });
-      } else save(current);
+      } else {
+        current.lastDeployed = attempt.sha;
+        save(current);
+      }
     };
     const cleanup = async () => {
       for (const job of read().pendingRemoval ?? []) {
@@ -168,7 +170,7 @@ export class AutoDeploy {
       return;
     if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error("Cannot resolve self repository main SHA");
     state.handled = landId;
-    if (sha === d.bootSha) {
+    if (sha === d.bootSha || sha === state.lastDeployed) {
       save(state);
       return;
     }

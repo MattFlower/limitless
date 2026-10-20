@@ -1002,6 +1002,8 @@ no entry in any repository's landing queue is active and the scheduler has no ac
 runs and evals do not count). Several landings during that wait produce one deploy of the current
 main SHA, only if it differs from the running release. It runs `limitless deploy <sha> --smoke`
 with the same checks, live smoke quota, default drain wait, restart and rollback described above.
+Landings arriving during a deploy stay pending for the next idle check. The last successfully
+deployed SHA is also skipped.
 The deploy runs once as a separate launchd job, with redacted output in
 `~/.limitless/logs/dev.limitless.deploy.*.log`. The daemon keeps its job id until removal succeeds
 and retries cleanup on later ticks.

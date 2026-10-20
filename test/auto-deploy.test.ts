@@ -174,10 +174,12 @@ test("failure redacts its reason and blocks across restart until a newer self la
 const KEY = "deploy.after_land:test/self";
 function state(store: Store) {
   return store.getSetting<{
+    handled: number;
     attempt: { job: string } | null;
-    blocked: { reason: string } | null;
+    blocked: { landId: number; reason: string } | null;
+    lastDeployed?: string;
     pendingRemoval?: string[];
-  }>(KEY, { attempt: null, blocked: null });
+  }>(KEY, { handled: 0, attempt: null, blocked: null });
 }
 
 for (const bootSha of [MAIN, BOOT]) {
@@ -209,8 +211,8 @@ for (const bootSha of [MAIN, BOOT]) {
     expect(state(f.store).attempt?.job).toBe(job);
     expect(state(f.store).blocked).toBeNull();
     expect(feed(f.store).filter((item) => item.kind === "deploy.failed")).toEqual([]);
-    // A landing during a still-running job belongs to the same batch.
-    land(f.store);
+    // A later landing with the same main must not redeploy a successful target after restart.
+    if (bootSha === BOOT) land(f.store);
     await restarted.module.tick();
     await restarted.module.tick();
     expect(restarted.calls).toEqual([]);
@@ -242,6 +244,47 @@ for (const bootSha of [MAIN, BOOT]) {
       await restarted.module.tick();
       expect(restarted.calls).toEqual(["c".repeat(40)]);
     }
+  });
+}
+
+for (const ok of [true, false]) {
+  test(`a newer main landing during a deploy stays pending after ${ok ? "success" : "failure"}`, async () => {
+    const pending = Promise.withResolvers<DeployResult>();
+    const calls: string[] = [];
+    const f = fixture({
+      deploy: (sha) => {
+        calls.push(sha);
+        return pending.promise;
+      },
+    });
+    await f.module.tick();
+    const first = land(f.store);
+    const inflight = f.module.tick();
+    await flush();
+    expect(calls).toEqual([MAIN]);
+    const newer = land(f.store);
+    await f.module.tick();
+    expect(calls).toEqual([MAIN]);
+    pending.resolve(ok ? { ok: true } : { ok: false, reason: "deploy failed" });
+    await inflight;
+    expect(state(f.store).handled).toBe(first.id);
+    if (ok) {
+      expect(state(f.store).blocked).toBeNull();
+      expect(state(f.store).lastDeployed).toBe(MAIN);
+    } else expect(state(f.store).blocked?.landId).toBe(first.id);
+    f.module.stop();
+
+    const next = "c".repeat(40);
+    const restarted = fixture({
+      store: f.store,
+      bootSha: ok ? MAIN : BOOT,
+      mainSha: async () => next,
+    });
+    await restarted.module.tick();
+    await restarted.module.tick();
+    expect(restarted.calls).toEqual([next]);
+    expect(state(f.store).handled).toBe(newer.id);
+    expect(state(f.store).blocked).toBeNull();
   });
 }
 

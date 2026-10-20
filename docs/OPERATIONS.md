@@ -68,7 +68,8 @@ after_land = "when_idle" # default: "off"; older releases ignore the table/key
 Only new landings on `main` in the daemon release checkout's `origin` GitHub repository count.
 Every 15 seconds, the daemon checks for pending landings and waits until no land entry in any
 repository is active and no scheduler run is active; parked runs and evals do not delay it.
-Landings during the wait coalesce. If main differs from the running boot SHA, a separate launchd
+Landings during the wait coalesce; landings during a deploy stay pending for the next idle check.
+If main differs from the running boot SHA and the last successfully deployed SHA, a separate launchd
 job runs the existing `limitless deploy <sha> --smoke` path, with checks, live smoke quota, default
 drain wait, restart and rollback. Redacted output is under `~/.limitless/logs/dev.limitless.deploy.*.log`.
 
