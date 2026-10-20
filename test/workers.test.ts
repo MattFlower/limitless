@@ -64,6 +64,8 @@ test("strict worker results and check events accept optional bounded skipped-tes
   for (const skippedTests of [
     undefined,
     [{ file: "test/one.test.ts", name: "suite > skipped" }],
+    [{ file: "test/one.test.ts", name: "suite > skipped", line: 12 }],
+    [{ file: "test/one.test.ts", name: "suite > skipped", line: Number.MAX_SAFE_INTEGER }],
     Array.from({ length: 2 }, () => ({ file: "test/one.test.ts", name: "duplicate" })),
   ]) {
     const result = {
@@ -74,10 +76,11 @@ test("strict worker results and check events accept optional bounded skipped-tes
         ...(skippedTests ? { skippedTests, skippedTestsIncomplete: false } : {}),
       },
     };
+    const decoded = Result.parse({ sha: releaseSha, run: { setupOk: true, setup: [], checks: [result] } });
+    expect(decoded.run.checks[0]?.testCoverage?.skippedTests).toEqual(skippedTests);
     expect(
-      Result.safeParse({ sha: releaseSha, run: { setupOk: true, setup: [], checks: [result] } }).success,
-    ).toBe(true);
-    expect(CheckEvent.safeParse({ type: "check", phase: "check", result }).success).toBe(true);
+      CheckEvent.parse({ type: "check", phase: "check", result }).result.testCoverage?.skippedTests,
+    ).toEqual(skippedTests);
   }
   for (const sha of [undefined, releaseSha, "f".repeat(64)]) {
     expect(
@@ -95,6 +98,9 @@ test("strict worker results and check events accept optional bounded skipped-tes
     [{ file: "test/one.test.ts", name: 1 }],
     [{ file: "test/one.test.ts", name: "skip", extra: true }],
     [{ file: "test/one.test.ts", name: "x".repeat(2001) }],
+    ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, "1", null].map((line) => [
+      { file: "test/one.test.ts", name: "skip", line },
+    ]),
     Array.from({ length: 1001 }, () => ({ file: "test/one.test.ts", name: "skip" })),
   ]) {
     const result = { ...check, testCoverage: { passedFiles: [], skippedFiles: [], skippedTests } };

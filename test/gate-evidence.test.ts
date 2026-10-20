@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { readJUnitSkips } from "../src/gates/junit.ts";
 import { redactGateData, redactGateDiagnostics } from "../src/gates/output.ts";
-import { compareGates, type GateRun, runGates } from "../src/gates/run.ts";
+import { compareGates, type GateRun, runGates, runLocalGates } from "../src/gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS } from "../src/gates/test-coverage.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
@@ -152,7 +152,7 @@ function coverage(output: string) {
       const row = /^\((pass|skip|todo)\) (.+)$/.exec(line);
       if (row)
         cases.push(
-          `<testcase file="${xmlEscape(file)}" name="${xmlEscape(row[2] ?? "")}">${row[1] === "pass" ? "" : "<skipped />"}</testcase>`,
+          `<testcase file="${xmlEscape(file)}" line="1" name="${xmlEscape(row[2] ?? "")}">${row[1] === "pass" ? "" : "<skipped />"}</testcase>`,
         );
     }
     runner.observe(`Ran ${cases.length} tests across 1 file.`);
@@ -240,6 +240,8 @@ test.each([
   "missing-baseline",
   "legacy-baseline",
   "legacy-candidate",
+  "legacy-baseline-line",
+  "legacy-candidate-line",
   "different-name",
   "different-command",
   "partial-identities",
@@ -336,6 +338,10 @@ test.each([
   if (kind.endsWith("outside-tail") || kind === "identity-limit") check.result.output = "x".repeat(6000);
   if (kind === "legacy-baseline") delete base.testCoverage?.skippedTests;
   if (kind === "legacy-candidate") delete check.result.testCoverage.skippedTests;
+  if (kind === "legacy-baseline-line")
+    for (const skip of base.testCoverage?.skippedTests ?? []) delete skip.line;
+  if (kind === "legacy-candidate-line")
+    for (const skip of check.result.testCoverage.skippedTests ?? []) delete skip.line;
   if (kind === "partial-identities") check.result.testCoverage.skippedFiles.push("test/unrecorded.test.ts");
   const result = applyGateEvidence(
     blocked,
@@ -380,6 +386,21 @@ test.each(["suite", "targeted", "retained-coverage"])(
     expect(result.overall).toBe("pass");
     expect(result.criteria[0]?.status).toBe("met");
     expect(result.criteria[0]?.gateEvidence?.stageId).toBe(12);
+  },
+);
+
+test.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity])(
+  "invalid persisted source line cannot authorize candidate or baseline skips: %s",
+  (line) => {
+    for (const side of ["candidate", "baseline"]) {
+      const { evidence, check, base, baseline } = inheritedFixture();
+      const skips = (side === "candidate" ? check.result : base).testCoverage?.skippedTests;
+      if (!skips?.[0]) throw new Error("missing skipped testcase");
+      skips[0].line = line;
+      const result = applyGateEvidence(blocked, spec, holdout, sha, evidence, baseline);
+      expect(result.criteria[0]?.status).toBe("blocked");
+      expect(result.criteria[0]?.evidence).toContain(`${side} skip identities unavailable`);
+    }
   },
 );
 
@@ -948,7 +969,11 @@ test.each([
 ])("inheritance refuses %s with a specific reason", (kind, reason) => {
   const { evidence, check, baseline, base } = inheritedFixture();
   if (kind === "new occurrence")
-    check.result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
+    check.result.testCoverage?.skippedTests?.push({
+      file: "test/loopback.test.ts",
+      name: "confined",
+      line: 1,
+    });
   else if (kind === "missing base commit") delete baseline.sha;
   else if (kind === "stale base") evidence.baseSha = "b".repeat(40);
   else if (kind === "missing diff") delete (evidence as GateEvidence).changedFiles;
@@ -967,10 +992,89 @@ test.each([
 test("inherited duplicate occurrences are counted in the citation", () => {
   const { evidence, check, baseline, base } = inheritedFixture();
   for (const result of [check.result, base])
-    result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined" });
+    result.testCoverage?.skippedTests?.push({ file: "test/loopback.test.ts", name: "confined", line: 1 });
   expect(applyGateEvidence(blocked, spec, holdout, sha, evidence, baseline).criteria[0]?.evidence).toContain(
     "3 inherited skips",
   );
+});
+
+test("unchanged duplicate titles cannot swap source lines through an edited helper", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "skip-lines-"));
+  try {
+    writeFileSync(join(cwd, "package.json"), "{}");
+    writeFileSync(
+      join(cwd, "same.test.ts"),
+      [
+        'import { expect, test } from "bun:test";',
+        'import { first, second } from "./helper.ts";',
+        'test.skipIf(first)("same", () => expect(true).toBe(true));',
+        'test.skipIf(second)("same", () => expect(true).toBe(true));',
+        'test("runs", () => expect(true).toBe(true));',
+      ].join("\n"),
+    );
+    const capture = async (first: boolean, second: boolean) => {
+      writeFileSync(join(cwd, "helper.ts"), `export const first = ${first}, second = ${second};`);
+      const run = await confinementScope.run(fakeConfinement, () =>
+        runLocalGates(
+          cwd,
+          {
+            source: "detected",
+            setup: [],
+            checks: [
+              {
+                name: "tests",
+                run: `${process.execPath} test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"`,
+              },
+            ],
+            protectedPaths: [],
+          },
+          new AbortController().signal,
+        ),
+      );
+      expect(run.checks[0]?.ok).toBe(true);
+      return { ...run, sha };
+    };
+    const first = await capture(true, false);
+    const swapped = await capture(false, true);
+    const both = await capture(true, true);
+    expect(first.checks[0]?.testCoverage?.skippedTests).toEqual([
+      { file: "same.test.ts", name: "same", line: 3 },
+    ]);
+    expect(swapped.checks[0]?.testCoverage?.skippedTests).toEqual([
+      { file: "same.test.ts", name: "same", line: 4 },
+    ]);
+    const evidence = { ...gates(), baseSha: sha, changedFiles: ["helper.ts"] };
+    const check = evidence.checks[0];
+    if (!check) throw new Error("missing fixture check");
+    const broad = {
+      ...spec,
+      acceptance_criteria: [{ id: "AC-1", criterion: "all tests pass", how_to_verify: "bun test" }],
+    };
+    for (const [baseline, candidate, status] of [
+      [first, swapped, "blocked"],
+      [both, first, "met"],
+    ] as const) {
+      const result = candidate.checks[0];
+      if (!result) throw new Error("missing candidate check");
+      check.result = result;
+      const verdict = applyGateEvidence(blocked, broad, holdout, sha, evidence, baseline).criteria[0];
+      expect(verdict?.status).toBe(status);
+      expect(verdict?.evidence).toContain(
+        status === "met" ? "1 inherited skips" : "occurrences not inherited",
+      );
+    }
+    // A matching title at another line cannot supply a second occurrence of line 3.
+    const result = first.checks[0];
+    const skip = result?.testCoverage?.skippedTests?.[0];
+    if (!result || !skip) throw new Error("missing skipped testcase");
+    check.result = structuredClone(result);
+    check.result.testCoverage?.skippedTests?.push(skip);
+    const verdict = applyGateEvidence(blocked, broad, holdout, sha, evidence, both).criteria[0];
+    expect(verdict?.status).toBe("blocked");
+    expect(verdict?.evidence).toContain("occurrences not inherited");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 // Captured from Bun 1.4.3; hostname replaced. A `test.skipIf` flag moves the skip between two
@@ -1039,9 +1143,11 @@ test.each([
     };
     const base = result("inner");
     expect(base.testCoverage.skippedTests).toEqual([
-      { file: "test/swap.test.ts", name: "outer > inner > x" },
+      { file: "test/swap.test.ts", name: "outer > inner > x", line: 5 },
     ]);
-    expect(result("b").testCoverage.skippedTests).toEqual([{ file: "test/swap.test.ts", name: "b > x" }]);
+    expect(result("b").testCoverage.skippedTests).toEqual([
+      { file: "test/swap.test.ts", name: "b > x", line: 9 },
+    ]);
     const evidence = { ...gates(), baseSha: sha, changedFiles: ["src/helper.ts"] };
     const check = evidence.checks[0];
     if (!check) throw new Error("missing fixture check");
@@ -1066,8 +1172,8 @@ test("redaction collisions cannot authorize inherited skips at cache or resume b
   const { evidence, check, baseline, base } = inheritedFixture();
   if (!base.testCoverage?.skippedTests || !check.result.testCoverage?.skippedTests)
     throw new Error("missing skips");
-  base.testCoverage.skippedTests[0] = { file: "test/loopback.test.ts", name: secret };
-  check.result.testCoverage.skippedTests[0] = { file: "test/loopback.test.ts", name: "[redacted]" };
+  base.testCoverage.skippedTests[0] = { file: "test/loopback.test.ts", name: secret, line: 1 };
+  check.result.testCoverage.skippedTests[0] = { file: "test/loopback.test.ts", name: "[redacted]", line: 1 };
   registerCredential("collision-fixture", secret);
   for (const stored of [redactGateData(baseline), { ...baseline, checks: [redactGateDiagnostics(base)] }]) {
     expect(stored.checks[0]?.testCoverage?.skippedTestsIncomplete).toBe(true);

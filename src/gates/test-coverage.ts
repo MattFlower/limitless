@@ -10,8 +10,8 @@ export interface TestCoverage {
   /** Files with at least one passing row and no failures; may also contain skipped tests. */
   passedFiles: string[];
   skippedFiles: string[];
-  /** Validated JUnit occurrences; duplicate file/name pairs are significant. */
-  skippedTests?: { file: string; name: string }[];
+  /** Validated JUnit occurrences; legacy identities without source lines cannot prove inheritance. */
+  skippedTests?: { file: string; name: string; line?: number }[];
   /** Unusable evidence survives tail truncation, including unattributed skips and failure rows. */
   skippedTestsIncomplete?: boolean;
   summary?: { passed: number; failed: number };

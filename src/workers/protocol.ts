@@ -63,6 +63,7 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
                 .object({
                   file: z.string().min(1).max(MAX_TEST_IDENTITY_LENGTH),
                   name: z.string().min(1).max(MAX_TEST_IDENTITY_LENGTH),
+                  line: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
                 })
                 .strict(),
             )

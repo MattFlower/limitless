@@ -85,7 +85,10 @@ function completeSkips(result: GateComparison["result"]): boolean {
     !!skips?.length &&
     skips.length <= MAX_SKIPPED_TESTS &&
     skips.every(
-      ({ file, name }) =>
+      ({ file, name, line }) =>
+        line !== undefined &&
+        Number.isSafeInteger(line) &&
+        line > 0 &&
         file.length > 0 &&
         name.trim().length > 0 &&
         Math.max(file.length, name.length) <= MAX_TEST_IDENTITY_LENGTH &&
@@ -137,11 +140,11 @@ function refusal(
     return "skipped-test files changed in the candidate diff";
   const remaining = new Map<string, number>();
   for (const skip of base.testCoverage?.skippedTests ?? []) {
-    const key = JSON.stringify([skip.file, skip.name]);
+    const key = JSON.stringify([skip.file, skip.name, skip.line]);
     remaining.set(key, (remaining.get(key) ?? 0) + 1);
   }
   for (const skip of skips) {
-    const key = JSON.stringify([skip.file, skip.name]);
+    const key = JSON.stringify([skip.file, skip.name, skip.line]);
     const count = remaining.get(key) ?? 0;
     if (!count) return "skipped-test occurrences not inherited from the baseline";
     remaining.set(key, count - 1);

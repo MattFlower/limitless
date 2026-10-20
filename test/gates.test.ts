@@ -41,6 +41,7 @@ import {
   retryBaselineFailures as productionBaselineRetry,
   runGates as productionGates,
   retryRegressions as productionRetry,
+  runLocalGates,
 } from "../src/gates/run.ts";
 import { defaultGateSlots, type GatePriority, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
@@ -2581,6 +2582,105 @@ const skipJUnit = `<?xml version="1.0" encoding="UTF-8"?>
 
 const skipSummary = ["1 pass", "2 skip", "1 todo", "0 fail", "Ran 4 tests across 1 file."];
 
+test("real Bun gate report retains skips beside a passing test.each title with a newline", async () => {
+  const cwd = tempDir({
+    "package.json": "{}",
+    "one.test.ts": [
+      'import { expect, test } from "bun:test";',
+      'test.skip("confined", () => {});',
+      'test.each(["first\\nsecond"])("passing %s", value => expect(value).toContain("second"));',
+    ].join("\n"),
+  });
+  try {
+    const result = await sandbox.confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        cwd,
+        {
+          source: "detected",
+          setup: [],
+          checks: [
+            {
+              name: "test",
+              run: `${process.execPath} test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"`,
+            },
+          ],
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      ),
+    );
+    expect(result.checks[0]).toMatchObject({
+      ok: true,
+      exitCode: 0,
+      testCoverage: {
+        skippedTests: [{ file: "one.test.ts", name: "confined", line: 2 }],
+        summary: { passed: 1, failed: 0 },
+      },
+    });
+    expect(result.checks[0]?.testCoverage?.skippedTestsIncomplete).toBeUndefined();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([undefined, "", "bad", "0", "-1", "1.5", "9007199254740992", "1e2", "0x10"])(
+  "skipped testcase requires its own positive safe source line: %s",
+  (line) => {
+    const cwd = tempDir({ "one.test.ts": "" });
+    try {
+      const report = join(cwd, "report.xml");
+      // Keep the enclosing suite's valid line: it must never supply a missing testcase line.
+      writeFileSync(
+        report,
+        skipJUnit.replace(
+          'file="one.test.ts" line="1" assertions="0"',
+          `file="one.test.ts" ${line === undefined ? "" : `line="${line}"`} assertions="0"`,
+        ),
+      );
+      const parsed = readJUnitSkips(report, cwd);
+      expect(parsed).toBeUndefined();
+      const coverage = new BunTestCoverage(cwd);
+      for (const row of skipSummary) coverage.observe(row);
+      expect(coverage.result(parsed, false).skippedTestsIncomplete).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["newline", "redacted", "redacted-passing-file", "missing-name", "long", "failure"])(
+  "non-skipped identity text does not invalidate skip evidence: %s",
+  (kind) => {
+    const cwd = tempDir({ "one.test.ts": "" });
+    const secret = ["passing", "identity", "credential"].join("-").repeat(3);
+    proc.registerCredential("non-skipped-identity", secret);
+    try {
+      const report = join(cwd, "report.xml");
+      const name = kind === "redacted" ? secret : kind === "long" ? "x".repeat(2001) : "a&#10;b";
+      let xml = skipJUnit.replace('name="runs"', `name="${name}"`);
+      if (kind === "missing-name") xml = xml.replace(`name="${name}"`, "");
+      if (kind === "redacted-passing-file") {
+        writeFileSync(join(cwd, `${secret}.test.ts`), "");
+        xml = xml.replace(
+          'file="one.test.ts" line="1" assertions="1" />',
+          `file="${secret}.test.ts" line="1" assertions="1" />`,
+        );
+      }
+      if (kind === "failure")
+        xml = xml
+          .replaceAll('failures="0"', 'failures="1"')
+          .replace('assertions="1" />', 'assertions="1"><failure /></testcase>');
+      writeFileSync(report, xml);
+      const parsed = readJUnitSkips(report, cwd);
+      if (kind === "failure") expect(parsed).toBeUndefined();
+      else expect(parsed?.skippedTests).toHaveLength(3);
+      expect(JSON.stringify(parsed) ?? "").not.toContain(secret);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
 test.each(["absent", "headerless", "interleaved"])(
   "JUnit attributes skips despite %s console rows",
   async (kind) => {
@@ -2611,9 +2711,9 @@ test.each(["absent", "headerless", "interleaved"])(
         runner.observe(line);
       }
       const expected = [
-        { file: "one.test.ts", name: "suite > same" },
-        { file: "one.test.ts", name: "suite > same" },
-        { file: "one.test.ts", name: "suite > pending" },
+        { file: "one.test.ts", name: "suite > same", line: 1 },
+        { file: "one.test.ts", name: "suite > same", line: 1 },
+        { file: "one.test.ts", name: "suite > pending", line: 1 },
       ];
       expect(parsed?.skippedTests).toEqual(expected);
       expect(coverage.result(parsed, runner.agrees(parsed?.counts))).toMatchObject({
@@ -2694,7 +2794,7 @@ test.each([
     if (kind === "oversized") xml += " ".repeat(16 * 1024 * 1024);
     if (kind.startsWith("count-")) {
       const count = MAX_SKIPPED_TESTS + Number(kind === "count-overflow");
-      xml = `<testsuite tests="${count + 1}" failures="0" skipped="${count}"><testcase file="one.test.ts" name="runs"/>${'<testcase file="one.test.ts" name="same"><skipped/></testcase>'.repeat(count)}</testsuite>`;
+      xml = `<testsuite tests="${count + 1}" failures="0" skipped="${count}"><testcase file="one.test.ts" name="runs"/>${'<testcase file="one.test.ts" name="same" line="1"><skipped/></testcase>'.repeat(count)}</testsuite>`;
     }
     if (kind === "length-boundary" || kind === "name-overflow")
       xml = xml.replaceAll(
@@ -2744,7 +2844,11 @@ test.each([
     if (valid) {
       expect(parsed?.skippedTests).toHaveLength(kind === "count-boundary" ? MAX_SKIPPED_TESTS : 3);
       if (kind === "xml-path")
-        expect(parsed?.skippedTests[0]).toEqual({ file: "one&two.test.ts", name: "suite > same & name" });
+        expect(parsed?.skippedTests[0]).toEqual({
+          file: "one&two.test.ts",
+          name: "suite > same & name",
+          line: 1,
+        });
     } else {
       expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTestsIncomplete).toBe(true);
       expect(coverage.result(parsed, runner.agrees(parsed?.counts)).skippedTests).toBeUndefined();

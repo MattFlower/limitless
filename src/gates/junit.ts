@@ -188,17 +188,26 @@ export function readJUnitSkips(
       cwd,
       (file) => {
         const canonical = canonicalTestFile(file, cwd);
-        if (!canonical || redactGateOutput(file) !== file || redactGateOutput(canonical) !== canonical)
-          throw new Error("Unsafe report path");
+        if (!canonical) throw new Error("Unsafe report path");
         return canonical;
       },
       (node, rawFile, describes = []) => {
+        const children = elements(node);
+        const outcomes = children.filter((child) => ["failure", "error", "skipped"].includes(child.name));
+        if (outcomes.some((child) => elements(child).length > 0) || outcomes.length > 1)
+          throw new Error("Ambiguous testcase");
+        if (outcomes[0]?.name !== "skipped") return;
         // Bun's console row (`outer > inner > test`); classname lists describes innermost first.
         const parts = [...describes, node.attributes.name];
         const name = parts.join(" > ");
         const file = rawFile && canonicalTestFile(rawFile, cwd);
+        const rawLine = node.attributes.line;
+        const line = Number(rawLine);
         if (
           !file ||
+          !rawLine ||
+          !/^[1-9]\d*$/.test(rawLine) ||
+          !Number.isSafeInteger(line) ||
           !node.attributes.name?.trim() ||
           [...name].some(
             (char) => char.charCodeAt(0) < 32 || (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159),
@@ -208,21 +217,15 @@ export function readJUnitSkips(
           redactGateOutput(name) !== name
         )
           throw new Error("Unusable testcase identity");
-        const children = elements(node);
-        const outcomes = children.filter((child) => ["failure", "error", "skipped"].includes(child.name));
-        if (outcomes.some((child) => elements(child).length > 0) || outcomes.length > 1)
-          throw new Error("Ambiguous testcase");
-        if (outcomes[0]?.name === "skipped") {
-          // A separator inside one component would let different describe paths compare equal.
-          if (parts.some((part) => !part?.trim() || part.includes(" > ")))
-            throw new Error("Ambiguous skip identity");
-          if (
-            skippedTests.length >= MAX_SKIPPED_TESTS ||
-            Math.max(file.length, name.length) > MAX_TEST_IDENTITY_LENGTH
-          )
-            throw new Error("Skip identity limit");
-          skippedTests.push({ file, name });
-        }
+        // A separator inside one component would let different describe paths compare equal.
+        if (parts.some((part) => !part?.trim() || part.includes(" > ")))
+          throw new Error("Ambiguous skip identity");
+        if (
+          skippedTests.length >= MAX_SKIPPED_TESTS ||
+          Math.max(file.length, name.length) > MAX_TEST_IDENTITY_LENGTH
+        )
+          throw new Error("Skip identity limit");
+        skippedTests.push({ file, name, line });
       },
     );
     return counts && counts.failures === 0 && counts.errors === 0 ? { counts, skippedTests } : undefined;
