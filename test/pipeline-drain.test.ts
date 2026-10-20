@@ -286,14 +286,13 @@ for (const profile of ["quick", "standard"] as const) {
       const resumed = start(handler);
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(implementations).toBe(1);
-      expect(resumed.store.listStages(run.id).map((stage) => stage.name)).toEqual([
-        ...completed,
-        "gates",
-        "audit",
+      const stages = resumed.store.listStages(run.id).map((stage) => stage.name);
+      expect(stages.slice(0, completed.length + 2)).toEqual([...completed, "gates", "audit"]);
+      expect(stages.slice(completed.length + 2, -1).sort()).toEqual([
         "review",
         ...(profile === "standard" ? (["verify"] as const) : []),
-        "deliver",
       ]);
+      expect(stages.at(-1)).toBe("deliver");
       expect(resumed.store.getRunState<RunState>(run.id)).toMatchObject({
         round: 0,
         worktreePath: worktree,
@@ -322,7 +321,16 @@ test("drain during verification parks before delivery", async () => {
   const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
   expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
   expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase: "deliver", parked: true, round: 0 });
-  expect(f.store.listStages(run.id).at(-1)).toMatchObject({ name: "verify", status: "succeeded" });
+  expect(
+    f.store
+      .listStages(run.id)
+      .slice(-2)
+      .map((stage) => [stage.name, stage.status])
+      .sort(),
+  ).toEqual([
+    ["review", "succeeded"],
+    ["verify", "succeeded"],
+  ]);
   f.scheduler.resume();
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
   expect(f.store.listStages(run.id).filter((s) => s.name === "verify")).toHaveLength(1);

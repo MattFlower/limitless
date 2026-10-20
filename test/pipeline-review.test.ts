@@ -359,7 +359,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.listStages(run.id).find((s) => s.name === "review")?.status).toBe("failed");
     expect(f.store.listArtifacts(run.id).some((a) => a.name.startsWith("review-"))).toBe(false);
     expect(f.store.getRunState<RunState>(run.id)?.lastReview).toBeUndefined();
-    expect(f.store.listStages(run.id).some((s) => s.name === "verify" || s.name === "deliver")).toBe(false);
+    expect(f.store.listStages(run.id).find((s) => s.name === "verify")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBeUndefined();
+    expect(f.store.listStages(run.id).some((s) => s.name === "deliver")).toBe(false);
   });
 
   test("later-round review accepts a short fix confirmation but still rejects a placeholder", async () => {
@@ -417,7 +419,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
-  test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {
+  test("happy path: triage → spec → implement → gates → concurrent review/verify → deliver", async () => {
     const seen: string[] = [];
     const f = start((s) => {
       const role = roleOf(s);
@@ -435,7 +437,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const detail = f.store.getRunDetail(run.id);
     expect(detail?.run.title).toBe("Add farewell");
     expect(detail?.run.resolvedProfile).toBe("standard");
-    expect(detail?.stages.map((s) => s.name)).toEqual([
+    const stages = detail?.stages.map((s) => s.name) ?? [];
+    expect(stages.slice(0, 7)).toEqual([
       "prepare",
       "triage",
       "spec",
@@ -443,10 +446,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       "implement",
       "gates",
       "audit",
-      "review",
-      "verify",
-      "deliver",
     ]);
+    expect(stages.slice(7, 9).sort()).toEqual(["review", "verify"]);
+    expect(stages.slice(9)).toEqual(["deliver"]);
     // Review and verify ran on a different vendor than the implementer.
     const impl = seen.find((s) => s.startsWith("implement"));
     const review = seen.find((s) => s.startsWith("review"));

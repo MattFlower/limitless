@@ -1,18 +1,20 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunStatus } from "../src/core/types.ts";
+import * as repos from "../src/git/repos.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
+import { findingEvidence } from "./review-support.ts";
 
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start } = pipelineSetup({
+const { start, wait } = pipelineSetup({
   get home() {
     return home;
   },
@@ -59,8 +61,8 @@ for (const evidence of [
       join(repoDir, "test/loopback.test.ts"),
       // The redaction case checks artifacts, so its gate must also pass where listening is denied.
       evidence === "resume-redacted"
-        ? `import { expect, test } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n`
-        : `import { expect, test } from "bun:test";
+        ? `import { expect, spyOn, test } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n`
+        : `import { expect, spyOn, test } from "bun:test";
 test("loopback server", () => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });
   try { expect(server.port).toBeGreaterThan(0); } finally { server.stop(true); }
@@ -195,6 +197,13 @@ afterAll(async () => {
     ].includes(evidence);
     expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
+    if (evidence === "different-sha") {
+      expect(f.store.getRun(run.id)?.error).toContain("Commit changed during verification");
+      expect(state?.lastVerifiedSha).toBeUndefined();
+      expect(f.store.listStages(run.id).some((stage) => stage.status === "running")).toBe(false);
+      expect(initialGateSha).not.toBe("");
+      return;
+    }
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
     if (evidence.includes("skips")) {
       for (const check of [state?.baseline?.checks[0], state?.gateEvidence?.checks[0]?.result])
@@ -226,12 +235,12 @@ afterAll(async () => {
         expect(result?.evidence).toContain("1 inherited skips");
         expect(state?.gateEvidence?.changedFiles).toEqual(["farewell.txt"]);
       }
-      expect(attempts).toBe(1);
+      expect(attempts).toBe(resume ? 2 : 1);
     } else {
       expect(result?.status).toBe("blocked");
       expect(result?.gateEvidence).toBeUndefined();
       if (resume) {
-        expect(state?.verifyResults?.[0]?.criteria.find((c) => c.id === "AC-1")?.status).toBe("blocked");
+        expect(state?.verifyResults?.at(-1)?.criteria.find((c) => c.id === "AC-1")?.status).toBe("blocked");
         expect(result?.evidence).toContain("Factory gate substitution unavailable");
       }
       expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
@@ -245,7 +254,7 @@ test("Linux checks skipped on simulated macOS deliver an environment-blocked rou
   mkdirSync(join(repoDir, "test"));
   writeFileSync(
     join(repoDir, "test/linux.test.ts"),
-    `import { expect, test } from "bun:test";
+    `import { expect, spyOn, test } from "bun:test";
 const platform = () => "darwin"; // Simulate macOS on either host platform.
 test("fixture loads", () => expect(true).toBe(true));
 test.skipIf(platform() !== "linux")("Linux wrapper", () => expect(platform()).toBe("linux"));
@@ -542,3 +551,297 @@ for (const grounded of [true, false]) {
     }
   });
 }
+
+const rejectedReview = {
+  ...approve,
+  findings: [
+    {
+      severity: "major",
+      security: false,
+      ...findingEvidence,
+      file: "farewell.txt",
+      line: 1,
+      title: "Wrong output",
+      detail: "Observed a defect",
+      suggestion: "Fix output",
+    },
+  ],
+};
+const reviewFeedback =
+  "### Code review findings (must fix)\n- **major** farewell.txt:1 — Wrong output\n  Observed a defect\n  Suggestion: Fix output";
+const verifyFeedback =
+  "### Checks not met\n- **AC-1** (unmet) farewell.txt says goodbye\n  Evidence: Observed incorrect output";
+const verification = (status: "met" | "unmet" | "blocked") => ({
+  ...pass,
+  criteria: pass.criteria.map((c) =>
+    c.id === "AC-1"
+      ? {
+          ...c,
+          status,
+          evidence: "Observed incorrect output",
+          ...(status === "blocked" ? { blockedReason: "environment" } : {}),
+        }
+      : c,
+  ),
+});
+
+for (const [reject, status] of [
+  [true, "met"],
+  [false, "unmet"],
+  [true, "unmet"],
+  [false, "met"],
+  [true, "blocked"],
+  [false, "blocked"],
+] as const) {
+  test(`concurrent decisions are independent of finish order: review rejects=${reject}, verify=${status}`, async () => {
+    const outcomes: unknown[] = [];
+    for (const first of ["review", "verify"] as const) {
+      const started = { review: deferred<void>(), verify: deferred<void>() };
+      const release = { review: deferred<void>(), verify: deferred<void>() };
+      let readers = 0;
+      let implementations = 0;
+      let initialVerifies = 0;
+      let feedback = "";
+      const f = start(async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review" || role === "verify") {
+          if (implementations === 1) {
+            if (role === "verify") initialVerifies++;
+            if (role === "review" || initialVerifies === 1) {
+              readers++;
+              started[role].resolve();
+              await release[role].promise;
+              return {
+                structured: role === "review" ? (reject ? rejectedReview : approve) : verification(status),
+              };
+            }
+            // A blocked-only retry is allowed only after both initial stages settle and review approves.
+            expect(
+              f.store
+                .listStages(run.id)
+                .filter((s) => s.round === 0 && s.name === "review")
+                .at(-1)?.status,
+            ).toBe("succeeded");
+            expect(
+              f.store.listStages(run.id).filter((s) => s.round === 0 && s.name === "verify")[0]?.status,
+            ).toBe("succeeded");
+            expect(reject).toBe(false);
+          }
+          return { structured: role === "review" ? approve : pass };
+        }
+        implementations++;
+        if (implementations === 2) feedback = f.store.getRunState<RunState>(run.id)?.feedback ?? "";
+        return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+      });
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: "Add farewell",
+        profile: first === "review" ? "standard" : "deep",
+      });
+      try {
+        await wait(() => readers === 2, { timeoutMs: 5000 });
+        await Promise.all([started.review.promise, started.verify.promise]);
+        expect(f.store.getRun(run.id)?.stage).toBe("review");
+        expect(f.store.getRunState<RunState>(run.id)?.feedback).toBeNull();
+        release[first].resolve();
+        await wait(
+          () => f.store.listStages(run.id).some((s) => s.name === first && s.status === "succeeded"),
+          { timeoutMs: 5000 },
+        );
+        expect(f.store.getRunState<RunState>(run.id)?.feedback).toBeNull();
+        expect(f.store.getRun(run.id)?.stage).toBe("review");
+        expect(initialVerifies).toBe(1);
+        release[first === "review" ? "verify" : "review"].resolve();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        const expected = reject
+          ? reviewFeedback +
+            (status === "unmet"
+              ? "\n\n" +
+                verifyFeedback.replace("### Checks not met", "### Acceptance criteria not yet met (verify)")
+              : "")
+          : status === "unmet"
+            ? verifyFeedback
+            : "";
+        expect(feedback).toBe(expected);
+        expect(initialVerifies).toBe(!reject && status === "blocked" ? 2 : 1);
+        const state = f.store.getRunState<RunState>(run.id);
+        expect(state?.round).toBe(expected ? 1 : 0);
+        expect(state?.lastVerifiedSha).toBe(state?.reviewedSha);
+        const invocations = f.store
+          .listInvocations(run.id)
+          .filter((i) => i.role === "review" || i.role === "verify");
+        expect(invocations[0]?.startedAt).toBeLessThanOrEqual(invocations[1]?.finishedAt ?? 0);
+        expect(invocations[1]?.startedAt).toBeLessThanOrEqual(invocations[0]?.finishedAt ?? 0);
+        outcomes.push({
+          feedback,
+          round: state?.round,
+          initialVerifies,
+          status: f.store.getRun(run.id)?.status,
+        });
+      } finally {
+        release.review.resolve();
+        release.verify.resolve();
+        await f.stop();
+        f.store.close();
+        factory = null;
+      }
+    }
+    expect(outcomes[0]).toEqual(outcomes[1]);
+  });
+}
+
+for (const failure of ["review", "verify", "both", "cancel"] as const) {
+  test(`concurrent error joins the sibling before propagation and cleanup: ${failure}`, async () => {
+    let readers = 0;
+    const started = { review: deferred<void>(), verify: deferred<void>() };
+    const release = { review: deferred<void>(), verify: deferred<void>() };
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review" || role === "verify") {
+        readers++;
+        started[role].resolve();
+        await release[role].promise;
+        return { structured: role === "review" ? approve : pass };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    f.deps.faults = {
+      ...(failure === "review" || failure === "both"
+        ? { "stage:review:after": { action: "throw" as const } }
+        : {}),
+      ...(failure === "verify" || failure === "both"
+        ? { "stage:verify:after": { action: "throw" as const } }
+        : {}),
+    };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+    const controller = new AbortController();
+    let settled = false;
+    const execution = executeRun(f.deps, run.id, controller.signal).finally(() => {
+      settled = true;
+    });
+    const mutations: string[] = [];
+    const discard = repos.discardChanges;
+    const reset = repos.resetTo;
+    const recordMutation = () => {
+      if (
+        f.store
+          .listStages(run.id)
+          .some((s) => (s.name === "review" || s.name === "verify") && s.status === "running")
+      )
+        mutations.push("mutation while a reader stage was running");
+    };
+    const discardSpy = spyOn(repos, "discardChanges").mockImplementation(async (...args) => {
+      recordMutation();
+      return discard(...args);
+    });
+    const resetSpy = spyOn(repos, "resetTo").mockImplementation(async (...args) => {
+      recordMutation();
+      return reset(...args);
+    });
+    try {
+      await wait(() => readers === 2, { timeoutMs: 5000 });
+      await Promise.all([started.review.promise, started.verify.promise]);
+      if (failure === "cancel") controller.abort();
+      const first = failure === "review" ? "review" : "verify";
+      release[first].resolve();
+      await wait(() => f.store.listStages(run.id).some((s) => s.name === first && s.status !== "running"), {
+        timeoutMs: 5000,
+      });
+      expect(settled).toBe(false);
+      expect(
+        f.store.listStages(run.id).find((s) => s.name === (first === "review" ? "verify" : "review"))?.status,
+      ).toBe("running");
+      release[first === "review" ? "verify" : "review"].resolve();
+      expect(await execution).toBe(failure === "cancel" ? "cancelled" : "queued");
+      expect(mutations).toEqual([]);
+      expect(f.store.listStages(run.id).some((s) => s.status === "running")).toBe(false);
+      expect(f.store.listInvocations(run.id).some((i) => i.status === "running")).toBe(false);
+      if (failure !== "cancel")
+        expect(
+          f.store
+            .listEvents(run.id)
+            .filter((e) => e.message.startsWith("Run interrupted:"))
+            .at(-1)?.message,
+        ).toContain(`stage:${failure === "both" ? "review" : failure}:after`);
+    } finally {
+      release.review.resolve();
+      release.verify.resolve();
+      await execution;
+      discardSpy.mockRestore();
+      resetSpy.mockRestore();
+    }
+  });
+}
+
+for (const changedHead of [false, true]) {
+  test(`resuming a recorded blocked retry cannot grant another: changed HEAD=${changedHead}`, async () => {
+    let verifies = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verifies++;
+        return { structured: verification("blocked") };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    f.deps.faults = { "stage:verify:after": { action: "kill", occurrence: 2 } };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+    const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+    expect(await execute()).toBe("running");
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.environmentRetryRound).toBe(0);
+    expect(state?.verifyResults?.map((v) => v.attempt)).toEqual([0, 1]);
+    if (changedHead) {
+      if (!state?.worktreePath) throw new Error("Missing resumed checkout");
+      await sh(["git", "commit", "--allow-empty", "-qm", "advance resumed fixture"], {
+        cwd: state.worktreePath,
+      });
+    }
+    f.deps.faults = undefined;
+    expect(await execute()).toBe("needs_human");
+    expect(verifies).toBe(3); // Fresh initial verification; the round's retry was already consumed.
+    expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
+    expect(f.store.getRunState<RunState>(run.id)?.verifyResults?.map((v) => v.attempt)).toEqual([0, 1, 0]);
+  });
+}
+
+test("missing holdout prevents both concurrent stages on resume", async () => {
+  const calls: string[] = [];
+  const f = start((s) => {
+    const role = roleOf(s);
+    calls.push(role);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: pass };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  await f.stop();
+  f.deps.faults = { "stage:audit:after": { action: "kill" } };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+  expect(await execute()).toBe("running");
+  const state = f.store.getRunState<RunState>(run.id);
+  if (!state) throw new Error("Missing checkpoint");
+  expect(state.holdoutStatus).toBe("complete");
+  delete state.holdout;
+  f.store.setRunState(run.id, state);
+  f.deps.faults = undefined;
+  expect(await execute()).toBe("needs_human");
+  expect(f.store.getRun(run.id)?.error).toContain("Holdout scenarios are unavailable");
+  expect(calls).not.toContain("review");
+  expect(calls).not.toContain("verify");
+});

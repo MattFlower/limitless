@@ -279,6 +279,8 @@ export class RunContext {
   private readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
+  /** Defer shared-worktree cleanup until the review/verify pair has settled. */
+  parallelChecks = false;
   private readonly pinnedStages = new Map<number, string[]>();
   readonly runDir: string;
   previewUrl?: string;
@@ -465,7 +467,10 @@ export class RunContext {
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
-    if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
+    if (!background)
+      this.run = this.store.updateRun(this.run.id, {
+        stage: this.parallelChecks && name === "verify" ? "review" : name,
+      });
     const stage = this.store.startStage(this.run.id, name, round);
     // Parallel holdout work must not suppress foreground drain boundaries.
     if (!background) this.foregroundStageDepth++;
@@ -890,7 +895,12 @@ export class RunContext {
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         const checkout = shadow?.cwd ?? this.state.worktreePath;
-        if ((opts.role === "review" || opts.role === "verify") && checkout) await discardChanges(checkout);
+        if (
+          (opts.role === "review" || opts.role === "verify") &&
+          checkout &&
+          (!this.parallelChecks || shadow)
+        )
+          await discardChanges(checkout);
       }
       if (callSignal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };

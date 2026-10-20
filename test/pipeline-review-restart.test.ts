@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { Factory } from "../src/app.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
+import { sh } from "../src/util/proc.ts";
+import { deferred } from "./evals-support.ts";
 import {
   approve,
   type Handler,
@@ -17,7 +20,7 @@ import { findingEvidence } from "./review-support.ts";
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start } = pipelineSetup({
+const { start, wait } = pipelineSetup({
   get home() {
     return home;
   },
@@ -187,8 +190,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
           return { structured: { ...approve, findings } };
         }
         if (role === "verify") {
-          verifyStarted = true;
-          if (slow) return { delayMs: 30_000 };
+          if (slow && implementations === restartRound + 1) {
+            verifyStarted = true;
+            return { delayMs: 30_000 };
+          }
+          if (slow) return { structured: pass };
           resumedVerifies++;
           return {
             structured:
@@ -206,9 +212,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const f = start(handler);
       const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
       const deadline = Date.now() + 10_000;
-      while (!verifyStarted && Date.now() < deadline) await Bun.sleep(10);
+      while (
+        (!verifyStarted ||
+          f.store.getRunState<RunState>(run.id)?.completedChecks?.values.review === undefined) &&
+        Date.now() < deadline
+      )
+        await Bun.sleep(10);
       expect(verifyStarted).toBe(true);
-      expect(f.store.getRun(run.id)?.stage).toBe("verify");
+      expect(f.store.getRun(run.id)?.stage).toBe("review");
       const checkpoint = f.store.getRunState<RunState>(run.id);
       expect(checkpoint?.round).toBe(restartRound);
       expect(checkpoint?.reviewHistory?.at(-1)?.round).toBe(restartRound);
@@ -236,3 +247,68 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 });
+
+for (const changedHead of [false, true]) {
+  for (const recordedVerify of [false, true]) {
+    test(`resume joins a cached review with fresh verify: changed HEAD=${changedHead}, recorded verify=${recordedVerify}`, async () => {
+      const verificationStarted = deferred<void>();
+      const releaseVerification = deferred<void>();
+      const reviewed: string[] = [];
+      const verified: string[] = [];
+      const f = start(async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review" || role === "verify") {
+          const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+          if (role === "review") {
+            reviewed.push(sha);
+            return { structured: approve };
+          }
+          verified.push(sha);
+          if (verified.length === 1) {
+            verificationStarted.resolve();
+            await releaseVerification.promise;
+          }
+          return { structured: pass };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      await f.stop();
+      if (recordedVerify) f.deps.faults = { "stage:verify:after": { action: "kill" } };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+      const controller = new AbortController();
+      const executing = executeRun(f.deps, run.id, controller.signal);
+      try {
+        await verificationStarted.promise;
+        await wait(
+          () => f.store.getRunState<RunState>(run.id)?.completedChecks?.values.review !== undefined,
+          { timeoutMs: 5000 },
+        );
+        if (!recordedVerify) controller.abort(new Error("shutdown"));
+      } finally {
+        releaseVerification.resolve();
+      }
+      expect(await executing).toBe(recordedVerify ? "running" : "queued");
+      const checkpoint = f.store.getRunState<RunState>(run.id);
+      expect(checkpoint?.completedChecks?.sha).toBe(reviewed[0]);
+      expect(checkpoint?.verifyResults?.length ?? 0).toBe(recordedVerify ? 1 : 0);
+      const cwd = checkpoint?.worktreePath;
+      if (!cwd) throw new Error("Missing resumed checkout");
+      if (changedHead)
+        await sh(["git", "commit", "--allow-empty", "-qm", "advance resumed fixture"], { cwd });
+      f.deps.faults = undefined;
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+      expect(reviewed).toHaveLength(changedHead ? 2 : 1);
+      expect(verified).toHaveLength(2);
+      if (changedHead) expect(verified[1]).not.toBe(verified[0]);
+      else expect(verified[1]).toBe(verified[0]);
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state?.reviewedSha).toBe(verified[1]);
+      expect(state?.lastVerifiedSha).toBe(verified[1]);
+      expect(state?.verifyResults?.at(-1)?.sha).toBe(verified[1]);
+      expect(f.store.listStages(run.id).some((stage) => stage.status === "running")).toBe(false);
+    });
+  }
+}

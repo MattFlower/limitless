@@ -453,7 +453,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(implementCalls()).toBe(1);
     });
 
-    test("verifier output without a requirement field stays blocking on replay", async () => {
+    test("fresh verification after restart keeps a legacy holdout failure blocking", async () => {
       let checked = false;
       const { f, handler, implementCalls, verifies } = drive(unmetH2({}), (prompt, call) => {
         if (call !== 2) return;
@@ -479,20 +479,24 @@ describe("pipeline (fake agents, real git + gates)", () => {
       };
       const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
       const deadline = Date.now() + 10_000;
-      while (f.store.listStages(run.id).at(-1)?.status !== "cancelled") {
+      while (!f.store.listStages(run.id).some((s) => s.name === "verify" && s.status === "cancelled")) {
         if (Date.now() > deadline) throw new Error("verify interruption timed out");
         await Bun.sleep(10);
       }
       await f.stop();
       f.store.close();
-      const resumed = start(handler);
+      const resumed = start(async (s) => {
+        const reply = await handler(s);
+        return roleOf(s) === "verify" && implementCalls() === 1 ? { structured: unmetH2({}) } : reply;
+      });
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(implementCalls()).toBe(2);
       expect(checked).toBe(true);
-      expect(verifies()).toBe(2);
-      const first = resumed.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
-      expect(first?.overall).toBe("fail");
-      expect(first?.criteria.find((c) => c.id === "H-2")?.requirement).toBeNull();
+      expect(verifies()).toBe(3);
+      const results = resumed.store.getRunState<RunState>(run.id)?.verifyResults;
+      expect(results?.[0]?.overall).toBe("pass"); // Historical verdicts cannot complete a resumed round.
+      expect(results?.[1]?.overall).toBe("fail");
+      expect(results?.[1]?.criteria.find((c) => c.id === "H-2")?.requirement).toBeNull();
     });
   });
 
