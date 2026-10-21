@@ -223,6 +223,43 @@ test("runner keeps overlapping credentials raw in one chunk and at every split o
   }
 });
 
+test("open streams apply new registrations to raw carry and later split output", async () => {
+  registerCredential("LATE_CARRY_LENGTH", `synthetic-carry-${"x".repeat(200)}`);
+  for (const stream of ["stdout", "stderr"] as const) {
+    const secret = `synthetic-late-"key"-\\tail-${stream}`;
+    const longer = `${secret}-late-footer`;
+    const escaped = JSON.stringify(longer).slice(1, -1);
+    const raw: string[] = [];
+    const lines: string[] = [];
+    let observed = 0;
+    const chunks = [
+      { stream, text: longer.slice(0, 12) },
+      { stream, text: `${longer.slice(12)}\n${escaped.slice(0, 17)}` },
+      { stream, text: `${escaped.slice(17)}\nlast` },
+    ];
+    const result = await withChunks(chunks, () =>
+      runProcess({
+        ...options(),
+        redactOutput: true,
+        tailLimit: 20,
+        onRawChunk: (text) => {
+          raw.push(text);
+          // This runs before processing the second observed chunk, after the first is buffered.
+          if (++observed === 2) {
+            registerCredential("LATE_STREAM_SHORT", secret);
+            registerCredential("LATE_STREAM_LONG", longer);
+          }
+        },
+        onStdoutLine: (line) => lines.push(line),
+        onStderrLine: (line) => lines.push(line),
+      }),
+    );
+    expect(result[stream]).toBe("ted]\n[redacted]\nlast");
+    expect(lines).toEqual(["[redacted]", "[redacted]", "last"]);
+    expect(raw.join("")).toBe(`${longer}\n${escaped}\nlast`);
+  }
+});
+
 test("runner strips split terminal sequences before matching and leaves raw observation unchanged", async () => {
   const secret = "synthetic-terminal-chunk-credential";
   registerCredential("TERMINAL_CHUNK_TEST_TOKEN", secret);
@@ -304,8 +341,7 @@ import { PassThrough } from "node:stream";
   `;
   const result = await runProcess({ ...options(), cmd: [process.execPath, "-e", script] });
   expect(result.exitCode).toBe(0);
-  // One redactCredentials call also matches the marker text it inserts, once.
-  expect(JSON.parse(result.stdout)).toBe(`[[redacted]] [redacted] ${"q".repeat(40)}`);
+  expect(JSON.parse(result.stdout)).toBe(`[redacted] [redacted] ${"q".repeat(40)}`);
 });
 
 test("runner redaction handles every two-chunk offset on both streams before framing and cuts", async () => {
