@@ -221,11 +221,7 @@ export function pipelineSetup(state: PipelineFixture) {
     const alpha = models[0];
     const beta = models[1];
     if (!alpha || !beta) throw new Error("missing fixture models");
-    const cfg = loadConfig({
-      home: join(state.home, "data"),
-      configDir: join(state.home, "cfg"),
-      raw: { owners: { github: "MattFlower" } },
-    });
+    const cfg = loadConfig({ home: join(state.home, "data"), configDir: join(state.home, "cfg") });
     state.factory = new Factory(cfg, {
       confinement: fakeConfinement,
       harnesses: { fake: fakeHarness(handler) },
