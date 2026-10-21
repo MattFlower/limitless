@@ -175,7 +175,12 @@ export class WorkerStore {
                 ? "needs update"
                 : this.available(w)
                   ? "available"
-                  : "offline",
+                  : c?.freeSlots === 0 &&
+                      this.releaseSha &&
+                      w.last_heartbeat_at !== null &&
+                      this.now() - w.last_heartbeat_at <= this.times.fresh
+                    ? "busy"
+                    : "offline",
         });
       });
   }
