@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { CiFailure, GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { redactCredentials } from "../util/proc.ts";
+import { credentialRedactionPadding, redactCredentials } from "../util/proc.ts";
 import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
 
 const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
@@ -44,7 +44,19 @@ type Call = (
   body?: unknown,
   optionalLog?: boolean,
 ) => Promise<GitHubResponse | null>;
-const bounded = (text: string) => redactCredentials(text).trim().slice(0, 500);
+const publication = (text: string, from: number, to: number) => {
+  if (to <= from) return "";
+  const padding = credentialRedactionPadding();
+  const start = Math.max(0, from - padding);
+  return redactCredentials(text.slice(start, to + padding), { start: from - start, end: to - start });
+};
+const bounded = (text: string, from = 0, to = text.length, limit = 500) => {
+  const value = text.slice(from, to);
+  from += value.length - value.trimStart().length;
+  return publication(text, from, Math.min(to, from + limit))
+    .trim()
+    .slice(0, limit);
+};
 const logLines = (log: string) =>
   Bun.stripANSI(log)
     .split(/\r?\n/)
@@ -63,8 +75,11 @@ export const headMoved = (head: string, sha: string, approvedSha?: string): bool
 
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
-  // Redact the whole normalized log first: a window boundary can split a multiline credential.
-  const lines = redactCredentials(logLines(redactCredentials(log)).join("\n")).split("\n");
+  const lines = logLines(log);
+  const text = lines.join("\n");
+  const offsets = [0];
+  for (const l of lines) offsets.push((offsets.at(-1) ?? 0) + l.length + 1);
+  const offset = (i: number) => offsets[Math.max(0, Math.min(lines.length, i))] ?? 0;
   const start = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
   let index = start;
   // Bun prints the assertion, diff and stack before the test name. Keep that block together.
@@ -72,20 +87,36 @@ export function ciSignature(check: string, log: string, fallback: string, labels
     const next = lines.slice(start + 1).findIndex((l) => failureLine.test(l) || /^\s*\(pass\)/i.test(l));
     if (/^\s*\(fail\)/i.test(lines[start + 1 + next] ?? "")) index += 1 + next;
   }
-  const line = bounded(lines[index] ?? fallback);
-  const window = (from: number, to: number) => lines.slice(Math.max(0, from), to).join("\n");
+  const line = index < 0 ? bounded(fallback) : bounded(text, offset(index), offset(index + 1) - 1);
+  const window = (from: number, to: number, limit: number, last = false) => {
+    if (index < 0) return "";
+    const left = offset(from);
+    const right = Math.max(left, offset(to) - 1);
+    return publication(
+      text,
+      last ? Math.max(left, right - limit) : left,
+      last ? right : Math.min(right, left + limit),
+    );
+  };
   // Bound the leading context and the first failure line so neither consumes the budget.
-  const head = `${window(start - 2, start).slice(-500)}\n${window(start, start + 1).slice(0, 500)}`;
+  const head = `${window(start - 2, start, 500, true)}\n${window(start, start + 1, 500)}`;
   // A long Bun diff keeps its newest lines: the stack frame and the failing test name.
   const tail =
-    index > start ? window(start + 1, index + 1).slice(head.length - 1999) : window(start + 1, start + 4);
-  const excerpt = (index < 0 ? redactCredentials(log || line) : `${head}\n${tail}`).trim().slice(0, 2000);
+    index > start
+      ? window(start + 1, index + 1, Math.max(0, 1999 - head.length), true)
+      : window(start + 1, start + 4, 2000);
+  const excerpt = (index < 0 ? bounded(log || line, 0, (log || line).length, 2000) : `${head}\n${tail}`)
+    .trim()
+    .slice(0, 2000);
+  const imageIndex = lines.findIndex((l) => /^\s*Image:/.test(l));
   const image =
-    bounded(
-      lines.find((l) => /^\s*Image:/.test(l))?.replace(/^\s*Image:\s*/, "") ??
-        labels.find((label) => /^(?:ubuntu|windows|macos)-/.test(label)) ??
-        "",
-    ) || null;
+    (imageIndex < 0
+      ? bounded(labels.find((label) => /^(?:ubuntu|windows|macos)-/.test(label)) ?? "")
+      : bounded(
+          text,
+          offset(imageIndex) + (lines[imageIndex]?.match(/^\s*Image:\s*/)?.[0].length ?? 0),
+          offset(imageIndex + 1) - 1,
+        )) || null;
   return { check, line, image, signature: JSON.stringify([check, line, image]), excerpt };
 }
 const quote = (s: string) => `> ${redactCredentials(s).replace(/\r?\n/g, "\n> ")}`;

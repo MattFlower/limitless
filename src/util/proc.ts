@@ -1100,6 +1100,8 @@ const credentialValues = new Set<string>();
 const credentialVariants = new Map<string, boolean>();
 let sortedCredentialVariants: [string, boolean][] = [];
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
+export const credentialRedactionPadding = (): number =>
+  Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
@@ -1110,11 +1112,30 @@ export function registerCredential(name: string, value?: string): void {
       sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
     }
 }
-export function redactCredentials(text: string): string {
+export function redactCredentials(text: string): string;
+export function redactCredentials(text: string, window?: { start: number; end: number }): string;
+export function redactCredentials(text: string, window?: { start: number; end: number }): string {
+  // Unary callers can also pass this function directly to Array.map.
+  const bounds = typeof window === "object" ? { ...window } : undefined;
+  const marker = "[redacted]";
   // Substring matches require at least 8 characters to avoid redacting common short strings.
   for (const [secret, substring] of sortedCredentialVariants)
-    if (substring || text === secret) text = text.split(secret).join("[redacted]");
-  return text;
+    if (substring || text === secret) {
+      if (!bounds) text = text.split(secret).join(marker);
+      else {
+        const { start, end } = bounds;
+        text = text.replaceAll(secret, (_match, offset: number) => {
+          // A cut inside a replacement retains the entire marker, never a credential fragment.
+          if (offset < start)
+            bounds.start += offset + secret.length <= start ? marker.length - secret.length : offset - start;
+          if (offset < end)
+            bounds.end +=
+              offset + secret.length <= end ? marker.length - secret.length : offset + marker.length - end;
+          return marker;
+        });
+      }
+    }
+  return bounds ? text.slice(bounds.start, bounds.end) : text;
 }
 export const redactCredentialData = <T>(value: T): T =>
   JSON.parse(

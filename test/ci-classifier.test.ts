@@ -1,10 +1,11 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { ciDecision, ciSignature } from "../src/integrations/ci-classifier.ts";
 import { normalizePr } from "../src/integrations/github-poller.ts";
+import * as proc from "../src/util/proc.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
@@ -772,6 +773,77 @@ test.each([false, true])(
     expect(excerpt).not.toContain("ci-window-finish");
   },
 );
+
+test.each(["ordinary", "multiline", "escaped"])(
+  "CI publication cuts redact crossing %s credentials",
+  (kind) => {
+    const key = `ci-publication-left${kind === "ordinary" ? "-" : '\n\\\t"'.repeat(10)}ci-publication-right`;
+    registerCredential("CI_PUBLICATION_KEY", key);
+    const value = kind === "escaped" ? JSON.stringify(key).slice(1, -1) : key;
+    for (const log of [
+      `${value}${"x".repeat(490)}\nerror: useful failure`,
+      `error: useful failure ${"x".repeat(470)}${value}`,
+      `error: useful failure\n${"x".repeat(1960)}${value}tail`,
+      `error: useful failure\n${"x".repeat(3000)}${value}${"x".repeat(1950)}\n(fail) useful failure`,
+      `Image: ${"x".repeat(480)}${value}\nerror: useful failure`,
+      `${"x".repeat(1985)}${value}`,
+    ]) {
+      const result = ciSignature("test", log, `useful fallback ${"x".repeat(470)}${value}`);
+      for (const output of [result.line, result.excerpt, result.image ?? ""])
+        for (const fragment of ["ci-pub", "publication-right"]) expect(output).not.toContain(fragment);
+      expect(result.line).toContain("useful");
+      expect(result.line.length).toBeLessThanOrEqual(500);
+      expect(result.excerpt.length).toBeLessThanOrEqual(2000);
+    }
+  },
+);
+
+test.each([false, true])("CI line and image cuts retain multiline context (timestamped: %s)", (stamped) => {
+  for (const key of ["ci-line-before\n(fail) ci-line-after", "ci-line-before\nci-line-after"]) {
+    registerCredential("CI_LINE_KEY", key);
+    for (const prefix of ["", "(fail) useful ", "Image: "]) {
+      const log = `${prefix}${key}\nerror: useful failure`;
+      const result = ciSignature(
+        "test",
+        stamped ? log.replace(/^/gm, "2026-10-05T00:00:00.0000000Z ") : log,
+        "",
+      );
+      for (const output of [result.line, result.excerpt, result.image ?? ""]) {
+        expect(output).not.toContain("ci-line-before");
+        expect(output).not.toContain("ci-line-after");
+      }
+      expect(result.excerpt).toContain("useful failure");
+      expect(result.excerpt).toContain("[redacted]");
+    }
+  }
+});
+
+test("CI redaction input stays bounded as unrelated job output grows, including fallback", () => {
+  const key = `ci-volume-${"\\\n".repeat(100)}ci-volume-end`;
+  registerCredential("CI_VOLUME_KEY", key);
+  expect(proc.credentialRedactionPadding()).toBeGreaterThanOrEqual(JSON.stringify(key).length - 3);
+  const real = proc.redactCredentials;
+  const redact = spyOn(proc, "redactCredentials").mockImplementation((...args: Parameters<typeof real>) =>
+    real(...args),
+  );
+  try {
+    const shortSize = Math.max(2000, Math.ceil((2 * proc.credentialRedactionPadding() + 4000) / 10));
+    for (const evidence of ["", "context\ncontext\nerror: useful failure\nstack\nend\n"]) {
+      const volumes = [shortSize, shortSize + 300000].map((size) => {
+        redact.mockClear();
+        ciSignature("test", `Image: ubuntu-24.04\n${"provision\n".repeat(size)}${evidence}`, "fallback");
+        const lengths = redact.mock.calls.map(([text]) => text.length);
+        expect(lengths.length).toBeGreaterThan(0);
+        for (const length of lengths)
+          expect(length).toBeLessThanOrEqual(2000 + 2 * proc.credentialRedactionPadding());
+        return lengths;
+      });
+      expect(volumes[1]).toEqual(volumes[0]);
+    }
+  } finally {
+    redact.mockRestore();
+  }
+});
 
 test.each(["timed_out", "startup_failure", "cancelled", "failure"])(
   "eligible %s failure reruns only its job",
