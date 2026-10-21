@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { CiFailure, GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { credentialRedactionPadding, redactCredentials } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
 
 const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
@@ -122,7 +123,15 @@ export function ciSignature(check: string, log: string, fallback: string, labels
 const quote = (s: string) => `> ${redactCredentials(s).replace(/\r?\n/g, "\n> ")}`;
 
 /** Serial REST inspection. False retains the persisted pending inspection for a later poll. */
-async function inspectCi(
+async function inspectCi(...args: Parameters<typeof inspectCiInner>) {
+  const end = beginActivity("ci-log.inspect");
+  try {
+    return await inspectCiInner(...args);
+  } finally {
+    end();
+  }
+}
+async function inspectCiInner(
   store: Store,
   pr: Omit<TrackedPr, "runId"> & { runId: string | null },
   snap: PrSnapshot,

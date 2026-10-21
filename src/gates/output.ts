@@ -1,5 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
 import { redactCredentials } from "../util/proc.ts";
+import { activity } from "../util/stall.ts";
 import type { GateResult } from "./run.ts";
 
 const LAUNCH_FAILURE = "sandbox_apply: Operation not permitted";
@@ -38,7 +39,8 @@ export function findGateCounterpart<T extends { name: string }>(
 }
 
 /** Sanitize decoded historical data without changing rows; preserve the raw confinement verdict. */
-export const redactGateData = <T>(value: T): T =>
+export const redactGateData = <T>(value: T): T => activity("gates.redact", () => redactData(value));
+const redactData = <T>(value: T): T =>
   value === undefined
     ? value
     : JSON.parse(

@@ -12,7 +12,14 @@ import {
   withGateLease,
 } from "../src/cli/gate-slot.ts";
 import { AgentTestSession } from "../src/gates/agent-tests.ts";
-import { GATE_LEASE_EXPIRY_MS, Semaphore } from "../src/gates/slots.ts";
+import {
+  acquireGateSlot,
+  agentTestSlots,
+  GATE_LEASE_EXPIRY_MS,
+  gateSlotScope,
+  gateSlots,
+  Semaphore,
+} from "../src/gates/slots.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -57,6 +64,133 @@ function rig(limit = 1) {
   };
 }
 const signal = new AbortController().signal;
+
+test("a small retry in an empty scope uses and releases only the agent-test lane", async () => {
+  const previous = [gateSlots.limit, agentTestSlots.limit] as const;
+  gateSlots.setLimit(1);
+  agentTestSlots.setLimit(1);
+  const controller = new AbortController();
+  const full = await gateSlots.acquire(signal, undefined, "full");
+  const endAttempt = Promise.withResolvers<void>();
+  const endScope = Promise.withResolvers<void>();
+  const attemptDone = Promise.withResolvers<void>();
+  const onWait = spyOn({ wait() {} }, "wait");
+  let started = false;
+  let competitor: Promise<() => void> | undefined;
+  const scope = gateSlotScope(async () => {
+    const release = await acquireGateSlot(controller.signal, onWait, "retry", true, "ship");
+    started = true;
+    try {
+      await endAttempt.promise;
+    } finally {
+      release();
+      attemptDone.resolve();
+    }
+    await endScope.promise;
+    return "settled";
+  })();
+  try {
+    await new Promise(setImmediate);
+    expect(started).toBe(true);
+    expect(onWait).not.toHaveBeenCalled();
+    expect(gateSlots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["full"] });
+    expect(agentTestSlots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["retry"] });
+    competitor = agentTestSlots.acquire(controller.signal, undefined, "next retry");
+    endAttempt.resolve();
+    await attemptDone.promise;
+    const release = await competitor;
+    expect(agentTestSlots.snapshot().holders).toEqual(["next retry"]);
+    expect(gateSlots.snapshot().holders).toEqual(["full"]);
+    release();
+    expect(agentTestSlots.snapshot().occupied).toBe(0);
+    endScope.resolve();
+    expect(await scope).toBe("settled");
+    expect(gateSlots.snapshot().holders).toEqual(["full"]);
+  } finally {
+    controller.abort();
+    endAttempt.resolve();
+    endScope.resolve();
+    await scope.catch(() => {});
+    (await competitor?.catch(() => undefined))?.();
+    full();
+    gateSlots.setLimit(previous[0]);
+    agentTestSlots.setLimit(previous[1]);
+    onWait.mockRestore();
+  }
+});
+
+test("a small retry in a reserved scope reuses its gate without consuming the agent-test lane", async () => {
+  const previous = [gateSlots.limit, agentTestSlots.limit] as const;
+  gateSlots.setLimit(1);
+  agentTestSlots.setLimit(1);
+  const controller = new AbortController();
+  const small = await agentTestSlots.acquire(signal, undefined, "other retry");
+  let reused = false;
+  let competitor: Promise<() => void> | undefined;
+  const done = Promise.withResolvers<void>();
+  const scope = gateSlotScope(async () => {
+    (await acquireGateSlot(controller.signal, undefined, "gate"))();
+    const release = await acquireGateSlot(controller.signal, undefined, "retry", true);
+    reused = true;
+    release();
+    await done.promise;
+  })();
+  try {
+    await new Promise(setImmediate);
+    expect(reused).toBe(true);
+    expect(gateSlots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["gate"] });
+    expect(agentTestSlots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["other retry"] });
+    let admitted = false;
+    competitor = gateSlots.acquire(controller.signal, undefined, "next gate", false, "ship").then((free) => {
+      admitted = true;
+      return free;
+    });
+    await new Promise(setImmediate);
+    expect(admitted).toBe(false);
+    done.resolve();
+    await scope;
+    (await competitor)();
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    done.resolve();
+    await scope.catch(() => {});
+    (await competitor?.catch(() => undefined))?.();
+    small();
+    gateSlots.setLimit(previous[0]);
+    agentTestSlots.setLimit(previous[1]);
+  }
+});
+
+test("scope cleanup preserves the body error after a queued acquisition rejects", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const controller = new AbortController();
+  const full = await gateSlots.acquire(signal, undefined, "existing holder");
+  const bodyError = new Error("result cleanup failed");
+  const queued = Promise.withResolvers<void>();
+  try {
+    const scope = gateSlotScope(async () => {
+      try {
+        await acquireGateSlot(controller.signal, () => queued.resolve());
+      } catch (error) {
+        expect(error).toBe(controller.signal.reason);
+        throw bodyError;
+      }
+    })();
+    await queued.promise;
+    controller.abort(new Error("cancelled"));
+    await expect(scope).rejects.toBe(bodyError);
+    expect(gateSlots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["existing holder"] });
+    full();
+    (await acquireGateSlot(signal))();
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    full();
+    gateSlots.setLimit(previous);
+  }
+});
 
 test("mixed internal and lease waiters share FIFO; queued time does not shorten lease lifetime", async () => {
   const f = rig();

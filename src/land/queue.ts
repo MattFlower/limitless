@@ -14,6 +14,7 @@ import { findGateCounterpart, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
+import { gateSlotScope } from "../gates/slots.ts";
 import { cacheGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
@@ -557,54 +558,56 @@ export class LandQueue {
             redactGateOutput(`\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
           ),
       };
-      const run = await executeGate(request, signal, hooks, this.deps.gateExecutor);
-      signal.throwIfAborted();
-      this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { logPath: log }));
-      const selected = run.setupOk
-        ? run.checks.flatMap((original) => {
-            const check = findGateCounterpart(original, run.checks, gates.checks);
-            return check?.run === original.command ? [{ check, original }] : [];
-          })
-        : [];
-      const retries = await retryFailures(
-        selected,
-        cwd,
-        gates,
-        signal,
-        undefined,
-        (retry, options) => {
-          appendFileSync(log, "\n# targeted retry\n");
-          return executeGate(
-            { ...request, gates: retry, skipGateSlot: options?.skipGateSlot },
-            signal,
-            hooks,
-            this.deps.gateExecutor,
-          );
-        },
-        true,
-        this.deps.gateExecutor?.freshCheckoutFor?.(entry.repo),
-      );
-      signal.throwIfAborted();
-      const failed = [...run.setup, ...run.checks].filter((c) => {
-        const result = retries.get(c) ?? c;
-        return !result.ok || result.timedOut || confinementFailed(result);
-      });
-      if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
-      if (retries.size) {
-        const reason = redactGateOutput(
-          `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
+      await gateSlotScope(async () => {
+        const run = await executeGate(request, signal, hooks, this.deps.gateExecutor);
+        signal.throwIfAborted();
+        this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { logPath: log }));
+        const selected = run.setupOk
+          ? run.checks.flatMap((original) => {
+              const check = findGateCounterpart(original, run.checks, gates.checks);
+              return check?.run === original.command ? [{ check, original }] : [];
+            })
+          : [];
+        const retries = await retryFailures(
+          selected,
+          cwd,
+          gates,
+          signal,
+          undefined,
+          (retry, options) => {
+            appendFileSync(log, "\n# targeted retry\n");
+            return executeGate(
+              { ...request, gates: retry, skipGateSlot: options?.skipGateSlot },
+              signal,
+              hooks,
+              this.deps.gateExecutor,
+            );
+          },
+          true,
+          this.deps.gateExecutor?.freshCheckoutFor?.(entry.repo),
         );
-        this.owned(entry.id, () => {
-          this.store.updateLandEntry(entry.id, { reason });
-          if (entry.runId)
-            this.store.addEvent({
-              runId: entry.runId,
-              type: "gate",
-              level: "warn",
-              message: redactGateOutput(`Land ${entry.id} ${reason}`),
-            });
+        signal.throwIfAborted();
+        const failed = [...run.setup, ...run.checks].filter((c) => {
+          const result = retries.get(c) ?? c;
+          return !result.ok || result.timedOut || confinementFailed(result);
         });
-      }
+        if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
+        if (retries.size) {
+          const reason = redactGateOutput(
+            `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
+          );
+          this.owned(entry.id, () => {
+            this.store.updateLandEntry(entry.id, { reason });
+            if (entry.runId)
+              this.store.addEvent({
+                runId: entry.runId,
+                type: "gate",
+                level: "warn",
+                message: redactGateOutput(`Land ${entry.id} ${reason}`),
+              });
+          });
+        }
+      })();
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
