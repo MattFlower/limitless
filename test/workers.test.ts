@@ -19,7 +19,7 @@ import { Factory } from "../src/app.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
-import { tokenHash, WorkerStore } from "../src/db/workers.ts";
+import { type AgentJobRequest, tokenHash, WorkerStore } from "../src/db/workers.ts";
 import {
   type ExecutionHandle,
   executeGate,
@@ -1000,7 +1000,39 @@ test("owner API requires authentication for approval, listing and revocation and
     }
     const req = await request();
     const id = workers.enqueue(req);
+    const agentReq: AgentJobRequest = {
+      runId: req.runId ?? "",
+      invocationId: 1,
+      parentSha: releaseSha,
+      prompt: "agent",
+      timeoutMs: 1000,
+      target: {
+        modelId: "fake",
+        provider: "fake",
+        harness: "fake",
+        model: "fake",
+        vendor: "fake",
+        tier: 1,
+        billing: "free",
+      },
+    };
+    const agentIds = Array.from({ length: 5 }, () => workers.enqueueAgentJob(agentReq) ?? "");
+    const [done = "", leased = "", failed = "", queued = "", other = ""] = agentIds;
+    expect(workers.leaseAgentJob("owner-approved")?.id).toBe(done);
+    expect(workers.completeAgentJob(done, {}, releaseSha)).toBe(true);
+    expect(workers.leaseAgentJob("owner-approved")?.id).toBe(leased);
+    workers.failAgentJob(failed, "failure");
+    workers.failAgentJob(failed, "failure");
+    store.db.query("UPDATE agent_jobs SET run_id='other-run' WHERE id=?").run(other);
+    const persisted = workers.agentJob(leased);
+    const restarted = new Factory(cfg, { store, bootSha: releaseSha, models: [], providers: [] });
+    expect(restarted.workers.agentJob(leased)).toEqual(persisted);
     expect(factory.cancelRun(req.runId ?? "")).toBe(true);
+    for (const id of [leased, failed, queued]) expect(workers.agentJob(id)?.state).toBe("cancelled");
+    expect(workers.agentJob(done)?.state).toBe("done");
+    expect(workers.agentJob(other)?.state).toBe("queued");
+    expect(factory.cancelRun("missing-run")).toBe(false);
+    expect(workers.agentJob(other)?.state).toBe("queued");
     expect(workers.job(id)?.state).toBe("cancelled");
     const warningJob = workers.enqueue(req);
     expect(workers.lease("owner-approved")?.id).toBe(warningJob);

@@ -1128,3 +1128,27 @@ test("operator approval policy parses booleans and case-insensitive repository s
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test.each([undefined, "1", "4", "0", "-1", "1.5", '"2"', "true", "nan", "inf"])(
+  "worker agent slots: %s",
+  (value) => {
+    const fixture = providerFixture();
+    try {
+      writeFileSync(fixture.file, value === undefined ? "" : `[workers]\nagent_slots = ${value}\n`);
+      if (value === undefined || value === "1" || value === "4") {
+        const cfg = fixture.load();
+        expect(cfg.workers.agentSlots).toBe(value === undefined ? 2 : Number(value));
+        const store = new Store(":memory:");
+        try {
+          expect(new Factory(cfg, { store, models: [], providers: [] }).workers.agentSlots).toBe(
+            cfg.workers.agentSlots,
+          );
+        } finally {
+          store.close();
+        }
+      } else expect(fixture.load).toThrow("workers.agent_slots must be a positive integer");
+    } finally {
+      fixture.close();
+    }
+  },
+);

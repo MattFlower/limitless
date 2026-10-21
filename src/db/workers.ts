@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateRun } from "../gates/run.ts";
+import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { registerCredential } from "../util/proc.ts";
 import {
@@ -12,7 +13,7 @@ import {
   timing,
   type WorkerTiming,
 } from "../workers/protocol.ts";
-import { attemptBudget, credentialBearing } from "../workers/validation.ts";
+import { attemptBudget, credentialBearing, credentialInText } from "../workers/validation.ts";
 import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -48,6 +49,18 @@ export interface JobRow {
   updated_at: number;
 }
 
+/** Persisted session inputs; runtime callbacks and confinement are supplied by a later dispatcher. */
+export interface AgentJobRequest extends Pick<AgentSpec, "prompt" | "target" | "timeoutMs"> {
+  runId: string;
+  invocationId: number;
+  parentSha: string;
+}
+export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_order" | "events"> {
+  invocation_id: number;
+  parent_sha: string;
+  result_sha: string | null;
+}
+
 /** All worker transitions are synchronous SQLite transactions; no observation crosses an await. */
 export class WorkerStore {
   pairingKey?: string;
@@ -57,6 +70,7 @@ export class WorkerStore {
     readonly releaseSha: string | undefined,
     times: Partial<WorkerTiming> = {},
     readonly now = Date.now,
+    readonly agentSlots = 2,
   ) {
     this.times = { ...timing, ...times };
   }
@@ -141,7 +155,7 @@ export class WorkerStore {
       .query("UPDATE workers SET state='revoked',token_hash=NULL,revoked_at=? WHERE name=?")
       .run(this.now(), name);
   }
-  available(w: WorkerRow) {
+  available(w: WorkerRow, agent = false) {
     const c = w.capabilities ? Heartbeat.parse(JSON.parse(w.capabilities)) : null;
     return (
       w.state === "approved" &&
@@ -150,7 +164,7 @@ export class WorkerStore {
       !!this.releaseSha &&
       c?.releaseSha === this.releaseSha &&
       c.bunVersion === Bun.version &&
-      c.freeSlots > 0
+      (agent || c.freeSlots > 0)
     );
   }
   list() {
@@ -186,18 +200,21 @@ export class WorkerStore {
   }
   heartbeat(w: WorkerRow, c: Capabilities) {
     this.sweep();
+    this.sweepAgentJobs();
     if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
     this.store.db
       .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
       .run(this.now(), JSON.stringify(c), w.name);
     const cancelled: string[] = [];
     for (const id of c.jobs) {
-      const j = this.job(id);
+      const gate = this.job(id);
+      const table = gate ? "gate_jobs" : "agent_jobs";
+      const j = gate ?? this.agentJob(id);
       if (j?.state !== "leased" || j.worker !== w.name) cancelled.push(id);
       else
         this.store.db
           .query(
-            "UPDATE gate_jobs SET lease_expires_at=?,updated_at=? WHERE id=? AND state='leased' AND worker=?",
+            `UPDATE ${table} SET lease_expires_at=?,updated_at=? WHERE id=? AND state='leased' AND worker=?`,
           )
           .run(Math.min(this.now() + this.times.lease, j.attempt_deadline_at ?? 0), this.now(), id, w.name);
     }
@@ -242,6 +259,128 @@ export class WorkerStore {
         this.store.db.query("UPDATE workers SET setup_order=setup_order+1 WHERE name=?").run(name);
       return changed.changes === 1 ? this.job(j.id) : null;
     })();
+  }
+  agentJob(id: string) {
+    return this.store.db.query<AgentJobRow, [string]>("SELECT * FROM agent_jobs WHERE id=?").get(id);
+  }
+  enqueueAgentJob(req: AgentJobRequest) {
+    if ([req.target.backend, req.target.openai, req.target.decisions].some((t) => t?.authToken)) return null;
+    let credentials = false;
+    const request = JSON.stringify(req, (key, value: unknown) => {
+      credentials ||= credentialInText(key) || (typeof value === "string" && credentialInText(value));
+      return value;
+    });
+    if (credentials || credentialInText(request)) return null;
+    const id = randomUUID(),
+      now = this.now();
+    this.store.db
+      .query(
+        "INSERT INTO agent_jobs (id,run_id,invocation_id,request,parent_sha,state,created_at,updated_at) VALUES (?,?,?,?,?,'queued',?,?)",
+      )
+      .run(id, req.runId, req.invocationId, request, req.parentSha, now, now);
+    return id;
+  }
+  leaseAgentJob(name: string) {
+    return this.store.db
+      .transaction(() => {
+        this.sweepAgentJobs();
+        const w = this.worker(name);
+        if (!w || !this.available(w, true)) return null;
+        const held =
+          this.store.db
+            .query<{ n: number }, [string]>(
+              "SELECT count(*) n FROM agent_jobs WHERE state='leased' AND worker=?",
+            )
+            .get(name)?.n ?? 0;
+        if (held >= this.agentSlots) return null;
+        const j = this.store.db
+          .query<AgentJobRow, [string]>(
+            "SELECT * FROM agent_jobs WHERE state='queued' AND NOT EXISTS (SELECT 1 FROM json_each(excluded) WHERE value=?) ORDER BY created_at, rowid LIMIT 1",
+          )
+          .get(name);
+        if (!j) return null;
+        const req: AgentJobRequest = JSON.parse(j.request);
+        const now = this.now(),
+          deadline = now + Math.min(2_147_483_647, req.timeoutMs + 360_000);
+        const changed = this.store.db
+          .query(
+            "UPDATE agent_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=? WHERE id=? AND state='queued'",
+          )
+          .run(name, Math.min(now + this.times.lease, deadline), deadline, now, j.id);
+        return changed.changes === 1 ? this.agentJob(j.id) : null;
+      })
+      .immediate();
+  }
+  holdsAgentJob(id: string, name: string) {
+    this.sweepAgentJobs();
+    const j = this.agentJob(id);
+    return j?.state === "leased" && j.worker === name ? j : null;
+  }
+  failAgentJob(id: string, reason: string) {
+    this.store.db
+      .transaction(() => {
+        const j = this.agentJob(id);
+        if (!j || !["queued", "leased"].includes(j.state)) return;
+        const excluded: string[] = JSON.parse(j.excluded);
+        if (j.worker) excluded.push(j.worker);
+        this.store.db
+          .query(
+            "UPDATE agent_jobs SET state=?,attempt=?,worker=NULL,lease_expires_at=NULL,attempt_deadline_at=NULL,failure_reason=?,excluded=?,updated_at=? WHERE id=? AND state IN ('queued','leased')",
+          )
+          .run(
+            j.attempt < 2 ? "queued" : "failed",
+            Math.min(2, j.attempt + 1),
+            this.sanitize(reason),
+            JSON.stringify(excluded),
+            this.now(),
+            id,
+          );
+      })
+      .immediate();
+  }
+  sweepAgentJobs() {
+    this.store.db
+      .transaction(() => {
+        const now = this.now();
+        for (const j of this.store.db
+          .query<AgentJobRow, []>("SELECT * FROM agent_jobs WHERE state IN ('queued','leased')")
+          .all()) {
+          if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
+            this.failAgentJob(j.id, "No worker picked up job");
+          else if (j.state === "leased") {
+            const w = j.worker ? this.worker(j.worker) : null;
+            if (w?.state !== "approved") this.failAgentJob(j.id, "Worker disconnected or revoked");
+            else if ((j.attempt_deadline_at ?? 0) <= now) this.failAgentJob(j.id, "Attempt deadline expired");
+            else if ((j.lease_expires_at ?? 0) <= now) this.failAgentJob(j.id, "Lease expired");
+            else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh)
+              this.failAgentJob(j.id, "Worker disconnected");
+          }
+        }
+      })
+      .immediate();
+  }
+  completeAgentJob(id: string, result: unknown, resultSha: string) {
+    return (
+      this.store.db
+        .query(
+          "UPDATE agent_jobs SET state='done',result=?,result_sha=?,updated_at=? WHERE id=? AND state='leased'",
+        )
+        .run(JSON.stringify(this.sanitize(result)), this.sanitize(resultSha), this.now(), id).changes === 1
+    );
+  }
+  cancelAgentJob(id: string) {
+    this.store.db
+      .query(
+        "UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','leased','failed')",
+      )
+      .run(this.now(), id);
+  }
+  cancelRunAgentJobs(runId: string) {
+    this.store.db
+      .query(
+        "UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE run_id=? AND state IN ('queued','leased','failed')",
+      )
+      .run(this.now(), runId);
   }
   cancelledHeld(ids: string[], name: string) {
     const owned = new Set(
