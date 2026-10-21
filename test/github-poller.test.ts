@@ -13,6 +13,7 @@ import {
   OBSERVE_QUERY,
   rollup as rollupOf,
 } from "../src/integrations/github-poller.ts";
+import { hasOtherApproval } from "../src/land/queue.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
 // The pure rollup test at the end of this file uses no harness at all.
@@ -1635,4 +1636,52 @@ test("a REST statusCheckRollup array reduces to the state and failing checks", (
   // No contexts at all is no rollup, not a pass: a fresh push has none yet.
   expect(rollupOf([])).toEqual({ ci: null, failing: [] });
   expect(rollupOf(null)).toEqual({ ci: null, failing: [] });
+});
+
+test.each([
+  ["APPROVED", "other", SHA, "factory", true],
+  ["APPROVED", "other", "b".repeat(40), "factory", false],
+  ["APPROVED", "FaCtOrY", SHA, "factory", false],
+  ["DISMISSED", "other", SHA, "factory", false],
+  ["COMMENTED", "other", SHA, "factory", false],
+  ["APPROVED", null, SHA, "factory", false],
+  ["APPROVED", "", SHA, "factory", false],
+  ["APPROVED", "other", null, "factory", false],
+  ["APPROVED", "other", SHA, null, false],
+] as const)("approval eligibility: %s %s %s factory=%s", (state, login, commit, factory, eligible) => {
+  const node = prNode("o/r", 1);
+  node.latestReviews.nodes.push({
+    state,
+    author: login === null ? null : { login },
+    commit: commit ? { oid: commit } : null,
+  });
+  const snapshot = normalizePr(node);
+  if (!snapshot) throw new Error("missing normalized PR");
+  expect(hasOtherApproval(snapshot, factory, SHA)).toBe(eligible);
+  delete snapshot.reviewEvidence;
+  expect(hasOtherApproval(snapshot, factory, SHA)).toBe(false);
+});
+
+test("polls explicitly queued PRs without runs, including first-observation review commits", async () => {
+  h = pollerHarness();
+  h.start(); // Initially nothing is tracked; land.queued must wake the poller.
+  const node = h.gh.add("o/r", 42);
+  node.latestReviews.nodes.push({ state: "APPROVED", author: { login: "other" }, commit: { oid: SHA } });
+  const entry = h.store.createLandEntry({
+    runId: null,
+    repo: "o/r",
+    prUrl: node.url,
+    baseBranch: "main",
+    headBranch: "feature",
+    approvedSha: SHA,
+  });
+  h.store.landFeed("land.queued", entry, "queued");
+  await h.advance(0);
+  const data = JSON.parse(snapshotOf(node.url));
+  expect(data.reviewEvidence).toEqual([{ state: "APPROVED", login: "other", commit: SHA }]);
+  expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
+  expect(kinds()).not.toContain("pr.review");
+  node.latestReviews.nodes[0] = { state: "DISMISSED", author: { login: "other" }, commit: { oid: SHA } };
+  await h.advance(15000);
+  expect(JSON.parse(snapshotOf(node.url)).reviewEvidence[0].state).toBe("DISMISSED");
 });

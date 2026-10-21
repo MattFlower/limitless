@@ -389,6 +389,22 @@ merge; a failed dependency can leave it `needs_human`.
 `LIMITLESS_URL` points the CLI at another daemon. The default is
 `http://127.0.0.1:${LIMITLESS_PORT:-7400}`.
 
+To require another account's GitHub approval before landing, set this in the operator's
+`config.toml` (repository `.limitless.toml` cannot change this policy):
+
+```toml
+[repos."owner/name"]
+land_requires_approval = true
+```
+
+The default is false; repository slugs match case-insensitively. With it enabled, run-backed and
+explicitly queued PRs stay in `waiting_approval` until polling observes a current `APPROVED` review
+from a known login other than the authenticated factory account, on exactly the approved SHA.
+Stale or dismissed reviews do not count, and unavailable identity or review evidence leaves the
+entry waiting without a new timeout. This gate precedes land checks and base integration; a later
+factory base merge does not need another approval. `limitless review --approve` only records the
+factory-side approval and never submits a GitHub review. Restart the daemon after changing policy.
+
 ### UI and chat
 
 The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, cost

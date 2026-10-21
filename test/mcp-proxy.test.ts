@@ -3461,6 +3461,12 @@ test("status explains review, input, land and terminal states using saved observ
       ],
       [{}, [entry], "Landing in progress (queued)", "Wait"],
       [{}, [{ ...entry, state: "waiting_ci" }], "Landing in progress (waiting_ci)", "Wait"],
+      [
+        {},
+        [{ ...entry, runId: null, state: "waiting_approval", reason: "Another GitHub account must approve" }],
+        "Landing in progress (waiting_approval)",
+        "Wait",
+      ],
       [{}, [{ ...entry, state: "blocked", reason: "CI failed" }], "Landing blocked", "resolve the blocker"],
       [{}, [{ ...entry, state: "landed" }], "Landed", "No action needed"],
       [{ prSnapshot: { state: "MERGED" } }, [], "Landed", "No action needed"],

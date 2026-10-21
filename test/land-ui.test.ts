@@ -65,7 +65,7 @@ test("Land renders newest first, PRs, SHA tooltips, reasons, logs and only activ
     const entries = [
       entry(1),
       entry(2, "checking", 3),
-      entry(3, "queued", 3),
+      entry(3, "waiting_approval", 3),
       { ...entry(4, "cancelled", 0), logPath: null },
     ];
     const html = renderToString(() => LandList({ entries, cancel: () => {}, error: "load failed" }));

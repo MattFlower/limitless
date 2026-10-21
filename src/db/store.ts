@@ -99,7 +99,8 @@ const FEED_OWNERSHIP = `EXISTS (SELECT 1 FROM runs WHERE runs.id = COALESCE(
 type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, NULLIF(run_id, '') AS runId, title, repo, pr_url AS prUrl, base_branch AS baseBranch,
-  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
+  head_branch AS headBranch, approved_sha AS approvedSha,
+  CASE WHEN state = 'checking' AND approval_wait = 1 THEN 'waiting_approval' ELSE state END AS state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
   log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
   finished_at AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
@@ -2913,7 +2914,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       Pick<LandEntry, "baseBranch" | "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">
     >,
   ): LandEntry {
-    const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
+    const { sets, values } = buildUpdate(
+      patch.state === "waiting_approval" ? { ...patch, state: "checking" } : patch,
+      LAND_PATCH_COLUMNS,
+    );
+    if (patch.state) {
+      sets.push("approval_wait = ?");
+      values.push(patch.state === "waiting_approval" ? 1 : 0);
+    }
     sets.push("updated_at = ?");
     values.push(Date.now());
     if (patch.state && !ACTIVE_LAND_STATES.includes(patch.state)) {
@@ -2925,7 +2933,13 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** Feed items for the queue: the PR URL, the SHA and, when it failed, the reason. */
-  landFeed(kind: LandFeedKind, entry: LandEntry, summary: string, data: Record<string, unknown> = {}): void {
+  landFeed(
+    kind: LandFeedKind,
+    entry: LandEntry,
+    summary: string,
+    data: Record<string, unknown> = {},
+    key = String(entry.id),
+  ): void {
     this.db.transaction(() =>
       this.addFeedItems([
         {
@@ -2934,7 +2948,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
           repo: entry.repo,
           summary,
           data: { url: entry.prUrl, sha: entry.approvedSha, ...data },
-          key: String(entry.id),
+          key,
         },
       ]),
     )();
@@ -2993,9 +3007,9 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       .run(outcome, f.prUrl, f.sha, f.signature);
   }
 
-  /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
+  /** Factory PRs still tracked by their runs, plus every active land (including external PRs). */
   githubTracked(now = Date.now()): TrackedPr[] {
-    const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
+    const sql = `WITH tracked AS (SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
       LEFT JOIN github_pr_expiry e ON e.url = r.pr_url
@@ -3005,7 +3019,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
         AND (r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000
           OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED' OR e.reopened_at >= ?1 - 604800000)
-      GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
+      GROUP BY r.pr_url)
+      SELECT * FROM tracked
+      UNION
+      SELECT l.pr_url, l.repo, NULLIF(l.run_id, ''), g.node_id, g.data, 1
+      FROM land_entries l LEFT JOIN github_prs g ON g.url = l.pr_url
+      WHERE l.state IN ('queued', 'checking', 'waiting_ci', 'merging')
+        AND NOT EXISTS (SELECT 1 FROM tracked WHERE url = l.pr_url)
+      ORDER BY repo, url`;
     return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
       const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
       return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();

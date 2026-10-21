@@ -38,9 +38,18 @@ export const statusDetailSchema = z.object({
 export const statusLandsSchema = z.array(
   z.object({
     id: z.number(),
-    runId: z.string(),
+    runId: z.string().nullable(),
     prUrl: z.string(),
-    state: z.enum(["queued", "checking", "waiting_ci", "merging", "landed", "blocked", "cancelled"]),
+    state: z.enum([
+      "queued",
+      "checking",
+      "waiting_approval",
+      "waiting_ci",
+      "merging",
+      "landed",
+      "blocked",
+      "cancelled",
+    ]),
     reason: z.string().nullable(),
   }),
 );
@@ -84,7 +93,7 @@ export function explainStatus(
       "Landing blocked",
       "Inspect the land reason, resolve the blocker, then request limitless_land again.",
     );
-  if (land && ["queued", "checking", "waiting_ci", "merging"].includes(land.state))
+  if (land && ["queued", "checking", "waiting_approval", "waiting_ci", "merging"].includes(land.state))
     return result(
       `Landing in progress (${land.state})`,
       "Wait for the land queue; check limitless_status for progress.",

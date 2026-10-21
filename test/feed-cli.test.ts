@@ -266,3 +266,54 @@ test("the CLI binary retries a 5xx response and then prints items", async () => 
     server.stop();
   }
 });
+
+test("human feed output exposes the approval wait and its reason", async () => {
+  const reason = `Another GitHub account must approve ${"a".repeat(40)}`;
+  const item: FeedItem = {
+    ...feedItem(1),
+    kind: "land.waiting_approval",
+    title: "Land waiting_approval",
+    summary: reason,
+    data: { state: "waiting_approval", reason },
+  };
+  const daemon = fakeDaemon([{ items: [item], nextAfter: 1, pruned: false }]);
+  const lines: string[] = [];
+  await feedCommand([], {}, { ...daemon, print: (line) => lines.push(line) });
+  expect(lines.join("\n")).toContain(`land.waiting_approval  Land waiting_approval\n    ${reason}`);
+});
+
+test("land list binary shows waiting_approval and its reason", async () => {
+  const reason = `Another GitHub account must approve ${"a".repeat(40)}`;
+  const server = Bun.serve({
+    port: 0,
+    fetch: () =>
+      Response.json([
+        {
+          id: 1,
+          state: "waiting_approval",
+          repo: "o/r",
+          approvedSha: "a".repeat(40),
+          prUrl: "https://github.com/o/r/pull/1",
+          reason,
+        },
+      ]),
+  });
+  try {
+    const child = Bun.spawn(["bun", "src/cli/main.ts", "land", "list"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, LIMITLESS_URL: `http://127.0.0.1:${server.port}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
+    expect(stdout).toContain("waiting_approval");
+    expect(stdout).toContain(reason);
+  } finally {
+    server.stop();
+  }
+});

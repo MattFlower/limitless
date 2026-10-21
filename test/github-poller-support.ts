@@ -34,7 +34,9 @@ export function prNode(repo: string, n: number) {
     commits: { nodes: [{ commit: { statusCheckRollup: null as unknown } }] },
     reviews: { nodes: [] as unknown[] },
     comments: { nodes: [] as unknown[] },
-    latestReviews: { nodes: [] as { state: string; author: { login: string } | null }[] },
+    latestReviews: {
+      nodes: [] as { state: string; author: { login: string } | null; commit?: { oid: string } | null }[],
+    },
   };
 }
 export type PrNode = ReturnType<typeof prNode>;

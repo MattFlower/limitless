@@ -40,7 +40,7 @@ export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Pu
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion status completedAt url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
-  latestReviews(first: 20) { nodes { state author { login } } }
+  latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
   reviews(last: 10) { nodes { id createdAt updatedAt comments(last: 10) { nodes { id createdAt updatedAt } } } }
   comments(last: 10) { nodes { id createdAt updatedAt } } } } }`;
 // Activity pages hold the newest few items so an edit to a recent older one still moves the marker.
@@ -72,7 +72,11 @@ type GqlPr = Base &
     commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
     reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
     comments?: Conn<Activity>;
-    latestReviews?: Conn<{ state: string; author?: { login: string } | null }>;
+    latestReviews?: Conn<{
+      state: string;
+      author?: { login: string } | null;
+      commit?: { oid: string } | null;
+    }>;
   };
 /** A PR's normalized state; `failing` is reduced and sorted so reordering is not a change. */
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
@@ -87,6 +91,7 @@ export type PrSnapshot = Known &
     statusNames?: string[];
     failing: { name: string; url: string | null }[];
     truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
+    reviewEvidence?: { state: string; login: string | null; commit: string | null }[];
     reviews?: string[]; // `login:state` of each reviewer's latest review
     reviewComments?: Record<string, string[]>; // each review connection has its own oldest-first order
     activity: Record<"review" | "review_comment" | "comment", string[]>;
@@ -179,6 +184,13 @@ export function normalizePr(node: unknown, id?: string | null): PrSnapshot | nul
       .flatMap((c) => (c.name ? [c.name] : [])),
     failing,
     truncated: nodes(head?.contexts).length >= 100 || undefined,
+    reviewEvidence: latestReviews
+      ? nodes(latestReviews).map((r) => ({
+          state: r.state,
+          login: r.author?.login ?? null,
+          commit: r.commit?.oid ?? null,
+        }))
+      : undefined,
     reviews: nodes(latestReviews).map((r) => `${r.author?.login ?? "ghost"}:${r.state}`),
     reviewComments: Object.fromEntries(all.map((r) => [r.id, newest(nodes(r.comments))])),
     activity: {
@@ -498,7 +510,11 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     schedule();
   };
   const unsubscribe = store.subscribe((msg) => {
-    if (msg.kind === "run" && msg.run.prUrl && !running) schedule();
+    if (
+      !running &&
+      ((msg.kind === "run" && msg.run.prUrl) || (msg.kind === "feed" && msg.item.kind === "land.queued"))
+    )
+      schedule();
   });
   schedule();
   return () => {

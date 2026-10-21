@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ACTIVE_LAND_STATES } from "../src/core/types.ts";
+import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { Store } from "../src/db/store.ts";
 
 function seedLandEntries(store: Store) {
@@ -101,5 +102,61 @@ test("land entries preserve previous inserts and persist unowned PRs without a n
     expect(store.listLandEntries().find((e) => e.id === entry.id)).toMatchObject({ runId: null, title: "T" });
   } finally {
     store.close();
+  }
+});
+
+test("approval waiting migrates old rows, survives reopening, and retains claims and uniqueness", () => {
+  const dir = mkdtempSync(join(tmpdir(), "land-migration-"));
+  const migrations = join(dir, "migrations");
+  mkdirSync(migrations);
+  for (const file of readdirSync(MIGRATION_DIR))
+    if (file.endsWith(".sql") && file !== "20261021T021253-land-approval-wait.sql")
+      copyFileSync(join(MIGRATION_DIR, file), join(migrations, file));
+  const path = join(dir, "db");
+  let store = new Store(path, migrations);
+  try {
+    const input = {
+      runId: "run",
+      repo: "test/repo",
+      prUrl: "https://github.com/test/repo/pull/1",
+      baseBranch: "main",
+      headBranch: "one",
+      approvedSha: "a".repeat(40),
+    };
+    const inserted = store.db
+      .query(`INSERT INTO land_entries
+      (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, 1)`)
+      .run(input.runId, input.repo, input.prUrl, input.baseBranch, input.headBranch, input.approvedSha);
+    const entry = { id: Number(inserted.lastInsertRowid) };
+    store.close();
+    store = new Store(path);
+    expect(store.getLandEntry(entry.id)?.state).toBe("queued");
+    expect(store.claimLandEntry(input.repo, 30000, "first", 1000)?.id).toBe(entry.id);
+    store.updateLandEntry(entry.id, {
+      state: "waiting_approval",
+      reason: "Another GitHub account must approve",
+    });
+    store.close();
+    store = new Store(path);
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: "waiting_approval",
+      finishedAt: null,
+      reason: "Another GitHub account must approve",
+    });
+    expect(store.heartbeatLandClaim(entry.id, "first", 2000)).toBe(true);
+    expect(() => store.createLandEntry(input)).toThrow("already in the land queue");
+    const next = store.createLandEntry({ ...input, prUrl: input.prUrl.replace("/1", "/2") });
+    expect(store.claimLandEntry(input.repo, 30000, "second", 2500)).toBeNull();
+    expect(store.claimLandEntry(input.repo, 30000, "second", 32001)).toMatchObject({
+      id: entry.id,
+      state: "waiting_approval",
+    });
+    expect(store.heartbeatLandClaim(entry.id, "first", 32002)).toBe(false);
+    store.updateLandEntry(entry.id, { state: "cancelled" });
+    expect(store.claimLandEntry(input.repo, 30000, "second", 32003)?.id).toBe(next.id);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
