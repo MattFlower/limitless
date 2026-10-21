@@ -500,7 +500,7 @@ test("cleanup prints a safely quoted recovery command only after resume retries 
   writeFileSync(join(configuredHome, "api-token"), token);
   process.env.LIMITLESS_HOME = configuredHome;
   try {
-    for (const stalls of [0, 1, 3]) {
+    for (const stalls of [0, 1, Infinity]) {
       const f = setup();
       const admin = f.client.admin;
       const signals: AbortSignal[] = [];
@@ -509,7 +509,9 @@ test("cleanup prints a safely quoted recovery command only after resume retries 
         if (action === "drain") throw new Error("original drain failure");
         if (++attempts <= stalls) {
           signals.push(signal);
-          queueMicrotask(() => {
+          const budget = f.timeouts.at(-1) ?? 0;
+          queueMicrotask(async () => {
+            await f.clock.sleep(budget);
             for (const timeout of [...f.pending]) timeout();
           });
           return new Promise<never>(() => {});
@@ -521,15 +523,18 @@ test("cleanup prints a safely quoted recovery command only after resume retries 
         (error: unknown) => String(error),
       );
       expect(diagnostic).toContain("original drain failure");
-      expect(attempts).toBe(stalls === 3 ? 3 : stalls + 1);
+      expect(attempts).toBe(stalls === Infinity ? 8 : stalls + 1);
       expect(signals.every((signal) => signal.aborted)).toBe(true);
-      expect(f.timeouts.filter((ms) => ms === 15_000)).toHaveLength(attempts);
+      expect(f.timeouts.slice(-attempts)).toEqual(
+        stalls === Infinity ? [...Array<number>(7).fill(15_000), 1000] : Array<number>(attempts).fill(15_000),
+      );
       expect(diagnostic).not.toContain(token);
-      if (stalls < 3) {
+      if (stalls < Infinity) {
         expect(diagnostic).not.toContain("curl");
         expect(diagnostic).not.toContain("Cleanup failures:");
       } else {
-        expect(diagnostic).toContain("Cleanup failures:\nresume scheduler: Error: daemon request timed out");
+        expect(diagnostic).toContain("daemon is left DRAINING");
+        expect(diagnostic).toContain("Error: daemon request timed out");
         expect(diagnostic).toContain(
           `curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- '${dir}/operator'"'"'s home $(unused)/api-token')" http://127.0.0.1:8123/api/admin/resume`,
         );
@@ -559,44 +564,149 @@ test("--now and zero-wait drains don't retry a stalled health poll", async () =>
   }
 });
 
-test("a drain tolerates two stalled health polls in a row but not three", async () => {
-  for (const stalls of [2, 3]) {
+test("drain retries unanswered polls for 60 seconds, then throws the last error", async () => {
+  for (const stalls of [4, Infinity]) {
     const f = setup();
     let reads = 0;
+    const error = new DaemonTimeoutError();
     f.client.health = async () => {
-      reads++;
-      if (reads >= 2 && reads < 2 + stalls) throw new DaemonTimeoutError();
-      return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: reads === 1 ? ["run-a"] : [] };
+      if (++reads <= stalls) {
+        await f.clock.sleep(f.timeouts.at(-1) ?? 5000);
+        throw error;
+      }
+      return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: [] };
     };
-    const result = waitForDrain(f.client, f.clock, 60_000, false, (line) => f.logs.push(line));
-    if (stalls === 3) {
-      await expect(result).rejects.toThrow("daemon request timed out");
-      continue;
+    const result = waitForDrain(f.client, f.clock, 180_000, false, (line) => f.logs.push(line));
+    if (stalls === Infinity) {
+      await expect(result).rejects.toBe(error);
+      expect(f.clock.now()).toBe(60_000);
+    } else {
+      await result;
+      expect(reads).toBe(5);
+      expect(f.logs.filter((line) => line.startsWith("Health poll unanswered"))).toHaveLength(4);
+      expect(f.logs.join("\n")).toContain("of 60000ms");
+      expect(f.logs.at(-1)).toStartWith("Drain complete");
     }
-    await result;
-    expect(f.logs.filter((line) => line.startsWith("Health poll timed out"))).toHaveLength(2);
-    expect(f.logs.at(-1)).toStartWith("Drain complete");
   }
 });
 
-test("resume retries a stalled daemon with a longer limit, up to three attempts", async () => {
+test("an answered poll resets the silence budget between two 40 second stalls", async () => {
   const f = setup();
-  let calls = 0;
-  f.client.admin = async (action) => {
-    if (++calls < 3) throw new DaemonTimeoutError();
-    return { draining: action === "drain", active: [] };
+  let reads = 0;
+  f.client.health = async () => {
+    reads++;
+    if (reads !== 7 && reads !== 14) {
+      await f.clock.sleep(5000);
+      throw new DaemonTimeoutError();
+    }
+    return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: reads === 7 ? ["run-a"] : [] };
   };
-  await requestAdmin(f.client, f.clock, "resume");
-  expect(calls).toBe(3);
-  expect(f.timeouts).toEqual([15_000, 15_000, 15_000]);
-  calls = -10;
-  await expect(requestAdmin(f.client, f.clock, "resume")).rejects.toThrow("daemon request timed out");
-  expect(calls).toBe(-7);
-  f.client.admin = async () => {
+  await waitForDrain(f.client, f.clock, 180_000, false, () => {});
+  expect(reads).toBe(14);
+  expect(f.clock.now()).toBeGreaterThan(80_000);
+});
+
+test("drain retries transport failures but fails immediately on answered errors", async () => {
+  for (const error of [
+    Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
+    new Error("HTTP 500"),
+    new Error("invalid JSON"),
+  ]) {
+    const f = setup();
+    let reads = 0;
+    f.client.health = async () => {
+      if (++reads === 1) throw error;
+      return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: [] };
+    };
+    const result = waitForDrain(f.client, f.clock, 180_000, false, () => {});
+    if ("code" in error) {
+      await result;
+      expect(reads).toBe(2);
+    } else {
+      await expect(result).rejects.toBe(error);
+      expect(reads).toBe(1);
+    }
+  }
+  const f = setup();
+  let reads = 0;
+  f.client.health = async () => {
+    reads++;
+    return { ok: false } as unknown as HealthResponse;
+  };
+  await expect(waitForDrain(f.client, f.clock, 180_000, false, () => {})).rejects.toThrow(
+    "invalid or unhealthy",
+  );
+  expect(reads).toBe(1);
+});
+
+test("the overall drain deadline still restarts during unanswered polls", async () => {
+  const f = setup();
+  f.client.health = async () => {
+    await f.clock.sleep(f.timeouts.at(-1) ?? 0);
     throw new DaemonTimeoutError();
   };
-  await expect(requestAdmin(f.client, f.clock, "drain")).rejects.toThrow("daemon request timed out");
-  expect(f.timeouts.at(-1)).toBe(5000);
+  await waitForDrain(f.client, f.clock, 20_000, false, (line) => f.logs.push(line));
+  expect(f.clock.now()).toBe(20_000);
+  expect(f.logs.at(-1)).toBe("Drain timeout after 20s; restarting");
+});
+
+test("resume retries resets, timeouts and missing acknowledgements within 120 seconds", async () => {
+  const f = setup();
+  let calls = 0;
+  f.client.admin = async () => {
+    calls++;
+    if (calls <= 2) throw Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" });
+    if (calls === 3) throw new DaemonTimeoutError();
+    return { draining: false, active: [] };
+  };
+  await requestAdmin(f.client, f.clock, "resume");
+  expect(calls).toBe(4);
+  expect(f.timeouts).toEqual([15_000, 15_000, 15_000, 15_000]);
+  calls = 0;
+  f.client.admin = async () => ({ draining: ++calls === 1, active: [] });
+  await requestAdmin(f.client, f.clock, "resume");
+  expect(calls).toBe(2);
+  for (const action of ["drain", "resume"] as const) {
+    calls = 0;
+    f.client.admin = async () => {
+      calls++;
+      throw new DrainUnsupportedError("unsupported");
+    };
+    await expect(requestAdmin(f.client, f.clock, action)).rejects.toThrow("unsupported");
+    expect(calls).toBe(1);
+  }
+  calls = 0;
+  f.client.admin = async () => {
+    calls++;
+    throw new Error("ECONNRESET");
+  };
+  await expect(requestAdmin(f.client, f.clock, "drain")).rejects.toThrow("ECONNRESET");
+  expect(calls).toBe(1);
+  const start = f.clock.now();
+  await expect(requestAdmin(f.client, f.clock, "resume")).rejects.toThrow("ECONNRESET");
+  expect(f.clock.now() - start).toBe(120_000);
+});
+
+test("rollback reports a stranded scheduler only after resume exhausts its budget", async () => {
+  for (const permanent of [false, true]) {
+    const f = setup();
+    let resumes = 0;
+    f.client.admin = async (action) => {
+      if (action === "drain") throw new Error("original failure");
+      if (++resumes === 1 || permanent) throw new Error("ECONNRESET");
+      return { draining: false, active: [] };
+    };
+    const error = await deploy(7400, "feature", false, f.opts).catch(String);
+    expect(error).toContain("original failure");
+    if (permanent) {
+      expect(error).toMatch(/left draining/i);
+      expect(error).toContain("ECONNRESET");
+      expect(error).toContain("/api/admin/resume");
+    } else {
+      expect(resumes).toBe(2);
+      expect(error).not.toContain("resume scheduler");
+    }
+  }
 });
 
 test("requests are bounded even if a client ignores abort", async () => {
@@ -653,7 +763,7 @@ test("polling failures after progress resume scheduling without restarting", asy
   expect(f.calls.at(-1)).toBe("resume");
 });
 
-test("a stalled deployment health request is bounded and cleans up", async () => {
+test("a stalled deployment health request respects the overall drain deadline", async () => {
   const f = setup();
   let signal: AbortSignal | undefined;
   let entered = () => {};
@@ -663,7 +773,7 @@ test("a stalled deployment health request is bounded and cleans up", async () =>
   const health = f.client.health;
   let reads = 0;
   f.client.health = async (s) => {
-    if (++reads === 1) return health(s);
+    if (++reads === 1 || f.calls.includes("restart")) return health(s);
     signal = s;
     entered();
     return new Promise<HealthResponse>(() => {});
@@ -671,11 +781,13 @@ test("a stalled deployment health request is bounded and cleans up", async () =>
   const result = deploy(7400, "feature", false, { ...f.opts, maxWaitMs: 123 });
   await inHealth;
   expect(f.timeouts.at(-1)).toBe(123);
+  await f.clock.sleep(123);
   for (const timeout of [...f.pending]) timeout();
-  await expect(result).rejects.toThrow("daemon request timed out");
+  await result;
   expect(signal?.aborted).toBe(true);
-  expect(f.calls).not.toContain("restart");
-  expect(f.calls.at(-1)).toBe("resume");
+  expect(f.calls).toContain("restart");
+  expect(f.logs.join("\n")).toContain("Drain timeout");
+  expect(f.calls).not.toContain("resume");
 });
 
 test("progress tracks changing active membership and post-restart rejects unhealthy data", async () => {
