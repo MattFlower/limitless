@@ -965,7 +965,7 @@ export class LandQueue {
     subject: string,
   ) {
     if (repoSettings(this.deps.cfg ?? {}, entry.repo).discreet) {
-      if (hasFactoryMark(subject, run?.id ?? ""))
+      if (hasFactoryMark(subject, run?.id ?? "", this.deps.cfg?.uiUrl))
         throw new LandBlocked("Discreet mode blocked factory marks in squash title");
       try {
         await checkDiscreetCommits(

@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, repoSettings } from "../src/config.ts";
 import { deliveryMarker, hasFactoryMark } from "../src/pipeline/markers.ts";
-import { renderReport } from "../src/pipeline/report.ts";
-import { stripReportManifest } from "../src/pipeline/report-privacy.ts";
+import { renderReport, renderReportArtifacts } from "../src/pipeline/report.ts";
+import { reportStructure, stripReportManifest } from "../src/pipeline/report-privacy.ts";
 import { roundSection } from "../src/pipeline/review-round.ts";
 
 let root: string;
@@ -124,4 +124,187 @@ test("an operator's title may contain the word limitless", () => {
       "test@example.invalid",
     ]),
   ).toBe(false);
+});
+
+const attribution = [
+  "Built by Limitless",
+  "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+  "Co-Authored-By: Claude Fable 5.1",
+].join("\n");
+
+test.each([
+  ...[
+    "Limitless",
+    "Claude",
+    "Claude Code",
+    "Codex",
+    "ChatGPT",
+    "GitHub Copilot",
+    "Gemini",
+    "Cursor",
+    "Aider",
+    "Claude Fable 5.1",
+    "Claude Opus 5.5",
+    "GPT-6.1 Codex",
+  ].flatMap((name) => [name, name.toUpperCase()]),
+  ...[
+    "limitless@localhost",
+    "noreply@anthropic.com",
+    "noreply@openai.com",
+    "codex@openai.com",
+    "copilot@github.com",
+    "copilot-swe-agent[bot]@users.noreply.github.com",
+    "198982749+Copilot[bot]@users.noreply.github.com",
+    "198982749+Copilot@users.noreply.github.com",
+    "167198135+copilot[bot]@users.noreply.github.com",
+    "199175422+chatgpt-codex-connector[bot]@users.noreply.github.com",
+    "223556219+Copilot@users.noreply.github.com",
+  ].map((email) => `Someone <${email}>`),
+])("shared tooling identity: %s", (identity) => {
+  expect(hasFactoryMark(`Co-Authored-By: ${identity}`, "")).toBe(true);
+  // Raw author/committer names and emails use the same classifier.
+  const match = /^(.*?) <(.*)>$/.exec(identity);
+  if (match) expect(hasFactoryMark("Change", "", "", [match[1] ?? "", match[2] ?? ""])).toBe(true);
+});
+
+test.each([
+  "co-authored",
+  "coauthored",
+  "co-developed",
+  "codeveloped",
+  "signed-off",
+  "authored",
+  "reviewed",
+  "tested",
+  "suggested",
+  "acked",
+  "helped",
+  "assisted",
+  "generated",
+])("attribution keys accept separators and spacing: %s", (key) => {
+  for (const separator of [":", "=", "#"])
+    expect(hasFactoryMark(`  ${key}-by  ${separator}  Claude Fable 5.1`, "")).toBe(true);
+});
+
+test.each([
+  "Co-authored-by: Claude Smith <claude.smith@example.org>",
+  "Co-authored-by: Claude <human@example.org>",
+  "Co-authored-by: Someone <claude@example.org>",
+  "Reviewed-by: Someone <codex@example.org>",
+  "Generated-by: Someone <engineer@anthropic.com>",
+  "Use Claude Code and Codex to check the examples",
+  "Document how Limitless handles input",
+])("preserves humans and ordinary prose: %s", (text) => {
+  expect(hasFactoryMark(text, "")).toBe(false);
+  const identity = /: (.*?) <(.*)>$/.exec(text);
+  if (identity) expect(hasFactoryMark("Change", "", "", [identity[1] ?? "", identity[2] ?? ""])).toBe(false);
+});
+
+test("discreet rendering sanitizes model content before quoting, tables, clips and report spans", () => {
+  const rendered = renderReportArtifacts({
+    discreet: true,
+    success: true,
+    runId: "private-run",
+    runUrl: "",
+    prompt: "Fix input",
+    state: {
+      implementerReport: `${attribution}\n${"Useful summary\n".repeat(400)}\nCo-authored-by: Claude <human@example.org>`,
+      spec: {
+        summary: "Fix",
+        requirements: [],
+        assumptions: [`${attribution}\nKeep input`],
+        acceptance_criteria: [
+          { id: "AC-1", criterion: `${attribution}\nInput accepted`, how_to_verify: "inspect" },
+        ],
+        out_of_scope: [],
+        blocking_questions: [],
+      },
+      lastVerify: {
+        modelId: "reviewer",
+        overall: "pass",
+        notes: "",
+        criteria: [
+          { id: "AC-1", status: "met", evidence: `${attribution}\nObserved result`, publicSummary: "" },
+        ],
+      },
+      lastReview: {
+        modelId: "reviewer",
+        verdict: "approve",
+        summary: `${attribution}\nChecked input`,
+        findings: [],
+      },
+    },
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+  });
+  const structure = reportStructure(rendered.report);
+  expect(structure).toBeTruthy();
+  const body = stripReportManifest(rendered.report);
+  expect(body).toContain("Useful summary");
+  expect(body).toContain("| ✅ AC-1 | Input accepted | Observed result |");
+  expect(body).toContain("**approve** — Checked input");
+  expect(hasFactoryMark(body, "private-run")).toBe(false);
+  const sources = Object.values(rendered.sources.sources).join("\n");
+  expect(sources).toContain("Co-authored-by: Claude <human@example.org>");
+  expect(hasFactoryMark(sources, "private-run")).toBe(false);
+  const section = roundSection(
+    "private-run",
+    2,
+    [{ severity: "major", title: `${attribution}\nHandle input`, detail: "Fix" }],
+    true,
+  );
+  expect(section.text).toContain("**major**: Handle input");
+  expect(hasFactoryMark(section.text, "private-run")).toBe(false);
+});
+
+test.each([undefined, false])(
+  "non-discreet rendering preserves exact attribution and branding (%s)",
+  (discreet) => {
+    const report = stripReportManifest(
+      renderReport({
+        discreet,
+        success: true,
+        runId: "private-run",
+        runUrl: "http://example.com/runs/private-run",
+        prompt: "Fix input",
+        state: { implementerReport: `Added input\n${attribution}\nKept checks` },
+        invocations: [],
+        totals: { costUsd: 0, costEquivUsd: 0 },
+      }),
+    );
+    expect(report).toBe(`Built by **Limitless** — every gate below passed.
+
+Flow: build
+
+## Request
+
+> Fix input
+
+## Implementer's summary
+
+Added input
+Built by Limitless
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+Co-Authored-By: Claude Fable 5.1
+Kept checks
+
+## Checks
+
+No automated checks were detected for this repository.
+
+Run \`private-run\` · http://example.com/runs/private-run
+
+🤖 Generated by Limitless
+`);
+  },
+);
+
+test.each([
+  "bUiLt By __LiMiTlEsS__",
+  "**Verified by Limitless** — passed checks",
+  "🤖 gEnErAtEd WiTh [cLaUdE cOdE](https://claude.com/claude-code)",
+  "Generated-with # Codex",
+  "Assisted by Claude Fable 5.1",
+])("shared attribution recognizes formatting: %s", (text) => {
+  expect(hasFactoryMark(text, "")).toBe(true);
 });

@@ -6,7 +6,7 @@ import type { Store } from "../db/store.ts";
 import { FeedQuerySchema, mcpRequestedBy } from "../feed.ts";
 import { cachePath, ensureCache, readFileAt } from "../git/repos.ts";
 import { type GhRunner, quotedJson, runGh } from "../integrations/github.ts";
-import { deliveryMarker } from "./markers.ts";
+import { deliveryMarker, discreetModelText } from "./markers.ts";
 
 export const DEFAULT_REVIEW_ROUNDS = 3;
 
@@ -76,7 +76,7 @@ ${quotedJson(findings)}
  */
 export function roundSection(runId: string, round: number, findings: ReviewFinding[], discreet = false) {
   const line = (text: string) =>
-    text
+    discreetModelText(text, discreet)
       .replace(/\s+/g, " ")
       .trim()
       .replace(/[<>&`]/g, (c) => `&#${c.charCodeAt(0)};`);

@@ -6,6 +6,7 @@ import { redactGateData } from "../gates/output.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { activity } from "../util/stall.ts";
 import type { RunContext, RunState } from "./context.ts";
+import { discreetModelText } from "./markers.ts";
 import {
   markReportArtifacts,
   type ReportArtifacts,
@@ -109,6 +110,24 @@ export function renderReportArtifacts(
 }
 
 function renderArtifacts(input: ReportInput, publication?: (text: string) => string): ReportArtifacts {
+  input = {
+    ...input,
+    state: {
+      ...input.state,
+      ...discreetModelText(
+        {
+          implementerReport: input.state.implementerReport,
+          spec: input.state.spec,
+          holdout: input.state.holdout,
+          lastVerify: input.state.lastVerify,
+          lastReview: input.state.lastReview,
+          reviewFollowUps: input.state.reviewFollowUps,
+          reviewHistory: input.state.reviewHistory,
+        },
+        !!input.discreet,
+      ),
+    },
+  };
   input = redactGateData(input);
   // Normalize complete strings before display cuts, spans and clipped-source metadata.
   if (publication)

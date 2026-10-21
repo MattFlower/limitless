@@ -351,16 +351,16 @@ test("discreet commit inspection uses raw identities and UTF-8 regardless of log
 
 test.each([
   ["Co-authored-by: Limitless <limitless@localhost>", true],
-  ["Co-Authored-By: Claude <claude@example.invalid>", true],
+  ["Co-Authored-By: Claude <noreply@anthropic.com>", true],
   ["Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>", true],
   ["Generated with Claude", true],
   ["Generated-by: Codex", true],
-  ["Reviewed-By: Claude <claude@example.invalid>", true],
-  ["Co-authored-by: claude@example.invalid", true],
+  ["Reviewed-By: Claude <noreply@anthropic.com>", true],
+  ["Co-authored-by: claude@example.invalid", false],
   ["Explain the change\nCo-authored-by: Limitless <limitless@localhost>", true],
-  ["Explain the change\n  Co-Authored-By : Claude <claude@example.invalid>", true],
+  ["Explain the change\n  Co-Authored-By : Claude <noreply@anthropic.com>", true],
   ["Co-authored-by: Limitless <limitless@localhost>\n\nFurther explanation", true],
-  ["Co-Authored-By: Claude <claude@example.invalid>\n\nFurther explanation", true],
+  ["Co-Authored-By: Claude <noreply@anthropic.com>\n\nFurther explanation", true],
   ["Co-authored-by: Human Contributor <human@example.invalid>", false],
   ["Co-authored-by: Claude Smith <human@example.invalid>", false],
   ["Explain the change\nCo-authored-by: Claude Smith <human@example.invalid>", false],
@@ -385,6 +385,39 @@ test.each([
         checkDiscreetCommits(dir, `${published}..HEAD`, base, "private-run"),
       ).resolves.toBeUndefined();
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each(["=", "#"])("discreet inspection ignores trailer configuration (%s)", async (separator) => {
+  const dir = mkdtempSync(join(tmpdir(), "discreet-trailer-config-"));
+  const git = (args: string[]) => mergeGit(dir, args, false, undefined, "operator");
+  try {
+    await git(["init", "-q", "-b", "main"]);
+    await git(["config", "trailer.separators", separator]);
+    await git(["config", "trailer.Co-authored-by.key", "Human-credit"]);
+    await git(["config", "trailer.Human-credit.key", "Co-authored-by"]);
+    await git(["commit", "--allow-empty", "-qm", "Base"]);
+    const base = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    for (const message of [
+      `Change\n\n  Co-authored-by  ${separator}  Claude Fable 5.1\n\nFurther explanation`,
+      "Change\n\nCo-authored-by:\n Claude Opus 5.5",
+      "Change\n\nHuman-credit: Human Contributor <human@example.org>",
+    ]) {
+      const before = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      await git(["commit", "--allow-empty", "-qm", message]);
+      const marked = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      await git(["commit", "--allow-empty", "-qm", "Clean tip"]);
+      const inspection = checkDiscreetCommits(dir, `${before}..HEAD`, base, "private-run");
+      if (message.includes("Human-credit:")) await expect(inspection).resolves.toBeUndefined();
+      else await expect(inspection).rejects.toThrow(`commits: ${marked}`);
+      await expect(
+        checkDiscreetCommits(dir, `${marked}..HEAD`, base, "private-run"),
+      ).resolves.toBeUndefined();
+    }
+    expect((await git(["config", "trailer.separators"])).stdout.trim()).toBe(separator);
+    expect((await git(["config", "trailer.Co-authored-by.key"])).stdout.trim()).toBe("Human-credit");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -106,6 +106,7 @@ let onImplement: () => Promise<Record<string, string>>;
 let rejectNextReview = false;
 let verifyStatus: "met" | "blocked" | "unmet" | "unclear";
 let verifyCalls: number;
+let verifyEvidence: string;
 /** The fake PR: `view` overrides fields of `gh pr view`; `fail` breaks it; `hold` delays one lookup. */
 let pr: {
   state: string;
@@ -167,7 +168,7 @@ function answer(s: AgentSpec): FakeReply | Promise<FakeReply> {
         ...verify,
         criteria: verify.criteria.map((c, i) =>
           i === 0
-            ? { ...c, status: verifyStatus, evidence: "Real confinement probes require unconfined gates" }
+            ? { ...c, status: verifyStatus, evidence: verifyEvidence }
             : i === 1 && verifyStatus !== "met"
               ? { ...c, status: "blocked", evidence: "Environment unavailable" }
               : c,
@@ -262,6 +263,7 @@ beforeEach(async () => {
   rejectNextReview = false;
   verifyStatus = "met";
   verifyCalls = 0;
+  verifyEvidence = "Real confinement probes require unconfined gates";
   pr = {
     state: "OPEN",
     body: "Factory report",
@@ -1548,15 +1550,21 @@ test("discreet review delivery uses stored ownership and recognizes an uncheckpo
   expect(pr.body).toBe(body);
 });
 
-test("discreet environment-blocked rounds omit the local report URL", async () => {
+test("discreet environment-blocked rounds sanitize model attribution before comments", async () => {
+  verifyEvidence =
+    "Retained review evidence\nBuilt by Limitless\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nCo-Authored-By: Claude Fable 5.1\nChecks require unconfined gates\nCo-authored-by: Claude <human@example.org>";
   factory.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
   const original = await delivered("standard");
   verifyStatus = "blocked";
   const roundId = (await changes(original.id)).body.round?.id as string;
   expect((await settle(roundId)).status).toBe("needs_human");
-  expect(pr.comments).toHaveLength(1);
+  expect(pr.comments, factory.store.getRun(roundId)?.error ?? "").toHaveLength(1);
   const body = pr.comments[0]?.body;
   expect(body).toContain("🚧 blocked AC-1");
+  expect(body).toContain("Retained review evidence");
+  expect(body).toContain("Checks require unconfined gates");
+  expect(body).toContain("Co-authored-by: Claude <human@example.org>");
+  expect(body).not.toMatch(/Claude Code|Claude Fable|Co-Authored-By: Claude Fable/);
   expect(body).not.toMatch(/limitless|\/runs\/|Full report:/i);
   expect(body).not.toContain(roundId);
   expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(0);

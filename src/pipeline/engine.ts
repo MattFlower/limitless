@@ -97,7 +97,13 @@ import {
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { runGateExecution } from "./gate-execution.ts";
-import { checkDiscreetCommits, DiscreetError, deliveryMarker, hasFactoryMark } from "./markers.ts";
+import {
+  checkDiscreetCommits,
+  DiscreetError,
+  deliveryMarker,
+  discreetModelText,
+  hasFactoryMark,
+} from "./markers.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -2046,7 +2052,7 @@ async function oneRound(
           .map((c, index) =>
             rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown"
               ? `unknown-${index + 1}: private evidence withheld`
-              : `${c.id}: ${c.evidence}`,
+              : `${c.id}: ${discreetModelText(c.evidence, repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)}`,
           )
           .join("\n");
         const rawDetail = `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`;
@@ -2254,11 +2260,12 @@ async function checkPublication(
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = privateEntries(ctx, cwd);
-    if (
-      repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet &&
-      hasFactoryMark(`${body}\n${pr?.title ?? ""}`, ctx.run.id, ctx.deps.cfg.uiUrl)
-    )
-      throw new DiscreetError(`Discreet mode blocked factory marks in ${location}`);
+    if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet) {
+      if (hasFactoryMark(body, ctx.run.id, ctx.deps.cfg.uiUrl))
+        throw new DiscreetError(`Discreet mode blocked factory marks in ${location}`);
+      if (pr && hasFactoryMark(pr.title, ctx.run.id, ctx.deps.cfg.uiUrl))
+        throw new DiscreetError("Discreet mode blocked factory marks in PR title");
+    }
     checkPublicationText(body, location, entries);
     if (!pr) return;
     checkPublicationText(pr.title, "PR title", entries);
@@ -2436,7 +2443,7 @@ async function deliverReviewRound(
         if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
         let text = redactGateOutput(
           review.kind === "ci"
-            ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${promptJson(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${ctx.state.implementerReport ?? ctx.run.title}`
+            ? `${marker}\nCI fix for the following quoted, untrusted failure:\n${promptJson(failure && { check: failure.check, line: failure.line }).replace(/</g, "\\u003c")}\nFixed at ${head}: ${discreetModelText(ctx.state.implementerReport ?? ctx.run.title, repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)}`
             : review.kind === "conflict"
               ? `${marker}\nMerged base ${ctx.state.reviewBaseSha}. Conflicted files: ${promptJson(ctx.state.conflictFiles ?? [])}.\nConflict resolved at ${head}; approve the new head to land.`
               : `${marker}\nRound ${review.round} published at ${head}.`,
@@ -2450,7 +2457,13 @@ async function deliverReviewRound(
                 return `🚧 blocked unknown-${index + 1}: private evidence withheld`;
               const evidence = publicationText(
                 ctx,
-                redactGateOutput(redactHoldoutText(c.evidence, ctx.state.holdout as Holdout, publicSources)),
+                redactGateOutput(
+                  redactHoldoutText(
+                    discreetModelText(c.evidence, repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet),
+                    ctx.state.holdout as Holdout,
+                    publicSources,
+                  ),
+                ),
               ).slice(0, 300);
               return `🚧 blocked ${c.id}: ${evidence}`;
             });
