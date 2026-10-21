@@ -695,17 +695,26 @@ export interface ProcResult {
 
 const DEFAULT_TAIL = 64_000;
 // Prefix tables let raw matching remember arbitrarily long discarded controls without retaining payload.
-function credentialMatcher(variants: readonly [string, boolean][]) {
-  const patterns = variants.map(([text, substring]) => {
-    const table = new Uint32Array(text.length);
-    for (let i = 1, prefix = 0; i < text.length; i++) {
-      while (prefix && text[i] !== text[prefix]) prefix = table[prefix - 1] ?? 0;
-      if (text[i] === text[prefix]) prefix++;
-      table[i] = prefix;
-    }
-    return { text, substring, table, prefix: 0 };
-  });
+function credentialMatcher() {
+  const patterns: { text: string; substring: boolean; table: Uint32Array; prefix: number }[] = [];
   return {
+    // Registrations only add variants (or widen them to substrings); new ones start unmatched.
+    sync(variants: readonly [string, boolean][]) {
+      for (const [text, substring] of variants) {
+        const known = patterns.find((p) => p.text === text);
+        if (known) {
+          known.substring = substring;
+          continue;
+        }
+        const table = new Uint32Array(text.length);
+        for (let i = 1, prefix = 0; i < text.length; i++) {
+          while (prefix && text[i] !== text[prefix]) prefix = table[prefix - 1] ?? 0;
+          if (text[i] === text[prefix]) prefix++;
+          table[i] = prefix;
+        }
+        patterns.push({ text, substring, table, prefix: 0 });
+      }
+    },
     match(char: string) {
       let matched = 0;
       for (const p of patterns) {
@@ -722,6 +731,8 @@ function credentialMatcher(variants: readonly [string, boolean][]) {
     restore(saved: number[]) {
       for (const [i, p] of patterns.entries()) p.prefix = saved[i] ?? 0;
     },
+    /** Longest partial substring credential in a saved state. */
+    partial: (saved: number[]) => Math.max(0, ...patterns.map((p, i) => (p.substring ? (saved[i] ?? 0) : 0))),
   };
 }
 
@@ -791,14 +802,29 @@ type OutputCharacter = { text: string; position: number; marked?: number; before
 
 /** Internal observation seam: unresolved printable characters (at most L - 1) plus a bounded hold. */
 export function outputRedactor(emit: (text: string) => void) {
-  const variants = sortedCredentialVariants;
-  const overlap = Math.max(0, (variants[0]?.[0].length ?? 0) - 1);
-  const raw = credentialMatcher(variants);
-  const clean = credentialMatcher(variants);
+  let variants: [string, boolean][] = [];
+  let overlap = 0;
+  const raw = credentialMatcher();
+  const clean = credentialMatcher();
   const parser = terminalParser();
-  const short = variants.filter(([, substring]) => !substring).map(([text]) => text);
-  let wholeRaw = short,
-    wholeClean = short;
+  const short: string[] = [];
+  let wholeRaw: string[] = [],
+    wholeClean: string[] = [];
+  // Credentials registered while the stream runs cover the output that follows their registration.
+  const sync = () => {
+    if (variants === sortedCredentialVariants) return;
+    variants = sortedCredentialVariants;
+    overlap = Math.max(overlap, (variants[0]?.[0].length ?? 0) - 1);
+    raw.sync(variants);
+    clean.sync(variants);
+    alt.sync(variants);
+    for (const [text, substring] of variants)
+      if (!substring && !short.includes(text)) {
+        short.push(text);
+        if (!position) wholeRaw = [...wholeRaw, text];
+        if (!count) wholeClean = [...wholeClean, text];
+      }
+  };
   let deferred: number | undefined;
   let deferredMarked: number | undefined, deferredBefore: number | undefined;
   const pending = new Map<number, OutputCharacter>();
@@ -807,7 +833,38 @@ export function outputRedactor(emit: (text: string) => void) {
     head = 0;
   let hidden: number | undefined, replacing: number | undefined;
   // Text after a line break that ended a terminal string: payload if the string's terminator follows.
-  let held: { kind: string; length: number; clean: number[]; wholeClean: string[] } | undefined;
+  // Past the hold it is discarded if this chunk terminates the string, and otherwise released as
+  // output, keeping the string's matching state so a later terminator still completes credentials.
+  let released: { kind: string; clean: number[] } | undefined;
+  const alt = credentialMatcher();
+  let altLeft = 0,
+    altSeen = 0;
+  const mark = (from: number, to: number, start: number) => {
+    for (let index = from; index < to; index++)
+      start = Math.min(start, pending.get(index)?.marked ?? Infinity);
+    for (let index = from; index < to; index++) {
+      const entry = pending.get(index);
+      if (!entry) continue;
+      entry.marked = start;
+      if (entry.before !== undefined && entry.before >= start) entry.before = undefined;
+    }
+    return start;
+  };
+  let held:
+    | { kind: string; length: number; clean: number[]; wholeClean: string[]; discard?: boolean }
+    | undefined;
+  const discardHeld = () => {
+    if (!held) return;
+    // Matching resumes as if the held text never arrived.
+    for (; held.length; held.length--) {
+      const entry = pending.get(--count);
+      pending.delete(count);
+      const marker = Math.min(entry?.marked ?? Infinity, entry?.before ?? Infinity, hidden ?? Infinity);
+      hidden = marker === Infinity ? undefined : marker;
+    }
+    clean.restore(held.clean);
+    wholeClean = held.wholeClean;
+  };
   const write = (text: string, marked: number | undefined, output: string[]) => {
     if (marked !== undefined) {
       if (replacing !== marked) output.push("[redacted]");
@@ -835,6 +892,7 @@ export function outputRedactor(emit: (text: string) => void) {
       return held?.length ?? 0;
     },
     push(chunk: string) {
+      sync();
       const output: string[] = [];
       // UTF-16 code units match credential lengths and indexOf/JSON-escaped variants.
       for (let i = 0; i < chunk.length; i++) {
@@ -844,18 +902,12 @@ export function outputRedactor(emit: (text: string) => void) {
         const kind = parser.state;
         let isVisible = parser.visible(char);
         if (held && endsString(char, held.kind)) {
-          // Terminated: the held text was payload, and matching resumes as if it never arrived.
-          for (; held.length; held.length--) {
-            const entry = pending.get(--count);
-            pending.delete(count);
-            const marker = Math.min(entry?.marked ?? Infinity, entry?.before ?? Infinity, hidden ?? Infinity);
-            hidden = marker === Infinity ? undefined : marker;
-          }
-          clean.restore(held.clean);
-          wholeClean = held.wholeClean;
+          // Terminated: the held text was payload.
+          discardHeld();
           held = undefined;
           isVisible = false;
-        } else if (!held && isVisible && (kind === "osc" || kind === "string"))
+        } else if (held?.discard) isVisible = false;
+        else if (!held && isVisible && (kind === "osc" || kind === "string"))
           held = { kind, length: 0, clean: clean.save(), wholeClean };
         let cleanLength = 0;
         if (isVisible) {
@@ -865,6 +917,11 @@ export function outputRedactor(emit: (text: string) => void) {
           pending.set(count++, { text: char, position, before: hidden });
           hidden = undefined;
           cleanLength = clean.match(char);
+          if (altLeft) {
+            // Only the characters after the terminator are pending; the rest were marked on release.
+            altLeft--;
+            cleanLength = Math.max(cleanLength, Math.min(alt.match(char), ++altSeen));
+          }
         }
         if (rawLength || cleanLength) {
           let start = Math.min(
@@ -882,20 +939,30 @@ export function outputRedactor(emit: (text: string) => void) {
             start = Math.min(start, entry.marked ?? Infinity);
             first = index;
           }
-          for (let index = first; index < count; index++) {
-            const entry = pending.get(index);
-            if (!entry) continue;
-            entry.marked = start;
-            if (entry.before !== undefined && entry.before >= start) entry.before = undefined;
-          }
+          start = mark(first, count, start);
           if (hidden !== undefined && hidden >= start) hidden = undefined;
           if (rawLength && first === count) hidden = Math.min(hidden ?? Infinity, start);
         }
         position++;
-        // Past the hold, the line break did end a stray introducer: the held text is output.
+        if (released && endsString(char, released.kind)) {
+          // Matching as payload resumes after the terminator (a BEL is otherwise visible output).
+          alt.restore(released.clean);
+          [altLeft, altSeen, released] = [overlap + 1, 0, undefined];
+        }
         if (held && held.length > MAX_PENDING_VT) {
-          held = undefined;
-          writeDeferred(output);
+          const { kind } = held;
+          if ([...chunk.slice(i + 1)].some((next) => endsString(next, kind))) {
+            discardHeld();
+            held.discard = true;
+          } else {
+            // A credential begun before the string could be completed after a later terminator.
+            const end = count - held.length,
+              from = end - clean.partial(held.clean);
+            if (from < end) mark(from, end, pending.get(from)?.position ?? position);
+            released = { kind, clean: held.clean };
+            held = undefined;
+            writeDeferred(output);
+          }
         }
         while (pending.size - (held?.length ?? 0) > overlap) {
           // A whole-text short variant at length L is represented by its catalog index until EOF
@@ -912,8 +979,9 @@ export function outputRedactor(emit: (text: string) => void) {
       emit(output.join(""));
     },
     flush() {
+      sync();
       const output: string[] = [];
-      if (held) writeDeferred(output);
+      if (held && !held.discard) writeDeferred(output);
       held = undefined;
       if (
         wholeRaw.some((text) => text.length === position) ||

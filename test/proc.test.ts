@@ -893,13 +893,55 @@ test("text held after a line break in a terminal string stays bounded and is rel
       expect(redactor.terminalPayloadLength).toBeLessThanOrEqual(4_096);
       expect(redactor.carryLength).toBeLessThanOrEqual(longest - 1);
     }
-    // Past the hold, the stray introducer ended at its line break: the held text joined the output.
+    // Past the hold, with no terminator in sight, the stray introducer ended at its line break.
     expect(peak).toBeGreaterThan(4_000);
     expect(redactor.terminalPayloadLength).toBe(0);
     if (terminated) redactor.push(`\u001b\\${secret}`);
     redactor.flush();
     expect(output.join("")).toBe(`error: \n[redacted]${"y".repeat(9_000)}${terminated ? "[redacted]" : ""}`);
   }
+});
+
+test("a credential around a terminated multiline string longer than the hold is redacted at every split", () => {
+  const secret = "synthetic-long-multiline-control-credential";
+  registerCredential("LONG_MULTILINE_TEST_TOKEN", secret);
+  for (const [introducer, terminator] of [
+    ["\u001bP", "\u001b\\"],
+    ["\u001b]", "\u0007"],
+    ["\u009d", "\u009c"],
+  ] as const) {
+    const text = `error: ${secret.slice(0, 12)}${introducer}payload\n${"x".repeat(4_100)}${terminator}${secret.slice(12)}\nafter`;
+    // The hold fills at this character; a chunk that ends between it and the terminator can't show
+    // that the text is payload, so it is released with both credential fragments redacted.
+    const full = text.indexOf("\n") + 4_096;
+    const end = text.indexOf(terminator, full);
+    for (let offset = 0; offset <= text.length; offset += offset < 40 || offset > 4_100 ? 1 : 97) {
+      const output: string[] = [];
+      const redactor = outputRedactor((chunk) => output.push(chunk));
+      redactor.push(text.slice(0, offset));
+      expect(redactor.terminalPayloadLength).toBeLessThanOrEqual(4_096);
+      redactor.push(text.slice(offset));
+      redactor.flush();
+      expect(output.join("")).toBe(
+        offset > full && offset <= end
+          ? // Once released, a BEL is ordinary output; the credential still isn't.
+            `error: [redacted]\n${"x".repeat(4_100)}${terminator === "\u0007" ? terminator : ""}[redacted]\nafter`
+          : "error: [redacted]\nafter",
+      );
+    }
+  }
+});
+
+test("a credential registered after a stream starts is redacted in its later output", () => {
+  const output: string[] = [];
+  const redactor = outputRedactor((chunk) => output.push(chunk));
+  redactor.push("before\n");
+  const secret = "synthetic-late-registration-credential";
+  registerCredential("LATE_REGISTRATION_TEST_TOKEN", secret);
+  redactor.push(`error: ${secret.slice(0, 9)}`);
+  redactor.push(`${secret.slice(9)}\nafter`);
+  redactor.flush();
+  expect(output.join("")).toBe("before\nerror: [redacted]\nafter");
 });
 
 test.each(["\u001b]", "\u001bP"])(
