@@ -1042,6 +1042,7 @@ test.each(["passing output", "step", "annotation", "test line", ...Object.keys(s
   "rerun reconciliation uses failure-only security evidence from %s",
   async (source) => {
     h = pollerHarness();
+    expect(/##\[|^::/m.test(source)).toBe(false);
     const f = failure();
     h.start(15);
     await h.advance(0);
