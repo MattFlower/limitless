@@ -217,6 +217,46 @@ test.each(["success", "failure"])("a previous-release signature resolves a %s re
   expect(reruns()).toHaveLength(0);
 });
 
+test.each(["pending", "started"])(
+  "a previous-release %s fix trigger survives reinspection",
+  async (state) => {
+    h = pollerHarness();
+    const f = failure(1, "test", "failure");
+    f.state.log = bunFailure();
+    const old = { check: "test", line: "(pass) handles socket failure [0.04ms]", excerpt: "old evidence" };
+    const key = `${f.node.url}:${SHA}:${JSON.stringify([old.check, old.line, null])}`;
+    h.store.recordCiFixTrigger(f.node.url, SHA, key, old, 0);
+    const runId = state === "started" ? h.store.githubTracked()[0]?.runId : null;
+    h.store.db
+      .query("UPDATE ci_fix_triggers SET state = ?, run_id = ?, next_attempt_at = ?")
+      .run(state, runId ?? null, h.clock.now() + 60000);
+    const rows = () => h.store.db.query("SELECT * FROM ci_fix_triggers ORDER BY id").all();
+    const original = rows();
+    h.reopen();
+    h.start(15);
+    await h.advance(0);
+    expect(items("ci.needs_fix")[0]?.data.signature).toMatchObject({
+      line: "> (fail) real Bun bail [0.10ms]",
+    });
+    expect(rows()).toEqual(original);
+    f.observe("FAILURE", "reobserved");
+    await h.advance(15000);
+    expect(rows()).toEqual(original);
+    for (const [pr, head, check] of [
+      [url("o/r", 2), SHA, "test"],
+      [f.node.url, mainSha, "test"],
+      [f.node.url, SHA, "lint"],
+    ] as const)
+      h.store.recordCiFixTrigger(pr, head, `${pr}:${head}:${check}`, { ...old, check }, 1);
+    expect(rows()).toHaveLength(4);
+    h.store.db.query("UPDATE ci_fix_triggers SET state = 'skipped' WHERE trigger_key = ?").run(key);
+    h.store.recordCiFixTrigger(f.node.url, SHA, key, old, 2);
+    expect(rows()).toHaveLength(4);
+    h.store.recordCiFixTrigger(f.node.url, SHA, "new failure", old, 3);
+    expect(rows()).toHaveLength(5);
+  },
+);
+
 test.each(["cancelled", "timed_out"])(
   "a started %s job with unavailable logs reruns once across restart",
   async (conclusion) => {
@@ -728,6 +768,31 @@ test("initial Bun failure evidence includes the assertion, location and test nam
     expect(fixEvidence()?.excerpt).toContain(diagnostic);
   expect(items("ci.needs_fix")[0]?.data.excerpt).toBe(`> ${fixEvidence()?.excerpt.replace(/\n/g, "\n> ")}`);
   expect(fixEvidence()?.excerpt).not.toContain("Runner provisioning");
+});
+
+test("short credentials matching a whole CI line stay redacted through inspection", async () => {
+  h = pollerHarness();
+  const f = failure(1, "test", "failure");
+  registerCredential("CI_SHORT_LINE", "FAIL xy");
+  f.state.log = "setup\nFAIL xy\nend";
+  expect(ciSignature("test", f.state.log, "")).toMatchObject({
+    line: "[redacted]",
+    signature: '["test","[redacted]",null]',
+    excerpt: "setup\n[redacted]\nend",
+  });
+  h.start(15);
+  await h.advance(0);
+  const failures = h.store.ciFailures(f.node.url, SHA);
+  expect(failures[0]).toMatchObject({
+    line: "[redacted]",
+    signature: '["test","[redacted]","ubuntu-latest"]',
+  });
+  expect(fixEvidence()).toEqual({ line: "[redacted]", excerpt: "setup\n[redacted]\nend" });
+  expect(items("ci.needs_fix")[0]?.data).toMatchObject({
+    signature: { line: "> [redacted]" },
+    excerpt: "> setup\n> [redacted]\n> end",
+  });
+  expect(JSON.stringify([failures, fixEvidence(), items("ci.needs_fix")])).not.toContain("FAIL xy");
 });
 
 test.each([false, true])("bounded, redacted CI excerpts (rerun rejected: %s)", async (rejected) => {

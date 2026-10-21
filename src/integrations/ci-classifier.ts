@@ -54,9 +54,7 @@ const publication = (text: string, from: number, to: number) => {
 const bounded = (text: string, from = 0, to = text.length, limit = 500) => {
   const value = text.slice(from, to);
   from += value.length - value.trimStart().length;
-  return publication(text, from, Math.min(to, from + limit))
-    .trim()
-    .slice(0, limit);
+  return redactCredentials(publication(text, from, Math.min(to, from + limit)).trim()).slice(0, limit);
 };
 const logLines = (log: string) =>
   Bun.stripANSI(log)
@@ -107,6 +105,7 @@ export function ciSignature(check: string, log: string, fallback: string, labels
       ? window(start + 1, index + 1, Math.max(0, 1999 - head.length), true)
       : window(start + 1, start + 4, 2000);
   const excerpt = (index < 0 ? bounded(log || line, 0, (log || line).length, 2000) : `${head}\n${tail}`)
+    .replace(/[^\r\n]+/g, (line) => redactCredentials(line))
     .trim()
     .slice(0, 2000);
   const imageIndex = lines.findIndex((l) => /^\s*Image:/.test(l));
