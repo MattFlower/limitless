@@ -687,7 +687,14 @@ test("trace is a pinned eval-only second finder after the standard reviewer", ()
   const main = { target: "codex/sol-6.1@medium", prompt: "standard" };
   const trace = { ...main, prompt: "trace" };
   const variant = system({ finders: [main, trace] });
-  expect(parseEvalReviewSystems(file(variant), "trace.json")).toEqual([variant] as ReviewSystem[]);
+  const checklist = { ...main, prompt: "adversarial-checklist" };
+  const variants = [
+    variant,
+    system({ name: "samples", samples: 2, finders: [main] }),
+    system({ name: "checklist", finders: [checklist] }),
+  ];
+  expect(parseEvalReviewSystems(file(...variants), "combined.json")).toEqual(variants as ReviewSystem[]);
+  for (const candidate of variants) expect(ReviewSystemSchema.safeParse(candidate).success).toBe(false);
   expect(reviewSystemHash(variant as ReviewSystem)).not.toBe(reviewSystemHash(system() as ReviewSystem));
   for (const finders of [
     [trace],
@@ -703,7 +710,8 @@ test("trace is a pinned eval-only second finder after the standard reviewer", ()
   expect(ReviewSystemSchema.safeParse(variant).success).toBe(false);
   expect(ReviewSystemSchema.safeParse(panel({ finders: [trace] })).success).toBe(false);
   for (const profile of ["quick", "standard", "deep"])
-    expect(() => parseReviewRosters({ [profile]: [trace] })).toThrow("eval-only");
+    for (const finder of [trace, checklist])
+      expect(() => parseReviewRosters({ [profile]: [finder] })).toThrow("eval-only");
 });
 
 test("registered trace experiment pins 35 dev cases, production E1, targets and the decision rule", async () => {

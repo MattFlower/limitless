@@ -369,11 +369,13 @@ test("checklist claims neither create findings nor change recall, blocking or ve
           ],
           [{ item: "defect-1", applies: "non-applicable", checked: "none", finding: null }],
         ]) {
-          const output = { ...original, checklist };
-          const parsed = StoredReviewSchema.parse(output);
-          expect(gradeCase(item, output)).toEqual(baseline);
-          expect(blockingReviewFindings(parsed)).toEqual(blockingReviewFindings(original));
-          expect(reviewVerdict(parsed)).toBe(reviewVerdict(original));
+          for (const verdict of ["approve", "request_changes"] as const) {
+            const output = { ...original, verdict, checklist };
+            const parsed = StoredReviewSchema.parse(output);
+            expect(gradeCase(item, output)).toEqual(baseline);
+            expect(blockingReviewFindings(parsed)).toEqual(blockingReviewFindings(original));
+            expect(reviewVerdict(parsed)).toBe(reviewVerdict(original));
+          }
         }
       }
     }

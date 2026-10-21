@@ -1,11 +1,7 @@
-import { z } from "zod";
-import { ChecklistEntrySchema, ReviewSchema } from "../pipeline/schemas.ts";
 import { redactCredentials } from "../util/proc.ts";
 
-export const ChecklistReviewSchema = ReviewSchema.safeExtend({
-  findings: z.array(ReviewSchema.shape.findings.element.extend({ id: z.string() })),
-  checklist: z.array(ChecklistEntrySchema),
-});
+export { ChecklistReviewSchema } from "../pipeline/schemas.ts";
+
 export const CHECKLIST_CAP = 12_000;
 
 /** Only base AGENTS.md is accepted by the caller; never substitute a checkout's rules. */

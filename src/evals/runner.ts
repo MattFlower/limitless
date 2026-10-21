@@ -29,6 +29,7 @@ import {
   mapVerifier,
   panelIdentity,
   pickVerifier,
+  type ReviewInput,
   type ReviewRequest,
   reviewRequest,
   runReview,
@@ -51,7 +52,7 @@ import {
   type TriageCase,
   validateRequest,
 } from "./cases.ts";
-import { ChecklistReviewSchema, checklistPrompt } from "./checklist.ts";
+import { checklistPrompt } from "./checklist.ts";
 import { gradeReview } from "./graders/review.ts";
 import {
   failedImplement,
@@ -736,18 +737,18 @@ export class EvalRunner {
       if ("defects" in item) trial.details.preparationMs = preparationMs;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
-      const reviewInput =
+      const reviewInput: ReviewInput | undefined =
         "review" in prepared && prepared.review
           ? { ...prepared.review, ...(system ? { system } : {}) }
           : undefined;
       const finder = system?.mode === "single" ? system.finders[0]?.prompt : undefined;
       if (reviewInput && finder && finder !== "standard") {
         reviewInput.prompt = { ...reviewInput.prompt, finder };
-        prompt = reviewRequest(reviewInput).prompt;
       }
-      const checklist = finder === "adversarial-checklist";
-      if (checklist && "defects" in effective)
-        prompt += checklistPrompt(await readFileAt(cwd, effective.base, "AGENTS.md"));
+      if (finder === "adversarial-checklist" && reviewInput && "defects" in effective)
+        reviewInput.checklist = checklistPrompt(await readFileAt(cwd, effective.base, "AGENTS.md"));
+      const request = reviewInput ? reviewRequest(reviewInput) : undefined;
+      if (request) prompt = request.prompt;
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
       // Panel targets beyond the trial's own (its first finder) are pinned in the system. A bare
       // target is an unset effort, which today's model default must not restore (as for the trial).
@@ -772,8 +773,8 @@ export class EvalRunner {
         typeof replayId === "string"
           ? ((panelTargets?.verifiers ?? []).map(unavailable).find(Boolean) ?? null)
           : eligible();
-      const schema = "hidden" in item ? undefined : checklist ? ChecklistReviewSchema : schemaFor(item);
-      const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
+      const schema = "hidden" in item ? undefined : (request?.schema ?? schemaFor(item));
+      const jsonSchema = request?.jsonSchema ?? (schema ? toStrictJsonSchema(schema) : undefined);
       const repository =
         "gold" in item && "prompt" in item
           ? item.snapshot
@@ -1055,9 +1056,7 @@ export class EvalRunner {
                 releaseEval();
               }
             };
-            // The eval-only checklist keeps its own output schema; other reviews use the pipeline.
-            const pipelineReview = !checklist && reviewInput;
-            result = pipelineReview
+            result = reviewInput
               ? (
                   await runReview(
                     {
@@ -1126,7 +1125,7 @@ export class EvalRunner {
                         return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },
-                    { ...pipelineReview, sampleOffset: trial.trial * 2 },
+                    { ...reviewInput, sampleOffset: trial.trial * 2 },
                   )
                 ).result
               : await send();
