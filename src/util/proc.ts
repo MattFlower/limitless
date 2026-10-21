@@ -660,6 +660,7 @@ export interface ProcOptions {
   timeoutMs?: number;
   /** Kill when neither stdout nor stderr produced output for this long. */
   idleTimeoutMs?: number;
+  idleNow?: () => number;
   /** Strip terminal controls and redact decoded streams before line framing and tail cuts. */
   redactOutput?: boolean;
   /** Raw decoded chunks for internal checks only; never retain or forward them. */
@@ -695,6 +696,16 @@ export interface ProcResult {
 }
 
 const DEFAULT_TAIL = 64_000;
+/** Byte-idle and meaningful-progress watchdogs share the same pausable time accounting. */
+export function idleWatchdog(limit: number, now = Date.now) {
+  let last = now();
+  return {
+    reset: () => {
+      last = now();
+    },
+    expired: () => now() - last > limit,
+  };
+}
 const VT_ESCAPE = "\u001b";
 const MAX_PENDING_VT = 4_096;
 const INCOMPLETE_VT = new RegExp(
@@ -820,7 +831,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let timedOut = false;
     let idleTimedOut = false;
     let settled = false;
-    let lastActivity = Date.now();
+    const idle = idleWatchdog(opts.idleTimeoutMs ?? Infinity, opts.idleNow);
     const out = lineSplitter(opts.onStdoutLine, opts.maxLineLength);
     const err = lineSplitter(opts.onStderrLine, opts.maxLineLength);
 
@@ -894,7 +905,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       const limit = opts.idleTimeoutMs;
       idleTimer = setInterval(
         () => {
-          if (shutdown === undefined && Date.now() - lastActivity > limit) {
+          if (shutdown === undefined && idle.expired()) {
             idleTimedOut = true;
             terminate();
           }
@@ -933,7 +944,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       };
       return {
         push(chunk: string) {
-          lastActivity = Date.now();
+          idle.reset();
           opts.onRawChunk?.(chunk, stream);
           if (!opts.redactOutput) return emit(chunk);
           const decoded = terminalPending + chunk;
