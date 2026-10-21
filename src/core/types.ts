@@ -657,6 +657,8 @@ export interface ReviewSystem {
   setup?: true;
   /** Eval only: the source panel system for stored finder replay. */
   replayFrom?: string;
+  /** Eval only: union two independent single-review samples. */
+  samples?: 2;
   name: string;
   mode: "single" | "panel";
   finders: ReviewFinder[];
@@ -742,6 +744,16 @@ export interface EvalGrade {
     >;
   };
 }
+/** Eval-only sample checkpoint; the original result retains spend and output across restarts. */
+export interface ReviewSample {
+  index: number;
+  result: import("../harness/types.ts").AgentResult;
+  output: unknown;
+  error?: string;
+  durationMs: number;
+  grade?: EvalGrade;
+}
+
 export interface EvalTrial {
   effort: RecordedEffort | null;
   evalRunId: string;
@@ -756,6 +768,7 @@ export interface EvalTrial {
   score: number | null;
   details: {
     fast?: boolean;
+    samples?: ReviewSample[];
     /** Review system name; distinguishes candidates that share a target. */
     system?: string;
     switchChain?: (ModelSelection & { tier: number })[];
