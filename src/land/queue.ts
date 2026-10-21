@@ -51,7 +51,7 @@ import {
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { checkDiscreetCommits, hasFactoryMark } from "../pipeline/markers.ts";
-import { renderReportArtifacts } from "../pipeline/report.ts";
+import { renderReportArtifacts, verifiedFailureState } from "../pipeline/report.ts";
 import { stripReportManifest } from "../pipeline/report-privacy.ts";
 import { redactCredentials } from "../util/proc.ts";
 
@@ -903,21 +903,31 @@ export class LandQueue {
   private reportBody(run: Run): string {
     const repo = this.store.getRepo(run.repoId);
     const discreet = repoSettings(this.deps.cfg ?? {}, repo?.slug ?? "").discreet;
-    if (discreet && run.status !== "succeeded")
-      throw new LandBlocked(`Discreet mode cannot render squash body: owner run is ${run.status}`);
     const state = this.store.getRunState<RunState>(run.id);
     if (discreet && !state)
       throw new LandBlocked("Discreet mode cannot render squash body: missing run state");
     const worktree = publicationWorktree(state ?? {});
+    const success = run.status === "succeeded";
+    // A needs-human owner's PR is landable once fixed; describe it as the run left it.
+    const verifiedFailure =
+      !success && state?.lastVerifiedSha
+        ? {
+            sha: state.lastVerifiedSha,
+            stage: run.stage ?? "deliver",
+            reason: state.needsHumanReason ?? run.error ?? run.status,
+            base: run.baseBranch ?? repo?.defaultBranch ?? "",
+          }
+        : undefined;
     const report = discreet
       ? renderReportArtifacts(
           {
             discreet: true,
-            success: true,
+            success,
+            ...(verifiedFailure ? { verifiedFailure } : {}),
             runId: run.id,
             runUrl: "",
             prompt: run.prompt,
-            state: state ?? {},
+            state: verifiedFailure && state ? verifiedFailureState(state) : (state ?? {}),
             invocations: this.store.listInvocations(run.id),
             totals: { costUsd: run.costUsd, costEquivUsd: run.costEquivUsd },
             models: run.models,

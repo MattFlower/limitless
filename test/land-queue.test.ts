@@ -3797,7 +3797,7 @@ test.each([true, false])("squash body uses current repository settings (discreet
 });
 
 test.each([false, true])(
-  "discreet landing blocks a needs-human owner (verified work: %s)",
+  "discreet landing renders a needs-human owner's squash body (verified work: %s)",
   async (verified) => {
     const pr = delivered(1, "change/feature");
     const head = await pushBranch("change/feature", "one.txt", "one\n");
@@ -3815,12 +3815,14 @@ test.each([false, true])(
     });
     const entry = await queue({ cfg }).request({ target: pr.run.id });
     await settle();
-    expect(store.getLandEntry(entry.id)).toMatchObject({
-      state: "blocked",
-      reason: expect.stringMatching(/Discreet mode.*owner run is needs_human/),
-    });
-    expect(ghCalls("pr merge")).toEqual([]);
-    expect(existsSync(join(root, "gh.body-1"))).toBe(false);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    const body = readFileSync(join(root, "gh.body-1"), "utf8");
+    expect(body).toContain("Needs a human");
+    expect(body).toContain("Work needs attention");
+    if (verified) expect(body).toContain(`Verified at \`${head}\`; failed after verification`);
+    else expect(body).not.toContain("Failed after verification");
+    expect(body).not.toMatch(/limitless|\/runs\//i);
+    expect(body).not.toContain(pr.run.id);
   },
 );
 
