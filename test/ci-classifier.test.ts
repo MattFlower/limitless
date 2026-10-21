@@ -1141,7 +1141,7 @@ test.each(["checks", "job", "logs", "main", "attempt", "steps", "annotations"])(
   },
 );
 
-test.each(["success", "failure"])("a lost rerun response reconciles %s after restart", async (result) => {
+async function reconcileLostRerunResponse(result: string) {
   h = pollerHarness();
   const f = failure();
   h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
@@ -1168,7 +1168,15 @@ test.each(["success", "failure"])("a lost rerun response reconciles %s after res
   h.start(15);
   await h.advance(0);
   expect(reruns()).toHaveLength(1);
-});
+}
+
+// Disk-backed setup/reopens dominate four-worker profiles; CI measured 5,626 ms (#684).
+// Allow roughly 3x that CI observation for the three disk-backed Store opens.
+test.each(["success", "failure"])(
+  "a lost rerun response reconciles %s after restart",
+  reconcileLostRerunResponse,
+  15_000,
+);
 
 test.each([408, 500])("an uncertain rerun response (%s) remains claimed and reconciles", async (status) => {
   h = pollerHarness();
