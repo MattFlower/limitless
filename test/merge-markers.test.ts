@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
+import { rebaseOnto } from "../src/git/repos.ts";
+import { checkDiscreetCommits } from "../src/pipeline/markers.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -41,6 +43,9 @@ async function assertPending(dir: string, head: string, base: string) {
 
 async function assertCompleted(dir: string, head: string, base: string) {
   const sha = await completeMerge(dir, head, base);
+  expect((await mergeGit(dir, ["log", "-1", "--format=%an %ae %cn %ce"])).stdout.trim()).toBe(
+    "Limitless limitless@localhost Limitless limitless@localhost",
+  );
   expect((await mergeGit(dir, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout.trim()).toBe(
     `${sha} ${head} ${base}`,
   );
@@ -301,6 +306,126 @@ test("markers written into a modify/delete conflict block the merge", async () =
     await expect(completeMerge(dir, head, base)).rejects.toThrow("Unresolved conflict markers: gone.txt");
     writeFileSync(join(dir, "gone.txt"), "changed\n");
     await completeMerge(dir, head, base);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each(["factory", "operator"] as const)(
+  "rebase uses the selected %s committer identity",
+  async (identity) => {
+    const { dir, base } = await conflict(async (dir, side) => {
+      writeFileSync(join(dir, `${side}.txt`), side);
+    });
+    try {
+      await mergeGit(dir, ["merge", "--abort"]);
+      expect(await rebaseOnto(dir, base, identity)).toBe("clean");
+      const committer = (await mergeGit(dir, ["log", "-1", "--format=%cn %ce"])).stdout.trim();
+      expect(committer).toBe(
+        identity === "factory" ? "Limitless limitless@localhost" : "Test test@example.invalid",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("discreet commit inspection uses raw identities and UTF-8 regardless of log configuration", async () => {
+  const { dir, head, base } = await conflict(async (dir, side) => {
+    writeFileSync(join(dir, `${side}.txt`), side);
+  });
+  try {
+    const merge = await completeMerge(dir, head, base, "Merge base", "operator");
+    await mergeGit(dir, ["config", "i18n.logOutputEncoding", "UTF-16"]);
+    await expect(
+      checkDiscreetCommits(dir, `${head}..${merge}`, base, "private-run"),
+    ).resolves.toBeUndefined();
+    await mergeGit(dir, ["commit", "--allow-empty", "-qm", "Public subject"]);
+    await expect(checkDiscreetCommits(dir, `${merge}..HEAD`, base, "private-run")).rejects.toThrow(
+      /Discreet mode.*commits: [a-f0-9]+/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["Co-authored-by: Limitless <limitless@localhost>", true],
+  ["Co-Authored-By: Claude <noreply@anthropic.com>", true],
+  ["Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>", true],
+  ["Co-authored-by: Cursor <cursoragent@cursor.com>", true],
+  ["Generated with Claude", true],
+  ["🤖 Generated with [Claude Code](https://claude.com/claude-code) by Anthropic", true],
+  ["Generated with Codex for the owner", true],
+  ["Built with Claude Code, reviewed by me", true],
+  ["Generated-by: Codex", true],
+  ["Reviewed-By: Claude <noreply@anthropic.com>", true],
+  ["Co-authored-by: claude@example.invalid", false],
+  ["Explain the change\nCo-authored-by: Limitless <limitless@localhost>", true],
+  ["Explain the change\n  Co-Authored-By : Claude <noreply@anthropic.com>", true],
+  ["Co-authored-by: Limitless <limitless@localhost>\n\nFurther explanation", true],
+  ["Co-Authored-By: Claude <noreply@anthropic.com>\n\nFurther explanation", true],
+  ["Co-authored-by: Human Contributor <human@example.invalid>", false],
+  ["Co-authored-by: Claude Smith <human@example.invalid>", false],
+  ["Co-authored-by: Claude Smith <claude.smith@example.org>", false],
+  ["Co-authored-by: Claude\n Smith <claude.smith@example.org>", false],
+  ["Co-authored-by: Claude\n Code <noreply@anthropic.com>", true],
+  ["Co-authored-by: Someone\n Else\n <noreply@anthropic.com>", true],
+  ["Explain the change\nCo-authored-by: Claude Smith <human@example.invalid>", false],
+  ["Co-authored-by: Human Contributor <human@example.invalid>\n\nFurther explanation", false],
+  ["Document how Claude and Limitless handle input", false],
+])("discreet commit attribution inspection: %s", async (body, blocked) => {
+  const dir = mkdtempSync(join(tmpdir(), "discreet-attribution-"));
+  try {
+    await mergeGit(dir, ["init", "-q", "-b", "main"]);
+    const git = (args: string[]) => mergeGit(dir, args, false, undefined, "operator");
+    await git(["commit", "--allow-empty", "-qm", "Base"]);
+    const base = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    await git(["commit", "--allow-empty", "-qm", `Add farewell\n\n${body}`]);
+    // The offending commit need not be the tip.
+    await git(["commit", "--allow-empty", "-qm", "Follow up"]);
+    const inspection = checkDiscreetCommits(dir, `${base}..HEAD`, base, "private-run");
+    if (blocked) await expect(inspection).rejects.toThrow(/Discreet mode.*commits/);
+    else await expect(inspection).resolves.toBeUndefined();
+    if (blocked) {
+      const published = (await git(["rev-parse", "HEAD~1"])).stdout.trim();
+      await expect(
+        checkDiscreetCommits(dir, `${published}..HEAD`, base, "private-run"),
+      ).resolves.toBeUndefined();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each(["=", "#"])("discreet inspection ignores trailer configuration (%s)", async (separator) => {
+  const dir = mkdtempSync(join(tmpdir(), "discreet-trailer-config-"));
+  const git = (args: string[]) => mergeGit(dir, args, false, undefined, "operator");
+  try {
+    await git(["init", "-q", "-b", "main"]);
+    await git(["config", "trailer.separators", separator]);
+    await git(["config", "trailer.Co-authored-by.key", "Human-credit"]);
+    await git(["config", "trailer.Human-credit.key", "Co-authored-by"]);
+    await git(["commit", "--allow-empty", "-qm", "Base"]);
+    const base = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    for (const message of [
+      `Change\n\n  Co-authored-by  ${separator}  Claude Fable 5.1\n\nFurther explanation`,
+      "Change\n\nCo-authored-by:\n Claude Opus 5.5",
+      "Change\n\nHuman-credit: Human Contributor <human@example.org>",
+    ]) {
+      const before = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      await git(["commit", "--allow-empty", "-qm", message]);
+      const marked = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      await git(["commit", "--allow-empty", "-qm", "Clean tip"]);
+      const inspection = checkDiscreetCommits(dir, `${before}..HEAD`, base, "private-run");
+      if (message.includes("Human-credit:")) await expect(inspection).resolves.toBeUndefined();
+      else await expect(inspection).rejects.toThrow(`commits: ${marked}`);
+      await expect(
+        checkDiscreetCommits(dir, `${marked}..HEAD`, base, "private-run"),
+      ).resolves.toBeUndefined();
+    }
+    expect((await git(["config", "trailer.separators"])).stdout.trim()).toBe(separator);
+    expect((await git(["config", "trailer.Co-authored-by.key"])).stdout.trim()).toBe("Human-credit");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

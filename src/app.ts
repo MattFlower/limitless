@@ -207,6 +207,7 @@ export class Factory {
       loadSource: opts.loadSource,
     });
     this.land = new LandQueue({
+      cfg,
       store: this.store,
       paths: cfg.paths,
       readPolicy: cfg.readPolicy,

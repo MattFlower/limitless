@@ -53,6 +53,12 @@ test.each([
     secret: "synthetic-gate-capped-key\nsecond-capped-line",
     padding: "x".repeat(7_900),
   },
+  // A stray introducer once consumed the first character, leaving the rest of the value visible.
+  {
+    kind: "terminal after a stray introducer",
+    secret: "terminal-synthetic-gate-key-707",
+    padding: "x".repeat(7_900),
+  },
 ])(
   "$kind credentials are redacted in gate results, artifacts and feedback",
   async ({ kind, secret, padding }) => {
@@ -60,7 +66,13 @@ test.each([
     const fixture = providerFixture([]);
     const factory = new Factory(fixture.load());
     try {
-      const diagnostic = kind === "JSON" ? JSON.stringify({ credential: secret }) : secret;
+      const diagnostic =
+        kind === "JSON"
+          ? JSON.stringify({ credential: secret })
+          : kind.startsWith("terminal")
+            ? `\u001b[${secret.slice(0, 9)}\u001b[31m${secret.slice(9)}\u001b[0m`
+            : secret;
+      const fragments = [secret.slice(1, 13), secret.slice(-12)];
       writeFileSync(join(fixture.work, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
       const gates = await confinementScope.run(fakeConfinement, () =>
         runGates(
@@ -86,6 +98,7 @@ test.each([
         expect(text).not.toContain(diagnostic);
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
           expect(text).not.toContain(fragment.slice(0, 12));
+        for (const fragment of fragments) expect(text).not.toContain(fragment);
       }
       const repo = factory.store.upsertRepo({
         slug: "test/repo",
@@ -97,6 +110,7 @@ test.each([
       });
       const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "test" });
       factory.store.putArtifact(run.id, "gates.json", "gates", JSON.stringify(gates));
+      factory.store.addEvent({ runId: run.id, type: "gate", message: "gates", data: gates });
       const routes = createHttpRoutes(factory);
       const route = routes["/api/runs/:id/artifacts/:name"] as Route;
       const response = await route(
@@ -107,15 +121,30 @@ test.each([
         localServer,
       );
       expect(response.status).toBe(200);
+      const events = await (routes["/api/runs/:id/events"] as Route)(
+        requestWithParams(`http://localhost:7400/api/runs/${run.id}/events`, undefined, { id: run.id }),
+        localServer,
+      );
       for (const text of [
         factory.store.getArtifact(run.id, "gates.json"),
         await response.text(),
+        await events.text(),
         formatGateFeedback(compareGates(null, gates)),
+        reviewPrompt({
+          prompt: "test",
+          spec: null,
+          baseSha: "base",
+          stat: "",
+          gates: compareGates(null, gates),
+          audit: [],
+          implementerReport: "",
+        }),
       ]) {
         expect(text).toContain("[redacted]");
         expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
           expect(text).not.toContain(fragment.slice(0, 12));
+        for (const fragment of fragments) expect(text).not.toContain(fragment);
       }
     } finally {
       await factory.stop();

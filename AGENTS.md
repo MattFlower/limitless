@@ -185,7 +185,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   but process execution and event storage don't, and error and retry paths need it as much as the
   normal path (#318, #367, #394). It replaces registered credentials
   literally, so decode before you redact and redact before you truncate, or an encoded or cut-off
-  secret slips through.
+  secret slips through. Gate-output redaction also covers terminal escape sequences around or inside
+  a credential (#707); output deliberately crafted to defeat redaction, including encodings and several
+  successive stray escape introducers inside one credential, is out of scope (#335).
 
 ## The diff audit
 The deterministic audit (`src/gates/audit.ts`) runs on every factory change.

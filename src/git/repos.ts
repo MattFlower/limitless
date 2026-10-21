@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
-import type { Paths } from "../config.ts";
+import { type Config, type Paths, repoSettings } from "../config.ts";
+import { isBranchName } from "../core/delivery.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
@@ -14,6 +15,8 @@ import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
+import type { GhRunner } from "../integrations/github.ts";
+import { DiscreetError } from "../pipeline/markers.ts";
 import { CommandError, redactCredentials, registeredCredentials, sh } from "../util/proc.ts";
 import {
   cacheGit,
@@ -24,6 +27,7 @@ import {
   worktreeGit,
   worktreeGitScope,
 } from "./command.ts";
+import { type CommitIdentity, mergeGit } from "./merge.ts";
 
 const BRANCH_PUSH = ["git", "push", "--no-follow-tags"];
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
@@ -317,12 +321,18 @@ export async function createWorktree(
   runId: string,
   title: string,
   baseBranch: string,
+  options: { cfg?: Pick<Config, "repos">; store?: Store; gh?: GhRunner } = {},
 ): Promise<Worktree> {
   const cache = cachePath(paths, repo);
   const path = join(paths.work, runId);
-  const branch = `limitless/${runId}-${slugify(title, 30)}`;
+  const stored = options.store?.getRun(runId)?.branch;
+  const settings = repoSettings(options.cfg ?? {}, repo.slug);
+  let branch = stored ?? `limitless/${runId}-${slugify(title, 30)}`;
   const baseRef = `refs/remotes/origin/${baseBranch}`;
   if (existsSync(path)) {
+    // The actual branch also covers a restart before prepare recorded it.
+    branch =
+      stored ?? (await worktreeGit(["git", "symbolic-ref", "--short", "HEAD"], { cwd: path })).stdout.trim();
     // Resuming an interrupted run: reuse the worktree as-is.
     const head = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: path });
     const owner = await worktreeOwner(path);
@@ -332,6 +342,51 @@ export async function createWorktree(
   }
   return withRepoLock(cache, async () => {
     if (repo.kind === "local") await refreshCache(paths, repo);
+    if (!stored && settings.discreet) {
+      const refs = await worktreeGit(
+        ["git", "for-each-ref", "--format=%(refname)", "refs/heads/", "refs/remotes/origin/"],
+        { cwd: cache },
+      );
+      const taken = new Set(refs.stdout.trim().split("\n"));
+      const recorded = new Set(
+        options.store
+          ?.listRuns({ repoId: repo.id, limit: Number.MAX_SAFE_INTEGER })
+          .filter((r) => r.id !== runId)
+          .map((r) => r.branch),
+      );
+      const name = `${settings.branchPrefix}${slugify(title, 30)}`;
+      const gh = options.gh;
+      const budget = { leftMs: githubRetry.budgetMs };
+      branch = "";
+      // Six candidates total; historical PRs with deleted branches must not hold the lock forever.
+      for (const suffix of ["", "-2", "-3", "-4", "-5", `-${randomUUID().slice(0, 8)}`]) {
+        const candidate = `${name}${suffix}`;
+        if (!isBranchName(candidate)) continue;
+        if (
+          recorded.has(candidate) ||
+          taken.has(`refs/heads/${candidate}`) ||
+          taken.has(`refs/remotes/origin/${candidate}`)
+        )
+          continue;
+        try {
+          if (
+            repo.kind === "github" &&
+            (gh
+              ? await withGitHubRetry(async () => (await gh(prLookup(repo, candidate).slice(1))) ?? "", {
+                  budget,
+                })
+              : (await remoteSh(prLookup(repo, candidate), { cwd: cache, budget })).stdout
+            ).trim()
+          )
+            continue;
+        } catch (cause) {
+          throw new Error(`Cannot allocate branch ${name}: PR lookup failed`, { cause });
+        }
+        branch = candidate;
+        break;
+      }
+      if (!branch) throw new Error(`Cannot allocate valid available branch for ${name} after six candidates`);
+    }
     const base = await worktreeGit(["git", "rev-parse", baseRef], { cwd: cache });
     // Hooks are blanked where a command runs. `worktree add` would check out inside the new
     // worktree, where includes conditional on its branch or git directory can first activate
@@ -441,14 +496,12 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
   return result.exitCode === 0;
 }
 
-export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" | "conflict"> {
-  const result = await worktreeGit(
-    ["git", "-c", "user.name=Limitless", "-c", "user.email=limitless@localhost", "rebase", baseSha],
-    {
-      cwd,
-      allowFail: true,
-    },
-  );
+export async function rebaseOnto(
+  cwd: string,
+  baseSha: string,
+  identity: CommitIdentity = "factory",
+): Promise<"clean" | "conflict"> {
+  const result = await mergeGit(cwd, ["rebase", baseSha], true, undefined, identity);
   if (result.exitCode === 0) return "clean";
   const state = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
   const apply = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
@@ -886,12 +939,24 @@ export async function deliveryPublicationRange(
   head: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  discreet?: { runId: string; published: boolean },
 ): Promise<string> {
   const url = repo.kind === "local" ? repo.localPath : repo.url;
   if (!url) throw new privacy.PrivateError("Cannot inspect destination branch; publication blocked");
   const opts = { cwd, signal, budget };
-  const remote = await remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], opts);
+  const marked = discreet && (branch.startsWith("limitless/") || branch.includes(discreet.runId));
+  const remote = await remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], opts).catch((error) => {
+    if (marked && !signal?.aborted)
+      throw new DiscreetError("Discreet mode cannot establish branch-name publication status");
+    throw error;
+  });
   const remoteHead = remote.stdout.trim().split(/\s+/)[0] || null;
+  if (marked && remoteHead && remote.stdout.trim() !== `${remoteHead}\trefs/heads/${branch}`)
+    throw new DiscreetError("Discreet mode cannot establish branch-name publication status");
+  if (marked && !remoteHead && !discreet.published)
+    throw new DiscreetError(
+      "Discreet mode blocked unpublished factory-marked branch name; use a neutral branch",
+    );
   if (remoteHead) {
     if (!/^[a-f0-9]{40,64}$/.test(remoteHead)) throw new privacy.PrivateError("Cannot inspect remote head");
     // An unknown object is not evidence of a rewrite; fetch it before deciding ancestry.
@@ -1454,6 +1519,80 @@ function isHttpUrl(value: string): boolean {
   return protocol === "http:" || protocol === "https:";
 }
 
+export interface PullRequestIdentity {
+  headSha: string;
+  prUrl?: string | null;
+}
+
+/** Reusable branch names alone cannot identify a delivery's PR. */
+export function matchesPullRequest(
+  pr: unknown,
+  identity: PullRequestIdentity,
+): pr is { url: string; headRefOid?: unknown } {
+  return (
+    !!pr &&
+    typeof pr === "object" &&
+    "url" in pr &&
+    typeof pr.url === "string" &&
+    (identity.prUrl
+      ? pr.url === identity.prUrl
+      : !!identity.headSha && "headRefOid" in pr && pr.headRefOid === identity.headSha)
+  );
+}
+
+export function lookupUrl(raw: string, identity?: PullRequestIdentity): string {
+  if (!identity) return raw.trim();
+  const prs: unknown = JSON.parse(raw || "[]");
+  if (!Array.isArray(prs)) throw new Error("PR lookup did not return a list");
+  const matches = prs.filter((pr) => matchesPullRequest(pr, identity));
+  if (matches.length > 1) throw new Error(`several pull requests share head ${identity.headSha}`);
+  return matches[0]?.url ?? "";
+}
+
+/** A recorded URL is authoritative; branch/SHA recovery must enumerate every PR state. */
+async function lookupIdentityPr(
+  repo: Repo,
+  branch: string,
+  cwd: string,
+  identity: PullRequestIdentity,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (identity.prUrl) {
+    const res = await sh(
+      ["gh", "pr", "view", identity.prUrl, "--repo", repo.slug, "--json", "url,headRefOid"],
+      { cwd, signal, timeoutMs: 15_000 },
+    );
+    const pr: unknown = JSON.parse(res.stdout || "null");
+    if (!matchesPullRequest(pr, identity) || !isHttpUrl(pr.url))
+      throw new Error("Cannot establish recorded PR identity; replacement creation blocked");
+    return pr.url;
+  }
+  if (!/^[a-f0-9]{40,64}$/.test(identity.headSha))
+    throw new Error("Cannot recover PR without an expected head SHA; creation blocked");
+  const head = encodeURIComponent(`${repo.slug.split("/")[0]}:${branch}`);
+  const res = await sh(
+    ["gh", "api", "--paginate", "--slurp", `repos/${repo.slug}/pulls?head=${head}&state=all&per_page=100`],
+    { cwd, signal, timeoutMs: 15_000 },
+  );
+  // gh follows the Link headers to completion; a failed later page fails the whole command.
+  const pages = z
+    .array(
+      z.array(
+        z.object({
+          html_url: z.string().refine(isHttpUrl),
+          head: z.object({ sha: z.string().regex(/^[a-f0-9]{40,64}$/) }),
+        }),
+      ),
+    )
+    .min(1)
+    .safeParse(JSON.parse(res.stdout || "null"));
+  if (!pages.success) throw new Error("Cannot establish complete PR lookup; creation blocked");
+  return lookupUrl(
+    JSON.stringify(pages.data.flat().map((pr) => ({ url: pr.html_url, headRefOid: pr.head.sha }))),
+    identity,
+  );
+}
+
 export async function createPullRequest(
   repo: Repo,
   opts: {
@@ -1465,15 +1604,18 @@ export async function createPullRequest(
     draft?: boolean;
     signal?: AbortSignal;
     budget?: GitHubBudget;
+    identity?: PullRequestIdentity;
   },
 ): Promise<string> {
   const { cwd, signal } = opts;
-  // A final lookup failure means "none found", as before; transient ones retry the attempt.
+  // Legacy lookups retain their absence fallback; identity-aware failures block creation.
   const find = () =>
-    sh(prLookup(repo, opts.branch), { cwd, signal }).then(
-      (r) => r.stdout.trim(),
-      (e) => (isTransient(e) || signal?.aborted ? Promise.reject(e) : ""),
-    );
+    opts.identity
+      ? lookupIdentityPr(repo, opts.branch, cwd, opts.identity, signal)
+      : sh(prLookup(repo, opts.branch), { cwd, signal }).then(
+          (r) => lookupUrl(r.stdout, opts.identity),
+          (e) => (isTransient(e) || signal?.aborted ? Promise.reject(e) : ""),
+        );
   let existing = false;
   let reportedExisting = false;
   // Look up before every create: a 5xx or timeout can hide a PR that was in fact opened.
@@ -1508,9 +1650,9 @@ export async function createPullRequest(
   return url;
 }
 
-const prLookup = (repo: Repo, branch: string) => [
+const prLookup = (repo: Repo, branch: string, identity?: PullRequestIdentity) => [
   ...["gh", "pr", "list", "--repo", repo.slug, "--head", branch, "--state", "all"],
-  ...["--json", "url", "--jq", ".[0].url"],
+  ...(identity ? ["--json", "url,headRefOid"] : ["--json", "url", "--jq", ".[0].url"]),
 ];
 
 /**
@@ -1522,14 +1664,19 @@ export async function findPullRequest(
   branch: string,
   cwd: string,
   signal?: AbortSignal,
+  identity?: PullRequestIdentity,
 ): Promise<string | null> {
-  const res = await sh(prLookup(repo, branch), { cwd, signal, timeoutMs: 15_000, allowFail: true }).catch(
-    (e) => {
-      if (signal?.aborted) throw e;
-      return null;
-    },
-  );
-  const url = res?.exitCode === 0 ? res.stdout.trim() : "";
+  if (identity) return (await lookupIdentityPr(repo, branch, cwd, identity, signal)) || null;
+  const res = await sh(prLookup(repo, branch, identity), {
+    cwd,
+    signal,
+    timeoutMs: 15_000,
+    allowFail: true,
+  }).catch((e) => {
+    if (signal?.aborted) throw e;
+    return null;
+  });
+  const url = res?.exitCode === 0 ? lookupUrl(res.stdout, identity) : "";
   return isHttpUrl(url) ? url : null;
 }
 

@@ -241,7 +241,7 @@ detection, per-invocation budget, process-group kill on cancel.
 ## 6. Isolation & git
 
 - Bare repo cache `~/.limitless/repos/<owner>__<name>.git`, fetched before each run.
-- One worktree per run at `~/.limitless/work/<run-id>` on branch `limitless/<run-id>-<slug>`.
+- One worktree per run at `~/.limitless/work/<run-id>` on branch `limitless/<run-id>-<slug>`; discreet repositories use `<branch_prefix><slug>` (default `change/`), with numeric suffixes for collisions.
 - Local-only (non-GitHub) repos use a factory-owned bare clone with independent objects, created
   via a shared clone and fetched from the source before each new run. Delivery pushes only the
   run branch back to the source. Legacy worktrees attached to the source remain there until they finish.

@@ -223,6 +223,35 @@ test("runner keeps overlapping credentials raw in one chunk and at every split o
   }
 });
 
+test("runner redacts output that is wholly a short credential at every split", async () => {
+  const short = "Sy7x2Q";
+  registerCredential("SHORT_WHOLE_TEST_TOKEN", short);
+  for (const [text, expected] of [
+    [short, "[redacted]"],
+    [`\u001b[1m${short}\u001b[0m`, "[redacted]"],
+    [`${short} and more`, `${short} and more`],
+  ] as const)
+    for (const stream of ["stdout", "stderr"] as const)
+      for (let offset = 0; offset <= text.length; offset++) {
+        const lines: string[] = [];
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(result[stream]).toBe(expected);
+        expect(lines).toEqual([expected]);
+      }
+});
+
 test("open streams apply new registrations to raw carry and later split output", async () => {
   registerCredential("LATE_CARRY_LENGTH", `synthetic-carry-${"x".repeat(200)}`);
   for (const stream of ["stdout", "stderr"] as const) {
@@ -258,6 +287,33 @@ test("open streams apply new registrations to raw carry and later split output",
     expect(lines).toEqual(["[redacted]", "[redacted]", "last"]);
     expect(raw.join("")).toBe(`${longer}\n${escaped}\nlast`);
   }
+  for (const stream of ["stdout", "stderr"] as const) {
+    const sample = `synthetic-late-terminal-${stream}-000-credential`;
+    const terminal = (secret: string) =>
+      `error: \u001b[${secret.slice(0, 8)}\u001b[31m${secret.slice(8)}\u001b[0m\nlast\n`;
+    for (let offset = 0; offset <= terminal(sample).length; offset++) {
+      // Registered while the stream is open, before any credential-bearing input arrives.
+      const secret = sample.replace("000", String(offset).padStart(3, "0"));
+      const text = terminal(secret);
+      const lines: string[] = [];
+      const result = await withChunks(
+        [
+          { stream, text: text.slice(0, offset) },
+          { stream, text: text.slice(offset) },
+        ],
+        () =>
+          runProcess({
+            ...options(),
+            redactOutput: true,
+            onRawChunk: () => registerCredential(`LATE_TERMINAL_${stream}_${offset}`, secret),
+            onStdoutLine: (line) => lines.push(line),
+            onStderrLine: (line) => lines.push(line),
+          }),
+      );
+      expect(result[stream]).toBe("error: [redacted]\nlast\n");
+      expect(lines).toEqual(["error: [redacted]", "last"]);
+    }
+  }
 });
 
 test("runner strips split terminal sequences before matching and leaves raw observation unchanged", async () => {
@@ -290,6 +346,40 @@ test("runner strips split terminal sequences before matching and leaves raw obse
       }
     }
   }
+  // A stray introducer would consume the first character; the tail cut falls inside the result.
+  const stray = "terminal-synthetic-stray-credential";
+  // Digits would instead be consumed as the parameters of the stray sequence.
+  const digits = "70707070synthetic-stray-digits";
+  registerCredential("TERMINAL_STRAY_TEST_TOKEN", stray);
+  registerCredential("TERMINAL_STRAY_DIGITS_TEST_TOKEN", digits);
+  for (const text of [
+    `error: \u001b[${stray.slice(0, 9)}\u001b[31m${stray.slice(9)}\u001b[0m\n(fail) terminal\n`,
+    `error: \u009b${digits.slice(0, 4)}\u001b[31m${digits.slice(4, 12)}\u001b[0m${digits.slice(12)}\n(fail) terminal\n`,
+  ])
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const raw: string[] = [];
+        const lines: string[] = [];
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              tailLimit: 25,
+              onRawChunk: (chunk) => raw.push(chunk),
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(lines).toEqual(["error: [redacted]", "(fail) terminal"]);
+        expect(result[stream]).toBe("error: [redacted]\n(fail) terminal\n".slice(-25));
+        expect(raw.join("")).toBe(text);
+      }
+    }
 });
 
 test("runner strips ANSI before the tail cap around a long credential", async () => {
@@ -533,15 +623,21 @@ test("runner without redaction retains raw callbacks, empty-line framing, tails 
   expect(encoded.stdout).toBe("ÿ");
 });
 
-test("runner releases an unterminated terminal sequence instead of holding the stream", async () => {
+test.each([
+  ["OSC", "\u001b]"],
+  ["DCS", "\u001bP"],
+  ["C1 OSC", "\u009d"],
+])("runner releases an unterminated %s string instead of holding the stream", async (_kind, introducer) => {
+  const secret = "synthetic-released-string-credential";
+  registerCredential("RELEASED_STRING_TEST_TOKEN", secret);
   const lines: string[] = [];
   const seenAtChunk: number[] = [];
   // Larger than any credential carry, which other tests' registrations can make long.
   const body = "x".repeat(200_000);
   await withChunks(
     [
-      { stream: "stdout", text: `\u001b]${body}\n${body}\n` },
-      { stream: "stdout", text: "after\n" },
+      { stream: "stdout", text: `${introducer}${body}\n${body}\n` },
+      { stream: "stdout", text: `after ${secret}\n` },
     ],
     () =>
       runProcess({
@@ -553,8 +649,55 @@ test("runner releases an unterminated terminal sequence instead of holding the s
   );
   // Past the hold limit, the stray sequence's text is released while the stream is still running.
   expect(seenAtChunk[1]).toBeGreaterThanOrEqual(1);
-  expect(lines.at(-1)).toBe("after");
+  expect(lines[0]).toBe(`${introducer.slice(1)}${body}`);
+  expect(lines.at(-1)).toBe("after [redacted]");
 });
+
+const RECOVERY_SECRET = "synthetic-terminal-recovery-credential";
+const [HELD, LINES] = ["t".repeat(4_200), "line\n".repeat(840)];
+// A line break, another escape, the hold and EOF each end a string as visible text.
+test.each([
+  [
+    "a line break",
+    `BEFORE \u001b]0;title\nerror: ${RECOVERY_SECRET}\nAFTER\n`,
+    "BEFORE ]0;title\nerror: [redacted]\nAFTER\n",
+  ],
+  [
+    "an escape",
+    `BEFORE \u001bPq data\u001b[31m ${RECOVERY_SECRET}\u001b[0m\nAFTER\n`,
+    "BEFORE Pq data [redacted]\nAFTER\n",
+  ],
+  [
+    "the hold",
+    `BEFORE \u001b]0;${HELD} ${RECOVERY_SECRET}\nAFTER\n`,
+    `BEFORE ]0;${HELD} [redacted]\nAFTER\n`,
+  ],
+  [
+    "a multiline string over the hold and a BEL",
+    `BEFORE \u001b]0;${LINES}\u0007${RECOVERY_SECRET}\nAFTER\n`,
+    `BEFORE ]0;${LINES}[redacted]\nAFTER\n`,
+  ],
+  ["EOF", `BEFORE \u001b]0;title ${RECOVERY_SECRET}`, "BEFORE ]0;title [redacted]"],
+])(
+  "a terminal string ended by %s releases visible text and later credentials at every split",
+  async (_end, text, expected) => {
+    registerCredential("TERMINAL_RECOVERY_TEST_TOKEN", RECOVERY_SECRET);
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () => runProcess({ ...options(), redactOutput: true }),
+        );
+        expect(result[stream]).toBe(expected);
+      }
+    }
+  },
+  // Every split of a string longer than the hold, on both streams, runs the runner about 8,500 times.
+  20_000,
+);
 
 test("cleanup records ownership before the first signal and deletes it after confirmation", async () => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "limitless-record-")));

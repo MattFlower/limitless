@@ -33,7 +33,7 @@ import { waitClock } from "./wait-clock.ts";
 
 setDefaultTimeout(30_000);
 const url = "https://github.com/test/repo/pull/1";
-const branch = "limitless/owner-feature";
+let branch = "limitless/owner-feature";
 const git = async (cwd: string, ...args: string[]) => (await sh(["git", ...args], { cwd })).stdout.trim();
 const seed = seeded(async (root) => {
   const work = join(root, "work");
@@ -68,6 +68,7 @@ let implementerReport: string;
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
 beforeEach(async () => {
+  branch = "limitless/owner-feature";
   root = mkdtempSync(join(tmpdir(), "ci-fix-rounds-"));
   observerRoots.add(realpathSync(root));
   await seed(root);
@@ -154,6 +155,7 @@ beforeEach(async () => {
   });
   factory.deps.gh = async (args, _signal, stdin) => {
     calls.push(args);
+    if (args[1] === "list") return "";
     if (args[1] === "ready" && args.includes("--undo")) {
       draft = true;
       return "";
@@ -731,3 +733,36 @@ test.each(["auto", "quick", "standard", "deep"] as const)(
     expect(factory.store.getRun(id)?.profile).toBe(profile);
   },
 );
+
+test("polling finds a discreet CI PR through the store and its delivery recovers a posted comment", async () => {
+  await git(join(root, "remote.git"), "branch", "-m", branch, "change/feature");
+  branch = "change/feature";
+  factory.store.updateRun(owner.id, { branch });
+  factory.cfg.repos = {
+    "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+  };
+  await classify();
+  await processTriggers();
+  const id = factory.store.reviewRounds(url).at(-1)?.runId;
+  if (!id) throw new Error("missing CI round");
+  expect(factory.store.runForPr(url)?.id).toBe(id);
+  const gh = factory.deps.gh;
+  if (!gh) throw new Error("missing gh");
+  factory.deps.gh = async (args, signal, stdin) => {
+    const result = await gh(args, signal, stdin);
+    if (args[1] === "comment") throw new Error("response lost after comment");
+    return result ?? "";
+  };
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("failed");
+  const round = factory.store.getRun(id);
+  expect(await git(join(root, "remote.git"), "log", "-1", "--format=%B", branch)).toBe(
+    `${round?.title} (round 1)`,
+  );
+  expect(comments[0]?.body).toContain("Fixed greeting validation");
+  expect(comments[0]?.body).not.toMatch(/limitless|\/runs\//i);
+  expect(comments[0]?.body).not.toContain(id);
+  factory.deps.gh = gh;
+  factory.cfg.repos = {};
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("succeeded");
+  expect(comments).toHaveLength(1);
+});
