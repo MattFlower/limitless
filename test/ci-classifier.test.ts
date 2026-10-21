@@ -21,17 +21,17 @@ const fixEvidence = () =>
       "SELECT signature_line AS line, excerpt FROM ci_fix_triggers",
     )
     .get();
-const securityRecords = [
-  "(fail) security tests [1ms]",
-  "\u001b[31m(fail) security tests\u001b[0m [1ms]",
-  "FAILED tests/test_security.py::test_authorization - AssertionError",
-  "  ✕ security tests (1 ms)",
-  "  ● security tests › authorization",
-  "--- FAIL: TestSecurityAuthorization (0.00s)",
-  "FAIL security tests",
-  "not ok 1 security tests",
-  "##[error]security tests failed",
-];
+const securityRecords = {
+  bun: "(fail) security tests [1ms]",
+  ansi: "\u001b[31m(fail) security tests\u001b[0m [1ms]",
+  pytest: "FAILED tests/test_security.py::test_authorization - AssertionError",
+  vitest: "  ✕ security tests (1 ms)",
+  jest: "  ● security tests › authorization",
+  go: "--- FAIL: TestSecurityAuthorization (0.00s)",
+  generic: "FAIL security tests",
+  tap: "not ok 1 security tests",
+  actions: "##[error]security tests failed",
+};
 // Bun's assertion block, with the stack frame before the failing test name.
 const bunFailure = (name = "real Bun bail") => `(pass) handles socket failure [0.04ms]
 1 | import { expect, test } from "bun:test";
@@ -678,7 +678,7 @@ test("signatures distinguish checks, errors, and images; recurring failure does 
   h = pollerHarness();
   const passing = "(pass) handles failure/error\nprose timed out after 30ms\n";
   for (const record of [
-    ...securityRecords,
+    ...Object.values(securityRecords),
     " × failed",
     "✗ failed",
     "❌ failed",
@@ -1025,8 +1025,9 @@ test("passing security output and unrelated text do not block a timeout rerun or
   expect(reruns()).toHaveLength(1);
 });
 
-test.each(securityRecords)("a failing security record blocks reruns and the ledger: %s", async (record) => {
+test.each(Object.entries(securityRecords))("security failure blocks reruns: %s", async (label, record) => {
   h = pollerHarness();
+  expect(/##\[|^::/m.test(label)).toBe(false);
   const f = failure();
   f.state.log += `\n${record}`;
   h.start(15);
@@ -1037,10 +1038,11 @@ test.each(securityRecords)("a failing security record blocks reruns and the ledg
   expect(items("ci.needs_fix")[0]?.data?.untrusted).toBe(true);
 });
 
-test.each(["passing output", "step", "annotation", "test line", ...securityRecords])(
+test.each(["passing output", "step", "annotation", "test line", ...Object.keys(securityRecords)])(
   "rerun reconciliation uses failure-only security evidence from %s",
   async (source) => {
     h = pollerHarness();
+    expect(/##\[|^::/m.test(source)).toBe(false);
     const f = failure();
     h.start(15);
     await h.advance(0);
@@ -1055,7 +1057,8 @@ test.each(["passing output", "step", "annotation", "test line", ...securityRecor
         respond(200, [{ annotation_level: "failure", title: "tests", message: "security test failed" }]),
       );
     if (source === "test line") f.state.log += "\n(fail) security tests [1ms]";
-    if (securityRecords.includes(source)) f.state.log += `\n${source}`;
+    const record = Object.entries(securityRecords).find(([label]) => label === source)?.[1];
+    if (record) f.state.log += `\n${record}`;
     f.observe("FAILURE", "rerun");
     h.start(15);
     await h.advance(0);
