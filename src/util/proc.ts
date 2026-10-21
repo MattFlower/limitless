@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
+import { credentialMatcher, registerCredentialVariant } from "./credential-matcher.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
 
@@ -939,8 +940,18 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
-      let pending = "";
       let terminalPending = "";
+      let matcher = credentialMatcher();
+      let redact = matcher.stream();
+      const redactStream = (chunk: string, flush = false) => {
+        const current = credentialMatcher();
+        if (current !== matcher) {
+          matcher = current;
+          chunk = redact.pending + chunk;
+          redact = matcher.stream();
+        }
+        return redact.push(chunk, flush);
+      };
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
@@ -958,26 +969,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
           const held = incomplete?.index !== undefined && decoded.length - incomplete.index <= MAX_PENDING_VT;
           const terminalCut = held ? (incomplete?.index ?? decoded.length) : decoded.length;
           terminalPending = decoded.slice(terminalCut);
-          pending += stripVTControlCharacters(decoded.slice(0, terminalCut));
-          // Retain possible credential prefixes, including JSON-escaped forms, across chunks.
-          const overlap = Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
-          let cut = Math.max(0, pending.length - overlap);
-          // A complete match crossing the cut must also stay raw: replacing a shorter
-          // prefix in the carry would destroy a longer credential arriving next.
-          let previousCut: number;
-          do {
-            previousCut = cut;
-            for (const [secret] of sortedCredentialVariants) {
-              const start = pending.indexOf(secret, Math.max(0, cut - secret.length + 1));
-              if (start >= 0 && start < cut && start + secret.length > cut) cut = start;
-            }
-          } while (cut !== previousCut);
-          emit(redactCredentials(pending.slice(0, cut)));
-          pending = pending.slice(cut);
+          emit(redactStream(stripVTControlCharacters(decoded.slice(0, terminalCut))));
         },
         flush() {
-          emit(redactCredentials(pending + stripVTControlCharacters(terminalPending)));
-          pending = "";
+          emit(redactStream(stripVTControlCharacters(terminalPending), true));
           terminalPending = "";
         },
       };
@@ -1101,11 +1096,8 @@ export async function sh(
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
-const credentialVariants = new Map<string, boolean>();
-let sortedCredentialVariants: [string, boolean][] = [];
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
-export const credentialRedactionPadding = (): number =>
-  Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
+export const credentialRedactionPadding = (): number => Math.max(0, credentialMatcher().maxLength - 1);
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
@@ -1114,37 +1106,16 @@ export function registerCredential(name: string, value?: string): void {
       // Log normalization removes CRLF line endings before publication-window redaction.
       const values = [secret, secret.replace(/\r\n/g, "\n")];
       for (const variant of new Set(values.flatMap((s) => [s, JSON.stringify(s).slice(1, -1)])))
-        credentialVariants.set(variant, credentialVariants.get(variant) || secret.length >= 8);
-      sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
+        registerCredentialVariant(variant, secret.length >= 8);
     }
 }
 export function redactCredentials(text: string): string;
 export function redactCredentials(text: string, window?: { start: number; end: number }): string;
 export function redactCredentials(text: string, window?: { start: number; end: number }): string {
-  return activity("credentials.redact", () => redactText(text, window));
-}
-function redactText(text: string, window?: { start: number; end: number }): string {
   // Unary callers can also pass this function directly to Array.map.
-  const bounds = typeof window === "object" ? { ...window } : undefined;
-  const marker = "[redacted]";
-  // Substring matches require at least 8 characters to avoid redacting common short strings.
-  for (const [secret, substring] of sortedCredentialVariants)
-    if (substring || text === secret) {
-      if (!bounds) text = text.split(secret).join(marker);
-      else {
-        const { start, end } = bounds;
-        text = text.replaceAll(secret, (_match, offset: number) => {
-          // A cut inside a replacement retains the entire marker, never a credential fragment.
-          if (offset < start)
-            bounds.start += offset + secret.length <= start ? marker.length - secret.length : offset - start;
-          if (offset < end)
-            bounds.end +=
-              offset + secret.length <= end ? marker.length - secret.length : offset + marker.length - end;
-          return marker;
-        });
-      }
-    }
-  return bounds ? text.slice(bounds.start, bounds.end) : text;
+  return activity("credentials.redact", () =>
+    credentialMatcher().redact(text, undefined, typeof window === "object" ? window : undefined),
+  );
 }
 export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
 const redactData = <T>(value: T): T =>
