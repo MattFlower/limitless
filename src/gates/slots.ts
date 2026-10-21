@@ -134,7 +134,12 @@ export const gateSlots = new Semaphore(defaultGateSlots());
 /** Targeted agent tests never queue behind a full gate suite. */
 export const agentTestSlots = new Semaphore(2);
 
-const reservation = new AsyncLocalStorage<{ release?: Promise<() => void>; closed: boolean }>();
+const reservation = new AsyncLocalStorage<{
+  release?: Promise<() => void>;
+  closed: boolean;
+  users: number;
+  releaseRequested: boolean;
+}>();
 
 /** Restoring execution context must not replace the attaching operation's reservation. */
 export function bindGateSlotScope<A extends unknown[], T>(fn: (...args: A) => T): (...args: A) => T {
@@ -145,8 +150,12 @@ export function bindGateSlotScope<A extends unknown[], T>(fn: (...args: A) => T)
 /** Worker attempts must leave coordinator capacity available for local gates. */
 export async function releaseGateSlotScope(): Promise<void> {
   const held = reservation.getStore();
-  const pending = held?.release;
-  if (held) held.release = undefined;
+  if (!held) return;
+  held.releaseRequested = true;
+  if (held.users) return;
+  const pending = held.release;
+  held.release = undefined;
+  held.releaseRequested = false;
   (await pending?.catch(() => undefined))?.();
 }
 
@@ -154,7 +163,13 @@ export async function releaseGateSlotScope(): Promise<void> {
 export const gateSlotScope =
   <T>(fn: () => Promise<T>): (() => Promise<T>) =>
   async () => {
-    const held = { closed: false, release: undefined as Promise<() => void> | undefined };
+    if (reservation.getStore()?.closed === false) return fn();
+    const held = {
+      closed: false,
+      users: 0,
+      releaseRequested: false,
+      release: undefined as Promise<() => void> | undefined,
+    };
     return reservation.run(held, async () => {
       try {
         return await fn();
@@ -176,8 +191,21 @@ export async function acquireGateSlot(
   const held = reservation.getStore();
   if (held && !held.closed && (held.release || !skipGateSlot)) {
     held.release ??= gateSlots.acquire(signal, onWait, holder, false, priority);
-    await held.release;
-    return () => {};
+    held.users++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      held.users--;
+      if (!held.users && held.releaseRequested) void reservation.run(held, releaseGateSlotScope);
+    };
+    try {
+      await held.release;
+      return release;
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
   return (skipGateSlot ? agentTestSlots : gateSlots).acquire(
     signal,
