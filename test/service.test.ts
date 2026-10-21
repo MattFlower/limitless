@@ -178,7 +178,8 @@ test("a failed resume reports both the original failure and the cleanup failure"
   const { result: r } = await migration("resume-failure");
   expect(r.error).toContain("drain failed");
   expect(r.error).toContain("Resume scheduler failed: Error: resume failed");
-  expect(r.calls).toEqual(["drain", "resume"]);
+  expect(r.calls).toEqual(["drain", ...Array<string>(60).fill("resume")]);
+  expect(r.time).toBe(120_000);
   expect(r.draining).toBe(true);
   expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.loaded).toContain("arbitrary.installed.daemon");

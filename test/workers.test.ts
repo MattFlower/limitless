@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -20,6 +21,7 @@ import { type Config, loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { tokenHash, WorkerStore } from "../src/db/workers.ts";
 import {
+  type ExecutionHandle,
   executeGate,
   type GateRequest,
   type GateRunner,
@@ -35,7 +37,7 @@ import {
   retryRegressions,
   runLocalGates,
 } from "../src/gates/run.ts";
-import { gateSlots } from "../src/gates/slots.ts";
+import { gateSlotScope, gateSlots } from "../src/gates/slots.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -782,6 +784,8 @@ test("heartbeats record capabilities, cancel unknown jobs and become stale after
     lastHeartbeatAt: now,
     capabilities: caps([id]),
   });
+  await call("/worker/heartbeat", { ...caps([id]), freeSlots: 0 }, token);
+  expect(workers.list()[0]?.state).toBe("busy");
   now += 30_001;
   expect(workers.list()[0]?.state).toBe("offline");
 }, 30_000);
@@ -1408,6 +1412,124 @@ test("repos without opt-in use local execution without creating jobs", async () 
   expect(readFileSync(join(req.cwd, "setup-runs"), "utf8")).toBe("setup\n");
   expect(workers.jobs("1=1")).toHaveLength(0);
 }, 30_000);
+
+test.each(["dispatch", "reattach", "live"])(
+  "a LAN retry releases the coordinator slot held by its local fallback (%s)",
+  async (mode) => {
+    const req = await request();
+    req.gates = { ...req.gates, setup: [], checks: [{ name: "test", run: "false" }] };
+    const now = Date.now();
+    workers = new WorkerStore(store, releaseSha, { tick: 1 }, () => now);
+    workers.pairingKey = "test-pairing-key";
+    const pairing = workers.pair("runner", "a".repeat(64), "b".repeat(64));
+    workers.approve(pairing.code);
+    const worker = workers.worker("runner");
+    if (!worker) throw new Error("missing worker fixture");
+    workers.heartbeat(worker, caps());
+    const executor = gateExecutorFor("lan", workers, [req.repo]);
+    const controller = new AbortController();
+    const previous = gateSlots.limit;
+    gateSlots.setLimit(1);
+    const localStarted = Promise.withResolvers<void>();
+    const finishLocal = Promise.withResolvers<void>();
+    const localDone = Promise.withResolvers<void>();
+    const dispatchRetry = Promise.withResolvers<void>();
+    const remoteStarted = Promise.withResolvers<ExecutionHandle>();
+    let admitted = false;
+    let competitor: Promise<() => void> | undefined;
+    let settled = false;
+    const outside = AsyncLocalStorage.snapshot();
+    const scope = confinementScope.run(
+      {
+        ...fakeConfinement,
+        async verify() {
+          localStarted.resolve();
+          await finishLocal.promise;
+        },
+      },
+      gateSlotScope(async () => {
+        const first = await executor.start(req, controller.signal);
+        expect(workers.lease(worker.name)?.id).toBe(first.id);
+        workers.fail(first.id, "Worker disconnected");
+        workers.fail(first.id, "No remaining worker");
+        const initial = await executeGate(req, controller.signal, {}, executor, first);
+        expect(initial.checks[0]?.ok).toBe(false);
+        localDone.resolve();
+        await dispatchRetry.promise;
+        return retryBaselineFailures(
+          initial,
+          req.cwd,
+          req.gates,
+          controller.signal,
+          undefined,
+          async (gates) => {
+            const retryRequest = { ...req, gates };
+            const saved =
+              mode === "dispatch"
+                ? undefined
+                : await outside(() => executor.start(retryRequest, controller.signal));
+            if (saved) {
+              if (mode === "live") outside(() => executor.attach(saved, controller.signal));
+              remoteStarted.resolve(saved);
+            }
+            return executeGate(retryRequest, controller.signal, {}, executor, saved, async (handle) => {
+              remoteStarted.resolve(handle);
+            });
+          },
+        );
+      }),
+    );
+    void scope.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    try {
+      await localStarted.promise;
+      competitor = gateSlots
+        .acquire(controller.signal, undefined, "local waiter", false, "ship")
+        .then((release) => {
+          admitted = true;
+          return release;
+        });
+      finishLocal.resolve();
+      await localDone.promise;
+      expect(admitted).toBe(false);
+      expect(gateSlots.snapshot().occupied).toBe(1);
+      dispatchRetry.resolve();
+      const retry = await remoteStarted.promise;
+      expect(workers.lease(worker.name)?.id).toBe(retry.id);
+      await new Promise(setImmediate);
+      expect(admitted).toBe(true);
+      expect(gateSlots.snapshot().holders).toEqual(["local waiter"]);
+      expect(workers.job(retry.id)?.state).toBe("leased");
+      expect(settled).toBe(false);
+      (await competitor)();
+      expect(gateSlots.snapshot().occupied).toBe(0);
+      expect(
+        workers.complete(retry.id, {
+          setupOk: true,
+          setup: [],
+          checks: [
+            { name: "test", command: "false", ok: true, exitCode: 0, durationMs: 1, output: "passed" },
+          ],
+        }),
+      ).toBe(true);
+      expect((await scope).checks[0]).toMatchObject({ ok: true, firstAttempt: { ok: false } });
+      expect(gateSlots.snapshot().occupied).toBe(0);
+    } finally {
+      controller.abort();
+      finishLocal.resolve();
+      dispatchRetry.resolve();
+      await scope.catch(() => {});
+      (await competitor?.catch(() => undefined))?.();
+      gateSlots.setLimit(previous);
+    }
+  },
+);
 
 test("restart reattaches to the durable job without enqueueing again", async () => {
   const req = await request(true);

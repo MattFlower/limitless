@@ -642,3 +642,64 @@ for (const failure of ["discovery", "birth", "recording", "boot"] as const) {
     }
   });
 }
+
+for (const idle of [false, true]) {
+  test(`an exited child keeps its status when the ${idle ? "idle" : "overall"} timer runs before its exit handler`, async () => {
+    const spawn = subprocess.spawn;
+    const setTimer = idle ? globalThis.setInterval : globalThis.setTimeout;
+    const children: subprocess.ChildProcess[] = [];
+    let fire: () => void = () => {
+      throw new Error("timer was not installed");
+    };
+    let now = Date.now();
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    const timer = spyOn(globalThis, idle ? "setInterval" : "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      fire = () => {
+        now += 200_000;
+        if (typeof fn === "function") fn(...args);
+      };
+      return setTimer(fn, ms, ...args);
+    }) as typeof setTimeout);
+    const spawning = spyOn(subprocess, "spawn").mockImplementation(((
+      ...args: Parameters<typeof subprocess.spawn>
+    ) => {
+      const child = spawn(...args);
+      children.push(child);
+      const emit = child.emit.bind(child);
+      child.emit = (event: string | symbol, ...values: unknown[]) => {
+        if (event === "exit") fire();
+        return emit(event, ...values);
+      };
+      return child;
+    }) as typeof subprocess.spawn);
+    try {
+      const cmd = [process.execPath, "-e", "process.exit(0)"];
+      const timeout = idle ? { idleTimeoutMs: 100_000 } : { timeoutMs: 100_000 };
+      const result = await runProcess({ cmd, cwd: process.cwd(), env: {}, ...timeout });
+      expect(result).toMatchObject({ exitCode: 0, signal: null, timedOut: false, idleTimedOut: false });
+      if (!idle)
+        await expect(sh(cmd, { cwd: process.cwd(), ...timeout })).resolves.toMatchObject({ exitCode: 0 });
+    } finally {
+      spawning.mockRestore();
+      timer.mockRestore();
+      clock.mockRestore();
+      for (const child of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
+    }
+  });
+}
+
+test("a live direct child is still killed and reported as timed out", async () => {
+  const result = await runProcess({
+    cmd: ["/bin/sleep", "30"],
+    cwd: process.cwd(),
+    env: {},
+    timeoutMs: 25,
+  });
+  expect(result).toMatchObject({ timedOut: true, exitCode: null, signal: "SIGKILL" });
+}, 15_000);

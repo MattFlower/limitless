@@ -30,7 +30,7 @@ test("empty --yes --json setup detects providers, writes validated config, start
     expect(hook.hooks.SessionStart[0].hooks[0].command).toEndWith("digest --consumer claude");
     expect(result.discreet).toContain("not available yet (#37)");
     expect(result.discreet).toContain("off (deferred to #37");
-    expect(result.warnings[0]).toContain("One-way migration");
+    expect(result.warnings).toContainEqual(expect.stringContaining("One-way migration"));
     expect(f.effects).toEqual(["service", "smoke", "mcp"]);
     expect(writes).toEqual([f.file, f.smokeFile]);
     const cfg = loadConfig({ configDir: f.configDir, home: f.home, readOnly: true });
@@ -606,3 +606,125 @@ for (const json of [false, true])
       f.close();
     }
   });
+
+for (const interactive of [false, true])
+  test(`init fills an owner-only gap using ${interactive ? "the prompt" : "gh discovery"}, preserving Discord and rerun bytes`, async () => {
+    const settings =
+      '[[providers]]\npreset = "claude"\n[[providers]]\npreset = "codex"\n[github]\nrepos = ["acme/app"]\nmerge = "pr"\n';
+    const owners = interactive
+      ? '[owners]\ndiscord  = "discord-id" # keep me\n'
+      : 'owners = { discord  = "discord-id" } # keep me\n';
+    const original = interactive ? settings + owners : owners + settings;
+    const f = setupFixture(original);
+    try {
+      f.state.local = false;
+      const run = f.d.run;
+      f.d.run = async (args) => {
+        const result = await run(args);
+        return args.join(" ") === "gh api user"
+          ? { ...result, stdout: '{"login":"discovered-owner"}' }
+          : result;
+      };
+      f.d.tty = interactive;
+      const prompts: string[] = [];
+      f.d.ask = async (q, fallback) => {
+        prompts.push(q);
+        if (q === "GitHub owner login") {
+          expect(fallback).toBe("discovered-owner");
+          return "chosen-owner";
+        }
+        return fallback;
+      };
+      const flags = { yes: !interactive, json: true };
+      expect(await setupCommand("init", flags, f.d)).toBe(0);
+      const cfg = loadConfig({ configDir: f.configDir, home: f.home, readOnly: true });
+      expect(cfg.githubOwner).toBe(interactive ? "chosen-owner" : "discovered-owner");
+      expect(cfg.discordOwnerId).toBe("discord-id");
+      expect(cfg.raw.github).toEqual({ repos: ["acme/app"], merge: "pr" });
+      expect(JSON.parse(f.output[0] ?? "").providers.added).toEqual([]);
+      expect(JSON.parse(f.output[0] ?? "").repos.added).toEqual([]);
+      const updated = readFileSync(f.file, "utf8"),
+        mtime = statSync(f.file).mtimeMs;
+      expect(updated).toContain('discord  = "discord-id"');
+      expect(updated).toContain("# keep me");
+      const backups = readdirSync(f.configDir).filter((p) => p.endsWith(".bak"));
+      expect(backups).toHaveLength(1);
+      expect(readFileSync(join(f.configDir, backups[0] ?? ""), "utf8")).toBe(original);
+      f.reload();
+      f.commands.length = 0;
+      prompts.length = 0;
+      expect(await setupCommand("init", flags, f.d)).toBe(0);
+      expect(f.commands).not.toContain("gh api user");
+      expect(prompts).not.toContain("GitHub owner login");
+      expect(readFileSync(f.file, "utf8")).toBe(updated);
+      expect(statSync(f.file).mtimeMs).toBe(mtime);
+      expect(readdirSync(f.configDir).filter((p) => p.endsWith(".bak"))).toEqual(backups);
+    } finally {
+      f.close();
+    }
+  });
+
+for (const result of ["failure", "throw", "malformed", "null", "missing", "blank", "invalid"])
+  for (const json of [false, true])
+    test(`init leaves owner triggers disabled when discovery is ${result} (json=${json})`, async () => {
+      const original =
+        '[[providers]]\npreset = "claude"\n[[providers]]\npreset = "codex"\n[github]\nrepos = ["acme/app"]\nmerge = "pr"\n';
+      const f = setupFixture(original);
+      try {
+        f.state.local = false;
+        const run = f.d.run;
+        f.d.run = async (args) => {
+          const response = await run(args);
+          if (args.join(" ") !== "gh api user") return response;
+          if (result === "throw") throw new Error("discovery unavailable");
+          return {
+            ...response,
+            exitCode: result === "failure" ? 1 : 0,
+            stdout:
+              {
+                failure: '{"login":"untrusted-owner"}',
+                malformed: "broken JSON",
+                null: '{"login":null}',
+                missing: "{}",
+                blank: '{"login":"  "}',
+                invalid: '{"login":"bad/login"}',
+              }[result] ?? "",
+          };
+        };
+        expect(await setupCommand("init", { yes: true, json }, f.d)).toBe(0);
+        expect(loadConfig({ configDir: f.configDir, home: f.home, readOnly: true }).githubOwner).toBeNull();
+        expect(readFileSync(f.file, "utf8")).toBe(original);
+        const warning =
+          "GitHub owner unset; Dependabot runs, issue-label triggers and /limitless comment triggers remain disabled. Set [owners] github in config.toml or rerun limitless init.";
+        if (json) expect(JSON.parse(f.output[0] ?? "").warnings).toContain(warning);
+        else expect(f.output).toContain(warning);
+      } finally {
+        f.close();
+      }
+    });
+
+test("interactive owner works after discovery failure and an owner-only write rolls back on smoke failure", async () => {
+  const original =
+    '[[providers]]\npreset = "claude"\n[[providers]]\npreset = "codex"\n[github]\nrepos = []\nmerge = "pr"\n[owners]\ndiscord = "discord-id"\n';
+  const f = setupFixture(original);
+  try {
+    f.state.local = false;
+    f.d.tty = true;
+    const run = f.d.run;
+    f.d.run = async (args) =>
+      args.join(" ") === "gh api user" ? { exitCode: 1, stdout: "", stderr: "unavailable" } : run(args);
+    f.d.ask = async (q, fallback) => (q === "GitHub owner login" ? "chosen-owner" : fallback);
+    f.d.smoke = async () => {
+      expect(loadConfig({ configDir: f.configDir, home: f.home, readOnly: true }).githubOwner).toBe(
+        "chosen-owner",
+      );
+      return [{ name: "live", status: "fail", durationMs: 0 }];
+    };
+    expect(await setupCommand("init", { json: true }, f.d)).toBe(1);
+    expect(readFileSync(f.file, "utf8")).toBe(original);
+    expect(loadConfig({ configDir: f.configDir, home: f.home, readOnly: true }).githubOwner).toBeNull();
+    expect(f.d.config.raw.owners).toEqual({ discord: "discord-id" });
+  } finally {
+    f.close();
+  }
+});

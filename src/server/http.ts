@@ -16,6 +16,7 @@ import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
+import { stallReporter } from "../util/stall.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { createApiToken, matchesApiToken } from "./api-token.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
@@ -23,7 +24,7 @@ import { EventLoopLag } from "./event-loop-lag.ts";
 import { Passkeys } from "./passkeys.ts";
 
 const eventLoopLag = new EventLoopLag();
-setInterval(() => eventLoopLag.sample(), 1000).unref();
+setInterval(() => stallReporter.sample(eventLoopLag.sample()), 1000).unref();
 
 export interface HttpExtras {
   apiToken?: string;

@@ -1,6 +1,6 @@
 import { mock } from "bun:test";
 import { setupDeps } from "../src/cli/setup.ts";
-import { assertReadOnlyCommand } from "./fixtures/setup-commands.ts";
+import { assertReadOnlyCommand } from "./setup-commands.ts";
 
 const commands: string[] = [],
   requests: string[] = [],
