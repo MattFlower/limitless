@@ -4,6 +4,7 @@ import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { redactGateData } from "../gates/output.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
+import { activity } from "../util/stall.ts";
 import type { RunContext, RunState } from "./context.ts";
 import {
   markReportArtifacts,
@@ -104,6 +105,10 @@ export function renderReportArtifacts(
   input: ReportInput,
   publication?: (text: string) => string,
 ): ReportArtifacts {
+  return activity("report.render", () => renderArtifacts(input, publication));
+}
+
+function renderArtifacts(input: ReportInput, publication?: (text: string) => string): ReportArtifacts {
   input = redactGateData(input);
   // Normalize complete strings before display cuts, spans and clipped-source metadata.
   if (publication)

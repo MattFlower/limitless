@@ -588,20 +588,28 @@ test("the migration preserves existing review rows and previous-release inserts"
     defaultBranch: "main",
     mergePolicy: "pr",
   });
-  const source = old.createRun(repo, { repo: repo.slug, prompt: "Owner" });
-  const round = old.createRun(repo, { repo: repo.slug, prompt: "Existing round" });
+  const source = "source";
+  const round = "round";
+  // Seed with prior-release SQL: today's createRun requires columns this schema lacks.
+  for (const [id, prompt] of [
+    [source, "Owner"],
+    [round, "Existing round"],
+  ] as const)
+    old.db
+      .query(
+        "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES (?, ?, ?, ?, 'cli', 'queued', ?)",
+      )
+      .run(id, repo.id, prompt, prompt, clock.now());
   const head = "a".repeat(40);
   const insert =
     "INSERT INTO review_rounds (run_id, source_run_id, pr_url, round, reviewed_sha, findings, created_at) VALUES (?, ?, ?, ?, ?, '[]', ?)";
-  old.db.query(insert).run(round.id, source.id, url, 1, head, clock.now());
+  old.db.query(insert).run(round, source, url, 1, head, clock.now());
   old.close();
   const upgraded = new Store(path);
   try {
-    expect(upgraded.reviewRounds(url)).toMatchObject([
-      { runId: round.id, kind: "review", reviewedSha: head },
-    ]);
+    expect(upgraded.reviewRounds(url)).toMatchObject([{ runId: round, kind: "review", reviewedSha: head }]);
     const later = upgraded.createRun(repo, { repo: repo.slug, prompt: "Previous release round" });
-    upgraded.db.query(insert).run(later.id, source.id, url, 2, head, clock.now());
+    upgraded.db.query(insert).run(later.id, source, url, 2, head, clock.now());
     expect(upgraded.reviewRounds(url)).toMatchObject([
       { kind: "review", round: 1 },
       { kind: "review", round: 2 },

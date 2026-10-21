@@ -5,6 +5,7 @@ import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
+import { activity } from "./stall.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
 export const invocationScratch = new AsyncLocalStorage<string>();
@@ -677,9 +678,9 @@ export interface ProcResult {
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
-  /** The overall timeout began the shutdown, not an exit or a cancel before it. */
+  /** The overall timeout shutdown killed a running direct child. */
   timedOut: boolean;
-  /** The idle timeout began the shutdown, as for timedOut. */
+  /** The idle timeout shutdown killed a running direct child. */
   idleTimedOut: boolean;
   stdout: string; // tail, bounded by tailLimit
   stderr: string; // tail, bounded by tailLimit
@@ -842,8 +843,9 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         const release = await ownInvocationCleanup(marker);
         try {
           if (leaderInspectionError) throw leaderInspectionError;
+          let killedRunningChild = false;
           if (child.pid !== undefined) {
-            const killedRunningChild = await stopMarkedProcesses(
+            killedRunningChild = await stopMarkedProcesses(
               marker,
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
@@ -853,8 +855,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
               spawnedAt,
               directory,
             );
-            cancelKilled = cancelStarted && killedRunningChild;
           }
+          cancelKilled = cancelStarted && killedRunningChild;
+          timedOut &&= killedRunningChild;
+          idleTimedOut &&= killedRunningChild;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.
@@ -1100,23 +1104,50 @@ const credentialValues = new Set<string>();
 const credentialVariants = new Map<string, boolean>();
 let sortedCredentialVariants: [string, boolean][] = [];
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
+export const credentialRedactionPadding = (): number =>
+  Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
     if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
       credentialValues.add(secret);
-      for (const variant of new Set([secret, JSON.stringify(secret).slice(1, -1)]))
+      // Log normalization removes CRLF line endings before publication-window redaction.
+      const values = [secret, secret.replace(/\r\n/g, "\n")];
+      for (const variant of new Set(values.flatMap((s) => [s, JSON.stringify(s).slice(1, -1)])))
         credentialVariants.set(variant, credentialVariants.get(variant) || secret.length >= 8);
       sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
     }
 }
-export function redactCredentials(text: string): string {
+export function redactCredentials(text: string): string;
+export function redactCredentials(text: string, window?: { start: number; end: number }): string;
+export function redactCredentials(text: string, window?: { start: number; end: number }): string {
+  return activity("credentials.redact", () => redactText(text, window));
+}
+function redactText(text: string, window?: { start: number; end: number }): string {
+  // Unary callers can also pass this function directly to Array.map.
+  const bounds = typeof window === "object" ? { ...window } : undefined;
+  const marker = "[redacted]";
   // Substring matches require at least 8 characters to avoid redacting common short strings.
   for (const [secret, substring] of sortedCredentialVariants)
-    if (substring || text === secret) text = text.split(secret).join("[redacted]");
-  return text;
+    if (substring || text === secret) {
+      if (!bounds) text = text.split(secret).join(marker);
+      else {
+        const { start, end } = bounds;
+        text = text.replaceAll(secret, (_match, offset: number) => {
+          // A cut inside a replacement retains the entire marker, never a credential fragment.
+          if (offset < start)
+            bounds.start += offset + secret.length <= start ? marker.length - secret.length : offset - start;
+          if (offset < end)
+            bounds.end +=
+              offset + secret.length <= end ? marker.length - secret.length : offset + marker.length - end;
+          return marker;
+        });
+      }
+    }
+  return bounds ? text.slice(bounds.start, bounds.end) : text;
 }
-export const redactCredentialData = <T>(value: T): T =>
+export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
+const redactData = <T>(value: T): T =>
   JSON.parse(
     JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redactCredentials(v) : v)),
     (_key, v: unknown) =>

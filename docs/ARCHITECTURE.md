@@ -299,7 +299,11 @@ detection, per-invocation budget, process-group kill on cancel.
   caches therefore cause cold `bun install` runs from the network. A safe shared package cache is
   separate work. Secrets for Discord/GitHub/OpenRouter are
   scrubbed from agent environments.
-- Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).
+- Triggers are **allowlisted** (your configured GitHub login, `dependabot[bot]`, your Discord user id).
+  The GitHub owner defaults to unset: Dependabot runs, issue-label triggers and `/limitless`
+  comment triggers stay disabled until configured. Init discovers or prompts for it; doctor warns
+  when missing. Installations relying on the former default must set `github = "<owner>"` under
+  `[owners]` in `config.toml` before upgrading, or these triggers stop.
   Untrusted issue/PR text is treated as data and quoted, never as instructions.
 
 ## 7. Persistence
@@ -349,7 +353,7 @@ aborts in-flight git, gates and `gh` calls through one signal.
 
 The factory runs from a **release checkout** (`~/.limitless/app`, tracking `main`) under launchd,
 never from the tree it is modifying. Improvements to Limitless are made *by Limitless*: the
-orchestrator (Claude, in this session) files runs against `MattFlower/limitless`, reviews the PRs
+orchestrator (Claude, in this session) files runs against `<owner>/limitless`, reviews the PRs
 the factory produces, merges, and runs `limitless deploy` (fetch → install → checks → optional live smoke → drain → restart).
 Deploy does not run a UI build; see [OPERATIONS](OPERATIONS.md#shipping-a-change).
 The limitless repo's merge policy is `pr` (reviewed by the orchestrator) even though your other

@@ -649,10 +649,17 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
     const original = run.checks[0];
     if (!original) throw new Error("Missing check");
     expect(original.output).toContain("Bailed out after 1 failure");
-    expect(original.output).toContain("Ran 1 test across 1 file.");
+    // Bun may finish and report the in-flight passing file after bailing.
+    const summary = /^Ran ([12]) tests? across \1 files?\./m.exec(original.output);
+    expect(summary).not.toBeNull();
     expect(original.failedFiles).toEqual(["test/a.test.ts"]);
     const junit = parseJUnit(readFileSync(join(f.cwd, "report.xml"), "utf8"), f.cwd);
-    expect(junit?.attributedCounts).toEqual({ tests: 1, failures: 1, errors: 0, skipped: 0 });
+    expect(junit?.attributedCounts).toEqual({
+      tests: Number(summary?.[1]),
+      failures: 1,
+      errors: 0,
+      skipped: 0,
+    });
     const withoutBail = new RunnerFailureEvidence();
     for (const line of original.output.split("\n"))
       if (!line.startsWith("Bailed out after ")) withoutBail.observe(line);

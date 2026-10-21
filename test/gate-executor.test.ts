@@ -15,7 +15,7 @@ import {
   retryBaselineFailures,
   retryRegressions,
 } from "../src/gates/run.ts";
-import { gateSlots } from "../src/gates/slots.ts";
+import { acquireGateSlot, agentTestSlots, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
@@ -23,6 +23,7 @@ import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { formatGateFeedback } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
+import * as proc from "../src/util/proc.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
@@ -1023,10 +1024,64 @@ test("local attachment preserves start-time read policy and confinement", async 
   expect(recording.calls[0]?.opts.cmd).toContain("true");
 });
 
-test.each([false, true])("shared local executor releases settled work (rejected=%s)", async (rejected) => {
+test("unscoped attachment cannot borrow its start-time gate reservation", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const executor = localExecutor();
+  const controller = new AbortController();
+  const recording = recordingConfinement();
+  const started = Promise.withResolvers<ExecutionHandle>();
+  const releaseA = Promise.withResolvers<void>();
+  const queued = Promise.withResolvers<void>();
+  const gateA = gateSlotScope(async () => {
+    const release = await acquireGateSlot(controller.signal, undefined, "gate A");
+    started.resolve(
+      await readPolicyScope.run(testReadPolicy, () =>
+        confinementScope.run(recording.backend, () =>
+          executor.start(request(fixture.repoDir), controller.signal),
+        ),
+      ),
+    );
+    await releaseA.promise;
+    release();
+  })();
+  let execution: ReturnType<typeof executor.attach> | undefined;
+  try {
+    const handle = await started.promise;
+    execution = readPolicyScope.run(undefined, () =>
+      confinementScope.exit(() =>
+        executor.attach(handle, controller.signal, undefined, {
+          onWait: () => queued.resolve(),
+          holder: "gate B",
+        }),
+      ),
+    );
+    expect(
+      await Promise.race([queued.promise.then(() => "queued"), execution.result.then(() => "ran")]),
+    ).toBe("queued");
+    expect(recording.calls).toHaveLength(0);
+    expect(gateSlots.snapshot().holders).toEqual(["gate A"]);
+    releaseA.resolve();
+    await gateA;
+    expect((await execution.result).checks[0]?.ok).toBe(true);
+    expect(recording.calls).toHaveLength(1);
+    expect(recording.calls[0]?.opts.cmd).toContain("true");
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    releaseA.resolve();
+    await gateA;
+    await execution?.result.catch(() => {});
+    gateSlots.setLimit(previous);
+  }
+});
+
+test.each(["pass", "fail", "throw"])("shared local executor releases reserved work (%s)", async (outcome) => {
+  const rejected = outcome === "throw";
   const executor = gateExecutorFor("local");
   const signal = new AbortController().signal;
   const req = request(fixture.repoDir);
+  if (outcome === "fail") req.gates = { ...gates, checks: [{ name: "check", run: "false" }] };
   const recording = recordingConfinement();
   const backend = {
     ...recording.backend,
@@ -1037,11 +1092,15 @@ test.each([false, true])("shared local executor releases settled work (rejected=
   };
   let handle: ExecutionHandle | undefined;
   await confinementScope.run(backend, async () => {
-    const first = executeGate(req, signal, {}, executor, undefined, async (started) => {
-      handle = started;
-    });
+    const first = gateSlotScope(() =>
+      executeGate(req, signal, {}, executor, undefined, async (started) => {
+        handle = started;
+      }),
+    )();
     if (rejected) await expect(first).rejects.toThrow("execution failed");
-    else expect((await first).checks[0]?.ok).toBe(true);
+    else expect((await first).checks[0]?.ok).toBe(outcome === "pass");
+    expect(gateSlots.snapshot().occupied).toBe(0);
+    req.gates = gates;
     if (!handle) throw new Error("missing handle");
     const settledHandle = handle;
     // Neither the cached execution nor its original request survives settlement.
@@ -1049,8 +1108,28 @@ test.each([false, true])("shared local executor releases settled work (rejected=
     const replay = await executeGate(req, signal, {}, executor, settledHandle);
     expect(replay.checks[0]?.ok).toBe(true);
     expect(recording.calls).toHaveLength(2);
+    expect(gateSlots.snapshot().occupied).toBe(0);
     expect(() => executor.attach(settledHandle, signal)).toThrow("missing its request");
   });
+});
+
+test("a resumed local handle uses the current reservation with its original confinement", async () => {
+  const executor = localExecutor();
+  const signal = new AbortController().signal;
+  const req = request(fixture.repoDir);
+  const recording = recordingConfinement();
+  const handle = await confinementScope.run(
+    recording.backend,
+    gateSlotScope(() => executor.start(req, signal)),
+  );
+  await confinementScope.exit(
+    gateSlotScope(async () => {
+      expect((await executeGate(req, signal, {}, executor, handle)).checks[0]?.ok).toBe(true);
+      expect(gateSlots.snapshot().occupied).toBe(1);
+    }),
+  );
+  expect(gateSlots.snapshot().occupied).toBe(0);
+  expect(recording.calls).toHaveLength(1);
 });
 
 test("local cancel is idempotent and stops work queued for a slot", async () => {
@@ -1395,3 +1474,133 @@ test("baseline environment hashes separate LAN and local execution", () => {
   expect(baselineCacheKey(input)).toEqual(baselineCacheKey({ ...input, executor: "local" }));
   expect(baselineCacheKey({ ...input, executor: "lan" }).envHash).not.toBe(baselineCacheKey(input).envHash);
 });
+
+test.each(["baseline", "regression", "cancel baseline", "cancel regression"])(
+  "local %s holds its slot through targeted and full retries",
+  async (scenario) => {
+    writeFileSync(
+      join(fixture.repoDir, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "test", run = "full-check" }]\nretry_files = "target-check {files}"\n',
+    );
+    await sh(["git", "commit", "-qam", "retry slots"], { cwd: fixture.repoDir });
+    const baseline = scenario.includes("baseline");
+    const cancelled = scenario.startsWith("cancel");
+    const ready = [deferred<void>(), deferred<void>(), deferred<void>()];
+    const proceed = [deferred<void>(), deferred<void>(), deferred<void>()];
+    const abortReady = deferred<void>();
+    const cleanup = deferred<void>();
+    const commands: string[] = [];
+    let attempts = 0;
+    let acquired = false;
+    const previous = gateSlots.limit;
+    const realProcess = proc.runProcess;
+    const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+      opts.onStdoutLine?.(opts.cmd[4] ?? "");
+      const command = opts.cmd.at(-1) ?? "";
+      const first = baseline ? 0 : 1;
+      const attempt = attempts++ - first;
+      if (attempt >= 0 && attempt < 3) {
+        commands.push(command);
+        ready[attempt]?.resolve();
+        if (attempt === 1 && cancelled) {
+          await new Promise<void>((resolve) =>
+            opts.signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          abortReady.resolve();
+          await cleanup.promise;
+          opts.signal?.throwIfAborted();
+        } else await proceed[attempt]?.promise;
+      }
+      const fail = attempt === 0;
+      if (fail) {
+        const report = opts.env?.LIMITLESS_GATE_REPORT;
+        if (!report) throw new Error("missing report path");
+        writeFileSync(
+          report,
+          '<testsuites><testsuite file="greeting.txt" time="1" failures="1"><testcase><failure/></testcase></testsuite></testsuites>',
+        );
+      }
+      return {
+        exitCode: fail ? 1 : 0,
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        stdout: fail ? "test failure" : "passed",
+        stderr: "",
+        durationMs: 1,
+      };
+    });
+    const f = start(handler);
+    gateSlots.setLimit(1);
+    let competitor: Promise<() => void> | undefined;
+    let release: (() => void) | undefined;
+    try {
+      const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+      await ready[0]?.promise;
+      competitor = gateSlots
+        .acquire(new AbortController().signal, undefined, "competitor", false, "ship")
+        .then((free) => {
+          acquired = true;
+          return free;
+        });
+      proceed[0]?.resolve();
+      const winner = await Promise.race([
+        ready[1]?.promise.then(() => "retry"),
+        competitor.then(() => "competitor"),
+      ]);
+      expect(winner).toBe("retry");
+      expect(acquired).toBe(false);
+      expect(gateSlots.snapshot().occupied).toBe(1);
+      expect(agentTestSlots.snapshot().occupied).toBe(0);
+      if (cancelled) {
+        f.cancelRun(run.id);
+        await abortReady.promise;
+        expect(acquired).toBe(false);
+        cleanup.resolve();
+      } else {
+        proceed[1]?.resolve();
+        expect(
+          await Promise.race([ready[2]?.promise.then(() => "full"), competitor.then(() => "competitor")]),
+        ).toBe("full");
+        expect(acquired).toBe(false);
+        proceed[2]?.resolve();
+      }
+      release = await competitor;
+      release();
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
+      expect(status).toBe(cancelled ? "cancelled" : "succeeded");
+      expect(commands).toEqual(
+        cancelled
+          ? ["full-check", "target-check './greeting.txt'"]
+          : ["full-check", "target-check './greeting.txt'", "full-check"],
+      );
+      if (!cancelled) {
+        const state = f.store.getRunState<RunState>(run.id);
+        if (baseline)
+          expect(state?.baseline?.checks[0]).toMatchObject({
+            ok: true,
+            firstAttempt: { ok: false },
+            targetedRetry: { ok: true },
+          });
+        else
+          expect(state?.lastGates?.[0]).toMatchObject({
+            verdict: "flaky",
+            firstAttempt: { ok: false },
+            result: { ok: true, targetedRetry: { ok: true } },
+          });
+      }
+      expect(gateSlots.snapshot().occupied).toBe(0);
+    } finally {
+      for (const barrier of proceed) barrier.resolve();
+      cleanup.resolve();
+      release?.();
+      await f.stop();
+      if (competitor) (await competitor)();
+      processSpy.mockRestore();
+      gateSlots.setLimit(previous);
+    }
+  },
+);

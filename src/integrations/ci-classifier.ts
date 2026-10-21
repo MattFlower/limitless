@@ -1,7 +1,8 @@
 import { z } from "zod";
 import type { CiFailure, GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { redactCredentials } from "../util/proc.ts";
+import { credentialRedactionPadding, redactCredentials } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
 
 const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
@@ -44,17 +45,24 @@ type Call = (
   body?: unknown,
   optionalLog?: boolean,
 ) => Promise<GitHubResponse | null>;
-const bounded = (text: string) => redactCredentials(text).trim().slice(0, 500);
+const publication = (text: string, from: number, to: number) => {
+  if (to <= from) return "";
+  const padding = credentialRedactionPadding();
+  const start = Math.max(0, from - padding);
+  return redactCredentials(text.slice(start, to + padding), { start: from - start, end: to - start });
+};
+const bounded = (text: string, from = 0, to = text.length, limit = 500) => {
+  const value = text.slice(from, to);
+  from += value.length - value.trimStart().length;
+  return redactCredentials(publication(text, from, Math.min(to, from + limit)).trim()).slice(0, limit);
+};
 const logLines = (log: string) =>
   Bun.stripANSI(log)
     .split(/\r?\n/)
     .map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+const failureLine = /^\s*(?:\(fail\)|FAIL(?:ED)?\b|[×✗✕❌●]|--- FAIL:|not ok\b|##\[error\]|error:)/i;
 const securityFailure = (log: string) =>
-  logLines(log).some(
-    (line) =>
-      /^\s*(?:\(fail\)|FAIL(?:ED)?\b|[×✗✕❌●]|--- FAIL:|not ok\b|##\[error\]|error:)/i.test(line) &&
-      security.test(line),
-  );
+  logLines(log).some((line) => failureLine.test(line) && security.test(line));
 // Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
 const timeoutDiagnostic =
   /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
@@ -67,21 +75,62 @@ export const headMoved = (head: string, sha: string, approvedSha?: string): bool
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
   const lines = logLines(log);
-  const line = bounded(
-    lines.find((l) => /timed out after|##\[error\]|\b(?:error|fail(?:ed|ure)?)\b/i.test(l)) ?? fallback,
-  );
+  const text = lines.join("\n");
+  const offsets = [0];
+  for (const l of lines) offsets.push((offsets.at(-1) ?? 0) + l.length + 1);
+  const offset = (i: number) => offsets[Math.max(0, Math.min(lines.length, i))] ?? 0;
+  const start = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
+  let index = start;
+  // Bun prints the assertion, diff and stack before the test name. Keep that block together.
+  if (/^\s*error:/i.test(lines[start] ?? "")) {
+    const next = lines.slice(start + 1).findIndex((l) => failureLine.test(l) || /^\s*\(pass\)/i.test(l));
+    if (/^\s*\(fail\)/i.test(lines[start + 1 + next] ?? "")) index += 1 + next;
+  }
+  const line = index < 0 ? bounded(fallback) : bounded(text, offset(index), offset(index + 1) - 1);
+  const window = (from: number, to: number, limit: number, last = false) => {
+    if (index < 0) return "";
+    const left = offset(from);
+    const right = Math.max(left, offset(to) - 1);
+    return publication(
+      text,
+      last ? Math.max(left, right - limit) : left,
+      last ? right : Math.min(right, left + limit),
+    );
+  };
+  // Bound the leading context and the first failure line so neither consumes the budget.
+  const head = `${window(start - 2, start, 500, true)}\n${window(start, start + 1, 500)}`;
+  // A long Bun diff keeps its newest lines: the stack frame and the failing test name.
+  const tail =
+    index > start
+      ? window(start + 1, index + 1, Math.max(0, 1999 - head.length), true)
+      : window(start + 1, start + 4, 2000);
+  const excerpt = (index < 0 ? bounded(log || line, 0, (log || line).length, 2000) : `${head}\n${tail}`)
+    .replace(/[^\r\n]+/g, (line) => redactCredentials(line))
+    .trim()
+    .slice(0, 2000);
+  const imageIndex = lines.findIndex((l) => /^\s*Image:/.test(l));
   const image =
-    bounded(
-      lines.find((l) => /^\s*Image:/.test(l))?.replace(/^\s*Image:\s*/, "") ??
-        labels.find((label) => /^(?:ubuntu|windows|macos)-/.test(label)) ??
-        "",
-    ) || null;
-  return { check, line, image, signature: JSON.stringify([check, line, image]) };
+    (imageIndex < 0
+      ? bounded(labels.find((label) => /^(?:ubuntu|windows|macos)-/.test(label)) ?? "")
+      : bounded(
+          text,
+          offset(imageIndex) + (lines[imageIndex]?.match(/^\s*Image:\s*/)?.[0].length ?? 0),
+          offset(imageIndex + 1) - 1,
+        )) || null;
+  return { check, line, image, signature: JSON.stringify([check, line, image]), excerpt };
 }
 const quote = (s: string) => `> ${redactCredentials(s).replace(/\r?\n/g, "\n> ")}`;
 
 /** Serial REST inspection. False retains the persisted pending inspection for a later poll. */
-async function inspectCi(
+async function inspectCi(...args: Parameters<typeof inspectCiInner>) {
+  const end = beginActivity("ci-log.inspect");
+  try {
+    return await inspectCiInner(...args);
+  } finally {
+    end();
+  }
+}
+async function inspectCiInner(
   store: Store,
   pr: Omit<TrackedPr, "runId"> & { runId: string | null },
   snap: PrSnapshot,
@@ -199,7 +248,7 @@ async function inspectCi(
   };
   const emit = (
     kind: GitHubFeedKind,
-    f: ReturnType<typeof ciSignature>,
+    f: Omit<ReturnType<typeof ciSignature>, "excerpt">,
     key: string,
     repository = false,
     excerpt = f.line,
@@ -227,9 +276,9 @@ async function inspectCi(
     });
     if (kind === "ci.needs_fix") onFailure();
   };
-  const reject = (f: CiFailure, excerpt = f.line, unsafe = false) => {
+  const reject = (f: CiFailure, excerpt = f.line, unsafe = false, evidence = f) => {
     write(() => store.finishCiFailure(f, "rerun_rejected"));
-    emit("ci.needs_fix", f, `${pr.url}:${f.sha}:${f.signature}`, false, excerpt, unsafe);
+    emit("ci.needs_fix", evidence, `${pr.url}:${f.sha}:${evidence.signature}`, false, excerpt, unsafe);
   };
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
     allowed();
@@ -332,7 +381,7 @@ async function inspectCi(
         failure,
         `${pr.url}:${f.sha}:${failure.signature}`,
         false,
-        log || failure.line,
+        failure.excerpt,
         unsafe,
       );
     } else continue;
@@ -408,8 +457,14 @@ async function inspectCi(
           log = body;
         }
       }
+      const { excerpt, ...signature } = ciSignature(
+        c.name,
+        log,
+        c.output?.title ?? c.conclusion ?? "failure",
+        job?.labels,
+      );
       const f: CiFailure = {
-        ...ciSignature(c.name, log, c.output?.title ?? c.conclusion ?? "failure", job?.labels),
+        ...signature,
         prUrl: pr.url,
         sha: snap.headRefOid,
         outcome: "failed",
@@ -439,12 +494,12 @@ async function inspectCi(
         const refused = prior.find((p) => pending(p) && p.rerunRetryAt != null);
         if (!refused) continue;
         // Older versions deferred explicit refusals; they also retain the head's claim.
-        reject(refused, log || f.line, unsafe);
+        reject(refused, excerpt, unsafe, f);
         continue;
       }
       if (!unsafe) write(() => store.recordCiFailure(f));
       const needsFix = () =>
-        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line, unsafe);
+        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, excerpt, unsafe);
       const transient =
         [c.conclusion, job?.conclusion].some((v) =>
           ["timed_out", "startup_failure", "cancelled"].includes(v ?? ""),
@@ -478,7 +533,7 @@ async function inspectCi(
             }),
           )
         ) {
-          await requestRerun(f, job.id, log || f.line);
+          await requestRerun(f, job.id, excerpt);
           continue;
         }
         // Another Store/daemon may win the atomic claim while this inspection awaits the head read.

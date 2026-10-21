@@ -13,9 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setupDeps } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
-import { assertReadOnlyCommand } from "./fixtures/setup-commands.ts";
+import { assertReadOnlyCommand } from "./setup-commands.ts";
 
-export { assertReadOnlyCommand } from "./fixtures/setup-commands.ts";
+export { assertReadOnlyCommand } from "./setup-commands.ts";
 
 export function setupFixture(text?: string) {
   const root = mkdtempSync(join(tmpdir(), "limitless-setup-")),

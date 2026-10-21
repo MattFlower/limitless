@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { availableParallelism } from "node:os";
 
 export const GATE_LEASE_EXPIRY_MS = 30_000;
@@ -132,3 +133,85 @@ export const gateSlots = new Semaphore(defaultGateSlots());
 
 /** Targeted agent tests never queue behind a full gate suite. */
 export const agentTestSlots = new Semaphore(2);
+
+const reservation = new AsyncLocalStorage<{
+  release?: Promise<() => void>;
+  closed: boolean;
+  users: number;
+  releaseRequested: boolean;
+}>();
+
+/** Restoring execution context must not replace the attaching operation's reservation. */
+export function bindGateSlotScope<A extends unknown[], T>(fn: (...args: A) => T): (...args: A) => T {
+  const held = reservation.getStore();
+  return held ? (...args) => reservation.run(held, fn, ...args) : (...args) => reservation.exit(fn, ...args);
+}
+
+/** Worker attempts must leave coordinator capacity available for local gates. */
+export async function releaseGateSlotScope(): Promise<void> {
+  const held = reservation.getStore();
+  if (!held) return;
+  held.releaseRequested = true;
+  if (held.users) return;
+  const pending = held.release;
+  held.release = undefined;
+  held.releaseRequested = false;
+  (await pending?.catch(() => undefined))?.();
+}
+
+/** Local attempts share ownership until retry decisions and cancellation cleanup finish. */
+export const gateSlotScope =
+  <T>(fn: () => Promise<T>): (() => Promise<T>) =>
+  async () => {
+    if (reservation.getStore()?.closed === false) return fn();
+    const held = {
+      closed: false,
+      users: 0,
+      releaseRequested: false,
+      release: undefined as Promise<() => void> | undefined,
+    };
+    return reservation.run(held, async () => {
+      try {
+        return await fn();
+      } finally {
+        held.closed = true;
+        await releaseGateSlotScope();
+      }
+    });
+  };
+
+export async function acquireGateSlot(
+  signal: AbortSignal,
+  onWait?: (limit: number) => void,
+  holder?: string,
+  skipGateSlot = false,
+  priority?: GatePriority,
+): Promise<() => void> {
+  signal.throwIfAborted();
+  const held = reservation.getStore();
+  if (held && !held.closed && (held.release || !skipGateSlot)) {
+    held.release ??= gateSlots.acquire(signal, onWait, holder, false, priority);
+    held.users++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      held.users--;
+      if (!held.users && held.releaseRequested) void reservation.run(held, releaseGateSlotScope);
+    };
+    try {
+      await held.release;
+      return release;
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+  return (skipGateSlot ? agentTestSlots : gateSlots).acquire(
+    signal,
+    skipGateSlot ? undefined : onWait,
+    holder,
+    false,
+    skipGateSlot ? undefined : priority,
+  );
+}

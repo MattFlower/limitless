@@ -10,8 +10,10 @@ export class EventLoopLag {
   sample() {
     const at = this.now();
     this.samples = this.samples.filter((sample) => at - sample.at <= 60_000);
-    this.samples.push({ at, lag: Math.max(0, at - this.expected) });
+    const lag = Math.max(0, at - this.expected);
+    this.samples.push({ at, lag });
     this.expected = at + 1000;
+    return lag;
   }
 
   maxMs() {

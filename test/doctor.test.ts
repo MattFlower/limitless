@@ -140,7 +140,7 @@ for (const [id, status, fix, arrange] of cases)
     }
   });
 test("all checks pass without external effects, and outputs stay read-only", async () => {
-  const f = setupFixture("[server]\nport = 7400\n");
+  const f = setupFixture('[server]\nport = 7400\n[owners]\ngithub = "acme"\n');
   try {
     writeFileSync(
       join(f.configDir, "secrets.env"),
@@ -438,3 +438,49 @@ for (const explicit of [false, true])
         f.close();
       }
     });
+
+for (const owner of [undefined, "", "acme"])
+  test(`doctor reports disabled GitHub triggers only with owner unset (${owner})`, async () => {
+    const f = setupFixture(owner === undefined ? undefined : `[owners]\ngithub = "${owner}"\n`);
+    try {
+      const before = f.snapshot();
+      for (const json of [false, true]) {
+        f.output.length = 0;
+        expect(await setupCommand("doctor", { json }, f.d)).toBe(0);
+        if (json) {
+          const checks = JSON.parse(f.output[0] ?? "").checks as {
+            id: string;
+            status: string;
+            message: string;
+            fix?: string;
+          }[];
+          const check = checks.find((c) => c.id === "github-owner");
+          if (owner) expect(check).toBeUndefined();
+          else {
+            expect(check?.status).toBe("warn");
+            expect(check?.message).toContain(
+              "Dependabot runs, issue-label triggers and /limitless comment triggers disabled",
+            );
+            expect(check?.fix).toContain("[owners]");
+            expect(check?.fix).toContain('github = "<owner>"');
+          }
+        } else {
+          const output = f.output.join("\n");
+          if (owner) expect(output).not.toContain("github-owner");
+          else {
+            expect(output).toContain("warn github-owner:");
+            expect(output).toContain(
+              "Dependabot runs, issue-label triggers and /limitless comment triggers disabled",
+            );
+            expect(output).toContain("[owners]");
+            expect(output).toContain('github = "<owner>"');
+          }
+        }
+        expect(f.snapshot()).toEqual(before);
+      }
+      expect(f.effects).toEqual([]);
+      expect(f.commands).not.toContain("gh api user");
+    } finally {
+      f.close();
+    }
+  });
