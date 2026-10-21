@@ -731,8 +731,16 @@ for (const [idle, code] of [
       const timeout = idle ? { idleTimeoutMs: 100_000 } : { timeoutMs: 100_000 };
       const result = await runProcess({ cmd, cwd: process.cwd(), env: {}, ...timeout });
       expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: false, idleTimedOut: false });
-      if (!idle && code === 0)
-        await expect(sh(cmd, { cwd: process.cwd(), ...timeout })).resolves.toMatchObject({ exitCode: 0 });
+      if (!idle && code === 0) {
+        await expect(sh(cmd, { cwd: process.cwd(), ...timeout })).resolves.toMatchObject({
+          exitCode: 0,
+          timedOut: false,
+        });
+        await expect(sh(cmd, { cwd: process.cwd(), ...timeout, allowFail: true })).resolves.toMatchObject({
+          exitCode: 0,
+          timedOut: false,
+        });
+      }
     } finally {
       spawning.mockRestore();
       timer.mockRestore();
@@ -805,17 +813,37 @@ for (const [idle, code] of [
       const cmd = [
         process.execPath,
         "-e",
-        `process.stdin.resume(); process.stdin.on("end", () => process.exit(${code})); console.log("ready")`,
+        `process.stdin.resume(); process.stdin.on("end", () => process.exit(${code})); console.error("diagnostic"); console.log("ready")`,
       ];
       const timeout = idle ? { idleTimeoutMs: 100_000, idleNow: () => now } : { timeoutMs: 100_000 };
       const opts = { cwd: process.cwd(), ...timeout };
       const result = await processInspection.run(inspect, () => runProcess({ cmd, env: {}, ...opts }));
       expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: !idle, idleTimedOut: idle });
       if (!idle && code === 0) {
-        await expect(processInspection.run(inspect, () => sh(cmd, opts))).rejects.toMatchObject({
+        await expect(
+          processInspection.run(inspect, () => sh(cmd, { ...opts, allowFail: true })),
+        ).resolves.toMatchObject({
           timedOut: true,
           exitCode: 0,
+          stdout: "ready\n",
+          stderr: "diagnostic\n",
         });
+        for (const timeoutMs of [100_000, undefined]) {
+          const error: unknown = await processInspection
+            .run(inspect, () => sh(cmd, { cwd: process.cwd(), timeoutMs }))
+            .catch((e: unknown) => e);
+          expect(error).toBeInstanceOf(CommandError);
+          if (!(error instanceof CommandError)) throw error;
+          expect(error.message).toContain(`timed out after ${(timeoutMs ?? 120_000) / 1000} s`);
+          expect(error.message).toContain(cmd.join(" "));
+          expect(error.message).toContain("diagnostic");
+          expect(error).toMatchObject({
+            timedOut: true,
+            exitCode: 0,
+            stdout: "ready\n",
+            stderr: "diagnostic\n",
+          });
+        }
       }
     } finally {
       spawning.mockRestore();

@@ -976,6 +976,28 @@ test("a target checkout still aborts on failed gates before draining", async () 
   expect(f.calls).not.toContain("bun scripts/smoke.ts");
 });
 
+test.each([
+  ["bun run lint", 600],
+  ["bun test --parallel=4", 1800],
+  ["bun scripts/smoke.ts", 900],
+] as const)("a timed-out zero-exit gate aborts deploy: %s", async (gate, seconds) => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== gate) return command(args, options);
+    return { stdout: "last progress\n", stderr: "last diagnostic\n", exitCode: 0, timedOut: true };
+  };
+  const message = String(await deploy(7400, "feature", true, f.opts).catch((e: unknown) => e));
+  expect(message).toContain("deploy gate failed; staying on previous");
+  expect(message).toContain(`Command timed out after ${seconds} s: ${gate}`);
+  expect(message).toContain("last progress");
+  expect(message).toContain("last diagnostic");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
+  expect(f.calls).toContain("git checkout -q --detach previous");
+  expect(f.selected()).toBe("previous");
+});
+
 test("a failed smoke gate reports the tail of both output streams and restores the checkout", async () => {
   const f = setup();
   const command = f.opts.command;

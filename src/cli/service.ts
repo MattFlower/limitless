@@ -452,7 +452,7 @@ function tailLines(lines: string[], maxLines: number, maxBytes: number): string[
 async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOptions): Promise<void> {
   const gate = async (args: string[], timeoutMs: number) => {
     const res = await run(args, { cwd: dir, timeoutMs, allowFail: true, redactOutput: true });
-    if (res.exitCode === 0) return;
+    if (res.exitCode === 0 && !res.timedOut) return;
     const { stdout, stderr } = redactGateStreams(res.stdout, res.stderr);
     const failures = extractFailures(`${stdout}\n${stderr}`);
     const tailBytes = failures ? 1_000 : GATE_TAIL_BYTES;
@@ -485,7 +485,9 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
     ];
     throw new Error(
       [
-        `Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`,
+        res.timedOut
+          ? `Command timed out after ${timeoutMs / 1000} s: ${args.join(" ")}`
+          : `Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`,
         ...(failures ? [failures] : []),
         ...tail,
       ].join("\n"),
