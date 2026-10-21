@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { availableParallelism } from "node:os";
 
 export const GATE_LEASE_EXPIRY_MS = 30_000;
@@ -132,3 +133,49 @@ export const gateSlots = new Semaphore(defaultGateSlots());
 
 /** Targeted agent tests never queue behind a full gate suite. */
 export const agentTestSlots = new Semaphore(2);
+
+const reservation = new AsyncLocalStorage<{ release?: Promise<() => void>; closed: boolean }>();
+
+/** Restoring execution context must not replace the attaching operation's reservation. */
+export function bindGateSlotScope<A extends unknown[], T>(fn: (...args: A) => T): (...args: A) => T {
+  const held = reservation.getStore();
+  return held ? (...args) => reservation.run(held, fn, ...args) : fn;
+}
+
+/** Local attempts share ownership until retry decisions and cancellation cleanup finish. */
+export const gateSlotScope =
+  <T>(fn: () => Promise<T>): (() => Promise<T>) =>
+  async () => {
+    const held = { closed: false, release: undefined as Promise<() => void> | undefined };
+    return reservation.run(held, async () => {
+      try {
+        return await fn();
+      } finally {
+        held.closed = true;
+        (await held.release)?.();
+      }
+    });
+  };
+
+export async function acquireGateSlot(
+  signal: AbortSignal,
+  onWait?: (limit: number) => void,
+  holder?: string,
+  skipGateSlot = false,
+  priority?: GatePriority,
+): Promise<() => void> {
+  signal.throwIfAborted();
+  const held = reservation.getStore();
+  if (held && !held.closed) {
+    held.release ??= gateSlots.acquire(signal, onWait, holder, false, priority);
+    await held.release;
+    return () => {};
+  }
+  return (skipGateSlot ? agentTestSlots : gateSlots).acquire(
+    signal,
+    skipGateSlot ? undefined : onWait,
+    holder,
+    false,
+    skipGateSlot ? undefined : priority,
+  );
+}

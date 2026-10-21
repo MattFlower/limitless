@@ -35,6 +35,7 @@ import {
   retryRegressions,
   runLocalGates,
 } from "../gates/run.ts";
+import { gateSlotScope } from "../gates/slots.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
@@ -562,30 +563,32 @@ async function prepare(ctx: RunContext): Promise<void> {
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const baselineSha = await headSha(wt.path);
-      const runBaseline = commandScope(wt.path, async (): Promise<GateRun> => {
-        const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
-        ctx.checkCancelled();
-        // Retry before resetting, so a check sees the same build output as its first attempt.
-        const retried = await retryBaselineFailures(
-          run,
-          wt.path,
-          gates,
-          ctx.signal,
-          onWait,
-          (retry, options) =>
-            runGateExecution(
-              ctx,
-              "prepare",
-              options?.targeted ? "baseline-retry-targeted" : "baseline-retry",
-              wt.path,
-              retry,
-              { onWait, skipGateSlot: options?.skipGateSlot },
-            ),
-          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
-        );
-        ctx.checkCancelled();
-        return { ...retried, sha: (await headSha(wt.path)) === baselineSha ? baselineSha : undefined };
-      });
+      const runBaseline = gateSlotScope(
+        commandScope(wt.path, async (): Promise<GateRun> => {
+          const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
+          ctx.checkCancelled();
+          // Retry before resetting, so a check sees the same build output as its first attempt.
+          const retried = await retryBaselineFailures(
+            run,
+            wt.path,
+            gates,
+            ctx.signal,
+            onWait,
+            (retry, options) =>
+              runGateExecution(
+                ctx,
+                "prepare",
+                options?.targeted ? "baseline-retry-targeted" : "baseline-retry",
+                wt.path,
+                retry,
+                { onWait, skipGateSlot: options?.skipGateSlot },
+              ),
+            ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+          );
+          ctx.checkCancelled();
+          return { ...retried, sha: (await headSha(wt.path)) === baselineSha ? baselineSha : undefined };
+        }),
+      );
       ctx.state.baselineCached = false;
       const buildSha = ctx.deps.buildSha;
       if (!hasGates) ctx.state.baseline = null;
@@ -1287,138 +1290,143 @@ async function oneRound(
   const checks = ctx.stage(
     "gates",
     (stage) =>
-      commandScope(cwd, async () => {
-        const events = {
-          ...gateEvents(ctx),
-          onLocalSetup: () => {
-            localSetupReady = true;
-          },
-        };
-        const checkedSha = await headSha(cwd);
-        let cmp: GateComparison[];
-        let testScripts: Record<string, string> = {};
-        let baseTimeout = false;
-        try {
-          await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
-          testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
-          let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events);
-          ctx.checkCancelled();
-          baseTimeout = after.checks.some(
-            (r) =>
-              r.timedOut && findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
-          );
-          const failed = after.checks.filter((r) => !r.ok);
-          const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
-          if (timeoutOnly && !baseTimeout) {
-            const first = after;
-            ctx.artifact(`gates-timeout-${round}.json`, "gates", JSON.stringify(redactGateData(first)));
-            ctx.log(
-              `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + 1})`,
-              "warn",
-            );
-            // The re-run starts from the committed tree too, not from what the first attempt left behind.
-            localSetupReady = false;
+      gateSlotScope(
+        commandScope(cwd, async () => {
+          const events = {
+            ...gateEvents(ctx),
+            onLocalSetup: () => {
+              localSetupReady = true;
+            },
+          };
+          const checkedSha = await headSha(cwd);
+          let cmp: GateComparison[];
+          let testScripts: Record<string, string> = {};
+          let baseTimeout = false;
+          try {
             await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
-            after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
+            testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
+            let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events);
             ctx.checkCancelled();
-            after = {
-              ...after,
-              checks: after.checks.map((r) => ({
-                ...r,
-                firstAttempt: findGateCounterpart(r, after.checks, first.checks),
-              })),
-            };
-          }
-          const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
-          // Retry before discarding, so a check sees the same build output as its first attempt.
-          cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
-            ...c,
-            firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
-          }));
-          if (!baseTimeout)
-            cmp = await retryRegressions(
-              cmp,
-              cwd,
-              gates,
-              changed,
-              ctx.signal,
-              events.onWait,
-              (retry, options) =>
-                runGateExecution(
-                  ctx,
-                  "gates",
-                  options?.targeted ? "regression-retry-targeted" : "regression-retry",
-                  cwd,
-                  retry,
-                  {
-                    onWait: events.onWait,
-                    skipGateSlot: options?.skipGateSlot,
-                    onLocalSetup: retry.setup.length === gates.setup.length ? events.onLocalSetup : undefined,
-                  },
-                ),
-              ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+            baseTimeout = after.checks.some(
+              (r) =>
+                r.timedOut &&
+                findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
             );
-          ctx.checkCancelled();
-          baseTimeout ||= after.checks.some(
-            (r) =>
-              r.timedOut && findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
-          );
-        } finally {
-          // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-          await discardChanges(cwd).catch((error: unknown) => {
-            if (ctx.state.implementerIssue && error instanceof CommandError)
-              throw new WorktreeCleanError(error.message, { cause: error });
-            throw error;
-          });
-        }
-        for (const c of cmp.filter((c) => c.firstAttempt)) {
-          ctx.event({
-            runId: ctx.run.id,
-            type: "gate",
-            level: "warn",
-            message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}${c.result.targetedRetry ? ` (targeted: ${c.firstAttempt?.failedFiles?.length ?? 0} files${c.result.targetedRetry.ok || (c.result.targetedRetry.timedOut && !confinementFailed(c.result.targetedRetry)) ? ", then full retry" : ""})` : ""}`,
-            data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
-          });
-        }
-        ctx.state.lastGates = cmp;
-        const paths = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
-        const canonicalPaths = paths.flatMap((path) => {
-          const canonical = canonicalTestFile(path, cwd);
-          return canonical && canonical !== path ? [path, canonical] : [path];
-        });
-        const changedFiles =
-          canonicalPaths.length <= 10_000 &&
-          canonicalPaths.every((path) => path.length <= 2000 && redactGateOutput(path) === path)
-            ? canonicalPaths
-            : undefined;
-        // A gate may have changed HEAD itself; those results cannot attest to the checked commit.
-        ctx.state.gateEvidence =
-          (await headSha(cwd)) === checkedSha
-            ? {
-                stageId: stage.id,
-                sha: checkedSha,
-                baseSha,
-                changedFiles,
-                checks: cmp.map((check) => ({
-                  ...check,
-                  testCommand: gateTestCommand(check.result.command, testScripts),
+            const failed = after.checks.filter((r) => !r.ok);
+            const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
+            if (timeoutOnly && !baseTimeout) {
+              const first = after;
+              ctx.artifact(`gates-timeout-${round}.json`, "gates", JSON.stringify(redactGateData(first)));
+              ctx.log(
+                `Gate checks timed out; re-running gates (timeout re-runs: ${(ctx.state.gateTimeoutReruns ?? 0) + 1})`,
+                "warn",
+              );
+              // The re-run starts from the committed tree too, not from what the first attempt left behind.
+              localSetupReady = false;
+              await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+              after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
+              ctx.checkCancelled();
+              after = {
+                ...after,
+                checks: after.checks.map((r) => ({
+                  ...r,
+                  firstAttempt: findGateCounterpart(r, after.checks, first.checks),
                 })),
-              }
-            : undefined;
-        ctx.artifact(`gates-${round}.json`, "gates", JSON.stringify(redactGateData(cmp), null, 2));
-        if (baseTimeout) {
-          await ctx.save();
-          throw new NeedsHumanError("gate timed out on the base revision too");
-        }
-        const blocking = cmp.filter((c) => c.blocking).map((c) => c.name);
-        const flaky = cmp.filter((c) => c.verdict === "flaky").map((c) => c.name);
-        return {
-          summary: blocking.length
-            ? `blocking: ${blocking.join(", ")}`
-            : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
-          value: cmp,
-        };
-      })(),
+              };
+            }
+            const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+            // Retry before discarding, so a check sees the same build output as its first attempt.
+            cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
+              ...c,
+              firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
+            }));
+            if (!baseTimeout)
+              cmp = await retryRegressions(
+                cmp,
+                cwd,
+                gates,
+                changed,
+                ctx.signal,
+                events.onWait,
+                (retry, options) =>
+                  runGateExecution(
+                    ctx,
+                    "gates",
+                    options?.targeted ? "regression-retry-targeted" : "regression-retry",
+                    cwd,
+                    retry,
+                    {
+                      onWait: events.onWait,
+                      skipGateSlot: options?.skipGateSlot,
+                      onLocalSetup:
+                        retry.setup.length === gates.setup.length ? events.onLocalSetup : undefined,
+                    },
+                  ),
+                ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+              );
+            ctx.checkCancelled();
+            baseTimeout ||= after.checks.some(
+              (r) =>
+                r.timedOut &&
+                findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
+            );
+          } finally {
+            // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
+            await discardChanges(cwd).catch((error: unknown) => {
+              if (ctx.state.implementerIssue && error instanceof CommandError)
+                throw new WorktreeCleanError(error.message, { cause: error });
+              throw error;
+            });
+          }
+          for (const c of cmp.filter((c) => c.firstAttempt)) {
+            ctx.event({
+              runId: ctx.run.id,
+              type: "gate",
+              level: "warn",
+              message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}${c.result.targetedRetry ? ` (targeted: ${c.firstAttempt?.failedFiles?.length ?? 0} files${c.result.targetedRetry.ok || (c.result.targetedRetry.timedOut && !confinementFailed(c.result.targetedRetry)) ? ", then full retry" : ""})` : ""}`,
+              data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
+            });
+          }
+          ctx.state.lastGates = cmp;
+          const paths = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+          const canonicalPaths = paths.flatMap((path) => {
+            const canonical = canonicalTestFile(path, cwd);
+            return canonical && canonical !== path ? [path, canonical] : [path];
+          });
+          const changedFiles =
+            canonicalPaths.length <= 10_000 &&
+            canonicalPaths.every((path) => path.length <= 2000 && redactGateOutput(path) === path)
+              ? canonicalPaths
+              : undefined;
+          // A gate may have changed HEAD itself; those results cannot attest to the checked commit.
+          ctx.state.gateEvidence =
+            (await headSha(cwd)) === checkedSha
+              ? {
+                  stageId: stage.id,
+                  sha: checkedSha,
+                  baseSha,
+                  changedFiles,
+                  checks: cmp.map((check) => ({
+                    ...check,
+                    testCommand: gateTestCommand(check.result.command, testScripts),
+                  })),
+                }
+              : undefined;
+          ctx.artifact(`gates-${round}.json`, "gates", JSON.stringify(redactGateData(cmp), null, 2));
+          if (baseTimeout) {
+            await ctx.save();
+            throw new NeedsHumanError("gate timed out on the base revision too");
+          }
+          const blocking = cmp.filter((c) => c.blocking).map((c) => c.name);
+          const flaky = cmp.filter((c) => c.verdict === "flaky").map((c) => c.name);
+          return {
+            summary: blocking.length
+              ? `blocking: ${blocking.join(", ")}`
+              : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
+            value: cmp,
+          };
+        }),
+      )(),
     round,
   );
   const comparison = await checks.catch(async (error: unknown) => {
@@ -2766,7 +2774,7 @@ async function mergeForDelivery(
   try {
     await ctx.stage(
       "gates",
-      async () => {
+      gateSlotScope(async () => {
         const timeoutOnly = (run: GateRun) =>
           run.setupOk &&
           ![...run.setup, ...run.checks].some(confinementFailed) &&
@@ -2829,7 +2837,7 @@ async function mergeForDelivery(
             timeoutOnly(after) ? "post-merge gate timed out" : "post-merge gates regressed",
           );
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
-      },
+      }),
       ctx.state.round,
     );
   } catch (error) {

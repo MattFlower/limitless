@@ -9,6 +9,7 @@ import {
   localExecutor,
 } from "./executor.ts";
 import type { GateRun } from "./run.ts";
+import { bindGateSlotScope } from "./slots.ts";
 
 export function lanExecutor(workers: WorkerStore, repos: readonly string[]): GateExecutor {
   const local = localExecutor();
@@ -79,7 +80,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
           if (job.state === "failed") {
             const request = JSON.parse(job.request) as GateRequest;
             workers.event(handle.id, { type: "status", text: "LAN gates falling back to local execution" });
-            const fallback = async () => {
+            const fallback = bindGateSlotScope(async () => {
               const h = await local.start(request, controller.signal);
               const execution = local.attach(h, controller.signal, undefined, hooks);
               const stream = (async () => {
@@ -93,7 +94,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
               controller.signal.throwIfAborted();
               if (!workers.complete(handle.id, run, true)) throw new Error("LAN gate job cancelled");
               return workers.sanitize(run);
-            };
+            });
             return start ? start.context(fallback) : fallback();
           }
           await Bun.sleep(workers.times.tick);
