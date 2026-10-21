@@ -49,12 +49,9 @@ const logLines = (log: string) =>
   Bun.stripANSI(log)
     .split(/\r?\n/)
     .map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+const failureLine = /^\s*(?:\(fail\)|FAIL(?:ED)?\b|[×✗✕❌●]|--- FAIL:|not ok\b|##\[error\]|error:)/i;
 const securityFailure = (log: string) =>
-  logLines(log).some(
-    (line) =>
-      /^\s*(?:\(fail\)|FAIL(?:ED)?\b|[×✗✕❌●]|--- FAIL:|not ok\b|##\[error\]|error:)/i.test(line) &&
-      security.test(line),
-  );
+  logLines(log).some((line) => failureLine.test(line) && security.test(line));
 // Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
 const timeoutDiagnostic =
   /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
@@ -67,16 +64,22 @@ export const headMoved = (head: string, sha: string, approvedSha?: string): bool
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
   const lines = logLines(log);
-  const line = bounded(
-    lines.find((l) => /timed out after|##\[error\]|\b(?:error|fail(?:ed|ure)?)\b/i.test(l)) ?? fallback,
-  );
+  const index = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
+  const line = bounded(lines[index] ?? fallback);
+  // Reserve room for the failure even when the preceding context contains very long lines.
+  const before = redactCredentials(lines.slice(Math.max(0, index - 2), index).join("\n")).slice(-500);
+  const excerpt = redactCredentials(
+    index < 0 ? log || line : [before, ...lines.slice(index, index + 4)].join("\n"),
+  )
+    .trim()
+    .slice(0, 2000);
   const image =
     bounded(
       lines.find((l) => /^\s*Image:/.test(l))?.replace(/^\s*Image:\s*/, "") ??
         labels.find((label) => /^(?:ubuntu|windows|macos)-/.test(label)) ??
         "",
     ) || null;
-  return { check, line, image, signature: JSON.stringify([check, line, image]) };
+  return { check, line, image, signature: JSON.stringify([check, line, image]), excerpt };
 }
 const quote = (s: string) => `> ${redactCredentials(s).replace(/\r?\n/g, "\n> ")}`;
 
@@ -199,7 +202,7 @@ async function inspectCi(
   };
   const emit = (
     kind: GitHubFeedKind,
-    f: ReturnType<typeof ciSignature>,
+    f: Omit<ReturnType<typeof ciSignature>, "excerpt">,
     key: string,
     repository = false,
     excerpt = f.line,
@@ -227,9 +230,9 @@ async function inspectCi(
     });
     if (kind === "ci.needs_fix") onFailure();
   };
-  const reject = (f: CiFailure, excerpt = f.line, unsafe = false) => {
+  const reject = (f: CiFailure, excerpt = f.line, unsafe = false, evidence = f) => {
     write(() => store.finishCiFailure(f, "rerun_rejected"));
-    emit("ci.needs_fix", f, `${pr.url}:${f.sha}:${f.signature}`, false, excerpt, unsafe);
+    emit("ci.needs_fix", evidence, `${pr.url}:${f.sha}:${evidence.signature}`, false, excerpt, unsafe);
   };
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
     allowed();
@@ -332,7 +335,7 @@ async function inspectCi(
         failure,
         `${pr.url}:${f.sha}:${failure.signature}`,
         false,
-        log || failure.line,
+        failure.excerpt,
         unsafe,
       );
     } else continue;
@@ -408,8 +411,14 @@ async function inspectCi(
           log = body;
         }
       }
+      const { excerpt, ...signature } = ciSignature(
+        c.name,
+        log,
+        c.output?.title ?? c.conclusion ?? "failure",
+        job?.labels,
+      );
       const f: CiFailure = {
-        ...ciSignature(c.name, log, c.output?.title ?? c.conclusion ?? "failure", job?.labels),
+        ...signature,
         prUrl: pr.url,
         sha: snap.headRefOid,
         outcome: "failed",
@@ -439,12 +448,12 @@ async function inspectCi(
         const refused = prior.find((p) => pending(p) && p.rerunRetryAt != null);
         if (!refused) continue;
         // Older versions deferred explicit refusals; they also retain the head's claim.
-        reject(refused, log || f.line, unsafe);
+        reject(refused, excerpt, unsafe, f);
         continue;
       }
       if (!unsafe) write(() => store.recordCiFailure(f));
       const needsFix = () =>
-        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line, unsafe);
+        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, excerpt, unsafe);
       const transient =
         [c.conclusion, job?.conclusion].some((v) =>
           ["timed_out", "startup_failure", "cancelled"].includes(v ?? ""),
@@ -478,7 +487,7 @@ async function inspectCi(
             }),
           )
         ) {
-          await requestRerun(f, job.id, log || f.line);
+          await requestRerun(f, job.id, excerpt);
           continue;
         }
         // Another Store/daemon may win the atomic claim while this inspection awaits the head read.
