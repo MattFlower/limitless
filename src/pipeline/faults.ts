@@ -16,7 +16,7 @@ export interface FaultContext {
 }
 export type StreamFault = { parser: "claude" | "codex"; lines: string[] };
 export interface Fault {
-  action: "throw" | "hang" | "kill" | StreamFault;
+  action: "throw" | "hang" | "kill" | "continue" | StreamFault;
   occurrence?: number;
   when?: (context: FaultContext) => boolean;
   onHit?: (context: FaultContext) => void;
@@ -27,6 +27,7 @@ export interface Fault {
  * Harness points follow slot acquisition and invocation creation, before calling the adapter.
  * Stream actions feed synthetic input through CLI parsers instead of invoking an adapter.
  * Store save fires immediately before setRunState; throwing leaves the durable checkpoint intact.
+ * Continue only calls onHit, allowing a real boundary fault such as a competing SQLite write lock.
  * Throw escaping a stage re-queues the run so it resumes like a daemon restart would.
  * Kill at a harness point is an unexpected harness process kill: a failed attempt, routed per policy.
  * Kill elsewhere unwinds active resources and leaves the run running for a fresh scheduler to recover.
@@ -84,7 +85,7 @@ export class FaultInjector {
         throw new InjectedFault(HARNESS_KILLED);
       else if (fault.action === "kill") throw new SimulatedTermination(`terminated at ${point}`);
       else if (fault.action === "throw") throw new InjectedFault(`injected failure at ${point}`);
-      else return fault.action;
+      else if (fault.action !== "continue") return fault.action;
     }
     return undefined;
   }

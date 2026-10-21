@@ -1449,6 +1449,11 @@ export async function pushExistingBranch(
   });
 }
 
+function isHttpUrl(value: string): boolean {
+  const protocol = URL.parse(value)?.protocol;
+  return protocol === "http:" || protocol === "https:";
+}
+
 export async function createPullRequest(
   repo: Repo,
   opts: {
@@ -1493,7 +1498,7 @@ export async function createPullRequest(
     });
     return res.stdout.trim().split("\n").pop() ?? "";
   }, opts);
-  if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${url}`);
+  if (!isHttpUrl(url)) throw new Error(`gh pr create returned unexpected output: ${url}`);
   if (existing)
     await remoteSh(["gh", "pr", "edit", url, "--body-file", "-"], { ...opts, stdin: opts.body }).catch(
       (e) => {
@@ -1525,7 +1530,7 @@ export async function findPullRequest(
     },
   );
   const url = res?.exitCode === 0 ? res.stdout.trim() : "";
-  return url.startsWith("http") ? url : null;
+  return isHttpUrl(url) ? url : null;
 }
 
 /**
