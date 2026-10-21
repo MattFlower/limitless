@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { CredentialMatcher, credentialMatcher, type MatchingWork } from "../src/util/credential-matcher.ts";
 import {
   agentEnv,
+  credentialRedactionPadding,
   redactCredentialData,
   redactCredentials,
   registerCredential,
@@ -76,6 +77,48 @@ test("original spans use descending length, registration order, then occurrence 
   );
   expect(redact(["redacted", "[redacted]"], "[redacted]")).toBe("[redacted]");
   expect(redact(['"'.repeat(7)], `x${'\\"'.repeat(7)}y`)).toBe(`x${'\\"'.repeat(7)}y`);
+});
+
+test("publication windows retain whole markers from original overlapping spans", () => {
+  const long = "synthetic-redacted-value";
+  const overlap = "abcdefghijk";
+  const matcher = new CredentialMatcher(variants(["redacted", long, "abcdefgh", overlap]));
+  const input = `x ${long} y ${overlap} z redacted!`;
+  const second = input.indexOf(overlap);
+  for (const [window, expected] of [
+    [{ start: 0, end: 4 }, "x [redacted]"],
+    [{ start: 4, end: second + 2 }, "[redacted] y [redacted]"],
+    [{ start: 2 + long.length, end: input.length }, " y [redacted] z [redacted]!"],
+    [{ start: 2, end: 2 + long.length }, "[redacted]"],
+    [{ start: 4, end: 4 }, "[redacted]"],
+    [{ start: 0, end: 2 }, "x "],
+    [{ start: 0, end: 0 }, ""],
+  ] as const) {
+    expect(matcher.redact(input, undefined, window)).toBe(expected);
+  }
+  const short = new CredentialMatcher(variants(["seven77"]));
+  const window = { start: 1, end: 4 };
+  expect(short.redact("seven77", undefined, window)).toBe("[redacted]");
+  expect(short.redact("xseven77", undefined, window)).toBe("sev");
+  expect(new CredentialMatcher(new Map()).redact("plain", undefined, window)).toBe("lai");
+  expect(window).toEqual({ start: 1, end: 4 });
+});
+
+test("CRLF registrations share normalized and escaped variants with publication and streaming", () => {
+  // Eligibility is based on the original eight characters, even after normalization shortens it.
+  const secret = "ab\r\ncdef";
+  registerCredential("MATCHER_CRLF", secret);
+  const matcher = credentialMatcher();
+  for (const value of [secret, secret.replace(/\r\n/g, "\n")]) {
+    for (const variant of [value, JSON.stringify(value).slice(1, -1)]) {
+      const input = `x${variant}y`;
+      expect(redactCredentials(input)).toBe("x[redacted]y");
+      expect(redactCredentials(input, { start: 2, end: input.length - 2 })).toBe("[redacted]");
+      expect(credentialRedactionPadding()).toBeGreaterThanOrEqual(variant.length - 1);
+      const stream = matcher.stream();
+      expect(stream.push(input.slice(0, 3)) + stream.push(input.slice(3), true)).toBe("x[redacted]y");
+    }
+  }
 });
 
 test("shared compilation survives duplicates and reloads and invalidates on variant eligibility promotion", () => {

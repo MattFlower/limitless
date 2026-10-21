@@ -37,7 +37,7 @@ import {
   retryRegressions,
   runLocalGates,
 } from "../src/gates/run.ts";
-import { gateSlotScope, gateSlots } from "../src/gates/slots.ts";
+import { acquireGateSlot, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -1412,6 +1412,54 @@ test("repos without opt-in use local execution without creating jobs", async () 
   expect(readFileSync(join(req.cwd, "setup-runs"), "utf8")).toBe("setup\n");
   expect(workers.jobs("1=1")).toHaveLength(0);
 }, 30_000);
+
+test.each(["dispatch", "reattach"])("a sibling LAN %s keeps an active local reservation", async (mode) => {
+  const req = await request();
+  const executor = gateExecutorFor("lan", workers, [req.repo]);
+  const controller = new AbortController();
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  let competitor: Promise<() => void> | undefined;
+  let remote: ReturnType<typeof executor.attach> | undefined;
+  const outside = AsyncLocalStorage.snapshot();
+  try {
+    const saved = mode === "reattach" ? await executor.start(req, controller.signal) : undefined;
+    await gateSlotScope(async () => {
+      const release = await acquireGateSlot(controller.signal, undefined, "local attempt");
+      const sibling = await acquireGateSlot(controller.signal);
+      let admitted = false;
+      competitor = outside(() =>
+        gateSlots.acquire(controller.signal, undefined, "competitor").then((free) => {
+          admitted = true;
+          return free;
+        }),
+      );
+      try {
+        if (saved) remote = executor.attach(saved, controller.signal);
+        else await executor.start(req, controller.signal);
+        release();
+        release();
+        await new Promise(setImmediate);
+        expect(admitted).toBe(false);
+        expect(gateSlots.snapshot().holders).toEqual(["local attempt"]);
+      } finally {
+        release();
+        sibling();
+      }
+      (await competitor)();
+      expect(admitted).toBe(true);
+      const next = await acquireGateSlot(controller.signal, undefined, "later local attempt");
+      next();
+      expect(gateSlots.snapshot().holders).toEqual(["later local attempt"]);
+    })();
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    await remote?.result.catch(() => {});
+    (await competitor?.catch(() => undefined))?.();
+    gateSlots.setLimit(previous);
+  }
+});
 
 test.each(["dispatch", "reattach", "live"])(
   "a LAN retry releases the coordinator slot held by its local fallback (%s)",

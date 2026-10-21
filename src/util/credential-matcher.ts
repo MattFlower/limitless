@@ -10,6 +10,7 @@ class Node {
 }
 type Hit = { end: number; node: Node };
 type Match = Hit;
+type RedactionWindow = { start: number; end: number };
 export type MatchingWork = { transitions: number; outputs: number; boundaries: number };
 
 export class CredentialMatcher {
@@ -81,13 +82,19 @@ export class CredentialMatcher {
     }
     return { state, hits };
   }
-  redact(text: string, work?: MatchingWork): string {
-    if (!this.maxLength || !text) return text;
-    return this.replace(text, this.scan(text, undefined, 0, work).hits, 0, work);
+  redact(text: string, work?: MatchingWork, window?: RedactionWindow): string {
+    if (!this.maxLength || !text) return render(text, [], window);
+    return this.replace(text, this.scan(text, undefined, 0, work).hits, 0, work, window);
   }
-  private replace(text: string, hits: Hit[], offset: number, work?: MatchingWork): string {
-    if (this.variants.has(text)) return "[redacted]";
-    if (!hits.some((hit) => hit.node.output)) return text;
+  private replace(
+    text: string,
+    hits: Hit[],
+    offset: number,
+    work?: MatchingWork,
+    window?: RedactionWindow,
+  ): string {
+    if (this.variants.has(text)) return render(text, [{ start: 0, end: text.length }], window);
+    if (!hits.some((hit) => hit.node.output)) return render(text, [], window);
     const heap: Match[] = [];
     const better = (a: Match, b: Match) => {
       if (work) work.outputs++;
@@ -165,13 +172,11 @@ export class CredentialMatcher {
       }
     }
     selected.sort((a, b) => a.end - b.end);
-    let start = 0;
-    const pieces: string[] = [];
-    for (const match of selected) {
-      pieces.push(text.slice(start, match.end - match.node.depth), "[redacted]");
-      start = match.end;
-    }
-    return pieces.length ? pieces.join("") + text.slice(start) : text;
+    return render(
+      text,
+      selected.map(({ end, node }) => ({ start: end - node.depth, end })),
+      window,
+    );
   }
   stream(work?: MatchingWork) {
     let pending = "";
@@ -233,6 +238,26 @@ export class CredentialMatcher {
       },
     };
   }
+}
+
+function render(text: string, spans: RedactionWindow[], window?: RedactionWindow): string {
+  const bounds = window ? { ...window } : undefined;
+  const marker = "[redacted]";
+  const pieces: string[] = [];
+  let cursor = 0;
+  for (const { start, end } of spans) {
+    pieces.push(text.slice(cursor, start), marker);
+    cursor = end;
+    // Map the original cuts through each replacement, retaining any intersected marker whole.
+    if (bounds && window) {
+      if (start < window.start)
+        bounds.start += end <= window.start ? marker.length - (end - start) : start - window.start;
+      if (start < window.end)
+        bounds.end += end <= window.end ? marker.length - (end - start) : start + marker.length - window.end;
+    }
+  }
+  const result = pieces.length ? pieces.join("") + text.slice(cursor) : text;
+  return bounds ? result.slice(bounds.start, bounds.end) : result;
 }
 
 const variants = new Map<string, boolean>();

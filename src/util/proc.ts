@@ -1097,19 +1097,25 @@ export async function sh(
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
+export const credentialRedactionPadding = (): number => Math.max(0, credentialMatcher().maxLength - 1);
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
     if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
       credentialValues.add(secret);
-      for (const variant of new Set([secret, JSON.stringify(secret).slice(1, -1)]))
+      // Log normalization removes CRLF line endings before publication-window redaction.
+      const values = [secret, secret.replace(/\r\n/g, "\n")];
+      for (const variant of new Set(values.flatMap((s) => [s, JSON.stringify(s).slice(1, -1)])))
         registerCredentialVariant(variant, secret.length >= 8);
     }
 }
-export const redactCredentials = (text: string): string =>
-  activity("credentials.redact", () => redactText(text));
-function redactText(text: string): string {
-  return credentialMatcher().redact(text);
+export function redactCredentials(text: string): string;
+export function redactCredentials(text: string, window?: { start: number; end: number }): string;
+export function redactCredentials(text: string, window?: { start: number; end: number }): string {
+  // Unary callers can also pass this function directly to Array.map.
+  return activity("credentials.redact", () =>
+    credentialMatcher().redact(text, undefined, typeof window === "object" ? window : undefined),
+  );
 }
 export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
 const redactData = <T>(value: T): T =>
