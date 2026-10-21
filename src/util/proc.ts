@@ -3,7 +3,6 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
@@ -695,11 +694,196 @@ export interface ProcResult {
 }
 
 const DEFAULT_TAIL = 64_000;
-const VT_ESCAPE = "\u001b";
-const MAX_PENDING_VT = 4_096;
-const INCOMPLETE_VT = new RegExp(
-  String.raw`(?:${VT_ESCAPE}(?:\][^${"\u0007\u001b\u009c"}]*(?:${VT_ESCAPE})?|\[[0-?]*[ -/]*|[ -/]*)|${"\u009b"}[0-?]*[ -/]*)$`,
-);
+// Prefix tables let raw matching remember arbitrarily long discarded controls without retaining payload.
+function credentialMatcher(variants: readonly [string, boolean][]) {
+  const patterns = variants.map(([text, substring]) => {
+    const table = new Uint32Array(text.length);
+    for (let i = 1, prefix = 0; i < text.length; i++) {
+      while (prefix && text[i] !== text[prefix]) prefix = table[prefix - 1] ?? 0;
+      if (text[i] === text[prefix]) prefix++;
+      table[i] = prefix;
+    }
+    return { text, substring, table, prefix: 0 };
+  });
+  return (char: string) => {
+    let matched = 0;
+    for (const p of patterns) {
+      while (p.prefix && char !== p.text[p.prefix]) p.prefix = p.table[p.prefix - 1] ?? 0;
+      if (char === p.text[p.prefix]) p.prefix++;
+      if (p.prefix === p.text.length) {
+        if (p.substring) matched = Math.max(matched, p.prefix);
+        p.prefix = p.table[p.prefix - 1] ?? 0;
+      }
+    }
+    return matched;
+  };
+}
+
+/** Incremental ECMA-48 recognition. String payload is discarded, never buffered. */
+function terminalParser() {
+  let state = "";
+  let escaped = false;
+  const introducers: Record<string, string> = {
+    "[": "csi",
+    "]": "osc",
+    P: "string",
+    X: "string",
+    "^": "string",
+    _: "string",
+    "\u009b": "csi",
+    "\u009d": "osc",
+    "\u0090": "string",
+    "\u0098": "string",
+    "\u009e": "string",
+    "\u009f": "string",
+  };
+  return (char: string) => {
+    if (state === "osc" || state === "string") {
+      if (char === "\u009c" || (escaped && char === "\\") || (state === "osc" && char === "\u0007"))
+        state = "";
+      escaped = char === "\u001b";
+      return false;
+    }
+    if (char === "\u001b") {
+      state = "esc";
+      return false;
+    }
+    if (introducers[char] && (state === "esc" || char >= "\u0080")) {
+      state = introducers[char];
+      return false;
+    }
+    if (char >= "\u0080" && char <= "\u009f") {
+      state = "";
+      return false;
+    }
+    if (state === "esc" || state === "csi") {
+      if (char >= " " && char <= (state === "esc" ? "/" : "?")) return false;
+      state = "";
+      if (char >= "0" && char <= "~") return false;
+    }
+    return true;
+  };
+}
+
+type OutputCharacter = { text: string; position: number; marked?: number; before?: number };
+
+/** Internal observation seam: only unresolved printable characters are retained (at most L - 1). */
+export function outputRedactor(emit: (text: string) => void) {
+  const variants = sortedCredentialVariants;
+  const overlap = Math.max(0, (variants[0]?.[0].length ?? 0) - 1);
+  const rawMatch = credentialMatcher(variants);
+  const cleanMatch = credentialMatcher(variants);
+  const visible = terminalParser();
+  const short = variants.filter(([, substring]) => !substring).map(([text]) => text);
+  let wholeRaw = short,
+    wholeClean = short;
+  let deferred: number | undefined;
+  let deferredMarked: number | undefined, deferredBefore: number | undefined;
+  const pending = new Map<number, OutputCharacter>();
+  let position = 0,
+    count = 0,
+    head = 0;
+  let hidden: number | undefined, replacing: number | undefined;
+  const write = (text: string, marked: number | undefined, output: string[]) => {
+    if (marked !== undefined) {
+      if (replacing !== marked) output.push("[redacted]");
+    } else output.push(text);
+    replacing = marked;
+  };
+  const release = (output: string[]) => {
+    const entry = pending.get(head);
+    if (!entry) return;
+    pending.delete(head++);
+    if (entry.before !== undefined) write("", entry.before, output);
+    write(entry.text, entry.marked, output);
+  };
+  return {
+    get carryLength() {
+      return pending.size;
+    },
+    get terminalPayloadLength() {
+      return 0;
+    },
+    push(chunk: string) {
+      const output: string[] = [];
+      // UTF-16 code units match credential lengths and indexOf/JSON-escaped variants.
+      for (let i = 0; i < chunk.length; i++) {
+        const char = chunk.charAt(i);
+        wholeRaw = wholeRaw.filter((text) => text.charAt(position) === char);
+        const rawLength = rawMatch(char);
+        const isVisible = visible(char);
+        let cleanLength = 0;
+        if (isVisible) {
+          if (deferred !== undefined) {
+            if (deferredBefore !== undefined) write("", deferredBefore, output);
+            write(short[deferred]?.charAt(0) ?? "", deferredMarked, output);
+            deferred = undefined;
+          }
+          wholeClean = wholeClean.filter((text) => text.charAt(count) === char);
+          pending.set(count++, { text: char, position, before: hidden });
+          hidden = undefined;
+          cleanLength = cleanMatch(char);
+        }
+        if (rawLength || cleanLength) {
+          let start = Math.min(
+            rawLength ? position - rawLength + 1 : Infinity,
+            cleanLength ? (pending.get(count - cleanLength)?.position ?? Infinity) : Infinity,
+          );
+          let first = count;
+          for (let index = count - 1; index >= head; index--) {
+            const entry = pending.get(index);
+            if (
+              !entry ||
+              (!(rawLength && entry.position > position - rawLength) && index < count - cleanLength)
+            )
+              break;
+            start = Math.min(start, entry.marked ?? Infinity);
+            first = index;
+          }
+          for (let index = first; index < count; index++) {
+            const entry = pending.get(index);
+            if (!entry) continue;
+            entry.marked = start;
+            if (entry.before !== undefined && entry.before >= start) entry.before = undefined;
+          }
+          if (hidden !== undefined && hidden >= start) hidden = undefined;
+          if (rawLength && first === count) hidden = Math.min(hidden ?? Infinity, start);
+        }
+        position++;
+        if (pending.size > overlap) {
+          // A whole-text short variant at length L is represented by its catalog index until EOF
+          // or the next printable character, rather than retaining an Lth unresolved character.
+          const entry = pending.get(head);
+          if (wholeClean.length && entry) {
+            deferred = short.indexOf(wholeClean[0] ?? "");
+            deferredMarked = entry.marked;
+            deferredBefore = entry.before;
+            pending.delete(head++);
+          } else release(output);
+        }
+      }
+      emit(output.join(""));
+    },
+    flush() {
+      const output: string[] = [];
+      if (
+        wholeRaw.some((text) => text.length === position) ||
+        wholeClean.some((text) => text.length === count)
+      ) {
+        write("", 0, output);
+        hidden = undefined;
+        pending.clear();
+        head = count;
+      } else while (pending.size) release(output);
+      deferred = undefined;
+      wholeRaw = [];
+      wholeClean = [];
+      if (hidden !== undefined) write("", hidden, output);
+      hidden = undefined;
+      emit(output.join(""));
+    },
+  };
+}
 
 function lineSplitter(onLine?: (line: string) => void, limit = Infinity) {
   let pending = "";
@@ -924,46 +1108,21 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
-      let pending = "";
-      let terminalPending = "";
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
         lines.push(text);
       };
+      const redactor = opts.redactOutput ? outputRedactor(emit) : undefined;
       return {
         push(chunk: string) {
           lastActivity = Date.now();
           opts.onRawChunk?.(chunk, stream);
-          if (!opts.redactOutput) return emit(chunk);
-          const decoded = terminalPending + chunk;
-          // Hold incomplete CSI, OSC and ESC sequences until stripping can see them whole.
-          const incomplete = decoded.match(INCOMPLETE_VT);
-          // An unterminated sequence (a stray ESC ] in binary output) must not hold the stream forever.
-          const held = incomplete?.index !== undefined && decoded.length - incomplete.index <= MAX_PENDING_VT;
-          const terminalCut = held ? (incomplete?.index ?? decoded.length) : decoded.length;
-          terminalPending = decoded.slice(terminalCut);
-          pending += stripVTControlCharacters(decoded.slice(0, terminalCut));
-          // Retain possible credential prefixes, including JSON-escaped forms, across chunks.
-          const overlap = Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
-          let cut = Math.max(0, pending.length - overlap);
-          // A complete match crossing the cut must also stay raw: replacing a shorter
-          // prefix in the carry would destroy a longer credential arriving next.
-          let previousCut: number;
-          do {
-            previousCut = cut;
-            for (const [secret] of sortedCredentialVariants) {
-              const start = pending.indexOf(secret, Math.max(0, cut - secret.length + 1));
-              if (start >= 0 && start < cut && start + secret.length > cut) cut = start;
-            }
-          } while (cut !== previousCut);
-          emit(redactCredentials(pending.slice(0, cut)));
-          pending = pending.slice(cut);
+          if (redactor) redactor.push(chunk);
+          else emit(chunk);
         },
         flush() {
-          emit(redactCredentials(pending + stripVTControlCharacters(terminalPending)));
-          pending = "";
-          terminalPending = "";
+          redactor?.flush();
         },
       };
     };
@@ -1100,11 +1259,32 @@ export function registerCredential(name: string, value?: string): void {
     }
 }
 export function redactCredentials(text: string): string {
-  // Substring matches require at least 8 characters to avoid redacting common short strings.
-  for (const [secret, substring] of sortedCredentialVariants)
-    if (substring || text === secret) text = text.split(secret).join("[redacted]");
-  return text;
+  const markers = [...text.matchAll(/\[redacted\]/g)].map((match) => match.index);
+  const spans: [number, number][] = [];
+  for (const [secret, substring] of sortedCredentialVariants) {
+    if (!substring && text !== secret) continue;
+    for (let start = text.indexOf(secret); start >= 0; start = text.indexOf(secret, start + 1)) {
+      const end = start + secret.length;
+      if (!markers.some((marker) => marker <= start && end <= marker + "[redacted]".length))
+        spans.push([start, end]);
+    }
+  }
+  spans.sort(([a], [b]) => a - b);
+  let output = "",
+    cursor = 0,
+    end = -1;
+  for (const [start, stop] of spans) {
+    if (start < end) {
+      end = Math.max(end, stop);
+      continue;
+    }
+    if (end >= 0) cursor = end;
+    output += `${text.slice(cursor, start)}[redacted]`;
+    end = stop;
+  }
+  return output + text.slice(Math.max(cursor, end));
 }
+
 export const redactCredentialData = <T>(value: T): T =>
   JSON.parse(
     JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redactCredentials(v) : v)),

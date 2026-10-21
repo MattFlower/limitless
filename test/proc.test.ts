@@ -11,6 +11,7 @@ import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import {
   CommandError,
+  outputRedactor,
   ProcessTerminationError,
   type ProcOptions,
   processBirthInspection,
@@ -19,6 +20,7 @@ import {
   processScope,
   recoveryProcessStopped,
   registerCredential,
+  registeredCredentials,
   runProcess,
   sh,
 } from "../src/util/proc.ts";
@@ -223,36 +225,113 @@ test("runner keeps overlapping credentials raw in one chunk and at every split o
   }
 });
 
-test("runner strips split terminal sequences before matching and leaves raw observation unchanged", async () => {
-  const secret = "synthetic-terminal-chunk-credential";
-  registerCredential("TERMINAL_CHUNK_TEST_TOKEN", secret);
-  for (const control of ["\u001b[31m", "\u009b38;5;1m", "\u001b]0;title\u0007", "\u001b]0;title\u001b\\"]) {
+test.each(["\u001b[", "\u001b]", "\u009b"])(
+  "runner redacts intact credentials after stray terminal prefix %j at every split and EOF",
+  async (control) => {
+    const secret = "synthetic-stray-terminal-credential";
+    registerCredential("STRAY_TERMINAL_TEST_TOKEN", secret);
+    const text = `error: ${control}${secret}`;
     for (const stream of ["stdout", "stderr"] as const) {
-      for (let offset = 1; offset < control.length; offset++) {
-        const raw: string[] = [];
-        const lines: string[] = [];
-        const prefix = `error: ${secret.slice(0, 12)}`;
-        const suffix = `${secret.slice(12)}\u001b[0m\n(fail) terminal\n`;
+      for (let offset = 0; offset <= text.length; offset++) {
+        const raw: string[] = [],
+          lines: string[] = [];
         const result = await withChunks(
           [
-            { stream, text: prefix + control.slice(0, offset) },
-            { stream, text: control.slice(offset) + suffix },
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
           ],
           () =>
             runProcess({
               ...options(),
               redactOutput: true,
-              onRawChunk: (chunk) => raw.push(chunk),
+              onRawChunk: (chunk, observedStream) => {
+                expect(observedStream).toBe(stream);
+                raw.push(chunk);
+              },
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(result[stream]).toBe("error: [redacted]");
+        expect(lines).toEqual(["error: [redacted]"]);
+        expect(raw.join("")).toBe(text);
+      }
+    }
+  },
+);
+
+const terminalCases = [
+  ["CSI", "\u001b[31m"],
+  ["C1 CSI", "\u009b38;5;1m"],
+  ["OSC BEL", "\u001b]0;title\u0007"],
+  ["OSC ST", "\u001b]0;title\u001b\\"],
+  ["long OSC", `\u001b]${"x".repeat(4_097)}\u001b\\`],
+  ["C1 OSC BEL", "\u009dtitle\u0007"],
+  ["C1 OSC ST", "\u009dtitle\u009c"],
+  ["DCS", "\u001bPpayload\u001b\\"],
+  ["C1 DCS", "\u0090payload\u009c"],
+  ["SOS", "\u001bXpayload\u001b\\"],
+  ["C1 SOS", "\u0098payload\u009c"],
+  ["PM", "\u001b^payload\u001b\\"],
+  ["C1 PM", "\u009epayload\u009c"],
+  ["APC", "\u001b_payload\u001b\\"],
+  ["C1 APC", "\u009fpayload\u009c"],
+] as const;
+
+test.each(terminalCases)(
+  "runner strips %s at every split without changing raw observation",
+  async (_name, control) => {
+    const secret = "synthetic-terminal-chunk-credential";
+    registerCredential("TERMINAL_CHUNK_TEST_TOKEN", secret);
+    const text = `error: ${secret.slice(0, 12)}${control}${secret.slice(12)}\u001b[0m\n(fail) terminal\n`;
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const raw: string[] = [],
+          lines: string[] = [];
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              onRawChunk: (chunk, observedStream) => {
+                expect(observedStream).toBe(stream);
+                raw.push(chunk);
+              },
               onStdoutLine: (line) => lines.push(line),
               onStderrLine: (line) => lines.push(line),
             }),
         );
         expect(result[stream]).toBe("error: [redacted]\n(fail) terminal\n");
         expect(lines).toEqual(["error: [redacted]", "(fail) terminal"]);
-        expect(raw.join("")).toBe(prefix + control + suffix);
+        expect(raw.join("")).toBe(text);
       }
     }
+  },
+  60_000,
+);
+
+test("overlapping periodic occurrences cannot grow the unresolved credential carry", () => {
+  const secret = "abababababababab";
+  registerCredential("PERIODIC_CARRY_TEST_TOKEN", secret);
+  const longest = Math.max(
+    ...registeredCredentials().flatMap((value) => [value.length, JSON.stringify(value).length - 2]),
+  );
+  const output: string[] = [];
+  const redactor = outputRedactor((chunk) => output.push(chunk));
+  redactor.push("error: ");
+  for (let i = 0; i < 40_000; i++) {
+    redactor.push("ab");
+    expect(redactor.carryLength).toBeLessThanOrEqual(longest - 1);
   }
+  redactor.push(" footer");
+  redactor.flush();
+  redactor.flush();
+  expect(redactor.carryLength).toBe(0);
+  expect(output.join("")).toBe("error: [redacted] footer");
 });
 
 test("runner strips ANSI before the tail cap around a long credential", async () => {
@@ -269,43 +348,109 @@ test("runner strips ANSI before the tail cap around a long credential", async ()
   }
 });
 
-test("runner does not reprocess redaction markers in its carry", async () => {
-  // Isolate the registration of marker text from every other test's credentials.
+test("raw credential spans cover contained matches inside discarded terminal payload", () => {
+  const inner = "synthetic-payload-fragment";
+  const secret = `synthetic-raw-prefix-\u001b]${inner}\u0007`;
+  registerCredential("RAW_INNER_TEST_TOKEN", inner);
+  registerCredential("RAW_OUTER_TEST_TOKEN", secret);
+  for (const value of [secret, JSON.stringify(secret).slice(1, -1)]) {
+    const text = `error: ${value} following`;
+    for (let offset = 0; offset <= text.length; offset++) {
+      const output: string[] = [];
+      const redactor = outputRedactor((chunk) => output.push(chunk));
+      redactor.push(text.slice(0, offset));
+      redactor.push(text.slice(offset));
+      redactor.flush();
+      expect(output.join("")).toBe("error: [redacted] following");
+    }
+  }
+});
+
+test("adjacent distinct credential spans each emit a marker", () => {
+  const secret = "synthetic-adjacent-credential";
+  registerCredential("ADJACENT_SPAN_TEST_TOKEN", secret);
+  for (let offset = 0; offset <= secret.length * 2; offset++) {
+    const output: string[] = [];
+    const redactor = outputRedactor((chunk) => output.push(chunk));
+    const text = secret.repeat(2);
+    redactor.push(text.slice(0, offset));
+    redactor.push(text.slice(offset));
+    redactor.flush();
+    expect(output.join("")).toBe("[redacted][redacted]");
+  }
+});
+
+test("streaming short credentials retain whole-text matching and bounded carry", async () => {
+  const script = `
+    import assert from "node:assert/strict";
+    import { outputRedactor, registerCredential } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).href)};
+    registerCredential("SHORT_WHOLE_TEST_TOKEN", "shorty7");
+    function check(text, expected, bound) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const output = [];
+        const redactor = outputRedactor(chunk => output.push(chunk));
+        redactor.push(text.slice(0, offset)); assert.ok(redactor.carryLength <= bound);
+        redactor.push(text.slice(offset)); assert.ok(redactor.carryLength <= bound);
+        redactor.flush(); redactor.flush();
+        assert.equal(output.join(""), expected);
+      }
+    }
+    check("shorty7", "[redacted]", 6);
+    check("shorty7x", "shorty7x", 6);
+    check("prefix shorty7", "prefix shorty7", 6);
+    check("short", "short", 6);
+    check("\\u001b[31mshorty7\\u001b[0m", "[redacted]", 6);
+    const escaped = String.fromCharCode(92).repeat(7);
+    registerCredential("SHORT_ESCAPED_TEST_TOKEN", escaped);
+    check(escaped, "[redacted]", 13);
+    check(JSON.stringify(escaped).slice(1, -1), "[redacted]", 13);
+    check(JSON.stringify(escaped).slice(1, -1) + "x", JSON.stringify(escaped).slice(1, -1) + "x", 13);
+    console.log("short rules preserved");
+  `;
+  const result = await runProcess({ ...options(), cmd: [process.execPath, "-e", script] });
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toBe("short rules preserved\n");
+});
+
+test("runner and downstream sanitizers keep markers stable when marker text is registered", async () => {
+  // Isolate marker registration from every other test's credentials.
   const script = `
     import { spyOn } from "bun:test";
     import * as subprocess from "node:child_process";
     import { EventEmitter } from "node:events";
-    import { mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Store } from "../src/db/store.ts";
-import { PassThrough } from "node:stream";
+    import { PassThrough } from "node:stream";
     import { registerCredential, runProcess } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).href)};
+    import { redactGateOutput } from ${JSON.stringify(new URL("../src/gates/output.ts", import.meta.url).href)};
     registerCredential("MARKER_TEXT_TEST_TOKEN", "redacted");
     const secret = "synthetic-marker-[redacted]-" + "x".repeat(100);
     registerCredential("MARKER_CREDENTIAL_TEST_TOKEN", secret);
-    const fixture = spyOn(subprocess, "spawn").mockImplementation(() => {
-      const child = Object.assign(new EventEmitter(), {
-        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough()
+    const text = secret + " redacted " + "q".repeat(40);
+    for (const stream of ["stdout", "stderr"]) for (let offset = 0; offset <= text.length; offset++) {
+      const fixture = spyOn(subprocess, "spawn").mockImplementation(() => {
+        const child = Object.assign(new EventEmitter(), {
+          stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough()
+        });
+        setImmediate(() => {
+          child[stream].write(text.slice(0, offset)); child[stream].write(text.slice(offset));
+          child.stdout.end(); child.stderr.end();
+          setImmediate(() => child.emit("close", 0, null));
+        });
+        return child;
       });
-      setImmediate(() => {
-        child.stdout.write(secret);
-        child.stdout.write(" redacted ");
-        for (let i = 0; i < 40; i++) child.stdout.write("q");
-        child.stdout.end(); child.stderr.end();
-        setImmediate(() => child.emit("close", 0, null));
-      });
-      return child;
-    });
-    try {
-      const result = await runProcess({ cmd: ["fixture"], cwd: process.cwd(), env: {}, redactOutput: true });
-      console.log(JSON.stringify(result.stdout));
-    } finally { fixture.mockRestore(); }
+      try {
+        const result = await runProcess({ cmd: ["fixture"], cwd: process.cwd(), env: {}, redactOutput: true });
+        let output = result[stream];
+        for (let pass = 0; pass < 4; pass++) {
+          if (output !== "[redacted] [redacted] " + "q".repeat(40)) throw new Error("unstable marker at " + offset);
+          output = redactGateOutput(output);
+        }
+      } finally { fixture.mockRestore(); }
+    }
+    console.log("stable");
   `;
   const result = await runProcess({ ...options(), cmd: [process.execPath, "-e", script] });
   expect(result.exitCode).toBe(0);
-  // One redactCredentials call also matches the marker text it inserts, once.
-  expect(JSON.parse(result.stdout)).toBe(`[[redacted]] [redacted] ${"q".repeat(40)}`);
+  expect(result.stdout).toBe("stable\n");
 });
 
 test("runner redaction handles every two-chunk offset on both streams before framing and cuts", async () => {
@@ -497,28 +642,34 @@ test("runner without redaction retains raw callbacks, empty-line framing, tails 
   expect(encoded.stdout).toBe("ÿ");
 });
 
-test("runner releases an unterminated terminal sequence instead of holding the stream", async () => {
-  const lines: string[] = [];
-  const seenAtChunk: number[] = [];
-  // Larger than any credential carry, which other tests' registrations can make long.
-  const body = "x".repeat(200_000);
-  await withChunks(
-    [
-      { stream: "stdout", text: `\u001b]${body}\n${body}\n` },
-      { stream: "stdout", text: "after\n" },
-    ],
-    () =>
-      runProcess({
-        ...options(),
-        redactOutput: true,
-        onRawChunk: () => seenAtChunk.push(lines.length),
-        onStdoutLine: (line) => lines.push(line),
-      }),
-  );
-  // Past the hold limit, the stray sequence's text is released while the stream is still running.
-  expect(seenAtChunk[1]).toBeGreaterThanOrEqual(1);
-  expect(lines.at(-1)).toBe("after");
-});
+test.each(["\u001b]", "\u001bP"])(
+  "long terminal payload %j is discarded with state preserved through ST and EOF",
+  (control) => {
+    const secret = "synthetic-bounded-terminal-credential";
+    registerCredential("BOUNDED_TERMINAL_TEST_TOKEN", secret);
+    for (const terminated of [false, true]) {
+      const output: string[] = [];
+      const redactor = outputRedactor((chunk) => output.push(chunk));
+      redactor.push(`error: ${secret.slice(0, 12)}${control}`);
+      const carry = redactor.carryLength;
+      for (let i = 0; i < 100; i++) {
+        redactor.push("x".repeat(4_096));
+        expect(redactor.carryLength).toBe(carry);
+        expect(redactor.terminalPayloadLength).toBe(0);
+      }
+      if (terminated) {
+        redactor.push("\u001b");
+        redactor.push(`\\${secret.slice(12)}\nfollowing`);
+      }
+      redactor.flush();
+      redactor.flush();
+      expect(redactor.carryLength).toBe(0);
+      expect(output.join("")).toBe(
+        terminated ? "error: [redacted]\nfollowing" : `error: ${secret.slice(0, 12)}`,
+      );
+    }
+  },
+);
 
 test("cleanup records ownership before the first signal and deletes it after confirmation", async () => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "limitless-record-")));
