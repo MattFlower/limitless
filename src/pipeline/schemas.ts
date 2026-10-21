@@ -280,6 +280,9 @@ const StoredFindingSchema = reviewBase.shape.findings.element.extend({
 });
 /** A panel's candidates and rulings, kept with eval output so refuted candidates stay regradable. */
 const StoredPanelSchema = z.object({
+  reports: z
+    .array(z.object({ summary: z.string().default(""), findings: z.array(StoredFindingSchema) }))
+    .optional(),
   // Absent in records from before parallel finders and the merge.
   finders: z
     .array(

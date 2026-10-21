@@ -260,6 +260,8 @@ export interface VerifierRequest {
 
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
+  /** Eval trace singles retain independent reports for counterfactual blocking counts. */
+  reports?: Review[];
   /** Each finder's prompt and the vendor it ran on, by finder index; why a local finder was skipped. */
   finders: {
     prompt: FinderPrompt;
@@ -357,6 +359,13 @@ const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
   candidates: [],
 };
 
+/** Trace prompt and merge behavior in addition to the trial's standard prompt and configuration. */
+export function traceIdentity(): string {
+  return new Bun.CryptoHasher("sha256")
+    .update(JSON.stringify([reviewPrompt({ ...FINDER_TEMPLATE, finder: "trace" }), MERGE_RULES]))
+    .digest("hex");
+}
+
 /**
  * What a panel's derived output depends on besides the case: the policy version, the finder and
  * verifier prompt templates, the verifier schema, and the merge and batching policy. Eval caches key
@@ -403,7 +412,8 @@ export async function runReview<T extends Invoked>(
   deps: ReviewDeps<T>,
   input: ReviewInput,
 ): Promise<ReviewOutcome<T>> {
-  if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders);
+  if (input.system && (input.system.mode === "panel" || input.system.finders.length > 1))
+    return runPanel(deps, input, input.system.finders);
   const request = reviewRequest(input);
   if (input.system?.samples === 2) return runUnion(deps, input, request);
   const invoked = await deps.invoke(request, 0);
@@ -566,10 +576,14 @@ async function runPanel<T extends Invoked>(
       const request = reviewRequest({
         ...input,
         timeoutMs: local ? Math.min(input.timeoutMs, LOCAL_FINDER_TIMEOUT_MS) : input.timeoutMs,
-        prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
+        prompt: {
+          ...input.prompt,
+          finder: input.system?.mode === "single" && finder === 0 ? undefined : prompt,
+          ...(lens ? { lens } : {}),
+        },
       });
       const invoked = await deps.invoke(request, finder).catch((error: unknown) => {
-        if (error instanceof FinderSkipped && (local || deps.skipAny))
+        if (input.system?.mode !== "single" && error instanceof FinderSkipped && (local || deps.skipAny))
           deps.finished?.push({ finder, skipped: error.message.slice(0, 300) });
         throw error;
       });
@@ -581,6 +595,7 @@ async function runPanel<T extends Invoked>(
     }),
   );
   const skippable = (member: (typeof settled)[number], finder: number) =>
+    input.system?.mode !== "single" &&
     member.status === "rejected" &&
     member.reason instanceof FinderSkipped &&
     !!(finders[finder]?.local || deps.skipAny);
@@ -594,13 +609,13 @@ async function runPanel<T extends Invoked>(
   const skipped = new Map<number, string>();
   for (const [finder, member] of settled.entries()) {
     const value = member.status === "fulfilled" ? member.value : undefined;
-    if (value?.output.success) {
+    if (value?.output.success && (input.system?.mode !== "single" || value.invoked.result.status === "ok")) {
       found[finder] = { invoked: value.invoked, review: value.output.data };
       continue;
     }
     found[finder] = undefined;
     const result = value?.invoked.result;
-    if (finders[finder]?.local || skippable(member, finder)) {
+    if ((input.system?.mode !== "single" && finders[finder]?.local) || skippable(member, finder)) {
       const problem =
         member.status === "rejected"
           ? String((member.reason as Error).message)
@@ -619,7 +634,9 @@ async function runPanel<T extends Invoked>(
         value.invoked.result,
         `Invalid review output from finder ${finder}: ${value.output.error?.message}`,
       ),
-      output: value.output,
+      output: value.output.success
+        ? z.custom<Review>(() => false, "Finder failed").safeParse(null)
+        : value.output,
     };
   }
   const first = found.find((member) => member !== undefined);
@@ -645,6 +662,33 @@ async function runPanel<T extends Invoked>(
     }),
   );
   const merged = mergeReports(raised, cited);
+  if (input.system?.mode === "single") {
+    const decision = decide(
+      input,
+      {
+        verdict: "approve",
+        summary: found.flatMap((m) => (m ? [m.review.summary] : [])).join("\n\n"),
+        findings: merged,
+      },
+      found.some((m) => m?.review.verdict === "request_changes") ? "request_changes" : "approve",
+    );
+    const panel: PanelRecord = {
+      reports: found.flatMap((m) => (m ? [m.review] : [])),
+      finders: finders.map(({ prompt }, i) => ({ prompt, vendor: found[i]?.invoked.target?.vendor ?? null })),
+      candidates: merged.map((c, i) => ({ ...c, id: `C${i + 1}` })),
+      verdicts: [],
+      refuted: [],
+      capped: [],
+      omitted: [],
+    };
+    return {
+      ...first.invoked,
+      result: combined(results, first.invoked.result, { ...decision.review, panel }),
+      output: { success: true, data: decision.review },
+      decision,
+      panel,
+    };
+  }
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.

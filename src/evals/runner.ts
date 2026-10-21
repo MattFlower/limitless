@@ -26,6 +26,7 @@ import {
   type ReviewRequest,
   reviewRequest,
   runReview,
+  traceIdentity,
   type VerifierRequest,
 } from "../pipeline/review.ts";
 import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
@@ -747,10 +748,12 @@ export class EvalRunner {
         return router.toTarget(pinnedModel, pinnedEffort ?? null);
       };
       const panelTargets =
-        system?.mode === "panel"
+        system && (system.mode === "panel" || system.finders.length > 1)
           ? {
               finders: system.finders.slice(1).map((f) => pinned(f.target)),
-              verifiers: (system.verifier?.targets ?? [system.verifier?.target]).map((t) => pinned(t)),
+              verifiers: (
+                system.verifier?.targets ?? (system.verifier?.target ? [system.verifier.target] : [])
+              ).map((t) => pinned(t)),
             }
           : undefined;
       // A replay makes no finder calls, so it waits on its verifiers instead of the trial's target:
@@ -787,6 +790,7 @@ export class EvalRunner {
               ...(replay ? { replay: replay.identity } : {}),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
               ...(system?.mode === "panel" ? { panel: panelIdentity(system.causalAttribution) } : {}),
+              ...(system?.finders.some((f) => f.prompt === "trace") ? { trace: traceIdentity() } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:
@@ -1181,9 +1185,14 @@ export class EvalRunner {
         const output = (
           system?.mode === "panel"
             ? StoredReviewSchema.refine((r) => r.mode === "panel", "not a derived panel review")
-            : system?.samples
-              ? StoredReviewSchema
-              : schema
+            : system?.finders.length === 2
+              ? StoredReviewSchema.refine(
+                  (r) => r.mode !== "panel" && r.panel?.reports?.length === 2,
+                  "not a derived trace review",
+                )
+              : system?.samples
+                ? StoredReviewSchema
+                : schema
         )?.safeParse(result.structured ?? extractJson(result.finalText));
         // A declined decision answer is still graded; details.invocationStatus records the escalation.
         const answered = result.status === "ok" || result.status === "declined";
