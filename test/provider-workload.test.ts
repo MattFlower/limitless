@@ -1,11 +1,12 @@
-import { expect, setSystemTime, test } from "bun:test";
+import { expect, setSystemTime, spyOn, test } from "bun:test";
 import { parseSince } from "../src/core/since.ts";
 import type { EvalRound, EvalTrial, ReviewSystem } from "../src/core/types.ts";
-import { computeProviderStatistics, computeProviderWorkload } from "../src/db/stats.ts";
+import { computeProviderStatistics, computeProviderWorkload, computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { emptyUsage } from "../src/harness/types.ts";
 import type { ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
+import { stallReporter } from "../src/util/stall.ts";
 import { workloadFor } from "../ui/lib/provider-workload.ts";
 
 function localDay(dayOffset: number, hour = 0): number {
@@ -369,6 +370,59 @@ function invocation(
     VALUES ('r', ?, 'fake', ?, ?, ?, ?, ?, ?, 10, 5, 3, 2, 0.25, 0.5)`)
     .run(role, provider, model, model, status, at, duration === null ? null : at + duration);
 }
+
+test("statistics queries preserve results and report both activity markers on a synthetic stall", () => {
+  const store = new Store(":memory:");
+  let time = 0;
+  const lines: string[] = [];
+  const clock = spyOn(stallReporter, "now").mockImplementation(() => time++);
+  const log = spyOn(console, "warn").mockImplementation((line: string) => lines.push(line));
+  try {
+    setSystemTime(localDay(0, 23));
+    invocation(store, "alpha", "m", "triage", localDay(0, 1), 250);
+    stallReporter.sample(0);
+    expect(computeStats(store)).toEqual({
+      needsYouRunIds: [],
+      days: [],
+      models: [
+        {
+          modelId: "m",
+          role: "triage",
+          invocations: 1,
+          ok: 1,
+          failed: 0,
+          costUsd: 0.25,
+          costEquivUsd: 0.5,
+          avgDurationMs: 250,
+          tokensIn: 15,
+          tokensOut: 5,
+        },
+      ],
+      totals: {
+        runs: 0,
+        succeeded: 0,
+        costUsd: 0,
+        costEquivUsd: 0,
+        active: 0,
+        queued: 0,
+        openNeedsHuman: 0,
+        openNeedsHumanRate: 0,
+      },
+    });
+    const totals = { invocations: 1, tokensIn: 15, tokensOut: 5, wallTimeMs: 250, costEquivUsd: 0.5 };
+    expect(computeProviderWorkload(store)).toEqual([{ provider: "alpha", today: totals, sevenDays: totals }]);
+    stallReporter.sample(4000);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("stats.computeStats: count=1 total=1ms max=1ms");
+    expect(lines[0]).toContain("stats.computeProviderWorkload: count=1 total=1ms max=1ms");
+  } finally {
+    stallReporter.sample(0);
+    clock.mockRestore();
+    log.mockRestore();
+    setSystemTime();
+    store.close();
+  }
+});
 
 test("historical production keeps stored identities, roles, tokens and finished medians", () => {
   const store = new Store(":memory:");
