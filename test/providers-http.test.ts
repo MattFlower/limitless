@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import type { EvalTrial } from "../src/core/types.ts";
+import type { ProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { PROVIDERS } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
@@ -238,5 +240,155 @@ test("configured provider status and model APIs include metadata but never crede
   } finally {
     store.close();
     fixture.close();
+  }
+});
+
+test("provider stats preserve chat/calendar totals while historical cutoffs affect only pipeline/eval work", async () => {
+  const f = await fixture();
+  try {
+    const store = f.factory.store;
+    store.db.exec("PRAGMA foreign_keys = OFF");
+    const at = Date.now() - 1000;
+    store.db
+      .query(`INSERT INTO invocations
+      (run_id, role, harness, provider, model, model_id, status, started_at, finished_at,
+       input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_equiv_usd)
+      VALUES ('r', 'spec', 'fake', 'retired', 'm', 'm', 'ok', ?, ?, 10, 2, 3, 5, 0.5)`)
+      .run(at, at + 100);
+    store.db
+      .query(`INSERT INTO chat_calls
+      (conversation_id, provider, model_id, result_json, cost_usd, started_at, duration_ms)
+      VALUES ('c', 'retired', 'm', ?, 0, ?, 200)`)
+      .run(JSON.stringify({ usage: { input: 4, output: 2 }, costEquivUsd: 0.25 }), at);
+    const route = createHttpRoutes(f.factory)["/api/stats/providers"] as Route;
+    const get = (since?: string) =>
+      route(
+        requestWithParams(
+          `http://localhost/api/stats/providers${since === undefined ? "" : `?since=${encodeURIComponent(since)}`}`,
+        ),
+        localServer,
+      );
+    const response = await get();
+    expect(response.status).toBe(200);
+    const rows = await response.json();
+    expect(rows).toMatchObject([
+      {
+        provider: "retired",
+        sevenDays: { invocations: 2, tokensIn: 19, tokensOut: 7, wallTimeMs: 300, costEquivUsd: 0.75 },
+        production: { totals: { invocations: 1, tokensIn: 15, inputTokens: 10 } },
+        eval: { totals: { invocations: 0 } },
+      },
+    ]);
+    const inclusive = await (await get(new Date(at).toISOString())).json();
+    expect(inclusive).toEqual(rows);
+    const future = await (await get("2100-01-01")).json();
+    expect(future[0].today).toEqual(rows[0].today);
+    expect(future[0].sevenDays).toEqual(rows[0].sevenDays);
+    expect(future[0].production.totals).toMatchObject({
+      invocations: 0,
+      successfulShare: 0,
+      p50WallTimeMs: null,
+    });
+    const offset = new Date(at).toISOString().replace("Z", "+00:00");
+    expect(await (await get(offset)).json()).toEqual(inclusive);
+    for (const value of ["", "yesterday", "2026-02-30", "2026-02-30T10:00:00Z"]) {
+      const invalid = await get(value);
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: expect.stringContaining("invalid ISO-8601") });
+    }
+    const run = store.createEvalRun({ role: "review", models: ["retired/m"], k: 1, maxUsd: 10 }, []);
+    const trial: EvalTrial = {
+      evalRunId: run.id,
+      modelId: "retired/m",
+      effort: null,
+      caseId: "case",
+      trial: 0,
+      cacheKey: "key",
+      harness: "fake",
+      status: "ok",
+      output: null,
+      pass: true,
+      score: 1,
+      createdAt: at,
+      tokensIn: 12,
+      tokensOut: 4,
+      costUsd: 0.5,
+      costEquivUsd: 1,
+      durationMs: 250,
+      details: {
+        provider: "retired",
+        invocationStatus: "ok",
+        cacheReadTokens: 2,
+        cacheWriteTokens: 0,
+        verifiers: [{ modelId: "other/verifier", effort: "high", candidates: [] }],
+      },
+    };
+    store.recordEvalTrial(trial);
+    store.recordEvalTrial({
+      ...trial,
+      trial: 1,
+      status: "running",
+      pass: null,
+      score: null,
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+      costEquivUsd: 0,
+      durationMs: 0,
+      details: { provider: "retired", cacheReadTokens: 0, cacheWriteTokens: 0 },
+    });
+    store.recordEvalTrial({
+      ...trial,
+      trial: 2,
+      status: "queued",
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+      costEquivUsd: 0,
+      durationMs: 0,
+      details: { provider: "retired" },
+    });
+    store.interruptEval(run.id, "restart");
+    const workload = (await (await get(new Date(at).toISOString())).json()) as ProviderWorkload[];
+    expect(workload.map((r) => r.provider)).toEqual(["(compound/unattributed)", "retired"]);
+    expect(workload[0]?.eval?.models[0]).toMatchObject({
+      provider: null,
+      modelId: null,
+      compound: true,
+      participants: ["other/verifier", "retired/m"],
+      invocations: 1,
+      tokensIn: 12,
+      tokensOut: 4,
+      costUsd: 0.5,
+      costEquivUsd: 1,
+      wallTimeMs: 250,
+      countingUnits: { invocation: 0, round: 0, trial: 1 },
+    });
+    expect(workload[0]?.eval?.roles[0]?.role).toBe("review");
+    const unknown = {
+      invocations: 1,
+      successfulShare: 0,
+      tokensIn: null,
+      inputTokens: null,
+      tokensOut: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      costUsd: null,
+      costEquivUsd: null,
+      wallTimeMs: 0,
+      p50WallTimeMs: null,
+    };
+    const evaluation = workload[1]?.eval;
+    for (const total of [
+      evaluation?.totals,
+      evaluation?.models[0],
+      evaluation?.roles[0],
+      evaluation?.days[0],
+    ])
+      expect(total).toMatchObject(unknown);
+    expect(workload[1]?.production).toEqual(rows[0].production);
+    expect((await (await get(new Date(at + 1).toISOString())).json())[0].eval.totals.invocations).toBe(0);
+  } finally {
+    await f.close();
   }
 });

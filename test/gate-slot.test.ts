@@ -65,6 +65,31 @@ function rig(limit = 1) {
 }
 const signal = new AbortController().signal;
 
+test("nested scopes reuse the outer reservation at a limit of one", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  try {
+    await gateSlotScope(async () => {
+      const release = await acquireGateSlot(signal, undefined, "outer");
+      try {
+        await gateSlotScope(async () => {
+          const free = await acquireGateSlot(signal, () => {
+            throw new Error("nested scope queued behind its outer scope");
+          });
+          free();
+        })();
+        expect(gateSlots.snapshot().holders).toEqual(["outer"]);
+      } finally {
+        release();
+      }
+      expect(gateSlots.snapshot().holders).toEqual(["outer"]);
+    })();
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    gateSlots.setLimit(previous);
+  }
+});
+
 test("a small retry in an empty scope uses and releases only the agent-test lane", async () => {
   const previous = [gateSlots.limit, agentTestSlots.limit] as const;
   gateSlots.setLimit(1);

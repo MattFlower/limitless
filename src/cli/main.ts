@@ -5,6 +5,7 @@ import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import { parseRunModels } from "../core/run-models.ts";
+import { parseSince } from "../core/since.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
@@ -50,6 +51,7 @@ Usage:
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
   limitless digest [--consumer <name>]  Read-only session summary of what needs attention
+  limitless stats providers [--since <ISO-8601>] [--json]  Stored provider workload
   limitless providers                     Provider health and quota
   limitless catalog list                  Effective models and discovery
   limitless catalog add <provider>/<id> --model <backend> --origin <country> --base-origin <country> --vendor <vendor> --tier N --price-input N --price-output N [--efforts none,high] [--effort high] [--notes …]
@@ -274,14 +276,6 @@ async function serve(): Promise<void> {
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
-}
-
-/** An ISO-8601 date or timestamp as ms. The calendar date must exist: Date.parse turns 02-30 into 03-02. */
-function parseSince(value: string): number {
-  const [since, day] = [Date.parse(value), value.slice(0, 10)];
-  const real = /^\d{4}-\d\d-\d\d(T|$)/.test(value) && !Number.isNaN(since);
-  if (real && new Date(`${day}T00:00:00Z`).toISOString().startsWith(day)) return since;
-  throw new Error(`--since: invalid ISO-8601 timestamp ${value}`);
 }
 
 async function main(): Promise<void> {
@@ -629,6 +623,38 @@ async function main(): Promise<void> {
       return (await import("./catalog.ts")).catalogCommand(rest, values, api);
     case "routing":
       return (await import("./routing.ts")).routingCommand(rest, values, api);
+    case "stats": {
+      if (rest.length !== 1 || rest[0] !== "providers")
+        throw new Error("usage: limitless stats providers [--since <ISO-8601>] [--json]");
+      if (values.since !== undefined) parseSince(values.since);
+      const rows = await api<import("../db/stats.ts").ProviderWorkload[]>(
+        `/api/stats/providers${values.since === undefined ? "" : `?since=${encodeURIComponent(values.since)}`}`,
+      );
+      if (values.json) console.log(JSON.stringify(rows));
+      else
+        for (const section of ["production", "eval"] as const) {
+          console.log(section === "production" ? "Production" : "Eval");
+          for (const row of rows) {
+            const data = row[section];
+            if (!data) {
+              console.log(`  ${row.provider}: historical statistics unavailable`);
+              continue;
+            }
+            const print = (label: string, t: import("../db/stats.ts").HistoricalTotals) =>
+              console.log(
+                `  ${label}: ${t.invocations} executions ${JSON.stringify(t.countingUnits)}, success ${t.successfulShare}; input ${t.inputTokens ?? "unknown"}, output ${t.tokensOut ?? "unknown"}, cache-read ${t.cacheReadTokens ?? "unknown"}, cache-write ${t.cacheWriteTokens ?? "unknown"} tokens; metered $${t.costUsd ?? "unknown"}, API-equivalent $${t.costEquivUsd ?? "unknown"}; total ${t.wallTimeMs} ms, p50 ${t.p50WallTimeMs ?? "unknown"} ms`,
+              );
+            print(row.provider, data.totals);
+            for (const group of ["models", "roles", "days"] as const)
+              for (const item of data[group])
+                print(
+                  `${group}: ${row.provider} ${item.compound ? `compound [${item.participants?.join(", ") ?? "unknown models"}]` : (item.modelId ?? "(unknown model)")} ${item.role ?? item.day ?? ""}`,
+                  item,
+                );
+          }
+        }
+      return;
+    }
     case "providers": {
       if (rest[0] === "export") {
         if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");
