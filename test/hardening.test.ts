@@ -1423,6 +1423,7 @@ describe("process handling", () => {
                       stdout: "continued",
                       stderr: "",
                       exitCode: 0,
+                      timedOut: false,
                     });
                     expect(clockCalls).toBe(state === "claimed" ? 1 : 0);
                   },

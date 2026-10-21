@@ -47,12 +47,9 @@ export class DrainUnsupportedError extends Error {}
 /** No HTTP response was received; HTTP/body errors deliberately stay outside this class. */
 class DaemonTransportError extends Error {}
 const unanswered = (error: unknown): boolean =>
-  error instanceof DaemonTimeoutError ||
-  error instanceof DaemonTransportError ||
-  (error instanceof Error &&
-    /^(ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT)$/.test(
-      String((error as NodeJS.ErrnoException).code ?? error.message),
-    ));
+  error instanceof DaemonTimeoutError || error instanceof DaemonTransportError;
+// A request deadline after headers is a response failure, not an unanswered request.
+const answered = new WeakSet<AbortSignal>();
 
 export interface DeployClient {
   admin(action: "drain" | "resume", signal: AbortSignal): Promise<DrainState>;
@@ -97,6 +94,7 @@ export function localDeployClient(port: number): DeployClient {
     }).catch((cause: unknown) => {
       throw new DaemonTransportError(redactCredentials(String(cause)), { cause });
     });
+    answered.add(signal);
     if (response.status === 404 && path.startsWith("/api/admin/"))
       throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
     if (!response.ok) {
@@ -136,7 +134,9 @@ export async function bounded<T>(
   let cancel = () => {};
   const timeout = new Promise<never>((_, reject) => {
     cancel = clock.timeout(() => {
-      reject(new DaemonTimeoutError());
+      reject(
+        answered.has(controller.signal) ? new Error("daemon response timed out") : new DaemonTimeoutError(),
+      );
       controller.abort();
     }, ms);
   });
@@ -165,7 +165,7 @@ export async function requestAdmin(
       }
       return;
     } catch (error) {
-      if (!resume || error instanceof DrainUnsupportedError || remaining() <= 0) throw error;
+      if (!resume || !unanswered(error) || remaining() <= 0) throw error;
       await clock.sleep(Math.min(2000, remaining()));
       if (remaining() <= 0) throw error;
     }
