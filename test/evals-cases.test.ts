@@ -43,6 +43,29 @@ test.each(["review", "implement"] as const)("%s cases contain no absolute home-d
   expect(leaked).toEqual([]);
 });
 
+test("review cases with evals/ in pinned history require snapshot mode", () => {
+  const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
+  const missingSnapshot: string[] = [];
+  for (const item of file.cases) {
+    if (item.snapshot) continue;
+    // Squash merges and shallow CI checkouts can leave PR pins unavailable; inspect each available pin.
+    const pins = [item.base, item.head];
+    const types = execFileSync("git", ["cat-file", "--batch-check=%(objecttype)"], {
+      input: `${pins.join("\n")}\n`,
+      encoding: "utf8",
+    })
+      .trim()
+      .split("\n");
+    const available = pins.filter((_, index) => types[index] === "commit");
+    if (!available.length) continue;
+    const touched = execFileSync("git", ["rev-list", "-1", "--full-history", ...available, "--", "evals/"], {
+      encoding: "utf8",
+    });
+    if (touched.trim()) missingSnapshot.push(item.id);
+  }
+  expect(missingSnapshot).toEqual([]);
+});
+
 test("dataset diagnostics reject malformed JSON and invalid fields", () => {
   const file = loadCases();
   const item = file.cases[0];
