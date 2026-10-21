@@ -69,6 +69,8 @@ export interface AgentSpec {
   confineReads?: boolean;
   timeoutMs: number;
   idleTimeoutMs: number;
+  /** Invocation-owned clock excluding live slotted-command time; never used for overall deadlines. */
+  idleNow?: () => number;
   maxToolCalls: number;
   /** Structured authoring call; disallow tool access where the CLI supports it. */
   noTools?: boolean;
