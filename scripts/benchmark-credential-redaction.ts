@@ -1,13 +1,15 @@
-/** Usage: git show <base>:src/util/proc.ts > "$TMPDIR/credential-baseline.ts"
- * bun scripts/benchmark-credential-redaction.ts "$TMPDIR/credential-baseline.ts"
+/** Usage: mkdir "$TMPDIR/baseline"; for f in proc credential-matcher; do
+ *   git show <base>:src/util/$f.ts > "$TMPDIR/baseline/$f.ts"; done
+ * bun scripts/benchmark-credential-redaction.ts "$TMPDIR/baseline/proc.ts"
+ * Modules beside the snapshot stay frozen; other imports resolve in the checkout.
  * Each version/size runs in a fresh process; median of 5 trials after 2 warmups.
  */
 import { spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
@@ -28,9 +30,11 @@ if (process.argv[2] === "--worker") {
     .join("")
     .repeat(2)
     .slice(0, 5 * 1024 * 1024);
-  const chunks = Array.from({ length: Math.ceil(text.length / 32768) }, (_, i) =>
-    text.slice(i * 32768, (i + 1) * 32768),
-  );
+  // The same workload with SGR colouring, as gate output often has.
+  const colored = text.replaceAll("event", "\u001b[32mevent\u001b[0m").slice(0, text.length);
+  const split = (s: string) =>
+    Array.from({ length: Math.ceil(s.length / 32768) }, (_, i) => s.slice(i * 32768, (i + 1) * 32768));
+  let chunks = split(text);
   const spawnFixture = () => {
     const child = Object.assign(new EventEmitter(), {
       stdin: new PassThrough(),
@@ -48,7 +52,8 @@ if (process.argv[2] === "--worker") {
   const fixture = spyOn(subprocess, "spawn").mockImplementation(spawnFixture as typeof subprocess.spawn);
   try {
     const result: Record<string, number> = {};
-    for (const kind of ["redactCredentials", "runProcess"] as const) {
+    for (const kind of ["redactCredentials", "runProcess", "runProcessSGR"] as const) {
+      chunks = split(kind === "runProcessSGR" ? colored : text);
       const samples: number[] = [];
       for (let trial = 0; trial < 7; trial++) {
         const start = performance.now();
@@ -76,9 +81,16 @@ if (process.argv[2] === "--worker") {
   const scratch = await mkdtemp(join(tmpdir(), "credential-benchmark-"));
   try {
     const snapshot = join(scratch, "proc.ts");
-    // Keep the snapshot's imports anchored in the checkout without changing tracked files.
+    // Keep the snapshot's other imports anchored in the checkout without changing tracked files.
     const util = new URL("../src/util/", import.meta.url).href;
-    await writeFile(snapshot, (await readFile(baseline, "utf8")).replaceAll('"./', `"${util}`));
+    const frozen = (await readdir(dirname(baseline))).filter((file) => file.endsWith(".ts"));
+    for (const file of frozen)
+      await writeFile(
+        join(scratch, file),
+        (await readFile(join(dirname(baseline), file), "utf8")).replace(/"\.\/([^"]+)"/g, (spec, name) =>
+          frozen.includes(name) ? spec : `"${util}${name}"`,
+        ),
+      );
     console.log(`Bun ${Bun.version}; milliseconds, median of 5 after 2 warmups; 5 MiB, 32 KiB chunks`);
     for (const [version, path] of [
       ["before", pathToFileURL(snapshot).href],
