@@ -174,6 +174,7 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   sure the closed path triggers only on the failure it guards against, not on ordinary conditions.
 
 ## Privacy
+- A command whose stdout is a secret must never reach an error path that quotes output; `redactCredentials` only covers registered values.
 - The repository is public. Never commit hostnames, domains, LAN addresses, machine names, usernames,
   service labels or webhook URLs from the owner's setup; use placeholders (`<host>`, `example.com`).
   The private-strings check ([GUIDE](docs/GUIDE.md#private-strings)) blocks audit, delivery and

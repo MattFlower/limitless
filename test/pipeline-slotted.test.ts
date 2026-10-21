@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { agentTestLease } from "../src/gates/agent-tests.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { sh } from "../src/util/proc.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
@@ -33,12 +34,19 @@ test.each([false, true])(
       if (role === "holdout") return { structured: holdout };
       roles.add(role);
       expect(!!agent.commandPath).toBe(enabled);
+      expect(!!agent.idleNow).toBe(enabled);
       if (agent.commandPath) {
         const wrapper = agent.commandPath.split(delimiter)[0] ?? "";
         expect(existsSync(join(wrapper, "bun"))).toBe(true);
         expect(wrapper.startsWith(agent.cwd)).toBe(false);
         expect(wrapper.startsWith(agent.scratchDir ?? "")).toBe(false);
         wrappers.push(wrapper);
+        if (role === "implement") {
+          const { token } = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+          const lease = await agentTestLease({ token, name: "bun test", lane: "small" });
+          expect(lease.acquired).toBe(true);
+          await agentTestLease({ token, id: lease.id, release: true });
+        }
       }
       if (role === "review") return { structured: approve };
       if (role === "verify") return { structured: pass };
@@ -50,6 +58,15 @@ test.each([false, true])(
     const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect([...roles].sort()).toEqual(["implement", "review", "verify"]);
+    const watchdogEvents = f.store.listEvents(run.id).filter((e) => e.message.startsWith("Idle watchdog"));
+    expect(watchdogEvents).toHaveLength(enabled ? 2 : 0);
+    if (enabled) {
+      expect(watchdogEvents[0]?.message).toBe("Idle watchdog held off for slotted command");
+      expect(watchdogEvents[1]?.message).toMatch(/^Idle watchdog resumed after \d+ms held off/);
+      const implementer = f.store.listInvocations(run.id).find((inv) => inv.role === "implement");
+      if (!implementer) throw new Error("missing implementer invocation");
+      expect(watchdogEvents.map((e) => e.invocationId)).toEqual([implementer.id, implementer.id]);
+    }
     expect(f.store.getRunState<RunState>(run.id)?.slottedCommands).toEqual(enabled ? [["bun", "test"]] : []);
     for (const wrapper of wrappers) expect(existsSync(wrapper)).toBe(false);
     const state = f.store.getRunState<RunState>(run.id);
