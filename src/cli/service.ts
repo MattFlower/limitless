@@ -658,7 +658,7 @@ export async function deploy(
         const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
         const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
         cleanupErrors.push(
-          `resume scheduler: ${String(resume)}\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`,
+          `resume scheduler: ${String(resume)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`,
         );
       }
     }

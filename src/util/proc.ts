@@ -5,6 +5,7 @@ import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
+import { activity } from "./stall.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
 export const invocationScratch = new AsyncLocalStorage<string>();
@@ -677,9 +678,9 @@ export interface ProcResult {
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
-  /** The overall timeout began the shutdown, not an exit or a cancel before it. */
+  /** The overall timeout shutdown killed a running direct child. */
   timedOut: boolean;
-  /** The idle timeout began the shutdown, as for timedOut. */
+  /** The idle timeout shutdown killed a running direct child. */
   idleTimedOut: boolean;
   stdout: string; // tail, bounded by tailLimit
   stderr: string; // tail, bounded by tailLimit
@@ -842,8 +843,9 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         const release = await ownInvocationCleanup(marker);
         try {
           if (leaderInspectionError) throw leaderInspectionError;
+          let killedRunningChild = false;
           if (child.pid !== undefined) {
-            const killedRunningChild = await stopMarkedProcesses(
+            killedRunningChild = await stopMarkedProcesses(
               marker,
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
@@ -853,8 +855,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
               spawnedAt,
               directory,
             );
-            cancelKilled = cancelStarted && killedRunningChild;
           }
+          cancelKilled = cancelStarted && killedRunningChild;
+          timedOut &&= killedRunningChild;
+          idleTimedOut &&= killedRunningChild;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.
@@ -1110,13 +1114,16 @@ export function registerCredential(name: string, value?: string): void {
       sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
     }
 }
-export function redactCredentials(text: string): string {
+export const redactCredentials = (text: string): string =>
+  activity("credentials.redact", () => redactText(text));
+function redactText(text: string): string {
   // Substring matches require at least 8 characters to avoid redacting common short strings.
   for (const [secret, substring] of sortedCredentialVariants)
     if (substring || text === secret) text = text.split(secret).join("[redacted]");
   return text;
 }
-export const redactCredentialData = <T>(value: T): T =>
+export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
+const redactData = <T>(value: T): T =>
   JSON.parse(
     JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redactCredentials(v) : v)),
     (_key, v: unknown) =>
