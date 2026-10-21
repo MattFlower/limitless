@@ -790,20 +790,25 @@ test("exhausted review and verify invocations never dispatch to excluded fallbac
   expect(JSON.stringify(factory.store.listEvents(run.id))).toContain("origin excluded (CN; baseOrigin=CN)");
 });
 
-test("routing and catalog API unavailable diagnostics redact a stored retired credential", async () => {
+test("routing and catalog API snapshots redact stored ids and history while edits retain raw ids", async () => {
+  factory.store.close();
+  factory = makeFactory(new Store(join(dir, "redaction.sqlite")));
   const credential = "synthetic-http-credential-419";
   registerCredential("LIMITLESS_TEST_HTTP_DIAGNOSTIC_KEY", credential);
   const provider = `retired-${credential}`;
   const id = `${provider}/legacy`;
+  factory.store.writeRouting("triage.default", [id], null, "previous release");
   factory.store.writeRouting("triage.default", [id, id], null, "previous release");
   factory.store.writeRouting("chat.default", [id], null, "previous release");
   factory.store.writeRouting("prefer", [provider, "codex"], null, "previous release");
   const model = runtimeModel({ ...customModel, provider: "codex", id: "legacy" }, PROVIDERS);
-  factory.store.writeRuntimeModel("retired-lan/runtime", {
+  const retired = {
     ...model,
-    id: "retired-lan/runtime",
+    id: `${provider}/runtime`,
     provider,
-  });
+  };
+  factory.store.writeRuntimeModel(retired.id, retired);
+  factory.store.writeRuntimeModel(retired.id, { ...retired, model: "updated-backend" });
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   try {
     factory = makeFactory(factory.store);
@@ -811,6 +816,14 @@ test("routing and catalog API unavailable diagnostics redact a stored retired cr
     const routingResponse = await call("/api/routing");
     expect(routingResponse.status).toBe(200);
     const routing = await routingResponse.json();
+    expect(JSON.stringify(routing)).not.toContain(credential);
+    expect(routing.history).toContainEqual(
+      expect.objectContaining({
+        key: "triage.default",
+        oldValue: ["retired-[redacted]/legacy"],
+        newValue: ["retired-[redacted]/legacy", "retired-[redacted]/legacy"],
+      }),
+    );
     expect(routing.unavailable).toEqual([
       {
         id: "retired-[redacted]/legacy",
@@ -829,16 +842,39 @@ test("routing and catalog API unavailable diagnostics redact a stored retired cr
     expect(routing.unavailable[0]?.references).toHaveLength(2);
     const catalogResponse = await call("/api/catalog");
     expect(catalogResponse.status).toBe(200);
-    expect((await catalogResponse.json()).models).toContainEqual(
+    const catalog = await catalogResponse.json();
+    expect(JSON.stringify(catalog)).not.toContain(credential);
+    expect(catalog.models).toContainEqual(
       expect.objectContaining({
-        id: "retired-lan/runtime",
+        id: "retired-[redacted]/runtime",
+        provider: "retired-[redacted]",
         unavailable: "retired reference: retired-[redacted] is not in the catalog",
       }),
     );
+    expect(catalog.history[0]).toMatchObject({
+      modelId: "retired-[redacted]/runtime",
+      oldValue: { id: "retired-[redacted]/runtime", provider: "retired-[redacted]" },
+      newValue: { id: "retired-[redacted]/runtime", provider: "retired-[redacted]" },
+    });
     expect(warn.mock.calls.flat().join("\n")).not.toContain(credential);
     expect(warn).toHaveBeenCalledTimes(3);
     expect(factory.store.routingPrefer()).toEqual([provider, "codex"]);
     expect(factory.store.runtimeModels()[0]?.provider).toBe(provider);
+    const editable = `codex/${credential}`;
+    expect(
+      (await call("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: credential }))
+        .status,
+    ).toBe(201);
+    const patched = await call(`/api/catalog/models/${encodeURIComponent(editable)}`, "PATCH", {
+      model: "edited-backend",
+    });
+    expect(patched.status).toBe(200);
+    expect(await patched.text()).not.toContain(credential);
+    const edited = await call("/api/routing/cells/triage/default", "PUT", { groups: [editable] });
+    expect(edited.status).toBe(200);
+    expect((await edited.json()).effective.triage.default.groups).toEqual(["codex/[redacted]"]);
+    expect(factory.store.runtimeModels().find((m) => m.id === editable)?.model).toBe("edited-backend");
+    expect(factory.store.routingCells().find((r) => r.role === "triage")?.groups).toEqual([editable]);
   } finally {
     warn.mockRestore();
   }
