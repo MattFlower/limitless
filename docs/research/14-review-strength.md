@@ -676,13 +676,110 @@ standard prompt (E1's stored dev trials, 33/98 and 2/8; the adversarial prompt a
 confirmed on held-out, #541). Attribution: E3's stored adversarial trials. Variant F: the
 adversarial prompt plus the checklist.
 
-**Cases and run.** The 35 dev ids, k=2, about $15.
+**Original registered design.** Issue #553 registered the original 35 dev IDs, k=2, about $15,
+with production E1 as the decision baseline and E3 for attribution. This remains the registered
+design that the amendment below changes; it is not an experiment result.
 
-**Measures.** As #531, plus the gain over E3 (what the checklist adds beyond the adversarial
-framing) and how many findings cite a command or input in `checked` versus a bare pattern match.
+**Authorized cohort amendment (recipe; execution deferred).** The amendment comment on
+[issue #553](https://github.com/MattFlower/limitless/issues/553), dated **2026-10-20**, authorized
+the cohort change before any trial. Use dev cases whose **pinned base AGENTS.md** contains both
+the recurring-defect bullets and the Privacy redaction-ordering bullets: the existing 19 eligible
+original cases listed below, **plus #542's dev cases once #674 makes them runnable**, subject to
+the same pinned-base eligibility check. Do not substitute a later AGENTS.md or select every
+current dev case. Variant F keeps `codex/sol-6.1@medium`, k=2 and the **$15 cap**.
 
-**Decision rule.** As #531 against the production baseline. Held-out once if adopted, and only
-after #542's fresh clean set exists.
+The following 16 original cases are excluded because their bases predate the required sections
+(before #395, 7cc4e186): their AGENTS.md has neither "Defects reviews keep finding" nor the
+Privacy redaction-ordering rule, so preparation fails:
+
+```text
+review-044,review-045,review-046,review-050,review-051,review-052,review-053,review-054,review-056,review-057,review-058,review-069,review-070,review-071,review-072,review-073
+```
+
+They are excluded rather than given a later AGENTS.md. A fixed later revision would leak
+hindsight: its bullets cite the PRs that fixed some of these gold defects (defect 5 cites #385's
+"timed out after" text, review-052#0). `test/evals-cases.test.ts` checks extraction at every
+one of the original 35 bases. The **19-case subset**, before adding eligible #542 dev cases,
+contains 22 required defects (3 blocker, 19 major; 44 defect-trials) and four clean cases
+(review-078, 079, 082, 097; 8 trials), 38 trials in this subset:
+
+```text
+review-076,review-077,review-078,review-079,review-080,review-082,review-087,review-088,review-093,review-096,review-097,review-098,review-099,review-100,review-101,review-103,review-104,review-105,review-106
+```
+
+For the amended run, save this configuration outside the checkout as `variant-f.json`.
+Set `DEV_IDS` to the 19 comma-separated IDs above plus the eligible #542 dev IDs once #674
+makes them runnable; record that exact list and recompute the expanded cohort's required
+defect-trial, clean-trial and total-trial denominators at k=2 before execution:
+
+```json
+{
+  "systems": [
+    {
+      "name": "F-checklist",
+      "mode": "single",
+      "finders": [{ "target": "codex/sol-6.1@medium", "prompt": "adversarial-checklist" }],
+      "implementerReport": "include"
+    }
+  ]
+}
+```
+
+```sh
+limitless eval run review --systems "$TMPDIR/variant-f.json" --cases "$DEV_IDS" --k 2 --max-usd 15 --no-cache --follow
+```
+
+Use the same labels as §1 and Appendix A, restricting stored E1 standard-prompt baseline
+trials (`eval-mv7igcxy1tl7bg203warej`, medium only) and stored E3 adversarial attribution trials
+(`eval-mv8gnw6f03ggcas1ml9ate`, medium) to the **same amended cases and matched trial indices**
+(0 and 1). Inventory every case/index in all three arms; explicitly list missing/error trials
+by arm, case, index and status rather than silently dropping them or treating them as misses.
+An incomplete arm cannot qualify. No stored coverage for the added cases is assumed here.
+
+For context only, Appendix A's **19-case subset figures** are E1 8/44 blocking recall (18.2%)
+and 2/8 clean false blocks, and E3 12/44 (27.3%) and 2/8. Original 35-case figures were E1
+33/98 and 2/8, E3 45/98 and 2/8. None is an expanded-cohort total. Neither retrieving stored
+trials nor executing this paid command is part of the implementation.
+
+**Prompt and evidence contract.** Read only the case's pinned base AGENTS.md through hardened
+Git access; missing recurring-defect bullets or Privacy redaction ordering fails preparation.
+The checklist retains whole items in source order up to 12,000 characters, including source
+identifiers and separators, after credential redaction. It reports the number of omitted items
+and uses a fence longer than any embedded backtick run. IDs identify source bullets within the
+extracted checklist. Every included item gets `item`, `applies` (changed hunks, or explicitly
+non-applicable), `checked` (command, traced path or input tried and result, or none), and
+`finding` (an emitted finding's ID or null). Applicability alone cannot justify a blocker.
+Stored checklist evidence is reviewer-reported, not verified command execution; grading ignores it.
+
+**Measures.** Report pooled blocking recall (caught / required defect-trials in the amended
+cohort) with Wilson 95% intervals; recall by gold severity and category; clean false blocks /
+clean trials; derived-verdict accuracy / total trials; input/output tokens and elapsed time
+(mean and median per trial). Use the recorded expanded-cohort denominators consistently for
+all matched arms; 44, 8 and 38 describe only the original eligible 19-case subset. Report recall
+gain in percentage points and clean-block differences over both E1 and E3, keeping E1 as the
+qualification baseline. Finding matching, severity-based blocking and verdict derivation use
+the unchanged grader, with no checklist credit.
+
+Manually inspect `checked` for distinct linked findings per case/trial: count a finding once
+when one or more checklist entries link its emitted ID. Classify concrete command or input
+citations (specific executable command or concrete input/state tried) separately from
+traced-path-only evidence (a named call/data path without a command or input) and bare pattern
+matching (only a rule resemblance or generic claim). If several entries link one finding,
+command/input takes precedence, then traced-path-only, then bare pattern; missing/empty evidence
+is reported separately. Report the command and input subcounts and their union, plus dangling
+links and unlinked findings; none changes recall or blocking. These are reported claims, with
+no automatic evidence classifier or assertion that commands actually ran.
+
+**Decision rule.** Dev qualifies only with at least **eight percentage points** of pooled recall
+gain over production E1 and **at most one additional clean false block** on matched trials
+in the amended cohort. Recompute the catch threshold from the matched E1 recall and the
+expanded required-defect denominator. The old subset illustration (12/44 catches and at most
+3/8 clean blocks) is not the expanded cohort's threshold. Gain over E3 measures attribution
+only, not qualification; the decision rule is unchanged by the amendment.
+Held-out confirmation runs **once**, only after dev qualification and availability of **#542's
+fresh clean set**. The old held-out set cannot decide this variant.
+Paid dev execution, baseline-record retrieval, held-out confirmation and production adoption
+are all deferred; this recipe claims no empirical gain.
 
 **Budget and scope.** About 60 source lines plus tests. Out of scope: lenses, the probe prompt,
 production adoption.
