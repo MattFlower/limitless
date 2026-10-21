@@ -63,7 +63,8 @@ export const headMoved = (head: string, sha: string, approvedSha?: string): bool
 
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
-  const lines = logLines(log);
+  // Redact the whole normalized log first: a window boundary can split a multiline credential.
+  const lines = redactCredentials(logLines(redactCredentials(log)).join("\n")).split("\n");
   const start = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
   let index = start;
   // Bun prints the assertion, diff and stack before the test name. Keep that block together.
@@ -72,8 +73,7 @@ export function ciSignature(check: string, log: string, fallback: string, labels
     if (/^\s*\(fail\)/i.test(lines[start + 1 + next] ?? "")) index += 1 + next;
   }
   const line = bounded(lines[index] ?? fallback);
-  const window = (from: number, to: number) =>
-    redactCredentials(lines.slice(Math.max(0, from), to).join("\n"));
+  const window = (from: number, to: number) => lines.slice(Math.max(0, from), to).join("\n");
   // Bound the leading context and the first failure line so neither consumes the budget.
   const head = `${window(start - 2, start).slice(-500)}\n${window(start, start + 1).slice(0, 500)}`;
   // A long Bun diff keeps its newest lines: the stack frame and the failing test name.

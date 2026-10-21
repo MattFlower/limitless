@@ -754,6 +754,26 @@ test.each([false, true])("bounded, redacted CI excerpts (rerun rejected: %s)", a
   expect(reruns()).toHaveLength(rejected ? 1 : 0);
 });
 
+test.each([false, true])(
+  "a multiline credential split by the excerpt window is redacted (timestamped: %s)",
+  (stamped) => {
+    const key =
+      "-----BEGIN PRIVATE KEY-----\nci-window-key-first\nci-window-key-last\n-----END PRIVATE KEY-----";
+    registerCredential("CI_WINDOW_KEY", key);
+    const log = `${key}\nerror: assertion failed\n  at test/example.test.ts:1:1\n(fail) actual test`;
+    const { excerpt, line } = ciSignature(
+      "test",
+      stamped ? log.replace(/^/gm, "2026-10-05T00:00:00.0000000Z ") : log,
+      "",
+    );
+    expect(line).toBe("(fail) actual test");
+    expect(excerpt).toContain("[redacted]");
+    expect(excerpt).toContain("error: assertion failed");
+    expect(excerpt).not.toContain("ci-window-key");
+    expect(excerpt).not.toContain("END PRIVATE KEY");
+  },
+);
+
 test.each(["timed_out", "startup_failure", "cancelled", "failure"])(
   "eligible %s failure reruns only its job",
   async (conclusion) => {
