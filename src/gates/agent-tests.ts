@@ -13,6 +13,7 @@ export interface TestWait {
 }
 
 interface SessionOptions {
+  onWatchdog?: (active: boolean, elapsedMs: number) => void;
   now?: () => number;
   timer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clear?: typeof clearTimeout;
@@ -43,10 +44,14 @@ export class AgentTestSession {
   private readonly clear;
   private readonly slots;
   private readonly caps;
+  private heldAt?: number;
+  private excludedMs = 0;
+  /** Idle time advances only outside this invocation's queued or acquired leases. */
+  readonly idleNow = () => (this.heldAt ?? this.now()) - this.excludedMs;
 
   constructor(
     private readonly event: (data: TestWait) => void,
-    options: SessionOptions = {},
+    private readonly options: SessionOptions = {},
   ) {
     registerCredential("LIMITLESS_AGENT_TEST_CAPABILITY", this.token);
     this.now = options.now ?? Date.now;
@@ -64,6 +69,12 @@ export class AgentTestSession {
     if (status !== "heartbeat" && lease.capTimer !== undefined) this.clear(lease.capTimer);
     if (lease.id) this.slots[lease.lane].heartbeat(lease.id, true);
     if (this.lanes.get(lease.lane) === lease) this.lanes.delete(lease.lane);
+    if (!this.lanes.size && this.heldAt !== undefined) {
+      const elapsedMs = this.now() - this.heldAt;
+      this.excludedMs += elapsedMs;
+      this.heldAt = undefined;
+      this.options.onWatchdog?.(false, elapsedMs);
+    }
     if (status === "capped" && !this.closed)
       this.event({
         kind: "agent-test",
@@ -169,6 +180,10 @@ export class AgentTestSession {
     const lease: Lease = { lane, command, status: "queued", started: previous?.started, waiter };
     // Reserve before the await: simultaneous registrations cannot create a second lease.
     this.lanes.set(lane, lease);
+    if (this.heldAt === undefined) {
+      this.heldAt = this.now();
+      this.options.onWatchdog?.(true, 0);
+    }
     if (previous) {
       previous.status = "recovered";
       if (previous.capTimer !== undefined) this.clear(previous.capTimer);
