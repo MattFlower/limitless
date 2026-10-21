@@ -1,16 +1,18 @@
 import { type CredentialMatcher, credentialMatcher, type MatchState } from "./credential-matcher.ts";
 
 /** Fixed allowance, in string-index units: terminal strings longer than this end as malformed text, and
- * held raw text never exceeds the longest credential variant plus this allowance plus one. */
+ * held raw text and its maps never exceed the longest credential variant plus this allowance plus one.
+ * Output held as a possible whole short credential never exceeds the longest variant. */
 export const TERMINAL_HOLD = 4_096;
 const MARKER = "[redacted]";
-// Each credential is matched in four readings of the raw text: A drops only control bytes; B strips
+// Each credential is matched in five readings of the raw text: A drops only control bytes; B strips
 // strictly (ECMA-48: strings run until their terminator); C strips leniently and is what is published
-// (a line break, another escape or the hold ends a string as visible text); D is C that also keeps the
-// final byte of a bare introducer (ESC x, ESC [ x), so a stray introducer never consumes a credential.
-const [A, B, C, D] = [1, 2, 4, 8];
-const [GROUND, ESC, ESC_INTER, CSI, CSI_PARAMS, STRING, STRING_ESC] = [0, 1, 2, 3, 4, 5, 6];
-const [TEXT, DROP, BARE, BREAK] = [0, 1, 2, 3];
+// (a line break, another escape or the hold ends a string as visible text). D is C in which the latest
+// ESC or CSI introducer is stray, so its parameters and final byte stay text; E is C in which an earlier
+// one was. A stray introducer therefore never consumes a credential, even one holding formatting.
+const [A, B, C, D, E, FORK] = [1, 2, 4, 8, 16, 32];
+const [GROUND, ESC, ESC_INTER, CSI, STRING, STRING_ESC] = [0, 1, 2, 3, 4, 5];
+const [TEXT, DROP, BODY, BREAK] = [0, 1, 2, 3];
 type Parser = { state: number; osc: boolean; body: number };
 type View = { state: MatchState; count: number; ring: number[] };
 
@@ -27,24 +29,21 @@ function advance(p: Parser, c: number, pos: number, strict: boolean): number {
       if (c === 0x5b) p.state = CSI;
       else if (c === 0x5d || c === 0x50 || c === 0x58 || c === 0x5e || c === 0x5f)
         Object.assign(p, { state: STRING, osc: c === 0x5d, body: pos });
-      else if (c >= 0x20 && c <= 0x2f) p.state = ESC_INTER;
-      else {
+      else if (c >= 0x20 && c <= 0x2f) {
+        p.state = ESC_INTER;
+        return BODY;
+      } else {
         p.state = GROUND;
-        if (c >= 0x30 && c <= 0x7e) return BARE;
+        if (c >= 0x30 && c <= 0x7e) return BODY;
         break;
       }
       return DROP;
     case ESC_INTER:
     case CSI:
-    case CSI_PARAMS:
-      if (c >= 0x20 && (c <= 0x2f || (p.state !== ESC_INTER && c <= 0x3f))) {
-        if (p.state === CSI) p.state = CSI_PARAMS;
-        return DROP;
-      }
+      if (c >= 0x20 && (c <= 0x2f || (p.state === CSI && c <= 0x3f))) return BODY;
       if (c >= (p.state === ESC_INTER ? 0x30 : 0x40) && c <= 0x7e) {
-        const bare = p.state === CSI;
         p.state = GROUND;
-        return bare ? BARE : DROP;
+        return BODY;
       }
       p.state = GROUND;
       break;
@@ -77,7 +76,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
   let views: View[] = [];
   let [size, pad, limit] = [0, 0, 0];
   const reset = () => {
-    views = [A, B, C, D].map(() => ({ state: matcher.root, count: 0, ring: [] }));
+    views = [A, B, C, D, E].map(() => ({ state: matcher.root, count: 0, ring: [] }));
     size = matcher.maxLength;
     pad = Math.max(0, size - 1);
     limit = size + TERMINAL_HOLD;
@@ -88,6 +87,8 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
   // marks: the readings keeping each held character; shown: whether the published reading keeps it.
   let [marks, shown] = [new Uint8Array(), new Uint8Array()];
   let [buf, out, entered] = ["", "", false];
+  // Published output while it could still equal a whole short credential, which only matches whole.
+  let lead: string | undefined = "";
   let [bufBase, base, end, head] = [0, 0, 0, 0];
   const spans: { start: number; end: number }[] = [];
   const addSpan = (start: number, stop: number) => {
@@ -108,7 +109,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
     if (!size) return;
     let from: MatchState | undefined;
     let to = matcher.root;
-    for (let v = 0; v < 4; v++) {
+    for (let v = 0; v < 5; v++) {
       const view = views[v];
       if (!view || !(mask & (1 << v))) continue;
       // Readings that agree share one transition.
@@ -138,7 +139,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
           addSpan(start < from ? matchStart(view, view.count + start - from, from) : start, stop);
         }
     for (const view of active) {
-      for (let pos = Math.max(from, to - size); pos < to; pos++)
+      for (let pos = Math.max(from, to - scanned.state.depth); pos < to; pos++)
         view.ring[(view.count + pos - from) % size] = pos;
       view.count += to - from;
       view.state = scanned.state;
@@ -147,10 +148,21 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
   const reveal = (from: number, to: number) => {
     for (let pos = from; pos < to; pos++) {
       if (control(buf.charCodeAt(pos - bufBase))) continue;
-      marks[pos - bufBase] = (marks[pos - bufBase] ?? 0) | C | D;
+      marks[pos - bufBase] = (marks[pos - bufBase] ?? 0) | C | D | E;
       shown[pos - bufBase] = 1;
-      feed(C | D, buf.charAt(pos - bufBase), pos);
+      feed(C | D | E, buf.charAt(pos - bufBase), pos);
     }
+  };
+  // At a new introducer, E keeps the longer partial match of D and E, and D restarts from C.
+  const fork = () => {
+    const [plain, stray, earlier] = [views[2], views[3], views[4]];
+    if (!plain || !stray || !earlier || !size) return;
+    const [kept, restart] = stray.state.depth >= earlier.state.depth ? [stray, earlier] : [earlier, stray];
+    [views[3], views[4]] = [restart, kept];
+    [restart.state, restart.count] = [plain.state, plain.count];
+    // Later matches start within the current depth, so only those positions are copied.
+    for (let k = plain.count - plain.state.depth; k < plain.count; k++)
+      restart.ring[k % size] = plain.ring[k % size] ?? 0;
   };
   const emit = (cut: number) => {
     while (base < cut) {
@@ -196,22 +208,37 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
     let kind = advance(strict, c, pos, true);
     if (kind === BREAK) kind = advance(strict, c, pos, true);
     if (kind === TEXT) mask |= B;
+    const prior = lenient.state;
     kind = advance(lenient, c, pos, false);
     if (kind === BREAK) {
       reveal(lenient.body, pos);
       kind = advance(lenient, c, pos, false);
     }
-    if (kind === TEXT) mask |= C | D;
-    else if (kind === BARE) mask |= D;
+    if (kind === TEXT) mask |= C | D | E;
+    else if (kind === BODY) mask |= D;
+    // Forks follow any reveal, so replaying held text in position order repeats them exactly.
+    if (
+      (c === 0x1b || c === 0x9b || prior === STRING_ESC) &&
+      (lenient.state === ESC || lenient.state === CSI)
+    ) {
+      mask |= FORK;
+      fork();
+    }
     marks[pos - bufBase] = mask;
     shown[pos - bufBase] = mask & C ? 1 : 0;
     feed(mask, buf.charAt(pos - bufBase), pos);
     if (pos + 1 - base > limit) release(pos + 1);
   };
   return {
-    /** Held raw characters and pending spans; the view rings hold at most 4 × the longest variant. */
+    /** Backing storage between pushes: held raw text and its maps, pending spans and held whole-value
+     * output. The view rings hold at most 5 × the longest variant. */
     get retained() {
-      return { text: end - base, spans: spans.length - head };
+      return {
+        text: buf.length,
+        maps: Math.max(marks.length, shown.length),
+        spans: spans.length,
+        output: lead?.length ?? 0,
+      };
     },
     push(chunk: string, flush = false): string {
       const latest = current();
@@ -219,17 +246,17 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
         // Rematch decided held text, including terminal state, against the new registrations.
         matcher = latest;
         reset();
-        for (let pos = base; pos < end; pos++)
+        for (let pos = base; pos < end; pos++) {
+          if ((marks[pos - bufBase] ?? 0) & FORK) fork();
           feed(marks[pos - bufBase] ?? 0, buf.charAt(pos - bufBase), pos);
+        }
       }
-      const held = [marks, shown].map((array) => {
-        const next = new Uint8Array(end - base + chunk.length);
-        next.set(array.subarray(base - bufBase, end - bufBase));
+      const grow = (array: Uint8Array) => {
+        const next = new Uint8Array(array.length + chunk.length);
+        next.set(array);
         return next;
-      });
-      [marks = new Uint8Array(), shown = new Uint8Array()] = held;
-      buf = buf.slice(base - bufBase) + chunk;
-      bufBase = base;
+      };
+      [marks, shown, buf] = [grow(marks), grow(shown), buf + chunk];
       out = "";
       const total = bufBase + buf.length;
       const next = [-1, -1];
@@ -246,7 +273,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
           const bound = inString ? lenient.body + TERMINAL_HOLD : total;
           const stop = Math.min(next[i] ?? end, base + limit, bound);
           if (stop > end) {
-            bulk(end, stop, (strict.state === GROUND ? A | B : A) | (inString ? 0 : C | D));
+            bulk(end, stop, (strict.state === GROUND ? A | B : A) | (inString ? 0 : C | D | E));
             end = stop;
             continue;
           }
@@ -261,6 +288,17 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       } else release(end);
       spans.splice(0, head);
       head = 0;
+      // Keep only the carry: joining copies it, where a slice would retain the whole chunk.
+      [buf, marks, shown] = [
+        [buf.slice(base - bufBase), ""].join(""),
+        marks.slice(base - bufBase),
+        shown.slice(base - bufBase),
+      ];
+      bufBase = base;
+      if (lead !== undefined)
+        [out, lead] =
+          lead.length + out.length > matcher.maxLength ? [lead + out, undefined] : ["", lead + out];
+      if (flush) [out, lead] = [lead !== undefined && matcher.has(lead) ? MARKER : (lead ?? out), ""];
       return out;
     },
   };

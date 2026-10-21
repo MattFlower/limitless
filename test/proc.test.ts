@@ -223,6 +223,35 @@ test("runner keeps overlapping credentials raw in one chunk and at every split o
   }
 });
 
+test("runner redacts output that is wholly a short credential at every split", async () => {
+  const short = "Sy7x2Q";
+  registerCredential("SHORT_WHOLE_TEST_TOKEN", short);
+  for (const [text, expected] of [
+    [short, "[redacted]"],
+    [`\u001b[1m${short}\u001b[0m`, "[redacted]"],
+    [`${short} and more`, `${short} and more`],
+  ] as const)
+    for (const stream of ["stdout", "stderr"] as const)
+      for (let offset = 0; offset <= text.length; offset++) {
+        const lines: string[] = [];
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(result[stream]).toBe(expected);
+        expect(lines).toEqual([expected]);
+      }
+});
+
 test("open streams apply new registrations to raw carry and later split output", async () => {
   registerCredential("LATE_CARRY_LENGTH", `synthetic-carry-${"x".repeat(200)}`);
   for (const stream of ["stdout", "stderr"] as const) {
@@ -319,32 +348,38 @@ test("runner strips split terminal sequences before matching and leaves raw obse
   }
   // A stray introducer would consume the first character; the tail cut falls inside the result.
   const stray = "terminal-synthetic-stray-credential";
+  // Digits would instead be consumed as the parameters of the stray sequence.
+  const digits = "70707070synthetic-stray-digits";
   registerCredential("TERMINAL_STRAY_TEST_TOKEN", stray);
-  const text = `error: \u001b[${stray.slice(0, 9)}\u001b[31m${stray.slice(9)}\u001b[0m\n(fail) terminal\n`;
-  for (const stream of ["stdout", "stderr"] as const) {
-    for (let offset = 0; offset <= text.length; offset++) {
-      const raw: string[] = [];
-      const lines: string[] = [];
-      const result = await withChunks(
-        [
-          { stream, text: text.slice(0, offset) },
-          { stream, text: text.slice(offset) },
-        ],
-        () =>
-          runProcess({
-            ...options(),
-            redactOutput: true,
-            tailLimit: 25,
-            onRawChunk: (chunk) => raw.push(chunk),
-            onStdoutLine: (line) => lines.push(line),
-            onStderrLine: (line) => lines.push(line),
-          }),
-      );
-      expect(lines).toEqual(["error: [redacted]", "(fail) terminal"]);
-      expect(result[stream]).toBe("error: [redacted]\n(fail) terminal\n".slice(-25));
-      expect(raw.join("")).toBe(text);
+  registerCredential("TERMINAL_STRAY_DIGITS_TEST_TOKEN", digits);
+  for (const text of [
+    `error: \u001b[${stray.slice(0, 9)}\u001b[31m${stray.slice(9)}\u001b[0m\n(fail) terminal\n`,
+    `error: \u009b${digits.slice(0, 4)}\u001b[31m${digits.slice(4, 12)}\u001b[0m${digits.slice(12)}\n(fail) terminal\n`,
+  ])
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const raw: string[] = [];
+        const lines: string[] = [];
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              tailLimit: 25,
+              onRawChunk: (chunk) => raw.push(chunk),
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(lines).toEqual(["error: [redacted]", "(fail) terminal"]);
+        expect(result[stream]).toBe("error: [redacted]\n(fail) terminal\n".slice(-25));
+        expect(raw.join("")).toBe(text);
+      }
     }
-  }
 });
 
 test("runner strips ANSI before the tail cap around a long credential", async () => {

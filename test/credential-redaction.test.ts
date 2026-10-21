@@ -223,15 +223,20 @@ test("shared suffix outputs and overlapping boundaries are resolved without dict
 const ESC = "\u001b";
 const SECRET = "synthetic-terminal-key";
 const [HEAD, TAIL] = [SECRET.slice(0, 5), SECRET.slice(5)];
+// Digits are CSI parameters, so a stray introducer before this credential reads them as a sequence.
+const DIGITS = "12345678abcdefgh";
 // Every two-chunk split, against an independently written expected output; carry stays bounded.
-function expectTerminal(input: string, expected: string, values = [SECRET]) {
+function expectTerminal(input: string, expected: string, values = [SECRET, DIGITS]) {
   const matcher = new CredentialMatcher(variants(values));
   for (let offset = 0; offset <= input.length; offset++) {
     const redactor = terminalRedactor(() => matcher);
     let output = redactor.push(input.slice(0, offset));
-    expect(redactor.retained.text).toBeLessThanOrEqual(matcher.maxLength + TERMINAL_HOLD + 1);
+    const { text, maps, output: held } = redactor.retained;
+    expect(Math.max(text, maps)).toBeLessThanOrEqual(matcher.maxLength + TERMINAL_HOLD + 1);
+    expect(held).toBeLessThanOrEqual(matcher.maxLength);
     output += redactor.push(input.slice(offset), true);
     expect(output).toBe(expected);
+    expect(redactor.retained).toEqual({ text: 0, maps: 0, spans: 0, output: 0 });
   }
 }
 
@@ -241,6 +246,19 @@ test.each([
   ["stray ESC and an SGR inside", `x ${ESC}${HEAD}${ESC}[1m${TAIL} y`, "x [redacted] y"],
   ["stray C1 CSI", `x \u009b${SECRET} y`, "x [redacted] y"],
   ["stray C1 CSI and an SGR inside", `x \u009b${HEAD}${ESC}[31m${TAIL} y`, "x [redacted] y"],
+  [
+    "stray CSI before digits, ended by an SGR inside",
+    `x ${ESC}[1234${ESC}[31m5678abcdefgh y`,
+    "x [redacted] y",
+  ],
+  ["stray CSI before digits, ended by a letter", `x ${ESC}[12345678ab${ESC}[31mcdefgh y`, "x [redacted] y"],
+  ["stray C1 CSI before digits", `x \u009b1234${ESC}[31m5678ab${ESC}[0mcdefgh y`, "x [redacted] y"],
+  [
+    "stray CSI before digits, two SGRs inside",
+    `x ${ESC}[123${ESC}[1m45678${ESC}[0mabcdefgh y`,
+    "x [redacted] y",
+  ],
+  ["stray ESC intermediate", `x ${ESC} ${HEAD}${ESC}[1m${TAIL} y`, "x [redacted] y"],
   ["stray OSC introducer at EOF", `x ${ESC}]${SECRET} y`, "x ][redacted] y"],
   ["stray OSC introducer and an SGR inside", `x ${ESC}]${HEAD}${ESC}[31m${TAIL} y`, "x ][redacted] y"],
   ["SGR reset inside", `x ${HEAD}${ESC}[m${TAIL} y`, "x [redacted] y"],
@@ -279,12 +297,58 @@ test("periodic credentials through a large interrupted stream keep bounded carry
   let output = redactor.push("x");
   for (let i = 0; i < 2_000; i++) {
     output += redactor.push(`${"abc".repeat(50)}${ESC}[1m${"abc".repeat(50)}`);
-    expect(redactor.retained.text).toBeLessThanOrEqual(matcher.maxLength + 8);
-    expect(redactor.retained.spans).toBeLessThanOrEqual(1);
+    const { text, maps, spans } = redactor.retained;
+    expect(Math.max(text, maps)).toBeLessThanOrEqual(matcher.maxLength + 8);
+    expect(spans).toBeLessThanOrEqual(1);
   }
   output += redactor.push("aby", true);
   expect(output).toBe("x[redacted]y");
-  expect(redactor.retained).toEqual({ text: 0, spans: 0 });
+  expect(redactor.retained).toEqual({ text: 0, maps: 0, spans: 0, output: 0 });
+});
+
+test("a large push leaves only the carry in backing storage", () => {
+  const matcher = new CredentialMatcher(variants([SECRET]));
+  const redactor = terminalRedactor(() => matcher);
+  const output = redactor.push(`${ESC}[1m${"y".repeat(3_000_000)}${ESC}[0m${HEAD}`);
+  // The carry is the last maxLength - 1 raw characters: some y, the SGR reset and HEAD.
+  const held = matcher.maxLength - 1 - `${ESC}[0m${HEAD}`.length;
+  expect(output).toBe("y".repeat(3_000_000 - held));
+  expect(redactor.retained).toEqual({
+    text: matcher.maxLength - 1,
+    maps: matcher.maxLength - 1,
+    spans: 0,
+    output: 0,
+  });
+  expect(redactor.push(TAIL, true)).toBe(`${"y".repeat(held)}[redacted]`);
+});
+
+test("a stream whose whole output is a short credential is redacted at every split", () => {
+  const matcher = new CredentialMatcher(variants(["seven77", SECRET]));
+  for (const [input, expected] of [
+    ["seven77", "[redacted]"],
+    [`${ESC}[1mseven77${ESC}[0m`, "[redacted]"],
+    ["seven77\n", "seven77\n"],
+    [`x seven77 ${"y".repeat(40)}`, `x seven77 ${"y".repeat(40)}`],
+  ] as const)
+    for (let offset = 0; offset <= input.length; offset++) {
+      const redactor = terminalRedactor(() => matcher);
+      expect(redactor.push(input.slice(0, offset)) + redactor.push(input.slice(offset), true)).toBe(expected);
+    }
+});
+
+test("a registration while a stray introducer is held rematches it", () => {
+  const input = `x ${ESC}[1234${ESC}[31m5678${ESC}[0mabcdefgh y`;
+  const before = new CredentialMatcher(variants([SECRET]));
+  const after = new CredentialMatcher(variants([SECRET, DIGITS]));
+  // Registered before the credential-bearing input, with the introducer already held.
+  for (let offset = 0; offset <= input.indexOf("1234"); offset++) {
+    let matcher = before;
+    const redactor = terminalRedactor(() => matcher);
+    let output = redactor.push(input.slice(0, offset));
+    matcher = after;
+    output += redactor.push(input.slice(offset), true);
+    expect(output).toBe("x [redacted] y");
+  }
 });
 
 test("an unterminated strict string bounds carry and releases visible text while open", () => {
