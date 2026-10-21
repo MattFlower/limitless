@@ -1,5 +1,6 @@
 import type { EvalTrial, ReviewSystem } from "../core/types.ts";
 import { parseTarget } from "../router/targets.ts";
+import { activity } from "../util/stall.ts";
 import type { Store } from "./store.ts";
 
 export interface DayStats {
@@ -59,6 +60,9 @@ export interface ProviderWorkload {
 
 /** Calendar days use the daemon's local timezone, including across DST changes. */
 export function computeProviderWorkload(store: Store, now = Date.now()): ProviderWorkload[] {
+  return activity("stats.computeProviderWorkload", () => computeProviderWorkloadQuery(store, now));
+}
+function computeProviderWorkloadQuery(store: Store, now = Date.now()): ProviderWorkload[] {
   const current = new Date(now);
   const today = new Date(current.getFullYear(), current.getMonth(), current.getDate()).getTime();
   const sevenDays = new Date(current.getFullYear(), current.getMonth(), current.getDate() - 6).getTime();
@@ -348,6 +352,9 @@ export function computeProviderStatistics(
 }
 
 export function computeStats(store: Store, days = 14): Stats {
+  return activity("stats.computeStats", () => computeStatsQuery(store, days));
+}
+function computeStatsQuery(store: Store, days = 14): Stats {
   const since = Date.now() - days * 86_400_000;
   const attention = store.db
     .query(`

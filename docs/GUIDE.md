@@ -133,8 +133,11 @@ limitless init --yes --repo <owner>/<repo> --json
 model servers, fills missing providers and repository settings, starts the service, and saves live
 smoke results. It asks before registering MCP with Claude Code or Codex; `--yes` grants consent.
 Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
-Re-running keeps existing settings and fills gaps. Existing TOML comments and unrelated settings
-are preserved, and changes create a timestamped backup. Converting to `[[providers]]` requires
+Init also fills a missing `[owners] github` using `gh api user`; interactively, you can override
+the discovered login. Without a usable login or supplied owner, it reports that Dependabot runs,
+issue-label triggers and `/limitless` comment triggers remain disabled. Re-running keeps existing
+settings and fills gaps. Existing TOML comments and unrelated settings are preserved, and changes
+create a timestamped backup. Converting to `[[providers]]` requires
 consent because the previous release cannot read it. If service startup, smoke checks, or MCP
 registration fails, init restores the original config. Discreet mode defaults to off; init records
 your choice in its summary, with behavior deferred to #37.
@@ -166,6 +169,11 @@ use the file first, then the environment.
 | `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID` | The Discord bot (also needs `[owners].discord` and `[discord].channel_id`) |
 | `GITHUB_WEBHOOK_SECRET` | `POST /webhooks/github`. Without it, the endpoint answers 503. |
 
+**Before upgrading:** installations relying on the former hardcoded GitHub owner must explicitly
+set `github = "<owner>"` under `[owners]` in `config.toml` before upgrading, or their Dependabot
+runs, issue-label triggers and `/limitless` comment triggers stop. Ordinary config loading never
+discovers an owner.
+
 **`config.toml`** keys (all optional; defaults shown):
 
 | Key | Default | Meaning |
@@ -187,7 +195,7 @@ use the file first, then the environment.
 | `[reserves] codex_five_hour` | `0.90` | Codex 5-hour window |
 | `[reserves] codex_weekly` | `0.90` | Codex weekly (`seven_day`) window |
 | `[reserves.windows.<provider>] <window>` | `1.0` | Reserve for any other provider or quota window, for example `[reserves.windows.my_provider] daily = 0.80` |
-| `[owners] github` | `"MattFlower"` | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login. |
+| `[owners] github` | unset | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled until set. `limitless doctor` warns when unset. |
 | `[owners] discord` | unset | The only Discord user ID allowed to use the bot |
 | `[discord] channel_id` | unset | Text channel for run threads and quota alerts |
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
@@ -413,6 +421,9 @@ Create a repository webhook pointing at `https://<your-host>/webhooks/github`. U
 and **Pull requests** events. See [the webhook tunnel](#webhook-tunnel) for exposing the endpoint.
 Deliveries are HMAC-verified and deduplicated by delivery ID. Through the tunnel, the source IP
 must also be in GitHub's published hook ranges.
+
+Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled unless
+`[owners] github` is configured.
 
 - **Issue label:** adding the `limitless` label creates a run. Both the person labelling and the
   issue author must be `[owners].github`, and the repository must belong to that account. The
