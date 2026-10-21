@@ -52,6 +52,7 @@ export interface Config {
   publicUrl: string | null; // e.g. https://limitless.example.com (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
+  maxLoadPerCore: number;
   providerMaxConcurrent: Record<string, number>;
   catalog?: EffectiveCatalog;
   /** Gate suites (setup + checks) allowed to run at once across the whole process. */
@@ -221,6 +222,9 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   if (server.require_api_token !== undefined && typeof server.require_api_token !== "boolean")
     throw new Error("server.require_api_token must be a boolean");
   const limits = (raw.limits ?? {}) as Record<string, unknown>;
+  const maxLoadPerCore = limits.max_load_per_core === undefined ? 2 : limits.max_load_per_core;
+  if (typeof maxLoadPerCore !== "number" || !Number.isFinite(maxLoadPerCore) || maxLoadPerCore < 0)
+    throw new Error("limits.max_load_per_core must be a finite number greater than or equal to zero");
   const reserves = (raw.reserves ?? {}) as Record<string, unknown>;
   const owners = (raw.owners ?? {}) as Record<string, unknown>;
   const discord = (raw.discord ?? {}) as Record<string, unknown>;
@@ -407,6 +411,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     publicUrl: str(server.public_url, null),
     uiUrl: str(server.ui_url, `http://localhost:${port}`) as string,
     maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
+    maxLoadPerCore,
     providerMaxConcurrent,
     catalog,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
