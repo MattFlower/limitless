@@ -648,7 +648,7 @@ async function main(): Promise<void> {
             for (const group of ["models", "roles", "days"] as const)
               for (const item of data[group])
                 print(
-                  `${group}: ${row.provider} ${item.modelId ?? "(unknown model)"} ${item.role ?? item.day ?? ""}`,
+                  `${group}: ${row.provider} ${item.compound ? `compound [${item.participants?.join(", ") ?? "unknown models"}]` : (item.modelId ?? "(unknown model)")} ${item.role ?? item.day ?? ""}`,
                   item,
                 );
           }

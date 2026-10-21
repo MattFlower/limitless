@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import type { EvalTrial } from "../src/core/types.ts";
+import type { ProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { PROVIDERS } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
@@ -294,6 +296,98 @@ test("provider stats preserve chat/calendar totals while historical cutoffs affe
       expect(invalid.status).toBe(400);
       expect(await invalid.json()).toMatchObject({ error: expect.stringContaining("invalid ISO-8601") });
     }
+    const run = store.createEvalRun({ role: "review", models: ["retired/m"], k: 1, maxUsd: 10 }, []);
+    const trial: EvalTrial = {
+      evalRunId: run.id,
+      modelId: "retired/m",
+      effort: null,
+      caseId: "case",
+      trial: 0,
+      cacheKey: "key",
+      harness: "fake",
+      status: "ok",
+      output: null,
+      pass: true,
+      score: 1,
+      createdAt: at,
+      tokensIn: 12,
+      tokensOut: 4,
+      costUsd: 0.5,
+      costEquivUsd: 1,
+      durationMs: 250,
+      details: {
+        provider: "retired",
+        invocationStatus: "ok",
+        cacheReadTokens: 2,
+        cacheWriteTokens: 0,
+        verifiers: [{ modelId: "other/verifier", effort: "high", candidates: [] }],
+      },
+    };
+    store.recordEvalTrial(trial);
+    store.recordEvalTrial({
+      ...trial,
+      trial: 1,
+      status: "running",
+      pass: null,
+      score: null,
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+      costEquivUsd: 0,
+      durationMs: 0,
+      details: { provider: "retired", cacheReadTokens: 0, cacheWriteTokens: 0 },
+    });
+    store.recordEvalTrial({
+      ...trial,
+      trial: 2,
+      status: "queued",
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+      costEquivUsd: 0,
+      durationMs: 0,
+      details: { provider: "retired" },
+    });
+    store.interruptEval(run.id, "restart");
+    const workload = (await (await get(new Date(at).toISOString())).json()) as ProviderWorkload[];
+    expect(workload.map((r) => r.provider)).toEqual(["(compound/unattributed)", "retired"]);
+    expect(workload[0]?.eval?.models[0]).toMatchObject({
+      provider: null,
+      modelId: null,
+      compound: true,
+      participants: ["other/verifier", "retired/m"],
+      invocations: 1,
+      tokensIn: 12,
+      tokensOut: 4,
+      costUsd: 0.5,
+      costEquivUsd: 1,
+      wallTimeMs: 250,
+      countingUnits: { invocation: 0, round: 0, trial: 1 },
+    });
+    expect(workload[0]?.eval?.roles[0]?.role).toBe("review");
+    const unknown = {
+      invocations: 1,
+      successfulShare: 0,
+      tokensIn: null,
+      inputTokens: null,
+      tokensOut: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      costUsd: null,
+      costEquivUsd: null,
+      wallTimeMs: 0,
+      p50WallTimeMs: null,
+    };
+    const evaluation = workload[1]?.eval;
+    for (const total of [
+      evaluation?.totals,
+      evaluation?.models[0],
+      evaluation?.roles[0],
+      evaluation?.days[0],
+    ])
+      expect(total).toMatchObject(unknown);
+    expect(workload[1]?.production).toEqual(rows[0].production);
+    expect((await (await get(new Date(at + 1).toISOString())).json())[0].eval.totals.invocations).toBe(0);
   } finally {
     await f.close();
   }

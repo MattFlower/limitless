@@ -1,6 +1,6 @@
 import { expect, setSystemTime, test } from "bun:test";
 import { parseSince } from "../src/core/since.ts";
-import type { EvalRound, EvalTrial } from "../src/core/types.ts";
+import type { EvalRound, EvalTrial, ReviewSystem } from "../src/core/types.ts";
 import { computeProviderStatistics, computeProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { emptyUsage } from "../src/harness/types.ts";
@@ -432,10 +432,15 @@ function dayKey(at: number) {
   const d = new Date(at);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-function evalTrial(store: Store, patch: Partial<EvalTrial> = {}) {
-  const run = store.createEvalRun({ role: "implement", models: ["m"], k: 1, maxUsd: 10 }, []);
+function evalTrial(store: Store, patch: Partial<EvalTrial> = {}, systems?: ReviewSystem[]) {
+  const evalRunId =
+    patch.evalRunId ??
+    store.createEvalRun(
+      { role: systems ? "review" : "implement", models: ["m"], k: 1, maxUsd: 10, systems },
+      [],
+    ).id;
   const trial: EvalTrial = {
-    evalRunId: run.id,
+    evalRunId,
     effort: null,
     caseId: "case",
     modelId: "legacy-model",
@@ -456,7 +461,224 @@ function evalTrial(store: Store, patch: Partial<EvalTrial> = {}) {
     ...patch,
   };
   store.recordEvalTrial(trial);
+  return trial;
 }
+
+test("unsplit verifier and multi-finder trials retain totals only in compound participant groups", () => {
+  const store = new Store(":memory:");
+  try {
+    const system: ReviewSystem = {
+      name: "panel",
+      mode: "panel",
+      implementerReport: "omit",
+      finders: [{ target: "alpha/finder@high", prompt: "standard" }],
+      verifier: { target: "beta/verifier" },
+    };
+    const details = {
+      provider: "alpha",
+      invocationStatus: "ok" as const,
+      cacheReadTokens: 2,
+      cacheWriteTokens: 1,
+    };
+    evalTrial(
+      store,
+      {
+        modelId: "alpha/finder",
+        details: {
+          ...details,
+          system: "panel",
+          verifiers: [
+            { modelId: "beta/verifier", effort: "high", candidates: [] },
+            { modelId: "beta/verifier", effort: "high", candidates: [] },
+          ],
+        },
+      },
+      [system],
+    );
+    const finders: ReviewSystem = {
+      ...system,
+      name: "finders",
+      mode: "single",
+      finders: [
+        { target: "beta/finder@high", prompt: "standard" },
+        { target: "alpha/finder", prompt: "trace" },
+      ],
+      verifier: undefined,
+    };
+    evalTrial(
+      store,
+      {
+        modelId: "beta/finder",
+        tokensIn: 20,
+        tokensOut: 8,
+        costUsd: 1,
+        costEquivUsd: 2,
+        durationMs: 300,
+        details: { ...details, provider: "beta", system: "finders" },
+      },
+      [finders],
+    );
+    // A single finder remains attributable, even when other systems exist in the run.
+    evalTrial(
+      store,
+      {
+        modelId: "alpha/finder",
+        details: { ...details, system: "single" },
+      },
+      [system, { ...system, name: "single", mode: "single", verifier: undefined }],
+    );
+    // Recorded rounds take precedence over trial totals and compound metadata, including on interruption.
+    evalTrial(
+      store,
+      {
+        costUsd: 999,
+        details: {
+          ...details,
+          invocationStatus: undefined,
+          interrupted: true,
+          system: "finders",
+          rounds: [
+            {
+              round: 0,
+              modelId: "beta/round",
+              provider: "beta",
+              effort: "high",
+              status: "ok",
+              pass: true,
+              reason: null,
+              tokensIn: 7,
+              tokensOut: 3,
+              costUsd: 0.25,
+              costEquivUsd: 0.5,
+              durationMs: 50,
+            },
+          ],
+        },
+      },
+      [finders],
+    );
+    const rows = computeProviderStatistics(store, cutoff, cutoff);
+    expect(rows.map((r) => r.provider)).toEqual(["(compound/unattributed)", "alpha", "beta"]);
+    expect(rows.every((r) => r.production?.totals.invocations === 0)).toBe(true);
+    const compound = rows[0]?.eval;
+    expect(compound?.totals).toEqual({
+      invocations: 2,
+      successfulShare: 1,
+      countingUnits: { invocation: 0, round: 0, trial: 2 },
+      tokensIn: 30,
+      inputTokens: 24,
+      tokensOut: 12,
+      cacheReadTokens: 4,
+      cacheWriteTokens: 2,
+      costUsd: 1.5,
+      costEquivUsd: 3,
+      wallTimeMs: 400,
+      p50WallTimeMs: 200,
+    });
+    for (const group of [compound?.models, compound?.roles, compound?.days]) {
+      expect(group).toHaveLength(2);
+      expect(
+        group?.map((r) => ({
+          provider: r.provider,
+          modelId: r.modelId,
+          compound: r.compound,
+          participants: r.participants,
+          count: r.invocations,
+          cost: r.costUsd,
+        })),
+      ).toEqual([
+        {
+          provider: null,
+          modelId: null,
+          compound: true,
+          participants: ["alpha/finder", "beta/finder"],
+          count: 1,
+          cost: 1,
+        },
+        {
+          provider: null,
+          modelId: null,
+          compound: true,
+          participants: ["alpha/finder", "beta/verifier"],
+          count: 1,
+          cost: 0.5,
+        },
+      ]);
+    }
+    expect(compound?.roles.map((r) => r.role)).toEqual(["review", "review"]);
+    expect(compound?.days.map((r) => r.day)).toEqual([dayKey(cutoff), dayKey(cutoff)]);
+    expect(rows[1]?.eval?.totals).toMatchObject({
+      invocations: 1,
+      tokensIn: 10,
+      costUsd: 0.5,
+      wallTimeMs: 100,
+    });
+    expect(rows[1]?.eval?.models[0]).toMatchObject({ provider: "alpha", modelId: "alpha/finder" });
+    expect(rows[2]?.eval?.totals).toMatchObject({
+      invocations: 1,
+      tokensIn: 7,
+      costUsd: 0.25,
+      wallTimeMs: 50,
+      countingUnits: { invocation: 0, round: 1, trial: 0 },
+    });
+    expect(rows[2]?.eval?.models[0]).toMatchObject({ provider: "beta", modelId: "beta/round" });
+    expect(computeProviderStatistics(store, cutoff + 1, cutoff)).toEqual([]);
+  } finally {
+    store.close();
+  }
+});
+
+test("restart-interrupted executions count unknown usage, exclude queued work and propagate unknown sums", () => {
+  const store = new Store(":memory:");
+  try {
+    const running = evalTrial(store, {
+      status: "running",
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+      costEquivUsd: 0,
+      durationMs: 0,
+      details: { provider: "legacy", cacheReadTokens: 0, cacheWriteTokens: 0 },
+    });
+    evalTrial(store, { ...running, trial: 1, status: "queued" });
+    store.interruptEval(running.evalRunId, "restart");
+    const unknown = {
+      tokensIn: null,
+      inputTokens: null,
+      tokensOut: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      costUsd: null,
+      costEquivUsd: null,
+    };
+    const interrupted = computeProviderStatistics(store, cutoff, cutoff)[0]?.eval;
+    expect(interrupted?.totals).toEqual({
+      ...unknown,
+      invocations: 1,
+      successfulShare: 0,
+      countingUnits: { invocation: 0, round: 0, trial: 1 },
+      wallTimeMs: 0,
+      p50WallTimeMs: null,
+    });
+    evalTrial(store, { evalRunId: running.evalRunId, trial: 2 });
+    const mixed = computeProviderStatistics(store, cutoff, cutoff)[0]?.eval;
+    for (const total of [mixed?.totals, mixed?.models[0], mixed?.roles[0], mixed?.days[0]]) {
+      expect(total).toMatchObject({
+        ...unknown,
+        invocations: 2,
+        successfulShare: 0.5,
+        countingUnits: { invocation: 0, round: 0, trial: 2 },
+        wallTimeMs: 100,
+        p50WallTimeMs: 100,
+      });
+    }
+    expect(mixed?.models).toHaveLength(1);
+    expect(mixed?.roles).toHaveLength(1);
+    expect(mixed?.days).toHaveLength(1);
+  } finally {
+    store.close();
+  }
+});
 
 test("evals count recorded rounds or trials once, with unknown cache splits and attribution explicit", () => {
   const store = new Store(":memory:");

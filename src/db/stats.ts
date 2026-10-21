@@ -1,4 +1,5 @@
-import type { EvalTrial } from "../core/types.ts";
+import type { EvalTrial, ReviewSystem } from "../core/types.ts";
+import { parseTarget } from "../router/targets.ts";
 import type { Store } from "./store.ts";
 
 export interface DayStats {
@@ -139,6 +140,9 @@ export interface HistoricalTotals {
 interface HistoricalRow extends HistoricalTotals {
   provider: string | null;
   modelId: string | null;
+  /** Unsplit multi-call trial totals, never attributed to an individual participant. */
+  compound?: boolean;
+  participants?: string[];
   role?: string;
   day?: string;
 }
@@ -200,7 +204,13 @@ function historical(rows: WorkRecord[]): HistoricalWorkload {
   const groups = (dimension?: "role" | "day"): HistoricalRow[] => {
     const grouped = new Map<string, WorkRecord[]>();
     for (const row of rows) {
-      const key = JSON.stringify([dimension ? row[dimension] : null, row.provider, row.modelId]);
+      const key = JSON.stringify([
+        dimension ? row[dimension] : null,
+        row.provider,
+        row.modelId,
+        row.compound,
+        row.participants,
+      ]);
       const values = grouped.get(key) ?? [];
       values.push(row);
       grouped.set(key, values);
@@ -213,6 +223,7 @@ function historical(rows: WorkRecord[]): HistoricalWorkload {
         return {
           provider: row.provider,
           modelId: row.modelId,
+          ...(row.compound ? { compound: true, participants: row.participants } : {}),
           ...(dimension ? { [dimension]: row[dimension] } : {}),
           ...summarize(values),
         };
@@ -243,9 +254,14 @@ export function computeProviderStatistics(
   for (const row of production) row.day = workloadDay(row.startedAt);
   const trials = store.db
     .query(
-      `SELECT t.*, r.role FROM eval_trials t JOIN eval_runs r ON r.id = t.eval_run_id WHERE t.created_at >= ? AND t.status != 'queued'`,
+      `SELECT t.*, r.role, s.systems_json FROM eval_trials t JOIN eval_runs r ON r.id = t.eval_run_id
+       LEFT JOIN eval_run_systems s ON s.eval_run_id = r.id WHERE t.created_at >= ? AND t.status != 'queued'`,
     )
-    .all(since) as (Record<string, string | number> & { role: string; details_json: string })[];
+    .all(since) as (Record<string, string | number | null> & {
+    role: string;
+    details_json: string;
+    systems_json: string | null;
+  })[];
   const evaluation: WorkRecord[] = [];
   for (const t of trials) {
     const details = JSON.parse(t.details_json) as EvalTrial["details"];
@@ -254,6 +270,7 @@ export function computeProviderStatistics(
     // Skips and preparation failures can happen before any provider call.
     if (
       !rounds?.length &&
+      details.interrupted !== true &&
       details.invocationStatus == null &&
       (t.status === "skipped" || details.preparationFailed) &&
       t.tokens_in === 0 &&
@@ -262,26 +279,41 @@ export function computeProviderStatistics(
       t.cost_equiv_usd === 0
     )
       continue;
+    const system = (JSON.parse(t.systems_json ?? "[]") as ReviewSystem[]).find(
+      (s) => details.system !== undefined && s.name === details.system,
+    );
+    const compound = !rounds?.length && (!!details.verifiers?.length || (system?.finders.length ?? 0) > 1);
+    const participants = compound
+      ? [
+          ...new Set([
+            String(t.model_id),
+            ...(system?.finders.flatMap((f) => (f.target ? [parseTarget(f.target).modelId] : [])) ?? []),
+            ...(details.verifiers?.map((v) => v.modelId) ?? []),
+          ]),
+        ].sort()
+      : undefined;
+    const unknown = details.interrupted === true && details.invocationStatus == null;
     const records = rounds?.length
       ? rounds
       : [
           {
             provider: details.provider,
             modelId: String(t.model_id),
-            status: details.invocationStatus ?? String(t.status),
-            tokensIn: Number(t.tokens_in),
-            tokensOut: Number(t.tokens_out),
-            costUsd: Number(t.cost_usd),
-            costEquivUsd: Number(t.cost_equiv_usd),
-            durationMs: Number(t.duration_ms),
+            status: details.invocationStatus ?? (unknown ? "interrupted" : String(t.status)),
+            tokensIn: unknown ? null : Number(t.tokens_in),
+            tokensOut: unknown ? null : Number(t.tokens_out),
+            costUsd: unknown ? null : Number(t.cost_usd),
+            costEquivUsd: unknown ? null : Number(t.cost_equiv_usd),
+            durationMs: unknown ? null : Number(t.duration_ms),
           },
         ];
     for (const r of records) {
-      const read = rounds?.length ? null : (details.cacheReadTokens ?? null);
-      const write = rounds?.length ? null : (details.cacheWriteTokens ?? null);
+      const read = rounds?.length || unknown ? null : (details.cacheReadTokens ?? null);
+      const write = rounds?.length || unknown ? null : (details.cacheWriteTokens ?? null);
       evaluation.push({
-        provider: r.provider ?? null,
-        modelId: r.modelId ?? null,
+        provider: compound ? null : (r.provider ?? null),
+        modelId: compound ? null : (r.modelId ?? null),
+        ...(compound ? { compound: true, participants } : {}),
         role: t.role,
         day: workloadDay(Number(t.created_at)),
         status: r.status,
@@ -298,10 +330,11 @@ export function computeProviderStatistics(
     }
   }
   const legacy = computeProviderWorkload(store, now);
+  const bucket = (r: WorkRecord) => (r.compound ? "(compound/unattributed)" : r.provider);
   const providers = new Set([
     ...legacy.map((r) => r.provider),
     ...production.map((r) => r.provider),
-    ...evaluation.map((r) => r.provider),
+    ...evaluation.map(bucket),
   ]);
   return [...providers].sort().map((provider) => ({
     ...(legacy.find((r) => r.provider === provider) ?? {
@@ -310,7 +343,7 @@ export function computeProviderStatistics(
       sevenDays: emptyWorkload(),
     }),
     production: historical(production.filter((r) => r.provider === provider)),
-    eval: historical(evaluation.filter((r) => r.provider === provider)),
+    eval: historical(evaluation.filter((r) => bucket(r) === provider)),
   }));
 }
 

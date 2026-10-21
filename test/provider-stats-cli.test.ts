@@ -19,6 +19,28 @@ const totals = {
 };
 const identity = { provider: "retired", modelId: "old-model" };
 const legacy = { provider: "retired", today: {}, sevenDays: {} };
+const interrupted = {
+  ...totals,
+  invocations: 1,
+  successfulShare: 0,
+  countingUnits: { invocation: 0, round: 0, trial: 1 },
+  tokensIn: null,
+  inputTokens: null,
+  tokensOut: null,
+  cacheReadTokens: null,
+  cacheWriteTokens: null,
+  costUsd: null,
+  costEquivUsd: null,
+  wallTimeMs: 0,
+  p50WallTimeMs: null,
+};
+const compound = {
+  provider: null,
+  modelId: null,
+  compound: true,
+  participants: ["alpha/finder", "beta/verifier"],
+  ...interrupted,
+};
 const rows = [
   {
     ...legacy,
@@ -34,6 +56,17 @@ const rows = [
       models: [],
       roles: [],
       days: [],
+    },
+  },
+  {
+    provider: "(compound/unattributed)",
+    today: {},
+    sevenDays: {},
+    eval: {
+      totals: interrupted,
+      models: [compound],
+      roles: [{ ...compound, role: "review" }],
+      days: [{ ...compound, day: "2026-09-01" }],
     },
   },
 ];
@@ -95,6 +128,13 @@ test("stats providers prints section, provider/model, role/day and unit labels",
     "total 400 ms",
     "p50 200 ms",
     '"trial":2',
+    "(compound/unattributed)",
+    "compound [alpha/finder, beta/verifier]",
+    "compound [alpha/finder, beta/verifier] review",
+    "compound [alpha/finder, beta/verifier] 2026-09-01",
+    "input unknown, output unknown, cache-read unknown, cache-write unknown",
+    "metered $unknown, API-equivalent $unknown",
+    "total 0 ms, p50 unknown ms",
   ])
     expect(result.stdout).toContain(text);
 });
