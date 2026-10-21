@@ -1185,7 +1185,9 @@ test("discreet conflict rounds publish neutral merges and recover posted comment
   await git(join(root, "remote.git"), "branch", "-m", branch, "change/feature");
   branch = "change/feature";
   factory.store.updateRun(owner.id, { branch });
-  factory.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  factory.cfg.repos = {
+    "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+  };
   const tip = await advanceBase();
   const id = await trigger();
   const gh = factory.deps.gh;

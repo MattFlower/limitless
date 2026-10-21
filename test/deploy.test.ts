@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -18,6 +18,7 @@ import {
   type DeployClient,
   type DeployClock,
   DrainUnsupportedError,
+  localDeployClient,
   parseMaxWait,
   requestAdmin,
   validateHealth,
@@ -464,12 +465,23 @@ test("failure after a possible drain restores release and resumes, retaining cle
       expect(f.calls.filter((c) => c === "restart")).toHaveLength(2);
   }
   const f = setup();
-  f.client.admin = async (action) => {
-    throw new Error(action === "drain" ? "original failure" : "cleanup failure");
+  const local = localDeployClient(7400);
+  f.client.admin = async (action, signal) => {
+    if (action === "drain") throw new Error("original failure");
+    return local.admin(action, signal);
   };
-  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
-    /original failure[\s\S]*Cleanup failures:[\s\S]*cleanup failure/,
+  const fetcher = spyOn(globalThis, "fetch").mockResolvedValue(
+    Response.json({ error: "cleanup failure" }, { status: 401 }),
   );
+  try {
+    await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
+      /original failure[\s\S]*Cleanup failures:[\s\S]*resume[\s\S]*HTTP 401: cleanup failure/,
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(f.sleeps).toEqual([]);
+  } finally {
+    fetcher.mockRestore();
+  }
 });
 
 test("malformed health fails closed and never restarts", async () => {
@@ -606,37 +618,64 @@ test("an answered poll resets the silence budget between two 40 second stalls", 
   expect(f.clock.now()).toBeGreaterThan(80_000);
 });
 
-test("drain retries transport failures but fails immediately on answered errors", async () => {
-  for (const error of [
-    Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
-    new Error("HTTP 500"),
-    new Error("invalid JSON"),
-  ]) {
+test("drain retries pre-response transport failures", async () => {
+  for (const code of ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"]) {
     const f = setup();
-    let reads = 0;
-    f.client.health = async () => {
-      if (++reads === 1) throw error;
-      return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: [] };
-    };
-    const result = waitForDrain(f.client, f.clock, 180_000, false, () => {});
-    if ("code" in error) {
-      await result;
-      expect(reads).toBe(2);
-    } else {
-      await expect(result).rejects.toBe(error);
-      expect(reads).toBe(1);
+    const fetcher = spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(Object.assign(new Error("connection failed"), { code }))
+      .mockResolvedValue(Response.json({ ok: true, uptimeMs: 1, draining: true, active: [] }));
+    try {
+      await waitForDrain(localDeployClient(7400), f.clock, 180_000, false, () => {});
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      expect(f.sleeps).toEqual([2000]);
+    } finally {
+      fetcher.mockRestore();
     }
   }
-  const f = setup();
-  let reads = 0;
-  f.client.health = async () => {
-    reads++;
-    return { ok: false } as unknown as HealthResponse;
-  };
-  await expect(waitForDrain(f.client, f.clock, 180_000, false, () => {})).rejects.toThrow(
-    "invalid or unhealthy",
-  );
-  expect(reads).toBe(1);
+});
+
+test("answered health failures reject without retries or restarting, even at the drain deadline", async () => {
+  for (const failure of ["http", "json", "health", "body", "late body", "stalled body"]) {
+    const f = setup();
+    const response =
+      failure === "http"
+        ? Response.json({}, { status: 500 })
+        : failure === "json"
+          ? new Response("{")
+          : Response.json({ ok: false });
+    if (failure.includes("body")) {
+      spyOn(response, "json").mockImplementation(async () => {
+        if (failure === "stalled body") {
+          for (const timeout of [...f.pending]) timeout();
+          return new Promise<never>(() => {});
+        }
+        if (failure === "late body") await f.clock.sleep(180_000);
+        throw Object.assign(new Error("body stream reset"), { code: "ECONNRESET" });
+      });
+    }
+    const fetcher = spyOn(globalThis, "fetch").mockResolvedValue(response);
+    try {
+      const result = waitForDrain(localDeployClient(7400), f.clock, 180_000, false, (line) =>
+        f.logs.push(line),
+      );
+      if (failure === "json") await expect(result).rejects.toBeInstanceOf(SyntaxError);
+      else
+        await expect(result).rejects.toThrow(
+          failure === "http"
+            ? "HTTP 500"
+            : failure === "health"
+              ? "invalid or unhealthy"
+              : failure === "stalled body"
+                ? "daemon response timed out"
+                : "body stream reset",
+        );
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(f.sleeps).toEqual(failure === "late body" ? [180_000] : []);
+      expect(f.logs).toEqual([]);
+    } finally {
+      fetcher.mockRestore();
+    }
+  }
 });
 
 test("the overall drain deadline still restarts during unanswered polls", async () => {
@@ -650,41 +689,95 @@ test("the overall drain deadline still restarts during unanswered polls", async 
   expect(f.logs.at(-1)).toBe("Drain timeout after 20s; restarting");
 });
 
-test("resume retries resets, timeouts and missing acknowledgements within 120 seconds", async () => {
+test("resume retries pre-response resets and timeouts within 120 seconds", async () => {
+  const f = setup();
+  let calls = 0;
+  const fetcher = spyOn(globalThis, "fetch").mockImplementation((async (
+    _url: Parameters<typeof fetch>[0],
+  ) => {
+    calls++;
+    if (calls <= 2) throw Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+    if (calls === 3) {
+      queueMicrotask(async () => {
+        await f.clock.sleep(f.timeouts.at(-1) ?? 0);
+        for (const timeout of [...f.pending]) timeout();
+      });
+      return new Promise<never>(() => {});
+    }
+    return Response.json({ draining: false, active: [] });
+  }) as typeof fetch);
+  try {
+    await requestAdmin(localDeployClient(7400), f.clock, "resume");
+    expect(calls).toBe(4);
+    expect(f.timeouts).toEqual([15_000, 15_000, 15_000, 15_000]);
+    expect(f.sleeps).toEqual([2000, 2000, 15_000, 2000]);
+    fetcher.mockRejectedValue(Object.assign(new Error("socket reset"), { code: "ECONNRESET" }));
+    fetcher.mockClear();
+    const start = f.clock.now();
+    await expect(requestAdmin(localDeployClient(7400), f.clock, "drain")).rejects.toThrow("socket reset");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    fetcher.mockClear();
+    await expect(requestAdmin(localDeployClient(7400), f.clock, "resume")).rejects.toThrow("socket reset");
+    expect(f.clock.now() - start).toBe(120_000);
+    expect(fetcher).toHaveBeenCalledTimes(60);
+  } finally {
+    fetcher.mockRestore();
+  }
+});
+
+test("resume rejects permanent responses after one attempt without sleeping", async () => {
+  for (const failure of ["http", "json", "state", "acknowledgement", "unsupported", "body", "stalled body"]) {
+    const f = setup();
+    const response =
+      failure === "http"
+        ? Response.json({}, { status: 401 })
+        : failure === "unsupported"
+          ? new Response(null, { status: 404 })
+          : failure === "json"
+            ? new Response("{")
+            : Response.json(failure === "state" ? { draining: false } : { draining: true, active: [] });
+    if (failure.includes("body")) {
+      spyOn(response, "json").mockImplementation(async () => {
+        if (failure === "stalled body") {
+          for (const timeout of [...f.pending]) timeout();
+          return new Promise<never>(() => {});
+        }
+        throw Object.assign(new Error("body stream reset"), { code: "ECONNRESET" });
+      });
+    }
+    const fetcher = spyOn(globalThis, "fetch").mockResolvedValue(response);
+    try {
+      const result = requestAdmin(localDeployClient(7400), f.clock, "resume");
+      if (failure === "json") await expect(result).rejects.toBeInstanceOf(SyntaxError);
+      else
+        await expect(result).rejects.toThrow(
+          failure === "http"
+            ? "HTTP 401"
+            : failure === "unsupported"
+              ? "HTTP 404"
+              : failure === "state"
+                ? "invalid resume response"
+                : failure === "acknowledgement"
+                  ? "did not acknowledge resume"
+                  : failure === "stalled body"
+                    ? "daemon response timed out"
+                    : "body stream reset",
+        );
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(f.sleeps).toEqual([]);
+    } finally {
+      fetcher.mockRestore();
+    }
+  }
   const f = setup();
   let calls = 0;
   f.client.admin = async () => {
     calls++;
-    if (calls <= 2) throw Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" });
-    if (calls === 3) throw new DaemonTimeoutError();
-    return { draining: false, active: [] };
+    throw Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" });
   };
-  await requestAdmin(f.client, f.clock, "resume");
-  expect(calls).toBe(4);
-  expect(f.timeouts).toEqual([15_000, 15_000, 15_000, 15_000]);
-  calls = 0;
-  f.client.admin = async () => ({ draining: ++calls === 1, active: [] });
-  await requestAdmin(f.client, f.clock, "resume");
-  expect(calls).toBe(2);
-  for (const action of ["drain", "resume"] as const) {
-    calls = 0;
-    f.client.admin = async () => {
-      calls++;
-      throw new DrainUnsupportedError("unsupported");
-    };
-    await expect(requestAdmin(f.client, f.clock, action)).rejects.toThrow("unsupported");
-    expect(calls).toBe(1);
-  }
-  calls = 0;
-  f.client.admin = async () => {
-    calls++;
-    throw new Error("ECONNRESET");
-  };
-  await expect(requestAdmin(f.client, f.clock, "drain")).rejects.toThrow("ECONNRESET");
-  expect(calls).toBe(1);
-  const start = f.clock.now();
   await expect(requestAdmin(f.client, f.clock, "resume")).rejects.toThrow("ECONNRESET");
-  expect(f.clock.now() - start).toBe(120_000);
+  expect(calls).toBe(1);
+  expect(f.sleeps).toEqual([]);
 });
 
 test("rollback reports a stranded scheduler only after resume exhausts its budget", async () => {
@@ -693,15 +786,16 @@ test("rollback reports a stranded scheduler only after resume exhausts its budge
     let resumes = 0;
     f.client.admin = async (action) => {
       if (action === "drain") throw new Error("original failure");
-      if (++resumes === 1 || permanent) throw new Error("ECONNRESET");
+      if (++resumes === 1 || permanent) throw new DaemonTimeoutError();
       return { draining: false, active: [] };
     };
     const error = await deploy(7400, "feature", false, f.opts).catch(String);
     expect(error).toContain("original failure");
     if (permanent) {
       expect(error).toMatch(/left draining/i);
-      expect(error).toContain("ECONNRESET");
+      expect(error).toContain("daemon request timed out");
       expect(error).toContain("/api/admin/resume");
+      expect(f.clock.now()).toBe(120_000);
     } else {
       expect(resumes).toBe(2);
       expect(error).not.toContain("resume scheduler");
@@ -880,6 +974,28 @@ test("a target checkout still aborts on failed gates before draining", async () 
   expect(f.calls).not.toContain("drain");
   expect(f.calls).not.toContain("restart");
   expect(f.calls).not.toContain("bun scripts/smoke.ts");
+});
+
+test.each([
+  ["bun run lint", 600],
+  ["bun test --parallel=4", 1800],
+  ["bun scripts/smoke.ts", 900],
+] as const)("a timed-out zero-exit gate aborts deploy: %s", async (gate, seconds) => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== gate) return command(args, options);
+    return { stdout: "last progress\n", stderr: "last diagnostic\n", exitCode: 0, timedOut: true };
+  };
+  const message = String(await deploy(7400, "feature", true, f.opts).catch((e: unknown) => e));
+  expect(message).toContain("deploy gate failed; staying on previous");
+  expect(message).toContain(`Command timed out after ${seconds} s: ${gate}`);
+  expect(message).toContain("last progress");
+  expect(message).toContain("last diagnostic");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
+  expect(f.calls).toContain("git checkout -q --detach previous");
+  expect(f.selected()).toBe("previous");
 });
 
 test("a failed smoke gate reports the tail of both output streams and restores the checkout", async () => {

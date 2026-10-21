@@ -17,6 +17,27 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
 
+test.each([
+  [undefined, 2],
+  ["0", 0],
+  ["1.5", 1.5],
+  ["-1", null],
+  ['"2"', null],
+  ["true", null],
+  ["nan", null],
+  ["inf", null],
+  ["-inf", null],
+] as const)("load admission config: %s", (value, expected) => {
+  const fixture = providerFixture();
+  try {
+    writeFileSync(fixture.file, value === undefined ? "" : `[limits]\nmax_load_per_core = ${value}\n`);
+    if (expected === null) expect(fixture.load).toThrow("limits.max_load_per_core");
+    else expect(fixture.load().maxLoadPerCore).toBe(expected);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("built-in endpoints use only loopback or documented public API hosts", () => {
   const catalog = resolveCatalog();
   const approved = new Set(["localhost", "127.0.0.1", "openrouter.ai", "api.typesafe.ai"]);
@@ -1083,5 +1104,27 @@ test.each(
     else expect(() => fixture.load()).toThrow("workers.repos must be an array of owner/name strings");
   } finally {
     fixture.close();
+  }
+});
+
+test("operator approval policy parses booleans and case-insensitive repository slugs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "land-policy-"));
+  try {
+    const load = (text: string) => {
+      writeFileSync(join(dir, "config.toml"), text);
+      return loadConfig({ home: dir, configDir: dir, readOnly: true });
+    };
+    expect([...load("").landRequiresApproval]).toEqual([]);
+    expect([
+      ...load(
+        '[repos."Owner/Work"]\nland_requires_approval = true\n[repos."Owner/Personal"]\nland_requires_approval = false',
+      ).landRequiresApproval,
+    ]).toEqual(["owner/work"]);
+    for (const value of ['"true"', "1", "[]", "{}"])
+      expect(() => load(`[repos."owner/work"]\nland_requires_approval = ${value}`)).toThrow(
+        "must be a boolean",
+      );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

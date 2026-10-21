@@ -1198,6 +1198,7 @@ test("approve records the reviewed head; a later push makes it stale", async () 
   expect(await review(original.id, { verdict: "approve", reviewedSha: reviewed })).toMatchObject({
     status: 200,
   });
+  expect(pr.calls.some((args) => args[0] === "pr" && args[1] === "review")).toBe(false);
   expect(reviewer()).toEqual({ reviewer: "human" });
   expect(approvalFeed()?.data.reviewer).toBe("human");
 
@@ -1553,7 +1554,9 @@ test("discreet review delivery uses stored ownership and recognizes an uncheckpo
 test("discreet environment-blocked rounds sanitize model attribution before comments", async () => {
   verifyEvidence =
     "Retained review evidence\nBuilt by Limitless\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nCo-Authored-By: Claude Fable 5.1\nChecks require unconfined gates\nCo-authored-by: Claude <human@example.org>";
-  factory.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  factory.cfg.repos = {
+    "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+  };
   const original = await delivered("standard");
   verifyStatus = "blocked";
   const roundId = (await changes(original.id)).body.round?.id as string;

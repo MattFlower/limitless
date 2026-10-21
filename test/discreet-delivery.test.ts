@@ -112,7 +112,7 @@ test("branch allocation checks stored, local and remote names and resumes a suff
   registerGithub(f, bare);
   const repo = f.store.getRepoBySlug("test/repo");
   if (!repo) throw new Error("missing repo");
-  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false } };
   await ensureCache(f.cfg.paths, repo);
   const allocate = async () => {
     const run = f.store.createRun(repo, { repo: repo.slug, prompt: "Add farewell", title: "Add farewell" });
@@ -125,7 +125,7 @@ test("branch allocation checks stored, local and remote names and resumes a suff
   expect((await allocate()).branch).toBe("change/add-farewell");
   const second = await allocate();
   expect(second.branch).toBe("change/add-farewell-2");
-  f.cfg.repos["test/repo"] = { discreet: true, branchPrefix: "feat/" };
+  f.cfg.repos["test/repo"] = { discreet: true, branchPrefix: "feat/", landRequiresApproval: false };
   expect(
     (
       await createWorktree(f.cfg.paths, repo, second.id, "Different title", "main", {
@@ -135,7 +135,7 @@ test("branch allocation checks stored, local and remote names and resumes a suff
     ).branch,
   ).toBe(second.branch ?? "");
   expect((await allocate()).branch).toBe("feat/add-farewell");
-  f.cfg.repos["test/repo"] = { discreet: true, branchPrefix: "change/" };
+  f.cfg.repos["test/repo"] = { discreet: true, branchPrefix: "change/", landRequiresApproval: false };
   const cache = cachePath(f.cfg.paths, repo);
   await sh(["git", "update-ref", "refs/heads/change/add-farewell-3", "refs/remotes/origin/main"], {
     cwd: cache,
@@ -157,7 +157,7 @@ esac
 `,
   );
   expect((await allocate()).branch).toMatch(/^change\/add-farewell-[a-f0-9]{8}$/);
-  f.cfg.repos["test/repo"] = { discreet: false, branchPrefix: "feat/" };
+  f.cfg.repos["test/repo"] = { discreet: false, branchPrefix: "feat/", landRequiresApproval: false };
   const ordinary = await allocate();
   expect(ordinary.branch).toBe(`limitless/${ordinary.id}-add-farewell`);
   expect(repoSettings(f.cfg, repo.slug).discreet).toBe(false);
@@ -327,7 +327,7 @@ test("branch probes are bounded, stop on lookup errors and validate complete nam
   const repo = f.store.getRepoBySlug("test/repo");
   if (!repo) throw new Error("missing repo");
   await ensureCache(f.cfg.paths, repo);
-  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false } };
   let probes = 0;
   await expect(
     createWorktree(f.cfg.paths, repo, "taken", "Add farewell", "main", {
@@ -371,7 +371,7 @@ test("discreet delivery merges an advanced base using the round commit's identit
     }
     return { files: { "farewell.txt": "goodbye\n" } };
   });
-  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false } };
   registerGithub(f, bare);
   const run = await f.createRun({
     repo: "test/repo",
@@ -664,7 +664,7 @@ test.each([
     return { files: { "farewell.txt": `goodbye ${++implementations}\n` } };
   });
   f.cfg.maxRounds = 1;
-  f.cfg.repos = { "test/repo": { discreet, branchPrefix: "change/" } };
+  f.cfg.repos = { "test/repo": { discreet, branchPrefix: "change/", landRequiresApproval: false } };
   registerGithub(f, bare);
   writeFileSync(join(state.home, "gh-calls"), "");
   const run = await f.createRun({
@@ -688,7 +688,7 @@ test("discreet publication refuses a marked factory-authored title before publis
     if (roleOf(s) === "review") return { structured: approve };
     return { files: { "farewell.txt": "goodbye\n" }, text: "Added farewell" };
   });
-  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false } };
   registerGithub(f, bare);
   const run = await f.createRun({ repo: "test/repo", title, prompt: "Add farewell", profile: "quick" });
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");

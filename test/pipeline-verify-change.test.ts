@@ -202,7 +202,9 @@ protected_paths = ["protected.txt"]
       const begin = () => {
         const next = start(handler);
         if (discreet)
-          next.cfg.repos = { "mattflower/limitless": { discreet: true, branchPrefix: "change/" } };
+          next.cfg.repos = {
+            "mattflower/limitless": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+          };
         if (blocked) next.cfg.maxRounds = 1;
         return next;
       };

@@ -506,7 +506,7 @@ const landEntry = (head: string) =>
     approvedSha: head,
   });
 
-test.each(["queued", "checking", "waiting_ci", "merging"] as const)(
+test.each(["queued", "checking", "waiting_approval", "waiting_ci", "merging"] as const)(
   "CI triggers wait for a %s land entry without lookup or backoff",
   async (state) => {
     const entry = landEntry(await remoteHead());
@@ -607,14 +607,18 @@ test.each(["approvedSha", "pushedSha"] as const)(
   },
 );
 
-test("CI delivery leaves a cancelled entry unchanged", async () => {
-  const entry = landEntry(await remoteHead());
-  factory.store.updateLandEntry(entry.id, { state: "cancelled", reason: "cancelled" });
-  const before = factory.store.getLandEntry(entry.id);
-  const id = await start();
-  factory.store.markRoundDelivered(id, "d".repeat(40));
-  expect(factory.store.getLandEntry(entry.id)).toEqual(before);
-});
+test.each(["cancelled", "waiting_approval"] as const)(
+  "CI delivery leaves a %s entry unchanged",
+  async (state) => {
+    const entry = landEntry(await remoteHead());
+    factory.store.updateLandEntry(entry.id, { state: "cancelled", reason: "cancelled" });
+    const id = await start();
+    factory.store.updateLandEntry(entry.id, { state });
+    const before = factory.store.getLandEntry(entry.id);
+    factory.store.markRoundDelivered(id, "d".repeat(40));
+    expect(factory.store.getLandEntry(entry.id)).toEqual(before);
+  },
+);
 
 test("pending CI trigger re-checks a default branch that went red", async () => {
   await classify();
@@ -734,7 +738,9 @@ test("polling finds a discreet CI PR through the store and its delivery recovers
   await git(join(root, "remote.git"), "branch", "-m", branch, "change/feature");
   branch = "change/feature";
   factory.store.updateRun(owner.id, { branch });
-  factory.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  factory.cfg.repos = {
+    "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+  };
   await classify();
   await processTriggers();
   const id = factory.store.reviewRounds(url).at(-1)?.runId;

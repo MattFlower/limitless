@@ -4,12 +4,14 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolResultSchema, JSONRPCResultResponseSchema } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 import type { FeedPage, LandEntry, Question, Run } from "../src/core/types.ts";
 import * as diagnosticCatalogue from "../src/db/owner-diagnostics.ts";
 import * as gitCommand from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
+import { statusLandsSchema } from "../src/integrations/mcp-status.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
 import {
@@ -3461,6 +3463,21 @@ test("status explains review, input, land and terminal states using saved observ
       ],
       [{}, [entry], "Landing in progress (queued)", "Wait"],
       [{}, [{ ...entry, state: "waiting_ci" }], "Landing in progress (waiting_ci)", "Wait"],
+      [{}, [{ ...entry, state: "some_future_state" }], "Landing in progress (some_future_state)", "Wait"],
+      [
+        {},
+        [
+          {
+            ...entry,
+            runId: null,
+            state: "queued",
+            waitingApproval: true,
+            reason: "Another GitHub account must approve",
+          },
+        ],
+        "Landing waiting_approval",
+        "Wait",
+      ],
       [{}, [{ ...entry, state: "blocked", reason: "CI failed" }], "Landing blocked", "resolve the blocker"],
       [{}, [{ ...entry, state: "landed" }], "Landed", "No action needed"],
       [{ prSnapshot: { state: "MERGED" } }, [], "Landed", "No action needed"],
@@ -4127,4 +4144,39 @@ test("cancelling a proxied feed long poll aborts the daemon request", async () =
   } finally {
     await proxy.close();
   }
+});
+
+test("waiting land HTTP states remain parseable by previous MCP readers", async () => {
+  const { store } = f.factory;
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });
+  const prUrl = "https://github.com/o/r/pull/1";
+  store.updateRun(run.id, { prUrl });
+  const entry = store.createLandEntry({
+    runId: run.id,
+    repo: "o/r",
+    prUrl,
+    baseBranch: "main",
+    headBranch: "feature",
+    approvedSha: "a".repeat(40),
+  });
+  const reason = `Another GitHub account must approve ${entry.approvedSha}`;
+  store.updateLandEntry(entry.id, { state: "waiting_approval", reason });
+  const previousSchema = z.array(
+    z.object({
+      id: z.number(),
+      runId: z.string().nullable(),
+      prUrl: z.string(),
+      state: z.enum(["queued", "checking", "waiting_ci", "merging", "landed", "blocked", "cancelled"]),
+      reason: z.string().nullable(),
+    }),
+  );
+  const route = (createHttpRoutes(f.factory)["/api/land"] as { GET: Route }).GET;
+  for (const query of ["", `?run=${run.id}`, `?pr=${encodeURIComponent(prUrl)}`]) {
+    const data = await (
+      await route(requestWithParams(`http://daemon.invalid/api/land${query}`), localServer)
+    ).json();
+    expect(previousSchema.safeParse(data).success).toBe(true);
+    expect(data).toMatchObject([{ id: entry.id, state: "queued", waitingApproval: true, reason }]);
+  }
+  expect(statusLandsSchema.safeParse([{ ...entry, state: "some_future_state" }]).success).toBe(true);
 });

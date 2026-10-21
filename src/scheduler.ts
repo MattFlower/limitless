@@ -1,3 +1,4 @@
+import { availableParallelism, loadavg } from "node:os";
 import { TERMINAL_STATUSES } from "./core/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { executeRun } from "./pipeline/engine.ts";
@@ -16,10 +17,13 @@ export class Scheduler {
   private drainEnabled = false;
   private readonly drainEvents = new EventTarget();
   private unsubscribe: (() => void) | null = null;
+  loadPerCore?: number;
+  admissionHeld = false;
 
   constructor(
     private readonly deps: EngineDeps,
     private readonly maxConcurrent: number,
+    private readonly options: { maxLoadPerCore?: number; loadSource?: () => number } = {},
   ) {}
 
   start(): void {
@@ -100,8 +104,24 @@ export class Scheduler {
     if (this.stopping) return;
     this.deps.store.reconcileWaitingRuns();
     this.deps.tracker.refreshAlerts();
+    this.loadPerCore = (
+      this.options.loadSource ?? (() => (loadavg()[0] as number) / availableParallelism())
+    )();
+    const limit = this.options.maxLoadPerCore ?? 2;
+    const held = limit > 0 && this.loadPerCore > limit;
+    if (held !== this.admissionHeld) {
+      this.admissionHeld = held;
+      console.log(
+        held
+          ? `Holding new runs: load ${this.loadPerCore} per core is above ${limit}`
+          : "Resuming new runs: host load is within the limit",
+      );
+    }
     if (this.draining) return;
-    const capacity = this.maxConcurrent - this.active.size;
+    const capacity = Math.min(
+      this.maxConcurrent - this.active.size,
+      held ? (this.active.size === 0 ? 1 : 0) : Infinity,
+    );
     if (capacity <= 0) return;
     for (const run of this.deps.store.nextQueuedRuns(capacity)) {
       if (this.stopping || this.draining) return;

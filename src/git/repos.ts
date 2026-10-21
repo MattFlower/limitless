@@ -1698,7 +1698,7 @@ export async function mergePullRequest(
     title?: string;
     subject?: string;
     auto?: boolean;
-    guard?: () => void;
+    guard?: () => void | Promise<void>;
     onFailure?: (reason: string) => void;
   } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
@@ -1741,7 +1741,7 @@ export async function mergePullRequest(
             : ["--subject", title, "--body", body, "--match-head-commit", sha];
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
         try {
-          opts.guard?.();
+          await opts.guard?.();
         } catch (cause) {
           throw new GitHubGuardError("Merge guard refused", { cause });
         }

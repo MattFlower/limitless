@@ -56,17 +56,21 @@ export const ghClient: GitHubClient = async (path, body, signal) => {
   };
 };
 
-export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest {
+export const OBSERVE_QUERY = `query($ids: [ID!]!, $after: String) { nodes(ids: $ids) { ... on PullRequest {
   id url headRefOid headRefName isCrossRepository headRepository { nameWithOwner } state isDraft mergeable mergeStateStatus updatedAt mergedAt mergedBy { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion status completedAt url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
-  latestReviews(first: 20) { nodes { state author { login } } }
+  latestReviews(first: 20) { nodes { state authorCanPushToRepository author { __typename login } commit { oid } } }
+  latestOpinionatedReviews(first: 20, after: $after) { pageInfo { hasNextPage endCursor } nodes { state authorCanPushToRepository author { __typename login } commit { oid } } }
   reviews(last: 10) { nodes { id createdAt updatedAt comments(last: 10) { nodes { id createdAt updatedAt } } } }
   comments(last: 10) { nodes { id createdAt updatedAt } } } } }`;
 // Activity pages hold the newest few items so an edit to a recent older one still moves the marker.
 
-type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
+type Conn<T> =
+  | { nodes?: (T | null)[]; pageInfo?: { hasNextPage: boolean; endCursor: string | null } }
+  | null
+  | undefined;
 type Activity = { id: string; createdAt?: string; updatedAt: string }; // createdAt: absent only in old markers
 /** One check: GraphQL's `name`/`conclusion`/`state`, or REST's `context`/`status`/`targetUrl`. */
 export type Context = {
@@ -93,7 +97,13 @@ type GqlPr = Base &
     commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
     reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
     comments?: Conn<Activity>;
-    latestReviews?: Conn<{ state: string; author?: { login: string } | null }>;
+    latestReviews?: Conn<{
+      state: string;
+      author?: { login: string; __typename?: string } | null;
+      authorCanPushToRepository?: boolean | null;
+      commit?: { oid: string } | null;
+    }>;
+    latestOpinionatedReviews?: GqlPr["latestReviews"];
   };
 /** A PR's normalized state; `failing` is reduced and sorted so reordering is not a change. */
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
@@ -108,6 +118,16 @@ export type PrSnapshot = Known &
     statusNames?: string[];
     failing: { name: string; url: string | null }[];
     truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
+    observedAt?: number;
+    requestSeq?: number;
+    reviewEvidenceComplete?: boolean;
+    reviewEvidence?: {
+      state: string;
+      login: string | null;
+      commit: string | null;
+      authorType?: string | null;
+      canPush?: boolean | null;
+    }[];
     reviews?: string[]; // `login:state` of each reviewer's latest review
     reviewComments?: Record<string, string[]>; // each review connection has its own oldest-first order
     activity: Record<"review" | "review_comment" | "comment", string[]>;
@@ -176,7 +196,7 @@ const saved = (data: string | null | undefined) => {
 export function normalizePr(node: unknown, id?: string | null): PrSnapshot | null {
   const pr = node as GqlPr | null;
   if (!pr || REQUIRED.some((k) => typeof pr[k] !== "string") || (id && pr.id !== id)) return null;
-  const { commits, reviews, comments, latestReviews, ...base } = pr;
+  const { commits, reviews, comments, latestReviews, latestOpinionatedReviews, ...base } = pr;
   const head = nodes(commits).at(-1)?.commit?.statusCheckRollup ?? null;
   const all = nodes(reviews);
   const { ci, failing } = rollup(head);
@@ -200,6 +220,19 @@ export function normalizePr(node: unknown, id?: string | null): PrSnapshot | nul
       .flatMap((c) => (c.name ? [c.name] : [])),
     failing,
     truncated: nodes(head?.contexts).length >= 100 || undefined,
+    reviewEvidenceComplete:
+      latestOpinionatedReviews?.pageInfo?.hasNextPage === false &&
+      Array.isArray(latestOpinionatedReviews.nodes) &&
+      latestOpinionatedReviews.nodes.every((r) => r !== null),
+    reviewEvidence: latestOpinionatedReviews
+      ? nodes(latestOpinionatedReviews).map((r) => ({
+          state: r.state,
+          login: r.author?.login ?? null,
+          authorType: r.author?.__typename ?? null,
+          canPush: r.authorCanPushToRepository ?? null,
+          commit: r.commit?.oid ?? null,
+        }))
+      : undefined,
     reviews: nodes(latestReviews).map((r) => `${r.author?.login ?? "ghost"}:${r.state}`),
     reviewComments: Object.fromEntries(all.map((r) => [r.id, newest(nodes(r.comments))])),
     activity: {
@@ -252,7 +285,8 @@ export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   return out;
 }
 
-const errorsOf = (res: GitHubResponse) => (res.body as { errors?: { type?: string }[] } | null)?.errors ?? [];
+const errorsOf = (res: GitHubResponse) =>
+  (res.body as { errors?: { type?: string; path?: unknown[] }[] } | null)?.errors ?? [];
 /** SSO, IP-allow-list and not-found failures for `subject` are access problems, never PR changes. */
 function accessProblem(res: GitHubResponse, subject: string) {
   const text = JSON.stringify(res.status === 200 ? errorsOf(res) : (res.body ?? ""));
@@ -282,11 +316,15 @@ const headOf = (pr: TrackedPr | undefined) => saved(pr?.data)?.headRefOid ?? nul
 const closed = (pr: TrackedPr) => saved(pr.data)?.state === "CLOSED";
 const backoff = (failures: number, base = 60_000) => Math.min(base * 2 ** failures, 900_000);
 /** Merge reconciliation's PR client while polling: the poller's observations for PRs it tracks, else `fallback`. */
-export function observedPrs(store: Store, fallback?: GitHubPrClient): GitHubPrClient {
+export function observedPrs(
+  store: Store,
+  fallback?: GitHubPrClient,
+  requiresApproval?: ReadonlySet<string>,
+): GitHubPrClient {
   let tracked: Set<string> | undefined;
   const client: GitHubPrClient = async (url, signal) => {
     const pr = saved(store.githubPrData(url));
-    tracked ??= new Set(store.githubTracked().map((p) => p.url));
+    tracked ??= new Set(store.githubTracked(undefined, requiresApproval).map((p) => p.url));
     if (!fallback || pr?.state === "MERGED" || tracked.has(url)) return pr;
     return fallback(url, signal);
   };
@@ -302,6 +340,7 @@ export interface PollerOptions {
   client?: GitHubClient;
   gh?: GhRunner;
   seconds?: number;
+  requiresApproval?: ReadonlySet<string>;
   ciReruns?: boolean;
   log?: (message: string) => void;
   clock?: { now: () => number; set: typeof setTimeout; clear: typeof clearTimeout };
@@ -357,6 +396,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
   /** `since`: the PR's head version before the request, so an overtaken observation is dropped. */
   const record = async (pr: TrackedPr, snap: PrSnapshot, since: number) => {
+    const observedAt = now();
     const prev = saved(pr.data);
     const head = snap.headRefOid;
     if (!store.observePrHead(pr.url, head, since)) return undefined;
@@ -386,7 +426,14 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       return { ...c, runId: pr.runId, repo: pr.repo, data: { ...c.data, url: pr.url, head }, key };
     });
     const save = (nudged: string | null, feed = items) => {
-      const data = JSON.stringify({ ...snap, revision, unknown, nudged, ciPending } satisfies Saved);
+      const data = JSON.stringify({
+        ...snap,
+        observedAt,
+        revision,
+        unknown,
+        nudged,
+        ciPending,
+      } satisfies Saved);
       store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", feed, now());
     };
     // One nudge per UNKNOWN episode on a head: a known value ends the episode.
@@ -438,6 +485,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     for (let known = resolved.splice(0, 100); known.length; known = resolved.splice(0, 100)) {
       const ids = known.map((p) => p.nodeId);
       const since = known.map((p) => store.prHead(p.url)?.version ?? 0);
+      const requestSeq = store.nextGithubObservationSeq();
       const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
       if (!res) return;
       // An access failure of the whole query (SSO, IP allow list, HTTP 404) says nothing about any PR.
@@ -445,11 +493,24 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       if (access) store.setGithubAccess(repo, access, headOf(known[0]));
       const found = (res.body as { data?: { nodes?: unknown } } | null)?.data?.nodes;
       // Partial data is never trusted; only unresolvable node ids (NOT_FOUND) leave the rest usable.
-      const failed = access || res.status !== 200 || errorsOf(res).some((e) => e.type !== "NOT_FOUND");
+      const failed =
+        access ||
+        res.status !== 200 ||
+        errorsOf(res).some(
+          (e) =>
+            e.type !== "NOT_FOUND" ||
+            !Array.isArray(e.path) ||
+            e.path.length !== 2 ||
+            e.path[0] !== "nodes" ||
+            !Number.isInteger(e.path[1]) ||
+            !Array.isArray(found) ||
+            found[e.path[1] as number] !== null,
+        );
       if (failed || !Array.isArray(found) || found.length !== known.length)
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
         const snap = normalizePr(found[i], pr.nodeId);
+        if (snap) snap.requestSeq = requestSeq;
         const nudged = snap ? await record(pr, snap, since[i] ?? 0) : null;
         // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
         if (nudged === null) complete = false;
@@ -461,16 +522,18 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   };
   /** Each repository with tracked PRs and when it is next due; delivered PRs use the fast cadence. */
   const plan = () =>
-    [...Map.groupBy(store.githubTracked(now()), (pr) => pr.repo)].map(([repo, prs]) => {
-      const interval = prs.some((p) => p.delivered && !closed(p)) ? 15_000 : normal;
-      const key = (p: TrackedPr) => (closed(p) ? p.url : repo); // open PRs share a deadline and a query
-      const last = (k: string) => observedAt.get(k) ?? -Infinity;
-      // A PR also keeps its own time, so closing or reopening it never makes it due at once.
-      const at = (p: TrackedPr) =>
-        closed(p) ? last(p.url) + 600_000 : Math.max(last(p.url), last(repo)) + interval;
-      const due = Math.max(blocks.get(repo)?.until ?? 0, Math.min(...prs.map(at)));
-      return { repo, key, due, prs: prs.filter((p) => at(p) <= now()) };
-    });
+    [...Map.groupBy(store.githubTracked(now(), opts.requiresApproval), (pr) => pr.repo)].map(
+      ([repo, prs]) => {
+        const interval = prs.some((p) => p.delivered && !closed(p)) ? 15_000 : normal;
+        const key = (p: TrackedPr) => (closed(p) ? p.url : repo); // open PRs share a deadline and a query
+        const last = (k: string) => observedAt.get(k) ?? -Infinity;
+        // A PR also keeps its own time, so closing or reopening it never makes it due at once.
+        const at = (p: TrackedPr) =>
+          closed(p) ? last(p.url) + 600_000 : Math.max(last(p.url), last(repo)) + interval;
+        const due = Math.max(blocks.get(repo)?.until ?? 0, Math.min(...prs.map(at)));
+        return { repo, key, due, prs: prs.filter((p) => at(p) <= now()) };
+      },
+    );
   const schedule = () => {
     if (stopped) return;
     clear(timer);
@@ -509,7 +572,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         // A repository a rate limit interrupted is due again as soon as the cooldown ends.
         if (now() >= cooldownUntil) for (const pr of prs) observedAt.set(pr.url, now()).set(key(pr), now());
       }
-      if (settled) await reconcileMergedRuns(store, observedPrs(store), log, now);
+      if (settled)
+        await reconcileMergedRuns(store, observedPrs(store, undefined, opts.requiresApproval), log, now);
       [settled, crashes, retryAt] = [false, 0, 0];
     } catch (e) {
       log(`GitHub poll failed: ${String(e)}`);
@@ -521,7 +585,11 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     schedule();
   };
   const unsubscribe = store.subscribe((msg) => {
-    if (msg.kind === "run" && msg.run.prUrl && !running) schedule();
+    if (
+      !running &&
+      ((msg.kind === "run" && msg.run.prUrl) || (msg.kind === "feed" && msg.item.kind === "land.queued"))
+    )
+      schedule();
   });
   schedule();
   return () => {

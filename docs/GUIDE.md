@@ -183,6 +183,7 @@ discovers an owner.
 | `[server] require_api_token` | `false` | Rollout: accept token or plain loopback in this release; the default becomes `true` in the next release. When enabled, all routes (including reads, streams, UI and HTTP `/mcp`) require the API token or UI sign-in session, except `GET /api/health`, sign-in/enrollment, `GET /api/auth/session`, caller-only logout and signature-verified webhooks. Loopback `trusted_proxies` then requires `server.auth = "required"`. All `public_origins` must use HTTPS when enabled, including `auth = "proxy"`, because browser sign-in uses a Secure session cookie. Anonymous `logout-all` is always refused, even with enforcement off. HTTP `/mcp` clients send `Authorization: Bearer $(cat ~/.limitless/api-token)`; the file follows `LIMITLESS_HOME`. Current CLI clients read it automatically. Older releases ignore this key, so rollback still starts. |
 | `[server] ui_url` | `http://localhost:<port>` | Base URL for run links in PR bodies and Discord. It is also an allowed browser origin. |
 | `[limits] max_concurrent_runs` | `3` | Runs executing at once. Others wait in `queued`. |
+| `[limits] max_load_per_core` | `2.0` | Hold new runs when the one-minute load average divided by `os.availableParallelism()` is strictly above this limit. `0` disables the check. When idle, admit one run regardless of load, subject to concurrency and drain/shutdown guards. Active runs continue unchanged. |
 | `[providers.<id>] max_concurrent` | Catalog limit | Concurrent requests for a catalog provider; positive safe integer. For example, `[providers.claude] max_concurrent = 5`. Unknown provider IDs are rejected. |
 | `[limits] max_rounds` | `3` | Base implementation rounds. A run gets `max_rounds + 2` rounds in total. |
 | `[limits] openrouter_budget_usd` | `50` | Rolling 30-day OpenRouter spend cap |
@@ -400,6 +401,32 @@ merge; a failed dependency can leave it `needs_human`.
 
 `LIMITLESS_URL` points the CLI at another daemon. The default is
 `http://127.0.0.1:${LIMITLESS_PORT:-7400}`.
+
+To require another account's GitHub approval before landing, set this in the operator's
+`config.toml` (repository `.limitless.toml` cannot change this policy):
+
+```toml
+[repos."owner/name"]
+land_requires_approval = true
+```
+
+The default is false; repository slugs match case-insensitively. With it enabled, run-backed and
+explicitly queued PRs stay in `waiting_approval` until a fresh observation shows an `APPROVED`
+review from a human GitHub User with push access, other than the authenticated factory account,
+on exactly the approved SHA. An outstanding change request from any push-access human holds the
+entry. Stale or dismissed reviews do not count; unavailable identity or review evidence leaves it
+waiting without a new timeout. Waiting entries do not block other PRs in the repository.
+
+The gate runs before checks and rechecks fresh reviews immediately before every merge attempt,
+including retries and restarts; incomplete review evidence never counts as approval.
+The final check narrows but cannot eliminate the review-change window because GitHub pins the
+merge to a head SHA rather than to review state. Repositories needing strict enforcement should
+also enable GitHub branch protection with required reviews, which GitHub enforces at merge time.
+Approval on the approved SHA or the factory's pushed base-merge head counts at that recheck;
+a later factory base merge does not need another approval. After a rollback, the previous release
+shows waiting entries as `blocked`; re-queue them to continue. `limitless review --approve` only
+records the factory-side approval and never submits a GitHub review. Restart the daemon after
+changing policy.
 
 ### UI and chat
 

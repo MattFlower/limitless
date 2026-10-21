@@ -369,7 +369,7 @@ function computeStatsQuery(store: Store, days = 14): Stats {
       AND (r.pr_url IS NULL OR r.pr_url NOT IN (
         SELECT pr_url FROM runs WHERE merged = 1 AND pr_url IS NOT NULL))
       AND NOT EXISTS (SELECT 1 FROM land_entries l WHERE l.pr_url = r.pr_url
-        AND l.state IN ('queued', 'checking', 'waiting_ci', 'merging'))
+        AND (l.state IN ('queued', 'checking', 'waiting_ci', 'merging') OR l.approval_wait > 0))
       AND NOT EXISTS (
         SELECT 1 FROM review_approvals a JOIN pr_heads h ON h.pr_url = a.pr_url AND h.sha = a.sha
         WHERE a.pr_url = r.pr_url AND a.stale_reason IS NULL
@@ -377,7 +377,7 @@ function computeStatsQuery(store: Store, days = 14): Stats {
           AND a.created_at > r.finished_at
           AND NOT EXISTS (SELECT 1 FROM land_entries l WHERE l.pr_url = r.pr_url
             AND l.id = (SELECT MAX(id) FROM land_entries WHERE pr_url = r.pr_url)
-            AND l.state = 'blocked' AND l.updated_at >= a.created_at)
+            AND l.state = 'blocked' AND l.approval_wait = 0 AND l.updated_at >= a.created_at)
       )
       AND NOT EXISTS (
         SELECT 1 FROM review_rounds rr JOIN runs next ON next.id = rr.run_id
