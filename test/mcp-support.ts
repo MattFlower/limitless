@@ -39,6 +39,7 @@ export async function fixture(
   cfg.secrets = {};
   if (excludeOrigins !== undefined) cfg.raw.routing = { exclude_origins: excludeOrigins };
   const factory = new Factory(cfg, {
+    loadSource: () => 0,
     ...(resolvedBootSha ? { bootSha: resolvedBootSha } : {}),
     harnesses: { fake: fakeHarness(() => ({ delayMs: 30_000 })) },
     providers: [{ id: "fake", label: "Fake", harness: "fake", billing: "subscription", maxConcurrent: 2 }],

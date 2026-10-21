@@ -17,6 +17,27 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
 
+test.each([
+  [undefined, 2],
+  ["0", 0],
+  ["1.5", 1.5],
+  ["-1", null],
+  ['"2"', null],
+  ["true", null],
+  ["nan", null],
+  ["inf", null],
+  ["-inf", null],
+] as const)("load admission config: %s", (value, expected) => {
+  const fixture = providerFixture();
+  try {
+    writeFileSync(fixture.file, value === undefined ? "" : `[limits]\nmax_load_per_core = ${value}\n`);
+    if (expected === null) expect(fixture.load).toThrow("limits.max_load_per_core");
+    else expect(fixture.load().maxLoadPerCore).toBe(expected);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("built-in endpoints use only loopback or documented public API hosts", () => {
   const catalog = resolveCatalog();
   const approved = new Set(["localhost", "127.0.0.1", "openrouter.ai", "api.typesafe.ai"]);
