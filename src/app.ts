@@ -211,6 +211,7 @@ export class Factory {
       paths: cfg.paths,
       readPolicy: cfg.readPolicy,
       polling: cfg.githubPoll,
+      requiresApproval: cfg.landRequiresApproval,
       ciReruns: cfg.githubCiReruns,
       client: getGitHubPr,
       confinement: this.deps.confinement,

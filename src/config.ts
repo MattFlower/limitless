@@ -84,6 +84,7 @@ export interface Config {
   reviewRosters: Record<ResolvedProfile, ReviewFinder[]>;
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
+  landRequiresApproval: ReadonlySet<string>; // operator repository slugs, lower case
   githubOwner: string | null; // allowlisted GitHub login for triggers
   githubMerge?: "auto" | "pr" | "none";
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
@@ -189,6 +190,16 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   } catch {
     // Parser diagnostics can include the source line, including credentials.
     throw new Error("Invalid config.toml; fix TOML syntax in the configuration file");
+  }
+  const landRequiresApproval = new Set<string>();
+  for (const [slug, policy] of Object.entries(raw.repos ?? {})) {
+    if (!policy || typeof policy !== "object" || Array.isArray(policy))
+      throw new Error("repos entries must be tables");
+    if ("land_requires_approval" in policy) {
+      if (typeof policy.land_requires_approval !== "boolean")
+        throw new Error("repos.land_requires_approval must be a boolean");
+      if (policy.land_requires_approval) landRequiresApproval.add(slug.toLowerCase());
+    }
   }
   evalSettings(raw);
   const catalog = resolveCatalog(raw.providers);
@@ -437,6 +448,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     reviewTrustedReviewers: trusted,
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
+    landRequiresApproval,
     githubOwner: str(owners.github, null),
     githubMerge: github.merge as Config["githubMerge"],
     githubPoll: github.poll !== false,

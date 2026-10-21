@@ -1194,6 +1194,7 @@ test("approve records the reviewed head; a later push makes it stale", async () 
   expect(await review(original.id, { verdict: "approve", reviewedSha: reviewed })).toMatchObject({
     status: 200,
   });
+  expect(pr.calls.some((args) => args[0] === "pr" && args[1] === "review")).toBe(false);
   expect(reviewer()).toEqual({ reviewer: "human" });
   expect(approvalFeed()?.data.reviewer).toBe("human");
 

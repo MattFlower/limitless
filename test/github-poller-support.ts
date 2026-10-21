@@ -34,7 +34,23 @@ export function prNode(repo: string, n: number) {
     commits: { nodes: [{ commit: { statusCheckRollup: null as unknown } }] },
     reviews: { nodes: [] as unknown[] },
     comments: { nodes: [] as unknown[] },
-    latestReviews: { nodes: [] as { state: string; author: { login: string } | null }[] },
+    latestReviews: {
+      nodes: [] as {
+        state: string;
+        author: { login: string; __typename?: string } | null;
+        authorCanPushToRepository?: boolean;
+        commit?: { oid: string } | null;
+      }[],
+    },
+    latestOpinionatedReviews: {
+      pageInfo: { hasNextPage: false, endCursor: null as string | null },
+      nodes: [] as {
+        state: string;
+        author: { login: string; __typename?: string } | null;
+        authorCanPushToRepository?: boolean;
+        commit?: { oid: string } | null;
+      }[],
+    },
   };
 }
 export type PrNode = ReturnType<typeof prNode>;
@@ -52,7 +68,7 @@ const aborted = (signal?: AbortSignal) =>
  */
 export function fakeGitHub(now: () => number = Date.now) {
   const nodes = new Map<string, PrNode>();
-  const calls: { path: string; ids?: string[] }[] = [];
+  const calls: { path: string; ids?: string[]; after?: string | null }[] = [];
   const times: number[] = [];
   const signals: AbortSignal[] = [];
   const next: (GitHubResponse | Error)[] = [];
@@ -63,7 +79,8 @@ export function fakeGitHub(now: () => number = Date.now) {
   let maxInFlight = 0;
   const client: GitHubClient = async (path, body, signal) => {
     const ids = (body as { variables?: { ids?: string[] } } | undefined)?.variables?.ids;
-    calls.push(ids ? { path, ids } : { path });
+    const after = (body as { variables?: { after?: string | null } } | undefined)?.variables?.after;
+    calls.push(ids ? { path, ids, ...(after !== undefined ? { after } : {}) } : { path });
     times.push(now());
     if (signal) signals.push(signal);
     maxInFlight = Math.max(maxInFlight, ++inFlight);
@@ -78,7 +95,26 @@ export function fakeGitHub(now: () => number = Date.now) {
     const queued = (path === "graphql" ? undefined : restNext.shift()) ?? next.shift();
     if (queued instanceof Error) throw queued;
     if (queued) return queued;
-    if (ids) return respond(200, { data: { nodes: ids.map((id) => nodes.get(id) ?? null) } });
+    if (ids)
+      return respond(200, {
+        data: {
+          nodes: ids.map((id) => {
+            const node = nodes.get(id);
+            if (!node) return null;
+            const connection = node.latestOpinionatedReviews;
+            if (connection.nodes.length <= 20) return node;
+            const start = after ? Number(after) : 0;
+            const end = start + 20;
+            return {
+              ...node,
+              latestOpinionatedReviews: {
+                nodes: connection.nodes.slice(start, end),
+                pageInfo: { hasNextPage: end < connection.nodes.length, endCursor: String(end) },
+              },
+            };
+          }),
+        },
+      });
     const response = responses.get(path);
     if (response) return response();
     const statuses = path.match(/^repos\/(.+)\/commits\/([^/?]+)\/statuses\?/);
@@ -188,7 +224,7 @@ export function pollerHarness(repos = ["o/r"]) {
       return run;
     },
     node: (repo: string, n: number) => gh.nodes.get(`PR_${repo}_${n}`) as PrNode,
-    start(seconds?: number, ciReruns?: boolean) {
+    start(seconds?: number, ciReruns?: boolean, requiresApproval?: ReadonlySet<string>) {
       stop = startGitHubPoller(h.store, {
         client: gh.client,
         gh: async (args) => {
@@ -205,6 +241,7 @@ export function pollerHarness(repos = ["o/r"]) {
         },
         seconds,
         ciReruns,
+        requiresApproval,
         log: (m) => logs.push(m),
         clock: {
           now: clock.now,

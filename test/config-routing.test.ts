@@ -1106,3 +1106,25 @@ test.each(
     fixture.close();
   }
 });
+
+test("operator approval policy parses booleans and case-insensitive repository slugs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "land-policy-"));
+  try {
+    const load = (text: string) => {
+      writeFileSync(join(dir, "config.toml"), text);
+      return loadConfig({ home: dir, configDir: dir, readOnly: true });
+    };
+    expect([...load("").landRequiresApproval]).toEqual([]);
+    expect([
+      ...load(
+        '[repos."Owner/Work"]\nland_requires_approval = true\n[repos."Owner/Personal"]\nland_requires_approval = false',
+      ).landRequiresApproval,
+    ]).toEqual(["owner/work"]);
+    for (const value of ['"true"', "1", "[]", "{}"])
+      expect(() => load(`[repos."owner/work"]\nland_requires_approval = ${value}`)).toThrow(
+        "must be a boolean",
+      );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

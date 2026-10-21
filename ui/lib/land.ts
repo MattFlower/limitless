@@ -67,3 +67,5 @@ export function createLandController(
     },
   };
 }
+
+export { landState } from "../../src/land/wire.ts";

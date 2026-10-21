@@ -38,9 +38,10 @@ export const statusDetailSchema = z.object({
 export const statusLandsSchema = z.array(
   z.object({
     id: z.number(),
-    runId: z.string(),
+    runId: z.string().nullable(),
     prUrl: z.string(),
-    state: z.enum(["queued", "checking", "waiting_ci", "merging", "landed", "blocked", "cancelled"]),
+    state: z.string(),
+    waitingApproval: z.boolean().optional(),
     reason: z.string().nullable(),
   }),
 );
@@ -60,9 +61,19 @@ export function explainStatus(
     .sort((a, b) => b.id - a.id)[0];
   const result = (state: string, nextAction: string) => {
     if (!privacy) {
-      // Only validated enum values and counts are safe without the privacy policy.
+      // Without a privacy policy, expose only known state labels and counts.
+      const known = [
+        "queued",
+        "checking",
+        "waiting_approval",
+        "waiting_ci",
+        "merging",
+        "landed",
+        "blocked",
+        "cancelled",
+      ];
       return {
-        land: land ? { id: land.id, state: land.state } : null,
+        land: land ? { id: land.id, state: known.includes(land.state) ? land.state : "queued" } : null,
         openQuestions: questions.filter((q) => q.answer === null).length,
       };
     }
@@ -84,7 +95,12 @@ export function explainStatus(
       "Landing blocked",
       "Inspect the land reason, resolve the blocker, then request limitless_land again.",
     );
-  if (land && ["queued", "checking", "waiting_ci", "merging"].includes(land.state))
+  if (land?.waitingApproval || land?.state === "waiting_approval")
+    return result(
+      "Landing waiting_approval",
+      `Wait for another GitHub account's approval; ${land.reason ?? ""}`,
+    );
+  if (land && !["landed", "blocked", "cancelled"].includes(land.state))
     return result(
       `Landing in progress (${land.state})`,
       "Wait for the land queue; check limitless_status for progress.",

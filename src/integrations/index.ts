@@ -41,7 +41,9 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
       deps.gh ?? runGh,
       console.warn,
       // While polling, merge reconciliation reads the poller's observations for the PRs it tracks.
-      factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
+      factory.cfg.githubPoll
+        ? observedPrs(factory.store, prClient, factory.cfg.landRequiresApproval)
+        : prClient,
       factory.cfg.paths.configDir,
       [factory.cfg.paths.repos, factory.cfg.paths.work],
     );
@@ -52,6 +54,7 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
           client: deps.github,
           gh: deps.gh,
           seconds,
+          requiresApproval: factory.cfg.landRequiresApproval,
           ciReruns: factory.cfg.githubCiReruns,
         })
       : () => {};
