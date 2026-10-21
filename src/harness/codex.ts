@@ -895,6 +895,7 @@ export async function runCodex(
     signal,
     timeoutMs: spec.timeoutMs,
     idleTimeoutMs: spec.idleTimeoutMs,
+    idleNow: spec.idleNow,
     onStdoutLine: (line) => {
       appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
       parser.feed(redactJsonLine(line, redactCredentials));

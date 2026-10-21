@@ -863,7 +863,15 @@ export class RunContext {
                   message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
                   data,
                 }),
-              (commandPath) => harness({ ...spec, scratchDir, ...(commandPath ? { commandPath } : {}) }),
+              (commandPath, idleNow) =>
+                harness({ ...spec, scratchDir, idleNow, ...(commandPath ? { commandPath } : {}) }),
+              (active, elapsedMs) =>
+                spec.onEvent({
+                  type: "status",
+                  text: active
+                    ? "Idle watchdog held off for slotted command"
+                    : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
+                }),
             );
           });
         } else {
