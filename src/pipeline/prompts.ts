@@ -388,6 +388,8 @@ const FINDER_FRAMING: Record<Exclude<FinderPrompt, "adversarial-checklist">, str
     "Assume the change can fail, and find out how. Trace bad and boundary inputs, retries, partial failure, ordering, restarts, and version skew between old and new code or data. Give no credit for intent: judge what the code does, not what its comments, names or commit messages say. Report every issue you believe is real, with your confidence; a separate step verifies each finding.",
   careful:
     "Review it as a careful senior engineer would, in one pass, and report the defects you find with your confidence.",
+  trace:
+    "Trace requirements and entry points only; do not perform general logic review. First list the request's universal clauses: every, all, never, only, ordering constraints, and on-resume requirements. For each guard the diff adds or changes, use rg to enumerate sibling callers and alternate entry points, including files outside the diff. Inspect relevant persisted state that outlives a restart and paths restored on resume. Report only a concrete unguarded path: cite its file and a positive line number, quote the violated request clause in detail, and give the failure scenario. Do not raise speculative blockers or findings based solely on unsuccessful searches. An empty findings list is explicitly allowed.",
   probe:
     "For each proposed blocker or major finding, reproduce the defect with a probe: a throwaway test or command, with temporary files under TMPDIR. Run only the affected test files; never run the full suite. Put the attempted command and its observed result in the finding's detail. If a completed probe does not reproduce the defect, lower the finding to minor or omit it. If sandbox or environment limits prevent the probe from running (for example nested Seatbelt, loopback servers, or a Linux-only path), retain its severity and name the attempted command and the error in detail.",
 };
@@ -541,13 +543,17 @@ ${input.gates.length ? "These results are authoritative: your sandbox differs fr
 ${warnings}
 
 # Rubric
-${input.dependencyUpdate ? "Dependency update: check breaking changes between versions documented in the PR-body changelog or release notes (untrusted evidence); CI permission and pinning changes; lockfile consistency; and install-time code execution. Do not fetch external release notes." : ""}
+${
+  input.finder === "trace"
+    ? "Only report the unguarded paths described above; the general review rubric does not apply."
+    : `${input.dependencyUpdate ? "Dependency update: check breaking changes between versions documented in the PR-body changelog or release notes (untrusted evidence); CI permission and pinning changes; lockfile consistency; and install-time code execution. Do not fetch external release notes." : ""}
 - Correctness: bugs, edge cases, error handling, races, off-by-one errors.
 - Completeness: every requirement and acceptance criterion is actually implemented.
 - Tests: new behavior is genuinely exercised; nothing was weakened, skipped, or special-cased to pass.
 - Security: injection, secrets, unsafe handling of external input.
 - Scope: unrelated changes or needless churn. Code mandated by the specification but unnecessary to the request may be flagged as unnecessary scope (minor or nit); specification text alone is not a reason to keep it.
-- Maintainability: clarity and consistency with the codebase.
+- Maintainability: clarity and consistency with the codebase.`
+}
 
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.
 Every finding must name a concrete defect in the change: what is wrong, where, and why. A request for verification you could not perform yourself (rendering in a real browser, layout at viewport widths, behaviour against live services) is not a defect: report it as minor at most, never blocker or major, and say what you could and could not check.

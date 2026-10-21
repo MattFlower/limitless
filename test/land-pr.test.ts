@@ -1131,8 +1131,10 @@ exec '${gitBin}' "$@"
       });
       if (scenario === "cancel") {
         const deadline = Date.now() + 5000;
-        while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
-        expect(existsSync(started)).toBe(true);
+        const ready = () =>
+          existsSync(started) && /^[1-9]\d* [1-9]\d*$/.test(readFileSync(started, "utf8").trim());
+        while (!ready() && Date.now() < deadline) await Bun.sleep(10);
+        expect(ready()).toBe(true);
         const pids = readFileSync(started, "utf8").split(" ").map(Number);
         scanGroup = pids[0];
         const at = Date.now();

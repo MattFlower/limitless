@@ -1048,3 +1048,34 @@ test("shared origin parser and predicate retain exact eval semantics", () => {
   );
   expect(originExclusion({ origin: "cn", baseOrigin: "US" }, ["CN"])).toBeNull();
 });
+
+test("trace single systems never calibrate the production single reviewer", () => {
+  const base = evidence("review", [local]);
+  const variant = {
+    ...base,
+    run: {
+      ...base.run,
+      id: "trace",
+      systems: [
+        {
+          name: "E",
+          mode: "single" as const,
+          finders: [
+            { target: local, prompt: "standard" as const },
+            { target: local, prompt: "trace" as const },
+          ],
+          implementerReport: "include" as const,
+        },
+      ],
+    },
+    trials: base.trials.map((t) => ({ ...t, details: { ...t.details, system: "E" } })),
+  };
+  for (const mode of ["include", "omit"] as const) {
+    expect(selectEvidence([variant], undefined, mode)).toEqual([]);
+    expect(selectEvidence([variant], ["trace"], mode)).toEqual([]);
+    expect(
+      generatePolicy(input([variant], { implementerReport: mode })).roles.find((r) => r.role === "review")
+        ?.candidates ?? [],
+    ).toEqual([]);
+  }
+});

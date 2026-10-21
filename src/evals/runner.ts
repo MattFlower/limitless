@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial, type ReviewSample } from "../core/types.ts";
 import { Semaphore } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
 import {
@@ -32,6 +32,7 @@ import {
   type ReviewRequest,
   reviewRequest,
   runReview,
+  traceIdentity,
   type VerifierRequest,
 } from "../pipeline/review.ts";
 import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
@@ -101,7 +102,21 @@ function regraded(
   const output = storedSchemaFor(item).safeParse(trial.output);
   if (!output.success) return null;
   const grade = gradeCase(item, output.data, causalAttribution);
-  return { ...trial, pass: grade.pass, score: grade.score, details: { ...trial.details, grade } };
+  const samples = trial.details.samples?.map((sample) => gradeSample(item, sample));
+  return {
+    ...trial,
+    pass: grade.pass,
+    score: grade.score,
+    details: { ...trial.details, grade, ...(samples ? { samples } : {}) },
+  };
+}
+
+function gradeSample(item: Exclude<EvalCase, ImplementCase>, sample: ReviewSample): ReviewSample {
+  const output = storedSchemaFor(item).safeParse(sample.output);
+  return {
+    ...sample,
+    grade: sample.error === undefined && output.success ? gradeCase(item, output.data) : undefined,
+  };
 }
 
 export interface EvalRegradeResult {
@@ -220,7 +235,10 @@ export class EvalRunner {
     const predecessors = new Map<string, EvalTrial>();
     for (let id = resume?.from; id; id = this.deps.store.getEvalRun(id)?.resumedFrom)
       for (const trial of this.deps.store.listEvalTrials(id))
-        if ((trial.status === "ok" || trial.status === "error") && !trial.details.preparationFailed)
+        if (
+          ((trial.status === "ok" || trial.status === "error") && !trial.details.preparationFailed) ||
+          trial.details.samples?.length
+        )
           if (!predecessors.has(trialKey(trial))) predecessors.set(trialKey(trial), trial);
     const switchChains = Object.fromEntries(
       trials.flatMap((t) => (t.details.switchChain ? [[t.caseId, t.details.switchChain]] : [])),
@@ -316,11 +334,24 @@ export class EvalRunner {
     );
     const result: EvalRegradeResult = { regraded: 0, changed: 0, skipped: [] };
     for (const trial of this.deps.store.listEvalTrials(id)) {
-      if (trial.status !== "ok" || !trial.details.grade?.review) continue;
+      if ((trial.status !== "ok" || !trial.details.grade?.review) && !trial.details.samples?.length) continue;
       const item = cases.get(trial.caseId);
       const updated =
         item &&
-        regraded(item, trial, run.systems?.find((s) => s.name === trial.details.system)?.causalAttribution);
+        (regraded(
+          item,
+          trial,
+          run.systems?.find((s) => s.name === trial.details.system)?.causalAttribution,
+        ) ??
+          (trial.details.samples
+            ? {
+                ...trial,
+                details: {
+                  ...trial.details,
+                  samples: trial.details.samples.map((s) => gradeSample(item, s)),
+                },
+              }
+            : null));
       if (!item || !updated) {
         result.skipped.push({
           caseId: trial.caseId,
@@ -331,7 +362,11 @@ export class EvalRunner {
         continue;
       }
       result.regraded++;
-      if (JSON.stringify(updated.details.grade) !== JSON.stringify(trial.details.grade)) result.changed++;
+      if (
+        JSON.stringify([updated.details.grade, updated.details.samples]) !==
+        JSON.stringify([trial.details.grade, trial.details.samples])
+      )
+        result.changed++;
       this.deps.store.recordEvalTrial(updated);
     }
     return result;
@@ -723,10 +758,12 @@ export class EvalRunner {
         return router.toTarget(pinnedModel, pinnedEffort ?? null);
       };
       const panelTargets =
-        system?.mode === "panel"
+        system && (system.mode === "panel" || system.finders.length > 1)
           ? {
               finders: system.finders.slice(1).map((f) => pinned(f.target)),
-              verifiers: (system.verifier?.targets ?? [system.verifier?.target]).map((t) => pinned(t)),
+              verifiers: (
+                system.verifier?.targets ?? (system.verifier?.target ? [system.verifier.target] : [])
+              ).map((t) => pinned(t)),
             }
           : undefined;
       // A replay makes no finder calls, so it waits on its verifiers instead of the trial's target:
@@ -763,6 +800,7 @@ export class EvalRunner {
               ...(replay ? { replay: replay.identity } : {}),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
               ...(system?.mode === "panel" ? { panel: panelIdentity(system.causalAttribution) } : {}),
+              ...(system?.finders.some((f) => f.prompt === "trace") ? { trace: traceIdentity() } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:
@@ -809,7 +847,7 @@ export class EvalRunner {
           (to) => to && [to.provider, to.model, selectHarness(run.role, to).harnessName, to.effort ?? null],
         ),
       );
-      if (predecessor?.cacheKey === trial.cacheKey) {
+      if (predecessor?.cacheKey === trial.cacheKey && ["ok", "error"].includes(predecessor.status)) {
         const copy =
           predecessor.status === "ok" && !("hidden" in item)
             ? (regraded(item, predecessor, system?.causalAttribution) ?? predecessor)
@@ -820,6 +858,10 @@ export class EvalRunner {
           details: { ...copy.details, resumedFrom: copy.details.resumedFrom ?? copy.evalRunId },
         });
       }
+      if (system?.samples && predecessor?.cacheKey === trial.cacheKey)
+        trial.details.samples = predecessor.details.samples?.map((s) =>
+          "hidden" in item ? s : gradeSample(item, s),
+        );
       if (cache) await coordination.keyed(trial.cacheKey);
       if (signal.aborted) return skip(stopReason(signal));
       if (budget()) return skip("eval budget exhausted");
@@ -850,6 +892,9 @@ export class EvalRunner {
               cacheWriteTokens: trial.details.cacheWriteTokens ?? 0,
               ...(source.details.fast === undefined ? {} : { fast: source.details.fast }),
               ...(source.details.verifiers ? { verifiers: source.details.verifiers } : {}),
+              ...(source.details.samples && !("hidden" in item)
+                ? { samples: source.details.samples.map((s) => gradeSample(item, s)) }
+                : {}),
               grade,
               cache: source.details.cache ?? {
                 evalRunId: source.evalRunId,
@@ -877,9 +922,10 @@ export class EvalRunner {
         const reason = gate();
         if (reason)
           return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
-        const runSlot = replay ? () => {} : await coordination.slot(target.provider);
+        const runSlot = replay || system?.samples ? () => {} : await coordination.slot(target.provider);
         release = runSlot;
-        const trackerSlot = replay ? () => {} : await tracker.acquire(target.provider, signal);
+        const trackerSlot =
+          replay || system?.samples ? () => {} : await tracker.acquire(target.provider, signal);
         release = () => {
           trackerSlot();
           runSlot();
@@ -939,7 +985,7 @@ export class EvalRunner {
               return to.harness({
                 fast,
                 scratchDir,
-                ...(sessionId ? { resumeSessionId: sessionId } : {}),
+                ...(sessionId && !system?.samples ? { resumeSessionId: sessionId } : {}),
                 cwd,
                 ...request,
                 decisionTask,
@@ -1015,7 +1061,28 @@ export class EvalRunner {
               ? (
                   await runReview(
                     {
-                      invoke: async (request, finder) => {
+                      samples: trial.details.samples,
+                      onSample: (sample) => {
+                        if (signal.aborted) return;
+                        trial.details.samples ??= [];
+                        trial.details.samples.push("hidden" in item ? sample : gradeSample(item, sample));
+                        trial.details.samples.sort((a, b) => a.index - b.index);
+                        const billed = combined(spent, sample.result, null);
+                        store.recordEvalTrial({
+                          ...trial,
+                          status: "running",
+                          costUsd: trial.costUsd + billed.costUsd,
+                          costEquivUsd: trial.costEquivUsd + billed.costEquivUsd,
+                          tokensIn:
+                            trial.tokensIn +
+                            billed.usage.input +
+                            billed.usage.cacheRead +
+                            billed.usage.cacheWrite,
+                          tokensOut: trial.tokensOut + billed.usage.output,
+                        });
+                      },
+                      invoke: async (request, finder, sample) => {
+                        if (sample !== undefined) return sendTo(request, target, `sample-${sample}`);
                         if (replay) {
                           release?.();
                           release = undefined;
@@ -1059,7 +1126,7 @@ export class EvalRunner {
                         return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },
-                    pipelineReview,
+                    { ...pipelineReview, sampleOffset: trial.trial * 2 },
                   )
                 ).result
               : await send();
@@ -1079,6 +1146,7 @@ export class EvalRunner {
             };
             result = spent.length ? combined(spent, failure, null) : failure;
           }
+          if (system?.samples) result = combined(spent, result, result.structured);
           trial.costUsd += result.costUsd;
           trial.costEquivUsd += result.costEquivUsd;
           trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
@@ -1121,14 +1189,21 @@ export class EvalRunner {
           store.recordEvalTrial({ ...trial, status: "running" });
         }
         // A panel's combined result carries its last call's status; the trial's own call is recorded here.
-        if (!replay) observe(target, own ?? result);
+        if (!replay && !system?.samples) observe(target, own ?? result);
         if (signal.aborted) return skip(stopReason(signal));
         // A panel's result is its derived review, whose verification fields only the stored schema keeps;
         // anything without the panel's mark (e.g. one member's raw review) is not a panel result.
         const output = (
           system?.mode === "panel"
             ? StoredReviewSchema.refine((r) => r.mode === "panel", "not a derived panel review")
-            : schema
+            : system?.finders.length === 2
+              ? StoredReviewSchema.refine(
+                  (r) => r.mode !== "panel" && r.panel?.reports?.length === 2,
+                  "not a derived trace review",
+                )
+              : system?.samples
+                ? StoredReviewSchema
+                : schema
         )?.safeParse(result.structured ?? extractJson(result.finalText));
         // A declined decision answer is still graded; details.invocationStatus records the escalation.
         const answered = result.status === "ok" || result.status === "declined";

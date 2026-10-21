@@ -1608,3 +1608,95 @@ test("executed trials snapshot fast mode and cached trials retain it across togg
     await f.close();
   }
 });
+
+test("trace single eval pins both targets, accounts all calls, reloads provenance and separates caches", async () => {
+  const f = await evalFixture();
+  try {
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({ role: "review", version: 1, cases: [{ ...reviewCase, base: f.sha, head }] }),
+    );
+    const main = { target: "candidate-a", prompt: "standard" };
+    const system = {
+      name: "E",
+      mode: "single",
+      implementerReport: "omit",
+      finders: [main, { target: "candidate-b", prompt: "trace" }],
+    };
+    let malformed = false;
+    f.respond((s) => ({
+      structured:
+        malformed && s.target.modelId === "candidate-b"
+          ? {}
+          : reviewOutput(s.target.modelId === "candidate-a" ? 10 : 11),
+      costUsd: 0.03,
+      costEquivUsd: 0.04,
+      usage: { input: 5, output: 3, cacheRead: 2, cacheWrite: 1 },
+    }));
+    const run = (systems: unknown[], over = {}) =>
+      f.run({ role: "review", models: undefined, k: 1, systems, ...over });
+    const baseline = await run([{ ...system, name: "baseline", finders: [main] }]);
+    expect(f.calls).toHaveLength(1);
+    const variant = await run([system]);
+    expect(
+      f.calls
+        .slice(1)
+        .map((s) => s.target.modelId)
+        .sort(),
+    ).toEqual(["candidate-a", "candidate-b"]);
+    expect(f.calls[2]?.prompt).toContain("Trace requirements and entry points only");
+    expect(f.calls.slice(1).every((s) => !s.prompt.includes("# Implementer's own report"))).toBe(true);
+    const trial = variant.trials[0];
+    expect(trial).toMatchObject({
+      status: "ok",
+      pass: true,
+      costUsd: 0.06,
+      costEquivUsd: 0.08,
+      tokensIn: 16,
+      tokensOut: 6,
+      details: { cacheReadTokens: 4, cacheWriteTokens: 2 },
+    });
+    expect(trial?.cacheKey).not.toBe(baseline.trials[0]?.cacheKey);
+    expect(trial?.details.verifiers).toBeUndefined();
+    const reloaded = StoredReviewSchema.parse(f.factory.store.listEvalTrials(variant.run.id)[0]?.output);
+    expect(reloaded.panel?.candidates).toHaveLength(1);
+    expect(reloaded.panel?.candidates[0]?.raisedBy).toEqual([0, 1]);
+    expect(reloaded.panel?.reports).toHaveLength(2);
+    expect(reloaded.panel?.finders?.map((f) => f.prompt)).toEqual(["standard", "trace"]);
+    const cached = await run([system]);
+    expect(f.calls).toHaveLength(3);
+    expect(cached.trials[0]?.details.cache?.evalRunId).toBe(variant.run.id);
+    expect(StoredReviewSchema.parse(cached.trials[0]?.output).panel?.candidates[0]?.raisedBy).toEqual([0, 1]);
+    malformed = true;
+    const failed = await run([system], { cache: false });
+    expect(failed.trials[0]).toMatchObject({ status: "error", pass: false, costUsd: 0.06, tokensIn: 16 });
+    expect(failed.trials[0]?.output).toBeNull();
+    expect(f.factory.tracker.status("openrouter")?.inFlight ?? 0).toBe(0);
+    expect(f.factory.tracker.status("provider-b")?.inFlight ?? 0).toBe(0);
+    // Registered E pins both passes to the same target; one provider slot must suffice.
+    malformed = false;
+    const shared = { ...system, name: "shared", finders: [main, { ...main, prompt: "trace" }] };
+    expect((await run([shared])).trials[0]?.status).toBe("ok");
+    const entered = deferred<void>();
+    f.respond((s) => {
+      if (s.prompt.includes("Trace requirements and entry points only")) {
+        const onEvent = s.onEvent;
+        s.onEvent = (event) => {
+          onEvent(event);
+          if (event.type === "text" && event.text === "trace ready") entered.resolve();
+        };
+        return { fault: "block", costUsd: 0.03, events: [{ type: "text", text: "trace ready" }] };
+      }
+      return { structured: reviewOutput(), costUsd: 0.03 };
+    });
+    const cancelled = f.factory.evals.submit({ role: "review", k: 1, systems: [shared], cache: false });
+    await entered.promise;
+    await f.factory.evals.cancel(cancelled.id);
+    const stopped = f.factory.store.listEvalTrials(cancelled.id)[0];
+    expect(stopped).toMatchObject({ status: "skipped", pass: null, costUsd: 0.06 });
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});

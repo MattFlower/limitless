@@ -103,6 +103,15 @@ export function formatEvalReport(report: EvalReport): string {
           `  ${legacyGrades} trials graded before blocking recall are excluded from pass, recall and comparisons; \`limitless eval regrade ${report.run.id}\` recomputes them from stored output without model calls`,
         );
     }
+    if (m.singleSample) {
+      const s = m.singleSample;
+      roleLines.push(
+        metric("single-sample blocking recall", s.defectRecall),
+        ...s.bySeverity.map((g) => metric(`single-sample ${g.severity}-severity blocking recall`, g)),
+        metric("single-sample clean false-block", s.falseBlock),
+        metric("single-sample verdict accuracy", s.verdictAccuracy),
+      );
+    }
     if (m.verify)
       roleLines.push(
         metric("false-accept", m.verify.falseAccept),

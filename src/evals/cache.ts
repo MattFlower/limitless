@@ -1,4 +1,6 @@
 import type { ReviewSystem } from "../core/types.ts";
+import { MERGE_RULES } from "../pipeline/panel-merge.ts";
+import { UNION_POLICY_VERSION } from "../pipeline/review.ts";
 
 /** Sort object keys recursively so schema construction order does not change identity. */
 function canonical(value: unknown): unknown {
@@ -47,5 +49,11 @@ export function cacheKey(
  * renaming a system (or `--models` naming it after its target) still reuses cached trials.
  */
 export function reviewSystemHash({ name: _name, ...config }: ReviewSystem): string {
-  return new Bun.CryptoHasher("sha256").update(JSON.stringify(canonical(config))).digest("hex");
+  return new Bun.CryptoHasher("sha256")
+    .update(
+      JSON.stringify(
+        canonical(config.samples ? { ...config, union: [UNION_POLICY_VERSION, MERGE_RULES] } : config),
+      ),
+    )
+    .digest("hex");
 }

@@ -778,7 +778,7 @@ test.each(["hook", "purpose", "sha"] as const)(
       const settled = execution.result.catch(() => undefined);
       try {
         const deadline = Date.now() + 5_000;
-        while (!existsSync(pidFile)) {
+        while (!existsSync(pidFile) || !/^[1-9]\d*$/.test(readFileSync(pidFile, "utf8").trim())) {
           if (Date.now() > deadline) throw new Error("gate child did not start");
           await Bun.sleep(10);
         }

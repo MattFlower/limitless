@@ -58,6 +58,8 @@ export function selectEvidence(
     const systems = entry.run.systems?.filter(
       (s) =>
         s.mode === "single" &&
+        s.finders.length === 1 &&
+        s.samples === undefined &&
         !s.setup &&
         s.finders[0]?.prompt === "standard" &&
         s.implementerReport === implementerReport,
@@ -134,6 +136,8 @@ export function generatePolicy(input: PolicyInput) {
         const systems = entry.run.systems?.filter(
           (s) =>
             s.mode === "single" &&
+            s.finders.length === 1 &&
+            s.samples === undefined &&
             !s.setup &&
             s.finders[0]?.prompt === "standard" &&
             s.implementerReport === implementerReport &&

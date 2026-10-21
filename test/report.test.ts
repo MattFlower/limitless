@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { Invocation } from "../src/core/types.ts";
 import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
-import { compareGates, type GateRun } from "../src/gates/run.ts";
+import { compareGates, type GateResult, type GateRun } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
 
@@ -106,6 +106,85 @@ test("needs-human report says so", () => {
     runUrl: "u",
   });
   expect(md).toContain("needs a human");
+});
+
+const passedCheck: GateResult = {
+  name: "test",
+  command: "bun test",
+  ok: true,
+  exitCode: 0,
+  durationMs: 1,
+  output: "",
+};
+const failedCheck: GateResult = { ...passedCheck, ok: false, exitCode: 1 };
+
+test.each(["pass", "flaky"] as const)(
+  "flaky baseline checks appear alongside candidate %s checks with the same name",
+  (verdict) => {
+    const baseline: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [
+        { ...passedCheck, firstAttempt: failedCheck },
+        { ...passedCheck, name: "lint", firstAttempt: { ...failedCheck, exitCode: null } },
+      ],
+    };
+    const lastGates = compareGates(baseline, { ...baseline, checks: [passedCheck] }).map((g) => ({
+      ...g,
+      verdict,
+      ...(verdict === "flaky" ? { firstAttempt: failedCheck } : {}),
+    }));
+    const md = renderReport({
+      success: true,
+      runId: "r1",
+      prompt: "check",
+      state: { baseline, lastGates },
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    });
+    const checks = md.split("## Checks")[1] ?? "";
+    expect(checks).toContain(`| test | ${verdict === "flaky" ? "⚠️ flaky" : "✅ pass"} |`);
+    expect(checks).toContain("**Flaky baseline checks**");
+    expect(checks).toContain("| test | failed (exit 1); passed on retry |");
+    expect(checks).toContain("| lint | failed; passed on retry |");
+    if (verdict === "flaky") expect(checks).toContain("Flaky: `test` failed, then passed when re-run.");
+  },
+);
+
+test("missing baseline and checks without a recovered failure produce no flaky baseline entry", () => {
+  const baselines: RunState["baseline"][] = [
+    undefined,
+    null,
+    { setupOk: true, setup: [], checks: [] },
+    {
+      setupOk: true,
+      setup: [],
+      checks: [
+        passedCheck,
+        failedCheck,
+        { ...passedCheck, firstAttempt: passedCheck },
+        { ...failedCheck, firstAttempt: failedCheck },
+      ],
+    },
+  ];
+  for (const baseline of baselines) {
+    const md = renderReport({
+      success: true,
+      runId: "r1",
+      prompt: "check",
+      state: {
+        baseline,
+        lastGates: compareGates(baseline ?? null, { setupOk: true, setup: [], checks: [passedCheck] }),
+      },
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    });
+    expect(md).not.toContain("Flaky baseline");
+    expect(md).not.toContain("passed on retry");
+    expect(md).toContain("| test | ✅");
+  }
 });
 
 test("the code review section lists every panel review and the diff it covered", () => {

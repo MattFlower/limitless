@@ -118,3 +118,39 @@ test.each([
 ])("checklist fails explicitly for missing required base content (%s)", (source) => {
   expect(() => checklistPrompt(source)).toThrow(/adversarial-checklist: .*base AGENTS.md/);
 });
+
+test("trace finder searches universal clauses and restart entry points with concrete evidence only", () => {
+  const prompt = reviewPrompt({
+    prompt: "Every path must validate, including on resume",
+    spec: null,
+    baseSha: "base",
+    stat: "src/check.ts | 1 +",
+    gates: [],
+    audit: [],
+    implementerReport: "",
+    finder: "trace",
+  });
+  for (const instruction of [
+    "First list",
+    "every, all, never, only",
+    "ordering constraints",
+    "on-resume",
+    "guard the diff adds or changes",
+    "use rg",
+    "sibling callers",
+    "alternate entry points",
+    "files outside the diff",
+    "persisted state",
+    "outlives a restart",
+    "positive line number",
+    "violated request clause",
+    "failure scenario",
+    "speculative blockers",
+    "unsuccessful searches",
+    "empty findings list",
+    "do not perform general logic review",
+  ])
+    expect(prompt).toContain(instruction);
+  expect(prompt).not.toContain("Correctness: bugs, edge cases");
+  expect(prompt).not.toContain("a separate step verifies");
+});

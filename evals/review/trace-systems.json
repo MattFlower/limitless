@@ -1,0 +1,19 @@
+{
+  "systems": [
+    {
+      "name": "E",
+      "mode": "single",
+      "finders": [
+        {
+          "target": "codex/sol-6.1@medium",
+          "prompt": "standard"
+        },
+        {
+          "target": "codex/sol-6.1@medium",
+          "prompt": "trace"
+        }
+      ],
+      "implementerReport": "include"
+    }
+  ]
+}

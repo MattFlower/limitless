@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { emptyUsage } from "../src/harness/types.ts";
+import { gradeReview } from "../src/evals/graders/review.ts";
+import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
 import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
 import * as prompts from "../src/pipeline/prompts.ts";
 import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
@@ -14,6 +15,7 @@ import {
   reviewRequest,
   reviewVerdict,
   runReview,
+  traceIdentity,
   type VerifierRequest,
 } from "../src/pipeline/review.ts";
 import {
@@ -27,6 +29,8 @@ import {
   type Verification,
   VerifierSchema,
 } from "../src/pipeline/schemas.ts";
+import { reviewCase } from "./evals-reading-support.ts";
+import { deferred } from "./evals-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
@@ -1994,4 +1998,271 @@ Inspect the latest-change diff with \`git diff fixbase..head\`. Compare it with 
     expect(stored.panel?.refuted).toEqual(["C1"]);
     expect(stored.panel?.candidates.map((c) => [c.id, c.line])).toEqual([["C1", 1]]);
   });
+});
+
+describe("trace single review", () => {
+  const input = {
+    prompt: {
+      prompt: "Every entry point must validate",
+      spec: null,
+      baseSha: "base",
+      stat: "src/changed.ts | 1 +",
+      gates: [],
+      audit: [],
+      implementerReport: "Done",
+    },
+    timeoutMs: 100,
+    system: {
+      mode: "single" as const,
+      finders: [{ prompt: "standard" as const }, { prompt: "trace" as const }],
+    },
+  };
+  const report = (findings: Review["findings"]) => ({
+    verdict: "approve" as const,
+    summary: "Inspected all applicable entry points against the request.",
+    findings,
+  });
+  const result = (structured: unknown, status: "ok" | "error" | "cancelled" | "timeout" = "ok") => ({
+    result: {
+      structured,
+      status,
+      finalText: "",
+      usage: emptyUsage(),
+      costUsd: 1,
+      costEquivUsd: 2,
+      numTurns: 1,
+      sessionId: null,
+      error: null,
+      quota: null,
+    },
+  });
+  test("merges duplicates with provenance, keeps out-of-diff findings, and never verifies", async () => {
+    const calls: number[] = [];
+    const main = finding("major");
+    const outside = { ...finding("minor"), file: "src/resume.ts", title: "Resume bypasses guard" };
+    const outcome = await runReview(
+      {
+        invoke: async (request, i) => {
+          calls.push(i);
+          if (i === 0) expect(request.prompt).toBe(reviewPrompt(input.prompt));
+          return result(report(i ? [main, outside] : [main]));
+        },
+        verify: async () => {
+          throw new Error("No verifier allowed");
+        },
+      },
+      input,
+    );
+    expect(calls).toEqual([0, 1]);
+    expect(outcome.decision?.review.findings).toHaveLength(2);
+    expect(outcome.panel?.candidates.map((c) => [c.file, c.agreement, c.raisedBy])).toEqual([
+      [main.file, 2, [0, 1]],
+      [outside.file, 1, [1]],
+    ]);
+    expect(outcome.decision?.review.mode).toBeUndefined();
+    expect(outcome.decision?.review.verdict).toBe("request_changes");
+    expect(outcome.decision?.blocking).toHaveLength(1);
+    expect(outcome.decision?.review.findings.every((f) => !f.verification)).toBe(true);
+    expect(outcome.result.costUsd).toBe(2);
+    const stored = StoredReviewSchema.parse(JSON.parse(JSON.stringify(outcome.result.structured)));
+    expect(stored.panel?.reports?.[1]?.findings).toHaveLength(2);
+    expect(stored.panel?.candidates[0]?.raisedBy).toEqual([0, 1]);
+  });
+  test("an empty trace preserves main findings and verdict", async () => {
+    const outcome = await runReview(
+      { invoke: async (_, i) => result(report(i ? [] : [finding("minor")])) },
+      input,
+    );
+    expect(outcome.decision?.review.verdict).toBe("approve");
+    expect(outcome.decision?.review.findings).toMatchObject([
+      { severity: "minor", file: "src/example.ts", line: 1, title: "Observed issue" },
+    ]);
+  });
+  test("agreement on minor findings does not confirm or promote them", async () => {
+    const outcome = await runReview({ invoke: async () => result(report([finding("minor")])) }, input);
+    expect(outcome.panel?.candidates[0]?.agreement).toBe(2);
+    expect(outcome.decision?.blocking).toHaveLength(0);
+    expect(outcome.decision?.review.verdict).toBe("approve");
+  });
+  test.each(["malformed", "error", "cancelled", "timeout", "throw", "skip"])(
+    "required trace %s cannot succeed main-only",
+    async (failure) => {
+      const calls: number[] = [];
+      const pending = runReview(
+        {
+          invoke: async (_, i) => {
+            calls.push(i);
+            if (!i) return result(report([finding("major")]));
+            if (failure === "throw") throw new Error("trace failed");
+            if (failure === "skip") throw new FinderSkipped("trace failed");
+            return result(
+              failure === "malformed" ? {} : report([]),
+              failure === "error"
+                ? "error"
+                : failure === "cancelled"
+                  ? "cancelled"
+                  : failure === "timeout"
+                    ? "timeout"
+                    : "ok",
+            );
+          },
+          skipAny: true,
+        },
+        input,
+      );
+      if (["throw", "skip"].includes(failure)) await expect(pending).rejects.toThrow("trace failed");
+      else {
+        const outcome = await pending;
+        expect(outcome.result.status).not.toBe("ok");
+        expect(outcome.result.structured).toBeNull();
+        expect(outcome.result.finalText).toBe("");
+        expect(outcome.output.success).toBe(false);
+        expect(outcome.result.costUsd).toBe(2);
+      }
+      expect(calls).toEqual([0, 1]);
+    },
+  );
+});
+
+test("trace cache identity includes its generated prompt and merge rules", () => {
+  const before = traceIdentity();
+  const original = prompts.reviewPrompt;
+  const spy = spyOn(prompts, "reviewPrompt").mockImplementation(
+    (input) => `${original(input)} trace revision`,
+  );
+  try {
+    expect(traceIdentity()).not.toBe(before);
+  } finally {
+    spy.mockRestore();
+  }
+  const version = MERGE_RULES.version;
+  try {
+    MERGE_RULES.version++;
+    expect(traceIdentity()).not.toBe(before);
+  } finally {
+    MERGE_RULES.version = version;
+  }
+});
+describe("two-sample single review", () => {
+  const input = {
+    prompt,
+    timeoutMs: 1234,
+    system: { mode: "single" as const, samples: 2 as const, finders: [{ prompt: "adversarial" as const }] },
+  };
+  const result = (structured: unknown, costUsd = 0): AgentResult => ({
+    status: "ok",
+    finalText: "",
+    structured,
+    sessionId: "fresh",
+    usage: { ...emptyUsage(), input: 10 },
+    numTurns: 1,
+    costUsd,
+    costEquivUsd: costUsd,
+    error: null,
+    quota: null,
+  });
+  const output = (findings: Review["findings"]): Review => ({
+    verdict: "request_changes",
+    summary: "Inspected every changed branch and found no other issues.",
+    findings,
+  });
+  test("both calls start on the same request before either settles; default remains one", async () => {
+    const pending = [deferred<{ result: AgentResult }>(), deferred<{ result: AgentResult }>()];
+    const calls: { request: ReviewRequest; sample?: number }[] = [];
+    const invoke = (request: ReviewRequest, _finder: number, sample?: number) => {
+      calls.push({ request, sample });
+      const wait = pending[sample ?? 0];
+      if (!wait) throw new Error("unexpected sample");
+      return wait.promise;
+    };
+    const running = runReview({ invoke }, input);
+    expect(calls.map((c) => c.sample)).toEqual([0, 1]);
+    expect(calls[0]?.request).toBe(calls[1]?.request);
+    for (const p of pending) p.resolve({ result: result(output([finding("minor")])) });
+    const union = await running;
+    expect(union.decision?.review.verdict).toBe("approve");
+    calls.length = 0;
+    const single = await runReview({ invoke }, { ...input, system: { ...input.system, samples: undefined } });
+    expect(calls.map((c) => c.sample)).toEqual([undefined]);
+    expect(single.decision?.review.verdict).toBe(union.decision?.review.verdict);
+  });
+  test("union keeps severity, agreement and alias locations under single-mode verdict rules", async () => {
+    const shared = { ...finding("major"), file: "src/a.ts", line: 10 };
+    const samples = [
+      output([shared, { ...finding("minor"), file: "minor.ts" }]),
+      output([
+        { ...shared, line: 14, severity: "minor" },
+        { ...finding("major"), file: "other.ts" },
+      ]),
+    ];
+    const union = await runReview(
+      { invoke: async (_r, _f, sample) => ({ result: result(samples[sample ?? 0]) }) },
+      input,
+    );
+    const findings = union.decision?.review.findings;
+    expect(findings).toHaveLength(3);
+    expect(findings?.[0]).toMatchObject({
+      line: 10,
+      severity: "major",
+      agreement: 2,
+      duplicates: [{ line: 14 }],
+    });
+    expect(findings?.slice(1).map((f) => f.agreement)).toEqual([1, 1]);
+    expect(findings?.[0]).not.toHaveProperty("finder");
+    expect(findings?.[0]).not.toHaveProperty("raisedBy");
+    expect(union.decision?.blocking).toHaveLength(2);
+    expect(union.decision?.review.verdict).toBe("request_changes");
+    expect(union.decision?.review.mode).toBeUndefined();
+    const defect = reviewCase.defects[0];
+    if (!defect || !union.decision) throw new Error("missing review");
+    expect(
+      gradeReview({ ...reviewCase, defects: [{ ...defect, lines: [18, 20] }] }, union.decision.review).review
+        ?.requiredMatched,
+    ).toBe(1);
+    expect(union.result.structured).toMatchObject({ samples: [{ index: 0 }, { index: 1 }] });
+  });
+  test.each(["invalid", "reject", "timeout", "both reject"])(
+    "sample failure (%s) waits and keeps spend",
+    async (failure) => {
+      const held = deferred<void>();
+      let finished = false;
+      const running = runReview(
+        {
+          invoke: async (_r, _f, sample) => {
+            if (sample === 0) {
+              await held.promise;
+              finished = true;
+              if (failure === "both reject") throw new Error("first failed");
+              return { result: result(output([finding("major")]), 0.1) };
+            }
+            if (failure === "reject" || failure === "both reject") throw new Error("second failed");
+            return {
+              result: {
+                ...result(null, 0.05),
+                ...(failure === "timeout" ? { status: "timeout" as const } : {}),
+              },
+            };
+          },
+        },
+        input,
+      );
+      let returned = false;
+      void running.then(() => {
+        returned = true;
+      });
+      await Promise.resolve();
+      expect(returned).toBe(false);
+      held.resolve();
+      const union = await running;
+      expect(finished).toBe(true);
+      expect(union.output.success).toBe(false);
+      expect(union.result.status).toBe("error");
+      expect(union.result.costUsd).toBeCloseTo(
+        failure === "both reject" ? 0 : failure === "reject" ? 0.1 : 0.15,
+      );
+      expect(union.result.usage.input).toBe(failure === "both reject" ? 0 : failure === "reject" ? 10 : 20);
+      expect(union.result.finalText).toBe("");
+      expect(union.decision).toBeUndefined();
+    },
+  );
 });

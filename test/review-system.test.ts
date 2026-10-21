@@ -7,6 +7,7 @@ import type { EvalTrial, ReviewSystem } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
+import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
 import { pickVerifier } from "../src/pipeline/review.ts";
 import {
   checkRosterTargets,
@@ -68,7 +69,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial", "careful", "probe" or "adversarial-checklist"',
+    'finder prompt must be "standard", "adversarial", "careful", "probe", "trace" or "adversarial-checklist"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -112,6 +113,12 @@ test("single prompt variants are eval-only and retain the single-mode restrictio
       expect(() =>
         parseEvalReviewSystems(file(panel({ finders: [{ target: "candidate-a", prompt }] })), "s.json"),
       ).toThrow('require mode "single"');
+      expect(() =>
+        parseEvalReviewSystems(
+          file(system({ samples: 2, finders: [{ target: "candidate-a", prompt }] })),
+          "s.json",
+        ),
+      ).toThrow("adversarial-checklist does not support samples; use k for repeats");
     }
     const finder = { target: "candidate-a", prompt };
     const variant = system({ finders: [finder] });
@@ -470,7 +477,15 @@ test("eval policy counts only standard systems matching the daemon's [review] im
           finders: [{ target: "candidate-a", prompt }],
         }),
       ),
+      system({
+        name: "trace",
+        finders: [
+          { target: "candidate-a", prompt: "standard" },
+          { target: "candidate-a", prompt: "trace" },
+        ],
+      }),
       system(),
+      system({ name: "two-samples", samples: 2 }),
       system({ name: "without", implementerReport: "omit" }),
     ] as ReviewSystem[];
     const trial = (name: string): EvalTrial => ({
@@ -665,5 +680,112 @@ test("an eval system can name a configured roster; it expands to exactly the pro
     ).toThrow('review system "standard-roster": local finder candidate-a is not a free model');
   } finally {
     await f.close();
+  }
+});
+
+test("trace is a pinned eval-only second finder after the standard reviewer", () => {
+  const main = { target: "codex/sol-6.1@medium", prompt: "standard" };
+  const trace = { ...main, prompt: "trace" };
+  const variant = system({ finders: [main, trace] });
+  expect(parseEvalReviewSystems(file(variant), "trace.json")).toEqual([variant] as ReviewSystem[]);
+  expect(reviewSystemHash(variant as ReviewSystem)).not.toBe(reviewSystemHash(system() as ReviewSystem));
+  for (const finders of [
+    [trace],
+    [trace, main],
+    [main, trace, trace],
+    [trace, trace],
+    [{ prompt: "standard" }, trace],
+  ])
+    expect(() => parseEvalReviewSystems(file(system({ finders })), "trace.json")).toThrow();
+  for (const extra of [{ verifier: {} }, { causalAttribution: true }, { samples: 2 }])
+    expect(() => parseEvalReviewSystems(file({ ...variant, ...extra }), "trace.json")).toThrow();
+  expect(() => parseEvalReviewSystems(file(panel({ finders: [trace] })), "trace.json")).toThrow();
+  expect(ReviewSystemSchema.safeParse(variant).success).toBe(false);
+  expect(ReviewSystemSchema.safeParse(panel({ finders: [trace] })).success).toBe(false);
+  for (const profile of ["quick", "standard", "deep"])
+    expect(() => parseReviewRosters({ [profile]: [trace] })).toThrow("eval-only");
+});
+
+test("registered trace experiment pins 35 dev cases, production E1, targets and the decision rule", async () => {
+  const registration = await Bun.file(
+    new URL("../evals/review/trace-experiment.json", import.meta.url),
+  ).json();
+  const definitions = await Bun.file(new URL("../evals/review/trace-systems.json", import.meta.url)).text();
+  const systems = parseEvalReviewSystems(definitions, "trace-systems.json");
+  const dataset = await Bun.file(new URL("../evals/review/cases.json", import.meta.url)).json();
+  expect(registration.caseIds).toHaveLength(35);
+  expect(new Set(registration.caseIds).size).toBe(35);
+  expect(registration.k).toBe(2);
+  expect(registration.baseline).toBe("eval-mv7igcxy1tl7bg203warej");
+  expect(registration.decision).toEqual({
+    minimumPooledRecallGain: 0.08,
+    maximumAdditionalCleanBlockedTrials: 1,
+  });
+  const cases = (
+    dataset.cases as { id: string; split: string; defects: { required: boolean }[]; kind: string }[]
+  ).filter((c) => registration.caseIds.includes(c.id));
+  expect(cases).toHaveLength(35);
+  expect(cases.every((c) => c.split === "dev")).toBe(true);
+  expect(cases.reduce((n, c) => n + c.defects.filter((d) => d.required).length, 0)).toBe(49);
+  expect(cases.filter((c) => c.kind === "clean")).toHaveLength(4);
+  expect(systems).toEqual([
+    {
+      name: "E",
+      mode: "single",
+      implementerReport: "include",
+      finders: [
+        { target: "codex/sol-6.1@medium", prompt: "standard" },
+        { target: "codex/sol-6.1@medium", prompt: "trace" },
+      ],
+    },
+  ]);
+});
+
+test("two samples are limited to eval single systems, with unchanged legacy hashes", () => {
+  const sampled = system({ samples: 2, finders: [{ target: "candidate-a@medium", prompt: "adversarial" }] });
+  expect(parseEvalReviewSystems(file(sampled), "systems.json")).toEqual([sampled] as EvalReviewSystem[]);
+  for (const samples of [1, 3, null, "2"])
+    expect(() => parseEvalReviewSystems(file(system({ samples })), "systems.json")).toThrow(
+      "samples must be 2",
+    );
+  for (const value of [panel({ samples: 2 }), system({ samples: 2, replayFrom: "previous" })])
+    expect(() => parseEvalReviewSystems(file(value), "systems.json")).toThrow(
+      "samples requires a single system without replayFrom",
+    );
+  expect(() =>
+    parseEvalReviewSystems(
+      file({
+        name: "roster",
+        roster: "standard",
+        targets: ["candidate-a"],
+        verifier: { target: "candidate-b" },
+        implementerReport: "include",
+        samples: 2,
+      }),
+      "systems.json",
+    ),
+  ).toThrow("samples is not supported on roster references");
+  expect(() => ReviewSystemSchema.parse(system({ samples: 2 }))).toThrow("eval-only until adopted");
+  const base = system() as ReviewSystem;
+  // The original hash was the canonical config alone (no name or union policy).
+  const original = new Bun.CryptoHasher("sha256")
+    .update(
+      JSON.stringify({
+        finders: [{ prompt: "standard", target: "candidate-a" }],
+        implementerReport: "include",
+        mode: "single",
+      }),
+    )
+    .digest("hex");
+  expect(reviewSystemHash(base)).toBe(original);
+  expect(reviewSystemHash({ ...base, samples: 2 })).not.toBe(original);
+  const unionHash = reviewSystemHash({ ...base, samples: 2 });
+  const version = MERGE_RULES.version;
+  try {
+    MERGE_RULES.version++;
+    expect(reviewSystemHash({ ...base, samples: 2 })).not.toBe(unionHash);
+    expect(reviewSystemHash(base)).toBe(original);
+  } finally {
+    MERGE_RULES.version = version;
   }
 });

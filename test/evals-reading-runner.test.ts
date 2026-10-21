@@ -2,12 +2,14 @@ import { expect, setDefaultTimeout, spyOn } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand } from "../src/cli/eval.ts";
+import * as caching from "../src/evals/cache.ts";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema, validateRequest } from "../src/evals/cases.ts";
 import * as checklist from "../src/evals/checklist.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import * as preparation from "../src/evals/prepare.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
+import { EvalRunner } from "../src/evals/runner.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
 import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
@@ -1688,6 +1690,56 @@ test("checklist eval pins base rules, preserves evidence and keys caches on the 
   }
 });
 
+const unionSystem = {
+  name: "union",
+  mode: "single",
+  samples: 2,
+  finders: [{ target: "candidate-a", prompt: "adversarial" }],
+  implementerReport: "include",
+};
+
+test("union cache identity leaves the original single trial inputs unchanged", async () => {
+  const f = await fixture();
+  const key = caching.cacheKey;
+  const inputs: Parameters<typeof key>[] = [];
+  const capture = spyOn(caching, "cacheKey").mockImplementation((...args) => {
+    inputs.push(args);
+    return key(...args);
+  });
+  try {
+    f.respond(() => ({ structured: reviewOutput() }));
+    const { samples: _samples, ...single } = unionSystem;
+    const baseline = await f.run({ models: undefined, systems: [single], cache: false });
+    const union = await f.run({ models: undefined, systems: [unionSystem], cache: false });
+    expect(baseline.trials[0]?.cacheKey).not.toBe(union.trials[0]?.cacheKey);
+    const original = inputs[0];
+    if (!original) throw new Error("missing cache inputs");
+    // Before this change the repository used the hash of exactly these canonical fields.
+    const oldHash = new Bun.CryptoHasher("sha256")
+      .update(
+        JSON.stringify({
+          finders: [{ prompt: "adversarial", target: "candidate-a" }],
+          implementerReport: "include",
+          mode: "single",
+        }),
+      )
+      .digest("hex");
+    expect(baseline.trials[0]?.cacheKey).toBe(
+      key(
+        ...(original.slice(0, 6) as [string, string, string, string, Record<string, unknown>, number]),
+        { ...(original[6] as object), reviewSystem: oldHash },
+        original[7],
+        original[8],
+      ),
+    );
+    expect(f.calls).toHaveLength(3);
+    expect(union.trials[0]?.details.samples).toHaveLength(2);
+  } finally {
+    capture.mockRestore();
+    await f.close();
+  }
+});
+
 test("missing base checklist content fails preparation without an ordinary review", async () => {
   const f = await fixture();
   try {
@@ -1705,6 +1757,192 @@ test("missing base checklist content fails preparation without an ordinary revie
     expect(f.calls).toHaveLength(0);
     await f.clean();
   } finally {
+    await f.close();
+  }
+});
+
+test("resume reuses a durably recorded union sample and bills only the missing one", async () => {
+  const f = await fixture();
+  let restarted: EvalRunner | undefined;
+  const second = deferred<void>();
+  const checkpoint = deferred<void>();
+  const record = f.factory.store.recordEvalTrial.bind(f.factory.store);
+  const recorded = spyOn(f.factory.store, "recordEvalTrial").mockImplementation((trial) => {
+    const value = record(trial);
+    if (trial.status === "running" && trial.details.samples?.length === 1) checkpoint.resolve();
+    return value;
+  });
+  try {
+    f.respond((s) => {
+      expect(s.resumeSessionId).toBeUndefined();
+      if (s.logPath.endsWith("sample-1")) {
+        second.resolve();
+        return { fault: "block" };
+      }
+      return { structured: reviewOutput(), costUsd: 0.1 };
+    });
+    const evals = f.factory.evals;
+    const run = evals.submit({ role: "review", systems: [unionSystem], k: 1 });
+    await Promise.all([checkpoint.promise, second.promise]);
+    const before = evals.report(run.id)?.trials[0]?.details.samples?.[0];
+    expect(before?.index).toBe(0);
+    const bytes = JSON.stringify(before?.output);
+    await evals.stop();
+    expect(evals.report(run.id)?.run.status).toBe("interrupted");
+    expect(evals.report(run.id)?.trials[0]?.costUsd).toBeCloseTo(0.1);
+    const calls = f.calls.length;
+    f.respond((s) => {
+      expect(s.logPath).toEndWith("trial.log.sample-1");
+      expect(s.resumeSessionId).toBeUndefined();
+      return { structured: reviewOutput(40), costUsd: 0.05 };
+    });
+    restarted = new EvalRunner(f.factory.deps, f.casePath);
+    const resumed = restarted.resume(run.id);
+    if (!resumed) throw new Error("missing resumed run");
+    await restarted.wait(resumed.id);
+    expect(f.calls.length - calls).toBe(1);
+    const trial = restarted.report(resumed.id)?.trials[0];
+    expect(trial).toMatchObject({ status: "ok", costUsd: 0.05 });
+    expect(trial?.details.samples).toHaveLength(2);
+    expect(JSON.stringify(trial?.details.samples?.[0]?.output)).toBe(bytes);
+    expect(f.factory.store.evalSpend(resumed.id)).toBeCloseTo(0.15);
+    await f.clean();
+  } finally {
+    recorded.mockRestore();
+    await restarted?.stop();
+    await f.close();
+  }
+});
+
+test("union trials grade all four fresh samples, pool attribution metrics, and regrade cached samples", async () => {
+  const f = await fixture();
+  try {
+    const first = f.item.defects[0];
+    if (!first) throw new Error("missing defect");
+    f.item.defects = [
+      { ...first, lines: [10, 20] },
+      { ...first, file: "src/b.ts", lines: [40, 50] },
+    ];
+    const clean = {
+      ...f.item,
+      id: "clean",
+      kind: "clean",
+      defects: [],
+      input: { ...f.item.input, prompt: "Inspect the clean fixture change" },
+    };
+    writeFileSync(f.casePath, JSON.stringify({ role: "review", version: 1, cases: [f.item, clean] }));
+    const empty = {
+      verdict: "approve",
+      summary: "Inspected every changed branch and found no other issues.",
+      findings: [],
+    };
+    let defectCalls = 0;
+    let cleanCalls = 0;
+    f.respond((s) => {
+      const isClean = s.prompt.includes("Inspect the clean fixture change");
+      const n = isClean ? cleanCalls++ : defectCalls++;
+      return {
+        structured: isClean
+          ? n === 0
+            ? reviewOutput()
+            : empty
+          : n === 0
+            ? reviewOutput()
+            : n === 1
+              ? reviewOutput(40, "major", "src/b.ts")
+              : empty,
+      };
+    });
+    const report = await f.run({
+      models: undefined,
+      systems: [unionSystem],
+      k: 2,
+      cache: false,
+      concurrency: 1,
+    });
+    expect(report.trials.map((t) => t.status)).toEqual(["ok", "ok", "ok", "ok"]);
+    expect(
+      report.trials.every(
+        (t) => t.details.samples?.length === 2 && t.details.samples.every((s) => s.grade?.review),
+      ),
+    ).toBe(true);
+    const summary = report.summaries[0];
+    expect(summary?.review?.defectRecall).toMatchObject({ numerator: 2, denominator: 4 });
+    expect(summary?.singleSample?.defectRecall).toMatchObject({ numerator: 2, denominator: 8 });
+    expect(summary?.review?.falseBlock).toMatchObject({ numerator: 1, denominator: 2 });
+    expect(summary?.singleSample?.falseBlock).toMatchObject({ numerator: 1, denominator: 4 });
+    expect(summary?.singleSample?.verdictAccuracy).toMatchObject({ numerator: 5, denominator: 8 });
+    expect(summary?.singleSample?.defectRecall.ci).toHaveLength(2);
+    expect(summary?.singleSample?.bySeverity.find((g) => g.severity === "medium")?.ci).toHaveLength(2);
+    const text = formatEvalReport(report);
+    expect(text).toContain("single-sample blocking recall 25.0% (2/8), Wilson 95% CI");
+    expect(text).toContain("single-sample clean false-block 25.0% (1/4)");
+    expect(report.trials.flatMap((t) => t.details.samples?.map((s) => s.index) ?? []).sort()).toEqual([
+      0, 0, 1, 1, 2, 2, 3, 3,
+    ]);
+    const cached = await f.run({ models: undefined, systems: [unionSystem], k: 2, concurrency: 1 });
+    expect(f.calls).toHaveLength(8);
+    expect(cached.summaries[0]?.singleSample).toEqual(summary?.singleSample);
+    // Changing labels must update the union and each sample without invoking the harness.
+    f.item.defects = f.item.defects.map((d) => ({ ...d, lines: [100, 110] }));
+    writeFileSync(f.casePath, JSON.stringify({ role: "review", version: 1, cases: [f.item, clean] }));
+    f.factory.evals.regrade(cached.run.id);
+    const regraded = f.factory.evals.report(cached.run.id);
+    expect(regraded?.summaries[0]?.singleSample?.defectRecall).toMatchObject({
+      numerator: 0,
+      denominator: 8,
+    });
+    expect(f.calls).toHaveLength(8);
+  } finally {
+    await f.close();
+  }
+});
+
+test("union samples acquire independent provider slots and retain both costs on invalid output", async () => {
+  const f = await fixture();
+  const both = deferred<void>();
+  const finish = deferred<void>();
+  let active = 0;
+  try {
+    const provider = f.factory.tracker.def("openrouter");
+    if (!provider) throw new Error("missing provider");
+    provider.maxConcurrent = 3;
+    f.respond(async (s) => {
+      active++;
+      if (active === 2) both.resolve();
+      await finish.promise;
+      return {
+        structured: s.logPath.endsWith("sample-0") ? reviewOutput() : { invalid: true },
+        costUsd: s.logPath.endsWith("sample-0") ? 0.1 : 0.05,
+      };
+    });
+    const running = f.run({ models: undefined, systems: [unionSystem], concurrency: 2 });
+    await both.promise;
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(2);
+    expect(f.calls.map((s) => s.logPath.split(".").at(-1)).sort()).toEqual(["sample-0", "sample-1"]);
+    expect(new Set(f.calls.map((s) => s.scratchDir)).size).toBe(2);
+    expect(f.calls.every((s) => s.target.modelId === "candidate-a" && s.resumeSessionId === undefined)).toBe(
+      true,
+    );
+    finish.resolve();
+    const report = await running;
+    expect(report.trials[0]).toMatchObject({
+      status: "error",
+      tokensIn: 200,
+      tokensOut: 100,
+      details: { invocationStatus: "error" },
+    });
+    expect(report.trials[0]?.costUsd).toBeCloseTo(0.15);
+    expect(report.trials[0]?.details.samples?.map((s) => !!s.grade)).toEqual([true, false]);
+    f.item.defects = f.item.defects.map((d) => ({ ...d, lines: [100, 110] }));
+    f.save();
+    f.factory.evals.regrade(report.run.id);
+    expect(
+      f.factory.evals.report(report.run.id)?.trials[0]?.details.samples?.[0]?.grade?.review?.requiredMatched,
+    ).toBe(0);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    finish.resolve();
     await f.close();
   }
 });

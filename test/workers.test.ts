@@ -1775,11 +1775,12 @@ test("cancelling execution aborts the worker's running gate on a held-job reply"
   try {
     const { signal, cwd } = await started.promise;
     const deadline = Date.now() + 10_000;
-    while (!existsSync(join(cwd, "gate.pid"))) {
+    const pidFile = join(cwd, "gate.pid");
+    while (!existsSync(pidFile) || !/^[1-9]\d*$/.test(readFileSync(pidFile, "utf8").trim())) {
       if (Date.now() > deadline) throw new Error("Worker gate did not start");
       await Bun.sleep(10);
     }
-    const pid = Number(readFileSync(join(cwd, "gate.pid"), "utf8").trim());
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
     process.kill(pid, 0);
     controller.abort();
     await expect(result).rejects.toThrow();
