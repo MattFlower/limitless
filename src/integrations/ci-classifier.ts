@@ -64,10 +64,18 @@ export const headMoved = (head: string, sha: string, approvedSha?: string): bool
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
   const lines = logLines(log);
-  const index = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
+  const start = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
+  let index = start;
+  // Bun prints the assertion and stack before the test name. Keep that block together.
+  if (/^\s*error:/i.test(lines[start] ?? "")) {
+    const next = lines
+      .slice(start + 1, start + 21)
+      .findIndex((l) => failureLine.test(l) || /^\s*\(pass\)/i.test(l));
+    if (next >= 0 && /^\s*\(fail\)/i.test(lines[start + 1 + next] ?? "")) index += 1 + next;
+  }
   const line = bounded(lines[index] ?? fallback);
   // Reserve room for the failure even when the preceding context contains very long lines.
-  const before = redactCredentials(lines.slice(Math.max(0, index - 2), index).join("\n")).slice(-500);
+  const before = redactCredentials(lines.slice(Math.max(0, start - 2), index).join("\n")).slice(-1000);
   const excerpt = redactCredentials(
     index < 0 ? log || line : [before, ...lines.slice(index, index + 4)].join("\n"),
   )

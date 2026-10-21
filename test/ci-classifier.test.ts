@@ -31,6 +31,20 @@ const securityRecords = [
   "not ok 1 security tests",
   "##[error]security tests failed",
 ];
+// Bun's assertion block, with the stack frame before the failing test name.
+const bunFailure = (name = "real Bun bail") => `(pass) handles socket failure [0.04ms]
+1 | import { expect, test } from "bun:test";
+2 | test("handles socket failure", () => {});
+3 | test("${name}", () => {
+4 |   expect(1).toBe(2);
+                ^
+error: expect(received).toBe(expected)
+
+Expected: 2
+Received: 1
+
+      at <anonymous> (test/example.test.ts:4:13)
+(fail) ${name} [0.10ms]`;
 
 function failure(n = 1, name = "test", conclusion = "timed_out") {
   h.factoryPr("o/r", n);
@@ -162,12 +176,12 @@ test("a failed rerun reports needs-fix and the cap survives reopening SQLite", a
 test.each(["success", "failure"])("a previous-release signature resolves a %s rerun", async (result) => {
   h = pollerHarness();
   const f = failure();
-  f.state.log = `Image: ubuntu-24.04\n${"Runner provisioning\n".repeat(150)}(pass) handles socket failure\n(fail) real Bun bail\nexpected: retry blocked`;
+  f.state.log = `Image: ubuntu-24.04\n${"Runner provisioning\n".repeat(150)}${bunFailure()}`;
   const old = {
     check: "test",
-    line: "(pass) handles socket failure",
+    line: "(pass) handles socket failure [0.04ms]",
     image: "ubuntu-24.04",
-    signature: '["test","(pass) handles socket failure","ubuntu-24.04"]',
+    signature: '["test","(pass) handles socket failure [0.04ms]","ubuntu-24.04"]',
     prUrl: f.node.url,
     sha: SHA,
     outcome: "failed" as const,
@@ -192,8 +206,11 @@ test.each(["success", "failure"])("a previous-release signature resolves a %s re
   expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
   expect(items("ci.needs_fix")).toHaveLength(result === "success" ? 0 : 1);
   if (result === "failure") {
-    expect(items("ci.needs_fix")[0]?.data.signature).toMatchObject({ line: "> (fail) real Bun bail" });
-    expect(items("ci.needs_fix")[0]?.data.excerpt).toContain("\n> expected: retry blocked");
+    expect(items("ci.needs_fix")[0]?.data.signature).toMatchObject({
+      line: "> (fail) real Bun bail [0.10ms]",
+    });
+    expect(items("ci.needs_fix")[0]?.data.excerpt).toContain("test/example.test.ts:4:13");
+    expect(items("ci.needs_fix")[0]?.data.excerpt).toContain("error: expect(received).toBe(expected)");
     expect(items("ci.needs_fix")[0]?.data.excerpt).toBe(`> ${fixEvidence()?.excerpt.replace(/\n/g, "\n> ")}`);
   }
   expect(reruns()).toHaveLength(0);
@@ -641,6 +658,13 @@ test("signatures distinguish checks, errors, and images; recurring failure does 
     ciSignature("a", `${passing}(fail) two`, "").signature,
   );
   expect(ciSignature("a", `${"x".repeat(3000)}\n(fail) real`, "").excerpt).toContain("(fail) real");
+  const bun = ciSignature("a", bunFailure(), "");
+  expect(bun.line).toBe("(fail) real Bun bail [0.10ms]");
+  expect(bun.signature).not.toBe(ciSignature("a", bunFailure("another failure"), "").signature);
+  expect(bun.excerpt).toContain("error: expect(received).toBe(expected)");
+  expect(bun.excerpt).toContain("test/example.test.ts:4:13");
+  expect(bun.excerpt).toContain(bun.line);
+  expect(ciSignature("a", `error: first\n${bunFailure()}`, "").line).toBe("error: first");
   const signatures = [
     ciSignature("a", "Image: ubuntu-24.04\nerror: one", ""),
     ciSignature("b", "Image: ubuntu-24.04\nerror: one", ""),
@@ -665,6 +689,23 @@ test("signatures distinguish checks, errors, and images; recurring failure does 
   expect(reruns()).toHaveLength(0);
   expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
   expect(items("ci.needs_fix")).toHaveLength(1);
+});
+
+test("initial Bun failure evidence includes the assertion, location and test name", async () => {
+  h = pollerHarness();
+  const f = failure(1, "test", "failure");
+  f.state.log = `${"Runner provisioning\n".repeat(150)}${bunFailure()}`;
+  h.start(15);
+  await h.advance(0);
+  expect(fixEvidence()?.line).toBe("(fail) real Bun bail [0.10ms]");
+  for (const diagnostic of [
+    "error: expect(received).toBe(expected)",
+    "test/example.test.ts:4:13",
+    "(fail) real Bun bail",
+  ])
+    expect(fixEvidence()?.excerpt).toContain(diagnostic);
+  expect(items("ci.needs_fix")[0]?.data.excerpt).toBe(`> ${fixEvidence()?.excerpt.replace(/\n/g, "\n> ")}`);
+  expect(fixEvidence()?.excerpt).not.toContain("Runner provisioning");
 });
 
 test.each([false, true])("bounded, redacted CI excerpts (rerun rejected: %s)", async (rejected) => {
