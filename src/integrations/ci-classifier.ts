@@ -66,21 +66,20 @@ export function ciSignature(check: string, log: string, fallback: string, labels
   const lines = logLines(log);
   const start = lines.findIndex((l) => failureLine.test(l) || timeoutDiagnostic.test(l));
   let index = start;
-  // Bun prints the assertion and stack before the test name. Keep that block together.
+  // Bun prints the assertion, diff and stack before the test name. Keep that block together.
   if (/^\s*error:/i.test(lines[start] ?? "")) {
-    const next = lines
-      .slice(start + 1, start + 21)
-      .findIndex((l) => failureLine.test(l) || /^\s*\(pass\)/i.test(l));
-    if (next >= 0 && /^\s*\(fail\)/i.test(lines[start + 1 + next] ?? "")) index += 1 + next;
+    const next = lines.slice(start + 1).findIndex((l) => failureLine.test(l) || /^\s*\(pass\)/i.test(l));
+    if (/^\s*\(fail\)/i.test(lines[start + 1 + next] ?? "")) index += 1 + next;
   }
   const line = bounded(lines[index] ?? fallback);
-  // Reserve room for the failure even when the preceding context contains very long lines.
-  const before = redactCredentials(lines.slice(Math.max(0, start - 2), index).join("\n")).slice(-1000);
-  const excerpt = redactCredentials(
-    index < 0 ? log || line : [before, ...lines.slice(index, index + 4)].join("\n"),
-  )
-    .trim()
-    .slice(0, 2000);
+  const window = (from: number, to: number) =>
+    redactCredentials(lines.slice(Math.max(0, from), to).join("\n"));
+  // Bound the leading context and the first failure line so neither consumes the budget.
+  const head = `${window(start - 2, start).slice(-500)}\n${window(start, start + 1).slice(0, 500)}`;
+  // A long Bun diff keeps its newest lines: the stack frame and the failing test name.
+  const tail =
+    index > start ? window(start + 1, index + 1).slice(head.length - 1999) : window(start + 1, start + 4);
+  const excerpt = (index < 0 ? redactCredentials(log || line) : `${head}\n${tail}`).trim().slice(0, 2000);
   const image =
     bounded(
       lines.find((l) => /^\s*Image:/.test(l))?.replace(/^\s*Image:\s*/, "") ??

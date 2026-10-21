@@ -664,6 +664,27 @@ test("signatures distinguish checks, errors, and images; recurring failure does 
   expect(bun.excerpt).toContain("error: expect(received).toBe(expected)");
   expect(bun.excerpt).toContain("test/example.test.ts:4:13");
   expect(bun.excerpt).toContain(bun.line);
+  // Bun 1.4 output for toEqual on 30 objects: a diff far past 20 lines and the excerpt budget.
+  const hunks = Array.from(
+    { length: 30 },
+    (_, i) =>
+      `@@ -${4 * i + 3},3 +${4 * i + 3},3 @@\n      "id": ${i},\n-     "name": "item ${i}!",\n+     "name": "item ${i}",\n    },`,
+  );
+  const diff = ciSignature(
+    "a",
+    `5 |   expect(a).toEqual(b);\n                ^\nerror: expect(received).toEqual(expected)\n\n${hunks.join("\n")}\n\n- Expected  - 30\n+ Received  + 30\n\n      at <anonymous> (test/big.test.ts:5:13)\n(fail) large diff [0.29ms]\n(pass) after [0.01ms]`,
+    "",
+  );
+  expect(diff.line).toBe("(fail) large diff [0.29ms]");
+  expect(diff.excerpt.length).toBeLessThanOrEqual(2000);
+  for (const part of [
+    "toEqual(b)",
+    "error: expect(received).toEqual(expected)",
+    "big.test.ts:5:13",
+    diff.line,
+  ])
+    expect(diff.excerpt).toContain(part);
+  expect(diff.excerpt).not.toContain("(pass) after");
   expect(ciSignature("a", `error: first\n${bunFailure()}`, "").line).toBe("error: first");
   const signatures = [
     ciSignature("a", "Image: ubuntu-24.04\nerror: one", ""),
