@@ -92,6 +92,8 @@ test("real credential and report paths preserve output and record their work", (
     stallReporter.sample(0);
     registerCredential("STALL_TEST_TOKEN", "synthetic-stall-token");
     expect(redactCredentials("value=synthetic-stall-token")).toBe("value=[redacted]");
+    expect(redactCredentials("value=synthetic-stall-token", { start: 10, end: 20 })).toBe("[redacted]");
+    expect(["plain", "synthetic-stall-token"].map(redactCredentials)).toEqual(["plain", "[redacted]"]);
     const report = renderReport({
       success: true,
       runId: "r1",

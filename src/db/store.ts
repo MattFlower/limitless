@@ -1214,7 +1214,10 @@ export class Store {
     this.db
       .query(`INSERT OR IGNORE INTO ci_fix_triggers
       (pr_url, observed_sha, trigger_key, check_name, signature_line, excerpt, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE NOT EXISTS (
+        SELECT 1 FROM ci_fix_triggers WHERE pr_url = ?1 AND observed_sha = ?2
+        AND check_name = ?4 AND state IN ('pending', 'started')
+      )`)
       .run(
         prUrl,
         head,
