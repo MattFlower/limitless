@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
-import type { Paths } from "../config.ts";
+import { type Config, type Paths, repoSettings } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
@@ -317,12 +317,18 @@ export async function createWorktree(
   runId: string,
   title: string,
   baseBranch: string,
+  options: { cfg?: Pick<Config, "repos">; store?: Store } = {},
 ): Promise<Worktree> {
   const cache = cachePath(paths, repo);
   const path = join(paths.work, runId);
-  const branch = `limitless/${runId}-${slugify(title, 30)}`;
+  const stored = options.store?.getRun(runId)?.branch;
+  const settings = repoSettings(options.cfg ?? {}, repo.slug);
+  let branch = stored ?? `limitless/${runId}-${slugify(title, 30)}`;
   const baseRef = `refs/remotes/origin/${baseBranch}`;
   if (existsSync(path)) {
+    // The actual branch also covers a restart before prepare recorded it.
+    branch =
+      stored ?? (await worktreeGit(["git", "symbolic-ref", "--short", "HEAD"], { cwd: path })).stdout.trim();
     // Resuming an interrupted run: reuse the worktree as-is.
     const head = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: path });
     const owner = await worktreeOwner(path);
@@ -332,6 +338,29 @@ export async function createWorktree(
   }
   return withRepoLock(cache, async () => {
     if (repo.kind === "local") await refreshCache(paths, repo);
+    if (!stored && settings.discreet) {
+      const refs = await worktreeGit(
+        ["git", "for-each-ref", "--format=%(refname)", "refs/heads/", "refs/remotes/origin/"],
+        { cwd: cache },
+      );
+      const taken = new Set(refs.stdout.trim().split("\n"));
+      const recorded = new Set(
+        options.store
+          ?.listRuns({ repoId: repo.id, limit: Number.MAX_SAFE_INTEGER })
+          .filter((r) => r.id !== runId)
+          .map((r) => r.branch),
+      );
+      const name = `${settings.branchPrefix}${slugify(title, 30)}`;
+      branch = name;
+      for (
+        let suffix = 2;
+        recorded.has(branch) ||
+        taken.has(`refs/heads/${branch}`) ||
+        taken.has(`refs/remotes/origin/${branch}`);
+        suffix++
+      )
+        branch = `${name}-${suffix}`;
+    }
     const base = await worktreeGit(["git", "rev-parse", baseRef], { cwd: cache });
     // Hooks are blanked where a command runs. `worktree add` would check out inside the new
     // worktree, where includes conditional on its branch or git directory can first activate

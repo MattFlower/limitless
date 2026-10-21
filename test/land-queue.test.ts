@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Paths } from "../src/config.ts";
+import { loadConfig } from "../src/config.ts";
 import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
@@ -287,6 +288,7 @@ function roundRun(ownerId: string, prUrl: string, head: string, db = store): Run
 
 function queue(
   opts: {
+    cfg?: import("../src/config.ts").Config;
     polling?: boolean;
     client?: LandPrClient;
     ciPollMs?: number;
@@ -3730,4 +3732,27 @@ test("red CI on an unowned PR blocks without a CI fix round", async () => {
   expect(store.pendingCiFixTriggers()).toEqual([]);
   expect(store.listRuns()).toEqual([]);
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a discreet stored PR lands with a neutral base merge subject", async () => {
+  const name = "change/feature";
+  const pr = delivered(1, name);
+  const head = await pushBranch(name, "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  await advanceBase();
+  const base = await remoteHead("main");
+  const cfg = loadConfig({
+    home: paths.home,
+    configDir: paths.configDir,
+    raw: { repos: { [SLUG]: { discreet: true } } },
+  });
+  const q = queue({ cfg });
+  const entry = await q.request({ target: pr.run.id });
+  await settle();
+  expect(store.runForPr(url(1))?.id).toBe(pr.run.id);
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect((await sh(["git", "log", "-1", "--format=%B", name], { cwd: bare })).stdout.trim()).toBe(
+    `Merge base ${base}`,
+  );
 });

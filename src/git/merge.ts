@@ -127,7 +127,12 @@ async function leftoverMarkers(
 }
 
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
-export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
+export async function completeMerge(
+  cwd: string,
+  head: string,
+  base: string,
+  message = `limitless: merge base ${base}`,
+): Promise<string> {
   await requireMerge(cwd, head, base);
   const mergeBase = (await mergeGit(cwd, ["merge-base", "HEAD", "MERGE_HEAD"])).stdout.trim();
   const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
@@ -163,6 +168,6 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
     await stageAll({ cwd, env: agentEnv() }, present);
   }
   await requireMerge(cwd, head, base);
-  await mergeGit(cwd, ["commit", "-q", "-m", `limitless: merge base ${base}`]);
+  await mergeGit(cwd, ["commit", "-q", "-m", message]);
   return validateMerge(cwd, head, base);
 }

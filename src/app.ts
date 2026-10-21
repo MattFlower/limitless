@@ -203,6 +203,7 @@ export class Factory {
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
     this.land = new LandQueue({
+      cfg,
       store: this.store,
       paths: cfg.paths,
       readPolicy: cfg.readPolicy,

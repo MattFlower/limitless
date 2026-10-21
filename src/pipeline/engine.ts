@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { repoSettings } from "../config.ts";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
@@ -94,6 +95,7 @@ import {
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { runGateExecution } from "./gate-execution.ts";
+import { deliveryMarker } from "./markers.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -496,7 +498,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     if (ctx.repo.kind === "github") await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
-    const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
+    const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base, { cfg, store });
     const review = reviewRound(ctx);
     // Refused before any model call; delivery checks the PR again just before pushing.
     if (review && wt.baseSha !== review.reviewedSha)
@@ -686,6 +688,18 @@ async function prepare(ctx: RunContext): Promise<void> {
   });
 }
 
+function commitMessage(ctx: RunContext, round?: number): string {
+  if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)
+    return round === undefined || (round === 0 && !reviewRound(ctx))
+      ? ctx.run.title
+      : `${ctx.run.title} (round ${round + 1})`;
+  return `limitless: ${ctx.run.title}${round === undefined ? "" : ` (round ${round + 1})`}\n\nRun: ${ctx.run.id}`;
+}
+
+function mergeMessage(ctx: RunContext, base: string): string {
+  return `${repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "Merge" : "limitless: merge"} base ${base}`;
+}
+
 /**
  * Merges the original run's base into the PR branch when the PR doesn't contain it, with the
  * factory's merge helpers; returns the merge commit, or null when unnecessary or deferred.
@@ -718,7 +732,7 @@ async function mergeReviewBase(
       await ctx.save();
       return null;
     }
-    await completeMerge(cwd, head, tip);
+    await completeMerge(cwd, head, tip, mergeMessage(ctx, tip));
     ctx.log(`Merged ${base} (${tip.slice(0, 8)}) into the PR branch before the round`);
   }
   return validateMerge(cwd, head, tip);
@@ -1189,8 +1203,8 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       }
       const sha =
         merge && previousHead
-          ? await completeMerge(cwd, previousHead, baseSha)
-          : await commitAll(cwd, `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`);
+          ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha))
+          : await commitAll(cwd, commitMessage(ctx, round));
       ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
@@ -2357,10 +2371,14 @@ async function deliverReviewRound(
     }
     const blocked = environmentBlockedRound(ctx);
     if (blocked || review.kind === "conflict" || review.kind === "ci") {
-      const marker = `<!-- limitless-${review.kind}-round:${ctx.run.id} -->`;
+      const { marker, includes: hasMarker } = deliveryMarker(
+        review.kind,
+        ctx.run.id,
+        repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet,
+      );
       const comments = JSON.parse((await gh(["pr", "view", prUrl, "--json", "comments"], ctx.signal)) || "{}")
         .comments as { body?: string }[] | undefined;
-      if (!comments?.some((comment) => comment.body?.includes(marker))) {
+      if (!comments?.some((comment) => hasMarker(comment.body))) {
         const failure = ctx.store.ciFixFailure(ctx.run.id);
         if (review.kind === "ci" && !failure) throw new Error("Missing CI fix failure record");
         let text = redactGateOutput(
@@ -2387,7 +2405,7 @@ async function deliverReviewRound(
           text = publicationText(
             ctx,
             redactGateOutput(
-              `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}\n\n${rows.join("\n")}`,
+              `${marker}\nRound ${review.round} published at ${head}.\n${ENVIRONMENT_BLOCKED}${repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "" : `\nFull report: ${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`}\n\n${rows.join("\n")}`,
             ),
           ).slice(0, 60_000);
         }
@@ -2397,9 +2415,14 @@ async function deliverReviewRound(
       }
       return;
     }
-    const { marker, text: section } = roundSection(ctx.run.id, review.round, redactGateData(review.findings));
+    const { includes: hasMarker, text: section } = roundSection(
+      ctx.run.id,
+      review.round,
+      redactGateData(review.findings),
+      repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet,
+    );
     const text = publicationText(ctx, section);
-    if (!pr.body.includes(marker)) {
+    if (!hasMarker(pr.body)) {
       const body = publicationText(ctx, pr.body + text);
       await checkPublication(ctx, text, undefined, "PR round section");
       await checkPublication(ctx, body, undefined, "PR body");
@@ -2480,7 +2503,11 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         const rendered = buildReportArtifacts(ctx, true);
         const report = rendered.report;
         if (!ctx.state.verdictCommentPosted) {
-          const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
+          const { marker, includes: hasMarker } = deliveryMarker(
+            "verification",
+            ctx.run.id,
+            repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet,
+          );
           ctx.checkCancelled();
           const comments = [
             "api",
@@ -2496,7 +2523,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               confirmingHead = false;
               // A pending post (an earlier attempt that failed late, or one whose checkpoint was
               // lost) may already exist remotely: look for its marker before posting again.
-              if (ctx.state.verdictCommentPending && (await runner(comments, ctx.signal))?.includes(marker))
+              if (ctx.state.verdictCommentPending && hasMarker((await runner(comments, ctx.signal)) ?? ""))
                 return;
               ctx.state.verdictCommentPending = true;
               await ctx.save("verification-comment-pending");
@@ -2575,7 +2602,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const sha =
       ctx.state.pendingRebaseSha || ctx.state.conflictRound !== undefined
         ? null
-        : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
+        : await commitAll(cwd, commitMessage(ctx));
     let head = sha ?? (await headSha(cwd));
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
@@ -2761,7 +2788,7 @@ async function mergeForDelivery(
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }
-  if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
+  if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched));
   await validateMerge(cwd, before, fetched);
   await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];

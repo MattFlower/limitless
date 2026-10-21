@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import type { Paths } from "../config.ts";
+import { type Config, type Paths, repoSettings } from "../config.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
@@ -84,6 +84,7 @@ export interface LandDeps {
   gateExecutor?: GateExecutor;
   store: Store;
   paths: Paths;
+  cfg?: Pick<Config, "repos">;
   readPolicy?: ReadPolicyOptions;
   /** GitHub polling is on: read the poller's saved observations instead of calling `gh` every cycle. */
   polling?: boolean;
@@ -525,7 +526,12 @@ export class LandQueue {
     if (await isAncestor(cwd, baseSha, entry.approvedSha)) return entry.approvedSha;
     const conflicts = await prepareMerge(cwd, entry.approvedSha, baseSha);
     if (conflicts.length) throw new LandConflict(`conflicts with ${entry.baseBranch}`);
-    return completeMerge(cwd, entry.approvedSha, baseSha);
+    return completeMerge(
+      cwd,
+      entry.approvedSha,
+      baseSha,
+      `${repoSettings(this.deps.cfg ?? {}, entry.repo).discreet ? "Merge" : "limitless: merge"} base ${baseSha}`,
+    );
   }
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */

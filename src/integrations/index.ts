@@ -44,6 +44,7 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
       factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
       factory.cfg.paths.configDir,
       [factory.cfg.paths.repos, factory.cfg.paths.work],
+      factory.cfg,
     );
     cleanups.push(stopNotifier);
     const seconds = factory.cfg.githubPollSeconds;

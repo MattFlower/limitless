@@ -27,7 +27,7 @@ import { seeded } from "./seeded.ts";
 // Real git, worktrees and gates; under load they outlast Bun's 5 s default.
 setDefaultTimeout(30_000);
 
-const BRANCH = "limitless/orig-add-feature";
+let BRANCH = "limitless/orig-add-feature";
 const PR_URL = "https://github.com/test/repo/pull/5";
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -250,6 +250,7 @@ async function restart(faults?: FaultPlan) {
 }
 
 beforeEach(async () => {
+  BRANCH = "limitless/orig-add-feature";
   root = mkdtempSync(join(tmpdir(), "review-rounds-"));
   observerRoots.add(realpathSync(root));
   await seed(root);
@@ -1510,4 +1511,52 @@ test("a delivered review round finishes after restart without undoing a branch r
   expect(await remoteHead()).toBe(reviewed);
   expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
   expect(pr.body).toBe(body);
+});
+
+test("discreet review delivery uses stored ownership and recognizes an uncheckpointed section after restart", async () => {
+  await sh(["git", "branch", "-m", BRANCH, "change/feature"], { cwd: remote });
+  BRANCH = "change/feature";
+  mkdirSync(join(root, "cfg"));
+  writeFileSync(join(root, "cfg", "config.toml"), '[repos."test/repo"]\ndiscreet = true');
+  await restart();
+  pr.body = "Every gate below passed.";
+  const original = await delivered();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  const gh = factory.deps.gh;
+  if (!gh) throw new Error("missing gh");
+  factory.deps.gh = async (args, signal, stdin) => {
+    const result = await gh(args, signal, stdin);
+    if (args[1] === "edit") throw new Error("response lost after edit");
+    return result ?? "";
+  };
+  expect((await settle(roundId)).status).toBe("failed");
+  const body = pr.body;
+  expect(body).toContain("Addressed review findings:");
+  expect(body).not.toMatch(/limitless|\/runs\//i);
+  expect(body).not.toContain(roundId);
+  expect(factory.store.runForPr(PR_URL)?.id).toBe(roundId);
+  const round = factory.store.getRun(roundId);
+  expect((await sh(["git", "log", "-1", "--format=%B", BRANCH], { cwd: remote })).stdout.trim()).toBe(
+    `${round?.title} (round 1)`,
+  );
+  writeFileSync(join(root, "cfg", "config.toml"), '[repos."test/repo"]\ndiscreet = false');
+  await restart();
+  // Re-enter the incomplete delivery; its append already reached GitHub before termination.
+  expect(await executeRun(factory.deps, roundId, new AbortController().signal)).toBe("succeeded");
+  expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+  expect(pr.body).toBe(body);
+});
+
+test("discreet environment-blocked rounds omit the local report URL", async () => {
+  factory.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  const original = await delivered("standard");
+  verifyStatus = "blocked";
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  expect((await settle(roundId)).status).toBe("needs_human");
+  expect(pr.comments).toHaveLength(1);
+  const body = pr.comments[0]?.body;
+  expect(body).toContain("🚧 blocked AC-1");
+  expect(body).not.toMatch(/limitless|\/runs\/|Full report:/i);
+  expect(body).not.toContain(roundId);
+  expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(0);
 });

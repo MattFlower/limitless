@@ -3,6 +3,7 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isBranchName } from "./core/delivery.ts";
 import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
@@ -36,6 +37,7 @@ export interface Reserves {
 export interface Config {
   readonly readPolicy: ReadPolicyOptions;
   paths: Paths;
+  repos?: Record<string, RepoSettings>;
   deploy: { afterLand: "off" | "when_idle" };
   retention: { worktreeDays: number; failedWorktreeDays: number; logDays: number; debugEventDays: number };
   port: number;
@@ -94,6 +96,34 @@ export interface Config {
   secrets: Record<string, string>;
   /** Raw config.toml overrides (routing policy, providers) consumed by their modules. */
   raw: Record<string, unknown>;
+}
+
+export interface RepoSettings {
+  discreet: boolean;
+  branchPrefix: string;
+}
+
+export function repoSettings(cfg: Pick<Config, "repos">, slug: string): RepoSettings {
+  return cfg.repos?.[slug.toLowerCase()] ?? { discreet: false, branchPrefix: "change/" };
+}
+
+function parseRepos(value: unknown): Record<string, RepoSettings> {
+  const table = (v: unknown): v is Record<string, unknown> =>
+    Object.prototype.toString.call(v) === "[object Object]";
+  if (!table(value)) throw new Error("repos must be a table");
+  const out: Record<string, RepoSettings> = Object.create(null);
+  for (const [slug, entry] of Object.entries(value)) {
+    if (!repoName.test(slug)) throw new Error("repos keys must be owner/name slugs");
+    if (!table(entry)) throw new Error("repos entries must be tables");
+    for (const key of Object.keys(entry))
+      if (key !== "discreet" && key !== "branch_prefix") throw new Error(`Unknown repos key: ${key}`);
+    const { discreet = false, branch_prefix = "change/" } = entry;
+    if (typeof discreet !== "boolean") throw new Error("repos.discreet must be a boolean");
+    if (typeof branch_prefix !== "string" || !branch_prefix || !isBranchName(`${branch_prefix}x`))
+      throw new Error("repos.branch_prefix must be a nonempty valid branch prefix");
+    out[slug.toLowerCase()] = { discreet, branchPrefix: branch_prefix };
+  }
+  return out;
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -375,6 +405,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   };
 
   return {
+    ...(raw.repos === undefined ? {} : { repos: parseRepos(raw.repos) }),
     deploy: { afterLand },
     readPolicy: configureReadPolicy(raw.sandbox, configDir),
     paths,
