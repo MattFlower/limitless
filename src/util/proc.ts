@@ -1107,7 +1107,9 @@ export function registerCredential(name: string, value?: string): void {
   for (const secret of [value, process.env[name]])
     if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
       credentialValues.add(secret);
-      for (const variant of new Set([secret, JSON.stringify(secret).slice(1, -1)]))
+      // Log normalization removes CRLF line endings before publication-window redaction.
+      const values = [secret, secret.replace(/\r\n/g, "\n")];
+      for (const variant of new Set(values.flatMap((s) => [s, JSON.stringify(s).slice(1, -1)])))
         credentialVariants.set(variant, credentialVariants.get(variant) || secret.length >= 8);
       sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
     }

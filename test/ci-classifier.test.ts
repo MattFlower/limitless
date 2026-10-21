@@ -755,15 +755,22 @@ test.each([false, true])("bounded, redacted CI excerpts (rerun rejected: %s)", a
   expect(reruns()).toHaveLength(rejected ? 1 : 0);
 });
 
-test.each([false, true])(
-  "a multiline credential split by the excerpt window is redacted (timestamped: %s)",
-  (stamped) => {
-    const key = "ci-window-start\nci-window-key-first\nci-window-key-last\nci-window-finish";
+test.each(["LF", "CRLF", "timestamped LF", "timestamped CRLF"])(
+  "a multiline credential split by the excerpt window is redacted (%s)",
+  (kind) => {
+    const key = [
+      `ci-window-start-${kind}`,
+      "ci-window-key-first",
+      "ci-window-key-last",
+      "ci-window-finish",
+    ].join(kind.endsWith("CRLF") ? "\r\n" : "\n");
     registerCredential("CI_WINDOW_KEY", key);
     const log = `${key}\nerror: assertion failed\n  at test/example.test.ts:1:1\n(fail) actual test`;
     const { excerpt, line } = ciSignature(
       "test",
-      stamped ? log.replace(/^/gm, "2026-10-05T00:00:00.0000000Z ") : log,
+      kind.startsWith("timestamped")
+        ? log.replace(/(^|\n)/g, (prefix) => `${prefix}2026-10-05T00:00:00.0000000Z `)
+        : log,
       "",
     );
     expect(line).toBe("(fail) actual test");
@@ -774,12 +781,13 @@ test.each([false, true])(
   },
 );
 
-test.each(["ordinary", "multiline", "escaped"])(
+test.each(["ordinary", "multiline", "escaped", "CRLF", "escaped CRLF"])(
   "CI publication cuts redact crossing %s credentials",
   (kind) => {
-    const key = `ci-publication-left${kind === "ordinary" ? "-" : '\n\\\t"'.repeat(10)}ci-publication-right`;
+    const separator = kind.endsWith("CRLF") ? '\r\n\\\t"' : '\n\\\t"';
+    const key = `ci-publication-left-${kind}${kind === "ordinary" ? "-" : separator.repeat(10)}ci-publication-right`;
     registerCredential("CI_PUBLICATION_KEY", key);
-    const value = kind === "escaped" ? JSON.stringify(key).slice(1, -1) : key;
+    const value = kind.startsWith("escaped") ? JSON.stringify(key).slice(1, -1) : key;
     for (const log of [
       `${value}${"x".repeat(490)}\nerror: useful failure`,
       `error: useful failure ${"x".repeat(470)}${value}`,
@@ -799,13 +807,18 @@ test.each(["ordinary", "multiline", "escaped"])(
 );
 
 test.each([false, true])("CI line and image cuts retain multiline context (timestamped: %s)", (stamped) => {
-  for (const key of ["ci-line-before\n(fail) ci-line-after", "ci-line-before\nci-line-after"]) {
+  for (const key of [
+    "ci-line-before\n(fail) ci-line-after",
+    "ci-line-before\nci-line-after",
+    "ci-line-before-crlf\r\n(fail) ci-line-after-crlf",
+    "ci-line-before-crlf\r\nci-line-after-crlf",
+  ]) {
     registerCredential("CI_LINE_KEY", key);
     for (const prefix of ["", "(fail) useful ", "Image: "]) {
       const log = `${prefix}${key}\nerror: useful failure`;
       const result = ciSignature(
         "test",
-        stamped ? log.replace(/^/gm, "2026-10-05T00:00:00.0000000Z ") : log,
+        stamped ? log.replace(/(^|\n)/g, (prefix) => `${prefix}2026-10-05T00:00:00.0000000Z `) : log,
         "",
       );
       for (const output of [result.line, result.excerpt, result.image ?? ""]) {
