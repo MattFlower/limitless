@@ -183,7 +183,7 @@ const approve = (n: number, head: string) => {
 };
 
 /** A succeeded run that delivered `branch` as PR `n`, with the poller's observation of its head. */
-function delivered(n: number, branch: string): { run: Run; prUrl: string } {
+function delivered(n: number, branch: string, requestedBy?: string): { run: Run; prUrl: string } {
   const repo = store.upsertRepo({
     slug: SLUG,
     kind: "github",
@@ -192,7 +192,7 @@ function delivered(n: number, branch: string): { run: Run; prUrl: string } {
     defaultBranch: "main",
     mergePolicy: "pr",
   });
-  const run = store.createRun(repo, { repo: SLUG, prompt: `pr ${n}` });
+  const run = store.createRun(repo, { repo: SLUG, prompt: `pr ${n}`, requestedBy });
   runs.set(n, run);
   store.updateRun(run.id, {
     prUrl: url(n),
@@ -3762,7 +3762,7 @@ test("a discreet stored PR lands with a neutral base merge subject", async () =>
 });
 
 test.each([true, false])("squash body uses current repository settings (discreet: %s)", async (discreet) => {
-  const pr = delivered(1, "change/feature");
+  const pr = delivered(1, "change/feature", "dependabot[bot]");
   const head = await pushBranch("change/feature", "one.txt", "one\n");
   observe(1, head);
   approve(1, head);
@@ -3789,11 +3789,40 @@ test.each([true, false])("squash body uses current repository settings (discreet
   if (discreet) {
     expect(body).toContain("## Checks");
     expect(body).toContain("Public summary");
+    expect(body).toContain("Routing: free-first (Dependabot)");
     expect(body).not.toContain("Changed after publication check");
     expect(body).not.toMatch(/limitless|\/runs\//i);
     expect(body).not.toContain(pr.run.id);
   } else expect(body).toBe(report);
 });
+
+test.each([false, true])(
+  "discreet landing blocks a needs-human owner (verified work: %s)",
+  async (verified) => {
+    const pr = delivered(1, "change/feature");
+    const head = await pushBranch("change/feature", "one.txt", "one\n");
+    observe(1, head);
+    approve(1, head);
+    store.updateRun(pr.run.id, { status: "needs_human", error: "Checks failed" });
+    store.setRunState(pr.run.id, {
+      implementerReport: "Work needs attention",
+      ...(verified ? { lastVerifiedSha: head, lastVerifiedEvidence: {} } : {}),
+    });
+    const cfg = loadConfig({
+      home: paths.home,
+      configDir: paths.configDir,
+      raw: { repos: { [SLUG]: { discreet: true } } },
+    });
+    const entry = await queue({ cfg }).request({ target: pr.run.id });
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: "blocked",
+      reason: expect.stringMatching(/Discreet mode.*owner run is needs_human/),
+    });
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(existsSync(join(root, "gh.body-1"))).toBe(false);
+  },
+);
 
 test("discreet landing blocks when the saved state cannot render a current squash body", async () => {
   const pr = delivered(1, "change/feature");

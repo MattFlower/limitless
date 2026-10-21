@@ -87,7 +87,7 @@ export interface LandDeps {
   gateExecutor?: GateExecutor;
   store: Store;
   paths: Paths;
-  cfg?: Pick<Config, "repos"> & Partial<Pick<Config, "uiUrl">>;
+  cfg?: Pick<Config, "repos"> & Partial<Pick<Config, "uiUrl" | "dependabotRouting">>;
   readPolicy?: ReadPolicyOptions;
   /** GitHub polling is on: read the poller's saved observations instead of calling `gh` every cycle. */
   polling?: boolean;
@@ -903,6 +903,8 @@ export class LandQueue {
   private reportBody(run: Run): string {
     const repo = this.store.getRepo(run.repoId);
     const discreet = repoSettings(this.deps.cfg ?? {}, repo?.slug ?? "").discreet;
+    if (discreet && run.status !== "succeeded")
+      throw new LandBlocked(`Discreet mode cannot render squash body: owner run is ${run.status}`);
     const state = this.store.getRunState<RunState>(run.id);
     if (discreet && !state)
       throw new LandBlocked("Discreet mode cannot render squash body: missing run state");
@@ -919,6 +921,8 @@ export class LandQueue {
             invocations: this.store.listInvocations(run.id),
             totals: { costUsd: run.costUsd, costEquivUsd: run.costEquivUsd },
             models: run.models,
+            freeFirstRouting:
+              run.requestedBy === "dependabot[bot]" && this.deps.cfg?.dependabotRouting === "free_first",
             signalWarnings: this.store.countEvents(run.id, "signal_attempt"),
             ...(run.sourceRef?.kind === "issue" &&
             run.sourceRef.repo === repo?.slug &&
