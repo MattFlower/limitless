@@ -30,7 +30,7 @@ const toolingEmails = new Set([
 ]);
 const toolName = /^(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)$/i;
 const versionedTool =
-  /^(?:(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)\b[\w .-]*\b\d+(?:\.\d+)*[\w .-]*|GPT-\d+(?:\.\d+)* Codex)$/i;
+  /^(?:(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)\b[\w .-]*\b\d+(?:[.-]\d+)*|GPT-\d+(?:\.\d+)* Codex)$/i;
 
 function toolingIdentity(value: string): boolean {
   value = value.trim();
@@ -41,7 +41,8 @@ function toolingIdentity(value: string): boolean {
     toolingEmails.has(email) ||
     /^Limitless(?: Factory| Bot)?$/i.test(name) ||
     versionedTool.test(name) ||
-    (!email && toolName.test(name))
+    // Claude with a human email can be a person's first name; product names remain tooling.
+    (toolName.test(name) && (!email || !/^Claude$/i.test(name)))
   );
 }
 

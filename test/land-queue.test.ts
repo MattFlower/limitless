@@ -3874,6 +3874,20 @@ test.each([true, false])("squash body uses current repository settings (discreet
   store.setRunState(pr.run.id, {
     implementerReport:
       "Public summary\nBuilt by Limitless\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nCo-Authored-By: Claude Fable 5.1\nRetained evidence",
+    spec: {
+      summary: "Fix input",
+      requirements: [],
+      assumptions: [],
+      acceptance_criteria: [{ id: "AC-1", criterion: "Input accepted", how_to_verify: "inspect" }],
+      out_of_scope: [],
+      blocking_questions: [],
+    },
+    lastVerify: {
+      modelId: "claude-opus-5-5",
+      overall: "pass",
+      notes: "",
+      criteria: [{ id: "AC-1", status: "met", evidence: "Observed input", publicSummary: "" }],
+    },
   });
   const cfg = loadConfig({
     home: paths.home,
@@ -3896,6 +3910,8 @@ test.each([true, false])("squash body uses current repository settings (discreet
     expect(body).toContain("## Checks");
     expect(body).toContain("Public summary");
     expect(body).toContain("Retained evidence");
+    expect(body).toContain("| ✅ AC-1 | Input accepted | Observed input |");
+    expect(body).toContain("Verifier: `claude-opus-5-5` (separate session from the implementer).");
     expect(body).not.toMatch(/Claude Code|Claude Fable|Co-Authored-By/);
     expect(body).toContain("Routing: free-first (Dependabot)");
     expect(body).not.toContain("Changed after publication check");

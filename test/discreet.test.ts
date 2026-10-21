@@ -146,7 +146,13 @@ test.each([
     "Claude Fable 5.1",
     "Claude Opus 5.5",
     "GPT-6.1 Codex",
+    "claude-opus-5-5",
   ].flatMap((name) => [name, name.toUpperCase()]),
+  ...["Limitless", "Claude Code", "Codex", "ChatGPT", "GitHub Copilot", "Gemini", "Cursor", "Aider"].map(
+    (name) => `${name} <unlisted@example.org>`,
+  ),
+  "Cursor <cursoragent@cursor.com>",
+  "Claude Code <claude-code@anthropic.com>",
   ...[
     "limitless@localhost",
     "noreply@anthropic.com",
@@ -194,68 +200,74 @@ test.each([
   "Generated-by: Someone <engineer@anthropic.com>",
   "Use Claude Code and Codex to check the examples",
   "Document how Limitless handles input",
+  "Verified by `claude-opus-5-5` in a separate session from the implementer.",
+  "Verified by `gemini-3.1-pro` in a separate session from the implementer.",
 ])("preserves humans and ordinary prose: %s", (text) => {
   expect(hasFactoryMark(text, "")).toBe(false);
   const identity = /: (.*?) <(.*)>$/.exec(text);
   if (identity) expect(hasFactoryMark("Change", "", "", [identity[1] ?? "", identity[2] ?? ""])).toBe(false);
 });
 
-test("discreet rendering sanitizes model content before quoting, tables, clips and report spans", () => {
-  const rendered = renderReportArtifacts({
-    discreet: true,
-    success: true,
-    runId: "private-run",
-    runUrl: "",
-    prompt: "Fix input",
-    state: {
-      implementerReport: `${attribution}\n${"Useful summary\n".repeat(400)}\nCo-authored-by: Claude <human@example.org>`,
-      spec: {
-        summary: "Fix",
-        requirements: [],
-        assumptions: [`${attribution}\nKeep input`],
-        acceptance_criteria: [
-          { id: "AC-1", criterion: `${attribution}\nInput accepted`, how_to_verify: "inspect" },
-        ],
-        out_of_scope: [],
-        blocking_questions: [],
+test.each(["claude-opus-5-5", "gemini-3.1-pro", "Claude"])(
+  "discreet rendering sanitizes model content and retains verification evidence (%s)",
+  (modelId) => {
+    const rendered = renderReportArtifacts({
+      discreet: true,
+      success: true,
+      runId: "private-run",
+      runUrl: "",
+      prompt: "Fix input",
+      state: {
+        implementerReport: `${attribution}\n${"Useful summary\n".repeat(400)}\nCo-authored-by: Claude <human@example.org>`,
+        spec: {
+          summary: "Fix",
+          requirements: [],
+          assumptions: [`${attribution}\nKeep input`],
+          acceptance_criteria: [
+            { id: "AC-1", criterion: `${attribution}\nInput accepted`, how_to_verify: "inspect" },
+          ],
+          out_of_scope: [],
+          blocking_questions: [],
+        },
+        lastVerify: {
+          modelId,
+          overall: "pass",
+          notes: "",
+          criteria: [
+            { id: "AC-1", status: "met", evidence: `${attribution}\nObserved result`, publicSummary: "" },
+          ],
+        },
+        lastReview: {
+          modelId: "reviewer",
+          verdict: "approve",
+          summary: `${attribution}\nChecked input`,
+          findings: [],
+        },
       },
-      lastVerify: {
-        modelId: "reviewer",
-        overall: "pass",
-        notes: "",
-        criteria: [
-          { id: "AC-1", status: "met", evidence: `${attribution}\nObserved result`, publicSummary: "" },
-        ],
-      },
-      lastReview: {
-        modelId: "reviewer",
-        verdict: "approve",
-        summary: `${attribution}\nChecked input`,
-        findings: [],
-      },
-    },
-    invocations: [],
-    totals: { costUsd: 0, costEquivUsd: 0 },
-  });
-  const structure = reportStructure(rendered.report);
-  expect(structure).toBeTruthy();
-  const body = stripReportManifest(rendered.report);
-  expect(body).toContain("Useful summary");
-  expect(body).toContain("| ✅ AC-1 | Input accepted | Observed result |");
-  expect(body).toContain("**approve** — Checked input");
-  expect(hasFactoryMark(body, "private-run")).toBe(false);
-  const sources = Object.values(rendered.sources.sources).join("\n");
-  expect(sources).toContain("Co-authored-by: Claude <human@example.org>");
-  expect(hasFactoryMark(sources, "private-run")).toBe(false);
-  const section = roundSection(
-    "private-run",
-    2,
-    [{ severity: "major", title: `${attribution}\nHandle input`, detail: "Fix" }],
-    true,
-  );
-  expect(section.text).toContain("**major**: Handle input");
-  expect(hasFactoryMark(section.text, "private-run")).toBe(false);
-});
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+    });
+    const structure = reportStructure(rendered.report);
+    expect(structure).toBeTruthy();
+    const body = stripReportManifest(rendered.report);
+    expect(body).toContain("Useful summary");
+    expect(body).toContain("| ✅ AC-1 | Input accepted | Observed result |");
+    expect(body).toContain("**approve** — Checked input");
+    expect(body).toContain(`Verifier: \`${modelId}\` (separate session from the implementer).`);
+    expect(hasFactoryMark(body, "private-run")).toBe(false);
+    const sources = Object.values(rendered.sources.sources).join("\n");
+    expect(sources).toContain("Co-authored-by: Claude <human@example.org>");
+    expect(hasFactoryMark(sources, "private-run")).toBe(false);
+    const section = roundSection(
+      "private-run",
+      2,
+      [{ severity: "major", title: `${attribution}\nHandle input`, detail: "Fix" }],
+      true,
+    );
+    expect(section.text).toContain("**major**: Handle input");
+    expect(hasFactoryMark(section.text, "private-run")).toBe(false);
+  },
+);
 
 test.each([undefined, false])(
   "non-discreet rendering preserves exact attribution and branding (%s)",

@@ -216,7 +216,7 @@ export function pipelineSetup(state: PipelineFixture) {
     handler: Handler,
     effortRouting = false,
     freeProviders = false,
-    options: Pick<FactoryOptions, "gateExecutor" | "faults"> = {},
+    options: Pick<FactoryOptions, "gateExecutor" | "faults" | "models"> = {},
   ): Factory {
     const alpha = models[0];
     const beta = models[1];

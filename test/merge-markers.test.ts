@@ -353,6 +353,7 @@ test.each([
   ["Co-authored-by: Limitless <limitless@localhost>", true],
   ["Co-Authored-By: Claude <noreply@anthropic.com>", true],
   ["Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>", true],
+  ["Co-authored-by: Cursor <cursoragent@cursor.com>", true],
   ["Generated with Claude", true],
   ["Generated-by: Codex", true],
   ["Reviewed-By: Claude <noreply@anthropic.com>", true],

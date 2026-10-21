@@ -14,7 +14,17 @@ import {
   findPullRequest,
 } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
-import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
+import {
+  approve,
+  holdout,
+  models,
+  pass,
+  pipelineSetup,
+  roleOf,
+  spec,
+  triage,
+  waitFor,
+} from "./pipeline-support.ts";
 
 import { findingEvidence } from "./review-support.ts";
 
@@ -25,31 +35,39 @@ test.each([true, false])("delivery publishes expected text (discreet: %s)", asyn
   const bare = await githubFixture();
   mkdirSync(join(state.home, "cfg"));
   writeFileSync(join(state.home, "cfg", "config.toml"), `[repos."test/repo"]\ndiscreet = ${discreet}`);
-  const f = start((s) => {
-    switch (roleOf(s)) {
-      case "triage":
-        return { structured: triage() };
-      case "spec":
-        return { structured: spec };
-      case "holdout":
-        return { structured: holdout };
-      case "review":
-        return { structured: approve };
-      case "verify":
-        return { structured: pass };
-      default:
-        return {
-          files: { "farewell.txt": "goodbye\n" },
-          text: "Added farewell\nBuilt by Limitless\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nCo-Authored-By: Claude Fable 5.1\nRetained checks",
-        };
-    }
-  });
+  const f = start(
+    (s) => {
+      switch (roleOf(s)) {
+        case "triage":
+          return { structured: triage() };
+        case "spec":
+          return { structured: spec };
+        case "holdout":
+          return { structured: holdout };
+        case "review":
+          return { structured: approve };
+        case "verify":
+          return { structured: pass };
+        default:
+          return {
+            files: { "farewell.txt": "goodbye\n" },
+            text: "Added farewell\nBuilt by Limitless\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nCo-Authored-By: Claude Fable 5.1\nRetained checks",
+          };
+      }
+    },
+    false,
+    false,
+    {
+      models: models.flatMap((m) => (m.id === "beta/m" ? [m, { ...m, id: "claude-opus-5-5" }] : [m])),
+    },
+  );
   registerGithub(f, bare);
   const created = await f.createRun({
     repo: "test/repo",
     prompt: "Add farewell",
     title: "Add farewell",
     profile: "standard",
+    models: { verify: ["claude-opus-5-5"] },
   });
   expect(await waitFor(f, created.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
   const run = f.store.getRun(created.id);
@@ -62,6 +80,11 @@ test.each([true, false])("delivery publishes expected text (discreet: %s)", asyn
   expect(body).toContain("Retained checks");
   expect(body).toContain("## Checks");
   expect(body).toContain("## Code review");
+  expect(body).toContain(
+    discreet
+      ? "Verifier: `claude-opus-5-5` (separate session from the implementer)."
+      : "Verified by `claude-opus-5-5` in a separate session from the implementer.",
+  );
   expect(calls).toContain("--title Add farewell");
   if (discreet) {
     expect(body).not.toMatch(/Claude Code|Claude Fable|Co-Authored-By/);

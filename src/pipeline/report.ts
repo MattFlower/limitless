@@ -216,7 +216,12 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
         privateRows,
       ),
     );
-    if (verify) blocks.push(`Verified by \`${verify.modelId}\` in a separate session from the implementer.`);
+    if (verify)
+      blocks.push(
+        input.discreet
+          ? `Verifier: \`${verify.modelId}\` (separate session from the implementer).`
+          : `Verified by \`${verify.modelId}\` in a separate session from the implementer.`,
+      );
     if (state.spec.assumptions.length) {
       blocks.push(
         "**Assumptions**",
