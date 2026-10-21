@@ -15,7 +15,7 @@ import {
   retryBaselineFailures,
   retryRegressions,
 } from "../src/gates/run.ts";
-import { agentTestSlots, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
+import { acquireGateSlot, agentTestSlots, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
@@ -1022,6 +1022,57 @@ test("local attachment preserves start-time read policy and confinement", async 
   expect((await execution.result).checks[0]?.ok).toBe(true);
   expect(recording.calls).toHaveLength(1);
   expect(recording.calls[0]?.opts.cmd).toContain("true");
+});
+
+test("unscoped attachment cannot borrow its start-time gate reservation", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const executor = localExecutor();
+  const controller = new AbortController();
+  const recording = recordingConfinement();
+  const started = Promise.withResolvers<ExecutionHandle>();
+  const releaseA = Promise.withResolvers<void>();
+  const queued = Promise.withResolvers<void>();
+  const gateA = gateSlotScope(async () => {
+    await acquireGateSlot(controller.signal, undefined, "gate A");
+    started.resolve(
+      await readPolicyScope.run(testReadPolicy, () =>
+        confinementScope.run(recording.backend, () =>
+          executor.start(request(fixture.repoDir), controller.signal),
+        ),
+      ),
+    );
+    await releaseA.promise;
+  })();
+  let execution: ReturnType<typeof executor.attach> | undefined;
+  try {
+    const handle = await started.promise;
+    execution = readPolicyScope.run(undefined, () =>
+      confinementScope.exit(() =>
+        executor.attach(handle, controller.signal, undefined, {
+          onWait: () => queued.resolve(),
+          holder: "gate B",
+        }),
+      ),
+    );
+    expect(
+      await Promise.race([queued.promise.then(() => "queued"), execution.result.then(() => "ran")]),
+    ).toBe("queued");
+    expect(recording.calls).toHaveLength(0);
+    expect(gateSlots.snapshot().holders).toEqual(["gate A"]);
+    releaseA.resolve();
+    await gateA;
+    expect((await execution.result).checks[0]?.ok).toBe(true);
+    expect(recording.calls).toHaveLength(1);
+    expect(recording.calls[0]?.opts.cmd).toContain("true");
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    controller.abort();
+    releaseA.resolve();
+    await gateA;
+    await execution?.result.catch(() => {});
+    gateSlots.setLimit(previous);
+  }
 });
 
 test.each(["pass", "fail", "throw"])("shared local executor releases reserved work (%s)", async (outcome) => {

@@ -139,7 +139,15 @@ const reservation = new AsyncLocalStorage<{ release?: Promise<() => void>; close
 /** Restoring execution context must not replace the attaching operation's reservation. */
 export function bindGateSlotScope<A extends unknown[], T>(fn: (...args: A) => T): (...args: A) => T {
   const held = reservation.getStore();
-  return held ? (...args) => reservation.run(held, fn, ...args) : fn;
+  return held ? (...args) => reservation.run(held, fn, ...args) : (...args) => reservation.exit(fn, ...args);
+}
+
+/** Worker attempts must leave coordinator capacity available for local gates. */
+export async function releaseGateSlotScope(): Promise<void> {
+  const held = reservation.getStore();
+  const pending = held?.release;
+  if (held) held.release = undefined;
+  (await pending?.catch(() => undefined))?.();
 }
 
 /** Local attempts share ownership until retry decisions and cancellation cleanup finish. */
@@ -152,7 +160,7 @@ export const gateSlotScope =
         return await fn();
       } finally {
         held.closed = true;
-        (await held.release)?.();
+        await releaseGateSlotScope();
       }
     });
   };
@@ -166,7 +174,7 @@ export async function acquireGateSlot(
 ): Promise<() => void> {
   signal.throwIfAborted();
   const held = reservation.getStore();
-  if (held && !held.closed) {
+  if (held && !held.closed && (held.release || !skipGateSlot)) {
     held.release ??= gateSlots.acquire(signal, onWait, holder, false, priority);
     await held.release;
     return () => {};
