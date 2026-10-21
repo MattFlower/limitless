@@ -74,6 +74,7 @@ export interface ReportInput {
     | "holdout"
     | "lastVerify"
     | "lastGates"
+    | "baseline"
     | "gateTimeoutReruns"
     | "lastReview"
     | "reviewFollowUps"
@@ -273,6 +274,14 @@ export function renderReportArtifacts(
   } else {
     blocks.push("No automated checks were detected for this repository.");
   }
+  const flakyBaseline = (state.baseline?.checks ?? []).flatMap((check) => {
+    const first = check.firstAttempt;
+    if (!first || first.ok || !check.ok) return [];
+    const result = `${first.timedOut ? "timed out" : "failed"}${first.exitCode === null ? "" : ` (exit ${first.exitCode})`}`;
+    return [[cell("prose", check.name), `${result}; passed on retry`]];
+  });
+  if (flakyBaseline.length)
+    blocks.push("**Flaky baseline checks**", table(["Check", "First attempt → Retry"], flakyBaseline));
 
   // Panel findings carry the verifier's consequence severity; unverified ones keep the finder's.
   const severity = (f: Review["findings"][number]) =>

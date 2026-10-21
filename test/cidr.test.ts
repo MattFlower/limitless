@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { githubHookRanges, githubWebhook } from "../src/integrations/github.ts";
 import { inAnyCidr, inCidr } from "../src/util/cidr.ts";
 
@@ -14,7 +14,11 @@ test("IPv4 and IPv6 CIDR matching", () => {
 });
 
 test("tunnel deliveries from outside GitHub's ranges are refused before the signature check", async () => {
-  const factory = { cfg: { secrets: { GITHUB_WEBHOOK_SECRET: "s" }, githubOwner: "o" } } as never;
+  const recordInbox = mock((_entry: unknown) => true);
+  const factory = {
+    cfg: { secrets: { GITHUB_WEBHOOK_SECRET: "s" }, githubOwner: "o" },
+    store: { recordInbox },
+  } as never;
   const handler = githubWebhook(factory, async () => ["140.82.112.0/20"]);
   const res = await handler(
     new Request("http://x/webhooks/github", {
@@ -24,6 +28,7 @@ test("tunnel deliveries from outside GitHub's ranges are refused before the sign
     }),
   );
   expect(res.status).toBe(403);
+  expect(recordInbox).not.toHaveBeenCalled();
   const fromGitHub = await handler(
     new Request("http://x/webhooks/github", {
       method: "POST",
@@ -32,6 +37,10 @@ test("tunnel deliveries from outside GitHub's ranges are refused before the sign
     }),
   );
   expect(fromGitHub.status).toBe(401); // reached the signature check
+  expect(recordInbox).toHaveBeenCalledTimes(1);
+  expect(recordInbox.mock.calls[0]).toEqual([
+    expect.objectContaining({ status: "error", note: "invalid signature" }),
+  ]);
 });
 
 test("hook ranges are cached and survive a failed refresh", async () => {
