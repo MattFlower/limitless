@@ -685,6 +685,7 @@ test.each(["\u001b[0m", "\u001b7", "\u0018", "\u001a"])(
       }
     }
   },
+  60_000,
 );
 
 test("runner releases an unterminated terminal sequence after an escape instead of holding the stream", async () => {
@@ -711,6 +712,99 @@ test("runner releases an unterminated terminal sequence after an escape instead 
     expect(seenAtChunk[2]).toBeGreaterThanOrEqual(1);
     expect(lines).toEqual(["err:  visible", body, "after"]);
     expect(result[stream]).toBe(`${body}\nafter\n`.slice(-64_000));
+  }
+});
+
+test("runner releases an unterminated terminal sequence instead of holding the stream", async () => {
+  for (const stream of ["stdout", "stderr"] as const) {
+    const lines: string[] = [];
+    const seenAtChunk: number[] = [];
+    // Larger than any credential carry, which other tests' registrations can make long.
+    const body = "x".repeat(200_000);
+    await withChunks(
+      [
+        { stream, text: `\u001b]${body}\n${body}\n` },
+        { stream, text: "after\n" },
+        // Moves the credential carry past the earlier lines; no later ESC, CAN or SUB ever arrives.
+        { stream, text: body },
+        { stream, text: "\n" },
+      ],
+      () =>
+        runProcess({
+          ...options(),
+          redactOutput: true,
+          onRawChunk: () => seenAtChunk.push(lines.length),
+          onStdoutLine: (line) => lines.push(line),
+          onStderrLine: (line) => lines.push(line),
+        }),
+    );
+    // The stray sequence ends at its line break, so later lines arrive while the stream runs.
+    expect(seenAtChunk[3]).toBe(2);
+    expect(lines).toEqual([body, "after", body]);
+  }
+});
+
+test("unterminated terminal strings end at line breaks without exposing credentials", async () => {
+  const secret = "synthetic-unterminated-string-credential";
+  registerCredential("UNTERMINATED_STRING_TEST_TOKEN", secret);
+  for (const control of [
+    "\u001b]",
+    "\u001bP",
+    "\u001bX",
+    "\u001b^",
+    "\u001b_",
+    "\u009d",
+    "\u0090",
+    "\u009e",
+  ]) {
+    for (const lineBreak of ["\n", "\r\n"]) {
+      const text = `err: ${control}0;payload${lineBreak}${secret}${lineBreak}after${lineBreak}`;
+      for (const stream of ["stdout", "stderr"] as const) {
+        for (let offset = 0; offset <= text.length; offset++) {
+          const lines: string[] = [],
+            raw: string[] = [];
+          const result = await withChunks(
+            [
+              { stream, text: text.slice(0, offset) },
+              { stream, text: text.slice(offset) },
+            ],
+            () =>
+              runProcess({
+                ...options(),
+                redactOutput: true,
+                onRawChunk: (chunk) => raw.push(chunk),
+                onStdoutLine: (line) => lines.push(line),
+                onStderrLine: (line) => lines.push(line),
+              }),
+          );
+          expect(result[stream]).toBe(["err: ", "[redacted]", "after", ""].join(lineBreak));
+          expect(lines).toEqual(
+            ["err: ", "[redacted]", "after"].map((line) => line + lineBreak.slice(0, -1)),
+          );
+          expect(raw.join("")).toBe(text);
+        }
+      }
+    }
+  }
+}, 60_000);
+
+test("a line break inside a credential that ends a stray terminal string exposes no suffix", () => {
+  const secret = "synthetic-multiline-\nstray-credential-tail";
+  registerCredential("STRAY_MULTILINE_TEST_TOKEN", secret);
+  for (const control of ["\u001b]", "\u001bP", "\u009d", "\u0090"]) {
+    for (const [text, expected] of [
+      [`err: ${control}${secret}\nafter`, "err: [redacted]\nafter"],
+      [`err: ${control}${secret}`, "err: [redacted]"],
+    ] as const) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const output: string[] = [];
+        const redactor = outputRedactor((chunk) => output.push(chunk));
+        redactor.push(text.slice(0, offset));
+        redactor.push(text.slice(offset));
+        redactor.flush();
+        expect(output.join("")).toBe(expected);
+      }
+    }
   }
 });
 

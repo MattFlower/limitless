@@ -748,8 +748,11 @@ function terminalParser() {
       return false;
     }
     if (state === "osc" || state === "string") {
-      if (char === "\u009c" || (state === "osc" && char === "\u0007")) state = "";
-      return false;
+      // Real titles, links and strings never span lines, so a stray introducer ends at the line
+      // break rather than hiding uncoloured output until EOF; the break itself stays visible.
+      const lineBreak = char === "\n" || char === "\r";
+      if (lineBreak || char === "\u009c" || (state === "osc" && char === "\u0007")) state = "";
+      return lineBreak;
     }
     if (introducers[char] && (state === "esc" || char >= "\u0080")) {
       state = introducers[char];
