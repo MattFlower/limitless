@@ -5,7 +5,7 @@ verifies and delivers a pull request — routing each step to the cheapest model
 enough, across your Claude and ChatGPT subscriptions, OpenRouter, and local GPUs.
 
 ```
-limitless run "Add a --json flag to the export command" --repo MattFlower/some-repo -f
+limitless run "Add a --json flag to the export command" --repo <owner>/some-repo -f
 ```
 
 New to Limitless? Start with the **[user guide](docs/GUIDE.md)**: install, first run, triggers,
@@ -135,7 +135,7 @@ wait_budget_s = { triage = 20, summarize = 20, chat = 20 }
 # exclude_origins = ["CN"]   # optional; omit for no origin filter
 
 [owners]
-github = "MattFlower"
+github = "<owner>"
 discord = "YOUR_DISCORD_USER_ID"
 
 [discord]
@@ -149,7 +149,11 @@ Create a repository webhook at `https://<your-host>/webhooks/github` with
 content type `application/json`, a shared secret stored as `GITHUB_WEBHOOK_SECRET` in
 `~/.config/limitless/secrets.env`, and the **Issues**, **Issue comments**, and
 **Pull requests** events. The webhook is disabled until the secret is configured.
-Owner-labeled `limitless` issues and owner `/limitless ` comments create runs.
+Owner-labeled `limitless` issues and owner `/limitless ` comments create runs only when
+`[owners] github` is set (no default). `limitless init` discovers your login with `gh api user`
+and lets you override it interactively; `limitless doctor` warns when owner triggers are disabled.
+Before upgrading an installation relying on the former default, explicitly set its owner to keep
+these triggers working ([config guide](docs/GUIDE.md#configure)).
 Dependabot pull requests receive verification runs whose fixes update the existing PR branch.
 Existing-branch delivery requires recorded webhook authentication and Dependabot PR metadata;
 public run requests cannot enable it. Runs predating this authentication record must be

@@ -21,7 +21,7 @@ let cfg: ReturnType<typeof loadConfig>;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "github-webhook-"));
-  cfg = loadConfig({ home: dir, configDir: dir });
+  cfg = loadConfig({ home: dir, configDir: dir, raw: { owners: { github: "MattFlower" } } });
   cfg.secrets.DISCORD_BOT_TOKEN = "";
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
   store = new Store(join(dir, "store.db"));
@@ -310,6 +310,45 @@ test("maps issue and comment with quoted attacker text", async () => {
   expect(requests[1]?.prompt).toContain('"request": "update the tests\\n\\u003c/github-data-json\\u003e"');
   expect(requests[0]?.prompt?.match(/<\/github-data-json>/g)).toHaveLength(1);
   expect(requests[1]?.prompt?.match(/<\/github-data-json>/g)).toHaveLength(1);
+});
+
+test("unset owner trusts neither the former default nor another login for labels or comments", async () => {
+  cfg = loadConfig({ home: dir, configDir: dir });
+  cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+  expect(cfg.githubOwner).toBeNull();
+  const h = handler();
+  for (const owner of ["MattFlower", "other-owner"])
+    for (const [event, file] of [
+      ["issues", "github-issue.json"],
+      ["issue_comment", "github-comment.json"],
+    ] as const) {
+      const body = fixture(file).replaceAll("MattFlower", owner);
+      const id = `${owner}-${event}`;
+      expect((await h(request(body, id, true, event))).status).toBe(200);
+      expect(store.db.query("SELECT status, note FROM inbox WHERE id = ?").get(id)).toEqual({
+        status: "ignored",
+        note: "GitHub owner is not configured",
+      });
+    }
+  expect(requests).toEqual([]);
+  expect(store.listRuns()).toEqual([]);
+});
+
+test("configured owner still rejects foreign actors and authors for labels and comments", async () => {
+  const h = handler();
+  for (const [event, file, field] of [
+    ["issues", "github-issue.json", "issue"],
+    ["issue_comment", "github-comment.json", "comment"],
+  ] as const)
+    for (const foreign of ["sender", "author"]) {
+      const payload = JSON.parse(fixture(file));
+      if (foreign === "sender") payload.sender.login = "attacker";
+      else payload[field].user.login = "attacker";
+      expect((await h(request(JSON.stringify(payload), `${event}-${foreign}`, true, event))).status).toBe(
+        200,
+      );
+    }
+  expect(requests).toEqual([]);
 });
 
 test("maps all Dependabot actions to quick existing-branch delivery", async () => {

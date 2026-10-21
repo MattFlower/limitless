@@ -71,6 +71,7 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
     daemon: "limitless service install",
     smoke: "run limitless init",
     "feed-access": "limitless service install",
+    "github-owner": 'set github = "<owner>" under [owners] in config.toml, or run limitless init',
   };
   const add = (id: string, status: Check["status"], message: string) => {
     checks.push({ id, status, message, ...(status === "ok" ? {} : { fix: fixes[id] }) });
@@ -96,6 +97,8 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
         : `grant repository access to ${repo}, then run gh auth refresh`;
   }
   add("gh", ghOk ? "ok" : "fail", ghOk ? "authenticated" : "not authenticated or no repo access");
+  if (!d.config.githubOwner)
+    add("github-owner", "warn", "GitHub owner unset; issue-label and /limitless comment triggers disabled");
   const cli = await Promise.all([run("claude", "--version"), run("codex", "--version")]);
   for (const [index, name] of ["claude", "codex"].entries()) {
     const present = cli[index]?.exitCode === 0;
@@ -220,6 +223,29 @@ async function runSetup(
   const confirm = async (q: string, fallback: boolean) =>
     flags.yes || /^y(es)?$/i.test(await ask(q, fallback ? "yes" : "no"));
   const raw = structuredClone(d.config.raw);
+  const owners = (raw.owners ?? {}) as Record<string, unknown>;
+  let owner: string | undefined;
+  if (typeof owners.github !== "string" || !owners.github) {
+    const user: unknown = await d
+      .run(["gh", "api", "user"])
+      .then((result) => (result.exitCode === 0 ? JSON.parse(result.stdout) : null))
+      .catch(() => null);
+    const login =
+      user && typeof user === "object" && "login" in user && typeof user.login === "string"
+        ? user.login.trim()
+        : "";
+    const valid = (value: string) => /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(value);
+    const answer = (await ask("GitHub owner login", valid(login) ? login : "")).trim();
+    if (valid(answer)) {
+      owner = answer;
+      raw.owners = { ...owners, github: owner };
+    } else {
+      const warning =
+        "GitHub owner unset; issue-label and /limitless comment triggers remain disabled. Set [owners] github in config.toml or rerun limitless init.";
+      transaction.warnings.push(warning);
+      if (!flags.json) d.print(warning);
+    }
+  }
   const entries: Record<string, unknown>[] = Array.isArray(raw.providers)
     ? (raw.providers as Record<string, unknown>[])
     : Object.entries(raw.providers ?? {}).map(([id, fields]) => ({ id, ...(fields as object) }));
@@ -272,7 +298,8 @@ async function runSetup(
   raw.github = { ...github, repos: [...existing, ...repos.added], merge };
   raw.providers = entries;
   d.validate(raw);
-  const missing = providers.added.length || repos.added.length || !("repos" in github && "merge" in github);
+  const missing =
+    owner || providers.added.length || repos.added.length || !("repos" in github && "merge" in github);
   if (missing) {
     const convert = !Array.isArray(d.config.raw.providers) && entries.length > 0;
     const backup =
@@ -292,6 +319,7 @@ async function runSetup(
       entries,
       providers.added,
       convert,
+      owner,
     );
     try {
       d.validate(Bun.TOML.parse(text) as Record<string, unknown>);
