@@ -15,7 +15,7 @@ import {
   redactGateOutput,
   redactGateStreams,
 } from "./output.ts";
-import { agentTestSlots, type GatePriority, gateSlots } from "./slots.ts";
+import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
@@ -160,12 +160,12 @@ export async function runLocalGates(
   signal: AbortSignal,
   hooks: GateHooks = {},
 ): Promise<GateRun> {
-  const release = await (hooks.skipGateSlot ? agentTestSlots : gateSlots).acquire(
+  const release = await acquireGateSlot(
     signal,
-    hooks.skipGateSlot ? undefined : hooks.onWait,
+    hooks.onWait,
     hooks.holder ?? basename(cwd),
-    false,
-    hooks.skipGateSlot ? undefined : hooks.priority,
+    hooks.skipGateSlot,
+    hooks.priority,
   );
   try {
     const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
@@ -223,11 +223,7 @@ async function retryChecks(
   options: GateRetryOptions = { targeted: false, skipGateSlot: false },
 ): Promise<GateRun> {
   if (runner) return runner(cfg, options);
-  const release = await (options.skipGateSlot ? agentTestSlots : gateSlots).acquire(
-    signal,
-    options.skipGateSlot ? undefined : onWait,
-    basename(cwd),
-  );
+  const release = await acquireGateSlot(signal, onWait, basename(cwd), options.skipGateSlot);
   try {
     const checks: GateResult[] = [];
     for (const check of cfg.checks) {
