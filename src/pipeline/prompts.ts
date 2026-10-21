@@ -288,24 +288,20 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
   collectHoldoutDetails(holdout, (detail) => {
     if (isPrivate(detail)) details.add(detail);
   });
-  const patterns = new Map<string, RegExp>();
-  const patternFor = (extra: Set<string>) => {
-    if (!details.size && !extra.size) return undefined;
-    const key = JSON.stringify([...extra].sort());
-    let pattern = patterns.get(key);
-    if (!pattern) {
-      pattern = new RegExp(
-        [...details, ...extra]
-          .sort((a, b) => b.length - a.length)
-          .map(holdoutBoundaryPattern)
-          .join("|"),
-        "giu",
-      );
-      patterns.set(key, pattern);
-    }
-    return pattern;
-  };
-  patternFor(new Set());
+  const compile = (extra: Set<string>) =>
+    details.size || extra.size
+      ? new RegExp(
+          [...details, ...extra]
+            .sort((a, b) => b.length - a.length)
+            .map(holdoutBoundaryPattern)
+            .join("|"),
+          "giu",
+        )
+      : undefined;
+  const basePattern = compile(new Set());
+  // Retain only the last combined pattern: event IDs make observed sets mostly unique.
+  let lastKey = "";
+  let lastPattern: RegExp | undefined;
   return (value: string, includeObservedLiterals = true): string => {
     if (!holdout.scenarios.length) return value;
     const extra = new Set<string>();
@@ -314,7 +310,12 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
       collectHoldoutLiterals(value, (detail) => {
         if (!details.has(detail) && isPrivate(detail)) extra.add(detail);
       });
-    const pattern = patternFor(extra);
+    const key = extra.size ? JSON.stringify([...extra].sort()) : "";
+    if (key && key !== lastKey) {
+      lastKey = key;
+      lastPattern = compile(extra);
+    }
+    const pattern = key ? lastPattern : basePattern;
     if (!pattern) return value;
     let removed = 0;
     // A single pass counts displayed replacements and never scans inserted placeholders.

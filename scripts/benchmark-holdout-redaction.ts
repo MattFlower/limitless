@@ -65,7 +65,7 @@ const holdout: Holdout = {
 };
 const publicSources =
   "Public documentation describes the collection request and stable ordering. Use --public-mode, publicInput, /api/public and 42 for the supported example.\n"
-    .repeat(140)
+    .repeat(160)
     .slice(0, 20 * 1024);
 const ordinary =
   "The agent inspected the collection and is checking the expected behavior before reporting the result. ";
@@ -82,7 +82,8 @@ const payloads = [
 const values = Array.from({ length: 20_000 }, (_, i) => {
   const payload = payloads[i % payloads.length] ?? "";
   const length = 100 + (i % 301);
-  return `${payload} ${ordinary.repeat(4)}`.slice(0, length);
+  const event = `toolu_${i.toString(36)} msg_${i} /work/event-${i}/output.ts:${100_000 + i}`;
+  return `${event} ${payload} ${ordinary.repeat(4)}`.slice(0, length);
 });
 const scenarioLengths = holdout.scenarios.map(
   (s) => s.description.length + s.steps.length + s.expected.length,
@@ -92,8 +93,11 @@ console.log(`Scenarios: ${scenarioLengths.length}; characters each: ${scenarioLe
 console.log(
   `Public sources: ${publicSources.length} characters; strings: ${values.length}; lengths: ${Math.min(...values.map((s) => s.length))}–${Math.max(...values.map((s) => s.length))} characters`,
 );
+console.log("Every string has unique private event IDs, a path and a line number.");
 
 function measure(redact: (value: string) => string) {
+  Bun.gc(true);
+  const memoryBefore = process.memoryUsage();
   let worstMs = 0;
   const outputs: string[] = [];
   const start = performance.now();
@@ -103,7 +107,16 @@ function measure(redact: (value: string) => string) {
     worstMs = Math.max(worstMs, performance.now() - callStart);
     outputs.push(output);
   }
-  return { totalMs: performance.now() - start, worstMs, outputs };
+  const totalMs = performance.now() - start;
+  Bun.gc(true);
+  const memoryAfter = process.memoryUsage();
+  return {
+    totalMs,
+    worstMs,
+    outputs,
+    rssMiB: (memoryAfter.rss - memoryBefore.rss) / 1024 ** 2,
+    heapMiB: (memoryAfter.heapUsed - memoryBefore.heapUsed) / 1024 ** 2,
+  };
 }
 
 const before = measure((value) => referenceRedactHoldoutText(value, holdout, publicSources));
@@ -121,4 +134,7 @@ for (let i = 0; i < values.length; i++) {
 }
 console.log(
   `Outputs identical: ${values.length}/${values.length}; speedup including construction: ${(before.totalMs / totalMs).toFixed(2)}x`,
+);
+console.log(
+  `Memory deltas after GC (includes retained outputs; sequential runs share allocator/JIT state): before RSS ${before.rssMiB.toFixed(2)} MiB, heap ${before.heapMiB.toFixed(2)} MiB; after RSS ${after.rssMiB.toFixed(2)} MiB, heap ${after.heapMiB.toFixed(2)} MiB`,
 );

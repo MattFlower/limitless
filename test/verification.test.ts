@@ -420,6 +420,36 @@ test("invocation redactors isolate observed details, counts and public-source ex
   expect(holdoutRedactor(scenarios, "--secret-mode")("ordinary words")).toBe("ordinary words");
 });
 
+test("streaming redaction reuses patterns without retaining every observed combination", () => {
+  const original = globalThis.RegExp;
+  let compiled = 0;
+  globalThis.RegExp = new Proxy(original, {
+    construct(target, args) {
+      if (args[1] === "giu") compiled++;
+      return Reflect.construct(target, args);
+    },
+  });
+  try {
+    const redact = holdoutRedactor(holdout);
+    expect(compiled).toBe(1);
+    for (let i = 0; i < 40; i++) {
+      const value = `runtimeId_${i}`;
+      expect(redact(value)).toBe("[private detail] [1 private details withheld]");
+      const afterFirstCall = compiled;
+      expect(redact(value)).toBe("[private detail] [1 private details withheld]");
+      expect(compiled).toBe(afterFirstCall);
+    }
+    const afterUniqueCalls = compiled;
+    expect(redact("ordinary words")).toBe("ordinary words");
+    expect(compiled).toBe(afterUniqueCalls);
+    expect(redact("runtimeId_0")).toBe("[private detail] [1 private details withheld]");
+    // An old observed combination was evicted, while the base pattern stayed cached.
+    expect(compiled).toBe(afterUniqueCalls + 1);
+  } finally {
+    globalThis.RegExp = original;
+  }
+});
+
 test("private summaries redact runtime error identifiers on unmet and unclear retries", () => {
   for (const status of ["unmet", "unclear"] as const) {
     const feedback = formatVerifyFeedback(
