@@ -215,17 +215,17 @@ afterEach(async () => {
 
 const triggers = (store = factory.store) => store.db.query("SELECT * FROM ci_fix_triggers ORDER BY id").all();
 const processTriggers = (store = factory.store) => processConflictTriggers(store, clock.now, factory.deps.gh);
-async function record(key = "failure", store = factory.store) {
+async function record(key = "failure", store = factory.store, check = "test") {
   store.recordCiFixTrigger(
     url,
     await remoteHead(),
     key,
-    { check: "test", line: "FAIL validation", excerpt: "error: invalid greeting" },
+    { check, line: "FAIL validation", excerpt: "error: invalid greeting" },
     clock.now(),
   );
 }
-async function start(key = "failure") {
-  await record(key);
+async function start(key = "failure", check = "test") {
+  await record(key, factory.store, check);
   await processTriggers();
   const round = factory.store.reviewRounds(url).at(-1);
   if (!round) throw new Error("missing round");
@@ -345,7 +345,7 @@ test.each(["draft", "needs_human", "security", "main-red", "land-main-red", "rev
       factory.store.db.query("UPDATE review_rounds SET kind = ? WHERE run_id = ?").run(caseName, active);
     }
     await classify(
-      caseName === "security" ? "CodeQL" : "test",
+      caseName === "security" ? "CodeQL" : "validation",
       "FAIL validation",
       caseName.endsWith("main-red"),
       caseName === "land-main-red" ? "land" : "poller",
@@ -459,7 +459,7 @@ test.each(["approval", "conflict"] as const)(
   "cap dedupes its feed episode and resets after %s",
   async (reset) => {
     for (let i = 0; i < 2; i++) {
-      const id = await start(`failure-${i}`);
+      const id = await start(`failure-${i}`, `check-${i}`);
       factory.store.updateRun(id, { status: "succeeded" });
       await clock.advance(10);
     }
