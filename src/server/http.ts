@@ -1,8 +1,10 @@
+import { profile } from "bun:jsc";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
+import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import { parseSince } from "../core/since.ts";
@@ -17,6 +19,7 @@ import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { stallReporter } from "../util/stall.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { createApiToken, matchesApiToken } from "./api-token.ts";
@@ -26,6 +29,16 @@ import { Passkeys } from "./passkeys.ts";
 
 const eventLoopLag = new EventLoopLag();
 setInterval(() => stallReporter.sample(eventLoopLag.sample()), 1000).unref();
+let profileRunning = false;
+
+const profileText = (value: unknown) =>
+  new TextDecoder().decode(
+    Buffer.from(redactCredentials(typeof value === "string" ? value : JSON.stringify(value))).subarray(
+      0,
+      64 * 1024,
+    ),
+    { stream: true },
+  );
 
 export interface HttpExtras {
   apiToken?: string;
@@ -355,6 +368,26 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/admin/drain": admin("drain"),
     "/api/admin/resume": admin("resume"),
+    "/api/admin/profile": {
+      POST: handle(async (req, server) => {
+        const { seconds } = z
+          .object({ seconds: z.number().min(0.2).max(120).default(30) })
+          .parse(await body<unknown>(req));
+        if (profileRunning) return error("A profile is already running", 409);
+        profileRunning = true;
+        try {
+          server.timeout(req, 0);
+          const result = await profile(() => Bun.sleep(seconds * 1000), 1000);
+          return json({
+            seconds,
+            functions: profileText(result.functions),
+            stackTraces: profileText(result.stackTraces),
+          });
+        } finally {
+          profileRunning = false;
+        }
+      }, true),
+    },
     "/api/admin/auth/password": {
       POST: handle(async (req) => {
         await auth.setPassword((await body<{ password?: unknown }>(req)).password);

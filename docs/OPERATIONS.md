@@ -193,6 +193,22 @@ for admission, subject to the invocation deadline. Exhausting that deadline can 
 Every agent session's raw event stream is kept in `~/.limitless/runs/<run>/inv-<n>.log`, and the UI
 shows the same events live, so failures can be diagnosed without re-running.
 
+`Event loop stall` log lines mean the daemon's event loop was delayed by at least 2 seconds.
+They report the lag and the top instrumented activities since the previous sample; small activity
+totals can mean the delay is in uninstrumented JavaScript. To find function names, call the
+loopback-only sampling endpoint with the API token:
+
+```sh
+curl --fail-with-body http://127.0.0.1:7400/api/admin/profile \
+  -H "Authorization: Bearer $(cat ~/.limitless/api-token)" \
+  -H 'Content-Type: application/json' -d '{"seconds":30}'
+```
+
+`seconds` accepts 0.2–120 and defaults to 30 with `{}`. The request waits for the profile and
+returns `{ seconds, functions, stackTraces }`, with each text field credential-redacted and capped
+at 64 KiB. Sampling covers all main-thread JavaScript and adds a little overhead while it runs.
+Only one profile can run at a time; another request receives HTTP 409.
+
 ## Evaluations
 
 Evaluations run in the daemon using its catalog, harness adapters, pipeline role prompts/schemas and shared
