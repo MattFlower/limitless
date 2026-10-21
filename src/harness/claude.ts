@@ -1,7 +1,7 @@
 import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
-import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
+import { agentEnv, idleWatchdog, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
 import { homeReadPolicy } from "./read-policy.ts";
 import { ConfinementError, runSandboxed } from "./sandbox.ts";
 import {
@@ -297,7 +297,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
   return args;
 }
 
-export async function runClaude(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
+export async function runClaude(
+  spec: AgentSpec,
+  processRunner = runProcess,
+  progressTimer = { set: setInterval, clear: clearInterval },
+): Promise<AgentResult> {
   spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
   const t = spec.target;
@@ -364,10 +368,10 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
 
   // Byte-level inactivity isn't enough: a degraded stream can trickle `thinking_tokens` counters
   // for many minutes without any real progress. Only text, tool calls and tool results count.
-  let lastProgress = Date.now();
-  const progressWatch = setInterval(
+  const progress = idleWatchdog(spec.idleTimeoutMs, spec.idleNow);
+  const progressWatch = progressTimer.set(
     () => {
-      if (stuckReason || Date.now() - lastProgress <= spec.idleTimeoutMs) return;
+      if (stuckReason || !progress.expired()) return;
       stuckReason = `no progress (text or tool activity) for ${Math.round(spec.idleTimeoutMs / 1000)}s`;
       // Abort before reporting, so the watchdog's stop is recorded ahead of anything the event triggers.
       stuckController.abort();
@@ -378,7 +382,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
 
   const parser = new ClaudeStreamParser((ev) => {
     if (ev.type === "text" || ev.type === "tool_call" || ev.type === "tool_result" || ev.type === "init") {
-      lastProgress = Date.now();
+      progress.reset();
     }
     // StructuredOutput is how Claude Code returns the final --json-schema answer, not agent work;
     // counting it would trip a zero tool budget exactly when a no-tools call succeeds.
@@ -415,6 +419,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     signal,
     timeoutMs: spec.timeoutMs,
     idleTimeoutMs: spec.idleTimeoutMs,
+    idleNow: spec.idleNow,
     onStdoutLine: (line) => {
       appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
       parser.feed(redactJsonLine(line, redactCredentials));
@@ -424,7 +429,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
       spec.onEvent({ type: "stderr", text: line });
     },
   }).finally(() => {
-    clearInterval(progressWatch);
+    progressTimer.clear(progressWatch);
     spec.signal.removeEventListener("abort", callerAborted);
     if (keyFile) rmSync(keyFile, { force: true });
   });
