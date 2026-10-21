@@ -44,14 +44,55 @@ export async function checkDiscreetCommits(
       "--",
     ],
     { cwd },
-  );
+  ).catch(() => {
+    throw new DiscreetError("Discreet mode cannot inspect unpublished commits");
+  });
   const fields = log.stdout.split("\0");
   if (fields.at(-1) === "") fields.pop();
   if (fields.length % 6) throw new DiscreetError("Discreet mode cannot inspect unpublished commits");
   const marked: string[] = [];
   for (let i = 0; i < fields.length; i += 6) {
     const sha = fields[i] ?? "";
-    if (hasFactoryMark(fields[i + 1] ?? "", runId, uiUrl, fields.slice(i + 2, i + 6))) marked.push(sha);
+    const message = fields[i + 1] ?? "";
+    let trailers: string;
+    try {
+      trailers = (
+        await worktreeGit(["git", "interpret-trailers", "--parse", "--no-divider"], { cwd, stdin: message })
+      ).stdout;
+    } catch {
+      throw new DiscreetError(`Discreet mode cannot inspect commit attribution: ${sha}`);
+    }
+    const agent = /\b(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)\b/i;
+    const attributed = trailers.split("\n").some((line) => {
+      const trailer = /^([^:]+):\s*(.*)$/.exec(line);
+      if (
+        !trailer ||
+        !/^(?:co-?(?:authored|developed)-by|(?:signed-off|authored|reviewed|tested|suggested|acked|helped|assisted)-by|generated-(?:by|with))$/i.test(
+          trailer[1] ?? "",
+        )
+      )
+        return false;
+      const value = trailer[2] ?? "";
+      // Human co-authors may share a first name with a tool (for example Claude Smith).
+      return (
+        (/^(?:generated|assisted)-/i.test(trailer[1] ?? "") && agent.test(value)) ||
+        /^(?:Limitless(?: Factory| Bot)?|Claude(?: Code)?(?: (?:Opus|Sonnet|Haiku)(?: [\d.]+)?)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)\s*(?:<[^>]*>)?$/i.test(
+          value,
+        ) ||
+        /(?:^|[<\s])(?:limitless@localhost|(?:claude|codex)@[^>\s]+|noreply@(?:anthropic|openai)\.com)(?:>|$)/i.test(
+          value,
+        )
+      );
+    });
+    const generation = message
+      .split("\n")
+      .some(
+        (line) =>
+          /^\s*(?:🤖\s*)?(?:generated|co-authored|authored|assisted) (?:by|with)\s+/i.test(line) &&
+          agent.test(line),
+      );
+    if (hasFactoryMark(message, runId, uiUrl, fields.slice(i + 2, i + 6)) || attributed || generation)
+      marked.push(sha);
   }
   if (marked.length)
     throw new DiscreetError(`Discreet mode blocked factory-marked commits: ${marked.join(", ")}`);

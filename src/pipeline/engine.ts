@@ -57,7 +57,6 @@ import {
   githubRetry,
   headSha,
   isAncestor,
-  lookupUrl,
   mergeBase,
   mergePullRequest,
   type PullRequestIdentity,
@@ -2275,6 +2274,9 @@ async function checkPublication(
       pr.sha,
       ctx.signal,
       deliveryBudget(ctx),
+      repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet
+        ? { runId: ctx.run.id, published: !!ctx.run.prUrl || !!ctx.run.deliveryBranch || !!reviewRound(ctx) }
+        : undefined,
     );
     if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)
       await checkDiscreetCommits(
@@ -2505,28 +2507,38 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       (ctx.run.prUrl || ctx.store.listStages(ctx.run.id).filter((s) => s.name === "deliver").length > 1)
     ) {
       const identity = deliveryIdentity(ctx);
-      const raw = await gh(
-        ctx.run.prUrl
-          ? ["pr", "view", ctx.run.prUrl, "--repo", ctx.repo.slug, "--json", "state,url"]
-          : [
-              "pr",
-              "list",
-              "--repo",
-              ctx.repo.slug,
-              "--head",
-              ctx.run.branch as string,
-              "--state",
-              "all",
-              "--json",
-              identity ? "state,url,headRefOid" : "state,url",
-            ],
-        ctx.signal,
-      );
+      const recordedUrl = identity
+        ? await withGitHubRetry(
+            () => findPullRequest(ctx.repo, ctx.run.branch as string, cwd, ctx.signal, identity),
+            { budget, signal: ctx.signal },
+          )
+        : ctx.run.prUrl;
+      if (identity && recordedUrl && !ctx.run.prUrl)
+        ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: recordedUrl });
+      const raw =
+        identity && !recordedUrl
+          ? "null"
+          : await gh(
+              recordedUrl
+                ? ["pr", "view", recordedUrl, "--repo", ctx.repo.slug, "--json", "state,url"]
+                : [
+                    "pr",
+                    "list",
+                    "--repo",
+                    ctx.repo.slug,
+                    "--head",
+                    ctx.run.branch as string,
+                    "--state",
+                    "all",
+                    "--json",
+                    "state,url",
+                  ],
+              ctx.signal,
+            );
       const data: unknown = JSON.parse(raw || "null");
       const candidates: unknown[] = Array.isArray(data) ? data : [data];
-      const url = identity ? lookupUrl(JSON.stringify(candidates), identity) : undefined;
       const pr = candidates.find(
-        (pr) => !identity || (!!pr && typeof pr === "object" && "url" in pr && pr.url === url),
+        (pr) => !identity || (!!pr && typeof pr === "object" && "url" in pr && pr.url === recordedUrl),
       );
       if (pr && typeof pr === "object" && "state" in pr && pr.state === "MERGED") {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)

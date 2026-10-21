@@ -9,6 +9,7 @@ import {
   cachePath,
   createPullRequest,
   createWorktree,
+  deliveryPublicationRange,
   ensureCache,
   findPullRequest,
 } from "../src/git/repos.ts";
@@ -130,98 +131,103 @@ esac
   expect(repoSettings(f.cfg, repo.slug).discreet).toBe(false);
 });
 
-test.each(["unrelated", "matching head", "recorded URL", "ambiguous head", "missing recorded URL"])(
-  "discreet PR lookup only recovers this delivery: %s",
-  async (scenario) => {
-    const bare = await githubFixture();
-    const f = start(() => ({ text: "unused" }));
-    await f.scheduler.stop();
-    registerGithub(f, bare);
-    const repo = f.store.getRepoBySlug("test/repo");
-    if (!repo) throw new Error("missing repo");
-    const oldUrl = "https://github.com/test/repo/pull/1";
-    const ownUrl = "https://github.com/test/repo/pull/2";
-    const headSha = "a".repeat(40);
-    const prs = [
-      {
-        url: oldUrl,
-        headRefOid:
-          scenario === "recorded URL" || scenario === "ambiguous head" || scenario === "missing recorded URL"
-            ? headSha
-            : "b".repeat(40),
-      },
-    ];
-    if (scenario !== "unrelated")
-      prs.push({
-        url: ownUrl,
-        headRefOid:
-          scenario === "matching head" || scenario === "ambiguous head" || scenario === "recorded URL"
-            ? headSha
-            : "c".repeat(40),
-      });
-    writeFileSync(
-      join(state.home, "bin", "gh"),
-      `#!${process.execPath}
+test.each([
+  "zero matches",
+  "unique later match",
+  "recorded URL",
+  "ambiguous head",
+  "missing recorded URL",
+  "wrong recorded identity",
+  "failed later page",
+  "incomplete pages",
+])("discreet PR recovery enumerates complete results or uses the recorded URL: %s", async (scenario) => {
+  const bare = await githubFixture();
+  const f = start(() => ({ text: "unused" }));
+  await f.scheduler.stop();
+  registerGithub(f, bare);
+  const repo = f.store.getRepoBySlug("test/repo");
+  if (!repo) throw new Error("missing repo");
+  const ownUrl = "https://github.com/test/repo/pull/31";
+  const headSha = "a".repeat(40);
+  const prs = Array.from({ length: 31 }, (_, i) => ({
+    url: `https://github.com/test/repo/pull/${i + 1}`,
+    headRefOid: i === 30 && scenario !== "zero matches" ? headSha : "b".repeat(40),
+  }));
+  if (scenario === "ambiguous head" || scenario.includes("recorded")) {
+    const first = prs[0];
+    if (first) first.headRefOid = headSha;
+  }
+  writeFileSync(
+    join(state.home, "bin", "gh"),
+    `#!${process.execPath}
 import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(join(state.home, "gh-calls"))}, args.join(" ")+"\\n");
 const prs = ${JSON.stringify(prs)};
-if (args[1] === "list") console.log(args.includes("--jq") ? prs[0]?.url : JSON.stringify(prs));
+const scenario = ${JSON.stringify(scenario)};
+if (args[1] === "list") console.log(JSON.stringify(prs.slice(0, 30)));
+if (args[1] === "view") {
+  if (scenario === "missing recorded URL") process.exit(1);
+  console.log(JSON.stringify(scenario === "wrong recorded identity" ? prs[0] : prs[30]));
+}
+if (args[0] === "api") {
+  const all = args.includes("--paginate") && args.includes("--slurp");
+  const rest = prs.map(pr => ({html_url: pr.url, head: {sha: pr.headRefOid}}));
+  if (scenario === "failed later page") { console.log(JSON.stringify([rest.slice(0,30)])); process.exit(1); }
+  console.log(JSON.stringify(scenario === "incomplete pages" ? [rest.slice(0,30), null] : all ? [rest.slice(0,30),rest.slice(30)] : [rest.slice(0,30)]));
+}
 if (args[1] === "create") console.log(${JSON.stringify(ownUrl)});
 `,
-    );
-    const identity = {
-      headSha,
-      prUrl:
-        scenario === "recorded URL"
-          ? ownUrl
-          : scenario === "missing recorded URL"
-            ? "https://github.com/test/repo/pull/10"
-            : null,
-    };
-    const create = () =>
-      createPullRequest(repo, {
-        branch: "change/add-farewell",
-        base: "main",
-        title: "Add farewell",
-        body: "Report",
-        cwd: state.repoDir,
-        identity,
-      });
-    if (scenario === "ambiguous head") {
-      await expect(
-        findPullRequest(repo, "change/add-farewell", state.repoDir, undefined, identity),
-      ).rejects.toThrow(`several pull requests share head ${headSha}`);
-      await expect(create()).rejects.toThrow("several pull requests share head");
-      const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
-      expect(calls).not.toMatch(/pr (?:create|edit)/);
-      return;
+  );
+  const identity = {
+    headSha,
+    prUrl: scenario.includes("recorded") || scenario === "recorded URL" ? ownUrl : null,
+  };
+  const find = () => findPullRequest(repo, "change/add-farewell", state.repoDir, undefined, identity);
+  const create = () =>
+    createPullRequest(repo, {
+      branch: "change/add-farewell",
+      base: "main",
+      title: "Add farewell",
+      body: "Report",
+      cwd: state.repoDir,
+      identity,
+    });
+  const refused = [
+    "ambiguous head",
+    "missing recorded URL",
+    "wrong recorded identity",
+    "failed later page",
+    "incomplete pages",
+  ].includes(scenario);
+  if (refused) {
+    for (const lookup of [find, create]) {
+      if (scenario === "ambiguous head")
+        await expect(lookup()).rejects.toThrow("several pull requests share head");
+      else await expect(lookup()).rejects.toThrow();
     }
-
-    expect(await findPullRequest(repo, "change/add-farewell", state.repoDir, undefined, identity)).toBe(
-      scenario === "unrelated" || scenario === "missing recorded URL" ? null : ownUrl,
-    );
-    expect(
-      await createPullRequest(repo, {
-        branch: "change/add-farewell",
-        base: "main",
-        title: "Add farewell",
-        body: "Report",
-        cwd: state.repoDir,
-        identity,
-      }),
-    ).toBe(ownUrl);
-    const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
-    expect(calls).not.toContain(`pr edit ${oldUrl}`);
-    if (scenario === "unrelated" || scenario === "missing recorded URL") {
-      expect(calls).toContain("pr create");
-      expect(calls).not.toContain("pr edit");
-    } else {
-      expect(calls).not.toContain("pr create");
-      expect(calls).toContain(`pr edit ${ownUrl}`);
-    }
-  },
-);
+  } else {
+    expect(await find()).toBe(scenario === "zero matches" ? null : ownUrl);
+    expect(await create()).toBe(ownUrl);
+  }
+  const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+  if (identity.prUrl) {
+    expect(calls).toContain(`pr view ${ownUrl}`);
+    expect(calls).not.toContain("pr list");
+    expect(calls).not.toContain("api ");
+  } else {
+    expect(calls).toContain("api --paginate --slurp");
+    expect(calls).toContain("head=test%3Achange%2Fadd-farewell&state=all");
+  }
+  if (refused) expect(calls).not.toMatch(/pr (?:create|edit)/);
+  else if (scenario === "zero matches") {
+    expect(calls).toContain("pr create");
+    expect(calls).not.toContain("pr edit");
+  } else {
+    expect(calls).not.toContain("pr create");
+    expect(calls).toContain(`pr edit ${ownUrl}`);
+  }
+});
 
 test("discreet delivery restart ignores an unrelated merged PR with the same branch", async () => {
   const bare = await githubFixture();
@@ -259,6 +265,7 @@ test("discreet delivery restart ignores an unrelated merged PR with the same bra
 import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(join(state.home, "gh-calls"))}, args.join(" ")+"\\n");
+if (args[0] === "api") console.log(JSON.stringify([[{html_url:"https://github.com/test/repo/pull/91",head:{sha:"${"b".repeat(40)}"}}]]));
 if (args[1] === "list") console.log(JSON.stringify([{state:"MERGED",url:"https://github.com/test/repo/pull/91",headRefOid:"${"b".repeat(40)}"}]));
 if (args[1] === "create") console.log("https://github.com/test/repo/pull/2");
 `,
@@ -272,7 +279,7 @@ if (args[1] === "create") console.log("https://github.com/test/repo/pull/2");
   expect(finished?.merged).toBe(false);
   expect(resumed.store.runForPr("https://github.com/test/repo/pull/91")).toBeNull();
   const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
-  expect(calls).toContain("--json state,url,headRefOid");
+  expect(calls).toContain("api --paginate --slurp");
   expect(calls).toContain("pr create");
   expect(calls).not.toContain("pr edit");
   expect((await sh(["git", "rev-parse", "change/add-farewell"], { cwd: bare })).stdout.trim()).toBe(
@@ -352,7 +359,7 @@ test("discreet delivery merges an advanced base using the round commit's identit
   expect(identities.join("\n")).not.toMatch(/Limitless|limitless@localhost/);
 });
 
-test.each(["legacy text", "clean", "factory identity", "existing PR"])(
+test.each(["legacy text", "clean", "factory identity", "agent trailer", "existing PR"])(
   "resumed delivery checks historical commits and renders a fresh body (%s)",
   async (scenario) => {
     const initialDiscreet = scenario !== "legacy text";
@@ -364,19 +371,23 @@ test.each(["legacy text", "clean", "factory identity", "existing PR"])(
       async (s) => {
         if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
         if (roleOf(s) === "review") return { structured: approve };
-        if (scenario === "factory identity") {
+        if (scenario === "factory identity" || scenario === "agent trailer") {
           writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
           await sh(["git", "add", "farewell.txt"], { cwd: s.cwd });
           await sh(
             [
               "git",
               "-c",
-              "user.name=Limitless",
+              scenario === "factory identity" ? "user.name=Limitless" : "user.name=Test",
               "-c",
-              "user.email=limitless@localhost",
+              scenario === "factory identity"
+                ? "user.email=limitless@localhost"
+                : "user.email=test@example.invalid",
               "commit",
               "-qm",
-              "Add farewell",
+              scenario === "agent trailer"
+                ? "Add farewell\n\nCo-Authored-By: Claude <claude@example.invalid>"
+                : "Add farewell",
             ],
             { cwd: s.cwd },
           );
@@ -400,7 +411,9 @@ test.each(["legacy text", "clean", "factory identity", "existing PR"])(
       subscribe: (wake) => f.store.subscribe(wake),
     });
     await f.stop();
-    const branch = f.store.getRun(run.id)?.branch ?? "";
+    const branch =
+      scenario === "legacy text" ? "change/add-farewell" : (f.store.getRun(run.id)?.branch ?? "");
+    if (scenario === "legacy text") f.store.updateRun(run.id, { branch });
     f.store.putArtifact(
       run.id,
       "report.md",
@@ -449,6 +462,130 @@ if (args[1] === "edit") writeFileSync(${JSON.stringify(join(state.home, "gh-body
       ).not.toBe(0);
       expect(calls).not.toMatch(/pr (?:create|edit)/);
       expect(resumed.store.getRun(run.id)?.error).toMatch(/discreet.*commits/i);
+    }
+  },
+);
+
+test.each(["limitless/neutral", "change/private-run-title"])(
+  "branch publication detects each mark independently: %s",
+  async (branch) => {
+    const bare = await githubFixture();
+    const f = start(() => ({ text: "unused" }));
+    await f.scheduler.stop();
+    registerGithub(f, bare);
+    const repo = f.store.getRepoBySlug("test/repo");
+    if (!repo) throw new Error("missing repo");
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd: state.repoDir })).stdout.trim();
+    await expect(
+      deliveryPublicationRange(repo, state.repoDir, branch, base, base, undefined, undefined, {
+        runId: "private-run",
+        published: false,
+      }),
+    ).rejects.toThrow(/Discreet mode.*branch name/);
+  },
+);
+
+test.each(["unpublished", "recorded PR", "push before checkpoint", "remote unavailable"])(
+  "enabling discreet mode preserves only previously published legacy branches (%s)",
+  async (scenario) => {
+    const bare = await githubFixture();
+    mkdirSync(join(state.home, "cfg"));
+    const config = join(state.home, "cfg", "config.toml");
+    writeFileSync(config, '[repos."test/repo"]\ndiscreet = false');
+    const agent = (s: Parameters<Parameters<typeof start>[0]>[0]) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(agent, false, false, { faults: { "stage:prepare:after": { action: "kill" } } });
+    registerGithub(f, bare);
+    const run = await f.createRun({
+      repo: "test/repo",
+      prompt: "Add farewell",
+      title: "Add farewell",
+      profile: "quick",
+    });
+    await wait(() => f.store.listStages(run.id).at(-1)?.status === "cancelled", {
+      timeoutMs: 10_000,
+      pollMs: null,
+      subscribe: (wake) => f.store.subscribe(wake),
+    });
+    await f.stop();
+    const prepared = f.store.getRun(run.id);
+    const branch = prepared?.branch;
+    if (!branch || !prepared?.baseSha) throw new Error("missing prepared branch");
+    expect(branch).toBe(`limitless/${run.id}-add-farewell`);
+    const url = "https://github.com/test/repo/pull/41";
+    if (scenario === "recorded PR" || scenario === "push before checkpoint") {
+      await sh(["git", "update-ref", `refs/heads/${branch}`, prepared.baseSha], { cwd: bare });
+      if (scenario === "recorded PR") f.store.updateRun(run.id, { prUrl: url });
+    }
+    f.store.close();
+    writeFileSync(config, '[repos."test/repo"]\ndiscreet = true');
+    const resumed = start(agent, false, false, { faults: { "stage:deliver:before": { action: "kill" } } });
+    await wait(
+      () => resumed.store.listStages(run.id).some((s) => s.name === "deliver" && s.status === "cancelled"),
+      {
+        timeoutMs: 10_000,
+        pollMs: null,
+        subscribe: (wake) => resumed.store.subscribe(wake),
+      },
+    );
+    await resumed.stop();
+    const checked = resumed.store.getRun(run.id);
+    const worktree = join(resumed.cfg.paths.work, run.id);
+    const head = checked?.headSha ?? "";
+    // All outgoing text/identities are neutral: refusal must specifically come from the branch.
+    expect((await sh(["git", "log", "-1", "--format=%B|%an|%cn"], { cwd: worktree })).stdout).not.toMatch(
+      /Limitless|Run:/i,
+    );
+    if (scenario === "recorded PR" || scenario === "push before checkpoint") {
+      await sh(["git", "push", bare, `HEAD:refs/heads/${branch}`], { cwd: worktree });
+    }
+    if (scenario === "remote unavailable") {
+      resumed.store.upsertRepo({
+        ...resumed.store.getRepoBySlug("test/repo"),
+        slug: "test/repo",
+        kind: "github",
+        url: join(state.home, "missing.git"),
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+    }
+    writeFileSync(
+      join(state.home, "bin", "gh"),
+      `#!${process.execPath}
+import { appendFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(join(state.home, "gh-calls"))}, args.join(" ")+"\\n");
+if(args[0] === "api") console.log(JSON.stringify(${JSON.stringify(scenario === "recorded PR" || scenario === "push before checkpoint")} ? [[{html_url:${JSON.stringify(url)},head:{sha:${JSON.stringify(head)}}}]] : [[]]));
+if(args[1] === "view") console.log(JSON.stringify({url:${JSON.stringify(url)},state:"OPEN",headRefOid:${JSON.stringify(head)}}));
+if(args[1] === "edit") writeFileSync(${JSON.stringify(join(state.home, "gh-body"))}, await Bun.stdin.text());
+`,
+    );
+    resumed.store.close();
+    const finished = start(() => {
+      throw new Error("delivery must not invoke agents");
+    });
+    const published = scenario === "recorded PR" || scenario === "push before checkpoint";
+    expect(await waitFor(finished, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      published ? "succeeded" : "needs_human",
+    );
+    expect(finished.store.getRun(run.id)?.branch).toBe(branch);
+    const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+    expect(calls).not.toContain("pr create");
+    if (published) {
+      expect(finished.store.getRun(run.id)?.prUrl).toBe(url);
+      expect(finished.store.runForPr(url)?.id).toBe(run.id);
+      expect(calls).toContain(`pr edit ${url}`);
+    } else {
+      expect(finished.store.getRun(run.id)?.error).toMatch(/discreet.*branch.name/i);
+      expect(calls).not.toContain("pr edit");
+      expect(
+        (await sh(["git", "show-ref", "--verify", `refs/heads/${branch}`], { cwd: bare, allowFail: true }))
+          .exitCode,
+      ).not.toBe(0);
     }
   },
 );

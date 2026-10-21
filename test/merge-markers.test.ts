@@ -348,3 +348,38 @@ test("discreet commit inspection uses raw identities and UTF-8 regardless of log
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test.each([
+  ["Co-authored-by: Limitless <limitless@localhost>", true],
+  ["Co-Authored-By: Claude <claude@example.invalid>", true],
+  ["Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>", true],
+  ["Generated with Claude", true],
+  ["Generated-by: Codex", true],
+  ["Reviewed-By: Claude <claude@example.invalid>", true],
+  ["Co-authored-by: claude@example.invalid", true],
+  ["Co-authored-by: Human Contributor <human@example.invalid>", false],
+  ["Co-authored-by: Claude Smith <human@example.invalid>", false],
+  ["Document how Claude and Limitless handle input", false],
+])("discreet commit attribution inspection: %s", async (body, blocked) => {
+  const dir = mkdtempSync(join(tmpdir(), "discreet-attribution-"));
+  try {
+    await mergeGit(dir, ["init", "-q", "-b", "main"]);
+    const git = (args: string[]) => mergeGit(dir, args, false, undefined, "operator");
+    await git(["commit", "--allow-empty", "-qm", "Base"]);
+    const base = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    await git(["commit", "--allow-empty", "-qm", `Add farewell\n\n${body}`]);
+    // The offending commit need not be the tip.
+    await git(["commit", "--allow-empty", "-qm", "Follow up"]);
+    const inspection = checkDiscreetCommits(dir, `${base}..HEAD`, base, "private-run");
+    if (blocked) await expect(inspection).rejects.toThrow(/Discreet mode.*commits/);
+    else await expect(inspection).resolves.toBeUndefined();
+    if (blocked) {
+      const published = (await git(["rev-parse", "HEAD~1"])).stdout.trim();
+      await expect(
+        checkDiscreetCommits(dir, `${published}..HEAD`, base, "private-run"),
+      ).resolves.toBeUndefined();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

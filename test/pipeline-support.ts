@@ -283,7 +283,7 @@ export function pipelineSetup(state: PipelineFixture) {
     mkdirSync(bin);
     writeFileSync(
       join(bin, "gh"),
-      `#!/bin/sh\necho "$*" >> '${join(state.home, "gh-calls")}'\ncase "$2" in\n  list) exit 0 ;;\n  create) cat > '${join(state.home, "gh-body")}'; echo https://github.com/test/repo/pull/1 ;;\nesac\n`,
+      `#!/bin/sh\necho "$*" >> '${join(state.home, "gh-calls")}'\ncase "$1:$2" in\n  api:--paginate) echo '[[]]' ;;\n  pr:list) exit 0 ;;\n  pr:create) cat > '${join(state.home, "gh-body")}'; echo https://github.com/test/repo/pull/1 ;;\nesac\n`,
       { mode: 0o755 },
     );
     process.env.PATH = `${bin}:${originalPath}`;
