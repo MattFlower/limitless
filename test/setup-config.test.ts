@@ -4,6 +4,8 @@ import { patchSetupConfig } from "../src/cli/setup-config.ts";
 for (const original of [
   '[repos."acme/app"]\nland_requires_approval = true\ndiscreet = false\n',
   'repos = { "acme/app" = { land_requires_approval = true, discreet = false }, "acme/other" = { discreet = false } }\n',
+  'repos = { "acme/other" = { discreet = false } }\n',
+  "repos = {}\n",
   '[repos]\n"acme/app" = { land_requires_approval = true, discreet = false }\n',
 ])
   test(`setup enables discreet mode while preserving repository settings: ${original.trim()}`, () => {
@@ -101,7 +103,7 @@ for (const members of ["", 'token_env = "X", poll = 60'])
     const github = { repos: ["acme/app"], merge: "pr" };
     const text = patchSetupConfig(original, github, [], [], false);
     expect(text).toBe(
-      `github\t= { ${members}${members ? ", " : ""}repos = ["acme/app"], merge = "pr"${members ? "" : " "}\t } # note\n`,
+      `github\t= { ${members}${members ? ", " : ""}"repos" = ["acme/app"], "merge" = "pr"${members ? "" : " "}\t } # note\n`,
     );
     expect(Bun.TOML.parse(text)).toMatchObject({ github });
   });
@@ -119,7 +121,7 @@ for (const quotes of [4, 5])
     const original = `github = {\n # keep leading comment\n notes = """quoted } , #${'"'.repeat(quotes)},\n repos = [] # keep value comment\n ,\n} # note\n`;
     const github = { repos: ["acme/app"], merge: "pr" };
     const text = patchSetupConfig(original, github, [], [], false);
-    expect(text).toBe(original.replace("[]", '["acme/app"], merge = "pr"'));
+    expect(text).toBe(original.replace("[]", '["acme/app"], "merge" = "pr"'));
     expect(Bun.TOML.parse(text)).toMatchObject({ github });
   });
 

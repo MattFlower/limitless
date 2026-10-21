@@ -166,7 +166,7 @@ for (const merge of ["", ', merge  =  "none"'])
       expect(await setupCommand("init", flags, f.d)).toBe(0);
       const updated = readFileSync(f.file, "utf8");
       expect(updated).toBe(
-        assignment.replace('[ "acme/app" ]', `["acme/app", "acme/lib"]${merge ? "" : ', merge = "pr"'}`) +
+        assignment.replace('[ "acme/app" ]', `["acme/app", "acme/lib"]${merge ? "" : ', "merge" = "pr"'}`) +
           providers,
       );
       expect(Bun.TOML.parse(updated)).toMatchObject({

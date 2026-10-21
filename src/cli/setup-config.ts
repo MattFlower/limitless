@@ -127,7 +127,7 @@ function patchInlineTable(text: string, table: string, values: Record<string, un
     edits.push({
       start: insertion,
       end: insertion,
-      value: `${members ? ", " : " "}${changes.map((key) => `${key} = ${tomlValue(values[key])}`).join(", ")}`,
+      value: `${members ? ", " : " "}${changes.map((key) => `${tomlValue(key)} = ${tomlValue(values[key])}`).join(", ")}`,
     });
   for (const edit of edits.sort((a, b) => b.start - a.start || b.end - a.end))
     text = text.slice(0, edit.start) + edit.value + text.slice(edit.end);
