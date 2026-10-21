@@ -54,6 +54,7 @@ import {
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { quotedJson } from "../integrations/github.ts";
+import type { PrSnapshot } from "../integrations/github-poller.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
@@ -100,9 +101,12 @@ const FEED_OWNERSHIP = `EXISTS (SELECT 1 FROM runs WHERE runs.id = COALESCE(
 type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, NULLIF(run_id, '') AS runId, title, repo, pr_url AS prUrl, base_branch AS baseBranch,
-  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
+  head_branch AS headBranch, approved_sha AS approvedSha,
+  CASE WHEN state = 'blocked' AND approval_wait > 0 THEN 'waiting_approval' ELSE state END AS state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
   log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
-  finished_at AS finishedAt FROM land_entries`;
+  approval_wait AS approvalWaitStartedAt,
+  approval_wait_request_seq AS approvalWaitRequestSeq,
+  CASE WHEN approval_wait > 0 THEN NULL ELSE finished_at END AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
   baseBranch: "base_branch",
   state: "state",
@@ -1314,7 +1318,7 @@ export class Store {
       }
       return !this.db
         .query(
-          "SELECT 1 FROM land_entries WHERE pr_url = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')",
+          "SELECT 1 FROM land_entries WHERE pr_url = ? AND (state IN ('queued', 'checking', 'waiting_ci', 'merging') OR approval_wait > 0)",
         )
         .get(trigger.prUrl);
     })();
@@ -1529,7 +1533,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       if (round?.kind === "ci") {
         this.db
           .query(`UPDATE land_entries SET reason = ?
-          WHERE pr_url = ? AND state = 'blocked' AND (approved_sha = ? OR pushed_sha = ?)`)
+          WHERE pr_url = ? AND state = 'blocked' AND approval_wait = 0 AND (approved_sha = ? OR pushed_sha = ?)`)
           .run(
             `CI fix at ${sha}; approve the new head to land`,
             round.prUrl,
@@ -1542,7 +1546,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
           .query(
             `UPDATE land_entries SET reason = ? WHERE id IN
               (SELECT land_entry_id FROM conflict_triggers WHERE run_id = ?)
-              AND state = 'blocked' AND reason = 'conflicts with ' || base_branch`,
+              AND state = 'blocked' AND approval_wait = 0 AND reason = 'conflicts with ' || base_branch`,
           )
           .run(`conflict resolved at ${sha}; approve the new head to land`, runId);
       }
@@ -2799,6 +2803,13 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     try {
       id = this.db.transaction(() => {
         this.assertNoRoundInFlight(entry.prUrl);
+        if (
+          this.db
+            .query(`SELECT 1 FROM land_entries WHERE pr_url = ? AND
+          (state IN ('queued', 'checking', 'waiting_ci', 'merging') OR approval_wait > 0)`)
+            .get(entry.prUrl)
+        )
+          throw new Error("PR is already in the land queue");
         const res = this.db
           .query(
             `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at, title)
@@ -2849,8 +2860,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       params.push(...ACTIVE_LAND_STATES);
     }
     const filter = where.length ? ` WHERE ${where.join(" AND ")}` : "";
-    const sql = `SELECT * FROM (${LAND_SELECT}${filter} ORDER BY id DESC LIMIT ?)
-      UNION ${LAND_SELECT}${filter}${where.length ? " AND" : " WHERE"}
+    const sql = `SELECT * FROM (SELECT * FROM (${LAND_SELECT})${filter} ORDER BY id DESC LIMIT ?)
+      UNION SELECT * FROM (${LAND_SELECT})${filter}${where.length ? " AND" : " WHERE"}
         state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")}) ORDER BY id`;
     return this.db
       .query(sql)
@@ -2918,22 +2929,71 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   updateLandEntry(
     id: number,
     patch: Partial<
-      Pick<LandEntry, "baseBranch" | "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">
+      Pick<
+        LandEntry,
+        | "baseBranch"
+        | "state"
+        | "pushedSha"
+        | "ciRerun"
+        | "logPath"
+        | "attempts"
+        | "reason"
+        | "approvalWaitStartedAt"
+        | "approvalWaitRequestSeq"
+      >
     >,
   ): LandEntry {
-    const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
+    const { sets, values } = buildUpdate(
+      patch.state === "waiting_approval" ? { ...patch, state: "blocked" } : patch,
+      LAND_PATCH_COLUMNS,
+    );
+    if (patch.state) {
+      sets.push("approval_wait_request_seq = ?");
+      values.push(patch.state === "waiting_approval" ? (patch.approvalWaitRequestSeq ?? 0) : 0);
+      sets.push("approval_wait = ?");
+      values.push(patch.state === "waiting_approval" ? (patch.approvalWaitStartedAt ?? Date.now()) : 0);
+      sets.push("finished_at = ?");
+      values.push(ACTIVE_LAND_STATES.includes(patch.state) ? null : Date.now());
+      if (patch.state === "waiting_approval") sets.push("claim_owner = NULL", "claim_heartbeat_at = NULL");
+    }
     sets.push("updated_at = ?");
     values.push(Date.now());
-    if (patch.state && !ACTIVE_LAND_STATES.includes(patch.state)) {
-      sets.push("finished_at = ?");
-      values.push(Date.now());
-    }
     this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     return this.getLandEntry(id) as LandEntry;
   }
 
+  /** Orders observation requests and approval waits across processes and restarts. */
+  nextGithubObservationSeq(): number {
+    return this.transaction(() => {
+      const row = this.db
+        .query<{ value: number }, []>(
+          "UPDATE github_observation_sequence SET value = value + 1 WHERE id = 1 RETURNING value",
+        )
+        .get();
+      if (!row || !Number.isSafeInteger(row.value)) throw new Error("Invalid GitHub observation sequence");
+      return row.value;
+    });
+  }
+
+  /** Atomically retire rollback re-queues, or release this exact wait episode. */
+  releaseLandApproval(id: number, waitStartedAt: number, release: boolean): LandEntry | null {
+    return this.transaction(() => {
+      const entry = this.getLandEntry(id);
+      if (entry?.state !== "waiting_approval" || entry.approvalWaitStartedAt !== waitStartedAt) return null;
+      if (this.db.query("SELECT 1 FROM land_entries WHERE pr_url = ? AND id > ?").get(entry.prUrl, id))
+        return this.updateLandEntry(id, { state: "blocked", reason: "superseded by a newer land entry" });
+      return release ? this.updateLandEntry(id, { state: "queued", reason: null }) : entry;
+    });
+  }
+
   /** Feed items for the queue: the PR URL, the SHA and, when it failed, the reason. */
-  landFeed(kind: LandFeedKind, entry: LandEntry, summary: string, data: Record<string, unknown> = {}): void {
+  landFeed(
+    kind: LandFeedKind,
+    entry: LandEntry,
+    summary: string,
+    data: Record<string, unknown> = {},
+    key = String(entry.id),
+  ): void {
     this.db.transaction(() =>
       this.addFeedItems([
         {
@@ -2942,7 +3002,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
           repo: entry.repo,
           summary,
           data: { url: entry.prUrl, sha: entry.approvedSha, ...data },
-          key: String(entry.id),
+          key,
         },
       ]),
     )();
@@ -3001,9 +3061,9 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       .run(outcome, f.prUrl, f.sha, f.signature);
   }
 
-  /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
-  githubTracked(now = Date.now()): TrackedPr[] {
-    const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
+  /** Factory PRs, plus active lands requiring operator-configured GitHub approval. */
+  githubTracked(now = Date.now(), requiresApproval: ReadonlySet<string> = new Set()): TrackedPr[] {
+    const sql = `WITH tracked AS (SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
       LEFT JOIN github_pr_expiry e ON e.url = r.pr_url
@@ -3013,16 +3073,47 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
         AND (r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000
           OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED' OR e.reopened_at >= ?1 - 604800000)
-      GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
-    return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
-      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
-      return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
-    });
+      GROUP BY r.pr_url)
+      SELECT * FROM tracked
+      UNION
+      SELECT l.pr_url, l.repo, NULLIF(l.run_id, ''), g.node_id, g.data, 1
+      FROM land_entries l LEFT JOIN github_prs g ON g.url = l.pr_url
+      WHERE lower(l.repo) IN (SELECT lower(value) FROM json_each(?2))
+        AND (l.state IN ('queued', 'checking', 'waiting_ci', 'merging') OR l.approval_wait > 0)
+        AND NOT EXISTS (SELECT 1 FROM tracked WHERE url = l.pr_url)
+      ORDER BY repo, url`;
+    return (this.db.query(sql).all(now, JSON.stringify([...requiresApproval])) as TrackedPr[]).filter(
+      (pr) => {
+        const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
+        return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
+      },
+    );
   }
 
   githubPrData(url: string): string | null {
     const query = this.db.query<{ data: string }, [string]>("SELECT data FROM github_prs WHERE url = ?");
     return query.get(url)?.data ?? null;
+  }
+
+  /** Review authority has its own monotonic record; direct reads must not baseline polling/feed data. */
+  githubReview(url: string): PrSnapshot | null {
+    const polled = parse<PrSnapshot | null>(this.githubPrData(url), null);
+    const review = this.getSetting<PrSnapshot | null>(`github.review:${url}`, null);
+    return (polled?.requestSeq ?? 0) > (review?.requestSeq ?? 0) ? polled : (review ?? polled);
+  }
+
+  /** Counts every completed review observation, including requests that started earlier. */
+  githubReviewObservationCount(url: string): number {
+    return this.getSetting<number>(`github.review-observations:${url}`, 0);
+  }
+
+  saveGithubReview(url: string, snapshot: PrSnapshot): void {
+    this.transaction(() => {
+      this.setSetting(`github.review-observations:${url}`, this.githubReviewObservationCount(url) + 1);
+      const current = this.githubReview(url);
+      const newest = (snapshot.requestSeq ?? 0) > (current?.requestSeq ?? 0) ? snapshot : current;
+      if (newest?.requestSeq) this.setSetting(`github.review:${url}`, newest);
+    });
   }
 
   githubPrExpired(url: string, now = Date.now()): boolean {
@@ -3066,6 +3157,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       const save = this.db.query(`INSERT INTO github_prs (url, node_id, data, terminal) VALUES (?, ?, ?, ?)
         ON CONFLICT(url) DO UPDATE SET node_id = excluded.node_id, data = excluded.data, terminal = excluded.terminal`);
       if (pr) {
+        const snapshot = parse<PrSnapshot | null>(pr.data, null);
+        if (snapshot) this.saveGithubReview(pr.url, snapshot);
         save.run(pr.url, pr.nodeId, pr.data, terminal);
         const state = pr.data && (JSON.parse(pr.data) as { state?: string }).state;
         if (state) this.observeGithubPrState(pr.url, state, now);

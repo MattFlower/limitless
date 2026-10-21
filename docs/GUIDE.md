@@ -397,6 +397,32 @@ merge; a failed dependency can leave it `needs_human`.
 `LIMITLESS_URL` points the CLI at another daemon. The default is
 `http://127.0.0.1:${LIMITLESS_PORT:-7400}`.
 
+To require another account's GitHub approval before landing, set this in the operator's
+`config.toml` (repository `.limitless.toml` cannot change this policy):
+
+```toml
+[repos."owner/name"]
+land_requires_approval = true
+```
+
+The default is false; repository slugs match case-insensitively. With it enabled, run-backed and
+explicitly queued PRs stay in `waiting_approval` until a fresh observation shows an `APPROVED`
+review from a human GitHub User with push access, other than the authenticated factory account,
+on exactly the approved SHA. An outstanding change request from any push-access human holds the
+entry. Stale or dismissed reviews do not count; unavailable identity or review evidence leaves it
+waiting without a new timeout. Waiting entries do not block other PRs in the repository.
+
+The gate runs before checks and rechecks fresh reviews immediately before every merge attempt,
+including retries and restarts; incomplete review evidence never counts as approval.
+The final check narrows but cannot eliminate the review-change window because GitHub pins the
+merge to a head SHA rather than to review state. Repositories needing strict enforcement should
+also enable GitHub branch protection with required reviews, which GitHub enforces at merge time.
+Approval on the approved SHA or the factory's pushed base-merge head counts at that recheck;
+a later factory base merge does not need another approval. After a rollback, the previous release
+shows waiting entries as `blocked`; re-queue them to continue. `limitless review --approve` only
+records the factory-side approval and never submits a GitHub review. Restart the daemon after
+changing policy.
+
 ### UI and chat
 
 The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, cost
