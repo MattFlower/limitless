@@ -98,7 +98,11 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
   }
   add("gh", ghOk ? "ok" : "fail", ghOk ? "authenticated" : "not authenticated or no repo access");
   if (!d.config.githubOwner)
-    add("github-owner", "warn", "GitHub owner unset; issue-label and /limitless comment triggers disabled");
+    add(
+      "github-owner",
+      "warn",
+      "GitHub owner unset; Dependabot runs, issue-label triggers and /limitless comment triggers disabled",
+    );
   const cli = await Promise.all([run("claude", "--version"), run("codex", "--version")]);
   for (const [index, name] of ["claude", "codex"].entries()) {
     const present = cli[index]?.exitCode === 0;
@@ -241,7 +245,7 @@ async function runSetup(
       raw.owners = { ...owners, github: owner };
     } else {
       const warning =
-        "GitHub owner unset; issue-label and /limitless comment triggers remain disabled. Set [owners] github in config.toml or rerun limitless init.";
+        "GitHub owner unset; Dependabot runs, issue-label triggers and /limitless comment triggers remain disabled. Set [owners] github in config.toml or rerun limitless init.";
       transaction.warnings.push(warning);
       if (!flags.json) d.print(warning);
     }

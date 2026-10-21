@@ -300,9 +300,10 @@ detection, per-invocation budget, process-group kill on cancel.
   separate work. Secrets for Discord/GitHub/OpenRouter are
   scrubbed from agent environments.
 - Triggers are **allowlisted** (your configured GitHub login, `dependabot[bot]`, your Discord user id).
-  The GitHub owner defaults to unset: issue-label and `/limitless` comment triggers stay disabled
-  until configured. Init discovers or prompts for it; doctor warns when missing. Installations
-  relying on the former default must set `[owners] github` explicitly before upgrading.
+  The GitHub owner defaults to unset: Dependabot runs, issue-label triggers and `/limitless`
+  comment triggers stay disabled until configured. Init discovers or prompts for it; doctor warns
+  when missing. Installations relying on the former default must set `github = "<owner>"` under
+  `[owners]` in `config.toml` before upgrading, or these triggers stop.
   Untrusted issue/PR text is treated as data and quoted, never as instructions.
 
 ## 7. Persistence

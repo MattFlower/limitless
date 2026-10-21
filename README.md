@@ -149,11 +149,12 @@ Create a repository webhook at `https://<your-host>/webhooks/github` with
 content type `application/json`, a shared secret stored as `GITHUB_WEBHOOK_SECRET` in
 `~/.config/limitless/secrets.env`, and the **Issues**, **Issue comments**, and
 **Pull requests** events. The webhook is disabled until the secret is configured.
-Owner-labeled `limitless` issues and owner `/limitless ` comments create runs only when
+Dependabot runs, issue-label triggers and owner `/limitless ` comment triggers are disabled until
 `[owners] github` is set (no default). `limitless init` discovers your login with `gh api user`
-and lets you override it interactively; `limitless doctor` warns when owner triggers are disabled.
-Before upgrading an installation relying on the former default, explicitly set its owner to keep
-these triggers working ([config guide](docs/GUIDE.md#configure)).
+and lets you override it interactively; init and `limitless doctor` warn when these triggers are disabled.
+Before upgrading an installation relying on the former default, set `github = "<owner>"` under
+`[owners]` in `config.toml`, or Dependabot runs, issue-label triggers and `/limitless` comment
+triggers stop ([config guide](docs/GUIDE.md#configure)).
 Dependabot pull requests receive verification runs whose fixes update the existing PR branch.
 Existing-branch delivery requires recorded webhook authentication and Dependabot PR metadata;
 public run requests cannot enable it. Runs predating this authentication record must be

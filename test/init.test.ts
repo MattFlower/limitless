@@ -665,41 +665,43 @@ for (const interactive of [false, true])
   });
 
 for (const result of ["failure", "throw", "malformed", "null", "missing", "blank", "invalid"])
-  test(`init leaves owner triggers disabled when discovery is ${result}`, async () => {
-    const original =
-      '[[providers]]\npreset = "claude"\n[[providers]]\npreset = "codex"\n[github]\nrepos = ["acme/app"]\nmerge = "pr"\n';
-    const f = setupFixture(original);
-    try {
-      f.state.local = false;
-      const run = f.d.run;
-      f.d.run = async (args) => {
-        const response = await run(args);
-        if (args.join(" ") !== "gh api user") return response;
-        if (result === "throw") throw new Error("discovery unavailable");
-        return {
-          ...response,
-          exitCode: result === "failure" ? 1 : 0,
-          stdout:
-            {
-              failure: '{"login":"untrusted-owner"}',
-              malformed: "broken JSON",
-              null: '{"login":null}',
-              missing: "{}",
-              blank: '{"login":"  "}',
-              invalid: '{"login":"bad/login"}',
-            }[result] ?? "",
+  for (const json of [false, true])
+    test(`init leaves owner triggers disabled when discovery is ${result} (json=${json})`, async () => {
+      const original =
+        '[[providers]]\npreset = "claude"\n[[providers]]\npreset = "codex"\n[github]\nrepos = ["acme/app"]\nmerge = "pr"\n';
+      const f = setupFixture(original);
+      try {
+        f.state.local = false;
+        const run = f.d.run;
+        f.d.run = async (args) => {
+          const response = await run(args);
+          if (args.join(" ") !== "gh api user") return response;
+          if (result === "throw") throw new Error("discovery unavailable");
+          return {
+            ...response,
+            exitCode: result === "failure" ? 1 : 0,
+            stdout:
+              {
+                failure: '{"login":"untrusted-owner"}',
+                malformed: "broken JSON",
+                null: '{"login":null}',
+                missing: "{}",
+                blank: '{"login":"  "}',
+                invalid: '{"login":"bad/login"}',
+              }[result] ?? "",
+          };
         };
-      };
-      expect(await setupCommand("init", { yes: true, json: true }, f.d)).toBe(0);
-      expect(loadConfig({ configDir: f.configDir, home: f.home, readOnly: true }).githubOwner).toBeNull();
-      expect(readFileSync(f.file, "utf8")).toBe(original);
-      expect(JSON.parse(f.output[0] ?? "").warnings).toContainEqual(
-        expect.stringContaining("triggers remain disabled"),
-      );
-    } finally {
-      f.close();
-    }
-  });
+        expect(await setupCommand("init", { yes: true, json }, f.d)).toBe(0);
+        expect(loadConfig({ configDir: f.configDir, home: f.home, readOnly: true }).githubOwner).toBeNull();
+        expect(readFileSync(f.file, "utf8")).toBe(original);
+        const warning =
+          "GitHub owner unset; Dependabot runs, issue-label triggers and /limitless comment triggers remain disabled. Set [owners] github in config.toml or rerun limitless init.";
+        if (json) expect(JSON.parse(f.output[0] ?? "").warnings).toContain(warning);
+        else expect(f.output).toContain(warning);
+      } finally {
+        f.close();
+      }
+    });
 
 test("interactive owner works after discovery failure and an owner-only write rolls back on smoke failure", async () => {
   const original =

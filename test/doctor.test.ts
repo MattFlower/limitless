@@ -439,9 +439,9 @@ for (const explicit of [false, true])
       }
     });
 
-for (const owner of [undefined, "acme"])
+for (const owner of [undefined, "", "acme"])
   test(`doctor reports disabled GitHub triggers only with owner unset (${owner})`, async () => {
-    const f = setupFixture(owner ? `[owners]\ngithub = "${owner}"\n` : undefined);
+    const f = setupFixture(owner === undefined ? undefined : `[owners]\ngithub = "${owner}"\n`);
     try {
       const before = f.snapshot();
       for (const json of [false, true]) {
@@ -458,7 +458,9 @@ for (const owner of [undefined, "acme"])
           if (owner) expect(check).toBeUndefined();
           else {
             expect(check?.status).toBe("warn");
-            expect(check?.message).toContain("issue-label and /limitless comment triggers disabled");
+            expect(check?.message).toContain(
+              "Dependabot runs, issue-label triggers and /limitless comment triggers disabled",
+            );
             expect(check?.fix).toContain("[owners]");
             expect(check?.fix).toContain('github = "<owner>"');
           }
@@ -467,7 +469,9 @@ for (const owner of [undefined, "acme"])
           if (owner) expect(output).not.toContain("github-owner");
           else {
             expect(output).toContain("warn github-owner:");
-            expect(output).toContain("issue-label and /limitless comment triggers disabled");
+            expect(output).toContain(
+              "Dependabot runs, issue-label triggers and /limitless comment triggers disabled",
+            );
             expect(output).toContain("[owners]");
             expect(output).toContain('github = "<owner>"');
           }
