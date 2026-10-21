@@ -3102,8 +3102,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     return (polled?.requestSeq ?? 0) > (review?.requestSeq ?? 0) ? polled : (review ?? polled);
   }
 
+  /** Counts every completed review observation, including requests that started earlier. */
+  githubReviewObservationCount(url: string): number {
+    return this.getSetting<number>(`github.review-observations:${url}`, 0);
+  }
+
   saveGithubReview(url: string, snapshot: PrSnapshot): void {
     this.transaction(() => {
+      this.setSetting(`github.review-observations:${url}`, this.githubReviewObservationCount(url) + 1);
       const current = this.githubReview(url);
       const newest = (snapshot.requestSeq ?? 0) > (current?.requestSeq ?? 0) ? snapshot : current;
       if (newest?.requestSeq) this.setSetting(`github.review:${url}`, newest);

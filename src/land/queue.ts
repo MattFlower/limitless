@@ -593,7 +593,10 @@ export class LandQueue {
         if (seen.reviewEvidenceComplete) return { login, seen };
         // A newer, truncated poll can wake the wait, but only complete direct evidence releases it.
       }
-      const requestSeq = this.store.nextGithubObservationSeq();
+      const { requestSeq, observations } = this.store.transaction(() => ({
+        requestSeq: this.store.nextGithubObservationSeq(),
+        observations: this.store.githubReviewObservationCount(entry.prUrl),
+      }));
       const pr = await client(
         `repos/${entry.repo}/pulls/${entry.prUrl.split("/").at(-1)}`,
         undefined,
@@ -622,8 +625,12 @@ export class LandQueue {
       if (!seen || seen.url !== entry.prUrl || !page.success) return { login, seen: null };
       // Pages are not an atomic review snapshot: a review can be dismissed between reads.
       seen.requestSeq = requestSeq;
-      this.store.saveGithubReview(entry.prUrl, seen);
-      return { login, seen };
+      const overlapped = this.store.transaction(() => {
+        const changed = observations !== this.store.githubReviewObservationCount(entry.prUrl);
+        this.store.saveGithubReview(entry.prUrl, seen);
+        return changed;
+      });
+      return { login, seen, overlapped };
     } catch (error) {
       signal.throwIfAborted();
       this.log(redactCredentials(`[land] ${entry.id}: approval observation pending: ${String(error)}`));
@@ -637,10 +644,14 @@ export class LandQueue {
       : `Another GitHub account must approve ${entry.approvedSha}`;
   }
 
-  private parkApproval(entry: LandEntry, signal: AbortSignal, seen: PrSnapshot | null): void {
+  private parkApproval(
+    entry: LandEntry,
+    signal: AbortSignal,
+    seen: PrSnapshot | null,
+    reason = this.approvalReason(entry, seen),
+  ): void {
     const waiting = this.owned(entry.id, () => {
       signal.throwIfAborted();
-      const reason = this.approvalReason(entry, seen);
       const parked = this.store.updateLandEntry(entry.id, {
         state: "waiting_approval",
         reason,
@@ -1030,9 +1041,24 @@ export class LandQueue {
     const guard = async () => {
       this.assertClaim(entry.id);
       if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) return;
-      const evidence = await this.approvalEvidence({ ...entry, pushedSha: sha }, signal);
-      signal.throwIfAborted();
-      this.assertClaim(entry.id);
+      let evidence: Awaited<ReturnType<LandQueue["approvalEvidence"]>>;
+      let reads = 0;
+      do {
+        // Request-start order cannot order observations that complete while this read is in flight.
+        evidence = await this.approvalEvidence({ ...entry, pushedSha: sha }, signal);
+        signal.throwIfAborted();
+        this.assertClaim(entry.id);
+        reads++;
+      } while (evidence.overlapped && reads < 3);
+      if (evidence.overlapped) {
+        this.parkApproval(
+          entry,
+          signal,
+          evidence.seen,
+          "Review state changed during the final approval check",
+        );
+        throw new LandApprovalStopped();
+      }
       this.checkApprovalHead({ ...entry, pushedSha: sha }, evidence.seen);
       if (evidence.seen?.state === "MERGED") {
         this.landed(entry, repo, sha, {

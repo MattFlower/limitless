@@ -4377,6 +4377,104 @@ test.each([false, true])("502 merge retry rechecks approval (dismissed: %s)", as
   }
 });
 
+test.each(["CHANGES_REQUESTED", "APPROVED"])(
+  "an older-start poll overlapping the final approval forces a fresh read (%s)",
+  async (state) => {
+    const head = await pushBranch("one", "one.txt", "one\n");
+    const pr = delivered(1, "one");
+    approve(1, head);
+    reviewObservation(head);
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const pollEntered = Promise.withResolvers<void>();
+    const releasePoll = Promise.withResolvers<void>();
+    const pollSaved = Promise.withResolvers<void>();
+    const save = store.saveGithubPr.bind(store);
+    let pollSeq = 0;
+    let firstDirectSeq = 0;
+    const saving = spyOn(store, "saveGithubPr").mockImplementation((...args) => {
+      const currentSeq = store.githubReview(url(1))?.requestSeq ?? 0;
+      save(...args);
+      const snapshot = JSON.parse(args[0]?.data ?? "null");
+      if (snapshot?.requestSeq && snapshot.requestSeq < currentSeq) {
+        firstDirectSeq = currentSeq;
+        pollSeq = snapshot.requestSeq;
+        pollSaved.resolve();
+      }
+    });
+    const stop = approvalPoller(async (path, body, signal) => {
+      if (path === "graphql") {
+        pollEntered.resolve();
+        await releasePoll.promise;
+      }
+      return github.client(path, body, signal);
+    });
+    let directReads = 0;
+    const client: GitHubClient = async (path, body, signal) => {
+      const response = await github.client(path, body, signal);
+      if (path !== "graphql") return response;
+      const captured = respond(response.status, structuredClone(response.body));
+      if (++directReads === 2) {
+        expect(store.listLandEntries()[0]?.state).toBe("merging");
+        const review = github.nodes.get(`PR_${SLUG}_1`)?.latestOpinionatedReviews.nodes[0];
+        if (!review) throw new Error("missing test review");
+        review.state = state;
+        releasePoll.resolve();
+        await pollSaved.promise;
+        stop();
+      }
+      return captured;
+    };
+    try {
+      await clock.advance(0);
+      await pollEntered.promise;
+      const entry = await queue({
+        requiresApproval: approvalPolicy(),
+        github: client,
+        gateExecutor: fakeLandGates((req) => retryRun(req)).executor,
+      }).request({ target: pr.run.id });
+      await waitFor(() => ["landed", "waiting_approval"].includes(store.getLandEntry(entry.id)?.state ?? ""));
+      expect(pollSeq).toBeLessThan(firstDirectSeq);
+      expect(store.getLandEntry(entry.id)?.state).toBe(state === "APPROVED" ? "landed" : "waiting_approval");
+      expect(ghCalls("pr merge")).toHaveLength(state === "APPROVED" ? 1 : 0);
+      expect(directReads).toBe(3); // Claim, held final approval, then a non-overlapping read.
+    } finally {
+      releasePoll.resolve();
+      stop();
+      saving.mockRestore();
+    }
+  },
+);
+
+test("overlap on every final approval read parks after three reads without merging", async () => {
+  const head = await pushBranch("one", "one.txt", "one\n");
+  const pr = delivered(1, "one");
+  approve(1, head);
+  reviewObservation(head);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  let finalReads = 0;
+  const client: GitHubClient = async (path, body, signal) => {
+    const response = await github.client(path, body, signal);
+    if (path === "graphql" && store.listLandEntries()[0]?.state === "merging") {
+      finalReads++;
+      reviewObservation(head);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return response;
+  };
+  const entry = await queue({
+    requiresApproval: approvalPolicy(),
+    github: client,
+    gateExecutor: fakeLandGates((req) => retryRun(req)).executor,
+  }).request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval" || finalReads > 3);
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "waiting_approval",
+    reason: "Review state changed during the final approval check",
+  });
+  expect(finalReads).toBe(3);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
 test("a newer polled change request overtakes a delayed final direct approval", async () => {
   const head = await pushBranch("one", "one.txt", "one\n");
   const pr = delivered(1, "one");
@@ -4406,7 +4504,7 @@ test("a newer polled change request overtakes a delayed final direct approval", 
   if (!oldResponse) throw new Error("missing held approval");
   held.resolve(oldResponse);
   await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
-  expect(store.githubReview(url(1))).toEqual(newer);
+  expect(store.githubReview(url(1))?.requestSeq).toBeGreaterThan(newer?.requestSeq ?? 0);
   expect(store.githubPrData(url(1))).toBe(pollData);
   expect(store.githubReview(url(1))?.reviewEvidence?.[0]?.state).toBe("CHANGES_REQUESTED");
   expect(ghCalls("pr merge")).toEqual([]);
