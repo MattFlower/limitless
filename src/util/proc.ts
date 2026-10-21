@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
+import { credentialMatcher, registerCredentialVariant } from "./credential-matcher.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
 
@@ -939,8 +940,18 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
-      let pending = "";
       let terminalPending = "";
+      let matcher = credentialMatcher();
+      let redact = matcher.stream();
+      const redactStream = (chunk: string, flush = false) => {
+        const current = credentialMatcher();
+        if (current !== matcher) {
+          matcher = current;
+          chunk = redact.pending + chunk;
+          redact = matcher.stream();
+        }
+        return redact.push(chunk, flush);
+      };
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
@@ -958,26 +969,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
           const held = incomplete?.index !== undefined && decoded.length - incomplete.index <= MAX_PENDING_VT;
           const terminalCut = held ? (incomplete?.index ?? decoded.length) : decoded.length;
           terminalPending = decoded.slice(terminalCut);
-          pending += stripVTControlCharacters(decoded.slice(0, terminalCut));
-          // Retain possible credential prefixes, including JSON-escaped forms, across chunks.
-          const overlap = Math.max(0, (sortedCredentialVariants[0]?.[0].length ?? 0) - 1);
-          let cut = Math.max(0, pending.length - overlap);
-          // A complete match crossing the cut must also stay raw: replacing a shorter
-          // prefix in the carry would destroy a longer credential arriving next.
-          let previousCut: number;
-          do {
-            previousCut = cut;
-            for (const [secret] of sortedCredentialVariants) {
-              const start = pending.indexOf(secret, Math.max(0, cut - secret.length + 1));
-              if (start >= 0 && start < cut && start + secret.length > cut) cut = start;
-            }
-          } while (cut !== previousCut);
-          emit(redactCredentials(pending.slice(0, cut)));
-          pending = pending.slice(cut);
+          emit(redactStream(stripVTControlCharacters(decoded.slice(0, terminalCut))));
         },
         flush() {
-          emit(redactCredentials(pending + stripVTControlCharacters(terminalPending)));
-          pending = "";
+          emit(redactStream(stripVTControlCharacters(terminalPending), true));
           terminalPending = "";
         },
       };
@@ -1101,8 +1096,6 @@ export async function sh(
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
-const credentialVariants = new Map<string, boolean>();
-let sortedCredentialVariants: [string, boolean][] = [];
 export const registeredCredentials = (): readonly string[] => [...credentialValues];
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
@@ -1110,17 +1103,13 @@ export function registerCredential(name: string, value?: string): void {
     if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
       credentialValues.add(secret);
       for (const variant of new Set([secret, JSON.stringify(secret).slice(1, -1)]))
-        credentialVariants.set(variant, credentialVariants.get(variant) || secret.length >= 8);
-      sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
+        registerCredentialVariant(variant, secret.length >= 8);
     }
 }
 export const redactCredentials = (text: string): string =>
   activity("credentials.redact", () => redactText(text));
 function redactText(text: string): string {
-  // Substring matches require at least 8 characters to avoid redacting common short strings.
-  for (const [secret, substring] of sortedCredentialVariants)
-    if (substring || text === secret) text = text.split(secret).join("[redacted]");
-  return text;
+  return credentialMatcher().redact(text);
 }
 export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
 const redactData = <T>(value: T): T =>
