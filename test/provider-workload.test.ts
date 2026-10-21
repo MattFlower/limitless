@@ -1,5 +1,7 @@
 import { expect, setSystemTime, test } from "bun:test";
-import { computeProviderWorkload } from "../src/db/stats.ts";
+import { parseSince } from "../src/core/since.ts";
+import type { EvalRound, EvalTrial } from "../src/core/types.ts";
+import { computeProviderStatistics, computeProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { emptyUsage } from "../src/harness/types.ts";
 import type { ProviderDef } from "../src/router/catalog.ts";
@@ -344,6 +346,273 @@ test("a waiter cancelled in the same turn as its slot frees never holds it", asy
     expect(order).toEqual(["next"]);
     other();
     expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});
+
+const cutoff = Date.parse("2026-09-01T00:00:00Z");
+function invocation(
+  store: Store,
+  provider: string,
+  model: string,
+  role: string,
+  at: number,
+  duration: number | null,
+  status = "ok",
+) {
+  store.db.exec("PRAGMA foreign_keys = OFF");
+  store.db
+    .query(`INSERT INTO invocations
+    (run_id, role, harness, provider, model, model_id, status, started_at, finished_at,
+    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, cost_equiv_usd)
+    VALUES ('r', ?, 'fake', ?, ?, ?, ?, ?, ?, 10, 5, 3, 2, 0.25, 0.5)`)
+    .run(role, provider, model, model, status, at, duration === null ? null : at + duration);
+}
+
+test("historical production keeps stored identities, roles, tokens and finished medians", () => {
+  const store = new Store(":memory:");
+  try {
+    invocation(store, "retired", "m1", "triage", cutoff - 86_400_000, 100);
+    invocation(store, "retired", "m1", "triage", cutoff, 300, "error");
+    invocation(store, "retired", "m2", "review_shadow", cutoff + 1, 500);
+    invocation(store, "second", "m1", "implement", cutoff + 2, 200);
+    invocation(store, "second", "m1", "implement", cutoff + 3, -100, "error");
+    invocation(store, "second", "m1", "implement", cutoff + 4, null, "running");
+    const rows = computeProviderStatistics(store, undefined, cutoff + 30 * 86_400_000);
+    expect(rows.map((r) => r.provider)).toEqual(["retired", "second"]);
+    const first = rows[0]?.production;
+    expect(first?.totals).toEqual({
+      invocations: 3,
+      successfulShare: 2 / 3,
+      countingUnits: { invocation: 3, round: 0, trial: 0 },
+      tokensIn: 45,
+      inputTokens: 30,
+      tokensOut: 15,
+      cacheReadTokens: 9,
+      cacheWriteTokens: 6,
+      costUsd: 0.75,
+      costEquivUsd: 1.5,
+      wallTimeMs: 900,
+      p50WallTimeMs: 300,
+    });
+    expect(first?.models.map((r) => [r.provider, r.modelId, r.invocations, r.p50WallTimeMs])).toEqual([
+      ["retired", "m1", 2, 200],
+      ["retired", "m2", 1, 500],
+    ]);
+    expect(first?.roles.map((r) => [r.provider, r.modelId, r.role, r.successfulShare])).toEqual([
+      ["retired", "m2", "review_shadow", 1],
+      ["retired", "m1", "triage", 0.5],
+    ]);
+    expect(first?.days.map((r) => [r.day, r.provider, r.modelId, r.invocations])).toEqual([
+      [dayKey(cutoff - 86_400_000), "retired", "m1", 1],
+      [dayKey(cutoff), "retired", "m1", 1],
+      [dayKey(cutoff), "retired", "m2", 1],
+    ]);
+    expect(rows[1]?.production?.totals).toMatchObject({
+      invocations: 3,
+      successfulShare: 1 / 3,
+      wallTimeMs: 200,
+      p50WallTimeMs: 100,
+    });
+    expect(rows[0]?.today.invocations).toBe(0);
+    expect(rows.every((r) => r.eval?.totals.invocations === 0)).toBe(true);
+    const filtered = computeProviderStatistics(store, cutoff, cutoff + 30 * 86_400_000);
+    expect(filtered[0]?.production?.totals).toMatchObject({
+      invocations: 2,
+      wallTimeMs: 800,
+      p50WallTimeMs: 400,
+    });
+  } finally {
+    store.close();
+  }
+});
+
+function dayKey(at: number) {
+  const d = new Date(at);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function evalTrial(store: Store, patch: Partial<EvalTrial> = {}) {
+  const run = store.createEvalRun({ role: "implement", models: ["m"], k: 1, maxUsd: 10 }, []);
+  const trial: EvalTrial = {
+    evalRunId: run.id,
+    effort: null,
+    caseId: "case",
+    modelId: "legacy-model",
+    trial: 0,
+    cacheKey: "key",
+    harness: "fake",
+    status: "error",
+    output: null,
+    pass: false,
+    score: 0,
+    details: { provider: "legacy", invocationStatus: "ok", cacheReadTokens: 2, cacheWriteTokens: 1 },
+    tokensIn: 10,
+    tokensOut: 4,
+    costUsd: 0.5,
+    costEquivUsd: 1,
+    durationMs: 100,
+    createdAt: cutoff,
+    ...patch,
+  };
+  store.recordEvalTrial(trial);
+}
+
+test("evals count recorded rounds or trials once, with unknown cache splits and attribution explicit", () => {
+  const store = new Store(":memory:");
+  try {
+    evalTrial(store);
+    const round = {
+      round: 0,
+      modelId: "switched",
+      effort: "default",
+      status: "ok",
+      pass: false,
+      reason: null,
+      costUsd: 0.25,
+      costEquivUsd: 0.5,
+      tokensIn: 20,
+      tokensOut: 8,
+      durationMs: 50,
+    } satisfies EvalRound;
+    evalTrial(store, {
+      details: {
+        rounds: [
+          { ...round, provider: "alpha" },
+          { ...round, round: 1, provider: "beta", status: "timeout", durationMs: 150 },
+        ],
+      },
+      costUsd: 999,
+    });
+    evalTrial(store, {
+      details: {
+        cache: {
+          evalRunId: "old",
+          caseId: "case",
+          costUsd: 1,
+          costEquivUsd: 2,
+          tokensIn: 3,
+          tokensOut: 4,
+          durationMs: 5,
+        },
+      },
+    });
+    evalTrial(store, { details: { resumedFrom: "old" } });
+    evalTrial(store, { status: "queued" });
+    evalTrial(store, { modelId: "unattributed", details: {} });
+    evalTrial(store, { createdAt: cutoff - 1 });
+    const rows = computeProviderStatistics(store, cutoff, cutoff);
+    expect(rows.map((r) => r.provider)).toEqual(["alpha", "beta", "legacy", "(unknown)"]);
+    expect(rows.every((r) => r.production?.totals.invocations === 0)).toBe(true);
+    expect(rows[0]?.eval?.totals).toEqual({
+      invocations: 1,
+      successfulShare: 1,
+      countingUnits: { invocation: 0, round: 1, trial: 0 },
+      tokensIn: 20,
+      inputTokens: null,
+      tokensOut: 8,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      costUsd: 0.25,
+      costEquivUsd: 0.5,
+      wallTimeMs: 50,
+      p50WallTimeMs: 50,
+    });
+    expect(rows[1]?.eval?.totals).toMatchObject({
+      invocations: 1,
+      successfulShare: 0,
+      costUsd: 0.25,
+      wallTimeMs: 150,
+    });
+    expect(rows[2]?.eval?.totals).toMatchObject({
+      invocations: 1,
+      successfulShare: 1,
+      inputTokens: 7,
+      cacheReadTokens: 2,
+      cacheWriteTokens: 1,
+      costUsd: 0.5,
+      countingUnits: { invocation: 0, round: 0, trial: 1 },
+    });
+    expect(rows[3]?.eval?.models[0]).toMatchObject({
+      provider: null,
+      modelId: "unattributed",
+      inputTokens: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      successfulShare: 0,
+    });
+    expect(rows[1]?.eval?.roles[0]).toMatchObject({
+      provider: "beta",
+      modelId: "switched",
+      role: "implement",
+    });
+    expect(rows[1]?.eval?.days[0]?.day).toBe(dayKey(cutoff));
+    expect(computeProviderStatistics(store, cutoff + 1, cutoff)).toEqual([]);
+  } finally {
+    store.close();
+  }
+});
+
+test("empty selections, unfinished durations and ISO cutoffs are finite and inclusive", () => {
+  const store = new Store(":memory:");
+  try {
+    expect(computeProviderStatistics(store)).toEqual([]);
+    invocation(store, "p", "m", "spec", cutoff - 1, 100);
+    invocation(store, "p", "m", "spec", cutoff, null, "running");
+    invocation(store, "p", "m", "spec", cutoff + 1, null, "running");
+    const utc = computeProviderStatistics(store, parseSince("2026-09-01T00:00:00Z"), cutoff);
+    expect(utc).toEqual(computeProviderStatistics(store, parseSince("2026-09-01T02:00:00+02:00"), cutoff));
+    expect(utc[0]?.production?.totals).toMatchObject({
+      invocations: 2,
+      successfulShare: 0,
+      wallTimeMs: 0,
+      p50WallTimeMs: null,
+    });
+    expect(
+      computeProviderStatistics(store, parseSince("2030-01-01"), cutoff)[0]?.production?.totals.invocations,
+    ).toBe(0);
+  } finally {
+    store.close();
+  }
+});
+
+test.each([
+  "",
+  "yesterday",
+  "2026-02-29",
+  "2026-02-30T12:00:00Z",
+  "2026-04-31",
+  "2026-09-01T24:00:00Z",
+  "2026-09-01T12:00:00Z trailing",
+])("rejects invalid cutoff %j", (value) => {
+  expect(() => parseSince(value)).toThrow("invalid ISO-8601 timestamp");
+});
+
+test("partial eval round evidence does not fabricate missing measurements", () => {
+  const store = new Store(":memory:");
+  try {
+    evalTrial(store);
+    store.db.run("UPDATE eval_trials SET details_json = ?", [
+      JSON.stringify({
+        rounds: [{ provider: "partial", modelId: "m", status: "ok", costUsd: 0.75 }],
+      }),
+    ]);
+    const data = computeProviderStatistics(store, cutoff, cutoff)[0]?.eval;
+    expect(data?.totals).toMatchObject({
+      invocations: 1,
+      successfulShare: 1,
+      tokensIn: null,
+      inputTokens: null,
+      tokensOut: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      costUsd: 0.75,
+      costEquivUsd: null,
+      wallTimeMs: 0,
+      p50WallTimeMs: null,
+    });
+    expect(data?.models[0]).toMatchObject({ provider: "partial", modelId: "m" });
+    expect(JSON.stringify(data)).not.toContain("NaN");
   } finally {
     store.close();
   }

@@ -240,3 +240,61 @@ test("configured provider status and model APIs include metadata but never crede
     fixture.close();
   }
 });
+
+test("provider stats preserve chat/calendar totals while historical cutoffs affect only pipeline/eval work", async () => {
+  const f = await fixture();
+  try {
+    const store = f.factory.store;
+    store.db.exec("PRAGMA foreign_keys = OFF");
+    const at = Date.now() - 1000;
+    store.db
+      .query(`INSERT INTO invocations
+      (run_id, role, harness, provider, model, model_id, status, started_at, finished_at,
+       input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_equiv_usd)
+      VALUES ('r', 'spec', 'fake', 'retired', 'm', 'm', 'ok', ?, ?, 10, 2, 3, 5, 0.5)`)
+      .run(at, at + 100);
+    store.db
+      .query(`INSERT INTO chat_calls
+      (conversation_id, provider, model_id, result_json, cost_usd, started_at, duration_ms)
+      VALUES ('c', 'retired', 'm', ?, 0, ?, 200)`)
+      .run(JSON.stringify({ usage: { input: 4, output: 2 }, costEquivUsd: 0.25 }), at);
+    const route = createHttpRoutes(f.factory)["/api/stats/providers"] as Route;
+    const get = (since?: string) =>
+      route(
+        requestWithParams(
+          `http://localhost/api/stats/providers${since === undefined ? "" : `?since=${encodeURIComponent(since)}`}`,
+        ),
+        localServer,
+      );
+    const response = await get();
+    expect(response.status).toBe(200);
+    const rows = await response.json();
+    expect(rows).toMatchObject([
+      {
+        provider: "retired",
+        sevenDays: { invocations: 2, tokensIn: 19, tokensOut: 7, wallTimeMs: 300, costEquivUsd: 0.75 },
+        production: { totals: { invocations: 1, tokensIn: 15, inputTokens: 10 } },
+        eval: { totals: { invocations: 0 } },
+      },
+    ]);
+    const inclusive = await (await get(new Date(at).toISOString())).json();
+    expect(inclusive).toEqual(rows);
+    const future = await (await get("2100-01-01")).json();
+    expect(future[0].today).toEqual(rows[0].today);
+    expect(future[0].sevenDays).toEqual(rows[0].sevenDays);
+    expect(future[0].production.totals).toMatchObject({
+      invocations: 0,
+      successfulShare: 0,
+      p50WallTimeMs: null,
+    });
+    const offset = new Date(at).toISOString().replace("Z", "+00:00");
+    expect(await (await get(offset)).json()).toEqual(inclusive);
+    for (const value of ["", "yesterday", "2026-02-30", "2026-02-30T10:00:00Z"]) {
+      const invalid = await get(value);
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: expect.stringContaining("invalid ISO-8601") });
+    }
+  } finally {
+    await f.close();
+  }
+});

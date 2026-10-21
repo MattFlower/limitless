@@ -5,8 +5,9 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
+import { parseSince } from "../core/since.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
-import { computeProviderWorkload, computeStats } from "../db/stats.ts";
+import { computeProviderStatistics, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
@@ -750,7 +751,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }),
       DELETE: handle(() => json(factory.routing.setPrefer(null))),
     },
-    "/api/stats/providers": handle(() => json(computeProviderWorkload(store))),
+    "/api/stats/providers": handle((req) => {
+      const since = new URL(req.url).searchParams.get("since");
+      return json(computeProviderStatistics(store, since === null ? undefined : parseSince(since)));
+    }),
     "/api/providers/:id/fast": {
       POST: handle(async (req) => {
         const data = await body<{ on?: unknown } | null>(req);

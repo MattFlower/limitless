@@ -1,3 +1,4 @@
+import type { EvalTrial } from "../core/types.ts";
 import type { Store } from "./store.ts";
 
 export interface DayStats {
@@ -51,6 +52,8 @@ export interface ProviderWorkload {
   provider: string;
   today: WorkloadTotals;
   sevenDays: WorkloadTotals;
+  production?: HistoricalWorkload;
+  eval?: HistoricalWorkload;
 }
 
 /** Calendar days use the daemon's local timezone, including across DST changes. */
@@ -116,6 +119,188 @@ function addWorkload(
   total.tokensOut += row.tokens_out;
   total.wallTimeMs += row.wall_ms;
   total.costEquivUsd += row.cost_equiv_usd;
+}
+
+/** Null metrics mean the persisted record cannot supply that measurement; sums stay unknown. */
+export interface HistoricalTotals {
+  invocations: number;
+  successfulShare: number;
+  countingUnits: { invocation: number; round: number; trial: number };
+  tokensIn: number | null;
+  inputTokens: number | null;
+  tokensOut: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  costUsd: number | null;
+  costEquivUsd: number | null;
+  wallTimeMs: number;
+  p50WallTimeMs: number | null;
+}
+interface HistoricalRow extends HistoricalTotals {
+  provider: string | null;
+  modelId: string | null;
+  role?: string;
+  day?: string;
+}
+export interface HistoricalWorkload {
+  totals: HistoricalTotals;
+  models: HistoricalRow[];
+  roles: HistoricalRow[];
+  days: HistoricalRow[];
+}
+type WorkRecord = Omit<
+  HistoricalRow,
+  "invocations" | "successfulShare" | "countingUnits" | "p50WallTimeMs" | "wallTimeMs"
+> & {
+  status: string;
+  unit: keyof HistoricalTotals["countingUnits"];
+  duration: number | null;
+};
+
+function summarize(rows: WorkRecord[]): HistoricalTotals {
+  const sum = (
+    key:
+      | "tokensIn"
+      | "tokensOut"
+      | "costUsd"
+      | "costEquivUsd"
+      | "inputTokens"
+      | "cacheReadTokens"
+      | "cacheWriteTokens",
+  ) =>
+    rows.some((r) => r[key] == null || !Number.isFinite(r[key]))
+      ? null
+      : rows.reduce((n, r) => n + (r[key] ?? 0), 0);
+  const durations = rows
+    .flatMap((r) => (r.duration === null || !Number.isFinite(r.duration) ? [] : [Math.max(0, r.duration)]))
+    .sort((a, b) => a - b);
+  const middle = Math.floor(durations.length / 2);
+  return {
+    invocations: rows.length,
+    successfulShare: rows.length ? rows.filter((r) => r.status === "ok").length / rows.length : 0,
+    countingUnits: {
+      invocation: rows.filter((r) => r.unit === "invocation").length,
+      round: rows.filter((r) => r.unit === "round").length,
+      trial: rows.filter((r) => r.unit === "trial").length,
+    },
+    tokensIn: sum("tokensIn"),
+    inputTokens: sum("inputTokens"),
+    tokensOut: sum("tokensOut"),
+    cacheReadTokens: sum("cacheReadTokens"),
+    cacheWriteTokens: sum("cacheWriteTokens"),
+    costUsd: sum("costUsd"),
+    costEquivUsd: sum("costEquivUsd"),
+    wallTimeMs: durations.reduce((n, ms) => n + ms, 0),
+    p50WallTimeMs: durations.length
+      ? ((durations[middle] ?? 0) + (durations[Math.ceil(durations.length / 2) - 1] ?? 0)) / 2
+      : null,
+  };
+}
+function historical(rows: WorkRecord[]): HistoricalWorkload {
+  const groups = (dimension?: "role" | "day"): HistoricalRow[] => {
+    const grouped = new Map<string, WorkRecord[]>();
+    for (const row of rows) {
+      const key = JSON.stringify([dimension ? row[dimension] : null, row.provider, row.modelId]);
+      const values = grouped.get(key) ?? [];
+      values.push(row);
+      grouped.set(key, values);
+    }
+    return [...grouped]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([, values]) => {
+        const row = values[0];
+        if (!row) throw new Error("Empty workload group");
+        return {
+          provider: row.provider,
+          modelId: row.modelId,
+          ...(dimension ? { [dimension]: row[dimension] } : {}),
+          ...summarize(values),
+        };
+      });
+  };
+  return { totals: summarize(rows), models: groups(), roles: groups("role"), days: groups("day") };
+}
+
+function workloadDay(at: number): string {
+  const date = new Date(at);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** Historical sections exclude chat. Eval days use trial creation, even for recorded rounds. */
+export function computeProviderStatistics(
+  store: Store,
+  since = -8_640_000_000_000_000,
+  now = Date.now(),
+): ProviderWorkload[] {
+  const production = store.db
+    .query(`SELECT provider, model_id AS modelId, role, status,
+    started_at AS startedAt,
+    input_tokens + cache_read_tokens + cache_write_tokens AS tokensIn, input_tokens AS inputTokens,
+    output_tokens AS tokensOut, cache_read_tokens AS cacheReadTokens, cache_write_tokens AS cacheWriteTokens,
+    cost_usd AS costUsd, cost_equiv_usd AS costEquivUsd, finished_at - started_at AS duration,
+    'invocation' AS unit FROM invocations WHERE started_at >= ?`)
+    .all(since) as (WorkRecord & { startedAt: number })[];
+  for (const row of production) row.day = workloadDay(row.startedAt);
+  const trials = store.db
+    .query(
+      `SELECT t.*, r.role FROM eval_trials t JOIN eval_runs r ON r.id = t.eval_run_id WHERE t.created_at >= ? AND t.status != 'queued'`,
+    )
+    .all(since) as (Record<string, string | number> & { role: string; details_json: string })[];
+  const evaluation: WorkRecord[] = [];
+  for (const t of trials) {
+    const details = JSON.parse(t.details_json) as EvalTrial["details"];
+    if (details.cache != null || details.resumedFrom != null) continue;
+    const rounds = details.rounds;
+    const records = rounds?.length
+      ? rounds
+      : [
+          {
+            provider: details.provider,
+            modelId: String(t.model_id),
+            status: details.invocationStatus ?? String(t.status),
+            tokensIn: Number(t.tokens_in),
+            tokensOut: Number(t.tokens_out),
+            costUsd: Number(t.cost_usd),
+            costEquivUsd: Number(t.cost_equiv_usd),
+            durationMs: Number(t.duration_ms),
+          },
+        ];
+    for (const r of records) {
+      const read = rounds?.length ? null : (details.cacheReadTokens ?? null);
+      const write = rounds?.length ? null : (details.cacheWriteTokens ?? null);
+      evaluation.push({
+        provider: r.provider ?? null,
+        modelId: r.modelId ?? null,
+        role: t.role,
+        day: workloadDay(Number(t.created_at)),
+        status: r.status,
+        unit: rounds?.length ? "round" : "trial",
+        tokensIn: r.tokensIn ?? null,
+        tokensOut: r.tokensOut ?? null,
+        inputTokens: read === null || write === null || r.tokensIn == null ? null : r.tokensIn - read - write,
+        cacheReadTokens: read,
+        cacheWriteTokens: write,
+        costUsd: r.costUsd ?? null,
+        costEquivUsd: r.costEquivUsd ?? null,
+        duration: !rounds?.length && t.status === "running" ? null : (r.durationMs ?? null),
+      });
+    }
+  }
+  const legacy = computeProviderWorkload(store, now);
+  const providers = new Set([
+    ...legacy.map((r) => r.provider),
+    ...production.map((r) => r.provider),
+    ...evaluation.map((r) => r.provider),
+  ]);
+  return [...providers].sort().map((provider) => ({
+    ...(legacy.find((r) => r.provider === provider) ?? {
+      provider: provider ?? "(unknown)",
+      today: emptyWorkload(),
+      sevenDays: emptyWorkload(),
+    }),
+    production: historical(production.filter((r) => r.provider === provider)),
+    eval: historical(evaluation.filter((r) => r.provider === provider)),
+  }));
 }
 
 export function computeStats(store: Store, days = 14): Stats {
