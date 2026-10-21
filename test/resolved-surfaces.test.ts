@@ -93,7 +93,7 @@ test("attention follows active landing by PR and returns on blockage despite its
       headBranch: "limitless/work",
       approvedSha: head,
     });
-    for (const state of ["queued", "checking", "waiting_ci", "merging"] as const) {
+    for (const state of ["queued", "checking", "waiting_approval", "waiting_ci", "merging"] as const) {
       store.updateLandEntry(entry.id, { state });
       const stats = computeStats(store);
       expect(stats.needsYouRunIds).not.toContain(run.id);
