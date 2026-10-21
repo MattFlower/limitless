@@ -1,5 +1,7 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -1033,6 +1035,120 @@ test("failed checkpoint leaves durable state usable after SQLite reopen", async 
   const db = new Store(f.cfg.paths.db);
   try {
     expect(db.getRunState<RunState>(r.id)).toEqual(before);
+  } finally {
+    db.close();
+  }
+});
+
+test.each(["ENOSPC", "EACCES"])("filesystem write failure: %s", async (code) => {
+  let armed = false;
+  const f = factory({
+    "stage:prepare:before": {
+      action: "continue",
+      onHit: () => {
+        armed = true;
+      },
+    },
+  });
+  const run = await f.createRun({ repo: source, prompt: "Change" });
+  const sidecar = `${join(f.cfg.paths.work, run.id)}.git-paths`;
+  const write = fs.writeFileSync;
+  let hits = 0;
+  // Fail the actual worktree metadata writer, rather than the surrounding stage.
+  const writes = spyOn(fs, "writeFileSync").mockImplementation((path, ...args) => {
+    if (armed && String(path) === sidecar) {
+      hits++;
+      throw Object.assign(new Error(`${code}: write worktree Git paths '${path}'`), {
+        code,
+        syscall: "write",
+        path,
+      });
+    }
+    return write(path, ...args);
+  });
+  try {
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("failed");
+  } finally {
+    writes.mockRestore();
+  }
+  expect(hits).toBe(1);
+  expect(existsSync(sidecar)).toBe(false);
+  const db = new Store(f.cfg.paths.db);
+  try {
+    const persisted = db.getRun(run.id);
+    expect(persisted?.status).toBe("failed");
+    expect(persisted?.finishedAt).toBeNumber();
+    expect(persisted?.error).toContain(code);
+    expect(persisted?.error).toContain("write worktree Git paths");
+    expect(db.getRunState<RunState>(run.id)?.phase).toBe("prepare");
+    const stages = db.listStages(run.id);
+    expect(stages).toHaveLength(1);
+    expect(stages[0]).toMatchObject({ name: "prepare", status: "failed" });
+    expect(stages[0]?.summary).toContain(code);
+    expect(stages[0]?.finishedAt).toBeNumber();
+    expect(db.listInvocations(run.id)).toEqual([]);
+    expect(db.db.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+  } finally {
+    db.close();
+  }
+});
+
+test("SQLite busy timeout aborts a state save without a half-written checkpoint", async () => {
+  let before: RunState | null = null;
+  let afterFailure: RunState | null = null;
+  let busy: unknown;
+  let hits = 0;
+  const f = factory({
+    "store:save": {
+      action: "continue",
+      when: (context) => context.stage === "triage",
+      onHit: ({ runId }) => {
+        hits++;
+        before = f.store.getRunState<RunState>(runId);
+        blocker.exec("BEGIN IMMEDIATE");
+      },
+    },
+  });
+  const run = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  f.store.db.exec("PRAGMA busy_timeout = 10");
+  const blocker = new Database(f.cfg.paths.db);
+  const save = f.store.setRunState.bind(f.store);
+  const saves = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+    if (!blocker.inTransaction) return save(id, state);
+    try {
+      // This is the real Store UPDATE on a separate connection's locked database.
+      save(id, state);
+    } catch (error) {
+      busy = error;
+      afterFailure = f.store.getRunState<RunState>(id);
+      throw error;
+    } finally {
+      // Let stage/run failure bookkeeping persist after the failed save.
+      blocker.exec("ROLLBACK");
+    }
+  });
+  try {
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("failed");
+  } finally {
+    saves.mockRestore();
+    blocker.close();
+  }
+  expect(hits).toBe(1);
+  expect(busy).toMatchObject({ code: "SQLITE_BUSY", errno: 5 });
+  expect(before).toMatchObject({ phase: "triage", round: 0 });
+  expect(afterFailure).toEqual(before);
+  const db = new Store(f.cfg.paths.db);
+  try {
+    expect(db.getRunState<RunState>(run.id)).toEqual(before);
+    expect(db.getRun(run.id)).toMatchObject({ status: "failed", error: "database is locked" });
+    expect(db.listStages(run.id).map((s) => [s.name, s.status])).toEqual([
+      ["prepare", "succeeded"],
+      ["triage", "failed"],
+    ]);
+    expect(db.listStages(run.id).at(-1)?.summary).toContain("database is locked");
+    expect(db.listStages(run.id).every((s) => s.finishedAt !== null)).toBe(true);
+    expect(db.listInvocations(run.id).map((i) => [i.role, i.status])).toEqual([["triage", "ok"]]);
+    expect(db.db.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
   } finally {
     db.close();
   }
