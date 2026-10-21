@@ -131,6 +131,7 @@ export interface Run {
   repoId: string;
   repoSlug: string;
   title: string;
+  titleProvenance?: "explicit" | "defaulted" | null;
   prompt: string;
   source: RunSource;
   githubWebhookVerified: boolean;

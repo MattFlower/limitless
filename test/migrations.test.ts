@@ -247,7 +247,7 @@ test("pre-diagnostics runs open and previous-release writes survive the additive
   });
 });
 
-test("model chains upgrade legacy runs, persist on reopen and preserve prior-schema reads and writes", () => {
+test("model chains and title provenance persist across upgrades, reopening and prior-release writes", () => {
   temporary((_directory, path) => {
     legacyDatabase(path);
     const legacy = new Database(path);
@@ -261,21 +261,52 @@ test("model chains upgrade legacy runs, persist on reopen and preserve prior-sch
     const repo = store.getRepo("repo");
     if (!repo) throw new Error("missing repo");
     const models = { implement: ["codex/sol@high", "claude/opus"], review: ["claude/opus|codex/sol"] };
-    const run = store.createRun(repo, { repo: repo.slug, prompt: "experiment", models });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "experiment", title: "Explicit", models });
+    const defaulted = store.createRun(repo, { repo: repo.slug, prompt: "Defaulted" });
+    expect(defaulted.title).toBe("Defaulted");
     store.close();
     // Prior-release SQL names only its known columns, so the default handles its inserts.
     const previous = new Database(path);
     expect(previous.query("SELECT title, prompt FROM runs WHERE id = ?").get(run.id)).toEqual({
-      title: "experiment",
+      title: "Explicit",
       prompt: "experiment",
     });
-    previous.exec(
-      "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES ('rollback', 'repo', 'rollback', 'rollback', 'cli', 'queued', 2)",
-    );
+    previous
+      .query(
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "rollback",
+        "repo",
+        "rollback",
+        "rollback",
+        "cli",
+        null,
+        null,
+        "auto",
+        "queued",
+        0,
+        null,
+        null,
+        0,
+        2,
+        "[]",
+        null,
+        null,
+        0,
+        "[]",
+        null,
+        "{}",
+      );
     previous.close();
     store = new Store(path);
     expect(store.getRun(run.id)?.models).toEqual(models);
     expect(store.getRun("rollback")?.models).toEqual({});
+    expect(store.getRun("old")).toMatchObject({ title: "old", titleProvenance: null });
+    expect(store.getRun(run.id)).toMatchObject({ title: "Explicit", titleProvenance: "explicit" });
+    expect(store.getRun(defaulted.id)).toMatchObject({ title: "Defaulted", titleProvenance: "defaulted" });
+    expect(store.getRun("rollback")).toMatchObject({ title: "rollback", titleProvenance: null });
     store.close();
   });
 });
