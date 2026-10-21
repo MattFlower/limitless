@@ -642,6 +642,78 @@ test("runner without redaction retains raw callbacks, empty-line framing, tails 
   expect(encoded.stdout).toBe("ÿ");
 });
 
+test.each(["\u001b[0m", "\u001b7", "\u0018", "\u001a"])(
+  "runner recovers malformed terminal strings on %j at every split",
+  async (abort) => {
+    const secret = "synthetic-terminal-recovery-credential";
+    registerCredential("TERMINAL_RECOVERY_TEST_TOKEN", secret);
+    for (const control of [
+      "\u001b]",
+      "\u001bP",
+      "\u001bX",
+      "\u001b^",
+      "\u001b_",
+      "\u009d",
+      "\u0090",
+      "\u0098",
+      "\u009e",
+      "\u009f",
+    ]) {
+      const text = `err: ${control}0;title${abort} visible\n${secret}\nmore\n`;
+      for (const stream of ["stdout", "stderr"] as const) {
+        for (let offset = 0; offset <= text.length; offset++) {
+          const lines: string[] = [],
+            raw: string[] = [];
+          const result = await withChunks(
+            [
+              { stream, text: text.slice(0, offset) },
+              { stream, text: text.slice(offset) },
+            ],
+            () =>
+              runProcess({
+                ...options(),
+                redactOutput: true,
+                onRawChunk: (chunk) => raw.push(chunk),
+                onStdoutLine: (line) => lines.push(line),
+                onStderrLine: (line) => lines.push(line),
+              }),
+          );
+          expect(result[stream]).toBe("err:  visible\n[redacted]\nmore\n");
+          expect(lines).toEqual(["err:  visible", "[redacted]", "more"]);
+          expect(raw.join("")).toBe(text);
+        }
+      }
+    }
+  },
+);
+
+test("runner releases an unterminated terminal sequence after an escape instead of holding the stream", async () => {
+  for (const stream of ["stdout", "stderr"] as const) {
+    const lines: string[] = [],
+      seenAtChunk: number[] = [];
+    // Exceed both the former terminal hold and any registered credential carry.
+    const body = "x".repeat(200_000);
+    const result = await withChunks(
+      [
+        { stream, text: `err: \u001b]${body}\u001b` },
+        { stream, text: `[0m visible\n${body}\n` },
+        { stream, text: "after\n" },
+      ],
+      () =>
+        runProcess({
+          ...options(),
+          redactOutput: true,
+          onRawChunk: () => seenAtChunk.push(lines.length),
+          onStdoutLine: (line) => lines.push(line),
+          onStderrLine: (line) => lines.push(line),
+        }),
+    );
+    expect(seenAtChunk[2]).toBeGreaterThanOrEqual(1);
+    expect(lines).toEqual(["err:  visible", body, "after"]);
+    expect(result[stream]).toBe(`${body}\nafter\n`.slice(-64_000));
+  }
+});
+
 test.each(["\u001b]", "\u001bP"])(
   "long terminal payload %j is discarded with state preserved through ST and EOF",
   (control) => {

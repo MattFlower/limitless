@@ -722,7 +722,6 @@ function credentialMatcher(variants: readonly [string, boolean][]) {
 /** Incremental ECMA-48 recognition. String payload is discarded, never buffered. */
 function terminalParser() {
   let state = "";
-  let escaped = false;
   const introducers: Record<string, string> = {
     "[": "csi",
     "]": "osc",
@@ -738,14 +737,18 @@ function terminalParser() {
     "\u009f": "string",
   };
   return (char: string) => {
-    if (state === "osc" || state === "string") {
-      if (char === "\u009c" || (escaped && char === "\\") || (state === "osc" && char === "\u0007"))
-        state = "";
-      escaped = char === "\u001b";
+    // ESC starts a new sequence even inside a command string; CAN/SUB cancel either kind.
+    // This also recognizes ST across chunks without swallowing later diagnostics on malformed input.
+    if (char === "\u0018" || char === "\u001a") {
+      state = "";
       return false;
     }
     if (char === "\u001b") {
       state = "esc";
+      return false;
+    }
+    if (state === "osc" || state === "string") {
+      if (char === "\u009c" || (state === "osc" && char === "\u0007")) state = "";
       return false;
     }
     if (introducers[char] && (state === "esc" || char >= "\u0080")) {
