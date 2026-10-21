@@ -553,6 +553,55 @@ test("evals count recorded rounds or trials once, with unknown cache splits and 
   }
 });
 
+test("evals exclude skips and preparation failures without execution evidence", () => {
+  const store = new Store(":memory:");
+  try {
+    evalTrial(store);
+    const unexecuted = { tokensIn: 0, tokensOut: 0, costUsd: 0, costEquivUsd: 0, durationMs: 0 };
+    evalTrial(store, {
+      ...unexecuted,
+      status: "skipped",
+      details: { provider: "legacy", reason: "eval budget exhausted" },
+    });
+    evalTrial(store, {
+      ...unexecuted,
+      durationMs: 25,
+      details: { provider: "legacy", preparationFailed: true },
+    });
+    evalTrial(store, { ...unexecuted, status: "skipped", details: {} });
+    const rows = computeProviderStatistics(store, cutoff, cutoff);
+    expect(rows.map((r) => r.provider)).toEqual(["legacy"]);
+    expect(rows[0]?.eval?.totals).toEqual({
+      invocations: 1,
+      successfulShare: 1,
+      countingUnits: { invocation: 0, round: 0, trial: 1 },
+      tokensIn: 10,
+      inputTokens: 7,
+      tokensOut: 4,
+      cacheReadTokens: 2,
+      cacheWriteTokens: 1,
+      costUsd: 0.5,
+      costEquivUsd: 1,
+      wallTimeMs: 100,
+      p50WallTimeMs: 100,
+    });
+    // A skipped trial can still have attempted a call, even with zero usage.
+    evalTrial(store, {
+      ...unexecuted,
+      status: "skipped",
+      details: { provider: "legacy", invocationStatus: "ok", cacheReadTokens: 0, cacheWriteTokens: 0 },
+    });
+    expect(computeProviderStatistics(store, cutoff, cutoff)[0]?.eval?.totals).toMatchObject({
+      invocations: 2,
+      successfulShare: 1,
+      wallTimeMs: 100,
+      p50WallTimeMs: 50,
+    });
+  } finally {
+    store.close();
+  }
+});
+
 test("empty selections, unfinished durations and ISO cutoffs are finite and inclusive", () => {
   const store = new Store(":memory:");
   try {

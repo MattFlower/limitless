@@ -251,6 +251,17 @@ export function computeProviderStatistics(
     const details = JSON.parse(t.details_json) as EvalTrial["details"];
     if (details.cache != null || details.resumedFrom != null) continue;
     const rounds = details.rounds;
+    // Skips and preparation failures can happen before any provider call.
+    if (
+      !rounds?.length &&
+      details.invocationStatus == null &&
+      (t.status === "skipped" || details.preparationFailed) &&
+      t.tokens_in === 0 &&
+      t.tokens_out === 0 &&
+      t.cost_usd === 0 &&
+      t.cost_equiv_usd === 0
+    )
+      continue;
     const records = rounds?.length
       ? rounds
       : [
