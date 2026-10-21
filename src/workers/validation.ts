@@ -15,13 +15,14 @@ export function credentialBearing(req: GateRequest) {
     ...req.gates.checks.flatMap((c) => [c.name, c.run]),
     ...(req.checks ?? []),
     req.gates.retryFiles ?? "",
-  ].some((input) => {
-    const normalized = stripVTControlCharacters(input);
-    return (
-      registeredCredentials().some((secret) => normalized.includes(secret)) ||
-      redactCredentials(normalized) !== normalized
-    );
-  });
+  ].some(credentialInText);
+}
+export function credentialInText(input: string) {
+  const normalized = stripVTControlCharacters(input);
+  return (
+    registeredCredentials().some((secret) => normalized.includes(secret)) ||
+    redactCredentials(normalized) !== normalized
+  );
 }
 
 /** Setup/check timeouts plus five minutes for transfer and one minute for posting/slot waits. */

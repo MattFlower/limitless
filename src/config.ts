@@ -62,7 +62,7 @@ export interface Config {
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
   baselineCache: boolean;
   gateExecutor: "local" | "lan";
-  workers: { listen?: string; repos: string[] };
+  workers: { listen?: string; repos: string[]; agentSlots: number };
   /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
   baselineEnv: string[];
   maxRounds: number; // implement ⇄ feedback rounds before escalation
@@ -380,7 +380,9 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   const workers = raw.workers ?? {};
   if (!workers || typeof workers !== "object" || Array.isArray(workers))
     throw new Error("workers must be a table");
-  const { listen, repos: workerRepos = [] } = workers as Record<string, unknown>;
+  const { listen, repos: workerRepos = [], agent_slots: agentSlots = 2 } = workers as Record<string, unknown>;
+  if (typeof agentSlots !== "number" || !Number.isSafeInteger(agentSlots) || agentSlots <= 0)
+    throw new Error("workers.agent_slots must be a positive integer");
   if (listen !== undefined) {
     const match = typeof listen === "string" ? /^(\[[0-9a-fA-F:]+\]|[^:\s/]+):(\d+)$/.exec(listen) : null;
     if (
@@ -463,7 +465,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
     gateExecutor: gates.executor === "lan" ? "lan" : "local",
-    workers: { listen: listen as string | undefined, repos: workerRepos },
+    workers: { listen: listen as string | undefined, repos: workerRepos, agentSlots },
     baselineEnv,
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
