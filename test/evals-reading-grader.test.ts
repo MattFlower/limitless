@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { gradeVerify } from "../src/evals/graders/verify.ts";
+import { gradeCase } from "../src/evals/prepare.ts";
+import { blockingReviewFindings, reviewVerdict } from "../src/pipeline/review.ts";
 import { type Review, ReviewSchema, StoredReviewSchema, type Verify } from "../src/pipeline/schemas.ts";
 import { adversarialReviewFixtures, graderReports } from "./data/evals-review-adversarial.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
@@ -342,4 +344,40 @@ test("verify truth table treats absent, unclear and duplicate IDs as inconclusiv
         })),
       }).pass,
     ).toBe(true);
+});
+
+test("checklist claims neither create findings nor change recall, blocking or verdicts", () => {
+  for (const severity of ["major", "minor"] as const) {
+    for (const findings of [reviewOutput(10, severity).findings, []]) {
+      const original = {
+        ...reviewOutput(),
+        summary: "Reviewed changed paths and boundary inputs in the diff.",
+        findings,
+      };
+      for (const item of [reviewCase, { ...reviewCase, kind: "clean" as const }]) {
+        const baseline = gradeCase(item, original);
+        for (const checklist of [
+          undefined,
+          [],
+          [
+            {
+              item: "defect-1",
+              applies: "all hunks block",
+              checked: "reproduced with bun test",
+              finding: "invented",
+            },
+          ],
+          [{ item: "defect-1", applies: "non-applicable", checked: "none", finding: null }],
+        ]) {
+          for (const verdict of ["approve", "request_changes"] as const) {
+            const output = { ...original, verdict, checklist };
+            const parsed = StoredReviewSchema.parse(output);
+            expect(gradeCase(item, output)).toEqual(baseline);
+            expect(blockingReviewFindings(parsed)).toEqual(blockingReviewFindings(original));
+            expect(reviewVerdict(parsed)).toBe(reviewVerdict(original));
+          }
+        }
+      }
+    }
+  }
 });
