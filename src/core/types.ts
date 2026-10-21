@@ -489,6 +489,9 @@ export interface LandEntry {
   /** The approved head: only it, or a base merge of it, may land. */
   approvedSha: string;
   state: LandState;
+  /** Compatibility wire flag: approval waits use state queued in HTTP responses. */
+  waitingApproval?: boolean;
+  approvalWaitStartedAt?: number;
   /** The commit the queue pushed (the merge commit, or the approved one when it needed no merge). */
   pushedSha: string | null;
   /** Failed workflow attempts for the single durable CI rerun. */

@@ -3740,19 +3740,26 @@ function approvalPolicy(): ReadonlySet<string> {
   return loadConfig({ ...paths, readOnly: true }).landRequiresApproval;
 }
 
-function reviewObservation(head: string, state = "APPROVED", login = "other", commit = head) {
-  const node = github.nodes.get(`PR_${SLUG}_1`);
+function reviewObservation(head: string, state = "APPROVED", login = "other", commit = head, n = 1) {
+  const node = github.nodes.get(`PR_${SLUG}_${n}`);
   if (!node) throw new Error("missing test PR");
   node.headRefOid = head;
-  node.latestReviews.nodes = [{ state, author: { login }, commit: { oid: commit } }];
+  node.latestReviews.nodes = [
+    {
+      state,
+      author: { login, __typename: "User" },
+      authorCanPushToRepository: true,
+      commit: { oid: commit },
+    },
+  ];
   const snapshot = normalizePr(node);
   store.saveGithubPr({
-    url: url(1),
+    url: url(n),
     repo: SLUG,
-    runId: runs.get(1)?.id ?? null,
+    runId: runs.get(n)?.id ?? null,
     delivered: 1,
     nodeId: node.id,
-    data: JSON.stringify(snapshot),
+    data: JSON.stringify({ ...snapshot, observedAt: clock.now() }),
   });
 }
 
@@ -3809,8 +3816,18 @@ test.each([false, true])(
       expect(ghCalls("pr merge")).toEqual([]);
       // Factory-side approval is present, but stale and self GitHub reviews must still wait.
       node.latestReviews.nodes = [
-        { state: "APPROVED", author: { login: "other" }, commit: { oid: "a".repeat(40) } },
-        { state: "APPROVED", author: { login: "FaCtOrY" }, commit: { oid: head } },
+        {
+          state: "APPROVED",
+          author: { login: "other", __typename: "User" },
+          authorCanPushToRepository: true,
+          commit: { oid: "a".repeat(40) },
+        },
+        {
+          state: "APPROVED",
+          author: { login: "FaCtOrY", __typename: "User" },
+          authorCanPushToRepository: true,
+          commit: { oid: head },
+        },
       ];
       for (let i = 0; i < 2; i++) {
         await clock.advance(15000);
@@ -3824,7 +3841,14 @@ test.each([false, true])(
         state: "waiting_approval",
         reason: `Another GitHub account must approve ${head}`,
       });
-      node.latestReviews.nodes = [{ state: "APPROVED", author: { login: "other" }, commit: { oid: head } }];
+      node.latestReviews.nodes = [
+        {
+          state: "APPROVED",
+          author: { login: "other", __typename: "User" },
+          authorCanPushToRepository: true,
+          commit: { oid: head },
+        },
+      ];
       await clock.advance(15000);
       await settle();
       expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: head });
@@ -3897,7 +3921,8 @@ test.each([false, true])(
       headBranch: "two",
       approvedSha: head,
     });
-    expect(store.claimLandEntry(SLUG, 30000, "other-worker", clock.now())).toBeNull();
+    expect(store.claimLandEntry(SLUG, 30000, "other-worker", clock.now())?.id).toBe(next.id);
+    store.releaseLandClaims("other-worker");
     await q.stop();
     store.close();
     store = new Store(paths.db);
@@ -3908,19 +3933,24 @@ test.each([false, true])(
       requested = true;
       return identity.promise;
     });
+    // Keep the second entry out of this race; it was independently claimable while entry 1 waited.
+    store.updateLandEntry(next.id, { state: "cancelled" });
     const resumed = queue({ requiresApproval });
     await waitFor(() => requested);
-    expect(store.getLandEntry(next.id)?.state).toBe("queued");
-    expect(resumed.cancel(next.id)).toBe(true);
+    expect(store.getLandEntry(next.id)?.state).toBe("cancelled");
     if (steal) {
-      expect(store.claimLandEntry(SLUG, 30000, "new-owner", clock.now() + 30001)?.id).toBe(entry.id);
+      store.db
+        .query(`INSERT INTO land_entries
+        (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, created_at, updated_at)
+        VALUES ('', ?, ?, 'main', 'one', ?, 'queued', 1, 1)`)
+        .run(SLUG, url(1), head);
     } else expect(resumed.cancel(entry.id)).toBe(true);
     reviewObservation(head);
     identity.resolve(respond(200, { login: "factory" }));
     await settleIdle();
     await resumed.stop();
-    expect(store.getLandEntry(entry.id)?.state).toBe(steal ? "waiting_approval" : "cancelled");
-    if (steal) expect(store.ownsLandClaim(entry.id, "new-owner")).toBe(true);
+    expect(store.getLandEntry(entry.id)?.state).toBe(steal ? "blocked" : "cancelled");
+    if (steal) expect(store.getLandEntry(entry.id)?.reason).toContain("superseded");
     expect(ghCalls("pr merge")).toEqual([]);
     expect(gateLog()).toEqual([]);
     expect(
@@ -3941,6 +3971,7 @@ test("unknown factory identity cannot release an otherwise qualifying approval",
   expect(store.getLandEntry(entry.id)?.state).toBe("waiting_approval");
   expect(gateLog()).toEqual([]);
   github.responses.set("user", () => respond(200, { login: "factory" }));
+  await clock.advance(1);
   reviewObservation(head);
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
@@ -3949,14 +3980,18 @@ test("unknown factory identity cannot release an otherwise qualifying approval",
 test("removing operator policy releases a persisted approval wait", async () => {
   const head = await pushBranch("one", "one.txt", "one\n");
   const pr = delivered(1, "one");
+  observe(1, head);
   approve(1, head);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
   const q = queue({ requiresApproval: approvalPolicy() });
   const entry = await q.request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
   await q.stop();
+  const before = github.calls.length;
   queue({ requiresApproval: new Set(["other/repo"]) });
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect(github.calls.slice(before).filter((c) => c.path === "user" || c.path === "graphql")).toEqual([]);
 });
 
 test("a dismissal during identity lookup cannot release an old approval observation", async () => {
@@ -3978,7 +4013,210 @@ test("a dismissal during identity lookup cannot release an old approval observat
   expect(store.getLandEntry(entry.id)?.state).toBe("waiting_approval");
   expect(gateLog()).toEqual([]);
   expect(ghCalls("pr merge")).toEqual([]);
+  await clock.advance(1);
   reviewObservation(head);
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+});
+
+const approvalCiClient: LandPrClient = async (url, signal) => {
+  const view = await getGitHubPr(url, signal);
+  return view ? { ...view, ci: ci()?.ci ?? "PENDING" } : null;
+};
+
+test("parked PR leaves the worker free for approved PRs, then rejoins and lands", async () => {
+  const head1 = await pushBranch("one", "one.txt", "one\n");
+  const first = delivered(1, "one");
+  observe(1, head1);
+  approve(1, head1);
+  const head2 = await pushBranch("two", "two.txt", "two\n", 2);
+  const second = delivered(2, "two");
+  approve(2, head2);
+  reviewObservation(head2, "APPROVED", "other", head2, 2);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  const q = queue({ requiresApproval: approvalPolicy() });
+  const e1 = await q.request({ target: first.run.id });
+  await waitFor(() => store.getLandEntry(e1.id)?.state === "waiting_approval");
+  const e2 = await q.request({ target: second.run.id });
+  await waitFor(() => store.getLandEntry(e2.id)?.state === "landed");
+  expect(store.getLandEntry(e1.id)?.state).toBe("waiting_approval");
+  await clock.advance(1);
+  reviewObservation(head1);
+  await settle();
+  expect(store.getLandEntry(e1.id)?.state).toBe("landed");
+  expect(ghCalls("pr merge").map((line) => line.includes(url(2)))).toEqual([true, false]);
+});
+
+test.each(["DISMISSED", "CHANGES_REQUESTED"])(
+  "pre-merge %s parks pushed work and emits a new wait episode",
+  async (state) => {
+    const head = await pushBranch("one", "one.txt", "one\n");
+    const pr = delivered(1, "one");
+    observe(1, head);
+    approve(1, head);
+    await advanceBase();
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    ci = () => null;
+    const q = queue({ requiresApproval: approvalPolicy(), polling: false, client: approvalCiClient });
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
+    reviewObservation(head);
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+    const pushed = store.getLandEntry(entry.id)?.pushedSha;
+    if (!pushed) throw new Error("missing pushed head");
+    expect(pushed).not.toBe(head);
+    reviewObservation(pushed, state);
+    ci = () => ({ ci: "SUCCESS" });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
+    expect(store.getLandEntry(entry.id)?.pushedSha).toBe(pushed);
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(
+      store.readFeed({ limit: 100 }).items.filter((i) => i.kind === "land.waiting_approval"),
+    ).toHaveLength(2);
+    reviewObservation(pushed);
+    await settle();
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(gateLog()).toEqual(["start", "end"]);
+  },
+);
+
+test("enabling policy for an in-flight pushed entry requires approval before merging", async () => {
+  const head = await pushBranch("one", "one.txt", "one\n");
+  const pr = delivered(1, "one");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const original = queue({ polling: false, client: approvalCiClient });
+  const entry = await original.request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  expect(github.calls.filter((c) => c.path === "user")).toEqual([]);
+  await original.stop();
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  ci = () => ({ ci: "SUCCESS" });
+  queue({ requiresApproval: approvalPolicy(), polling: false, client: approvalCiClient });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
+  expect(github.calls.some((c) => c.path === "user")).toBe(true);
+  expect(ghCalls("pr merge")).toEqual([]);
+  reviewObservation(head);
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+});
+
+test.each([
+  [true, 200],
+  [true, 502],
+  [true, 429],
+  [false, 200],
+] as const)(
+  "failed review observation never releases saved approval (polling=%s HTTP=%s)",
+  async (polling, status) => {
+    const head = await pushBranch("one", "one.txt", "one\n");
+    const pr = delivered(1, "one");
+    observe(1, head);
+    approve(1, head);
+    reviewObservation(head);
+    const saved = store.githubPrData(url(1));
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    github.deny.set(SLUG, () =>
+      respond(status, { errors: [{ message: status === 429 ? "rate limit" : "unavailable" }] }),
+    );
+    const q = queue({ requiresApproval: approvalPolicy(), polling });
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
+    const stop = polling
+      ? startGitHubPoller(store, {
+          client: github.client,
+          gh: runGh,
+          ciReruns: false,
+          clock: {
+            now: clock.now,
+            set: clock.timer.set as unknown as typeof setTimeout,
+            clear: clock.timer.clear as unknown as typeof clearTimeout,
+          },
+        })
+      : () => {};
+    try {
+      for (let i = 0; i < 3; i++) {
+        await clock.advance(15000);
+        await settleIdle();
+      }
+      expect(store.githubPrData(url(1))).toBe(saved);
+      expect(store.getLandEntry(entry.id)?.state).toBe("waiting_approval");
+      expect(gateLog()).toEqual([]);
+      expect(ghCalls("pr merge")).toEqual([]);
+      expect(q.cancel(entry.id)).toBe(true);
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "cancelled", approvalWaitStartedAt: 0 });
+    } finally {
+      stop();
+    }
+  },
+);
+
+test.each(["CLOSED", "DRAFT", "MOVED", "MERGED"])(
+  "waiting PR becoming %s leaves waiting through the ordinary terminal path",
+  async (state) => {
+    const head = await pushBranch("one", "one.txt", "one\n");
+    const pr = delivered(1, "one");
+    observe(1, head);
+    approve(1, head);
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const entry = await queue({ requiresApproval: approvalPolicy(), polling: false }).request({
+      target: pr.run.id,
+    });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
+    const node = github.nodes.get(`PR_${SLUG}_1`);
+    if (!node) throw new Error("missing test PR");
+    if (state === "DRAFT") Object.assign(node, { isDraft: true });
+    else if (state === "MOVED") node.headRefOid = "b".repeat(40);
+    else node.state = state;
+    await waitFor(() => store.getLandEntry(entry.id)?.state !== "waiting_approval");
+    if (state === "MERGED") await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: state === "MERGED" ? "landed" : "blocked",
+      approvalWaitStartedAt: 0,
+    });
+    if (state !== "MERGED")
+      expect(store.getLandEntry(entry.id)?.reason).toBe(
+        state === "CLOSED"
+          ? "PR was closed without merging"
+          : state === "DRAFT"
+            ? "PR is a draft"
+            : "head moved after approval",
+      );
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(gateLog()).toEqual([]);
+  },
+);
+
+test("startup supersedes an older wait requeued by the previous release", async () => {
+  const head = await pushBranch("one", "one.txt", "one\n");
+  const pr = delivered(1, "one");
+  observe(1, head);
+  approve(1, head);
+  const input = {
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "one",
+    approvedSha: head,
+  };
+  const old = store.createLandEntry(input);
+  store.updateLandEntry(old.id, { state: "waiting_approval", approvalWaitStartedAt: clock.now() - 1 });
+  store.db
+    .query(`INSERT INTO land_entries
+    (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, created_at, updated_at)
+    VALUES (?, ?, ?, 'main', 'one', ?, 'queued', 1, 1)`)
+    .run(pr.run.id, SLUG, url(1), head);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  reviewObservation(head);
+  queue({ requiresApproval: approvalPolicy() });
+  expect(store.getLandEntry(old.id)).toMatchObject({
+    state: "blocked",
+    approvalWaitStartedAt: 0,
+    reason: "superseded by a newer land entry",
+  });
+  await settle();
+  expect(store.getLandEntry(old.id)?.state).toBe("blocked");
+  expect(ghCalls("pr merge")).toHaveLength(1);
 });

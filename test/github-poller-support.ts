@@ -35,7 +35,12 @@ export function prNode(repo: string, n: number) {
     reviews: { nodes: [] as unknown[] },
     comments: { nodes: [] as unknown[] },
     latestReviews: {
-      nodes: [] as { state: string; author: { login: string } | null; commit?: { oid: string } | null }[],
+      nodes: [] as {
+        state: string;
+        author: { login: string; __typename?: string } | null;
+        authorCanPushToRepository?: boolean;
+        commit?: { oid: string } | null;
+      }[],
     },
   };
 }

@@ -7,7 +7,7 @@ import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
 import type { LandEntry } from "../src/core/types.ts";
-import { createLandController, type LandListState } from "../ui/lib/land.ts";
+import { createLandController, type LandListState, landState } from "../ui/lib/land.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 function entry(id: number, state: LandEntry["state"] = "landed", createdAt = id): LandEntry {
@@ -65,7 +65,7 @@ test("Land renders newest first, PRs, SHA tooltips, reasons, logs and only activ
     const entries = [
       entry(1),
       entry(2, "checking", 3),
-      entry(3, "waiting_approval", 3),
+      { ...entry(3, "queued", 3), waitingApproval: true },
       { ...entry(4, "cancelled", 0), logPath: null },
     ];
     const html = renderToString(() => LandList({ entries, cancel: () => {}, error: "load failed" }));
@@ -73,7 +73,7 @@ test("Land renders newest first, PRs, SHA tooltips, reasons, logs and only activ
     expect(html.indexOf("PR title 2")).toBeLessThan(html.indexOf("PR title 1"));
     expect(html.indexOf("PR title 1")).toBeLessThan(html.indexOf("PR title 4"));
     for (const row of entries) {
-      expect(html).toContain(row.state);
+      expect(html).toContain(landState(row));
       expect(html).toContain(`href="${row.prUrl}"`);
       expect(html).toContain(row.reason ?? "");
     }

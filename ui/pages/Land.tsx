@@ -1,7 +1,7 @@
 import { type Component, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { ACTIVE_LAND_STATES, type LandEntry } from "../../src/core/types.ts";
 import { cancelLand, landLogUrl, listLand } from "../api.ts";
-import { createLandController, type LandListState, newestLand } from "../lib/land.ts";
+import { createLandController, type LandListState, landState, newestLand } from "../lib/land.ts";
 import { subscribeLiveUpdates } from "../store.ts";
 
 export const LandList: Component<{
@@ -38,7 +38,7 @@ export const LandList: Component<{
           >
             {(entry) => (
               <tr>
-                <td>{entry.state}</td>
+                <td>{landState(entry)}</td>
                 <td>
                   <a href={entry.prUrl}>{entry.title || entry.prUrl}</a>
                 </td>

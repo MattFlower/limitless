@@ -60,7 +60,7 @@ export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Pu
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion status completedAt url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
-  latestReviews(first: 20) { nodes { state author { login } commit { oid } } }
+  latestReviews(first: 20) { nodes { state authorCanPushToRepository author { __typename login } commit { oid } } }
   reviews(last: 10) { nodes { id createdAt updatedAt comments(last: 10) { nodes { id createdAt updatedAt } } } }
   comments(last: 10) { nodes { id createdAt updatedAt } } } } }`;
 // Activity pages hold the newest few items so an edit to a recent older one still moves the marker.
@@ -94,7 +94,8 @@ type GqlPr = Base &
     comments?: Conn<Activity>;
     latestReviews?: Conn<{
       state: string;
-      author?: { login: string } | null;
+      author?: { login: string; __typename?: string } | null;
+      authorCanPushToRepository?: boolean | null;
       commit?: { oid: string } | null;
     }>;
   };
@@ -111,7 +112,14 @@ export type PrSnapshot = Known &
     statusNames?: string[];
     failing: { name: string; url: string | null }[];
     truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
-    reviewEvidence?: { state: string; login: string | null; commit: string | null }[];
+    observedAt?: number;
+    reviewEvidence?: {
+      state: string;
+      login: string | null;
+      commit: string | null;
+      authorType?: string | null;
+      canPush?: boolean | null;
+    }[];
     reviews?: string[]; // `login:state` of each reviewer's latest review
     reviewComments?: Record<string, string[]>; // each review connection has its own oldest-first order
     activity: Record<"review" | "review_comment" | "comment", string[]>;
@@ -208,6 +216,8 @@ export function normalizePr(node: unknown, id?: string | null): PrSnapshot | nul
       ? nodes(latestReviews).map((r) => ({
           state: r.state,
           login: r.author?.login ?? null,
+          authorType: r.author?.__typename ?? null,
+          canPush: r.authorCanPushToRepository ?? null,
           commit: r.commit?.oid ?? null,
         }))
       : undefined,
@@ -368,6 +378,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
   /** `since`: the PR's head version before the request, so an overtaken observation is dropped. */
   const record = async (pr: TrackedPr, snap: PrSnapshot, since: number) => {
+    const observedAt = now();
     const prev = saved(pr.data);
     const head = snap.headRefOid;
     if (!store.observePrHead(pr.url, head, since)) return undefined;
@@ -397,7 +408,14 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       return { ...c, runId: pr.runId, repo: pr.repo, data: { ...c.data, url: pr.url, head }, key };
     });
     const save = (nudged: string | null, feed = items) => {
-      const data = JSON.stringify({ ...snap, revision, unknown, nudged, ciPending } satisfies Saved);
+      const data = JSON.stringify({
+        ...snap,
+        observedAt,
+        revision,
+        unknown,
+        nudged,
+        ciPending,
+      } satisfies Saved);
       store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", feed, now());
     };
     // One nudge per UNKNOWN episode on a head: a known value ends the episode.

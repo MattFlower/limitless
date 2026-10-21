@@ -14,6 +14,7 @@ import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
+import { landWire } from "../land/wire.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
@@ -659,10 +660,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle((req) => {
         const params = new URL(req.url).searchParams;
         const prUrl = params.get("pr");
-        if (prUrl === null) return json(factory.land.list(params.get("run") ?? undefined));
+        if (prUrl === null) return json(factory.land.list(params.get("run") ?? undefined).map(landWire));
         const entry = store.latestLandEntry(null, prUrl);
         const prSnapshot: unknown = JSON.parse(store.githubPrData(prUrl) ?? "null");
-        return json(entry ? [{ ...entry, prSnapshot }] : []);
+        return json(entry ? [{ ...landWire(entry), prSnapshot }] : []);
       }),
       POST: handle(async (req) => {
         const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
@@ -670,7 +671,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (typeof target !== "string" || !target.trim())
           return error("target is required: a run id, a PR URL or a PR number");
         if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
-        return json(await factory.land.request({ target, sha: input.sha as string | undefined }), 201);
+        return json(
+          landWire(await factory.land.request({ target, sha: input.sha as string | undefined })),
+          201,
+        );
       }, true),
     },
     "/api/land/:id/log": handle(async (req) => {

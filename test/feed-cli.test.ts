@@ -290,7 +290,8 @@ test("land list binary shows waiting_approval and its reason", async () => {
       Response.json([
         {
           id: 1,
-          state: "waiting_approval",
+          state: "queued",
+          waitingApproval: true,
           repo: "o/r",
           approvedSha: "a".repeat(40),
           prUrl: "https://github.com/o/r/pull/1",

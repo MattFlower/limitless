@@ -398,12 +398,18 @@ land_requires_approval = true
 ```
 
 The default is false; repository slugs match case-insensitively. With it enabled, run-backed and
-explicitly queued PRs stay in `waiting_approval` until polling observes a current `APPROVED` review
-from a known login other than the authenticated factory account, on exactly the approved SHA.
-Stale or dismissed reviews do not count, and unavailable identity or review evidence leaves the
-entry waiting without a new timeout. This gate precedes land checks and base integration; a later
-factory base merge does not need another approval. `limitless review --approve` only records the
-factory-side approval and never submits a GitHub review. Restart the daemon after changing policy.
+explicitly queued PRs stay in `waiting_approval` until a fresh observation shows an `APPROVED`
+review from a human GitHub User with push access, other than the authenticated factory account,
+on exactly the approved SHA. An outstanding change request from any push-access human holds the
+entry. Stale or dismissed reviews do not count; unavailable identity or review evidence leaves it
+waiting without a new timeout. Waiting entries do not block other PRs in the repository.
+
+The gate runs before checks and rechecks fresh reviews immediately before merging, including on
+restart. Approval on the approved SHA or the factory's pushed base-merge head counts at that recheck;
+a later factory base merge does not need another approval. After a rollback, the previous release
+shows waiting entries as `blocked`; re-queue them to continue. `limitless review --approve` only
+records the factory-side approval and never submits a GitHub review. Restart the daemon after
+changing policy.
 
 ### UI and chat
 

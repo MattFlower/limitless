@@ -100,9 +100,10 @@ type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data">
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, NULLIF(run_id, '') AS runId, title, repo, pr_url AS prUrl, base_branch AS baseBranch,
   head_branch AS headBranch, approved_sha AS approvedSha,
-  CASE WHEN state = 'checking' AND approval_wait = 1 THEN 'waiting_approval' ELSE state END AS state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
+  CASE WHEN state = 'blocked' AND approval_wait > 0 THEN 'waiting_approval' ELSE state END AS state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
   log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
-  finished_at AS finishedAt FROM land_entries`;
+  approval_wait AS approvalWaitStartedAt,
+  CASE WHEN approval_wait > 0 THEN NULL ELSE finished_at END AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
   baseBranch: "base_branch",
   state: "state",
@@ -1309,7 +1310,7 @@ export class Store {
       }
       return !this.db
         .query(
-          "SELECT 1 FROM land_entries WHERE pr_url = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')",
+          "SELECT 1 FROM land_entries WHERE pr_url = ? AND (state IN ('queued', 'checking', 'waiting_ci', 'merging') OR approval_wait > 0)",
         )
         .get(trigger.prUrl);
     })();
@@ -1524,7 +1525,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       if (round?.kind === "ci") {
         this.db
           .query(`UPDATE land_entries SET reason = ?
-          WHERE pr_url = ? AND state = 'blocked' AND (approved_sha = ? OR pushed_sha = ?)`)
+          WHERE pr_url = ? AND state = 'blocked' AND approval_wait = 0 AND (approved_sha = ? OR pushed_sha = ?)`)
           .run(
             `CI fix at ${sha}; approve the new head to land`,
             round.prUrl,
@@ -1537,7 +1538,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
           .query(
             `UPDATE land_entries SET reason = ? WHERE id IN
               (SELECT land_entry_id FROM conflict_triggers WHERE run_id = ?)
-              AND state = 'blocked' AND reason = 'conflicts with ' || base_branch`,
+              AND state = 'blocked' AND approval_wait = 0 AND reason = 'conflicts with ' || base_branch`,
           )
           .run(`conflict resolved at ${sha}; approve the new head to land`, runId);
       }
@@ -2792,6 +2793,13 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     try {
       id = this.db.transaction(() => {
         this.assertNoRoundInFlight(entry.prUrl);
+        if (
+          this.db
+            .query(`SELECT 1 FROM land_entries WHERE pr_url = ? AND
+          (state IN ('queued', 'checking', 'waiting_ci', 'merging') OR approval_wait > 0)`)
+            .get(entry.prUrl)
+        )
+          throw new Error("PR is already in the land queue");
         const res = this.db
           .query(
             `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at, title)
@@ -2842,8 +2850,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       params.push(...ACTIVE_LAND_STATES);
     }
     const filter = where.length ? ` WHERE ${where.join(" AND ")}` : "";
-    const sql = `SELECT * FROM (${LAND_SELECT}${filter} ORDER BY id DESC LIMIT ?)
-      UNION ${LAND_SELECT}${filter}${where.length ? " AND" : " WHERE"}
+    const sql = `SELECT * FROM (SELECT * FROM (${LAND_SELECT})${filter} ORDER BY id DESC LIMIT ?)
+      UNION SELECT * FROM (${LAND_SELECT})${filter}${where.length ? " AND" : " WHERE"}
         state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")}) ORDER BY id`;
     return this.db
       .query(sql)
@@ -2911,25 +2919,45 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   updateLandEntry(
     id: number,
     patch: Partial<
-      Pick<LandEntry, "baseBranch" | "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">
+      Pick<
+        LandEntry,
+        | "baseBranch"
+        | "state"
+        | "pushedSha"
+        | "ciRerun"
+        | "logPath"
+        | "attempts"
+        | "reason"
+        | "approvalWaitStartedAt"
+      >
     >,
   ): LandEntry {
     const { sets, values } = buildUpdate(
-      patch.state === "waiting_approval" ? { ...patch, state: "checking" } : patch,
+      patch.state === "waiting_approval" ? { ...patch, state: "blocked" } : patch,
       LAND_PATCH_COLUMNS,
     );
     if (patch.state) {
       sets.push("approval_wait = ?");
-      values.push(patch.state === "waiting_approval" ? 1 : 0);
+      values.push(patch.state === "waiting_approval" ? (patch.approvalWaitStartedAt ?? Date.now()) : 0);
+      sets.push("finished_at = ?");
+      values.push(ACTIVE_LAND_STATES.includes(patch.state) ? null : Date.now());
+      if (patch.state === "waiting_approval") sets.push("claim_owner = NULL", "claim_heartbeat_at = NULL");
     }
     sets.push("updated_at = ?");
     values.push(Date.now());
-    if (patch.state && !ACTIVE_LAND_STATES.includes(patch.state)) {
-      sets.push("finished_at = ?");
-      values.push(Date.now());
-    }
     this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     return this.getLandEntry(id) as LandEntry;
+  }
+
+  /** Atomically retire rollback re-queues, or release this exact wait episode. */
+  releaseLandApproval(id: number, waitStartedAt: number, release: boolean): LandEntry | null {
+    return this.transaction(() => {
+      const entry = this.getLandEntry(id);
+      if (entry?.state !== "waiting_approval" || entry.approvalWaitStartedAt !== waitStartedAt) return null;
+      if (this.db.query("SELECT 1 FROM land_entries WHERE pr_url = ? AND id > ?").get(entry.prUrl, id))
+        return this.updateLandEntry(id, { state: "blocked", reason: "superseded by a newer land entry" });
+      return release ? this.updateLandEntry(id, { state: "queued", reason: null }) : entry;
+    });
   }
 
   /** Feed items for the queue: the PR URL, the SHA and, when it failed, the reason. */
@@ -3024,7 +3052,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       UNION
       SELECT l.pr_url, l.repo, NULLIF(l.run_id, ''), g.node_id, g.data, 1
       FROM land_entries l LEFT JOIN github_prs g ON g.url = l.pr_url
-      WHERE l.state IN ('queued', 'checking', 'waiting_ci', 'merging')
+      WHERE (l.state IN ('queued', 'checking', 'waiting_ci', 'merging') OR l.approval_wait > 0)
         AND NOT EXISTS (SELECT 1 FROM tracked WHERE url = l.pr_url)
       ORDER BY repo, url`;
     return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {

@@ -105,7 +105,7 @@ test("land entries preserve previous inserts and persist unowned PRs without a n
   }
 });
 
-test("approval waiting migrates old rows, survives reopening, and retains claims and uniqueness", () => {
+test("approval waiting survives rollback unclaimable, releases the slot, and retains new-release uniqueness", () => {
   const dir = mkdtempSync(join(tmpdir(), "land-migration-"));
   const migrations = join(dir, "migrations");
   mkdirSync(migrations);
@@ -144,19 +144,72 @@ test("approval waiting migrates old rows, survives reopening, and retains claims
       finishedAt: null,
       reason: "Another GitHub account must approve",
     });
-    expect(store.heartbeatLandClaim(entry.id, "first", 2000)).toBe(true);
+    expect(store.heartbeatLandClaim(entry.id, "first", 2000)).toBe(false);
+    store.releaseLandClaims("first");
+    const oldClaimable = `repo = ? AND state IN ('queued','checking','waiting_ci','merging')
+      AND (state = 'queued' OR claim_heartbeat_at IS NULL OR claim_heartbeat_at <= ?)`;
+    expect(
+      store.db
+        .query(`SELECT id FROM land_entries WHERE ${oldClaimable} ORDER BY id LIMIT 1`)
+        .get(input.repo, 32001),
+    ).toBeNull();
+    expect(
+      store.db
+        .query(`UPDATE land_entries SET state = 'checking', claim_owner = 'old',
+      claim_heartbeat_at = 62001 WHERE ${oldClaimable}`)
+        .run(input.repo, 32001).changes,
+    ).toBe(0);
     expect(() => store.createLandEntry(input)).toThrow("already in the land queue");
     const next = store.createLandEntry({ ...input, prUrl: input.prUrl.replace("/1", "/2") });
-    expect(store.claimLandEntry(input.repo, 30000, "second", 2500)).toBeNull();
-    expect(store.claimLandEntry(input.repo, 30000, "second", 32001)).toMatchObject({
-      id: entry.id,
-      state: "waiting_approval",
+    expect(store.claimLandEntry(input.repo, 30000, "second", 32001)?.id).toBe(next.id);
+    store.updateLandEntry(next.id, { state: "landed" });
+    const waiting = store.getLandEntry(entry.id);
+    expect(waiting).toMatchObject({ state: "waiting_approval", finishedAt: null });
+    store.releaseLandApproval(entry.id, waiting?.approvalWaitStartedAt ?? 0, true);
+    expect(store.claimLandEntry(input.repo, 30000, "second", 32002)?.id).toBe(entry.id);
+    store.updateLandEntry(entry.id, { state: "waiting_approval" });
+    store.db
+      .query(`INSERT INTO land_entries
+      (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, 1)`)
+      .run(input.runId, input.repo, input.prUrl, input.baseBranch, input.headBranch, input.approvedSha);
+    store.releaseLandApproval(entry.id, store.getLandEntry(entry.id)?.approvalWaitStartedAt ?? 0, true);
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      state: "blocked",
+      approvalWaitStartedAt: 0,
+      reason: "superseded by a newer land entry",
     });
-    expect(store.heartbeatLandClaim(entry.id, "first", 32002)).toBe(false);
-    store.updateLandEntry(entry.id, { state: "cancelled" });
-    expect(store.claimLandEntry(input.repo, 30000, "second", 32003)?.id).toBe(next.id);
+    expect(store.getLandEntry(entry.id)?.finishedAt).toBeNumber();
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("released approval waits keep FIFO position and terminal updates clear the marker", () => {
+  const store = new Store(":memory:");
+  try {
+    const create = (n: number) =>
+      store.createLandEntry({
+        runId: null,
+        repo: "test/repo",
+        prUrl: `https://github.com/test/repo/pull/${n}`,
+        baseBranch: "main",
+        headBranch: `pr-${n}`,
+        approvedSha: "a".repeat(40),
+      });
+    const first = create(1);
+    const wait = store.updateLandEntry(first.id, { state: "waiting_approval" });
+    const third = create(3);
+    expect(store.releaseLandApproval(first.id, wait.approvalWaitStartedAt ?? 0, true)?.state).toBe("queued");
+    expect(store.claimLandEntry("test/repo", 30000, "worker")?.id).toBe(first.id);
+    store.updateLandEntry(first.id, { state: "landed" });
+    store.updateLandEntry(third.id, { state: "waiting_approval" });
+    expect(store.latestLandEntry(null, third.prUrl)?.state).toBe("waiting_approval");
+    const blocked = store.updateLandEntry(third.id, { state: "blocked", reason: "actual blocker" });
+    expect(blocked).toMatchObject({ state: "blocked", approvalWaitStartedAt: 0, reason: "actual blocker" });
+    expect(blocked.finishedAt).toBeNumber();
+  } finally {
+    store.close();
   }
 });

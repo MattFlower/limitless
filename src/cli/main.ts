@@ -6,6 +6,7 @@ import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { landState } from "../land/wire.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 import { resolveClientPort } from "./client-port.ts";
@@ -584,7 +585,7 @@ async function main(): Promise<void> {
         const entries = await api<import("../core/types.ts").LandEntry[]>("/api/land");
         for (const entry of entries)
           console.log(
-            `${entry.id}  ${statusColor(entry.state.padEnd(11))} ${entry.repo.padEnd(28)} ${entry.approvedSha.slice(0, 12)}  ${entry.prUrl}${entry.reason ? color.dim(`  ${entry.reason}`) : ""}`,
+            `${entry.id}  ${statusColor(landState(entry).padEnd(11))} ${entry.repo.padEnd(28)} ${entry.approvedSha.slice(0, 12)}  ${entry.prUrl}${entry.reason ? color.dim(`  ${entry.reason}`) : ""}`,
           );
         return;
       }

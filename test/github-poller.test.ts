@@ -730,6 +730,7 @@ test("SSO, 404, IP restrictions and missing nodes are access problems, once per 
   await h.advance(60 * S);
   expect(h.gh.next).toHaveLength(0);
   expect(kinds()).toEqual([]);
+  expect(snapshotOf(url("o/r", 1))).toBe(before);
   // Still the same episode after a restart.
   h.gh.next.push(sso());
   h.reopen();
@@ -740,7 +741,10 @@ test("SSO, 404, IP restrictions and missing nodes are access problems, once per 
   expect(h.store.githubAccessProblems().map((p) => p.repo)).toEqual(["o/r"]);
   await h.advance(3600 * S);
   expect(kinds()).toEqual([]);
-  expect(snapshotOf(url("o/r", 1))).toBe(before);
+  const recovered = JSON.parse(snapshotOf(url("o/r", 1)));
+  const previous = JSON.parse(before);
+  expect({ ...recovered, observedAt: previous.observedAt }).toEqual(previous);
+  expect(recovered.observedAt).toBeGreaterThan(previous.observedAt);
   expect(h.store.getRun(run.id)).toMatchObject({
     status: "succeeded",
     merged: false,
@@ -1652,7 +1656,8 @@ test.each([
   const node = prNode("o/r", 1);
   node.latestReviews.nodes.push({
     state,
-    author: login === null ? null : { login },
+    author: login === null ? null : { login, __typename: "User" },
+    authorCanPushToRepository: true,
     commit: commit ? { oid: commit } : null,
   });
   const snapshot = normalizePr(node);
@@ -1678,10 +1683,45 @@ test("polls explicitly queued PRs without runs, including first-observation revi
   h.store.landFeed("land.queued", entry, "queued");
   await h.advance(0);
   const data = JSON.parse(snapshotOf(node.url));
-  expect(data.reviewEvidence).toEqual([{ state: "APPROVED", login: "other", commit: SHA }]);
+  expect(data.reviewEvidence).toEqual([
+    { state: "APPROVED", login: "other", commit: SHA, authorType: null, canPush: null },
+  ]);
+  expect(data.observedAt).toBeNumber();
+  h.store.updateLandEntry(entry.id, { state: "waiting_approval" });
+  expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
   expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
   expect(kinds()).not.toContain("pr.review");
   node.latestReviews.nodes[0] = { state: "DISMISSED", author: { login: "other" }, commit: { oid: SHA } };
   await h.advance(15000);
   expect(JSON.parse(snapshotOf(node.url)).reviewEvidence[0].state).toBe("DISMISSED");
+});
+
+test.each([
+  ["Bot", true, "APPROVED", false],
+  ["User", false, "APPROVED", false],
+  [undefined, undefined, "APPROVED", false],
+  ["User", true, "CHANGES_REQUESTED", false],
+  ["User", true, "COMMENTED", true],
+] as const)("review authority %s push=%s state=%s", (authorType, canPush, state, expected) => {
+  const node = prNode("o/r", 1);
+  node.latestReviews.nodes = [
+    {
+      state,
+      author: { login: "reviewer", __typename: authorType },
+      authorCanPushToRepository: canPush,
+      commit: { oid: SHA },
+    },
+  ];
+  if (state === "CHANGES_REQUESTED" || state === "COMMENTED")
+    node.latestReviews.nodes.push({
+      state: "APPROVED",
+      author: { login: "another", __typename: "User" },
+      authorCanPushToRepository: true,
+      commit: { oid: SHA },
+    });
+  const snapshot = normalizePr(node);
+  if (!snapshot) throw new Error("missing normalized PR");
+  expect(hasOtherApproval(snapshot, "factory", SHA)).toBe(expected);
+  expect(OBSERVE_QUERY).toContain("authorCanPushToRepository");
+  expect(OBSERVE_QUERY).toContain("__typename");
 });

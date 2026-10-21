@@ -1,3 +1,3 @@
--- Keep the shipped state CHECK and both active-entry indexes effective on rollback.
--- Logical waiting_approval entries remain physically checking and retain their claim.
+-- Blocked storage keeps approval waits unclaimable by the previous release.
+-- The marker records the start of the current wait episode in milliseconds.
 ALTER TABLE land_entries ADD COLUMN approval_wait INTEGER NOT NULL DEFAULT 0;

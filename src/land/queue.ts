@@ -74,14 +74,17 @@ export interface LandObservation {
 
 /** Only current review evidence on the approved commit can authorize this operator gate. */
 export function hasOtherApproval(snapshot: PrSnapshot, factoryLogin: string | null, sha: string): boolean {
+  const reviews = snapshot.reviewEvidence ?? [];
+  const authorized = (r: NonNullable<PrSnapshot["reviewEvidence"]>[number]) =>
+    r.authorType === "User" && r.canPush === true && typeof r.login === "string" && !!r.login.trim();
   return (
     !!factoryLogin?.trim() &&
-    (snapshot.reviewEvidence ?? []).some(
+    !reviews.some((r) => authorized(r) && r.state === "CHANGES_REQUESTED") &&
+    reviews.some(
       (r) =>
+        authorized(r) &&
         r.state === "APPROVED" &&
-        typeof r.login === "string" &&
-        !!r.login.trim() &&
-        r.login.toLowerCase() !== factoryLogin.toLowerCase() &&
+        r.login?.toLowerCase() !== factoryLogin.toLowerCase() &&
         r.commit === sha,
     )
   );
@@ -141,6 +144,8 @@ export class LandQueue {
   private readonly workers = new Map<string, Promise<void>>();
   private readonly inFlight = new Map<number, AbortController>();
   private stopped = false;
+  private readonly waiting = new Map<number, { controller: AbortController; work: Promise<void> }>();
+  private readonly repump = new Set<string>();
   private conflictStartup?: { controller: AbortController; work: Promise<void> };
   private readonly owner = randomUUID();
 
@@ -169,16 +174,21 @@ export class LandQueue {
       this.conflictStartup = { controller, work };
     }
     if (!this.workers.size) this.store.releaseLandClaims(this.owner);
-    for (const entry of this.store.listLandEntries({ active: true })) this.pump(entry.repo);
+    for (const entry of this.store.listLandEntries({ active: true })) {
+      if (entry.state === "waiting_approval") this.watchApproval(entry);
+      else this.pump(entry.repo);
+    }
   }
 
   /** Abort in-flight git, gates and `gh` calls; entries keep their state for the next start. */
   async stop(): Promise<void> {
     this.stopped = true;
     this.conflictStartup?.controller.abort();
+    for (const wait of this.waiting.values()) wait.controller.abort();
     for (const controller of this.inFlight.values()) controller.abort();
     await this.conflictStartup?.work;
     this.conflictStartup = undefined;
+    await Promise.all([...this.waiting.values()].map((wait) => wait.work));
     if (!this.workers.size) return;
     await Promise.all([...this.workers.values()].map((worker) => worker.catch(() => undefined)));
     this.store.releaseLandClaims(this.owner);
@@ -333,6 +343,7 @@ export class LandQueue {
     const entry = this.store.getLandEntry(id);
     if (!entry || !this.isActive(entry)) return false;
     this.inFlight.get(id)?.abort();
+    this.waiting.get(id)?.controller.abort();
     this.finish(id, "cancelled", "cancelled");
     return true;
   }
@@ -343,7 +354,11 @@ export class LandQueue {
 
   /** Drain this repository's queue: claim the next entry and land it, until there is none. */
   private pump(repo: string): void {
-    if (this.stopped || draining.has(repo)) return;
+    if (this.stopped) return;
+    if (draining.has(repo)) {
+      if (draining.get(repo) === this) this.repump.add(repo);
+      return;
+    }
     draining.set(repo, this);
     const worker = (async () => {
       for (;;) {
@@ -360,6 +375,7 @@ export class LandQueue {
       .finally(() => {
         this.workers.delete(repo);
         if (draining.get(repo) === this) draining.delete(repo);
+        if (this.repump.delete(repo)) this.pump(repo);
       });
   }
 
@@ -414,15 +430,8 @@ export class LandQueue {
    * between the push and the `waiting_ci` update therefore resumes instead of pushing the factory's
    * own merge commit again, which the lease would refuse as a head that moved after approval.
    */
-  private async land(entry: LandEntry, signal: AbortSignal, approvalChecked = false): Promise<void> {
+  private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
     const { repo, run } = this.context(entry);
-    if (
-      entry.state === "waiting_approval" &&
-      (entry.pushedSha || !this.deps.requiresApproval?.has(entry.repo.toLowerCase()))
-    )
-      entry = this.owned(entry.id, () =>
-        this.store.updateLandEntry(entry.id, { state: "checking", reason: null }),
-      );
     // Claims reset merging to checking; any recorded push may have merged before a restart.
     if (entry.pushedSha) {
       const fresh = await this.mergeMetadata(entry.prUrl, signal);
@@ -482,10 +491,23 @@ export class LandQueue {
     if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
     if (headMoved(fresh.headRefOid, entry.pushedSha ?? entry.approvedSha, entry.approvedSha))
       throw new LandBlocked("head moved after approval");
-    if (!entry.pushedSha && !approvalChecked && this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
-      await this.awaitApproval(entry, signal);
-      // Approval may have taken hours; repeat the current-head/draft/closed preflight.
-      return this.land(entry, signal, true);
+    if (this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
+      const evidence = await this.approvalEvidence(entry, signal);
+      signal.throwIfAborted();
+      this.assertClaim(entry.id);
+      this.checkApprovalHead(entry, evidence.seen);
+      if (evidence.seen?.state === "MERGED") {
+        this.landed(entry, repo, entry.pushedSha ?? entry.approvedSha, {
+          ...evidence.seen,
+          head: evidence.seen.headRefOid,
+          failing: evidence.seen.failing.map((f) => f.name),
+        });
+        return;
+      }
+      if (!this.qualifies(entry, evidence)) {
+        this.parkApproval(entry, signal);
+        return;
+      }
     }
     if (!entry.baseBranch || entry.baseBranch === entry.headBranch) {
       const baseBranch = await this.resolveBase(run, entry.prUrl, entry.headBranch, signal);
@@ -530,74 +552,133 @@ export class LandQueue {
     }
   }
 
-  private async awaitApproval(entry: LandEntry, signal: AbortSignal): Promise<void> {
-    this.owned(entry.id, () => {
+  private qualifies(entry: LandEntry, evidence: { seen: PrSnapshot | null; login: string | null }): boolean {
+    const { seen, login } = evidence;
+    return (
+      !!seen &&
+      (seen.state === "MERGED" ||
+        (seen.state === "OPEN" &&
+          (hasOtherApproval(seen, login, entry.approvedSha) ||
+            (!!entry.pushedSha && hasOtherApproval(seen, login, entry.pushedSha)))))
+    );
+  }
+
+  private checkApprovalHead(entry: LandEntry, seen: PrSnapshot | null): void {
+    if (!seen || seen.state === "MERGED") return;
+    if (seen.state === "CLOSED") throw new LandBlocked("PR was closed without merging");
+    if (seen.isDraft) throw new LandBlocked("PR is a draft");
+    if (headMoved(seen.headRefOid, entry.pushedSha ?? entry.approvedSha, entry.approvedSha))
+      throw new LandBlocked("head moved after approval");
+  }
+
+  /** Fresh direct evidence at claim and immediately before merge; saved evidence only while parked. */
+  private async approvalEvidence(entry: LandEntry, signal: AbortSignal, saved = false) {
+    const client = this.deps.github ?? ghClient;
+    try {
+      const identity = await client("user", undefined, signal);
+      const parsed = z.object({ login: z.string().trim().min(1) }).safeParse(identity.body);
+      const login = identity.status === 200 && parsed.success ? parsed.data.login : null;
+      if (saved) {
+        const seen = savedSnapshot(this.store.githubPrData(entry.prUrl));
+        return {
+          login,
+          seen:
+            seen?.url === entry.prUrl &&
+            seen.observedAt !== undefined &&
+            seen.observedAt > (entry.approvalWaitStartedAt ?? Infinity)
+              ? seen
+              : null,
+        };
+      }
+      const pr = await client(
+        `repos/${entry.repo}/pulls/${entry.prUrl.split("/").at(-1)}`,
+        undefined,
+        signal,
+      );
+      if (pr.status !== 200) return { login, seen: null };
+      const id = z.object({ node_id: z.string() }).parse(pr.body).node_id;
+      const response = await client("graphql", { query: OBSERVE_QUERY, variables: { ids: [id] } }, signal);
+      const data = z
+        .object({ data: z.object({ nodes: z.array(z.unknown()) }), errors: z.unknown().optional() })
+        .safeParse(response.body);
+      const seen =
+        response.status === 200 && data.success && !data.data.errors
+          ? normalizePr(data.data.data.nodes[0], id)
+          : null;
+      return { login, seen: seen?.url === entry.prUrl ? seen : null };
+    } catch (error) {
       signal.throwIfAborted();
-      const current = this.store.getLandEntry(entry.id);
-      if (!current || !this.isActive(current)) throw new LandClaimLost();
-      if (current.state === "waiting_approval") return;
+      this.log(redactCredentials(`[land] ${entry.id}: approval observation pending: ${String(error)}`));
+      return { login: null, seen: null };
+    }
+  }
+
+  private parkApproval(entry: LandEntry, signal: AbortSignal): void {
+    const waiting = this.owned(entry.id, () => {
+      signal.throwIfAborted();
       const reason = `Another GitHub account must approve ${entry.approvedSha}`;
-      const waiting = this.store.updateLandEntry(entry.id, { state: "waiting_approval", reason });
+      const parked = this.store.updateLandEntry(entry.id, {
+        state: "waiting_approval",
+        reason,
+        approvalWaitStartedAt: this.now(),
+      });
       this.store.landFeed(
         "land.waiting_approval",
-        waiting,
+        parked,
         reason,
-        { state: waiting.state, reason },
+        { state: parked.state, reason },
         `${entry.id}:${entry.attempts}`,
       );
+      return parked;
     });
-    const client = this.deps.github ?? ghClient;
-    for (;;) {
-      let login: string | null = null;
-      signal.throwIfAborted();
-      this.assertClaim(entry.id);
-      const snapshot = this.store.githubPrData(entry.prUrl);
-      let seen = savedSnapshot(snapshot);
-      try {
-        const identity = await client("user", undefined, signal);
-        const parsed = z.object({ login: z.string().trim().min(1) }).safeParse(identity.body);
-        if (identity.status === 200 && parsed.success) login = parsed.data.login;
-        else this.log(`[land] ${entry.id}: authenticated GitHub login unavailable (HTTP ${identity.status})`);
-        if (this.deps.polling !== false) seen = savedSnapshot(this.store.githubPrData(entry.prUrl));
-        if (this.deps.polling === false) {
-          const pr = await client(
-            `repos/${entry.repo}/pulls/${entry.prUrl.split("/").at(-1)}`,
-            undefined,
-            signal,
-          );
-          if (pr.status !== 200) throw new Error("cannot resolve PR for approval observation");
-          const id = z.object({ node_id: z.string() }).parse(pr.body).node_id;
-          const response = await client(
-            "graphql",
-            { query: OBSERVE_QUERY, variables: { ids: [id] } },
-            signal,
-          );
-          const data = z
-            .object({ data: z.object({ nodes: z.array(z.unknown()) }), errors: z.unknown().optional() })
-            .parse(response.body);
-          seen = response.status === 200 && !data.errors ? normalizePr(data.data.nodes[0], id) : null;
-        }
-      } catch (error) {
+    this.watchApproval(waiting);
+  }
+
+  /** Parked entries have no claim and never occupy a repository's worker or running slot. */
+  private watchApproval(entry: LandEntry): void {
+    if (this.stopped || this.waiting.has(entry.id)) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    const work = (async () => {
+      for (;;) {
         signal.throwIfAborted();
-        this.log(redactCredentials(`[land] ${entry.id}: approval observation pending: ${String(error)}`));
-        seen = null;
+        const current = this.store.releaseLandApproval(entry.id, entry.approvalWaitStartedAt ?? 0, false);
+        if (current?.state !== "waiting_approval") return;
+        const snapshot = this.store.githubPrData(entry.prUrl);
+        const required = this.deps.requiresApproval?.has(entry.repo.toLowerCase());
+        const evidence = required
+          ? await this.approvalEvidence(entry, signal, this.deps.polling !== false)
+          : null;
+        signal.throwIfAborted();
+        const released = this.store.transaction(() => {
+          const still = this.store.releaseLandApproval(entry.id, entry.approvalWaitStartedAt ?? 0, false);
+          if (still?.state !== "waiting_approval") return null;
+          try {
+            this.checkApprovalHead(entry, evidence?.seen ?? null);
+          } catch (error) {
+            if (!(error instanceof LandBlocked)) throw error;
+            this.block(entry.id, error.message);
+            return null;
+          }
+          return this.store.releaseLandApproval(
+            entry.id,
+            entry.approvalWaitStartedAt ?? 0,
+            !required || (!!evidence && this.qualifies(entry, evidence)),
+          );
+        });
+        if (released?.state === "queued") {
+          this.pump(entry.repo);
+          return;
+        }
+        if (this.store.getLandEntry(entry.id)?.state !== "waiting_approval") return;
+        await this.ciWake(entry, signal, snapshot);
       }
-      signal.throwIfAborted();
-      this.assertClaim(entry.id);
-      const current = this.store.getLandEntry(entry.id);
-      if (!current || !this.isActive(current)) throw new LandClaimLost();
-      if (seen?.state === "CLOSED") throw new LandBlocked("PR was closed without merging");
-      if (seen?.isDraft) throw new LandBlocked("PR is a draft");
-      if (seen && seen.headRefOid !== entry.approvedSha) throw new LandBlocked("head moved after approval");
-      if (
-        seen?.state === "MERGED" ||
-        (seen?.state === "OPEN" && hasOtherApproval(seen, login, entry.approvedSha))
-      ) {
-        this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { state: "checking", reason: null }));
-        return;
-      }
-      await this.ciWake(entry, signal, snapshot);
-    }
+    })()
+      .catch((error: unknown) => {
+        if (!signal.aborted) this.log(redactCredentials(`[land] ${entry.id}: ${String(error)}`));
+      })
+      .finally(() => this.waiting.delete(entry.id));
+    this.waiting.set(entry.id, { controller, work });
   }
 
   /** A PR that already merged is recorded, never merged again. */
@@ -900,6 +981,24 @@ export class LandQueue {
     subject: string,
     signal: AbortSignal,
   ): Promise<void> {
+    if (this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
+      const evidence = await this.approvalEvidence({ ...entry, pushedSha: sha }, signal);
+      signal.throwIfAborted();
+      this.assertClaim(entry.id);
+      this.checkApprovalHead({ ...entry, pushedSha: sha }, evidence.seen);
+      if (evidence.seen?.state === "MERGED") {
+        this.landed(entry, repo, sha, {
+          ...evidence.seen,
+          head: evidence.seen.headRefOid,
+          failing: evidence.seen.failing.map((f) => f.name),
+        });
+        return;
+      }
+      if (!this.qualifies({ ...entry, pushedSha: sha }, evidence)) {
+        this.parkApproval(entry, signal);
+        return;
+      }
+    }
     const merging = this.owned(entry.id, () => {
       signal.throwIfAborted();
       this.store.assertNoRoundInFlight(entry.prUrl);
