@@ -13,6 +13,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -747,7 +748,7 @@ test.each(["releaseSha", "bunVersion"] as const)(
       headSha: releaseSha,
       gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
     });
-    expect((await call("/worker/lease", {}, wrong)).json()).toEqual({ job: null });
+    expect((await call("/worker/lease", {}, wrong)).json()).toEqual({ job: null, agentJob: null });
     expect(workers.list().find((w) => w.name === "wrong")?.state).toBe("needs update");
     const lease = (await call("/worker/lease", {}, right)).json() as {
       job: { id: string; request: GateRequest };
@@ -800,7 +801,7 @@ test("worker routes authenticate first and reject jobs without the caller's leas
     expect((await call(path, body)).status).toBe(401);
     expect((await call(path, body, token)).status).toBe(409);
   }
-  expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null });
+  expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null, agentJob: null });
   expect((await call("/worker/unknown", {}, token)).status).toBe(404);
   expect(store.db.query("SELECT COUNT(*) n FROM gate_jobs").get()).toEqual({ n: 0 });
 }, 30_000);
@@ -1656,7 +1657,7 @@ test("expired leases retry once on a different worker then fall back locally wit
     cancelled: [handle.id],
     releaseSha,
   });
-  expect((await call("/worker/lease", {}, a)).json()).toEqual({ job: null });
+  expect((await call("/worker/lease", {}, a)).json()).toEqual({ job: null, agentJob: null });
   const second = (await call("/worker/lease", {}, b)).json() as { job: { id: string } };
   expect(second.job.id).toBe(handle.id);
   now += 61;
@@ -1875,6 +1876,7 @@ test("cancellation is durable and is returned by both lease and heartbeat replie
   expect(workers.job(handle.id)?.state).toBe("cancelled");
   expect((await call("/worker/lease", { jobs: [handle.id] }, token)).json()).toEqual({
     job: null,
+    agentJob: null,
     cancelled: [handle.id],
   });
   expect((await call("/worker/heartbeat", caps([handle.id]), token)).json()).toEqual({
@@ -2059,7 +2061,7 @@ test("short registered credentials in executable inputs never reach a lease repl
   const immediate = workers.enqueue(req);
   expect(workers.job(immediate)?.state).toBe("failed");
   const reply = await call("/worker/lease", {}, token);
-  expect(reply.json()).toEqual({ job: null });
+  expect(reply.json()).toEqual({ job: null, agentJob: null });
   expect(reply.data.toString()).not.toContain(secret);
   expect(workers.job(queued)?.state).toBe("failed");
 }, 30_000);
@@ -2107,7 +2109,7 @@ test("credential-bearing executable inputs stay local, including requests queued
   const queued = workers.enqueue(variants[0] ?? req);
   expect(workers.job(queued)?.state).toBe("queued");
   registerCredential("DISPATCH_TEST", secret);
-  expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null });
+  expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null, agentJob: null });
   expect(workers.job(queued)?.state).toBe("failed");
   await confinementScope.run(fakeConfinement, () =>
     executeGate(
@@ -2128,7 +2130,7 @@ test("credential-bearing executable inputs stay local, including requests queued
     expect(workers.job(handle.id)?.state).toBe("failed");
     const reply = await call("/worker/lease", {}, token);
     expect(reply.data.toString()).not.toContain(secret);
-    expect(reply.json()).toEqual({ job: null });
+    expect(reply.json()).toEqual({ job: null, agentJob: null });
     const preservesCommand =
       input.gates.setup.includes(original) || input.gates.checks.some((c) => c.run === original);
     if (preservesCommand) rmSync(join(req.cwd, "preserved-command"), { force: true });
@@ -2191,7 +2193,7 @@ test.each([1, 128])(
     const query = spyOn(store.db, "query");
     try {
       const cancelled = (await call("/worker/lease", { jobs: ids }, token)).json();
-      expect(cancelled).toEqual({ job: null, cancelled: ids.slice(0, Math.min(count, 3)) });
+      expect(cancelled).toEqual({ job: null, agentJob: null, cancelled: ids.slice(0, Math.min(count, 3)) });
       expect(sweep).toHaveBeenCalledTimes(1);
       expect(lookup).toHaveBeenCalledTimes(1);
       expect(query.mock.calls.filter(([sql]) => sql.includes("json_each"))).toHaveLength(1);
@@ -3327,3 +3329,462 @@ test("the target deadline cancels an active update while heartbeats continue", a
     await worker.stop();
   }
 });
+
+const agentRequest = (overrides: Partial<AgentJobRequest> = {}): AgentJobRequest => ({
+  runId: "test-agent-run",
+  invocationId: 1,
+  parentSha: releaseSha,
+  prompt: "Edit code",
+  timeoutMs: 1000,
+  target: {
+    modelId: "fake",
+    provider: "fake",
+    harness: "fake",
+    model: "fake",
+    vendor: "fake",
+    tier: 1,
+    billing: "free",
+  },
+  ...overrides,
+});
+function enqueueAgent(overrides: Partial<AgentJobRequest> = {}) {
+  const id = workers.enqueueAgentJob(agentRequest(overrides));
+  if (!id) throw new Error("Agent request refused");
+  return id;
+}
+const agentResult = (parentSha = releaseSha) => ({
+  status: "ok",
+  finalText: "Completed",
+  structured: null,
+  sessionId: null,
+  usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+  numTurns: 1,
+  costUsd: 0,
+  costEquivUsd: 0,
+  error: null,
+  quota: null,
+  parentSha,
+  sha: "a".repeat(40),
+  branch: "change/example",
+});
+const agentPath = (id: string, action: string) => `/worker/agent-jobs/${id}/${action}`;
+const batches = () =>
+  store.db
+    .query<{ seq: number; events: string; created_at: number }, []>(
+      "SELECT seq,events,created_at FROM agent_job_events ORDER BY seq",
+    )
+    .all();
+
+// Streaming requests exercise the byte limit and authorization across body-reading awaits.
+function streamingReport(path: string, token: string, contentLength?: number) {
+  if (!listener) throw new Error("Missing listener");
+  const response = Promise.withResolvers<number>();
+  const req = httpsRequest(
+    new URL(path, listener.url),
+    {
+      method: "POST",
+      rejectUnauthorized: false,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        ...(contentLength === undefined
+          ? { "transfer-encoding": "chunked" }
+          : { "content-length": contentLength }),
+      },
+    },
+    (res) => {
+      res.resume();
+      res.on("end", () => response.resolve(res.statusCode ?? 0));
+      res.on("error", response.reject);
+    },
+  );
+  req.on("error", response.reject);
+  return { req, response: response.promise };
+}
+
+test("gate-first leases preserve both payload fields, agent inputs and cancellation", async () => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const gate = workers.enqueue(await request());
+  const agent = enqueueAgent();
+  const stored = workers.agentJob(agent);
+  store.db
+    .query("UPDATE agent_jobs SET request=? WHERE id=?")
+    .run(
+      JSON.stringify({ ...JSON.parse(stored?.request ?? "{}"), cwd: home, scratchDir: home, logPath: home }),
+      agent,
+    );
+  expect((await call("/worker/lease", {}, token)).json()).toMatchObject({
+    job: { id: gate },
+    agentJob: null,
+  });
+  expect(workers.agentJob(agent)?.state).toBe("queued");
+  const reply = (await call("/worker/lease", {}, token)).json() as {
+    job: null;
+    agentJob: { id: string; remainingMs: number; request: unknown };
+  };
+  expect(reply.job).toBeNull();
+  expect(reply.agentJob.id).toBe(agent);
+  expect(reply.agentJob.remainingMs).toBeGreaterThanOrEqual(0);
+  expect(reply.agentJob.request).toEqual(agentRequest());
+  expect(JSON.stringify(reply)).not.toContain(home);
+  expect((await call("/worker/lease", { jobs: [agent] }, token)).json()).toEqual({
+    job: null,
+    agentJob: null,
+  });
+  workers.cancelAgentJob(agent);
+  expect((await call("/worker/lease", { jobs: [agent] }, token)).json()).toEqual({
+    job: null,
+    agentJob: null,
+    cancelled: [agent],
+  });
+  const queued = enqueueAgent();
+  await call("/worker/heartbeat", { ...caps(), releaseSha: "different" }, token);
+  expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null, agentJob: null });
+  expect(workers.agentJob(queued)?.state).toBe("queued");
+});
+
+test("all agent routes authenticate holders and reject a token revoked during a job", async () => {
+  await listen();
+  const owner = await paired(),
+    other = await paired("other");
+  await call("/worker/heartbeat", caps(), owner);
+  const id = enqueueAgent();
+  workers.leaseAgentJob("runner");
+  for (const action of ["bundle", "events", "result", "failure"]) {
+    const body = action === "bundle" ? undefined : {};
+    expect((await call(agentPath(id, action), body)).status).toBe(401);
+    expect((await call(agentPath(id, action), body, "0".repeat(64))).status).toBe(401);
+    expect((await call(agentPath(id, action), body, other)).status).toBe(409);
+  }
+  workers.revoke("runner");
+  for (const action of ["bundle", "events", "result", "failure"])
+    expect((await call(agentPath(id, action), action === "bundle" ? undefined : {}, owner)).status).toBe(401);
+  expect(batches()).toEqual([]);
+});
+
+test.each(["events", "result", "failure"])(
+  "agent %s enforces byte limits with and without Content-Length",
+  async (action) => {
+    await listen();
+    const token = await paired();
+    await call("/worker/heartbeat", caps(), token);
+    const id = enqueueAgent();
+    workers.leaseAgentJob("runner");
+    const payload = JSON.stringify({ reason: "é".repeat((action === "events" ? 512 : 1024) * 1024) });
+    for (const length of [undefined, Buffer.byteLength(payload)]) {
+      const { req, response } = streamingReport(agentPath(id, action), token, length);
+      req.end(payload);
+      expect(await response).toBe(413);
+    }
+    expect(batches()).toEqual([]);
+    expect(workers.agentJob(id)?.state).toBe("leased");
+  },
+);
+
+test.each(["events", "result", "failure"])(
+  "agent %s rechecks ownership and revocation after reading a body",
+  async (action) => {
+    await listen();
+    const token = await paired();
+    await call("/worker/heartbeat", caps(), token);
+    for (const revoked of [false, true]) {
+      const id = enqueueAgent();
+      workers.leaseAgentJob("runner");
+      const started = Promise.withResolvers<void>(),
+        original = workers.holdsAgentJob.bind(workers);
+      const spy = spyOn(workers, "holdsAgentJob").mockImplementation((...args) => {
+        const job = original(...args);
+        started.resolve();
+        return job;
+      });
+      const payload = JSON.stringify(
+        action === "events"
+          ? { seq: 0, events: [] }
+          : action === "result"
+            ? agentResult()
+            : { reason: "failed" },
+      );
+      const { req, response } = streamingReport(agentPath(id, action), token);
+      try {
+        req.write(payload.slice(0, 1));
+        await started.promise;
+        if (revoked) workers.revoke("runner");
+        else workers.cancelAgentJob(id);
+        req.end(payload.slice(1));
+        expect(await response).toBe(revoked ? 401 : 409);
+        expect(workers.agentJob(id)?.state).not.toBe("done");
+        expect(batches()).toEqual([]);
+      } finally {
+        req.destroy();
+        spy.mockRestore();
+      }
+    }
+  },
+);
+
+test("agent event batches validate every variant, redact nested data, deduplicate and survive reopening", async () => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = enqueueAgent();
+  workers.leaseAgentJob("runner");
+  const secret = randomBytes(24).toString("hex");
+  registerCredential("AGENT_EVENT_TEST", secret);
+  const events = [
+    { type: "init", sessionId: "session", model: "fake" },
+    ...["text", "thinking", "stderr", "status"].map((type) => ({ type, text: secret })),
+    { type: "tool_call", id: "t", name: "tool", input: { nested: [{ [secret]: secret }] } },
+    { type: "tool_result", id: "t", output: secret, isError: false },
+    {
+      type: "rate_limit",
+      status: "allowed",
+      windows: { short: { utilization: 0.5, resetsAt: null } },
+      resetsAt: null,
+    },
+    { type: "warning", id: "warning", text: secret },
+  ];
+  for (const body of [
+    { seq: -1, events },
+    { seq: 1.5, events },
+    { seq: Number.MAX_SAFE_INTEGER + 1, events },
+    { seq: 0, events, extra: true },
+    ...events.map((event) => ({ seq: 0, events: [{ ...event, extra: true }] })),
+    {
+      seq: 0,
+      events: [
+        {
+          type: "rate_limit",
+          status: "allowed",
+          resetsAt: null,
+          windows: { short: { utilization: 0, resetsAt: null, extra: true } },
+        },
+      ],
+    },
+    { seq: 0, events: [{ type: "tool_call", id: "t", name: "tool" }] },
+    { seq: 0, events: [{ type: "unknown" }] },
+  ])
+    expect((await call(agentPath(id, "events"), body, token)).status).toBe(400);
+  expect(batches()).toEqual([]);
+  expect((await call(agentPath(id, "events"), { seq: 7, events }, token)).json()).toEqual({ ok: true });
+  const saved = batches();
+  expect(saved).toHaveLength(1);
+  expect(saved[0]?.events).not.toContain(secret);
+  expect(JSON.parse(saved[0]?.events ?? "[]").map((e: { type: string }) => e.type)).toEqual(
+    events.map((e) => e.type),
+  );
+  expect((await call(agentPath(id, "events"), { seq: 7, events: [] }, token)).status).toBe(200);
+  expect(batches()).toEqual(saved);
+  const retryToken = await paired("retry");
+  await call("/worker/heartbeat", caps(), retryToken);
+  workers.failAgentJob(id, "Disconnected");
+  expect(workers.leaseAgentJob("retry")?.id).toBe(id);
+  expect((await call(agentPath(id, "events"), { seq: 7, events: [] }, retryToken)).status).toBe(200);
+  expect(batches()).toEqual(saved);
+  store.close();
+  store = new Store(cfg.paths.db);
+  expect(batches()).toEqual(saved);
+});
+
+test("agent reports validate result metadata and persist changed and unchanged completions without fetching", async () => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  for (const unchanged of [false, true]) {
+    const id = enqueueAgent();
+    workers.leaseAgentJob("runner");
+    const result = agentResult();
+    for (const bad of [
+      { parentSha: "b".repeat(40) },
+      ...["short", "g".repeat(40), "a".repeat(41), "a".repeat(63)].map((sha) => ({ sha })),
+      ...["-branch", "a..b", "a.lock", "a/", "@{-1}", "a b", "HEAD"].map((branch) => ({ branch })),
+      { extra: true },
+      { status: "unknown" },
+      { usage: { ...result.usage, extra: 1 } },
+      { quota: { windows: { short: { utilization: "bad", resetsAt: null } }, exhaustedUntil: null } },
+      { decline: { reason: "unsure", lastResort: false, extra: 1 } },
+      { confinement: { ok: false, path: null, version: null, reason: "unknown", exitCode: null } },
+    ]) {
+      expect((await call(agentPath(id, "result"), { ...result, ...bad }, token)).status).toBe(400);
+      expect(workers.agentJob(id)?.state).toBe("leased");
+    }
+    const report = {
+      ...result,
+      sha: unchanged ? releaseSha : "a".repeat(64),
+      structured: { arbitrary: [1, null] },
+      modelCooldownMs: 100,
+      quota: { windows: { short: { utilization: 0.3, resetsAt: null } }, exhaustedUntil: null },
+      decline: { reason: "unsure", lastResort: true },
+      confinement: { ok: true, path: null, version: null, reason: null, exitCode: 0 },
+    };
+    expect((await call(agentPath(id, "result"), report, token)).json()).toEqual({ ok: true });
+    expect(workers.agentJob(id)).toMatchObject({ state: "done", result_sha: report.sha });
+    expect(JSON.parse(workers.agentJob(id)?.result ?? "null")).toEqual(report);
+  }
+});
+
+test("agent failure validates the supplied reason and preserves sanitized retry and exclusion transitions", async () => {
+  await listen();
+  const first = await paired(),
+    second = await paired("second");
+  await call("/worker/heartbeat", caps(), first);
+  await call("/worker/heartbeat", caps(), second);
+  const id = enqueueAgent(),
+    secret = randomBytes(24).toString("hex");
+  registerCredential("AGENT_FAILURE_TEST", secret);
+  workers.leaseAgentJob("runner");
+  for (const body of [{}, { reason: 3 }, { reason: "bad", extra: true }])
+    expect((await call(agentPath(id, "failure"), body, first)).status).toBe(400);
+  for (const [worker, token] of [
+    ["runner", first],
+    ["second", second],
+  ]) {
+    if (!token || !worker) throw new Error("Missing worker");
+    if (worker === "second") workers.leaseAgentJob(worker);
+    const reason = worker === "runner" ? "Agent execution interrupted" : `Failed: ${secret}`;
+    expect((await call(agentPath(id, "failure"), { reason }, token)).status).toBe(200);
+    expect(workers.agentJob(id)?.failure_reason).toBe(
+      worker === "runner" ? reason : "[withheld: private text]",
+    );
+  }
+  expect(workers.agentJob(id)).toMatchObject({
+    state: "failed",
+    attempt: 2,
+    excluded: '["runner","second"]',
+  });
+});
+
+test("agent event volume stores 2,000 ordered events in 10 durable batches", async () => {
+  for (let i = 0; i < 600; i++) registerCredential(`AGENT_VOLUME_${i}`, randomBytes(24).toString("hex"));
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = enqueueAgent();
+  workers.leaseAgentJob("runner");
+  const start = performance.now();
+  for (let seq = 0; seq < 10; seq++) {
+    const events = Array.from({ length: 200 }, (_, i) => ({
+      type: "text",
+      text: `${seq * 200 + i}: ${"event output ".repeat(80)}`,
+    }));
+    expect((await call(agentPath(id, "events"), { seq, events }, token)).status).toBe(200);
+  }
+  console.log(
+    `Agent events: 2,000 events / 10 batches stored in ${(performance.now() - start).toFixed(1)} ms`,
+  );
+  const rows = batches();
+  expect(rows).toHaveLength(10);
+  const events = rows.flatMap((row) => JSON.parse(row.events) as { text: string }[]);
+  expect(events).toHaveLength(2000);
+  expect(events.map((e) => Number(e.text.split(":")[0]))).toEqual(Array.from({ length: 2000 }, (_, i) => i));
+});
+
+test.each([false, true])(
+  "agent bundles include the exact parent and optional base (base=%s), with cleanup",
+  async (withBase) => {
+    const gate = await request();
+    await sh(["git", "commit", "--allow-empty", "-qm", "second"], { cwd: gate.cwd });
+    const parent = (await sh(["git", "rev-parse", "HEAD"], { cwd: gate.cwd })).stdout.trim();
+    const cache = join(cfg.paths.repos, "test__repo.git");
+    await sh(["git", "clone", "--bare", gate.cwd, cache], { cwd: home });
+    await listen();
+    const token = await paired();
+    await call("/worker/heartbeat", caps(), token);
+    const id = enqueueAgent({
+      runId: gate.runId,
+      parentSha: parent,
+      ...(withBase ? { baseSha: gate.baseSha } : {}),
+    });
+    workers.leaseAgentJob("runner");
+    const command = await import("../src/git/command.ts"),
+      original = command.worktreeGit;
+    const dirs: string[] = [];
+    const spy = spyOn(command, "worktreeGit").mockImplementation((args, options) => {
+      if (args[1] === "bundle" && args[2] === "create") dirs.push(dirname(args[3] ?? ""));
+      return original(args, options);
+    });
+    try {
+      const response = await call(agentPath(id, "bundle"), undefined, token);
+      expect(response.status).toBe(200);
+      const bundle = join(home, "agent.bundle");
+      writeFileSync(bundle, response.data);
+      const heads = (await sh(["git", "bundle", "list-heads", bundle], { cwd: home })).stdout;
+      expect(heads).toContain(`${parent} refs/limitless-bundles/${id}/0`);
+      if (withBase) expect(heads).toContain(`${gate.baseSha} refs/limitless-bundles/${id}/1`);
+      else expect(heads.trim().split("\n")).toHaveLength(1);
+      const imported = join(home, "imported.git");
+      await sh(["git", "init", "--bare", "--template=", imported], { cwd: home });
+      await sh(["git", "bundle", "verify", bundle], { cwd: imported });
+      await sh(["git", "fetch", bundle, "+refs/*:refs/*"], { cwd: imported });
+      for (const sha of [parent, ...(withBase ? [gate.baseSha] : [])])
+        expect((await sh(["git", "cat-file", "-t", sha], { cwd: imported })).stdout.trim()).toBe("commit");
+      // A missing commit fails after creating the first temporary ref, which must still be removed.
+      const invalid = enqueueAgent({ runId: gate.runId, parentSha: parent, baseSha: "0".repeat(40) });
+      workers.leaseAgentJob("runner");
+      expect((await call(agentPath(invalid, "bundle"), undefined, token)).status).toBe(400);
+      expect(
+        (
+          await worktreeGit(["git", "for-each-ref", "--format=%(refname)", "refs/limitless-bundles/"], {
+            cwd: cache,
+          })
+        ).stdout,
+      ).toBe("");
+      expect(dirs.length).toBeGreaterThan(0);
+      expect(dirs.every((dir) => !existsSync(dir))).toBe(true);
+      workers.cancelAgentJob(id);
+      workers.cancelAgentJob(invalid);
+      const missing = enqueueAgent();
+      workers.leaseAgentJob("runner");
+      expect((await call(agentPath(missing, "bundle"), undefined, token)).status).toBe(400);
+    } finally {
+      spy.mockRestore();
+    }
+  },
+);
+
+test.each(["revoked", "cancelled"])(
+  "agent bundle rechecks a %s holder after asynchronous creation",
+  async (kind) => {
+    const gate = await request(true),
+      cache = join(cfg.paths.repos, "test__repo.git");
+    await listen();
+    const token = await paired();
+    await call("/worker/heartbeat", caps(), token);
+    const id = enqueueAgent({ runId: gate.runId, parentSha: gate.headSha });
+    workers.leaseAgentJob("runner");
+    const locked = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    const lock = withRepoLock(cache, async () => {
+      locked.resolve();
+      await release.promise;
+    });
+    await locked.promise;
+    const entered = Promise.withResolvers<void>(),
+      original = workers.holdsAgentJob.bind(workers);
+    const spy = spyOn(workers, "holdsAgentJob").mockImplementation((...args) => {
+      const job = original(...args);
+      entered.resolve();
+      return job;
+    });
+    try {
+      const response = call(agentPath(id, "bundle"), undefined, token);
+      await entered.promise;
+      if (kind === "revoked") workers.revoke("runner");
+      else workers.cancelAgentJob(id);
+      release.resolve();
+      expect((await response).status).toBe(kind === "revoked" ? 401 : 409);
+      expect(
+        (
+          await worktreeGit(["git", "for-each-ref", "--format=%(refname)", "refs/limitless-bundles/"], {
+            cwd: cache,
+          })
+        ).stdout,
+      ).toBe("");
+    } finally {
+      release.resolve();
+      await lock;
+      spy.mockRestore();
+    }
+  },
+);
