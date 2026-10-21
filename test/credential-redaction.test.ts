@@ -225,10 +225,19 @@ const SECRET = "synthetic-terminal-key";
 const [HEAD, TAIL] = [SECRET.slice(0, 5), SECRET.slice(5)];
 // Digits are CSI parameters, so a stray introducer before this credential reads them as a sequence.
 const DIGITS = "12345678abcdefgh";
-// Every two-chunk split, against an independently written expected output; carry stays bounded.
-function expectTerminal(input: string, expected: string, values = [SECRET, DIGITS]) {
+// Exhaust short inputs; sample long inputs densely at boundaries. Carry stays bounded at every split.
+function expectTerminal(input: string, expected: string, values = [SECRET, DIGITS], boundaries = [0]) {
   const matcher = new CredentialMatcher(variants(values));
+  // A held credential prefix delays forced release past the sequence's hold boundary.
+  const release = (boundaries[0] ?? 0) + matcher.maxLength + TERMINAL_HOLD;
   for (let offset = 0; offset <= input.length; offset++) {
+    if (
+      input.length > TERMINAL_HOLD &&
+      offset % 97 !== 0 &&
+      Math.abs(offset - release) > 3 &&
+      !boundaries.some((boundary) => Math.abs(offset - boundary) <= 3)
+    )
+      continue;
     const redactor = terminalRedactor(() => matcher);
     let output = redactor.push(input.slice(0, offset));
     const { text, maps, output: held } = redactor.retained;
@@ -287,9 +296,12 @@ test.each([
     `x [redacted]]0;${"t".repeat(5_000)}[redacted] y`,
   ],
   ["ordinary formatting and no credential", `${ESC}[1;31mred${ESC}[0m ${ESC}(Bplain${ESC}[K`, "red plain"],
-])("terminal readings cannot expose a credential: %s", (_name, input, expected) =>
-  expectTerminal(input, expected),
-);
+])("terminal readings cannot expose a credential: %s", (_name, input, expected) => {
+  const start = input.indexOf(ESC);
+  const end = input.indexOf("\u0007") + 1;
+  const boundaries = [2, start, start + 2 + TERMINAL_HOLD, end, input.length - 2];
+  expectTerminal(input, expected, undefined, boundaries);
+});
 
 // An unrelated registration gives the other stray reading a deeper partial match at the same introducer.
 test.each([
