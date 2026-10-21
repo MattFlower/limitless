@@ -155,6 +155,7 @@ beforeEach(async () => {
   });
   factory.deps.gh = async (args, _signal, stdin) => {
     calls.push(args);
+    if (args[1] === "list") return "";
     if (args[1] === "ready" && args.includes("--undo")) {
       draft = true;
       return "";

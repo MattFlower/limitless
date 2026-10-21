@@ -56,8 +56,10 @@ import {
   githubRetry,
   headSha,
   isAncestor,
+  matchesPullRequest,
   mergeBase,
   mergePullRequest,
+  type PullRequestIdentity,
   pushBranch,
   pushExistingBranch,
   readFileAt,
@@ -498,7 +500,11 @@ async function prepare(ctx: RunContext): Promise<void> {
     if (ctx.repo.kind === "github") await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
-    const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base, { cfg, store });
+    const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base, {
+      cfg,
+      store,
+      gh: ctx.deps.gh,
+    });
     const review = reviewRound(ctx);
     // Refused before any model call; delivery checks the PR again just before pushing.
     if (review && wt.baseSha !== review.reviewedSha)
@@ -2257,6 +2263,12 @@ async function checkPublication(
   }
 }
 
+function deliveryIdentity(ctx: RunContext, headSha = ctx.run.headSha): PullRequestIdentity | undefined {
+  return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet
+    ? { headSha: headSha ?? "", prUrl: ctx.run.prUrl }
+    : undefined;
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -2277,7 +2289,7 @@ async function deliverVerifiedDraft(
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
   // keep the draft below from finding it.
   if (!ctx.run.prUrl) {
-    const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal);
+    const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal, deliveryIdentity(ctx, sha));
     if (found) ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: found });
   }
   ctx.checkCancelled();
@@ -2292,6 +2304,7 @@ async function deliverVerifiedDraft(
     body,
     cwd,
     draft: true,
+    identity: deliveryIdentity(ctx, sha),
     signal: ctx.signal,
     budget,
   });
@@ -2453,6 +2466,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       !review &&
       (ctx.run.prUrl || ctx.store.listStages(ctx.run.id).filter((s) => s.name === "deliver").length > 1)
     ) {
+      const identity = deliveryIdentity(ctx);
       const raw = await gh(
         ctx.run.prUrl
           ? ["pr", "view", ctx.run.prUrl, "--repo", ctx.repo.slug, "--json", "state,url"]
@@ -2466,12 +2480,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               "--state",
               "all",
               "--json",
-              "state,url",
+              identity ? "state,url,headRefOid" : "state,url",
             ],
         ctx.signal,
       );
       const data: unknown = JSON.parse(raw || "null");
-      const pr = Array.isArray(data) ? data[0] : data;
+      const pr = (Array.isArray(data) ? data : [data]).find(
+        (pr) => !identity || matchesPullRequest(pr, identity),
+      );
       if (pr && typeof pr === "object" && "state" in pr && pr.state === "MERGED") {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
@@ -2699,6 +2715,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       body,
       cwd,
       draft: !success,
+      identity: deliveryIdentity(ctx, head),
       signal: ctx.signal,
       budget,
     });

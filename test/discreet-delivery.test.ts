@@ -3,12 +3,18 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { repoSettings } from "../src/config.ts";
-import { cachePath, createWorktree, ensureCache } from "../src/git/repos.ts";
+import {
+  cachePath,
+  createPullRequest,
+  createWorktree,
+  ensureCache,
+  findPullRequest,
+} from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 
 const state = { home: "", repoDir: "", factory: null as Factory | null };
-const { start, githubFixture, registerGithub } = pipelineSetup(state);
+const { start, githubFixture, registerGithub, wait } = pipelineSetup(state);
 
 test.each([true, false])("delivery publishes expected text (discreet: %s)", async (discreet) => {
   const bare = await githubFixture();
@@ -102,9 +108,129 @@ test("branch allocation checks stored, local and remote names and resumes a suff
   });
   const recorded = f.store.createRun(repo, { repo: repo.slug, prompt: "recorded" });
   f.store.updateRun(recorded.id, { branch: "change/add-farewell-5" });
-  expect((await allocate()).branch).toBe("change/add-farewell-6");
+  // Closed/merged PRs survive auto-deletion of their head refs and removal of local run records.
+  writeFileSync(
+    join(state.home, "bin", "gh"),
+    `#!/bin/sh
+echo "$*" >> '${join(state.home, "gh-calls")}'
+case "$*" in
+  *'--head change/add-farewell-6 --state all '*) echo 61 ;;
+  *'--head change/add-farewell-7 --state all '*) echo 62 ;;
+esac
+`,
+  );
+  expect((await allocate()).branch).toBe("change/add-farewell-8");
   f.cfg.repos["test/repo"] = { discreet: false, branchPrefix: "feat/" };
   const ordinary = await allocate();
   expect(ordinary.branch).toBe(`limitless/${ordinary.id}-add-farewell`);
   expect(repoSettings(f.cfg, repo.slug).discreet).toBe(false);
+});
+
+test.each(["unrelated", "matching head", "recorded URL"])(
+  "discreet PR lookup only recovers this delivery: %s",
+  async (scenario) => {
+    const bare = await githubFixture();
+    const f = start(() => ({ text: "unused" }));
+    await f.scheduler.stop();
+    registerGithub(f, bare);
+    const repo = f.store.getRepoBySlug("test/repo");
+    if (!repo) throw new Error("missing repo");
+    const oldUrl = "https://github.com/test/repo/pull/1";
+    const ownUrl = "https://github.com/test/repo/pull/2";
+    const headSha = "a".repeat(40);
+    const prs = [{ url: oldUrl, headRefOid: "b".repeat(40) }];
+    if (scenario !== "unrelated")
+      prs.push({ url: ownUrl, headRefOid: scenario === "matching head" ? headSha : "c".repeat(40) });
+    writeFileSync(
+      join(state.home, "bin", "gh"),
+      `#!${process.execPath}
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(join(state.home, "gh-calls"))}, args.join(" ")+"\\n");
+const prs = ${JSON.stringify(prs)};
+if (args[1] === "list") console.log(args.includes("--jq") ? prs[0]?.url : JSON.stringify(prs));
+if (args[1] === "create") console.log(${JSON.stringify(ownUrl)});
+`,
+    );
+    const identity = { headSha, prUrl: scenario === "recorded URL" ? ownUrl : null };
+    expect(await findPullRequest(repo, "change/add-farewell", state.repoDir, undefined, identity)).toBe(
+      scenario === "unrelated" ? null : ownUrl,
+    );
+    expect(
+      await createPullRequest(repo, {
+        branch: "change/add-farewell",
+        base: "main",
+        title: "Add farewell",
+        body: "Report",
+        cwd: state.repoDir,
+        identity,
+      }),
+    ).toBe(ownUrl);
+    const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+    expect(calls).not.toContain(`pr edit ${oldUrl}`);
+    if (scenario === "unrelated") {
+      expect(calls).toContain("pr create");
+      expect(calls).not.toContain("pr edit");
+    } else {
+      expect(calls).not.toContain("pr create");
+      expect(calls).toContain(`pr edit ${ownUrl}`);
+    }
+  },
+);
+
+test("discreet delivery restart ignores an unrelated merged PR with the same branch", async () => {
+  const bare = await githubFixture();
+  mkdirSync(join(state.home, "cfg"));
+  writeFileSync(join(state.home, "cfg", "config.toml"), '[repos."test/repo"]\ndiscreet = true');
+  const f = start(
+    (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    false,
+    { faults: { "stage:deliver:before": { action: "kill" } } },
+  );
+  registerGithub(f, bare);
+  const run = await f.createRun({
+    repo: "test/repo",
+    prompt: "Add farewell",
+    title: "Add farewell",
+    profile: "quick",
+  });
+  await wait(() => f.store.listStages(run.id).at(-1)?.status === "cancelled", {
+    timeoutMs: 10_000,
+    pollMs: null,
+    subscribe: (wake) => f.store.subscribe(wake),
+  });
+  await f.stop();
+  expect(f.store.getRun(run.id)?.branch).toBe("change/add-farewell");
+  f.store.close();
+  // Simulate a run allocated before historical PRs were included in collision detection.
+  writeFileSync(
+    join(state.home, "bin", "gh"),
+    `#!${process.execPath}
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(join(state.home, "gh-calls"))}, args.join(" ")+"\\n");
+if (args[1] === "list") console.log(JSON.stringify([{state:"MERGED",url:"https://github.com/test/repo/pull/91",headRefOid:"${"b".repeat(40)}"}]));
+if (args[1] === "create") console.log("https://github.com/test/repo/pull/2");
+`,
+  );
+  const resumed = start(() => {
+    throw new Error("delivery must not invoke agents");
+  });
+  expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const finished = resumed.store.getRun(run.id);
+  expect(finished?.prUrl).toBe("https://github.com/test/repo/pull/2");
+  expect(finished?.merged).toBe(false);
+  expect(resumed.store.runForPr("https://github.com/test/repo/pull/91")).toBeNull();
+  const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+  expect(calls).toContain("--json state,url,headRefOid");
+  expect(calls).toContain("pr create");
+  expect(calls).not.toContain("pr edit");
+  expect((await sh(["git", "rev-parse", "change/add-farewell"], { cwd: bare })).stdout.trim()).toBe(
+    finished?.headSha ?? "",
+  );
 });

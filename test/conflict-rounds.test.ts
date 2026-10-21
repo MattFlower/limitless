@@ -173,6 +173,7 @@ beforeEach(async () => {
     },
   });
   factory.deps.gh = async (args, _signal, stdin) => {
+    if (args[1] === "list") return "";
     calls.push(args);
     if (args[1] === "ready" && args.includes("--undo")) {
       draft = true;

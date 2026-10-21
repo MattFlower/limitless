@@ -198,6 +198,7 @@ function makeFactory(faults?: FaultPlan): Factory {
   });
   // Fake `gh`: the PR's head is whatever the bare remote's branch holds.
   f.deps.gh = async (args, _signal, stdin) => {
+    if (args[1] === "list") return "";
     pr.calls.push(args);
     if (args[0] === "pr" && args[1] === "view" && args[2] === PR_URL) {
       if (pr.fail) throw new Error("GraphQL: Could not resolve to a PullRequest");

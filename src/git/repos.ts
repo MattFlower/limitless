@@ -14,6 +14,7 @@ import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
+import type { GhRunner } from "../integrations/github.ts";
 import { CommandError, redactCredentials, registeredCredentials, sh } from "../util/proc.ts";
 import {
   cacheGit,
@@ -317,7 +318,7 @@ export async function createWorktree(
   runId: string,
   title: string,
   baseBranch: string,
-  options: { cfg?: Pick<Config, "repos">; store?: Store } = {},
+  options: { cfg?: Pick<Config, "repos">; store?: Store; gh?: GhRunner } = {},
 ): Promise<Worktree> {
   const cache = cachePath(paths, repo);
   const path = join(paths.work, runId);
@@ -351,12 +352,18 @@ export async function createWorktree(
           .map((r) => r.branch),
       );
       const name = `${settings.branchPrefix}${slugify(title, 30)}`;
+      const gh = options.gh;
       branch = name;
       for (
         let suffix = 2;
         recorded.has(branch) ||
         taken.has(`refs/heads/${branch}`) ||
-        taken.has(`refs/remotes/origin/${branch}`);
+        taken.has(`refs/remotes/origin/${branch}`) ||
+        (repo.kind === "github" &&
+          (gh
+            ? await withGitHubRetry(async () => (await gh(prLookup(repo, branch).slice(1))) ?? "")
+            : (await remoteSh(prLookup(repo, branch), { cwd: cache })).stdout
+          ).trim() !== "");
         suffix++
       )
         branch = `${name}-${suffix}`;
@@ -1483,6 +1490,33 @@ function isHttpUrl(value: string): boolean {
   return protocol === "http:" || protocol === "https:";
 }
 
+export interface PullRequestIdentity {
+  headSha: string;
+  prUrl?: string | null;
+}
+
+/** Reusable branch names alone cannot identify a delivery's PR. */
+export function matchesPullRequest(
+  pr: unknown,
+  identity: PullRequestIdentity,
+): pr is { url: string; headRefOid?: unknown } {
+  return (
+    !!pr &&
+    typeof pr === "object" &&
+    "url" in pr &&
+    typeof pr.url === "string" &&
+    (pr.url === identity.prUrl ||
+      (!!identity.headSha && "headRefOid" in pr && pr.headRefOid === identity.headSha))
+  );
+}
+
+function lookupUrl(raw: string, identity?: PullRequestIdentity): string {
+  if (!identity) return raw.trim();
+  const prs: unknown = JSON.parse(raw || "[]");
+  if (!Array.isArray(prs)) throw new Error("PR lookup did not return a list");
+  return prs.find((pr): pr is { url: string } => matchesPullRequest(pr, identity))?.url ?? "";
+}
+
 export async function createPullRequest(
   repo: Repo,
   opts: {
@@ -1494,13 +1528,14 @@ export async function createPullRequest(
     draft?: boolean;
     signal?: AbortSignal;
     budget?: GitHubBudget;
+    identity?: PullRequestIdentity;
   },
 ): Promise<string> {
   const { cwd, signal } = opts;
   // A final lookup failure means "none found", as before; transient ones retry the attempt.
   const find = () =>
-    sh(prLookup(repo, opts.branch), { cwd, signal }).then(
-      (r) => r.stdout.trim(),
+    sh(prLookup(repo, opts.branch, opts.identity), { cwd, signal }).then(
+      (r) => lookupUrl(r.stdout, opts.identity),
       (e) => (isTransient(e) || signal?.aborted ? Promise.reject(e) : ""),
     );
   let existing = false;
@@ -1537,9 +1572,9 @@ export async function createPullRequest(
   return url;
 }
 
-const prLookup = (repo: Repo, branch: string) => [
+const prLookup = (repo: Repo, branch: string, identity?: PullRequestIdentity) => [
   ...["gh", "pr", "list", "--repo", repo.slug, "--head", branch, "--state", "all"],
-  ...["--json", "url", "--jq", ".[0].url"],
+  ...(identity ? ["--json", "url,headRefOid"] : ["--json", "url", "--jq", ".[0].url"]),
 ];
 
 /**
@@ -1551,14 +1586,18 @@ export async function findPullRequest(
   branch: string,
   cwd: string,
   signal?: AbortSignal,
+  identity?: PullRequestIdentity,
 ): Promise<string | null> {
-  const res = await sh(prLookup(repo, branch), { cwd, signal, timeoutMs: 15_000, allowFail: true }).catch(
-    (e) => {
-      if (signal?.aborted) throw e;
-      return null;
-    },
-  );
-  const url = res?.exitCode === 0 ? res.stdout.trim() : "";
+  const res = await sh(prLookup(repo, branch, identity), {
+    cwd,
+    signal,
+    timeoutMs: 15_000,
+    allowFail: true,
+  }).catch((e) => {
+    if (signal?.aborted) throw e;
+    return null;
+  });
+  const url = res?.exitCode === 0 ? lookupUrl(res.stdout, identity) : "";
   return isHttpUrl(url) ? url : null;
 }
 
