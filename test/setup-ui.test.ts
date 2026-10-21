@@ -8,9 +8,11 @@ import type { ProviderStatus, Run, RunModels } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import type { RoutePreview } from "../src/router/router.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import type { CatalogSnapshot, RoutingSnapshot } from "../ui/api.ts";
 import { deferred } from "./evals-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { buildSetupUi, closeSetupBrowser, settle, setupLayout, type Ui } from "./setup-ui-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -704,31 +706,38 @@ test("Setup displays configured origin exclusions without an edit control", asyn
   });
 });
 
-test("Setup renders redacted unavailable diagnostics from the runtime snapshots", async () => {
+test("Setup renders redacted stored ids, history and unavailable diagnostics from API snapshots", async () => {
   const credential = "synthetic-setup-credential-419";
   registerCredential("LIMITLESS_TEST_SETUP_DIAGNOSTIC_KEY", credential);
   const provider = `retired-${credential}`;
-  const store = new Store(":memory:");
+  const store = new Store(join(dir, "redaction.sqlite"));
+  store.writeRouting("triage.default", [`${provider}/old`], null, "previous release");
   store.writeRouting("triage.default", [`${provider}/legacy`], null, "previous release");
   store.writeRouting("prefer", [provider], null, "previous release");
-  store.writeRuntimeModel("retired-lan/runtime", {
+  const retired = {
     ...first,
-    id: "retired-lan/runtime",
+    id: `${provider}/runtime`,
     provider,
-    source: "runtime",
-  });
+    source: "runtime" as const,
+  };
+  store.writeRuntimeModel(retired.id, retired);
+  store.writeRuntimeModel(retired.id, { ...retired, model: "updated-backend" });
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   try {
     const factory = new Factory(loadConfig({ home: dir, configDir: dir }), { store });
+    const routes = createHttpRoutes(factory);
+    const snapshot = async (path: string) =>
+      (await (routes[path] as Route)(requestWithParams(`http://localhost${path}`), localServer)).json();
     await fixture(async (_sent, state) => {
-      state.routing.unavailable = factory.routing.snapshot().unavailable;
-      const retired = factory.catalog.snapshot().models.find((m) => m.id === "retired-lan/runtime");
-      if (!retired) throw new Error("missing retired runtime model");
-      state.catalog.models.push(retired);
+      state.routing = await snapshot("/api/routing");
+      state.catalog = await snapshot("/api/catalog");
       ui.emit({ kind: "reconnected" });
       await settle();
       const html = ui.render();
       expect(html).not.toContain(credential);
+      expect(html.split("Routing history")[1]).toContain("retired-[redacted]/old");
+      expect(html.split("Routing history")[1]).toContain("retired-[redacted]/legacy");
+      expect(html.split("Catalog history")[1]).toContain("retired-[redacted]/runtime");
       expect(html).toContain("retired-[redacted]/legacy: unavailable");
       expect(html).toContain("retired-[redacted]: unavailable");
       expect(html).toContain("no override; falling back to code/evals policy");
