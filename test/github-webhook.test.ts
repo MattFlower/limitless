@@ -12,6 +12,7 @@ import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import type { GitHubClient } from "../src/integrations/github-poller.ts";
 import { type IntegrationDeps, type Integrations, mountIntegrations } from "../src/integrations/index.ts";
 import { LandQueue } from "../src/land/queue.ts";
+import { registerCredential } from "../src/util/proc.ts";
 
 const fixture = (name: string): string => readFileSync(join(import.meta.dir, "data", name), "utf8").trim();
 let dir: string;
@@ -116,14 +117,68 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   const missingDelivery = request(body, "missing");
   missingDelivery.headers.delete("x-github-delivery");
   expect((await h(missingDelivery)).status).toBe(400);
-  expect(store.db.query("SELECT COUNT(*) AS count FROM inbox").get()).toEqual({ count: 3 });
-  expect(store.db.query("SELECT status, note FROM inbox WHERE id = 'e'").get()).toEqual({
-    status: "error",
-    note: "invalid JSON",
-  });
+  expect(store.db.query("SELECT COUNT(*) AS count FROM inbox").get()).toEqual({ count: 6 });
+  const malformed = { status: "error", note: "invalid JSON", run_id: null };
+  expect(store.db.query("SELECT status, note, run_id FROM inbox WHERE id = 'e'").get()).toEqual(malformed);
   expect((await h(request("{broken", "e"))).status).toBe(200);
+  expect(store.db.query("SELECT status, note, run_id FROM inbox WHERE id = 'e'").get()).toEqual(malformed);
+  expect(store.listRuns()).toHaveLength(2);
   expect((await h(new Request("http://localhost/webhooks/github"))).status).toBe(405);
   expect(requests).toHaveLength(2);
+});
+
+test("signature mismatch audit cannot reserve or overwrite authenticated deliveries", async () => {
+  const body = fixture("github-issue.json");
+  const h = handler();
+  const credential = "webhook-audit-test-credential";
+  registerCredential("WEBHOOK_AUDIT_TEST", credential);
+  for (const validFirst of [false, true]) {
+    const id = `${validFirst}-${credential}`;
+    if (validFirst) expect((await h(request(body, id))).status).toBe(201);
+    const before = store.db.query("SELECT * FROM inbox WHERE id = ?").get(id);
+    const runCount = store.listRuns().length;
+    // Invalid JSON must still be rejected for its signature before payload processing.
+    const invalid = request("{broken", id);
+    invalid.headers.set("x-hub-signature-256", `sha256=${"0".repeat(64)}`);
+    invalid.headers.set("x-github-event", credential);
+    expect((await h(invalid)).status).toBe(401);
+    expect(store.listRuns()).toHaveLength(runCount);
+    expect(requests).toHaveLength(runCount);
+    expect(store.db.query("SELECT * FROM inbox WHERE id = ?").get(id)).toEqual(before);
+    if (!validFirst) expect((await h(request(body, id))).status).toBe(201);
+    const authenticated = store.db.query("SELECT * FROM inbox WHERE id = ?").get(id);
+    expect((await h(request(body, id))).status).toBe(200);
+    expect(store.db.query("SELECT * FROM inbox WHERE id = ?").get(id)).toEqual(authenticated);
+  }
+  const reopened = new Store(join(dir, "store.db"));
+  try {
+    const rejections = reopened.db
+      .query("SELECT id, kind, payload, status, note, run_id FROM inbox WHERE status = 'error'")
+      .all() as { id: string; kind: string; payload: string; status: string; note: string; run_id: null }[];
+    expect(rejections).toHaveLength(2);
+    for (const rejection of rejections) {
+      expect(rejection).toMatchObject({
+        status: "error",
+        note: "invalid signature",
+        run_id: null,
+        kind: "[redacted]",
+      });
+      expect(JSON.stringify(rejection)).not.toContain(credential);
+      expect(JSON.parse(rejection.payload)).toEqual({
+        deliveryId: expect.stringContaining("[redacted]"),
+      });
+      // An audit ID cannot be supplied as a later authenticated delivery header.
+      expect(() => request(body, rejection.id)).toThrow();
+    }
+    const runs = reopened.listRuns();
+    expect(runs).toHaveLength(2);
+    expect(requests).toHaveLength(2);
+    expect(
+      reopened.db.query("SELECT run_id FROM inbox WHERE status = 'run_created' ORDER BY run_id").all(),
+    ).toEqual(runs.map((run) => ({ run_id: run.id })).sort((a, b) => a.run_id.localeCompare(b.run_id)));
+  } finally {
+    reopened.close();
+  }
 });
 
 test("mounting with fake dependencies spawns no processes, including notifier activity", async () => {
@@ -285,7 +340,9 @@ test("deduplicates and finalizes inbox", async () => {
   const body = fixture("github-issue.json");
   const h = handler();
   expect((await h(request(body))).status).toBe(201);
+  const original = store.db.query("SELECT * FROM inbox WHERE id = ?").get("delivery-1");
   expect((await h(request(body))).status).toBe(200);
+  expect(store.db.query("SELECT * FROM inbox WHERE id = ?").get("delivery-1")).toEqual(original);
   expect(requests).toHaveLength(1);
   const row = store.db
     .query("SELECT status, note, run_id FROM inbox WHERE id = ?")
@@ -293,6 +350,8 @@ test("deduplicates and finalizes inbox", async () => {
   expect(row.status).toBe("run_created");
   expect(row.note).toBe("owner issue labeled");
   expect(row.run_id).toBeTruthy();
+  expect(store.listRuns()).toHaveLength(1);
+  expect(row.run_id).toBe(store.listRuns()[0]?.id);
 });
 
 test("maps issue and comment with quoted attacker text", async () => {
@@ -481,14 +540,17 @@ test("filters unsupported, unauthorized, wrong label, malformed and fork payload
   for (const [index, [event, payload, outcome, status]] of cases.entries()) {
     const id = `filter-${index}`;
     expect((await h(request(JSON.stringify(payload), id, true, event))).status).toBe(status);
-    const row = store.db.query("SELECT status, note FROM inbox WHERE id = ?").get(id) as Record<
+    const row = store.db.query("SELECT status, note, run_id FROM inbox WHERE id = ?").get(id) as Record<
       string,
       unknown
     >;
     expect(row.status).toBe(outcome);
     expect(row.note).toBeTruthy();
+    if (outcome === "error") expect(row.note).toMatch(/^malformed (issue|pull request)$/);
+    expect(row.run_id).toBeNull();
   }
   expect(requests).toHaveLength(0);
+  expect(store.listRuns()).toHaveLength(0);
   expect(mapGitHubEvent("ping", issue, "MattFlower").request).toBeUndefined();
   expect(
     mapGitHubEvent("issues", { ...issue, repository: { full_name: "some-org/project" } }, "MattFlower"),

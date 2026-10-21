@@ -386,7 +386,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
         )
           return "running";
-        if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
+        // A failed fallback must retain the delivery fault that made the draft necessary.
+        if (err instanceof NeedsHumanError)
+          message += `; verified-work draft failed: ${redactGateOutput(err.message)}`;
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (

@@ -1,5 +1,7 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +44,7 @@ import {
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
+import * as proc from "../src/util/proc.ts";
 import {
   CommandError,
   type ProcOptions,
@@ -1038,6 +1041,120 @@ test("failed checkpoint leaves durable state usable after SQLite reopen", async 
   }
 });
 
+test.each(["ENOSPC", "EACCES"])("filesystem write failure: %s", async (code) => {
+  let armed = false;
+  const f = factory({
+    "stage:prepare:before": {
+      action: "continue",
+      onHit: () => {
+        armed = true;
+      },
+    },
+  });
+  const run = await f.createRun({ repo: source, prompt: "Change" });
+  const sidecar = `${join(f.cfg.paths.work, run.id)}.git-paths`;
+  const write = fs.writeFileSync;
+  let hits = 0;
+  // Fail the actual worktree metadata writer, rather than the surrounding stage.
+  const writes = spyOn(fs, "writeFileSync").mockImplementation((path, ...args) => {
+    if (armed && String(path) === sidecar) {
+      hits++;
+      throw Object.assign(new Error(`${code}: write worktree Git paths '${path}'`), {
+        code,
+        syscall: "write",
+        path,
+      });
+    }
+    return write(path, ...args);
+  });
+  try {
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("failed");
+  } finally {
+    writes.mockRestore();
+  }
+  expect(hits).toBe(1);
+  expect(existsSync(sidecar)).toBe(false);
+  const db = new Store(f.cfg.paths.db);
+  try {
+    const persisted = db.getRun(run.id);
+    expect(persisted?.status).toBe("failed");
+    expect(persisted?.finishedAt).toBeNumber();
+    expect(persisted?.error).toContain(code);
+    expect(persisted?.error).toContain("write worktree Git paths");
+    expect(db.getRunState<RunState>(run.id)?.phase).toBe("prepare");
+    const stages = db.listStages(run.id);
+    expect(stages).toHaveLength(1);
+    expect(stages[0]).toMatchObject({ name: "prepare", status: "failed" });
+    expect(stages[0]?.summary).toContain(code);
+    expect(stages[0]?.finishedAt).toBeNumber();
+    expect(db.listInvocations(run.id)).toEqual([]);
+    expect(db.db.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+  } finally {
+    db.close();
+  }
+});
+
+test("SQLite busy timeout aborts a state save without a half-written checkpoint", async () => {
+  let before: RunState | null = null;
+  let afterFailure: RunState | null = null;
+  let busy: unknown;
+  let hits = 0;
+  const f = factory({
+    "store:save": {
+      action: "continue",
+      when: (context) => context.stage === "triage",
+      onHit: ({ runId }) => {
+        hits++;
+        before = f.store.getRunState<RunState>(runId);
+        blocker.exec("BEGIN IMMEDIATE");
+      },
+    },
+  });
+  const run = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  f.store.db.exec("PRAGMA busy_timeout = 10");
+  const blocker = new Database(f.cfg.paths.db);
+  const save = f.store.setRunState.bind(f.store);
+  const saves = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+    if (!blocker.inTransaction) return save(id, state);
+    try {
+      // This is the real Store UPDATE on a separate connection's locked database.
+      save(id, state);
+    } catch (error) {
+      busy = error;
+      afterFailure = f.store.getRunState<RunState>(id);
+      throw error;
+    } finally {
+      // Let stage/run failure bookkeeping persist after the failed save.
+      blocker.exec("ROLLBACK");
+    }
+  });
+  try {
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("failed");
+  } finally {
+    saves.mockRestore();
+    blocker.close();
+  }
+  expect(hits).toBe(1);
+  expect(busy).toMatchObject({ code: "SQLITE_BUSY", errno: 5 });
+  expect(before).toMatchObject({ phase: "triage", round: 0 });
+  expect(afterFailure).toEqual(before);
+  const db = new Store(f.cfg.paths.db);
+  try {
+    expect(db.getRunState<RunState>(run.id)).toEqual(before);
+    expect(db.getRun(run.id)).toMatchObject({ status: "failed", error: "database is locked" });
+    expect(db.listStages(run.id).map((s) => [s.name, s.status])).toEqual([
+      ["prepare", "succeeded"],
+      ["triage", "failed"],
+    ]);
+    expect(db.listStages(run.id).at(-1)?.summary).toContain("database is locked");
+    expect(db.listStages(run.id).every((s) => s.finishedAt !== null)).toBe(true);
+    expect(db.listInvocations(run.id).map((i) => [i.role, i.status])).toEqual([["triage", "ok"]]);
+    expect(db.db.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+  } finally {
+    db.close();
+  }
+});
+
 for (const [checkpoint, action] of [
   ["implementation-committed", "kill"],
   ["stage:implement:after", "kill"],
@@ -1304,7 +1421,7 @@ function fakeGh(pr: string) {
   mkdirSync(bin);
   writeFileSync(
     join(bin, "gh"),
-    // `${pr}.fail` queues scripted failures: {on, err?, landed?, hang?, delay?} (no err: succeed with
+    // `${pr}.fail` queues scripted failures: {on, err?, output?, landed?, hang?, delay?} (no err: succeed with
     // no output; hang: never exit, so the caller's command timeout fires; delay: ms before acting).
     `#!${process.execPath}
 import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
@@ -1316,7 +1433,7 @@ const fail=q[0]&&cmd.startsWith(q[0].on)?q.shift():null;
 writeFileSync(file+".fail",JSON.stringify(q));
 if(fail?.delay) await Bun.sleep(fail.delay);
 const out=fail?()=>{}:console.log, end=()=>{ if(fail?.hang){setInterval(()=>{},1e6);return;} if(fail?.err){console.error(fail.err);process.exit(1);} };
-if(fail&&!fail.landed){end();process.exit(0);}
+if(fail&&!fail.landed){if(fail.output)console.log(fail.output);end();process.exit(0);}
 if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); out(process.argv.includes("--jq") ? url : JSON.stringify([{state:state(),url}])); }
 if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
 if(process.argv[3]==="merge") writeFileSync(file+".merged","");
@@ -2554,6 +2671,194 @@ for (const failures of [2, 3]) {
     timeout,
   );
 }
+
+// Stop after verification so every fault targets delivery, including real cache damage.
+async function deliveryFaultFixture() {
+  const remote = join(root, "remote.git");
+  await sh(["git", "clone", "--bare", source, remote], { cwd: root });
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  try {
+    // Exercise real local pushes; only gh and explicitly injected network faults are faked.
+    rmSync(join(root, "bin", "git"));
+    const f = factory({ "stage:deliver:before": { action: "kill" } });
+    const repo = githubRun(f, remote);
+    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+    const signal = new AbortController().signal;
+    expect(await executeRun(f.deps, r.id, signal)).toBe("running");
+    const saved = f.store.getRunState<RunState>(r.id);
+    if (!saved?.lastVerifiedSha || !saved.worktreePath) throw new Error("missing verified fixture");
+    const before = { ...saved, lastVerifiedSha: saved.lastVerifiedSha, worktreePath: saved.worktreePath };
+    expect(before.phase).toBe("deliver");
+    expect(before.reviewedSha).toBe(before.lastVerifiedSha);
+    const refs = async () =>
+      (await sh(["git", "for-each-ref", "--format=%(refname) %(objectname)"], { cwd: remote })).stdout;
+    const finish = async (reason: string, draft: boolean) => {
+      expect(await executeRun(f.deps, r.id, signal)).toBe("needs_human");
+      const run = f.store.getRun(r.id);
+      const state = f.store.getRunState<RunState>(r.id);
+      expect(run).toMatchObject({
+        status: "needs_human",
+        merged: false,
+        prUrl: draft ? "https://github.com/test/repo/pull/1" : null,
+        headSha: before.lastVerifiedSha,
+      });
+      expect(run?.error, state?.needsHumanReason).toContain(reason);
+      expect(state?.needsHumanReason).toContain(reason);
+      expect(state?.lastVerifiedSha).toBe(before.lastVerifiedSha);
+      expect(state?.reviewedSha).toBe(before.reviewedSha);
+      expect(state?.lastVerifiedEvidence).toEqual(before.lastVerifiedEvidence);
+      expect(state?.phase).toBe("deliver");
+      expect(state?.deliveryComplete ?? false).toBe(draft);
+      expect(f.store.listStages(r.id).some((s) => s.name === "deliver" && s.status === "succeeded")).toBe(
+        draft,
+      );
+      expect(state?.pendingRebaseSha).toBeUndefined();
+      expect(state?.worktreePath).toBe(before.worktreePath);
+      expect(existsSync(before.worktreePath)).toBe(true);
+      const creates = ghCalls(pr, "pr create");
+      if (creates.length) expect(creates.at(-1)).toContain("--draft");
+      expect(ghCalls(pr, "pr merge")).toHaveLength(0);
+    };
+    return {
+      f,
+      r,
+      before,
+      remote,
+      pr,
+      restore,
+      refs,
+      finish,
+      cache: join(f.cfg.paths.repos, "test__repo.git"),
+    };
+  } catch (error) {
+    await restore();
+    throw error;
+  }
+}
+
+test.each(["permanent PR-create failure", "PR-create timeout", "unparsable PR-create response"])(
+  "delivery persists needs_human after %s through fallback",
+  async (fault) => {
+    const { before, remote, pr, restore, finish } = await deliveryFaultFixture();
+    const timeout = fault === "PR-create timeout";
+    const reason = timeout
+      ? "gh pr create timed out"
+      : fault === "permanent PR-create failure"
+        ? "HTTP 422: Validation Failed"
+        : "gh pr create returned unexpected output: https://";
+    const attempts = timeout ? githubRetry.attempts * 2 : 2;
+    writeFileSync(
+      `${pr}.fail`,
+      JSON.stringify(
+        Array(attempts).fill({
+          on: "pr create",
+          ...(timeout
+            ? {}
+            : fault === "permanent PR-create failure"
+              ? { err: reason }
+              : { output: "https://" }),
+        }),
+      ),
+    );
+    const realSh = proc.sh;
+    // Simulate a command-boundary timeout after recording the fake gh call, without a 120s wait.
+    const command = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+      const result = await realSh(cmd, opts);
+      if (timeout && cmd.slice(0, 3).join(" ") === "gh pr create")
+        throw new CommandError(reason, null, result.stdout, "", true);
+      return result;
+    });
+    try {
+      await finish(reason, false);
+      expect(ghCalls(pr, "pr create")).toHaveLength(attempts);
+      expect(JSON.parse(readFileSync(`${pr}.fail`, "utf8"))).toEqual([]);
+      expect(existsSync(pr)).toBe(false);
+      const published = (
+        await sh(["git", "for-each-ref", "--format=%(objectname)", "refs/heads/limitless/"], { cwd: remote })
+      ).stdout.trim();
+      expect(published).toBe(before.lastVerifiedSha);
+    } finally {
+      command.mockRestore();
+      await restore();
+    }
+  },
+);
+
+test.each([
+  ["push rejection", "stale info", false],
+  ["exhausted network fetch failure", "Could not resolve host: example.invalid", true],
+  ["deleted base branch", "couldn't find remote ref refs/heads/main", true],
+  ["blocking bare-cache Git lock", "main.lock", true],
+  ["corrupt bare cache", "failed to unpack tree object HEAD", false],
+] as const)("delivery persists needs_human after %s", async (fault, reason, draft) => {
+  const { f, r, before, remote, pr, restore, refs, finish, cache } = await deliveryFaultFixture();
+  const branch = f.store.getRun(r.id)?.branch;
+  if (!branch) throw new Error("missing delivery branch");
+  const realGit = Bun.which("git");
+  if (!realGit) throw new Error("missing git");
+  try {
+    if (fault === "push rejection") {
+      // The transport expects a new branch; another writer already published it.
+      await sh(["git", "update-ref", `refs/heads/${branch}`, "refs/heads/main"], { cwd: remote });
+    } else if (fault === "deleted base branch") {
+      await sh(["git", "update-ref", "-d", "refs/heads/main"], { cwd: remote });
+    } else if (fault === "blocking bare-cache Git lock") {
+      // Force a ref update: an unchanged cached ref would not need its lock.
+      await sh(["git", "commit", "--allow-empty", "-qm", "advance base"], { cwd: source });
+      await sh(["git", "fetch", source, "main:refs/heads/main"], { cwd: remote });
+      const ref = join(cache, "refs/remotes/origin");
+      mkdirSync(ref, { recursive: true });
+      writeFileSync(join(ref, "main.lock"), "held by fixture\n");
+    } else if (fault === "corrupt bare cache") {
+      renameSync(join(cache, "objects"), join(root, "cached-objects"));
+      mkdirSync(join(cache, "objects"));
+    } else {
+      writeFileSync(
+        join(root, "bin", "git"),
+        `#!/bin/sh
+command=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")
+if [ "$command" = fetch ]; then
+  case "$*" in *'+refs/heads/main:refs/remotes/origin/main'*)
+    echo fetch >> '${join(root, "fetch-calls")}'
+    echo '${reason}' >&2; exit 128;;
+  esac
+fi
+exec '${realGit.replaceAll("'", "'\\''")}' "$@"
+`,
+        { mode: 0o755 },
+      );
+    }
+    const originalRefs = await refs();
+    await finish(reason, draft);
+    expect(ghCalls(pr, "pr create")).toHaveLength(draft ? 1 : 0);
+    if (draft) {
+      expect(f.store.getRun(r.id)?.prUrl).toBe(readFileSync(pr, "utf8"));
+      expect((await sh(["git", "rev-parse", `refs/heads/${branch}`], { cwd: remote })).stdout.trim()).toBe(
+        before.lastVerifiedSha,
+      );
+      expect((await refs()).trim().split("\n").sort()).toEqual(
+        [
+          ...originalRefs.trim().split("\n").filter(Boolean),
+          `refs/heads/${branch} ${before.lastVerifiedSha}`,
+        ].sort(),
+      );
+    } else expect(await refs()).toBe(originalRefs);
+    if (fault === "exhausted network fetch failure")
+      expect(readFileSync(join(root, "fetch-calls"), "utf8").trim().split("\n")).toHaveLength(
+        githubRetry.attempts,
+      );
+    if (fault === "corrupt bare cache") {
+      rmSync(join(cache, "objects"), { recursive: true });
+      renameSync(join(root, "cached-objects"), join(cache, "objects"));
+    }
+    expect((await sh(["git", "rev-parse", "HEAD"], { cwd: before.worktreePath })).stdout.trim()).toBe(
+      before.lastVerifiedSha,
+    );
+  } finally {
+    await restore();
+  }
+});
 
 test("PR create retries a lagging lookup after 'already exists', up to twice", async () => {
   const pr = join(root, "pr");
