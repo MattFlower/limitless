@@ -298,7 +298,13 @@ async function runSetup(
   if (requested.some((r) => !repoName.test(r))) throw new Error("--repo requires owner/name");
   const repos = { added: [...new Set(requested)].filter((r) => !existing.includes(r)), existing };
   const merge = github.merge ?? (await ask("Merge policy (auto/pr/none)", "pr"));
-  const discreet = `discreet mode: ${await ask("Discreet mode (on/off)", "off")} (deferred to #37; not available yet (#37))`;
+  const discreetRepos = (await ask("Discreet mode (on/off)", "off")) === "on" ? repos.added : [];
+  const repoSettings = (raw.repos ?? {}) as Record<string, Record<string, unknown>>;
+  for (const slug of discreetRepos) repoSettings[slug] = { ...repoSettings[slug], discreet: true };
+  if (discreetRepos.length) raw.repos = repoSettings;
+  const discreet = discreetRepos.length
+    ? `discreet mode enabled for: ${discreetRepos.join(", ")}`
+    : "discreet mode: no repositories changed";
   raw.github = { ...github, repos: [...existing, ...repos.added], merge };
   raw.providers = entries;
   d.validate(raw);
@@ -324,6 +330,7 @@ async function runSetup(
       providers.added,
       convert,
       owner,
+      Object.fromEntries(discreetRepos.map((slug) => [slug, repoSettings[slug] ?? {}])),
     );
     try {
       d.validate(Bun.TOML.parse(text) as Record<string, unknown>);
