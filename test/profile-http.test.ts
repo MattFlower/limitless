@@ -1,3 +1,4 @@
+import type { SamplingProfileStackFrame } from "bun:jsc";
 import * as jsc from "bun:jsc";
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -50,7 +51,9 @@ test("admin profile samples an unrelated named timer callback", async () => {
     const result = await response.json();
     expect(result.seconds).toBe(0.3);
     expect(result.functions).toContain("limitlessProfileBusyTimer709");
-    expect(typeof result.stackTraces).toBe("string");
+    expect(result.stackTraces.split("\n")[0]).toMatch(
+      /limitlessProfileBusyTimer709 \([^)]*profile-http\.test\.ts:\d+\)/,
+    );
     for (const field of [result.functions, result.stackTraces])
       expect(Buffer.byteLength(field)).toBeLessThanOrEqual(64 * 1024);
   } finally {
@@ -90,6 +93,46 @@ test("admin profile validates seconds and uses the admin access protections", as
   expect((await route(request(), remote)).status).toBe(403);
 });
 
+const frame = (name: string, line = 42): SamplingProfileStackFrame => ({
+  sourceID: 1,
+  name,
+  location: "",
+  sourceURL: "file:///example.ts",
+  line,
+  column: 1,
+  category: "Baseline",
+  flags: 0,
+});
+
+test("admin profile counts stacks by their first eight frames and ranks by frequency", async () => {
+  const rare = Array.from({ length: 9 }, (_, i) => frame(`caller${i}`, i + 1));
+  const busy = [frame("busy"), frame("")];
+  const profiler = spyOn(jsc, "profile").mockReturnValue({
+    functions: "",
+    bytecodes: "",
+    stackTraces: {
+      interval: 0.001,
+      traces: [rare, busy, busy, [...rare.slice(0, 8), frame("different")], busy].map(
+        (frames, timestamp) => ({ timestamp, frames }),
+      ),
+      sources: [],
+    },
+  });
+  try {
+    const response = await route(request({ seconds: 0.2 }), localServer);
+    expect(response.status).toBe(200);
+    expect((await response.json()).stackTraces).toBe(
+      "3  busy (file:///example.ts:42) < <anonymous> (file:///example.ts:42)\n" +
+        "2  caller0 (file:///example.ts:1) < caller1 (file:///example.ts:2) < " +
+        "caller2 (file:///example.ts:3) < caller3 (file:///example.ts:4) < " +
+        "caller4 (file:///example.ts:5) < caller5 (file:///example.ts:6) < " +
+        "caller6 (file:///example.ts:7) < caller7 (file:///example.ts:8)",
+    );
+  } finally {
+    profiler.mockRestore();
+  }
+});
+
 test("admin profile clears failures, defaults seconds, and redacts before capping UTF-8 text", async () => {
   const secret = "profile-test-credential";
   registerCredential("PROFILE_TEST_CREDENTIAL", secret);
@@ -101,7 +144,11 @@ test("admin profile clears failures, defaults seconds, and redacts before cappin
     .mockReturnValue({
       functions: text,
       bytecodes: "",
-      stackTraces: { interval: 0.001, traces: [], sources: [{ sourceID: 1, url: text }] },
+      stackTraces: {
+        interval: 0.001,
+        traces: [{ timestamp: 0, frames: [{ ...frame("busy"), sourceURL: text }] }],
+        sources: [],
+      },
     });
   const timeout = spyOn(localServer, "timeout");
   try {

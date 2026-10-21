@@ -206,7 +206,10 @@ curl --fail-with-body http://127.0.0.1:7400/api/admin/profile \
 
 `seconds` accepts 0.2–120 and defaults to 30 with `{}`. The request waits for the profile and
 returns `{ seconds, functions, stackTraces }`, with each text field credential-redacted and capped
-at 64 KiB. Sampling covers all main-thread JavaScript and adds a little overhead while it runs.
+at 64 KiB. `stackTraces` groups samples by their first eight frames (innermost first), showing
+`count  name (sourceURL:line) < name (sourceURL:line)` lines sorted by count descending so the
+most frequent stacks survive the cap. Empty names appear as `<anonymous>`.
+Sampling covers all main-thread JavaScript and adds a little overhead while it runs.
 Only one profile can run at a time; another request receives HTTP 409.
 
 ## Evaluations

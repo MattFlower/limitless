@@ -1,4 +1,4 @@
-import { profile } from "bun:jsc";
+import { profile, type SamplingProfileStackTraces } from "bun:jsc";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
@@ -31,14 +31,23 @@ const eventLoopLag = new EventLoopLag();
 setInterval(() => stallReporter.sample(eventLoopLag.sample()), 1000).unref();
 let profileRunning = false;
 
-const profileText = (value: unknown) =>
-  new TextDecoder().decode(
-    Buffer.from(redactCredentials(typeof value === "string" ? value : JSON.stringify(value))).subarray(
-      0,
-      64 * 1024,
-    ),
-    { stream: true },
-  );
+const profileText = (value: string) =>
+  new TextDecoder().decode(Buffer.from(redactCredentials(value)).subarray(0, 64 * 1024), { stream: true });
+
+function profileStacks({ traces }: SamplingProfileStackTraces): string {
+  const counts = new Map<string, number>();
+  for (const { frames } of traces) {
+    const stack = frames
+      .slice(0, 8)
+      .map(({ name, sourceURL, line }) => `${name || "<anonymous>"} (${sourceURL}:${line})`)
+      .join(" < ");
+    counts.set(stack, (counts.get(stack) ?? 0) + 1);
+  }
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .map(([stack, count]) => `${count}  ${stack}`)
+    .join("\n");
+}
 
 export interface HttpExtras {
   apiToken?: string;
@@ -381,7 +390,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           return json({
             seconds,
             functions: profileText(result.functions),
-            stackTraces: profileText(result.stackTraces),
+            stackTraces: profileText(profileStacks(result.stackTraces)),
           });
         } finally {
           profileRunning = false;
