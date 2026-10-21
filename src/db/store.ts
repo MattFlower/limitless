@@ -205,6 +205,7 @@ const toRun = (r: Row): Run => ({
   repoId: r.repo_id as string,
   repoSlug: (r.repo_slug as string) ?? "",
   title: r.title as string,
+  titleProvenance: (r.title_provenance as Run["titleProvenance"]) ?? null,
   prompt: r.prompt as string,
   source: r.source as Run["source"],
   githubWebhookVerified: r.github_webhook_verified === 1,
@@ -1113,8 +1114,8 @@ export class Store {
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json, title_provenance)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1138,6 +1139,7 @@ export class Store {
         json(allow),
         round?.prUrl ?? null,
         json(req.models ?? {}),
+        req.title != null ? "explicit" : "defaulted",
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
@@ -1212,7 +1214,10 @@ export class Store {
     this.db
       .query(`INSERT OR IGNORE INTO ci_fix_triggers
       (pr_url, observed_sha, trigger_key, check_name, signature_line, excerpt, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE NOT EXISTS (
+        SELECT 1 FROM ci_fix_triggers WHERE pr_url = ?1 AND observed_sha = ?2
+        AND check_name = ?4 AND state IN ('pending', 'started')
+      )`)
       .run(
         prUrl,
         head,
