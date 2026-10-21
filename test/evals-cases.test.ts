@@ -17,6 +17,7 @@ import {
   VerifyCaseFileSchema,
   validateRequest,
 } from "../src/evals/cases.ts";
+import { checklistPrompt } from "../src/evals/checklist.ts";
 import { checkPrivateText, loadPrivateStrings } from "../src/gates/private.ts";
 import { compareGates } from "../src/gates/run.ts";
 import type { ModelDef } from "../src/router/catalog.ts";
@@ -891,4 +892,28 @@ test("the 2026-10-16 fresh clean set matches its LABELS.md table, splits and lab
     count("dev", "clean"),
     count("dev", "real"),
   ]).toEqual([10, 1, 12, 2]);
+});
+
+test("the checklist recipe's eligible dev cases extract the checklist from their pinned base AGENTS.md", () => {
+  const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
+  const ids = (list: string) => list.split(",").map((n) => `review-${n}`);
+  // Issue #553's 35 pinned dev IDs; bases before #395 (7cc4e186) predate both checklist sections.
+  const eligible = ids("076,077,078,079,080,082,087,088,093,096,097,098,099,100,101,103,104,105,106");
+  const preChecklist = ids("044,045,046,050,051,052,053,054,056,057,058,069,070,071,072,073");
+  const recipe = readFileSync(new URL("../docs/research/14-review-strength.md", import.meta.url), "utf8");
+  expect(recipe).toContain(`\n${eligible.join(",")}\n`);
+  expect(recipe).toContain(`\n${preChecklist.join(",")}\n`);
+  let checked = 0;
+  for (const id of [...eligible, ...preChecklist]) {
+    const item = file.cases.find((c) => c.id === id);
+    if (!item || !("defects" in item)) throw new Error(`missing ${id}`);
+    expect(item.split).toBe("dev");
+    // Shallow CI checkouts lack older bases; full clones (and the factory) check every case.
+    if (spawnSync("git", ["cat-file", "-e", `${item.base}^{commit}`]).status !== 0) continue;
+    const source = execFileSync("git", ["show", `${item.base}:AGENTS.md`], { encoding: "utf8" });
+    if (eligible.includes(id)) expect(checklistPrompt(source)).toMatch(/\[privacy-1\][\s\S]*\[defect-1\]/);
+    else expect(() => checklistPrompt(source)).toThrow("adversarial-checklist: base AGENTS.md requires");
+    checked++;
+  }
+  expect(checked === 0 || checked === 35).toBe(true);
 });

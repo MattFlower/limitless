@@ -677,16 +677,28 @@ confirmed on held-out, #541). Attribution: E3's stored adversarial trials. Varia
 adversarial prompt plus the checklist.
 
 **Cases and run (recipe; execution deferred).** Variant F uses `codex/sol-6.1@medium`,
-k=2 (70 trials), approximately $15. Keep the original 35 dev IDs explicitly pinned; do not
-select all current dev cases, since the dataset has grown. These still contain 49 required
-defects and four clean cases (review-078, 079, 082, 097):
+k=2, approximately $8 (capped at $15). Issue #553 named the original 35 dev IDs, but 16 of them
+have bases from before #395 (7cc4e186), whose AGENTS.md has neither "Defects reviews keep finding"
+nor the Privacy redaction-ordering rule, so their checklist would be empty and preparation fails:
 
 ```text
-review-044,review-045,review-046,review-050,review-051,review-052,review-053,review-054,review-056,review-057,review-058,review-069,review-070,review-071,review-072,review-073,review-076,review-077,review-078,review-079,review-080,review-082,review-087,review-088,review-093,review-096,review-097,review-098,review-099,review-100,review-101,review-103,review-104,review-105,review-106
+review-044,review-045,review-046,review-050,review-051,review-052,review-053,review-054,review-056,review-057,review-058,review-069,review-070,review-071,review-072,review-073
+```
+
+They are excluded rather than given a later AGENTS.md. A fixed later revision would leak
+hindsight: its bullets cite the PRs that fixed some of these gold defects (defect 5 cites #385's
+"timed out after" text, review-052#0). Variant F and both comparison arms use only the 19 pinned
+cases whose base carries both sections; `test/evals-cases.test.ts` checks extraction at every
+one of the 35 bases. Do not select all current dev cases, since the dataset has grown. The 19
+cases contain 22 required defects (3 blocker, 19 major; 44 defect-trials) and all four clean
+cases (review-078, 079, 082, 097; 8 trials), 38 trials in all:
+
+```text
+review-076,review-077,review-078,review-079,review-080,review-082,review-087,review-088,review-093,review-096,review-097,review-098,review-099,review-100,review-101,review-103,review-104,review-105,review-106
 ```
 
 For a later authorized run, save this configuration outside the checkout as `variant-f.json`
-and pass the comma-separated IDs above to `--cases`:
+and pass the 19 comma-separated IDs above to `--cases`:
 
 ```json
 {
@@ -705,13 +717,14 @@ and pass the comma-separated IDs above to `--cases`:
 limitless eval run review --systems "$TMPDIR/variant-f.json" --cases "$DEV_IDS" --k 2 --max-usd 15 --no-cache --follow
 ```
 
-Use the same pinned cases and labels as §1 and Appendix A for the comparisons. E1's production
+Use the same labels as §1 and Appendix A, restricted to the 19 cases. E1's production
 standard-prompt trials (`eval-mv7igcxy1tl7bg203warej`, medium only) are the decision baseline:
-33/98 blocking recall and 2/8 clean false blocks. E3's adversarial trials
-(`eval-mv8gnw6f03ggcas1ml9ate`, medium) are the attribution comparison: 45/98 recall and 2/8
-clean false blocks. Match comparisons by case ID and trial index; missing/error trials are
-reported explicitly and cannot qualify an incomplete arm. Neither retrieving stored trials nor
-executing this paid command is part of the implementation.
+on these cases Appendix A gives 8/44 blocking recall (18.2%) and 2/8 clean false blocks (35-case
+figures: 33/98 and 2/8). E3's adversarial trials (`eval-mv8gnw6f03ggcas1ml9ate`, medium) are
+the attribution comparison: 12/44 (27.3%) and 2/8 (35-case: 45/98 and 2/8). Match comparisons by
+case ID and trial index; missing/error trials are reported explicitly and cannot qualify an
+incomplete arm. Neither retrieving stored trials nor executing this paid command is part of the
+implementation.
 
 **Prompt and evidence contract.** Read only the case's pinned base AGENTS.md through hardened
 Git access; missing recurring-defect bullets or Privacy redaction ordering fails preparation.
@@ -723,9 +736,9 @@ non-applicable), `checked` (command, traced path or input tried and result, or n
 `finding` (an emitted finding's ID or null). Applicability alone cannot justify a blocker.
 Stored checklist evidence is reviewer-reported, not verified command execution; grading ignores it.
 
-**Measures.** Report pooled blocking recall (caught required defect-trials / 98) with Wilson
+**Measures.** Report pooled blocking recall (caught required defect-trials / 44) with Wilson
 95% intervals; recall by gold severity and category; clean false blocks / 8; derived-verdict
-accuracy / 70; input/output tokens and elapsed time (mean and median per trial). Report recall
+accuracy / 38; input/output tokens and elapsed time (mean and median per trial). Report recall
 gain in percentage points and clean-block differences over both E1 and E3, keeping E1 as the
 qualification baseline. Finding matching, severity-based blocking and verdict derivation use
 the unchanged grader, with no checklist credit.
@@ -742,9 +755,11 @@ no automatic evidence classifier or assertion that commands actually ran.
 
 **Decision rule.** Dev qualifies only with at least **eight percentage points** of pooled recall
 gain over production E1 and **at most one additional clean false block** on matched trials
-(here at least 41/98 catches and at most 3/8 clean blocks). Gain over E3 is attribution, not a
-substitute decision baseline. Held-out confirmation runs **once**, only after dev qualification
-and availability of **#542's fresh clean set**. The old held-out set cannot decide this variant.
+on the 19 eligible cases (here at least 12/44 catches, +9.1 points, since 11/44 is +6.8; and at
+most 3/8 clean blocks). E3 alone already reaches 12/44 on these cases, so a qualifying F must
+also be read against E3: gain over E3 is attribution, not a substitute decision baseline.
+Held-out confirmation runs **once**, only after dev qualification and availability of **#542's
+fresh clean set**. The old held-out set cannot decide this variant.
 Paid dev execution, baseline-record retrieval, held-out confirmation and production adoption
 are all deferred; this recipe claims no empirical gain.
 
