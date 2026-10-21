@@ -678,9 +678,9 @@ export interface ProcResult {
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
-  /** The overall timeout shutdown killed a running direct child. */
+  /** The direct child was observed running when the overall deadline callback ran. */
   timedOut: boolean;
-  /** The idle timeout shutdown killed a running direct child. */
+  /** The direct child was observed running when the idle deadline callback ran. */
   idleTimedOut: boolean;
   stdout: string; // tail, bounded by tailLimit
   stderr: string; // tail, bounded by tailLimit
@@ -857,8 +857,6 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
             );
           }
           cancelKilled = cancelStarted && killedRunningChild;
-          timedOut &&= killedRunningChild;
-          idleTimedOut &&= killedRunningChild;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.
@@ -893,13 +891,22 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     };
     child.once("exit", terminate);
 
+    // A stalled event loop can delay both the timer and exit handler. If the child has already
+    // exited, its exit time is unavailable: conservatively keep its ordinary status, even if it
+    // actually exited after the deadline. Once observed running, natural exit during cleanup
+    // does not undo the timeout.
+    const runningAtDeadline = () =>
+      child.exitCode === null &&
+      child.signalCode === null &&
+      child.pid !== undefined &&
+      stillRunning(child.pid);
     const timers: ReturnType<typeof setTimeout>[] = [];
     if (opts.timeoutMs) {
       timers.push(
         setTimeout(() => {
           // A timer firing after an exit or a cancel began the shutdown didn't stop the child.
           if (shutdown !== undefined) return;
-          timedOut = true;
+          timedOut = runningAtDeadline();
           terminate();
         }, opts.timeoutMs),
       );
@@ -910,7 +917,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       idleTimer = setInterval(
         () => {
           if (shutdown === undefined && idle.expired()) {
-            idleTimedOut = true;
+            idleTimedOut = runningAtDeadline();
             terminate();
           }
         },

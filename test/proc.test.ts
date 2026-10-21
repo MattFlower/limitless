@@ -643,8 +643,13 @@ for (const failure of ["discovery", "birth", "recording", "boot"] as const) {
   });
 }
 
-for (const idle of [false, true]) {
-  test(`an exited child keeps its status when the ${idle ? "idle" : "overall"} timer runs before its exit handler`, async () => {
+for (const [idle, code] of [
+  [false, 0],
+  [false, 7],
+  [true, 0],
+  [true, 7],
+] as const) {
+  test(`an exited child keeps status ${code} when the ${idle ? "idle" : "overall"} timer runs before its exit handler`, async () => {
     const spawn = subprocess.spawn;
     const setTimer = idle ? globalThis.setInterval : globalThis.setTimeout;
     const children: subprocess.ChildProcess[] = [];
@@ -671,17 +676,26 @@ for (const idle of [false, true]) {
       children.push(child);
       const emit = child.emit.bind(child);
       child.emit = (event: string | symbol, ...values: unknown[]) => {
-        if (event === "exit") fire();
+        if (event === "exit") {
+          // Hide the runtime's status until its exit handler runs, as during an event-loop stall.
+          const code = child.exitCode;
+          Object.defineProperty(child, "exitCode", { value: null });
+          try {
+            fire();
+          } finally {
+            Object.defineProperty(child, "exitCode", { value: code });
+          }
+        }
         return emit(event, ...values);
       };
       return child;
     }) as typeof subprocess.spawn);
     try {
-      const cmd = [process.execPath, "-e", "process.exit(0)"];
+      const cmd = [process.execPath, "-e", `process.exit(${code})`];
       const timeout = idle ? { idleTimeoutMs: 100_000 } : { timeoutMs: 100_000 };
       const result = await runProcess({ cmd, cwd: process.cwd(), env: {}, ...timeout });
-      expect(result).toMatchObject({ exitCode: 0, signal: null, timedOut: false, idleTimedOut: false });
-      if (!idle)
+      expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: false, idleTimedOut: false });
+      if (!idle && code === 0)
         await expect(sh(cmd, { cwd: process.cwd(), ...timeout })).resolves.toMatchObject({ exitCode: 0 });
     } finally {
       spawning.mockRestore();
@@ -703,3 +717,76 @@ test("a live direct child is still killed and reported as timed out", async () =
   });
   expect(result).toMatchObject({ timedOut: true, exitCode: null, signal: "SIGKILL" });
 }, 15_000);
+
+for (const [idle, code] of [
+  [false, 0],
+  [false, 7],
+  [true, 0],
+  [true, 7],
+] as const) {
+  test(`a child exiting ${code} during cleanup retains its ${idle ? "idle" : "overall"} timeout`, async () => {
+    const spawn = subprocess.spawn;
+    const setTimer = idle ? globalThis.setInterval : globalThis.setTimeout;
+    const children: subprocess.ChildProcess[] = [];
+    let fire = () => {};
+    let releaseInput = () => {};
+    let exited = Promise.resolve();
+    let now = 0;
+    const timer = spyOn(globalThis, idle ? "setInterval" : "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      fire = () => {
+        now = 200_000;
+        fn(...args);
+      };
+      return setTimer(fn, ms, ...args);
+    }) as typeof setTimeout);
+    const spawning = spyOn(subprocess, "spawn").mockImplementation(((
+      ...args: Parameters<typeof subprocess.spawn>
+    ) => {
+      const child = spawn(...args);
+      children.push(child);
+      const input = child.stdin;
+      if (!input) throw new Error("missing stdin");
+      const end = input.end.bind(input);
+      input.end = (() => input) as typeof input.end;
+      releaseInput = () => {
+        end();
+      };
+      exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      child.stdout?.once("data", () => fire());
+      return child;
+    }) as typeof subprocess.spawn);
+    const inspect = async (_environment: boolean, marker: string) => {
+      // The timer has observed a live child. Let it exit before cleanup's first snapshot finishes.
+      releaseInput();
+      await exited;
+      return `${process.pid} ${process.getuid?.()} S scanner LIMITLESS_PROCESS_SCAN=${marker}`;
+    };
+    try {
+      const cmd = [
+        process.execPath,
+        "-e",
+        `process.stdin.resume(); process.stdin.on("end", () => process.exit(${code})); console.log("ready")`,
+      ];
+      const timeout = idle ? { idleTimeoutMs: 100_000, idleNow: () => now } : { timeoutMs: 100_000 };
+      const opts = { cwd: process.cwd(), ...timeout };
+      const result = await processInspection.run(inspect, () => runProcess({ cmd, env: {}, ...opts }));
+      expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: !idle, idleTimedOut: idle });
+      if (!idle && code === 0) {
+        await expect(processInspection.run(inspect, () => sh(cmd, opts))).rejects.toMatchObject({
+          timedOut: true,
+          exitCode: 0,
+        });
+      }
+    } finally {
+      spawning.mockRestore();
+      timer.mockRestore();
+      for (const child of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
+    }
+  });
+}
