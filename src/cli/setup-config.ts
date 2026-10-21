@@ -80,7 +80,7 @@ function inlineValueEnd(text: string, start: number): { end: number; delimiter: 
     else if (c === "]" || c === "}") depth--;
     if (c && !/\s/.test(c)) end = i + 1;
   }
-  throw new Error("Cannot patch inline github table; fix TOML syntax");
+  throw new Error("Cannot patch inline setup table; fix TOML syntax");
 }
 
 function skipTrivia(text: string, start: number): number {
@@ -93,10 +93,10 @@ function skipTrivia(text: string, start: number): number {
   return start;
 }
 
-function patchInlineGithub(text: string, github: Record<string, unknown>): string {
-  const current = (Bun.TOML.parse(text) as { github: Record<string, unknown> }).github;
-  const changes = ["repos", "merge"].filter(
-    (key) => JSON.stringify(current[key]) !== JSON.stringify(github[key]),
+function patchInlineTable(text: string, table: string, values: Record<string, unknown>): string {
+  const current = (Bun.TOML.parse(text) as Record<string, Record<string, unknown>>)[table] ?? {};
+  const changes = Object.keys(values).filter(
+    (key) => JSON.stringify(current[key]) !== JSON.stringify(values[key]),
   );
   if (!changes.length) return text;
   const assignment = keyAssignment.exec(text);
@@ -109,13 +109,13 @@ function patchInlineGithub(text: string, github: Record<string, unknown>): strin
     cursor = skipTrivia(text, cursor);
     if (text[cursor] === "}") break;
     const member = keyAssignment.exec(text.slice(cursor));
-    if (!member) throw new Error("Cannot patch inline github table; fix TOML syntax");
+    if (!member) throw new Error("Cannot patch inline setup table; fix TOML syntax");
     const path = keyPath(member[1] ?? "");
     const start = skipTrivia(text, cursor + member[0].length);
     const { delimiter, end } = inlineValueEnd(text, start);
     if (path.length === 1 && changes.includes(path[0] ?? "")) {
       const key = path[0] ?? "";
-      edits.push({ start, end, value: tomlValue(github[key]) });
+      edits.push({ start, end, value: tomlValue(values[key]) });
       changes.splice(changes.indexOf(key), 1);
     }
     insertion = end;
@@ -127,7 +127,7 @@ function patchInlineGithub(text: string, github: Record<string, unknown>): strin
     edits.push({
       start: insertion,
       end: insertion,
-      value: `${members ? ", " : " "}${changes.map((key) => `${key} = ${tomlValue(github[key])}`).join(", ")}`,
+      value: `${members ? ", " : " "}${changes.map((key) => `${key} = ${tomlValue(values[key])}`).join(", ")}`,
     });
   for (const edit of edits.sort((a, b) => b.start - a.start || b.end - a.end))
     text = text.slice(0, edit.start) + edit.value + text.slice(edit.end);
@@ -140,40 +140,48 @@ export function patchSetupConfig(
   entries: Record<string, unknown>[],
   added: string[],
   convert: boolean,
+  owner?: string,
 ): string {
   const parts = statements(original);
-  const githubInline = parts.find((p) => hasKey(p, "github"));
-  if (githubInline) githubInline.text = patchInlineGithub(githubInline.text, github);
-  else {
-    const missing: Record<string, unknown> = {};
-    for (const key of ["repos", "merge"]) {
-      const part = parts.find((p) => hasKey(p, "github", key));
-      if (!part) missing[key] = github[key];
-      else {
-        const value = Bun.TOML.parse(part.text) as Record<string, unknown>;
-        const current = part.table.length === 0 ? (value.github as Record<string, unknown>)[key] : value[key];
-        if (JSON.stringify(current) !== JSON.stringify(github[key])) {
-          const comment = /\s+#.*(?:\r?\n)?$/.exec(part.text)?.[0] ?? "\n";
-          part.text = `${part.key} = ${tomlValue(github[key])}${comment}`;
+  const tables: Record<string, Record<string, unknown>> = {
+    github: { repos: github.repos, merge: github.merge },
+    ...(owner ? { owners: { github: owner } } : {}),
+  };
+  for (const [table, values] of Object.entries(tables)) {
+    const inline = parts.find((p) => hasKey(p, table));
+    if (inline) inline.text = patchInlineTable(inline.text, table, values);
+    else {
+      const missing: Record<string, unknown> = {};
+      for (const key of Object.keys(values)) {
+        const part = parts.find((p) => hasKey(p, table, key));
+        if (!part) missing[key] = values[key];
+        else {
+          const value = Bun.TOML.parse(part.text) as Record<string, unknown>;
+          const current =
+            part.table.length === 0 ? (value[table] as Record<string, unknown>)[key] : value[key];
+          if (JSON.stringify(current) !== JSON.stringify(values[key])) {
+            const comment = /\s+#.*(?:\r?\n)?$/.exec(part.text)?.[0] ?? "\n";
+            part.text = `${part.key} = ${tomlValue(values[key])}${comment}`;
+          }
         }
       }
-    }
-    const at = parts.findIndex((p) => inTable(p, "github"));
-    if (Object.keys(missing).length) {
-      if (at >= 0) {
-        const end = parts.findIndex((p, i) => i > at && !inTable(p, "github"));
-        parts.splice(end < 0 ? parts.length : end, 0, {
-          table: ["github"],
-          text: `\n${assignments(missing)}`,
-        });
-      } else if (parts.some((p) => p.table.length === 0 && p.path?.[0] === "github")) {
-        parts.unshift({
-          table: [],
-          text: Object.entries(missing)
-            .map(([k, v]) => `github.${k} = ${tomlValue(v)}\n`)
-            .join(""),
-        });
-      } else parts.push({ table: ["github"], text: `\n[github]\n${assignments(missing)}` });
+      const at = parts.findIndex((p) => inTable(p, table));
+      if (Object.keys(missing).length) {
+        if (at >= 0) {
+          const end = parts.findIndex((p, i) => i > at && !inTable(p, table));
+          parts.splice(end < 0 ? parts.length : end, 0, {
+            table: [table],
+            text: `\n${assignments(missing)}`,
+          });
+        } else if (parts.some((p) => p.table.length === 0 && p.path?.[0] === table)) {
+          parts.unshift({
+            table: [],
+            text: Object.entries(missing)
+              .map(([k, v]) => `${table}.${k} = ${tomlValue(v)}\n`)
+              .join(""),
+          });
+        } else parts.push({ table: [table], text: `\n[${table}]\n${assignments(missing)}` });
+      }
     }
   }
   const providersInline = parts.find((p) => hasKey(p, "providers"));

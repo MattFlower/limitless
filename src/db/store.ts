@@ -58,6 +58,7 @@ import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
 import { type ProcessCleanup, redactCredentials } from "../util/proc.ts";
+import { activity } from "../util/stall.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
 
@@ -2183,19 +2184,21 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     data?: unknown;
   }): RunEvent {
     const ts = Date.now();
-    const res = this.db
-      .query(
-        "INSERT INTO events (run_id, invocation_id, ts, type, level, message, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(
-        ev.runId,
-        ev.invocationId ?? null,
-        ts,
-        ev.type,
-        ev.level ?? "info",
-        ev.message.slice(0, 4000),
-        clampData(ev.data),
-      );
+    const res = activity("store.event", () =>
+      this.db
+        .query(
+          "INSERT INTO events (run_id, invocation_id, ts, type, level, message, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          ev.runId,
+          ev.invocationId ?? null,
+          ts,
+          ev.type,
+          ev.level ?? "info",
+          ev.message.slice(0, 4000),
+          clampData(ev.data),
+        ),
+    );
     const event: RunEvent = {
       id: Number(res.lastInsertRowid),
       runId: ev.runId,

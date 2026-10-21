@@ -109,7 +109,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     }
   });
 
-  // "slot" is the plain timeout re-run that passes, with the re-run also queued for a gate slot.
+  // A queued competitor must wait until the timeout re-run finishes.
   test.each([
     "twice",
     "base",
@@ -136,6 +136,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const clock = waitClock();
     const scheduled = [deferred<void>(), deferred<void>()];
     const queued = deferred<void>();
+    const finishRetry = deferred<void>();
+    let acquired = false;
     const prompts: string[] = [];
     const f = start((s) => {
       const role = roleOf(s);
@@ -187,12 +189,20 @@ describe("pipeline (fake agents, real git + gates)", () => {
                   ? 3
                   : 1) ||
             (["twice", "cancel retry"].includes(scenario) && attempt === 2);
+      if (attempt === 2 && (scenario === "slot" || scenario === "cancel slot")) {
+        queued.resolve();
+        await finishRetry.promise;
+        opts.signal?.throwIfAborted();
+      }
       const fail =
         (isLint && attempt === (scenario === "retry-lint" ? 5 : 3)) ||
         (scenario === "retry setup failure" && attempt === 4);
       if (timeout && scenario !== "unflagged") {
         if (scenario === "slot" || scenario === "cancel slot")
-          held = gateSlots.acquire(new AbortController().signal);
+          held = gateSlots.acquire(new AbortController().signal).then((free) => {
+            acquired = true;
+            return free;
+          });
         await new Promise<void>((resolve, reject) => {
           const timer = clock.timer.set(resolve, opts.timeoutMs ?? 900_000);
           opts.signal?.addEventListener(
@@ -225,11 +235,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
         durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
       };
     });
-    const addEvent = f.store.addEvent.bind(f.store);
-    const eventSpy = spyOn(f.store, "addEvent").mockImplementation((event) => {
-      if (event.message?.startsWith("Waiting for a gate slot")) queued.resolve();
-      return addEvent(event);
-    });
     try {
       const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
       if (scenario !== "unflagged") {
@@ -241,10 +246,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
       }
       if (scenario === "slot" || scenario === "cancel slot") {
-        await queued.promise;
-        release = await held;
-        expect(calls).toBe(2);
+        expect(await Promise.race([queued.promise.then(() => "retry"), held?.then(() => "competitor")])).toBe(
+          "retry",
+        );
+        expect(acquired).toBe(false);
+        expect(calls).toBe(3);
         if (scenario === "cancel slot") f.cancelRun(run.id);
+        finishRetry.resolve();
+        release = await held;
         release?.();
       }
       if (scenario === "cancel retry") {
@@ -335,11 +344,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
       }
     } finally {
+      finishRetry.resolve();
       release?.();
-      if (held) (await held)();
       await f.stop();
+      if (held) (await held)();
       processSpy.mockRestore();
-      eventSpy.mockRestore();
       gateSlots.setLimit(previous);
     }
   });
@@ -385,6 +394,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const clock = waitClock();
     const scheduled = [deferred<void>(), deferred<void>()];
     const queued = deferred<void>();
+    const finishRetry = deferred<void>();
+    let acquired = false;
     const previous = gateSlots.limit;
     gateSlots.setLimit(1);
     let held: Promise<() => void> | undefined;
@@ -412,6 +423,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
             expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("hello\n");
             expect(existsSync(join(cwd, "timeout-debris"))).toBe(false);
           }
+          if (attempts === 2 && (scenario === "slot" || scenario === "cancel slot")) {
+            queued.resolve();
+            await finishRetry.promise;
+            opts.signal?.throwIfAborted();
+          }
         }
       }
       const timeout =
@@ -430,7 +446,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
           (command === "fake-setup" && scenario === "retry setup" && attempts === 2));
       if (timeout) {
         if (scenario === "slot" || scenario === "cancel slot")
-          held = gateSlots.acquire(new AbortController().signal);
+          held = gateSlots.acquire(new AbortController().signal).then((free) => {
+            acquired = true;
+            return free;
+          });
         writeFileSync(join(cwd, "greeting.txt"), "gate dirt\n");
         writeFileSync(join(cwd, "timeout-debris"), "gate dirt\n");
         writeFileSync(join(cwd, ".limitless.toml"), "untrusted gate configuration\n");
@@ -463,11 +482,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
         durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
       };
     });
-    const addEvent = f.store.addEvent.bind(f.store);
-    const eventSpy = spyOn(f.store, "addEvent").mockImplementation((event) => {
-      if (event.message?.startsWith("Waiting for a gate slot")) queued.resolve();
-      return addEvent(event);
-    });
     try {
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
       if (!["failure", "unflagged"].includes(scenario)) {
@@ -475,11 +489,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
         await clock.advance(900_000);
       }
       if (scenario === "slot" || scenario === "cancel slot") {
-        await queued.promise;
-        release = await held;
-        expect(attempts).toBe(1);
-        expect(commands).toEqual(["fake-setup", "fake-test", "fake-lint"]);
+        expect(await Promise.race([queued.promise.then(() => "retry"), held?.then(() => "competitor")])).toBe(
+          "retry",
+        );
+        expect(acquired).toBe(false);
+        expect(attempts).toBe(2);
+        expect(commands).toEqual(["fake-setup", "fake-test", "fake-lint", "fake-setup"]);
         if (scenario === "cancel slot") f.cancelRun(run.id);
+        finishRetry.resolve();
+        release = await held;
         release?.();
       }
       if (scenario === "twice" || scenario === "cancel retry") {
@@ -489,7 +507,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
       const state = f.store.getRunState<RunState>(run.id);
-      const retries = ["slot", "twice", "retry failure", "retry setup", "cancel retry"].includes(scenario);
+      const retries = [
+        "slot",
+        "cancel slot",
+        "twice",
+        "retry failure",
+        "retry setup",
+        "cancel retry",
+      ].includes(scenario);
       expect(attempts).toBe(retries ? 2 : 1);
       expect(clock.pending).toBe(0);
       if (scenario.startsWith("cancel")) {
@@ -546,11 +571,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(state?.preRebaseGates).toBeUndefined();
       expect(state?.gateExecution).toBeUndefined();
     } finally {
+      finishRetry.resolve();
       release?.();
-      if (held) (await held)();
       await f.stop();
+      if (held) (await held)();
       processSpy.mockRestore();
-      eventSpy.mockRestore();
       gateSlots.setLimit(previous);
     }
   });
