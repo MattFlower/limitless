@@ -232,6 +232,10 @@ finish.
   original failure and its classification (a gate that passes on retry is `flaky`, not a clean
   pass), and a retry never turns a security check's failure into a pass (#179, #385). A failed candidate hands over to a different one or asks a
   question; it doesn't end the run or loop back to the model that just failed (#53, #254).
+- **Hot paths are measured at production size.** Report one before-and-after timing in the PR for code run per gate or agent output line, event or poll,
+  in `redactCredentials` or in the stall reporter's activities. Use hundreds of registered credentials, megabytes of output and thousands of events
+  (#694: 19.6 s vs 245 ms on main for 5 MB/600 credentials; #704: 635 ms per 5 MB/600 credentials, fixed to 3–4 ms).
+  Keep reusable benchmarks under `scripts/` (like `scripts/benchmark-credential-redaction.ts`); tests stay fast and don't assert timings.
 - **Derive current state; don't replay history.** Compute what's actionable from current records,
   dedupe by status episode, and treat UNKNOWN as "no observation" (#348: FAILURE→SUCCESS→FAILURE
   lost the second failure; #283: UNKNOWN mergeability stored as a state).
