@@ -782,6 +782,8 @@ test("heartbeats record capabilities, cancel unknown jobs and become stale after
     lastHeartbeatAt: now,
     capabilities: caps([id]),
   });
+  await call("/worker/heartbeat", { ...caps([id]), freeSlots: 0 }, token);
+  expect(workers.list()[0]?.state).toBe("busy");
   now += 30_001;
   expect(workers.list()[0]?.state).toBe("offline");
 }, 30_000);
