@@ -6,6 +6,8 @@ class Node {
   output?: Node;
   all?: Node;
   jump: Node[] = [];
+  // Characters still needed to complete the longest variant through this prefix.
+  rest = 0;
   constructor(readonly depth = 0) {}
 }
 export type MatchState = Node;
@@ -25,6 +27,7 @@ export class CredentialMatcher {
       this.maxLength = Math.max(this.maxLength, text.length);
       let node = this.root;
       for (const char of text.split("")) {
+        node.rest = Math.max(node.rest, text.length - node.depth);
         let next = node.next.get(char);
         if (!next) {
           next = new Node(node.depth + 1);

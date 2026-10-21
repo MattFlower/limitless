@@ -291,6 +291,36 @@ test.each([
   expectTerminal(input, expected),
 );
 
+// An unrelated registration gives the other stray reading a deeper partial match at the same introducer.
+test.each([
+  [
+    "earlier stray reading against a deeper decoy",
+    ["1abcdefghijk", "31mab-decoy-credential"],
+    `x ${ESC}[1${ESC}[31mab${ESC}[0mcdefghijk y`,
+    "x [redacted] y",
+  ],
+  [
+    "latest stray reading against a deeper decoy",
+    ["31mabcdefghij", "zz x 1ab-decoy"],
+    `zz x ${ESC}[1${ESC}[31mab${ESC}[0mcdefghij y`,
+    "zz x [redacted] y",
+  ],
+  [
+    "latest stray reading without a decoy",
+    ["31mabcdefghij"],
+    `zz x ${ESC}[1${ESC}[31mab${ESC}[0mcdefghij y`,
+    "zz x [redacted] y",
+  ],
+  [
+    "a discarded prefix that never completes",
+    ["1abcdefghijk", "31mab-decoy-credential"],
+    `x ${ESC}[1${ESC}[31mab${ESC}[0mcd${"y".repeat(10)} z`,
+    "x [redacted]yyy z",
+  ],
+])("competing stray readings cannot expose a credential: %s", (_name, values, input, expected) =>
+  expectTerminal(input, expected, values),
+);
+
 test("periodic credentials through a large interrupted stream keep bounded carry and one span", () => {
   const matcher = new CredentialMatcher(variants(["abcabcab"]));
   const redactor = terminalRedactor(() => matcher);

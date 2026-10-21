@@ -75,7 +75,10 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
   let matcher = current();
   let views: View[] = [];
   let [size, pad, limit] = [0, 0, 0];
+  // A discarded partial match: the published reading stays redacted until it could have completed.
+  let taint: { start: number; left: number } | undefined;
   const reset = () => {
+    taint = undefined;
     views = [A, B, C, D, E].map(() => ({ state: matcher.root, count: 0, ring: [] }));
     size = matcher.maxLength;
     pad = Math.max(0, size - 1);
@@ -122,8 +125,16 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       if (to.output) addSpan(matchStart(view, view.count - to.output.depth, pos), pos + 1);
     }
   };
+  const spread = (mask: number, from: number, to: number) => {
+    if (!taint || !(mask & C) || from >= to) return;
+    const stop = Math.min(to, from + taint.left);
+    taint.left -= stop - from;
+    addSpan(taint.start, stop);
+    if (!taint.left) taint = undefined;
+  };
   // Plain text kept by every reading in `mask`: one scan once those readings agree.
   const bulk = (from: number, to: number, mask: number) => {
+    spread(mask, from, to);
     marks.fill(mask, from - bufBase, to - bufBase);
     shown.fill(mask & C ? 1 : 0, from - bufBase, to - bufBase);
     if (!size) return;
@@ -151,13 +162,37 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       marks[pos - bufBase] = (marks[pos - bufBase] ?? 0) | C | D | E;
       shown[pos - bufBase] = 1;
       feed(C | D | E, buf.charAt(pos - bufBase), pos);
+      spread(C, pos, pos + 1);
     }
   };
   // At a new introducer, E keeps the longer partial match of D and E, and D restarts from C.
-  const fork = () => {
+  const fork = (pos: number) => {
     const [plain, stray, earlier] = [views[2], views[3], views[4]];
     if (!plain || !stray || !earlier || !size) return;
     const [kept, restart] = stray.state.depth >= earlier.state.depth ? [stray, earlier] : [earlier, stray];
+    // Kept and C both read C's text from here, so either continues the other's partial match if that is a
+    // suffix of its own; a match then starts at the earlier position. Otherwise it is redacted conservatively.
+    const absorb = (into: View) => {
+      let node = into.state;
+      while (node !== restart.state && node !== matcher.root) node = node.fail;
+      for (let i = 1; node === restart.state && i <= node.depth; i++) {
+        const k = (into.count - i) % size;
+        into.ring[k] = Math.min(into.ring[k] ?? pos, restart.ring[(restart.count - i) % size] ?? pos);
+      }
+      return node === restart.state;
+    };
+    if (!absorb(kept) && !absorb(plain)) {
+      const start = Math.min(
+        matchStart(restart, restart.count - restart.state.depth, pos),
+        taint?.start ?? pos,
+      );
+      // Shorter partial matches in the discarded reading may belong to longer variants.
+      let left = taint?.left ?? 0;
+      for (let node = restart.state; node !== matcher.root; node = node.fail)
+        left = Math.max(left, node.rest);
+      taint = { start, left };
+      if (start < pos) addSpan(start, pos);
+    }
     [views[3], views[4]] = [restart, kept];
     [restart.state, restart.count] = [plain.state, plain.count];
     // Later matches start within the current depth, so only those positions are copied.
@@ -188,7 +223,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
   // Release what no reading can still extend; past the bound, hide pending prefixes and release anyway.
   const release = (stop: number) => {
     const string = lenient.state >= STRING ? lenient.body : stop;
-    let safe = Math.min(stop - pad, string);
+    let safe = Math.min(stop - pad, string, taint?.start ?? stop);
     for (const view of views)
       if (view.state.depth) safe = Math.min(safe, view.ring[(view.count - view.state.depth) % size] ?? 0);
     // Only the per-character bound forces a release, so its position is independent of chunking.
@@ -222,11 +257,12 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       (lenient.state === ESC || lenient.state === CSI)
     ) {
       mask |= FORK;
-      fork();
+      fork(pos);
     }
     marks[pos - bufBase] = mask;
     shown[pos - bufBase] = mask & C ? 1 : 0;
     feed(mask, buf.charAt(pos - bufBase), pos);
+    spread(mask, pos, pos + 1);
     if (pos + 1 - base > limit) release(pos + 1);
   };
   return {
@@ -247,8 +283,10 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
         matcher = latest;
         reset();
         for (let pos = base; pos < end; pos++) {
-          if ((marks[pos - bufBase] ?? 0) & FORK) fork();
-          feed(marks[pos - bufBase] ?? 0, buf.charAt(pos - bufBase), pos);
+          const mask = marks[pos - bufBase] ?? 0;
+          if (mask & FORK) fork(pos);
+          feed(mask, buf.charAt(pos - bufBase), pos);
+          spread(mask, pos, pos + 1);
         }
       }
       const grow = (array: Uint8Array) => {
