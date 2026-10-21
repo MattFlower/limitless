@@ -7,8 +7,70 @@ import { Semaphore } from "../src/gates/slots.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import { idleWatchdog, type ProcOptions, type ProcResult } from "../src/util/proc.ts";
+import { idleWatchdog, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { waitClock } from "./wait-clock.ts";
+
+for (const scenario of [
+  {
+    name: "frozen clock permits silent completion",
+    sleep: "0.8",
+    timeoutMs: 3000,
+    frozen: true,
+    timedOut: false,
+    idleTimedOut: false,
+  },
+  {
+    name: "overall timeout still applies with a frozen clock",
+    sleep: "10",
+    timeoutMs: 800,
+    frozen: true,
+    timedOut: true,
+    idleTimedOut: false,
+  },
+  {
+    name: "default clock detects silent idle",
+    sleep: "10",
+    timeoutMs: 3000,
+    frozen: false,
+    timedOut: false,
+    idleTimedOut: true,
+  },
+]) {
+  test.concurrent(`real byte-idle ${scenario.name}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "real-byte-idle-"));
+    const controller = new AbortController();
+    const pending = runProcess({
+      cmd: ["/bin/sleep", scenario.sleep],
+      cwd: root,
+      env: {},
+      signal: controller.signal,
+      idleTimeoutMs: 200,
+      timeoutMs: scenario.timeoutMs,
+      idleNow: scenario.frozen ? () => 0 : undefined,
+    });
+    try {
+      const result = await pending;
+      expect(result).toMatchObject({
+        timedOut: scenario.timedOut,
+        idleTimedOut: scenario.idleTimedOut,
+        cancelled: false,
+        stdout: "",
+        stderr: "",
+      });
+      if (!scenario.timedOut && !scenario.idleTimedOut) {
+        expect(result.exitCode).toBe(0);
+        expect(result.signal).toBeNull();
+      }
+    } finally {
+      controller.abort();
+      try {
+        await pending;
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+}
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
