@@ -8,13 +8,14 @@ class Node {
   jump: Node[] = [];
   constructor(readonly depth = 0) {}
 }
+export type MatchState = Node;
 type Hit = { end: number; node: Node };
 type Match = Hit;
 type RedactionWindow = { start: number; end: number };
 export type MatchingWork = { transitions: number; outputs: number; boundaries: number };
 
 export class CredentialMatcher {
-  private root: Node;
+  readonly root: Node;
   readonly maxLength: number;
   constructor(private variants: ReadonlyMap<string, boolean>) {
     this.root = new Node();
@@ -81,6 +82,16 @@ export class CredentialMatcher {
       if (state.all) hits.push({ end: offset + i + 1, node: state });
     }
     return { state, hits };
+  }
+  step(state: Node, char: string): Node {
+    for (;;) {
+      const next = state.next.get(char);
+      if (next || state === this.root) return next ?? this.root;
+      state = state.fail;
+    }
+  }
+  has(text: string): boolean {
+    return this.variants.has(text);
   }
   redact(text: string, work?: MatchingWork, window?: RedactionWindow): string {
     if (!this.maxLength || !text) return render(text, [], window);

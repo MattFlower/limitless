@@ -1,6 +1,6 @@
-import { stripVTControlCharacters } from "node:util";
-import { redactCredentials } from "../util/proc.ts";
+import { credentialMatcher } from "../util/credential-matcher.ts";
 import { activity } from "../util/stall.ts";
+import { terminalRedactor } from "../util/terminal-redaction.ts";
 import type { GateResult } from "./run.ts";
 
 const LAUNCH_FAILURE = "sandbox_apply: Operation not permitted";
@@ -20,9 +20,12 @@ export function launchFailureScan() {
   };
 }
 
-/** Remove terminal formatting before redaction, and redact before any diagnostic or tail cuts. */
-export const redactGateOutput = (output: string): string =>
-  redactCredentials(stripVTControlCharacters(output));
+/** Remove terminal formatting while redacting, before any diagnostic or tail cuts; a whole value equal
+ * to a short credential is still redacted. */
+export function redactGateOutput(output: string): string {
+  const text = terminalRedactor().push(output, true);
+  return credentialMatcher().has(text) ? "[redacted]" : text;
+}
 
 /** Prefer literal identity; sanitized stored names are usable only without collisions on either side. */
 export function findGateCounterpart<T extends { name: string }>(

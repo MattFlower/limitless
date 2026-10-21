@@ -8,6 +8,7 @@ import {
   registerCredential,
   registeredCredentials,
 } from "../src/util/proc.ts";
+import { TERMINAL_HOLD, terminalRedactor } from "../src/util/terminal-redaction.ts";
 
 function variants(values: string[]) {
   const result = new Map<string, boolean>();
@@ -217,4 +218,85 @@ test("shared suffix outputs and overlapping boundaries are resolved without dict
     expect(count.outputs).toBeLessThan(100 * input.length);
     expect(count.boundaries).toBeLessThan(5 * input.length);
   }
+});
+
+const ESC = "\u001b";
+const SECRET = "synthetic-terminal-key";
+const [HEAD, TAIL] = [SECRET.slice(0, 5), SECRET.slice(5)];
+// Every two-chunk split, against an independently written expected output; carry stays bounded.
+function expectTerminal(input: string, expected: string, values = [SECRET]) {
+  const matcher = new CredentialMatcher(variants(values));
+  for (let offset = 0; offset <= input.length; offset++) {
+    const redactor = terminalRedactor(() => matcher);
+    let output = redactor.push(input.slice(0, offset));
+    expect(redactor.retained.text).toBeLessThanOrEqual(matcher.maxLength + TERMINAL_HOLD + 1);
+    output += redactor.push(input.slice(offset), true);
+    expect(output).toBe(expected);
+  }
+}
+
+test.each([
+  ["stray CSI introducer", `x ${ESC}[${SECRET} y`, "x [redacted] y"],
+  ["stray CSI introducer and an SGR inside", `x ${ESC}[${HEAD}${ESC}[31m${TAIL} y`, "x [redacted] y"],
+  ["stray ESC and an SGR inside", `x ${ESC}${HEAD}${ESC}[1m${TAIL} y`, "x [redacted] y"],
+  ["stray C1 CSI", `x \u009b${SECRET} y`, "x [redacted] y"],
+  ["stray C1 CSI and an SGR inside", `x \u009b${HEAD}${ESC}[31m${TAIL} y`, "x [redacted] y"],
+  ["stray OSC introducer at EOF", `x ${ESC}]${SECRET} y`, "x ][redacted] y"],
+  ["stray OSC introducer and an SGR inside", `x ${ESC}]${HEAD}${ESC}[31m${TAIL} y`, "x ][redacted] y"],
+  ["SGR reset inside", `x ${HEAD}${ESC}[m${TAIL} y`, "x [redacted] y"],
+  ["DCS inside", `x ${HEAD}${ESC}Pq#0;2;0${ESC}\\${TAIL} y`, "x [redacted] y"],
+  ["C1 DCS and ST inside", `x ${HEAD}\u0090q#0\u009c${TAIL} y`, "x [redacted] y"],
+  ["C1 OSC with BEL inside", `x ${HEAD}\u009d0;title\u0007${TAIL} y`, "x [redacted] y"],
+  [
+    "SOS, PM and APC inside",
+    `x ${HEAD}${ESC}Xa${ESC}\\${TAIL.slice(0, 4)}${ESC}^b${ESC}\\${TAIL.slice(4, 9)}${ESC}_c${ESC}\\${TAIL.slice(9)} y`,
+    "x [redacted] y",
+  ],
+  ["credential inside a terminated OSC title", `x ${ESC}]0;${SECRET}\u0007 y`, "x [redacted] y"],
+  [
+    "stray OSC before a line break, then an SGR inside",
+    `x ${ESC}]\n${HEAD}${ESC}[31m${TAIL} y`,
+    "x ]\n[redacted] y",
+  ],
+  [
+    "two multiline strings interrupting one credential",
+    `x ${HEAD}${ESC}]0;a\nb\u0007${TAIL.slice(0, 6)}${ESC}Pc\nd${ESC}\\${TAIL.slice(6)} y`,
+    "x [redacted] y",
+  ],
+  [
+    "OSC longer than the hold inside",
+    `x ${HEAD}${ESC}]0;${"t".repeat(5_000)}\u0007${TAIL} y`,
+    `x [redacted]]0;${"t".repeat(5_000)}[redacted] y`,
+  ],
+  ["ordinary formatting and no credential", `${ESC}[1;31mred${ESC}[0m ${ESC}(Bplain${ESC}[K`, "red plain"],
+])("terminal readings cannot expose a credential: %s", (_name, input, expected) =>
+  expectTerminal(input, expected),
+);
+
+test("periodic credentials through a large interrupted stream keep bounded carry and one span", () => {
+  const matcher = new CredentialMatcher(variants(["abcabcab"]));
+  const redactor = terminalRedactor(() => matcher);
+  let output = redactor.push("x");
+  for (let i = 0; i < 2_000; i++) {
+    output += redactor.push(`${"abc".repeat(50)}${ESC}[1m${"abc".repeat(50)}`);
+    expect(redactor.retained.text).toBeLessThanOrEqual(matcher.maxLength + 8);
+    expect(redactor.retained.spans).toBeLessThanOrEqual(1);
+  }
+  output += redactor.push("aby", true);
+  expect(output).toBe("x[redacted]y");
+  expect(redactor.retained).toEqual({ text: 0, spans: 0 });
+});
+
+test("an unterminated strict string bounds carry and releases visible text while open", () => {
+  const matcher = new CredentialMatcher(variants([SECRET]));
+  const redactor = terminalRedactor(() => matcher);
+  // The strict reading never sees a terminator, so its pending prefix is hidden at the bound.
+  let output = redactor.push(`x ${HEAD}${ESC}]0;`);
+  for (let i = 0; i < 50; i++) {
+    output += redactor.push(`${"line ".repeat(39)}\n`);
+    expect(redactor.retained.text).toBeLessThanOrEqual(matcher.maxLength + TERMINAL_HOLD + 1);
+  }
+  expect(output.length).toBeGreaterThan(5_000);
+  output += redactor.push(`${SECRET} end`, true);
+  expect(output).toBe(`x [redacted]]0;${`${"line ".repeat(39)}\n`.repeat(50)}[redacted] end`);
 });

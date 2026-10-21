@@ -3,10 +3,10 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { stripVTControlCharacters } from "node:util";
 import { credentialMatcher, registerCredentialVariant } from "./credential-matcher.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
+import { terminalRedactor } from "./terminal-redaction.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
 export const invocationScratch = new AsyncLocalStorage<string>();
@@ -708,11 +708,6 @@ export function idleWatchdog(limit: number, now = Date.now) {
     expired: () => now() - last > limit,
   };
 }
-const VT_ESCAPE = "\u001b";
-const MAX_PENDING_VT = 4_096;
-const INCOMPLETE_VT = new RegExp(
-  String.raw`(?:${VT_ESCAPE}(?:\][^${"\u0007\u001b\u009c"}]*(?:${VT_ESCAPE})?|\[[0-?]*[ -/]*|[ -/]*)|${"\u009b"}[0-?]*[ -/]*)$`,
-);
 
 function lineSplitter(onLine?: (line: string) => void, limit = Infinity) {
   let pending = "";
@@ -940,18 +935,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
-      let terminalPending = "";
-      let matcher = credentialMatcher();
-      let redact = matcher.stream();
-      const redactStream = (chunk: string, flush = false) => {
-        const current = credentialMatcher();
-        if (current !== matcher) {
-          matcher = current;
-          chunk = redact.pending + chunk;
-          redact = matcher.stream();
-        }
-        return redact.push(chunk, flush);
-      };
+      const redactor = terminalRedactor();
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
@@ -961,19 +945,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         push(chunk: string) {
           idle.reset();
           opts.onRawChunk?.(chunk, stream);
-          if (!opts.redactOutput) return emit(chunk);
-          const decoded = terminalPending + chunk;
-          // Hold incomplete CSI, OSC and ESC sequences until stripping can see them whole.
-          const incomplete = decoded.match(INCOMPLETE_VT);
-          // An unterminated sequence (a stray ESC ] in binary output) must not hold the stream forever.
-          const held = incomplete?.index !== undefined && decoded.length - incomplete.index <= MAX_PENDING_VT;
-          const terminalCut = held ? (incomplete?.index ?? decoded.length) : decoded.length;
-          terminalPending = decoded.slice(terminalCut);
-          emit(redactStream(stripVTControlCharacters(decoded.slice(0, terminalCut))));
+          emit(opts.redactOutput ? redactor.push(chunk) : chunk);
         },
         flush() {
-          emit(redactStream(stripVTControlCharacters(terminalPending), true));
-          terminalPending = "";
+          emit(redactor.push("", true));
         },
       };
     };
