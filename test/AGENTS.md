@@ -54,6 +54,8 @@ and extend the closest case when it already exercises that behavior.
 
 ## Tests that hold on every machine
 
+- Keep `sandbox_apply: Operation not permitted` out of test titles and printed strings (see root `AGENTS.md`).
+  Actions parses `##[…]` anywhere in a job log line, so test titles and printed output must not contain runner commands.
 - **Files run in parallel.** Every new test file must run independently alongside other files:
   use its own temporary directories under `os.tmpdir()`, port 0, no fixed shared paths, and no
   dependence on file order. Process isolation keeps globals local to a file, not to a test.
