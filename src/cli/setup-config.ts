@@ -141,6 +141,7 @@ export function patchSetupConfig(
   added: string[],
   convert: boolean,
   owner?: string,
+  repos: Record<string, Record<string, unknown>> = {},
 ): string {
   const parts = statements(original);
   const tables: Record<string, Record<string, unknown>> = {
@@ -182,6 +183,21 @@ export function patchSetupConfig(
           });
         } else parts.push({ table: [table], text: `\n[${table}]\n${assignments(missing)}` });
       }
+    }
+  }
+  for (const [slug, settings] of Object.entries(repos)) {
+    const inline = parts.find((p) => hasKey(p, "repos"));
+    const entry = parts.find((p) => hasKey(p, "repos", slug));
+    const discreet = parts.find((p) => hasKey(p, "repos", slug, "discreet"));
+    if (inline) inline.text = patchInlineTable(inline.text, "repos", { [slug]: settings });
+    else if (entry) entry.text = `${entry.key} = ${tomlValue(settings)}\n`;
+    else if (discreet) discreet.text = `${discreet.key} = true\n`;
+    else {
+      const at = parts.findIndex(
+        (p) => p.table.length === 2 && p.table[0] === "repos" && p.table[1] === slug,
+      );
+      if (at >= 0) parts.splice(at + 1, 0, { table: ["repos", slug], text: "\ndiscreet = true\n" });
+      else parts.push({ table: ["repos", slug], text: `\n[repos.${tomlValue(slug)}]\ndiscreet = true\n` });
     }
   }
   const providersInline = parts.find((p) => hasKey(p, "providers"));

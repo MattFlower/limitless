@@ -28,8 +28,7 @@ test("empty --yes --json setup detects providers, writes validated config, start
     const hook = JSON.parse(result.sessionStart.split("acknowledging:\n")[1]);
     expect(hook.hooks.SessionStart[0].hooks[0]).toMatchObject({ type: "command" });
     expect(hook.hooks.SessionStart[0].hooks[0].command).toEndWith("digest --consumer claude");
-    expect(result.discreet).toContain("not available yet (#37)");
-    expect(result.discreet).toContain("off (deferred to #37");
+    expect(result.discreet).toBe("discreet mode: no repositories changed");
     expect(result.warnings).toContainEqual(expect.stringContaining("One-way migration"));
     expect(f.effects).toEqual(["service", "smoke", "mcp"]);
     expect(writes).toEqual([f.file, f.smokeFile]);
@@ -586,22 +585,68 @@ for (const consent of ["no", "yes", "noninteractive"])
     }
   });
 
-for (const json of [false, true])
-  test(`interactive init asks about discreet mode with off default and reports deferral (json=${json})`, async () => {
-    const f = setupFixture();
+for (const [mode, json] of [
+  ["on", false],
+  ["on", true],
+  ["off", true],
+] as const)
+  test(`interactive init persists discreet mode ${mode} only for added repositories (json=${json})`, async () => {
+    const original = `[[providers]]
+preset = "claude"
+[[providers]]
+preset = "codex"
+[owners]
+github = "acme"
+[github]
+repos = ["acme/existing"]
+merge = "pr"
+[repos."acme/app"]
+land_requires_approval = true
+branch_prefix = "custom/"
+[repos."acme/existing"]
+discreet = false
+[repos."acme/other"]
+discreet = true
+`;
+    const f = setupFixture(original);
     try {
       const questions: [string, string][] = [];
+      f.state.local = false;
       f.d.tty = true;
       f.d.ask = async (q, fallback) => {
         questions.push([q, fallback]);
-        if (q.startsWith("Convert")) return "yes";
-        if (q.startsWith("Discreet")) return "on";
+        if (q.startsWith("Repositories")) return "acme/existing,acme/app,acme/lib";
+        if (q.startsWith("Discreet")) return mode;
         return fallback;
       };
       expect(await setupCommand("init", { json }, f.d)).toBe(0);
       expect(questions).toContainEqual(["Discreet mode (on/off)", "off"]);
       const output = json ? JSON.parse(f.output[0] ?? "").discreet : f.output.join("\n");
-      expect(output).toContain("discreet mode: on (deferred to #37");
+      expect(output).toContain(
+        mode === "on"
+          ? "discreet mode enabled for: acme/app, acme/lib"
+          : "discreet mode: no repositories changed",
+      );
+      f.reload();
+      expect(f.d.config.raw.repos).toEqual({
+        "acme/app": {
+          land_requires_approval: true,
+          branch_prefix: "custom/",
+          ...(mode === "on" ? { discreet: true } : {}),
+        },
+        "acme/existing": { discreet: false },
+        "acme/other": { discreet: true },
+        ...(mode === "on" ? { "acme/lib": { discreet: true } } : {}),
+      });
+      expect(f.d.config.repos?.["acme/app"]).toEqual({
+        landRequiresApproval: true,
+        branchPrefix: "custom/",
+        discreet: mode === "on",
+      });
+      const updated = readFileSync(f.file, "utf8");
+      if (mode === "off") expect(updated).toContain(original.slice(original.indexOf("[repos.")));
+      expect(await setupCommand("init", { json }, f.d)).toBe(0);
+      expect(readFileSync(f.file, "utf8")).toBe(updated);
     } finally {
       f.close();
     }

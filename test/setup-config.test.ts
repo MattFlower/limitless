@@ -1,6 +1,22 @@
 import { expect, test } from "bun:test";
 import { patchSetupConfig } from "../src/cli/setup-config.ts";
 
+for (const original of [
+  '[repos."acme/app"]\nland_requires_approval = true\ndiscreet = false\n',
+  'repos = { "acme/app" = { land_requires_approval = true, discreet = false }, "acme/other" = { discreet = false } }\n',
+  '[repos]\n"acme/app" = { land_requires_approval = true, discreet = false }\n',
+])
+  test(`setup enables discreet mode while preserving repository settings: ${original.trim()}`, () => {
+    const text = patchSetupConfig(original, { repos: ["acme/app"], merge: "pr" }, [], [], false, undefined, {
+      "acme/app": { land_requires_approval: true, discreet: true },
+    });
+    expect(Bun.TOML.parse(text)).toMatchObject({
+      repos: { "acme/app": { land_requires_approval: true, discreet: true } },
+    });
+    if (original.includes("acme/other"))
+      expect(Bun.TOML.parse(text)).toMatchObject({ repos: { "acme/other": { discreet: false } } });
+  });
+
 test("provider conversion preserves literal dotted table and assignment names", () => {
   const unrelated = String.raw`"providers.root-note" = "keep root value"
 ["providers.notes"]
