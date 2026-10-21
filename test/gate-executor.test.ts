@@ -1034,7 +1034,7 @@ test("unscoped attachment cannot borrow its start-time gate reservation", async 
   const releaseA = Promise.withResolvers<void>();
   const queued = Promise.withResolvers<void>();
   const gateA = gateSlotScope(async () => {
-    await acquireGateSlot(controller.signal, undefined, "gate A");
+    const release = await acquireGateSlot(controller.signal, undefined, "gate A");
     started.resolve(
       await readPolicyScope.run(testReadPolicy, () =>
         confinementScope.run(recording.backend, () =>
@@ -1043,6 +1043,7 @@ test("unscoped attachment cannot borrow its start-time gate reservation", async 
       ),
     );
     await releaseA.promise;
+    release();
   })();
   let execution: ReturnType<typeof executor.attach> | undefined;
   try {
