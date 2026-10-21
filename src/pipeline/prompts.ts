@@ -235,30 +235,34 @@ export const holdoutBoundaryPattern = (detail: string) => {
   return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
 };
 
+function collectHoldoutLiterals(source: string, collect: (detail: string) => void) {
+  for (const literal of source.match(
+    /(?<![\w])(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
+  ) ?? []) {
+    collect(/^["'`]/u.test(literal) ? literal.slice(1, -1) : literal);
+  }
+}
+
 export function privateHoldoutDetails(holdout: Holdout, publicSources = "", observed?: string): Set<string> {
   const details = new Set<string>();
   const collect = (detail: string) => {
     if (detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources)) details.add(detail);
   };
-  const collectLiterals = (source: string) => {
-    for (const literal of source.match(
-      /(?<![\w])(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
-    ) ?? []) {
-      collect(/^["'`]/u.test(literal) ? literal.slice(1, -1) : literal);
-    }
-  };
+  collectHoldoutDetails(holdout, collect);
+  if (observed !== undefined) collectHoldoutLiterals(observed, collect);
+  return details;
+}
+
+function collectHoldoutDetails(holdout: Holdout, collect: (detail: string) => void) {
   for (const scenario of holdout.scenarios) {
     for (const source of [scenario.description, scenario.steps, scenario.expected]) {
       // Whole phrases cover prose; only syntax-shaped literals are removed in isolation.
       if (source.trim().split(/\s+/).length > 1) collect(source.trim());
       for (const sentence of source.match(/[^.!?\n]+[.!?]/g) ?? [])
         if (sentence.trim().split(/\s+/).length > 1) collect(sentence.trim());
-      collectLiterals(source);
+      collectHoldoutLiterals(source, collect);
     }
   }
-  // Observed values and runtime error identifiers need not occur in the authored scenarios.
-  if (observed !== undefined) collectLiterals(observed);
-  return details;
 }
 
 export function redactHoldoutText(
@@ -267,23 +271,83 @@ export function redactHoldoutText(
   publicSources = "",
   includeObservedLiterals = true,
 ): string {
-  if (!holdout.scenarios.length) return value;
-  const details = privateHoldoutDetails(holdout, publicSources, includeObservedLiterals ? value : undefined);
-  if (!details.size) return value;
-  const pattern = new RegExp(
-    [...details]
-      .sort((a, b) => b.length - a.length)
-      .map(holdoutBoundaryPattern)
-      .join("|"),
-    "giu",
-  );
-  let removed = 0;
-  // A single pass counts displayed replacements and never scans inserted placeholders.
-  const safe = value.replace(pattern, () => {
-    removed++;
-    return "[private detail]";
+  return holdoutRedactor(holdout, publicSources)(value, includeObservedLiterals);
+}
+
+export function holdoutRedactor(holdout: Holdout, publicSources = "") {
+  const privateLiterals = new Map<string, boolean>();
+  const isPrivate = (detail: string) => {
+    let result = privateLiterals.get(detail);
+    if (result === undefined) {
+      result = !!detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources);
+      privateLiterals.set(detail, result);
+    }
+    return result;
+  };
+  const details = new Set<string>();
+  collectHoldoutDetails(holdout, (detail) => {
+    if (isPrivate(detail)) details.add(detail);
   });
-  return removed ? `${safe} [${removed} private details withheld]` : safe;
+  const compile = (literals: Set<string>) =>
+    literals.size
+      ? new RegExp(
+          [...literals]
+            .sort((a, b) => b.length - a.length)
+            .map(holdoutBoundaryPattern)
+            .join("|"),
+          "giu",
+        )
+      : undefined;
+  const basePattern = compile(details);
+  // Retain only the last observed pattern: event IDs make observed sets mostly unique.
+  let lastKey = "";
+  let lastPattern: RegExp | undefined;
+  return (value: string, includeObservedLiterals = true): string => {
+    if (!holdout.scenarios.length) return value;
+    const extra = new Set<string>();
+    // Observed details belong only to this value; public exemptions are safe to memoize.
+    if (includeObservedLiterals)
+      collectHoldoutLiterals(value, (detail) => {
+        if (!details.has(detail) && isPrivate(detail)) extra.add(detail);
+      });
+    const key = extra.size ? JSON.stringify([...extra].sort()) : "";
+    if (key && key !== lastKey) {
+      lastKey = key;
+      lastPattern = compile(extra);
+    }
+    const observedPattern = key ? lastPattern : undefined;
+    if (basePattern) basePattern.lastIndex = 0;
+    if (observedPattern) observedPattern.lastIndex = 0;
+    let base = basePattern?.exec(value);
+    let observed = observedPattern?.exec(value);
+    let position = 0;
+    let removed = 0;
+    let safe = "";
+    // Merge against the original input, preserving the combined alternation's stable length sort.
+    while (base || observed) {
+      const match =
+        base &&
+        (!observed ||
+          base.index < observed.index ||
+          (base.index === observed.index && base[0].length >= observed[0].length))
+          ? base
+          : observed;
+      if (!match) break;
+      safe += `${value.slice(position, match.index)}[private detail]`;
+      position = match.index + match[0].length;
+      removed++;
+      // An overlapping pending match may hide another match starting inside its own span.
+      if (base && base.index < position && basePattern) {
+        basePattern.lastIndex = position;
+        base = basePattern.exec(value);
+      }
+      if (observed && observed.index < position && observedPattern) {
+        observedPattern.lastIndex = position;
+        observed = observedPattern.exec(value);
+      }
+    }
+    return removed ? `${safe}${value.slice(position)} [${removed} private details withheld]` : value;
+  };
 }
 
 /** Exactly the private-row summary rendered in implementer feedback. */

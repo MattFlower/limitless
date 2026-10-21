@@ -3,6 +3,7 @@ import { compareGates } from "../src/gates/run.ts";
 import {
   formatVerifyFeedback,
   holdoutPrompt,
+  holdoutRedactor,
   redactHoldoutText,
   verifyPrompt,
 } from "../src/pipeline/prompts.ts";
@@ -276,6 +277,227 @@ test("observed literal exemptions are case insensitive and respect identifier bo
   expect(redactHoldoutText(input, holdout, publicSources)).toBe(
     "Common words remain: /API/v2/WIDGETS --FORCE 48231 'NEGATIVE-QUANTITY' RETRYPUBLICCALL buildPrivateInputArgs err_public; [private detail] [private detail] [private detail]. [3 private details withheld]",
   );
+});
+
+// Frozen pre-optimization algorithm, including independent extraction and boundary logic.
+function referenceRedactHoldoutText(
+  value: string,
+  holdout: Holdout,
+  publicSources = "",
+  includeObservedLiterals = true,
+): string {
+  if (!holdout.scenarios.length) return value;
+  const boundaryPattern = (detail: string) => {
+    const escaped = detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
+  };
+
+  const observed = includeObservedLiterals ? value : undefined;
+  const details = new Set<string>();
+  const collect = (detail: string) => {
+    if (detail && !new RegExp(boundaryPattern(detail), "iu").test(publicSources)) details.add(detail);
+  };
+  const collectLiterals = (source: string) => {
+    for (const literal of source.match(
+      /(?<![\w])(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
+    ) ?? []) {
+      collect(/^["'`]/u.test(literal) ? literal.slice(1, -1) : literal);
+    }
+  };
+  for (const scenario of holdout.scenarios) {
+    for (const source of [scenario.description, scenario.steps, scenario.expected]) {
+      // Whole phrases cover prose; only syntax-shaped literals are removed in isolation.
+      if (source.trim().split(/\s+/).length > 1) collect(source.trim());
+      for (const sentence of source.match(/[^.!?\n]+[.!?]/g) ?? [])
+        if (sentence.trim().split(/\s+/).length > 1) collect(sentence.trim());
+      collectLiterals(source);
+    }
+  }
+  // Observed values and runtime error identifiers need not occur in the authored scenarios.
+  if (observed !== undefined) collectLiterals(observed);
+  if (!details.size) return value;
+  const pattern = new RegExp(
+    [...details]
+      .sort((a, b) => b.length - a.length)
+      .map(boundaryPattern)
+      .join("|"),
+    "giu",
+  );
+  let removed = 0;
+  // A single pass counts displayed replacements and never scans inserted placeholders.
+  const safe = value.replace(pattern, () => {
+    removed++;
+    return "[private detail]";
+  });
+  return removed ? `${safe} [${removed} private details withheld]` : safe;
+}
+
+test("invocation redaction matches the frozen algorithm on generated values in both observed modes", () => {
+  const scenarios: Holdout = {
+    scenarios: [
+      ...Array.from({ length: 4 }, (_, i) => ({
+        id: `H-${i + 1}`,
+        description: `The empty collection returns ${731 + i}. Preserve the original ordering! A final check?`,
+        steps: `Run 'violet-key' with "overlap phrase tail" and \`overlap phrase\`. Use /fixtures/case-${i} --hidden-mode privateArg_${i}, sharedInput, and 42.`,
+        expected: `Return ERR_PRIVATE_${i} with 'café' and 'input'. Report a missing private detail.`,
+        edge_case: i % 2 === 0,
+      })),
+      {
+        id: "H-overlap",
+        description: "amber oak",
+        steps: "'elm ash' 'cedar maple' 'maple' 'quartz' 'x-' '-y'",
+        expected: "ok",
+        edge_case: true,
+      },
+    ],
+  };
+  const publicSources =
+    "The empty collection returns 731. --public-mode /api/public 42 sharedInput ERR_PUBLIC 'public phrase' buildPrivateArg_0 café";
+  const fragments = [
+    ...scenarios.scenarios.flatMap((s) => [
+      s.description,
+      s.steps,
+      s.expected,
+      ...s.description.split(/(?<=[.!?]) /),
+    ]),
+    "'observed ordinary words' observed ordinary words",
+    '"public phrase" "private phrase"',
+    "`runtime phrase` `` '' \"\"",
+    "'overlap phrase' overlap phrase tail",
+    // Same-start longer static/observed choices, case-insensitive ties and adjacent matches.
+    "'amber' amber oak",
+    "'amber oak extended' amber oak extended",
+    "'QUARTZ' quartz QUARTZ",
+    "x--y '--y' x---y",
+    // Consuming either pattern invalidates the other's pending match; rescan inside its span.
+    "'ash pine' 'pine' elm ash pine",
+    "'oak cedar' oak cedar maple",
+    "/api/public /API/PUBLIC ../fixtures/other ./fixtures/other /fixtures/case-2",
+    "--public-mode --PUBLIC-MODE --observed-mode -x",
+    "42 731 733 93827 3.14 0",
+    "privateArg_0 PRIVATEARG_0 sharedInput SHAREDINPUT ERR_PRIVATE_3 ERR_PUBLIC runtimeObservedCall",
+    "input inputs reinput $input _input éinput inputé 中input input中 input٢ input",
+    "café CAFÉ 'naïve' `日本語` 'a+b.*?[x](z)$'",
+    "unclosed 'quote and line\nbreak `other\nline`",
+    "ordinary words remain unchanged",
+    "",
+  ];
+  let seed = 718;
+  const next = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+  const values = [
+    ...fragments,
+    ...Array.from({ length: 360 }, () =>
+      Array.from({ length: 1 + (next() % 4) }, () => fragments[next() % fragments.length]).join(" | "),
+    ),
+  ];
+  const redact = holdoutRedactor(scenarios, publicSources);
+  for (const value of values) {
+    for (const observed of [true, false]) {
+      const expected = referenceRedactHoldoutText(value, scenarios, publicSources, observed);
+      expect(redact(value, observed)).toBe(expected);
+      expect(redactHoldoutText(value, scenarios, publicSources, observed)).toBe(expected);
+    }
+  }
+});
+
+test("invocation redactors isolate observed details, counts and public-source exemptions", () => {
+  let scenarioReads = 0;
+  const scenarios: Holdout = {
+    scenarios: [
+      {
+        id: "H-1",
+        get description() {
+          scenarioReads++;
+          return "private";
+        },
+        steps: "--secret-mode",
+        expected: "ok",
+        edge_case: true,
+      },
+    ],
+  };
+  const redact = holdoutRedactor(scenarios);
+  const publicRedact = holdoutRedactor(scenarios, "--secret-mode 'ordinary' --observed-mode");
+  expect(redact("'ordinary'")).toBe("'[private detail]' [1 private details withheld]");
+  expect(redact("ordinary")).toBe("ordinary");
+  expect(publicRedact("'ordinary' --secret-mode --observed-mode")).toBe(
+    "'ordinary' --secret-mode --observed-mode",
+  );
+  expect(redact("--secret-mode --secret-mode")).toBe(
+    "[private detail] [private detail] [2 private details withheld]",
+  );
+  expect(redact("--secret-mode")).toBe("[private detail] [1 private details withheld]");
+  expect(redact("--secret-mode", false)).toBe("[private detail] [1 private details withheld]");
+  expect(redact("ordinary words", false)).toBe("ordinary words");
+  expect(redact("--secret-mode", false)).toBe("[private detail] [1 private details withheld]");
+  expect(redact("'ordinary'", false)).toBe("'ordinary'");
+  expect(redact("'ordinary'")).toBe("'[private detail]' [1 private details withheld]");
+  expect(redact("--observed-mode")).toBe("[private detail] [1 private details withheld]");
+  expect(publicRedact("--observed-mode")).toBe("--observed-mode");
+  expect(redact("ordinary")).toBe("ordinary");
+  expect(scenarioReads).toBe(2);
+  expect(holdoutRedactor({ scenarios: [] })("'ordinary' 123 --mode")).toBe("'ordinary' 123 --mode");
+  expect(holdoutRedactor(scenarios, "--secret-mode")("ordinary words")).toBe("ordinary words");
+});
+
+test("streaming redaction reuses patterns without retaining every observed combination", () => {
+  const original = globalThis.RegExp;
+  let compiled = 0;
+  const replacements: string[] = [];
+  const boundaries: string[] = [];
+  globalThis.RegExp = new Proxy(original, {
+    construct(target, args) {
+      if (args[1] === "giu") {
+        compiled++;
+        replacements.push(String(args[0]));
+      }
+      if (args[1] === "iu") boundaries.push(String(args[0]));
+      return Reflect.construct(target, args);
+    },
+  });
+  try {
+    const redact = holdoutRedactor(holdout);
+    expect(compiled).toBe(1);
+    const staticSource = replacements[0] ?? "";
+    expect(staticSource).not.toBe("");
+    const initialBoundaries = boundaries.length;
+    for (let i = 0; i < 40; i++) {
+      const value = `runtimeId_${i}`;
+      expect(redact(value)).toBe("[private detail] [1 private details withheld]");
+      const afterFirstCall = compiled;
+      expect(redact(value)).toBe("[private detail] [1 private details withheld]");
+      expect(compiled).toBe(afterFirstCall);
+      expect(boundaries.length).toBe(initialBoundaries + i + 1);
+    }
+    // Unique observed literals must never recompile any static alternatives.
+    expect(replacements.slice(1).every((source) => !source.includes(staticSource))).toBe(true);
+    const afterUniqueCalls = compiled;
+    expect(redact("ordinary words")).toBe("ordinary words");
+    expect(compiled).toBe(afterUniqueCalls);
+    expect(redact("runtimeId_0")).toBe("[private detail] [1 private details withheld]");
+    // An old observed combination was evicted, while the base pattern stayed cached.
+    expect(compiled).toBe(afterUniqueCalls + 1);
+    expect(boundaries.length).toBe(initialBoundaries + 40);
+    expect(redact("secret input", false)).toBe("[private detail] [1 private details withheld]");
+    expect(redact("secret input", false)).toBe("[private detail] [1 private details withheld]");
+    expect(compiled).toBe(afterUniqueCalls + 1);
+    expect(redact("runtimeId_38 runtimeId_39")).toBe(
+      "[private detail] [private detail] [2 private details withheld]",
+    );
+    const afterPair = compiled;
+    expect(redact("runtimeId_39 runtimeId_38")).toBe(
+      "[private detail] [private detail] [2 private details withheld]",
+    );
+    expect(compiled).toBe(afterPair);
+    expect(boundaries.length).toBe(initialBoundaries + 40);
+    const publicRedact = holdoutRedactor(holdout, "runtimeId_public");
+    const beforePublicCalls = boundaries.length;
+    expect(publicRedact("runtimeId_public")).toBe("runtimeId_public");
+    expect(publicRedact("runtimeId_public")).toBe("runtimeId_public");
+    expect(boundaries.length).toBe(beforePublicCalls + 1);
+  } finally {
+    globalThis.RegExp = original;
+  }
 });
 
 test("private summaries redact runtime error identifiers on unmet and unclear retries", () => {
