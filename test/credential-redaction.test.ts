@@ -228,10 +228,13 @@ const DIGITS = "12345678abcdefgh";
 // Exhaust short inputs; sample long inputs densely at boundaries. Carry stays bounded at every split.
 function expectTerminal(input: string, expected: string, values = [SECRET, DIGITS], boundaries = [0]) {
   const matcher = new CredentialMatcher(variants(values));
+  // A held credential prefix delays forced release past the sequence's hold boundary.
+  const release = (boundaries[0] ?? 0) + matcher.maxLength + TERMINAL_HOLD;
   for (let offset = 0; offset <= input.length; offset++) {
     if (
       input.length > TERMINAL_HOLD &&
       offset % 97 !== 0 &&
+      Math.abs(offset - release) > 3 &&
       !boundaries.some((boundary) => Math.abs(offset - boundary) <= 3)
     )
       continue;
