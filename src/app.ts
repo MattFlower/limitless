@@ -98,7 +98,7 @@ export class Factory {
     gateSlots.setLimit(cfg.maxConcurrentGates);
     const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
     this.store = opts.store ?? new Store(cfg.paths.db);
-    this.workers = new WorkerStore(this.store, opts.bootSha);
+    this.workers = new WorkerStore(this.store, opts.bootSha, {}, Date.now, cfg.workers.agentSlots);
     this.models = [...(opts.models ?? catalog.models)];
     this.evalSettings = evalSettings(cfg.raw);
     this.providerDefs = (opts.providers ?? catalog.providers).map((provider) => ({
@@ -338,7 +338,10 @@ export class Factory {
 
   cancelRun(id: string, by = "user"): boolean {
     const cancelled = this.scheduler.cancel(id, by);
-    if (cancelled) for (const job of this.workers.jobs("run_id=?", id)) this.workers.cancel(job.id);
+    if (cancelled) {
+      for (const job of this.workers.jobs("run_id=?", id)) this.workers.cancel(job.id);
+      this.workers.cancelRunAgentJobs(id);
+    }
     return cancelled;
   }
 
