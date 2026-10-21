@@ -411,6 +411,17 @@ for (const stage of ["implement", "gates", "review", "verify", "deliver"] as con
     const id = await run(f);
     // Holdout exports a base snapshot in parallel; let it finish so only `stage` is interrupted.
     await wait(() => reached && f.store.getRunState<RunState>(id)?.holdoutStatus === "complete");
+    if (stage === "verify")
+      await wait(() =>
+        f.store
+          .listStages(id)
+          .some(
+            (s) =>
+              s.name === "review" &&
+              s.round === f.store.getRunState<RunState>(id)?.round &&
+              s.status === "succeeded",
+          ),
+      );
     await f.stop();
     expect(f.store.getRun(id)?.status).toBe("queued");
     history(f, id);
@@ -1783,7 +1794,7 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     return kill(pid, signal);
   });
   try {
-    await wait(() => existsSync(entered));
+    await wait(() => existsSync(entered) && /^[1-9]\d*$/.test(readFileSync(entered, "utf8").trim()));
     gatePid = Number(readFileSync(entered, "utf8"));
     child.kill("SIGKILL");
     await child.exited;
