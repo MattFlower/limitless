@@ -54,6 +54,7 @@ export interface FactoryOptions {
     clear: (timer: ReturnType<typeof setInterval>) => void;
   };
   clock?: () => number;
+  loadSource?: () => number;
   fetch?: typeof fetch;
   providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
   healthFetch?: typeof fetch;
@@ -201,7 +202,10 @@ export class Factory {
       ),
     };
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
-    this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
+    this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns, {
+      maxLoadPerCore: cfg.maxLoadPerCore,
+      loadSource: opts.loadSource,
+    });
     this.land = new LandQueue({
       store: this.store,
       paths: cfg.paths,

@@ -487,6 +487,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       json({
         ok: true,
         uptimeMs: Date.now() - factory.startedAt,
+        loadPerCore: factory.scheduler.loadPerCore,
+        admissionHeld: factory.scheduler.admissionHeld,
         eventLoopLagMaxMs: eventLoopLag.maxMs(),
         sha: factory.bootSha,
         gateSlots: gateSlots.snapshot(),
