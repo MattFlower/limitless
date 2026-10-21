@@ -1,12 +1,15 @@
+import { profile, type SamplingProfileStackTraces } from "bun:jsc";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
+import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
+import { parseSince } from "../core/since.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
-import { computeProviderWorkload, computeStats } from "../db/stats.ts";
+import { computeProviderStatistics, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
@@ -17,6 +20,7 @@ import { getChange } from "../integrations/mcp-change.ts";
 import { landWire } from "../land/wire.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { stallReporter } from "../util/stall.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { createApiToken, matchesApiToken } from "./api-token.ts";
@@ -26,6 +30,25 @@ import { Passkeys } from "./passkeys.ts";
 
 const eventLoopLag = new EventLoopLag();
 setInterval(() => stallReporter.sample(eventLoopLag.sample()), 1000).unref();
+let profileRunning = false;
+
+const profileText = (value: string) =>
+  new TextDecoder().decode(Buffer.from(redactCredentials(value)).subarray(0, 64 * 1024), { stream: true });
+
+function profileStacks({ traces }: SamplingProfileStackTraces): string {
+  const counts = new Map<string, number>();
+  for (const { frames } of traces) {
+    const stack = frames
+      .slice(0, 8)
+      .map(({ name, sourceURL, line }) => `${name || "<anonymous>"} (${sourceURL}:${line})`)
+      .join(" < ");
+    counts.set(stack, (counts.get(stack) ?? 0) + 1);
+  }
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .map(([stack, count]) => `${count}  ${stack}`)
+    .join("\n");
+}
 
 export interface HttpExtras {
   apiToken?: string;
@@ -355,6 +378,26 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/admin/drain": admin("drain"),
     "/api/admin/resume": admin("resume"),
+    "/api/admin/profile": {
+      POST: handle(async (req, server) => {
+        const { seconds } = z
+          .object({ seconds: z.number().min(0.2).max(120).default(30) })
+          .parse(await body<unknown>(req));
+        if (profileRunning) return error("A profile is already running", 409);
+        profileRunning = true;
+        try {
+          server.timeout(req, 0);
+          const result = await profile(() => Bun.sleep(seconds * 1000), 1000);
+          return json({
+            seconds,
+            functions: profileText(result.functions),
+            stackTraces: profileText(profileStacks(result.stackTraces)),
+          });
+        } finally {
+          profileRunning = false;
+        }
+      }, true),
+    },
     "/api/admin/auth/password": {
       POST: handle(async (req) => {
         await auth.setPassword((await body<{ password?: unknown }>(req)).password);
@@ -755,7 +798,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }),
       DELETE: handle(() => json(factory.routing.setPrefer(null))),
     },
-    "/api/stats/providers": handle(() => json(computeProviderWorkload(store))),
+    "/api/stats/providers": handle((req) => {
+      const since = new URL(req.url).searchParams.get("since");
+      return json(computeProviderStatistics(store, since === null ? undefined : parseSince(since)));
+    }),
     "/api/providers/:id/fast": {
       POST: handle(async (req) => {
         const data = await body<{ on?: unknown } | null>(req);
