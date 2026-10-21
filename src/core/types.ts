@@ -628,8 +628,14 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 /** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
-/** Finder prompts: `standard`, `adversarial`, `careful`, or eval-only `probe` reproduction and `trace` entry-point search. */
-export type FinderPrompt = "standard" | "adversarial" | "careful" | "probe" | "trace";
+/** Finder prompts include eval-only `probe`, `trace`, and `adversarial-checklist`. */
+export type FinderPrompt =
+  | "standard"
+  | "adversarial"
+  | "careful"
+  | "probe"
+  | "trace"
+  | "adversarial-checklist";
 /**
  * One review finder; production may omit `target` (routed), evals may not. Production single-mode
  * reviews use the reviewer prompt, named `standard`; evals may add a second `trace` finder.
