@@ -45,6 +45,31 @@ const { start } = pipelineSetup({
   },
 });
 
+test.each([
+  ["explicit", "x".repeat(80), "x".repeat(80)],
+  ["defaulted", undefined, "Triage title"],
+  ["legacy matching", "x".repeat(80), "Triage title"],
+  ["legacy differing", "Requester title", "Requester title"],
+] as const)("triage respects %s title provenance", async (kind, title, expected) => {
+  const f = start(() => ({
+    structured: triage({ title: "Triage title", ambiguity: "high", blocking_questions: ["Clarify?"] }),
+  }));
+  const run = await f.createRun({
+    repo: repoDir,
+    prompt: `${"x".repeat(kind === "explicit" ? 80 : 100)}\nDetails`,
+    title,
+    profile: "standard",
+  });
+  expect(run.title).toBe(title ?? "x".repeat(80));
+  if (kind.startsWith("legacy"))
+    f.store.db.query("UPDATE runs SET title_provenance = NULL WHERE id = ?").run(run.id);
+  expect(await waitFor(f, run.id, ["waiting_input", "failed", "needs_human"])).toBe("waiting_input");
+  expect(f.store.getRun(run.id)).toMatchObject({
+    title: expected,
+    titleProvenance: kind.startsWith("legacy") ? null : kind,
+  });
+});
+
 describe("per-run model chains", () => {
   const reply: Handler = (s) => {
     const role = roleOf(s);

@@ -759,7 +759,11 @@ async function triage(ctx: RunContext): Promise<void> {
     ctx.state.triage = t;
     const profile: ResolvedProfile = ctx.run.profile === "auto" ? t.suggested_profile : ctx.run.profile;
     ctx.run = ctx.store.updateRun(ctx.run.id, {
-      title: ctx.run.title === ctx.run.prompt.split("\n")[0]?.slice(0, 80) ? t.title : ctx.run.title,
+      title:
+        ctx.run.titleProvenance === "defaulted" ||
+        (ctx.run.titleProvenance == null && ctx.run.title === ctx.run.prompt.split("\n")[0]?.slice(0, 80))
+          ? t.title
+          : ctx.run.title,
       taskClass: t.task_class,
       complexity: t.complexity,
       resolvedProfile: profile,
