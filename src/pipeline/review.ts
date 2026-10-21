@@ -8,6 +8,8 @@ import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
   AttributionVerifierSchema,
+  ChecklistReviewSchema,
+  LaterChecklistReviewSchema,
   LaterReviewSchema,
   type Review,
   ReviewSchema,
@@ -220,6 +222,8 @@ export function reviewVerdict(
 
 export interface ReviewInput {
   prompt: Parameters<typeof reviewPrompt>[0];
+  /** Eval only: a fenced checklist already extracted from the pinned base and redacted. */
+  checklist?: string;
   timeoutMs: number;
   sampleOffset?: number;
   /** Follow-ups already recorded for this round and commit, when a review is replayed after a restart. */
@@ -238,7 +242,11 @@ export interface ReviewInput {
 /** What the invoker sends to the model; later rounds (with previous findings) use the labelled schema. */
 export interface ReviewRequest {
   prompt: string;
-  schema: typeof ReviewSchema | typeof LaterReviewSchema;
+  schema:
+    | typeof ReviewSchema
+    | typeof LaterReviewSchema
+    | typeof ChecklistReviewSchema
+    | typeof LaterChecklistReviewSchema;
   jsonSchema: Record<string, unknown>;
   timeoutMs: number;
 }
@@ -399,9 +407,23 @@ export type ReviewOutcome<T> = T & {
 };
 
 export function reviewRequest(input: ReviewInput): ReviewRequest {
-  const schema = input.prompt.previous ? LaterReviewSchema : ReviewSchema;
+  const checklist = input.prompt.finder === "adversarial-checklist";
+  if (checklist && !input.checklist)
+    throw new Error("adversarial-checklist: missing prepared base checklist");
+  const schema = input.prompt.previous
+    ? checklist
+      ? LaterChecklistReviewSchema
+      : LaterReviewSchema
+    : checklist
+      ? ChecklistReviewSchema
+      : ReviewSchema;
   const jsonSchema = toStrictJsonSchema(schema);
-  return { prompt: reviewPrompt(input.prompt), schema, jsonSchema, timeoutMs: input.timeoutMs };
+  return {
+    prompt: reviewPrompt(input.prompt) + (checklist ? input.checklist : ""),
+    schema,
+    jsonSchema,
+    timeoutMs: input.timeoutMs,
+  };
 }
 
 /**

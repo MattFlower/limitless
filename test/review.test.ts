@@ -357,6 +357,33 @@ describe("runReview", () => {
     expect(out.decision?.followUps).toEqual([]);
   });
 
+  test("checklist extensions retain ordinary first and later review validation", async () => {
+    const checklist = [{ item: "defect-1", applies: "src/example.ts:1", checked: "none", finding: "F1" }];
+    for (const previous of [undefined, { sha: "old", findings: [finding("major")] }]) {
+      const input = {
+        prompt: { ...prompt, finder: "adversarial-checklist" as const, previous },
+        checklist: "\n\n```text\n[defect-1] Check every path.\n```\n",
+      };
+      const valid = { ...reviewed([{ ...finding("major"), id: "F1" }]), checklist };
+      const out = await review(valid, input);
+      expect(out.output.success).toBe(true);
+      expect(out.decision?.review.checklist).toEqual(checklist);
+      expect(out.decision?.review.findings[0]?.id).toBe("F1");
+      for (const invalid of [
+        reviewed([{ ...plain, id: "F1" }]),
+        { ...valid, findings: [{ ...finding("major"), id: "F1", failure_scenario: undefined }] },
+        { ...valid, findings: [{ ...finding("major"), id: undefined }] },
+        { ...valid, findings: [], summary: "" },
+        ...(previous ? [{ ...valid, findings: [{ ...plain, id: "F1" }] }] : []),
+      ]) {
+        expect((await review(invalid, input)).output.success).toBe(false);
+      }
+    }
+    expect(() =>
+      reviewRequest({ prompt: { ...prompt, finder: "adversarial-checklist" }, timeoutMs: 1 }),
+    ).toThrow("missing prepared base checklist");
+  });
+
   test("later rounds block unaddressed, regressed and security findings and keep replayed follow-ups", async () => {
     const out = await review(
       reviewed([

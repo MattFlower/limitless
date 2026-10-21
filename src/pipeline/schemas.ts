@@ -163,7 +163,23 @@ const rejectDegenerate =
   };
 
 export const ReviewSchema = reviewBase.superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
+export const ChecklistEntrySchema = z.object({
+  item: z.string(),
+  applies: z.string(),
+  checked: z.string(),
+  finding: z.string().nullable(),
+});
 export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate(MIN_LATER_REVIEW_SUMMARY));
+
+/** Eval-only evidence; preserve each ordinary review schema's validation. */
+export const ChecklistReviewSchema = ReviewSchema.safeExtend({
+  findings: z.array(ReviewSchema.shape.findings.element.extend({ id: z.string() })),
+  checklist: z.array(ChecklistEntrySchema),
+});
+export const LaterChecklistReviewSchema = LaterReviewSchema.safeExtend({
+  findings: z.array(LaterReviewSchema.shape.findings.element.extend({ id: z.string() })),
+  checklist: z.array(ChecklistEntrySchema),
+});
 
 /** A panel verifier's ruling on one finder candidate; its severity, not the finder's, is authoritative. */
 const VerificationSchema = z.object({
@@ -239,12 +255,15 @@ type FindingV2Field = keyof typeof findingV2;
 
 /** Findings in run state may predate schema v2, so its fields stay optional once stored. */
 export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
+  /** Eval-only reviewer-reported evidence; ignored when deriving decisions and grades. */
+  checklist?: z.infer<typeof ChecklistEntrySchema>[];
   /** Set by panel reviews, whose findings block by verification instead of finder severity. */
   mode?: "panel";
   findings: (Omit<LiveFinding, FindingV2Field> &
     Partial<Pick<LiveFinding, FindingV2Field>> & {
       label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
       prior?: string;
+      id?: string;
       /** Panel only; absent when the candidate was not verified (capped, cleanup or conventions, or left out by the verifier). */
       verification?: Verification;
       /** Panel only: how many distinct finders raised it (0 for a recheck of a prior blocking finding). */
@@ -269,6 +288,7 @@ export interface ReviewScope {
  * (`security` was added later). The degenerate-summary rule still applies.
  */
 const StoredFindingSchema = reviewBase.shape.findings.element.extend({
+  id: z.string().optional(),
   security: z.boolean().default(false),
   title: z.string().default(""),
   detail: z.string().default(""),
@@ -317,6 +337,7 @@ export const StoredReviewSchema = reviewBase
     summary: z.string().default(""),
     findings: z.array(StoredFindingSchema),
     panel: StoredPanelSchema.optional(),
+    checklist: z.array(ChecklistEntrySchema).optional(),
   })
   .superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
 export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdict">>;
