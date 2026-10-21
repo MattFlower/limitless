@@ -46,6 +46,7 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
         : prClient,
       factory.cfg.paths.configDir,
       [factory.cfg.paths.repos, factory.cfg.paths.work],
+      factory.cfg,
     );
     cleanups.push(stopNotifier);
     const seconds = factory.cfg.githubPollSeconds;

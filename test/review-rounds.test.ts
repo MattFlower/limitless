@@ -27,7 +27,7 @@ import { seeded } from "./seeded.ts";
 // Real git, worktrees and gates; under load they outlast Bun's 5 s default.
 setDefaultTimeout(30_000);
 
-const BRANCH = "limitless/orig-add-feature";
+let BRANCH = "limitless/orig-add-feature";
 const PR_URL = "https://github.com/test/repo/pull/5";
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -106,6 +106,7 @@ let onImplement: () => Promise<Record<string, string>>;
 let rejectNextReview = false;
 let verifyStatus: "met" | "blocked" | "unmet" | "unclear";
 let verifyCalls: number;
+let verifyEvidence: string;
 /** The fake PR: `view` overrides fields of `gh pr view`; `fail` breaks it; `hold` delays one lookup. */
 let pr: {
   state: string;
@@ -167,7 +168,7 @@ function answer(s: AgentSpec): FakeReply | Promise<FakeReply> {
         ...verify,
         criteria: verify.criteria.map((c, i) =>
           i === 0
-            ? { ...c, status: verifyStatus, evidence: "Real confinement probes require unconfined gates" }
+            ? { ...c, status: verifyStatus, evidence: verifyEvidence }
             : i === 1 && verifyStatus !== "met"
               ? { ...c, status: "blocked", evidence: "Environment unavailable" }
               : c,
@@ -198,6 +199,7 @@ function makeFactory(faults?: FaultPlan): Factory {
   });
   // Fake `gh`: the PR's head is whatever the bare remote's branch holds.
   f.deps.gh = async (args, _signal, stdin) => {
+    if (args[1] === "list") return "";
     pr.calls.push(args);
     if (args[0] === "pr" && args[1] === "view" && args[2] === PR_URL) {
       if (pr.fail) throw new Error("GraphQL: Could not resolve to a PullRequest");
@@ -250,6 +252,7 @@ async function restart(faults?: FaultPlan) {
 }
 
 beforeEach(async () => {
+  BRANCH = "limitless/orig-add-feature";
   root = mkdtempSync(join(tmpdir(), "review-rounds-"));
   observerRoots.add(realpathSync(root));
   await seed(root);
@@ -260,6 +263,7 @@ beforeEach(async () => {
   rejectNextReview = false;
   verifyStatus = "met";
   verifyCalls = 0;
+  verifyEvidence = "Real confinement probes require unconfined gates";
   pr = {
     state: "OPEN",
     body: "Factory report",
@@ -1511,4 +1515,60 @@ test("a delivered review round finishes after restart without undoing a branch r
   expect(await remoteHead()).toBe(reviewed);
   expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
   expect(pr.body).toBe(body);
+});
+
+test("discreet review delivery uses stored ownership and recognizes an uncheckpointed section after restart", async () => {
+  await sh(["git", "branch", "-m", BRANCH, "change/feature"], { cwd: remote });
+  BRANCH = "change/feature";
+  mkdirSync(join(root, "cfg"));
+  writeFileSync(join(root, "cfg", "config.toml"), '[repos."test/repo"]\ndiscreet = true');
+  await restart();
+  pr.body = "Every gate below passed.";
+  const original = await delivered();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  const gh = factory.deps.gh;
+  if (!gh) throw new Error("missing gh");
+  factory.deps.gh = async (args, signal, stdin) => {
+    const result = await gh(args, signal, stdin);
+    if (args[1] === "edit") throw new Error("response lost after edit");
+    return result ?? "";
+  };
+  expect((await settle(roundId)).status).toBe("failed");
+  const body = pr.body;
+  expect(body).toContain("Addressed review findings:");
+  expect(body).not.toMatch(/limitless|\/runs\//i);
+  expect(body).not.toContain(roundId);
+  expect(factory.store.runForPr(PR_URL)?.id).toBe(roundId);
+  const round = factory.store.getRun(roundId);
+  expect((await sh(["git", "log", "-1", "--format=%B", BRANCH], { cwd: remote })).stdout.trim()).toBe(
+    `${round?.title} (round 1)`,
+  );
+  writeFileSync(join(root, "cfg", "config.toml"), '[repos."test/repo"]\ndiscreet = false');
+  await restart();
+  // Re-enter the incomplete delivery; its append already reached GitHub before termination.
+  expect(await executeRun(factory.deps, roundId, new AbortController().signal)).toBe("succeeded");
+  expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
+  expect(pr.body).toBe(body);
+});
+
+test("discreet environment-blocked rounds sanitize model attribution before comments", async () => {
+  verifyEvidence =
+    "Retained review evidence\nBuilt by Limitless\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nCo-Authored-By: Claude Fable 5.1\nChecks require unconfined gates\nCo-authored-by: Claude <human@example.org>";
+  factory.cfg.repos = {
+    "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+  };
+  const original = await delivered("standard");
+  verifyStatus = "blocked";
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  expect((await settle(roundId)).status).toBe("needs_human");
+  expect(pr.comments, factory.store.getRun(roundId)?.error ?? "").toHaveLength(1);
+  const body = pr.comments[0]?.body;
+  expect(body).toContain("🚧 blocked AC-1");
+  expect(body).toContain("Retained review evidence");
+  expect(body).toContain("Checks require unconfined gates");
+  expect(body).toContain("Co-authored-by: Claude <human@example.org>");
+  expect(body).not.toMatch(/Claude Code|Claude Fable|Co-Authored-By: Claude Fable/);
+  expect(body).not.toMatch(/limitless|\/runs\/|Full report:/i);
+  expect(body).not.toContain(roundId);
+  expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(0);
 });

@@ -48,6 +48,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "restart-initial",
     "restart-repair",
     "pending-comment",
+    "discreet-pending",
     "head-moved",
     "head-lookup-failure",
     "head-lookup-missing",
@@ -65,6 +66,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fixture");
         return git("rev-parse", "HEAD");
       };
+      const discreet = scenario === "discreet-pending";
       const scriptAudit = scenario.includes("script");
       const prScript = scenario === "pr-script";
       const stale = scenario.startsWith("head-");
@@ -199,6 +201,10 @@ protected_paths = ["protected.txt"]
       // maxRounds + 2 = 3 rounds: enough to repeat a block and escalate the implementer once.
       const begin = () => {
         const next = start(handler);
+        if (discreet)
+          next.cfg.repos = {
+            "mattflower/limitless": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+          };
         if (blocked) next.cfg.maxRounds = 1;
         return next;
       };
@@ -224,7 +230,7 @@ protected_paths = ["protected.txt"]
         if (args[0] === "api") return calls.find((call) => call[1] === "comment")?.at(-1) ?? "";
         return "";
       };
-      if (scenario === "pending-comment")
+      if (scenario === "pending-comment" || discreet)
         f.deps.faults = {
           "store:save": { action: "kill", when: (c) => c.checkpoint === "verification-comment-posted" },
         };
@@ -261,7 +267,7 @@ protected_paths = ["protected.txt"]
       );
       expect(response.status).toBe(201);
       const { runId } = (await response.json()) as { runId: string };
-      if (scenario === "pending-comment") {
+      if (scenario === "pending-comment" || discreet) {
         const deadline = Date.now() + 10_000;
         while (f.store.listStages(runId).at(-1)?.status !== "cancelled") {
           if (Date.now() > deadline) throw new Error("comment interruption timed out");
@@ -347,9 +353,14 @@ protected_paths = ["protected.txt"]
         expect(
           state?.lastAudit?.some((a) => a.rule === "gate-script-changed" && a.severity === "block"),
         ).toBe(prScript);
-      const unchanged = ["approve", "baseline", "restart-initial", "pending-comment", "base-script"].includes(
-        scenario,
-      );
+      const unchanged = [
+        "approve",
+        "baseline",
+        "restart-initial",
+        "pending-comment",
+        "discreet-pending",
+        "base-script",
+      ].includes(scenario);
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
       if (unchanged) {
         expect(implementations).toBe(0);
@@ -368,7 +379,11 @@ protected_paths = ["protected.txt"]
         expect(f.store.getArtifact(runId, "report.md")).toContain("<!-- limitless-report:");
         expect(comments[0]?.at(-1)).toContain(`Verified commit: \`${head}\``);
         expect(f.store.getArtifact(runId, "report.md")).toContain(`Verified commit: \`${head}\``);
-        expect(comments[0]?.at(-1)).toContain(`<!-- limitless-verification:${runId} -->`);
+        if (discreet) {
+          expect(comments[0]?.at(-1)).toMatch(/<!-- verification:[a-f0-9]{12} -->/);
+          expect(comments[0]?.at(-1)).not.toMatch(/limitless|\/runs\//i);
+          expect(comments[0]?.at(-1)).not.toContain(runId);
+        } else expect(comments[0]?.at(-1)).toContain(`<!-- limitless-verification:${runId} -->`);
         for (const text of [
           "Flow: verify-change",
           "| Check |",

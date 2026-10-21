@@ -37,7 +37,7 @@ import { waitClock } from "./wait-clock.ts";
 
 setDefaultTimeout(30_000);
 const url = "https://github.com/test/repo/pull/1";
-const branch = "limitless/owner-feature";
+let branch = "limitless/owner-feature";
 const seed = seeded(async (root) => {
   const work = join(root, "work");
   mkdirSync(work);
@@ -75,6 +75,7 @@ const git = async (cwd: string, ...args: string[]) => (await sh(["git", ...args]
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
 beforeEach(async () => {
+  branch = "limitless/owner-feature";
   root = mkdtempSync(join(tmpdir(), "conflict-rounds-"));
   observerRoots.add(realpathSync(root));
   await seed(root);
@@ -172,6 +173,7 @@ beforeEach(async () => {
     },
   });
   factory.deps.gh = async (args, _signal, stdin) => {
+    if (args[1] === "list") return "";
     calls.push(args);
     if (args[1] === "ready" && args.includes("--undo")) {
       draft = true;
@@ -1178,3 +1180,29 @@ test.each(["prepare", "deliver"] as const)(
     expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
   },
 );
+
+test("discreet conflict rounds publish neutral merges and recover posted comments", async () => {
+  await git(join(root, "remote.git"), "branch", "-m", branch, "change/feature");
+  branch = "change/feature";
+  factory.store.updateRun(owner.id, { branch });
+  factory.cfg.repos = {
+    "test/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+  };
+  const tip = await advanceBase();
+  const id = await trigger();
+  const gh = factory.deps.gh;
+  if (!gh) throw new Error("missing gh");
+  factory.deps.gh = async (args, signal, stdin) => {
+    const result = await gh(args, signal, stdin);
+    if (args[1] === "comment") throw new Error("response lost after comment");
+    return result ?? "";
+  };
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("failed");
+  expect(await git(join(root, "remote.git"), "log", "-1", "--format=%B", branch)).toBe(`Merge base ${tip}`);
+  expect(comments[0]?.body).toContain(tip);
+  expect(comments[0]?.body).not.toMatch(/limitless|\/runs\//i);
+  expect(comments[0]?.body).not.toContain(id);
+  factory.deps.gh = gh;
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("succeeded");
+  expect(comments).toHaveLength(1);
+});

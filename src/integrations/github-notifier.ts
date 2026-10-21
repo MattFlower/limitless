@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { type Config, repoSettings } from "../config.ts";
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
@@ -238,6 +239,7 @@ export function startGitHubNotifier(
   client: GitHubPrClient = getGitHubPr,
   configDir?: string,
   roots: string[] = [],
+  cfg: Pick<Config, "repos"> = {},
 ): () => Promise<void> {
   const seen = new Set<string>();
   const abort = new AbortController();
@@ -302,6 +304,7 @@ export function startGitHubNotifier(
     const key = `${run.id}:${terminal ? "terminal" : "created"}`;
     if (seen.has(key)) return;
     seen.add(key);
+    if (repoSettings(cfg, run.repoSlug).discreet) return;
     const body = terminal
       ? `Limitless run ${run.id} finished: **${run.status}**.\nPR: ${run.prUrl ?? "none"}\nCost: $${run.costUsd.toFixed(2)} (${run.costEquivUsd.toFixed(2)} subscription equivalent).`
       : `Limitless run created: ${run.id}`;

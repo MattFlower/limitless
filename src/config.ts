@@ -3,6 +3,7 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isBranchName } from "./core/delivery.ts";
 import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
@@ -36,6 +37,7 @@ export interface Reserves {
 export interface Config {
   readonly readPolicy: ReadPolicyOptions;
   paths: Paths;
+  repos?: Record<string, RepoSettings>;
   deploy: { afterLand: "off" | "when_idle" };
   retention: { worktreeDays: number; failedWorktreeDays: number; logDays: number; debugEventDays: number };
   port: number;
@@ -96,6 +98,53 @@ export interface Config {
   secrets: Record<string, string>;
   /** Raw config.toml overrides (routing policy, providers) consumed by their modules. */
   raw: Record<string, unknown>;
+}
+
+export interface RepoSettings {
+  discreet: boolean;
+  branchPrefix: string;
+  landRequiresApproval: boolean;
+}
+
+export function repoSettings(cfg: Pick<Config, "repos">, slug: string): RepoSettings {
+  return (
+    cfg.repos?.[slug.toLowerCase()] ?? {
+      discreet: false,
+      branchPrefix: "change/",
+      landRequiresApproval: false,
+    }
+  );
+}
+
+function parseRepos(value: unknown): Record<string, RepoSettings> {
+  const table = (v: unknown): v is Record<string, unknown> =>
+    Object.prototype.toString.call(v) === "[object Object]";
+  if (!table(value)) throw new Error("repos must be a table");
+  const out: Record<string, RepoSettings> = Object.create(null);
+  const spellings = new Map<string, string>();
+  for (const [slug, entry] of Object.entries(value)) {
+    if (!repoName.test(slug)) throw new Error("repos keys must be owner/name slugs");
+    const normalized = slug.toLowerCase();
+    const previous = spellings.get(normalized);
+    if (previous !== undefined) throw new Error(`Duplicate repository keys "${previous}" and "${slug}"`);
+    spellings.set(normalized, slug);
+    if (!table(entry)) throw new Error("repos entries must be tables");
+    for (const key of Object.keys(entry))
+      if (key !== "discreet" && key !== "branch_prefix" && key !== "land_requires_approval")
+        console.warn(`Ignoring unknown repository setting for ${slug}: ${key}`);
+    const { discreet = false, branch_prefix = "change/", land_requires_approval = false } = entry;
+    if (typeof discreet !== "boolean") throw new Error("repos.discreet must be a boolean");
+    if (typeof land_requires_approval !== "boolean")
+      throw new Error("repos.land_requires_approval must be a boolean");
+    if (typeof branch_prefix !== "string" || !branch_prefix || !isBranchName(`${branch_prefix}x`))
+      throw new Error("repos.branch_prefix must be a nonempty valid branch prefix");
+    out[normalized] = {
+      discreet,
+      branchPrefix: branch_prefix,
+      landRequiresApproval: land_requires_approval,
+    };
+  }
+  return out;
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -191,16 +240,12 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     // Parser diagnostics can include the source line, including credentials.
     throw new Error("Invalid config.toml; fix TOML syntax in the configuration file");
   }
-  const landRequiresApproval = new Set<string>();
-  for (const [slug, policy] of Object.entries(raw.repos ?? {})) {
-    if (!policy || typeof policy !== "object" || Array.isArray(policy))
-      throw new Error("repos entries must be tables");
-    if ("land_requires_approval" in policy) {
-      if (typeof policy.land_requires_approval !== "boolean")
-        throw new Error("repos.land_requires_approval must be a boolean");
-      if (policy.land_requires_approval) landRequiresApproval.add(slug.toLowerCase());
-    }
-  }
+  const parsedRepos = raw.repos === undefined ? undefined : parseRepos(raw.repos);
+  const landRequiresApproval = new Set(
+    Object.entries(parsedRepos ?? {})
+      .filter(([, settings]) => settings.landRequiresApproval)
+      .map(([slug]) => slug),
+  );
   evalSettings(raw);
   const catalog = resolveCatalog(raw.providers);
   const { providerMaxConcurrent } = catalog;
@@ -390,6 +435,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   };
 
   return {
+    ...(parsedRepos === undefined ? {} : { repos: parsedRepos }),
     deploy: { afterLand },
     readPolicy: configureReadPolicy(raw.sandbox, configDir),
     paths,

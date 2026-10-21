@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadConfig } from "../src/config.ts";
 import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import {
@@ -1647,3 +1648,47 @@ test("inaccessible expired PRs rotate with the others instead of holding the res
     h.close();
   }
 });
+
+test.each(["issue", "pull_request"] as const)(
+  "discreet %s runs emit no creation or completion comment",
+  async (kind) => {
+    const cfg = loadConfig({
+      home: join(dir, "data"),
+      configDir: join(dir, "cfg"),
+      raw: { repos: { "test/repo": { discreet: true } } },
+    });
+    const calls: string[][] = [];
+    const stop = startGitHubNotifier(
+      store,
+      async (args) => {
+        calls.push(args);
+      },
+      () => {},
+      async () => null,
+      cfg.paths.configDir,
+      [],
+      cfg,
+    );
+    try {
+      const repo = store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        url: "unused",
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const run = store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "fix",
+        source: "github",
+        sourceRef: { kind, repo: repo.slug, number: 12 },
+      });
+      store.updateRun(run.id, { status: "running" });
+      store.updateRun(run.id, { status: "succeeded" });
+    } finally {
+      await stop();
+    }
+    expect(calls).toHaveLength(0);
+  },
+);

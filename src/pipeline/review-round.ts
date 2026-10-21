@@ -6,6 +6,7 @@ import type { Store } from "../db/store.ts";
 import { FeedQuerySchema, mcpRequestedBy } from "../feed.ts";
 import { cachePath, ensureCache, readFileAt } from "../git/repos.ts";
 import { type GhRunner, quotedJson, runGh } from "../integrations/github.ts";
+import { deliveryMarker, discreetModelText } from "./markers.ts";
 
 export const DEFAULT_REVIEW_ROUNDS = 3;
 
@@ -73,19 +74,20 @@ ${quotedJson(findings)}
  * The PR body section a delivered round appends. The marker, keyed on the round's run, keeps a retried
  * delivery from adding it twice; finding text is escaped so it can neither forge one nor add markup.
  */
-export function roundSection(runId: string, round: number, findings: ReviewFinding[]) {
+export function roundSection(runId: string, round: number, findings: ReviewFinding[], discreet = false) {
   const line = (text: string) =>
-    text
+    discreetModelText(text, discreet)
       .replace(/\s+/g, " ")
       .trim()
       .replace(/[<>&`]/g, (c) => `&#${c.charCodeAt(0)};`);
   const where = (f: ReviewFinding) =>
     f.file ? ` (${line(f.file)}${f.line === undefined ? "" : `:${f.line}`})` : "";
-  const marker = `<!-- limitless-review-round:${runId} -->`;
+  const markers = deliveryMarker("review", runId, discreet);
+  const { marker } = markers;
   const items = findings.map((f) => `- **${f.severity}**: ${line(f.title)}${where(f)}`);
   return {
-    marker,
-    text: `\n\n${marker}\n## Round ${round}\nAddressed review findings (run ${runId}):\n${items.join("\n")}\n`,
+    ...markers,
+    text: `\n\n${marker}\n## Round ${round}\nAddressed review findings${discreet ? "" : ` (run ${runId})`}:\n${items.join("\n")}\n`,
   };
 }
 
