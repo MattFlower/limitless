@@ -31,6 +31,22 @@ const toolingEmails = new Set([
 const toolName = /^(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)$/i;
 const versionedTool =
   /^(?:(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)\b[\w .-]*\b\d+(?:[.-]\d+)*|GPT-\d+(?:\.\d+)* Codex)$/i;
+const generationToolPrefix =
+  /^(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider|GPT-\d+(?:\.\d+)* Codex)\b/i;
+const attributionTrailer =
+  /^(co-?(?:authored|developed)-by|(?:signed-off|authored|reviewed|tested|suggested|acked|helped|assisted)-by|generated-(?:by|with))\s*[:=#]\s*(.*)$/is;
+
+function attributionLines(text: string): string[] {
+  const lines: string[] = [];
+  for (const line of text.split("\n")) {
+    const previous = lines.at(-1);
+    // Only trailers fold: an indented attribution after ordinary prose is still a new line.
+    if (/^[ \t]/.test(line) && previous !== undefined && attributionTrailer.test(previous.trim()))
+      lines[lines.length - 1] = `${previous}\n${line}`;
+    else lines.push(line);
+  }
+  return lines;
+}
 
 function toolingIdentity(value: string): boolean {
   value = value.trim();
@@ -49,26 +65,27 @@ function toolingIdentity(value: string): boolean {
 /** Classify complete lines before quoting, clipping or table rendering can hide their structure. */
 function toolingAttribution(line: string): boolean {
   const plain = line
+    .replace(/\n[ \t]+/g, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/[*_`]/g, "")
     .replace(/^\s*(?:>\s*|[-+]\s+)*/, "")
     .trim();
   if (/(?:built|verified|generated)\s+(?:by|with)\s+Limitless\b/i.test(plain)) return true;
-  const trailer =
-    /^(co-?(?:authored|developed)-by|(?:signed-off|authored|reviewed|tested|suggested|acked|helped|assisted)-by|generated-(?:by|with))\s*[:=#]\s*(.*)$/i.exec(
-      plain,
-    );
+  const trailer = attributionTrailer.exec(plain);
   const generation =
-    /^(?:🤖\s*)?(?:generated|co-authored|co-developed|authored|assisted|built|verified)\s+(?:by|with)\s+(.+?)\.?$/i.exec(
+    /^(?:🤖\s*)?(generated|created|co-authored|co-developed|authored|assisted|built|verified)\s+(?:by|with)\s+(.+?)\.?$/i.exec(
       plain,
     );
-  const value = trailer?.[2] ?? generation?.[1];
-  return value !== undefined && toolingIdentity(value);
+  const value = trailer?.[2] ?? generation?.[2];
+  if (value === undefined) return false;
+  if (toolingIdentity(value)) return true;
+  if (trailer || generation?.[1]?.toLowerCase() === "verified") return false;
+  const identityPrefix = /^(?:.*?<[^<>]+>|\S+)/.exec(value)?.[0] ?? "";
+  return generationToolPrefix.test(value) || toolingIdentity(identityPrefix);
 }
 
 export function stripToolAttribution(text: string): string {
-  return text
-    .split("\n")
+  return attributionLines(text)
     .filter((line) => !toolingAttribution(line))
     .join("\n");
 }
@@ -86,7 +103,7 @@ export function discreetModelText<T>(value: T, discreet: boolean): T {
 export function hasFactoryMark(text: string, runId: string, uiUrl = "", identities: string[] = []): boolean {
   return (
     /^limitless:|^Run:\s/im.test(text) ||
-    text.split("\n").some(toolingAttribution) ||
+    attributionLines(text).some(toolingAttribution) ||
     (!!runId && text.includes(runId)) ||
     (!!uiUrl && text.includes(`${uiUrl}/runs/`)) ||
     [0, 2].some((i) => toolingIdentity(`${identities[i] ?? ""} <${identities[i + 1] ?? ""}>`))

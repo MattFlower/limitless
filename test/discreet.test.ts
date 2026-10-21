@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, repoSettings } from "../src/config.ts";
-import { deliveryMarker, hasFactoryMark } from "../src/pipeline/markers.ts";
+import { deliveryMarker, hasFactoryMark, stripToolAttribution } from "../src/pipeline/markers.ts";
 import { renderReport, renderReportArtifacts } from "../src/pipeline/report.ts";
 import { reportStructure, stripReportManifest } from "../src/pipeline/report-privacy.ts";
 import { roundSection } from "../src/pipeline/review-round.ts";
@@ -61,6 +61,12 @@ test("unknown repository keys warn while known settings still apply", () => {
   } finally {
     warning.mockRestore();
   }
+});
+
+test("rejects repository tables whose spellings normalize to the same slug", () => {
+  expect(() =>
+    config('[repos."Acme/Widgets"]\nland_requires_approval = true\n[repos."acme/widgets"]\ndiscreet = true'),
+  ).toThrow('Duplicate repository keys "Acme/Widgets" and "acme/widgets"');
 });
 
 test.each([
@@ -154,6 +160,32 @@ const attribution = [
 ].join("\n");
 
 test.each([
+  "🤖 Generated with [Claude Code](https://claude.com/claude-code) by Anthropic",
+  "Generated with Codex for the owner",
+  "Built with Claude Code, reviewed by me",
+  "Created by Someone <noreply@anthropic.com>, reviewed by me",
+])("discreet PR body removes attribution with trailing prose: %s", (line) => {
+  expect(hasFactoryMark(line, "")).toBe(true);
+  const human = "Co-authored-by: Claude Smith <claude.smith@example.org>";
+  const body = stripReportManifest(
+    renderReport({
+      discreet: true,
+      success: true,
+      runId: "private-run",
+      runUrl: "",
+      prompt: "Fix input",
+      state: { implementerReport: `Useful summary\n${line}\n${human}` },
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+    }),
+  );
+  expect(body).toContain("Useful summary");
+  expect(body).not.toContain(line);
+  expect(body).toContain(human);
+  expect(hasFactoryMark(body, "private-run")).toBe(false);
+});
+
+test.each([
   ...[
     "Limitless",
     "Claude",
@@ -227,6 +259,19 @@ test.each([
   expect(hasFactoryMark(text, "")).toBe(false);
   const identity = /: (.*?) <(.*)>$/.exec(text);
   if (identity) expect(hasFactoryMark("Change", "", "", [identity[1] ?? "", identity[2] ?? ""])).toBe(false);
+});
+
+test("folded attribution distinguishes human and tooling identities", () => {
+  const human = "Co-authored-by: Claude\n Smith <claude.smith@example.org>";
+  expect(hasFactoryMark(human, "")).toBe(false);
+  expect(stripToolAttribution(human)).toBe(human);
+  for (const tooling of [
+    "Co-authored-by: Claude\n Code <noreply@anthropic.com>",
+    "Co-authored-by: Someone\n Else\n <noreply@anthropic.com>",
+  ]) {
+    expect(hasFactoryMark(tooling, "")).toBe(true);
+    expect(stripToolAttribution(tooling)).toBe("");
+  }
 });
 
 test.each(["claude-opus-5-5", "gemini-3.1-pro", "Claude"])(

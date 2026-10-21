@@ -121,8 +121,13 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
     Object.prototype.toString.call(v) === "[object Object]";
   if (!table(value)) throw new Error("repos must be a table");
   const out: Record<string, RepoSettings> = Object.create(null);
+  const spellings = new Map<string, string>();
   for (const [slug, entry] of Object.entries(value)) {
     if (!repoName.test(slug)) throw new Error("repos keys must be owner/name slugs");
+    const normalized = slug.toLowerCase();
+    const previous = spellings.get(normalized);
+    if (previous !== undefined) throw new Error(`Duplicate repository keys "${previous}" and "${slug}"`);
+    spellings.set(normalized, slug);
     if (!table(entry)) throw new Error("repos entries must be tables");
     for (const key of Object.keys(entry))
       if (key !== "discreet" && key !== "branch_prefix" && key !== "land_requires_approval")
@@ -133,7 +138,7 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
       throw new Error("repos.land_requires_approval must be a boolean");
     if (typeof branch_prefix !== "string" || !branch_prefix || !isBranchName(`${branch_prefix}x`))
       throw new Error("repos.branch_prefix must be a nonempty valid branch prefix");
-    out[slug.toLowerCase()] = {
+    out[normalized] = {
       discreet,
       branchPrefix: branch_prefix,
       landRequiresApproval: land_requires_approval,
