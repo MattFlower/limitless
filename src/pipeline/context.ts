@@ -39,6 +39,7 @@ import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
 import { redactCredentialData } from "../util/proc.ts";
+import { type AgentExecutor, localAgentExecutor } from "./agent-executor.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
@@ -48,6 +49,7 @@ import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
   gateExecutor?: GateExecutor;
+  agentExecutor?: AgentExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
   faults?: FaultPlan;
   gh?: GhRunner;
@@ -846,34 +848,52 @@ export class RunContext {
           dispatch();
           result = parseFakeStream(stream, spec.onEvent);
         } else if (!noTools) {
+          const slottedCommands = opts.confineReads ? [] : (this.state.slottedCommands ?? []);
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
-          result = await withScratch(spec.cwd, (scratchDir) => {
-            dispatch();
-            return withSlottedCommands(
-              opts.confineReads ? [] : (this.state.slottedCommands ?? []),
-              spec.cwd,
-              scratchDir,
-              this.deps.cfg.port,
-              (data) =>
-                this.event({
-                  runId: this.run.id,
-                  invocationId: invocation.id,
-                  type: "log",
-                  level: "info",
-                  message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
-                  data,
-                }),
-              (commandPath, idleNow) =>
-                harness({ ...spec, scratchDir, idleNow, ...(commandPath ? { commandPath } : {}) }),
-              (active, elapsedMs) =>
-                spec.onEvent({
-                  type: "status",
-                  text: active
-                    ? "Idle watchdog held off for slotted command"
-                    : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
-                }),
-            );
-          });
+          const local = () =>
+            withScratch(spec.cwd, (scratchDir) => {
+              dispatch();
+              return withSlottedCommands(
+                slottedCommands,
+                spec.cwd,
+                scratchDir,
+                this.deps.cfg.port,
+                (data) =>
+                  this.event({
+                    runId: this.run.id,
+                    invocationId: invocation.id,
+                    type: "log",
+                    level: "info",
+                    message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
+                    data,
+                  }),
+                (commandPath, idleNow) =>
+                  harness({ ...spec, scratchDir, idleNow, ...(commandPath ? { commandPath } : {}) }),
+                (active, elapsedMs) =>
+                  spec.onEvent({
+                    type: "status",
+                    text: active
+                      ? "Idle watchdog held off for slotted command"
+                      : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
+                  }),
+              );
+            });
+          result = await (this.deps.agentExecutor ?? localAgentExecutor).run(
+            {
+              runId: this.run.id,
+              invocationId: invocation.id,
+              role: opts.role,
+              repoSlug: this.repo.slug,
+              worktree: spec.cwd,
+              spec,
+              slottedCommands,
+              shadow: Boolean(shadow),
+              private: Boolean(opts.privateOutput || opts.redactHoldout || opts.privateSession),
+              denyRead: opts.denyRead,
+              dispatch,
+            },
+            local,
+          );
         } else {
           dispatch();
           result = await harness(spec);
