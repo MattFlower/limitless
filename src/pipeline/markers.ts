@@ -63,8 +63,9 @@ export async function checkDiscreetCommits(
       throw new DiscreetError(`Discreet mode cannot inspect commit attribution: ${sha}`);
     }
     const agent = /\b(?:Limitless|Claude(?: Code)?|Codex|ChatGPT|GitHub Copilot|Gemini|Cursor|Aider)\b/i;
-    const attributed = trailers.split("\n").some((line) => {
-      const trailer = /^([^:]+):\s*(.*)$/.exec(line);
+    // Git only parses the final trailer block; attribution elsewhere still gets published.
+    const attributed = `${trailers}\n${message}`.split("\n").some((line) => {
+      const trailer = /^\s*([^:]+?)\s*:\s*(.*)$/.exec(line);
       if (
         !trailer ||
         !/^(?:co-?(?:authored|developed)-by|(?:signed-off|authored|reviewed|tested|suggested|acked|helped|assisted)-by|generated-(?:by|with))$/i.test(

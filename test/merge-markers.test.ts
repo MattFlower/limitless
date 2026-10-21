@@ -357,8 +357,14 @@ test.each([
   ["Generated-by: Codex", true],
   ["Reviewed-By: Claude <claude@example.invalid>", true],
   ["Co-authored-by: claude@example.invalid", true],
+  ["Explain the change\nCo-authored-by: Limitless <limitless@localhost>", true],
+  ["Explain the change\n  Co-Authored-By : Claude <claude@example.invalid>", true],
+  ["Co-authored-by: Limitless <limitless@localhost>\n\nFurther explanation", true],
+  ["Co-Authored-By: Claude <claude@example.invalid>\n\nFurther explanation", true],
   ["Co-authored-by: Human Contributor <human@example.invalid>", false],
   ["Co-authored-by: Claude Smith <human@example.invalid>", false],
+  ["Explain the change\nCo-authored-by: Claude Smith <human@example.invalid>", false],
+  ["Co-authored-by: Human Contributor <human@example.invalid>\n\nFurther explanation", false],
   ["Document how Claude and Limitless handle input", false],
 ])("discreet commit attribution inspection: %s", async (body, blocked) => {
   const dir = mkdtempSync(join(tmpdir(), "discreet-attribution-"));
