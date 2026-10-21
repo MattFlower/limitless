@@ -333,9 +333,13 @@ for (const scenario of [
     const scratchPaths: string[] = [];
     const implementationPrompts: string[] = [];
     const order: string[] = [];
-    const f = start((s) => {
+    // Readers start concurrently; arrange review entry before asserting consecutive verify retries.
+    const reviewReady = deferred<void>();
+    const f = start(async (s) => {
       const role = roleOf(s);
+      if (role === "verify") await reviewReady.promise;
       order.push(role);
+      if (role === "review") reviewReady.resolve();
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") return { structured: holdout };
