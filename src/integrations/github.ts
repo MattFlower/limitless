@@ -1,10 +1,10 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Factory } from "../app.ts";
 import { parseAllow } from "../core/allow.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
 import { inAnyCidr } from "../util/cidr.ts";
-import { sh } from "../util/proc.ts";
+import { redactCredentialData, redactCredentials, sh } from "../util/proc.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
 export type GhRunner = (
@@ -218,8 +218,18 @@ export function githubWebhook(
       if (allowed && !inAnyCidr(clientIp, allowed)) return new Response("forbidden", { status: 403 });
     }
     const bytes = new Uint8Array(await req.arrayBuffer());
-    if (!verifyGitHubSignature(bytes, req.headers.get("x-hub-signature-256"), secret))
+    if (!verifyGitHubSignature(bytes, req.headers.get("x-hub-signature-256"), secret)) {
+      factory.store.recordInbox({
+        // NUL cannot appear in an HTTP header: rejected audits cannot reserve a delivery ID.
+        id: `github-signature-rejected\0${randomUUID()}`,
+        source: "github",
+        kind: redactCredentials(req.headers.get("x-github-event") ?? "unknown"),
+        payload: redactCredentialData({ deliveryId: req.headers.get("x-github-delivery") }),
+        status: "error",
+        note: "invalid signature",
+      });
       return new Response("invalid signature", { status: 401 });
+    }
     const id = req.headers.get("x-github-delivery");
     if (!id) return new Response("missing delivery ID", { status: 400 });
     const event = req.headers.get("x-github-event") ?? "unknown";
