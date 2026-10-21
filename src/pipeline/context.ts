@@ -42,7 +42,7 @@ import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
-import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
+import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
@@ -771,7 +771,7 @@ export class RunContext {
       const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
       const redact =
         opts.redactHoldout && this.state.holdout
-          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout, publicSources)
+          ? holdoutRedactor(this.state.holdout, publicSources)
           : undefined;
       try {
         const spec: AgentSpec = {

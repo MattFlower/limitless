@@ -235,30 +235,34 @@ export const holdoutBoundaryPattern = (detail: string) => {
   return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
 };
 
+function collectHoldoutLiterals(source: string, collect: (detail: string) => void) {
+  for (const literal of source.match(
+    /(?<![\w])(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
+  ) ?? []) {
+    collect(/^["'`]/u.test(literal) ? literal.slice(1, -1) : literal);
+  }
+}
+
 export function privateHoldoutDetails(holdout: Holdout, publicSources = "", observed?: string): Set<string> {
   const details = new Set<string>();
   const collect = (detail: string) => {
     if (detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources)) details.add(detail);
   };
-  const collectLiterals = (source: string) => {
-    for (const literal of source.match(
-      /(?<![\w])(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
-    ) ?? []) {
-      collect(/^["'`]/u.test(literal) ? literal.slice(1, -1) : literal);
-    }
-  };
+  collectHoldoutDetails(holdout, collect);
+  if (observed !== undefined) collectHoldoutLiterals(observed, collect);
+  return details;
+}
+
+function collectHoldoutDetails(holdout: Holdout, collect: (detail: string) => void) {
   for (const scenario of holdout.scenarios) {
     for (const source of [scenario.description, scenario.steps, scenario.expected]) {
       // Whole phrases cover prose; only syntax-shaped literals are removed in isolation.
       if (source.trim().split(/\s+/).length > 1) collect(source.trim());
       for (const sentence of source.match(/[^.!?\n]+[.!?]/g) ?? [])
         if (sentence.trim().split(/\s+/).length > 1) collect(sentence.trim());
-      collectLiterals(source);
+      collectHoldoutLiterals(source, collect);
     }
   }
-  // Observed values and runtime error identifiers need not occur in the authored scenarios.
-  if (observed !== undefined) collectLiterals(observed);
-  return details;
 }
 
 export function redactHoldoutText(
@@ -267,23 +271,59 @@ export function redactHoldoutText(
   publicSources = "",
   includeObservedLiterals = true,
 ): string {
-  if (!holdout.scenarios.length) return value;
-  const details = privateHoldoutDetails(holdout, publicSources, includeObservedLiterals ? value : undefined);
-  if (!details.size) return value;
-  const pattern = new RegExp(
-    [...details]
-      .sort((a, b) => b.length - a.length)
-      .map(holdoutBoundaryPattern)
-      .join("|"),
-    "giu",
-  );
-  let removed = 0;
-  // A single pass counts displayed replacements and never scans inserted placeholders.
-  const safe = value.replace(pattern, () => {
-    removed++;
-    return "[private detail]";
+  return holdoutRedactor(holdout, publicSources)(value, includeObservedLiterals);
+}
+
+export function holdoutRedactor(holdout: Holdout, publicSources = "") {
+  const privateLiterals = new Map<string, boolean>();
+  const isPrivate = (detail: string) => {
+    let result = privateLiterals.get(detail);
+    if (result === undefined) {
+      result = !!detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources);
+      privateLiterals.set(detail, result);
+    }
+    return result;
+  };
+  const details = new Set<string>();
+  collectHoldoutDetails(holdout, (detail) => {
+    if (isPrivate(detail)) details.add(detail);
   });
-  return removed ? `${safe} [${removed} private details withheld]` : safe;
+  const patterns = new Map<string, RegExp>();
+  const patternFor = (extra: Set<string>) => {
+    if (!details.size && !extra.size) return undefined;
+    const key = JSON.stringify([...extra].sort());
+    let pattern = patterns.get(key);
+    if (!pattern) {
+      pattern = new RegExp(
+        [...details, ...extra]
+          .sort((a, b) => b.length - a.length)
+          .map(holdoutBoundaryPattern)
+          .join("|"),
+        "giu",
+      );
+      patterns.set(key, pattern);
+    }
+    return pattern;
+  };
+  patternFor(new Set());
+  return (value: string, includeObservedLiterals = true): string => {
+    if (!holdout.scenarios.length) return value;
+    const extra = new Set<string>();
+    // Observed details belong only to this value; public exemptions are safe to memoize.
+    if (includeObservedLiterals)
+      collectHoldoutLiterals(value, (detail) => {
+        if (!details.has(detail) && isPrivate(detail)) extra.add(detail);
+      });
+    const pattern = patternFor(extra);
+    if (!pattern) return value;
+    let removed = 0;
+    // A single pass counts displayed replacements and never scans inserted placeholders.
+    const safe = value.replace(pattern, () => {
+      removed++;
+      return "[private detail]";
+    });
+    return removed ? `${safe} [${removed} private details withheld]` : safe;
+  };
 }
 
 /** Exactly the private-row summary rendered in implementer feedback. */
