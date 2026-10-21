@@ -508,7 +508,7 @@ export class LandQueue {
         return;
       }
       if (!this.qualifies(entry, evidence)) {
-        this.parkApproval(entry, signal);
+        this.parkApproval(entry, signal, evidence.seen);
         return;
       }
     }
@@ -559,6 +559,7 @@ export class LandQueue {
     const { seen, login } = evidence;
     return (
       !!seen &&
+      seen.requestSeq === this.store.githubReview(entry.prUrl)?.requestSeq &&
       (seen.state === "MERGED" ||
         (seen.state === "OPEN" &&
           (hasOtherApproval(seen, login, entry.approvedSha) ||
@@ -582,7 +583,7 @@ export class LandQueue {
       const parsed = z.object({ login: z.string().trim().min(1) }).safeParse(identity.body);
       const login = identity.status === 200 && parsed.success ? parsed.data.login : null;
       if (saved) {
-        const seen = savedSnapshot(this.store.githubPrData(entry.prUrl));
+        const seen = this.store.githubReview(entry.prUrl);
         if (
           seen?.url !== entry.prUrl ||
           !seen.requestSeq ||
@@ -592,6 +593,7 @@ export class LandQueue {
         if (seen.reviewEvidenceComplete) return { login, seen };
         // A newer, truncated poll can wake the wait, but only complete direct evidence releases it.
       }
+      const requestSeq = this.store.nextGithubObservationSeq();
       const pr = await client(
         `repos/${entry.repo}/pulls/${entry.prUrl.split("/").at(-1)}`,
         undefined,
@@ -599,51 +601,29 @@ export class LandQueue {
       );
       if (pr.status !== 200) return { login, seen: null };
       const id = z.object({ node_id: z.string() }).parse(pr.body).node_id;
-      let after: string | null = null;
-      let first: PrSnapshot | null = null;
-      const reviews: NonNullable<PrSnapshot["reviewEvidence"]> = [];
-      const cursors = new Set<string>();
-      for (;;) {
-        const response = await client(
-          "graphql",
-          { query: OBSERVE_QUERY, variables: { ids: [id], after } },
-          signal,
-        );
-        const data = z
-          .object({
-            data: z.object({ nodes: z.array(z.unknown()).length(1) }),
-            errors: z.array(z.unknown()).nullish(),
-          })
-          .safeParse(response.body);
-        if (response.status !== 200 || !data.success || data.data.errors?.length)
-          return { login, seen: null };
-        const raw = data.data.data.nodes[0];
-        const seen = normalizePr(raw, id);
-        const page = z
-          .object({
-            latestOpinionatedReviews: z.object({
-              nodes: z.array(z.object({}).passthrough()),
-              pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
-            }),
-          })
-          .safeParse(raw);
-        if (!seen || seen.url !== entry.prUrl || !page.success) return { login, seen: null };
-        if (
-          first &&
-          (seen.headRefOid !== first.headRefOid ||
-            seen.state !== first.state ||
-            seen.isDraft !== first.isDraft)
-        )
-          return { login, seen: { ...seen, reviewEvidenceComplete: false } };
-        first ??= seen;
-        reviews.push(...(seen.reviewEvidence ?? []));
-        const { hasNextPage, endCursor } = page.data.latestOpinionatedReviews.pageInfo;
-        if (!hasNextPage)
-          return { login, seen: { ...first, reviewEvidence: reviews, reviewEvidenceComplete: true } };
-        if (!endCursor || cursors.has(endCursor)) return { login, seen: null };
-        cursors.add(endCursor);
-        after = endCursor;
-      }
+      const response = await client("graphql", { query: OBSERVE_QUERY, variables: { ids: [id] } }, signal);
+      const data = z
+        .object({
+          data: z.object({ nodes: z.array(z.unknown()).length(1) }),
+          errors: z.array(z.unknown()).nullish(),
+        })
+        .safeParse(response.body);
+      if (response.status !== 200 || !data.success || data.data.errors?.length) return { login, seen: null };
+      const raw = data.data.data.nodes[0];
+      const seen = normalizePr(raw, id);
+      const page = z
+        .object({
+          latestOpinionatedReviews: z.object({
+            nodes: z.array(z.object({}).passthrough()),
+            pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+          }),
+        })
+        .safeParse(raw);
+      if (!seen || seen.url !== entry.prUrl || !page.success) return { login, seen: null };
+      // Pages are not an atomic review snapshot: a review can be dismissed between reads.
+      seen.requestSeq = requestSeq;
+      this.store.saveGithubReview(entry.prUrl, seen);
+      return { login, seen };
     } catch (error) {
       signal.throwIfAborted();
       this.log(redactCredentials(`[land] ${entry.id}: approval observation pending: ${String(error)}`));
@@ -651,10 +631,16 @@ export class LandQueue {
     }
   }
 
-  private parkApproval(entry: LandEntry, signal: AbortSignal): void {
+  private approvalReason(entry: LandEntry, seen: PrSnapshot | null): string {
+    return seen?.reviewEvidenceComplete === false
+      ? "Review evidence is incomplete because pagination is required"
+      : `Another GitHub account must approve ${entry.approvedSha}`;
+  }
+
+  private parkApproval(entry: LandEntry, signal: AbortSignal, seen: PrSnapshot | null): void {
     const waiting = this.owned(entry.id, () => {
       signal.throwIfAborted();
-      const reason = `Another GitHub account must approve ${entry.approvedSha}`;
+      const reason = this.approvalReason(entry, seen);
       const parked = this.store.updateLandEntry(entry.id, {
         state: "waiting_approval",
         reason,
@@ -706,6 +692,17 @@ export class LandQueue {
             if (!(error instanceof LandBlocked)) throw error;
             this.block(entry.id, error.message);
             return null;
+          }
+          const reason = this.approvalReason(entry, evidence?.seen ?? null);
+          if (evidence?.seen && still.reason !== reason) {
+            const waiting = this.store.updateLandEntry(entry.id, { reason });
+            this.store.landFeed(
+              "land.waiting_approval",
+              waiting,
+              reason,
+              { state: waiting.state, reason },
+              `${entry.id}:${still.approvalWaitRequestSeq}:${reason}`,
+            );
           }
           return this.store.releaseLandApproval(
             entry.id,
@@ -1046,7 +1043,7 @@ export class LandQueue {
         throw new LandApprovalStopped();
       }
       if (!this.qualifies({ ...entry, pushedSha: sha }, evidence)) {
-        this.parkApproval(entry, signal);
+        this.parkApproval(entry, signal, evidence.seen);
         throw new LandApprovalStopped();
       }
     };

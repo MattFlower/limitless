@@ -1670,9 +1670,46 @@ test.each([
   expect(hasOtherApproval(snapshot, factory, SHA)).toBe(false);
 });
 
+test.each([undefined, false, true])(
+  "external land polling follows operator approval policy (%s)",
+  async (enabled) => {
+    h = pollerHarness();
+    h.factoryPr("o/r", 1);
+    const node = h.gh.add("o/r", 42);
+    ci(node, rollup("FAILURE", [{ name: "test", conclusion: "FAILURE" }]));
+    if (enabled !== undefined)
+      writeFileSync(join(h.dir, "config.toml"), `[repos."O/R"]\nland_requires_approval = ${enabled}\n`);
+    const policy = loadConfig({ home: h.dir, configDir: h.dir, readOnly: true }).landRequiresApproval;
+    h.start(undefined, false, policy);
+    const entry = h.store.createLandEntry({
+      runId: null,
+      repo: "o/r",
+      prUrl: node.url,
+      baseBranch: "main",
+      headBranch: "feature",
+      approvedSha: SHA,
+    });
+    h.store.landFeed("land.queued", entry, "queued");
+    await h.advance(0);
+    expect(h.store.githubTracked(h.clock.now(), policy).map((p) => p.url)).toEqual(
+      enabled ? [url("o/r", 1), node.url] : [url("o/r", 1)],
+    );
+    expect(h.gh.rest().some((call) => call.path === "repos/o/r/pulls/42")).toBe(enabled === true);
+    expect(h.gh.graphql().some((call) => call.ids?.includes(node.id))).toBe(enabled === true);
+    expect(
+      h.store
+        .readFeed()
+        .items.filter((i) => i.data.url === node.url && ["pr.ci_failed", "ci.needs_fix"].includes(i.kind))
+        .map((i) => i.kind)
+        .sort(),
+    ).toEqual(enabled ? ["pr.ci_failed"] : []);
+  },
+);
+
 test("polls explicitly queued PRs without runs, including first-observation review commits", async () => {
   h = pollerHarness();
-  h.start(); // Initially nothing is tracked; land.queued must wake the poller.
+  const policy = new Set(["O/R"]);
+  h.start(undefined, undefined, policy); // Initially nothing is tracked; land.queued wakes polling.
   const node = h.gh.add("o/r", 42);
   node.latestOpinionatedReviews.nodes.push({
     state: "APPROVED",
@@ -1695,8 +1732,8 @@ test("polls explicitly queued PRs without runs, including first-observation revi
   ]);
   expect(data.observedAt).toBeNumber();
   h.store.updateLandEntry(entry.id, { state: "waiting_approval" });
-  expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
-  expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
+  expect(h.store.githubTracked(undefined, policy)).toMatchObject([{ runId: null, url: node.url }]);
+  expect(h.store.githubTracked(undefined, policy)).toMatchObject([{ runId: null, url: node.url }]);
   expect(kinds()).not.toContain("pr.review");
   node.latestOpinionatedReviews.nodes[0] = {
     state: "DISMISSED",
@@ -1829,4 +1866,46 @@ test("observation sequence survives reopening the store and nested transactions"
   h.reopen();
   expect(h.store.nextGithubObservationSeq()).toBe(first + 1);
   expect(h.store.transaction(() => h.store.nextGithubObservationSeq())).toBe(first + 2);
+});
+
+test("review authority remains monotonic across delayed polls, direct reads and restart", () => {
+  h = pollerHarness();
+  const node = h.gh.add("o/r", 42);
+  node.latestOpinionatedReviews.nodes = [
+    { state: "APPROVED", author: { login: "other" }, commit: { oid: SHA } },
+  ];
+  const snapshot = normalizePr(node);
+  if (!snapshot) throw new Error("missing normalized PR");
+  const older = { ...snapshot, requestSeq: h.store.nextGithubObservationSeq() };
+  node.latestOpinionatedReviews.nodes[0] = {
+    state: "CHANGES_REQUESTED",
+    author: { login: "other" },
+    commit: { oid: SHA },
+  };
+  const changed = normalizePr(node);
+  if (!changed) throw new Error("missing normalized PR");
+  const newer = { ...changed, requestSeq: h.store.nextGithubObservationSeq() };
+  h.store.saveGithubPr({
+    url: node.url,
+    repo: "o/r",
+    runId: null,
+    delivered: 1,
+    nodeId: node.id,
+    data: JSON.stringify(newer),
+  });
+  // An upgraded store can have only the previous release's polling snapshot.
+  h.store.db.query("DELETE FROM settings WHERE key = ?").run(`github.review:${node.url}`);
+  h.store.saveGithubReview(node.url, older);
+  expect(h.store.githubReview(node.url)).toEqual(newer);
+  h.reopen();
+  h.store.saveGithubPr({
+    url: node.url,
+    repo: "o/r",
+    runId: null,
+    delivered: 1,
+    nodeId: node.id,
+    data: JSON.stringify({ ...older, revision: 7, ciPending: true }),
+  });
+  expect(h.store.githubReview(node.url)).toEqual(newer);
+  expect(JSON.parse(snapshotOf(node.url))).toMatchObject({ revision: 7, ciPending: true });
 });

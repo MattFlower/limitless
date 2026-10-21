@@ -3907,6 +3907,7 @@ test.each([false, true])(
     const stop = startGitHubPoller(store, {
       client: github.client,
       gh: runGh,
+      requiresApproval: approvalPolicy(),
       ciReruns: false,
       clock: {
         now: clock.now,
@@ -4157,7 +4158,7 @@ test("parked PR leaves the worker free for approved PRs, then rejoins and lands"
   expect(ghCalls("pr merge").map((line) => line.includes(url(2)))).toEqual([true, false]);
 });
 
-test.each(["DISMISSED", "CHANGES_REQUESTED"])(
+test.each(["DISMISSED", "CHANGES_REQUESTED", "PAGINATED"])(
   "pre-merge %s parks pushed work and emits a new wait episode",
   async (state) => {
     const head = await pushBranch("one", "one.txt", "one\n");
@@ -4175,7 +4176,10 @@ test.each(["DISMISSED", "CHANGES_REQUESTED"])(
     const pushed = store.getLandEntry(entry.id)?.pushedSha;
     if (!pushed) throw new Error("missing pushed head");
     expect(pushed).not.toBe(head);
-    reviewObservation(pushed, state);
+    reviewObservation(pushed, state === "PAGINATED" ? "APPROVED" : state);
+    const node = github.nodes.get(`PR_${SLUG}_1`);
+    if (!node) throw new Error("missing test PR");
+    node.latestOpinionatedReviews.pageInfo.hasNextPage = state === "PAGINATED";
     ci = () => ({ ci: "SUCCESS" });
     await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
     expect(store.getLandEntry(entry.id)?.pushedSha).toBe(pushed);
@@ -4183,6 +4187,8 @@ test.each(["DISMISSED", "CHANGES_REQUESTED"])(
     expect(
       store.readFeed({ limit: 100 }).items.filter((i) => i.kind === "land.waiting_approval"),
     ).toHaveLength(2);
+    if (state === "PAGINATED") expect(store.getLandEntry(entry.id)?.reason).toContain("pagination");
+    node.latestOpinionatedReviews.pageInfo.hasNextPage = false;
     reviewObservation(pushed);
     await settle();
     expect(store.getLandEntry(entry.id)?.state).toBe("landed");
@@ -4371,25 +4377,80 @@ test.each([false, true])("502 merge retry rechecks approval (dismissed: %s)", as
   }
 });
 
-test.each([false, true])(
-  "paginated opinionated reviews release only without a later change request (%s)",
-  async (blocked) => {
+test("a newer polled change request overtakes a delayed final direct approval", async () => {
+  const head = await pushBranch("one", "one.txt", "one\n");
+  const pr = delivered(1, "one");
+  approve(1, head);
+  reviewObservation(head);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  const started = Promise.withResolvers<void>();
+  const held = Promise.withResolvers<ReturnType<typeof respond>>();
+  let oldResponse: ReturnType<typeof respond> | undefined;
+  const client: GitHubClient = async (path, body, signal) => {
+    const response = await github.client(path, body, signal);
+    if (path === "graphql" && store.listLandEntries()[0]?.state === "merging" && !oldResponse) {
+      oldResponse = respond(response.status, structuredClone(response.body));
+      started.resolve();
+      return held.promise;
+    }
+    return response;
+  };
+  const entry = await queue({ requiresApproval: approvalPolicy(), github: client }).request({
+    target: pr.run.id,
+  });
+  await waitFor(() => !!oldResponse);
+  await started.promise;
+  reviewObservation(head, "CHANGES_REQUESTED");
+  const newer = store.githubReview(url(1));
+  const pollData = store.githubPrData(url(1));
+  if (!oldResponse) throw new Error("missing held approval");
+  held.resolve(oldResponse);
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
+  expect(store.githubReview(url(1))).toEqual(newer);
+  expect(store.githubPrData(url(1))).toBe(pollData);
+  expect(store.githubReview(url(1))?.reviewEvidence?.[0]?.state).toBe("CHANGES_REQUESTED");
+  expect(ghCalls("pr merge")).toEqual([]);
+  reviewObservation(head);
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+});
+
+test.each(["APPROVED", "CHANGES_REQUESTED", "DISMISSED"])(
+  "paginated opinionated reviews remain incomplete even if a review becomes %s between pages",
+  async (state) => {
     const head = await pushBranch("one", "one.txt", "one\n");
     const pr = delivered(1, "one");
     approve(1, head);
     observe(1, head);
     github.responses.set("user", () => respond(200, { login: "factory" }));
-    const entry = await queue({ requiresApproval: approvalPolicy() }).request({ target: pr.run.id });
+    let dismissed = false;
+    const client: GitHubClient = async (path, body, signal) => {
+      const result = await github.client(path, body, signal);
+      const response = respond(result.status, structuredClone(result.body));
+      const node = github.nodes.get(`PR_${SLUG}_1`);
+      if (path === "graphql" && node && node.latestOpinionatedReviews.nodes.length > 20) {
+        const approval = node.latestOpinionatedReviews.nodes[0];
+        if (approval && state === "DISMISSED") {
+          approval.state = "DISMISSED";
+          dismissed = true;
+        }
+      }
+      return response;
+    };
+    const entry = await queue({ requiresApproval: approvalPolicy(), github: client }).request({
+      target: pr.run.id,
+    });
     await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_approval");
     const node = github.nodes.get(`PR_${SLUG}_1`);
     if (!node) throw new Error("missing test PR");
     node.latestOpinionatedReviews.nodes = Array.from({ length: 25 }, (_, i) => ({
-      state: blocked && i === 24 ? "CHANGES_REQUESTED" : "APPROVED",
+      state: i === 0 ? "APPROVED" : state === "CHANGES_REQUESTED" && i === 24 ? state : "COMMENTED",
       author: { login: `reviewer-${i}`, __typename: "User" },
       authorCanPushToRepository: true,
       commit: { oid: head },
     }));
-    // Save the same first page the conditional poller sees. It must trigger direct pagination.
+    // A truncated conditional poll triggers a direct read, which must stop at page one.
     const response = await github.client("graphql", { query: "observation", variables: { ids: [node.id] } });
     const raw = (response.body as { data: { nodes: unknown[] } }).data.nodes[0];
     const snapshot = normalizePr(raw);
@@ -4402,15 +4463,17 @@ test.each([false, true])(
       nodeId: node.id,
       data: JSON.stringify({ ...snapshot, requestSeq: store.nextGithubObservationSeq() }),
     });
-    await waitFor(() => github.graphql().some((c) => c.after === "20"));
-    if (blocked) {
-      await settleIdle();
-      expect(store.getLandEntry(entry.id)?.state).toBe("waiting_approval");
-      expect(ghCalls("pr merge")).toEqual([]);
-    } else {
-      await settle();
-      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
-    }
+    await waitFor(() => store.getLandEntry(entry.id)?.reason?.includes("pagination") === true);
+    await settleIdle();
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_approval");
+    expect(store.getLandEntry(entry.id)?.reason).toContain("incomplete");
+    expect(github.graphql().some((c) => c.after === "20")).toBe(false);
+    expect(dismissed).toBe(state === "DISMISSED");
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(gateLog()).toEqual([]);
+    expect(store.readFeed().items.findLast((i) => i.kind === "land.waiting_approval")?.data.reason).toContain(
+      "pagination",
+    );
   },
 );
 
@@ -4445,6 +4508,7 @@ function approvalPoller(client: GitHubClient = github.client) {
   return startGitHubPoller(store, {
     client,
     gh: runGh,
+    requiresApproval: approvalPolicy(),
     ciReruns: false,
     clock: {
       now: clock.now,
@@ -4598,7 +4662,7 @@ test("a review-path NOT_FOUND poll cannot release a parked entry", async () => {
 });
 
 test.each(["HTTP", "errors", "id", "URL", "null review", "pageInfo", "cursor", "changed head"])(
-  "a failed later approval page grants no approval (%s)",
+  "failed or incomplete approval evidence grants no approval (%s)",
   async (failure) => {
     const head = await pushBranch("one", "one.txt", "one\n");
     const pr = delivered(1, "one");
@@ -4615,8 +4679,7 @@ test.each(["HTTP", "errors", "id", "URL", "null review", "pageInfo", "cursor", "
     github.responses.set("user", () => respond(200, { login: "factory" }));
     const client: GitHubClient = async (path, body, signal) => {
       const response = await github.client(path, body, signal);
-      const after = (body as { variables?: { after?: string } } | undefined)?.variables?.after;
-      if (path !== "graphql" || !after) return response;
+      if (path !== "graphql") return response;
       const raw = structuredClone(node);
       const reviews = {
         ...raw.latestOpinionatedReviews,
@@ -4655,7 +4718,7 @@ test.each(["HTTP", "errors", "id", "URL", "null review", "pageInfo", "cursor", "
     );
     if (failure === "changed head")
       expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
-    expect(github.graphql().some((call) => call.after === "20")).toBe(true);
+    expect(github.graphql().some((call) => call.after === "20")).toBe(false);
     expect(ghCalls("pr merge")).toEqual([]);
     expect(gateLog()).toEqual([]);
   },

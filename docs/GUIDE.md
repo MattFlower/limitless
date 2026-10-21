@@ -414,6 +414,9 @@ waiting without a new timeout. Waiting entries do not block other PRs in the rep
 
 The gate runs before checks and rechecks fresh reviews immediately before every merge attempt,
 including retries and restarts; incomplete review evidence never counts as approval.
+The final check narrows but cannot eliminate the review-change window because GitHub pins the
+merge to a head SHA rather than to review state. Repositories needing strict enforcement should
+also enable GitHub branch protection with required reviews, which GitHub enforces at merge time.
 Approval on the approved SHA or the factory's pushed base-merge head counts at that recheck;
 a later factory base merge does not need another approval. After a rollback, the previous release
 shows waiting entries as `blocked`; re-queue them to continue. `limitless review --approve` only

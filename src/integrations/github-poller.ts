@@ -316,11 +316,15 @@ const headOf = (pr: TrackedPr | undefined) => saved(pr?.data)?.headRefOid ?? nul
 const closed = (pr: TrackedPr) => saved(pr.data)?.state === "CLOSED";
 const backoff = (failures: number, base = 60_000) => Math.min(base * 2 ** failures, 900_000);
 /** Merge reconciliation's PR client while polling: the poller's observations for PRs it tracks, else `fallback`. */
-export function observedPrs(store: Store, fallback?: GitHubPrClient): GitHubPrClient {
+export function observedPrs(
+  store: Store,
+  fallback?: GitHubPrClient,
+  requiresApproval?: ReadonlySet<string>,
+): GitHubPrClient {
   let tracked: Set<string> | undefined;
   const client: GitHubPrClient = async (url, signal) => {
     const pr = saved(store.githubPrData(url));
-    tracked ??= new Set(store.githubTracked().map((p) => p.url));
+    tracked ??= new Set(store.githubTracked(undefined, requiresApproval).map((p) => p.url));
     if (!fallback || pr?.state === "MERGED" || tracked.has(url)) return pr;
     return fallback(url, signal);
   };
@@ -336,6 +340,7 @@ export interface PollerOptions {
   client?: GitHubClient;
   gh?: GhRunner;
   seconds?: number;
+  requiresApproval?: ReadonlySet<string>;
   ciReruns?: boolean;
   log?: (message: string) => void;
   clock?: { now: () => number; set: typeof setTimeout; clear: typeof clearTimeout };
@@ -517,16 +522,18 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   };
   /** Each repository with tracked PRs and when it is next due; delivered PRs use the fast cadence. */
   const plan = () =>
-    [...Map.groupBy(store.githubTracked(now()), (pr) => pr.repo)].map(([repo, prs]) => {
-      const interval = prs.some((p) => p.delivered && !closed(p)) ? 15_000 : normal;
-      const key = (p: TrackedPr) => (closed(p) ? p.url : repo); // open PRs share a deadline and a query
-      const last = (k: string) => observedAt.get(k) ?? -Infinity;
-      // A PR also keeps its own time, so closing or reopening it never makes it due at once.
-      const at = (p: TrackedPr) =>
-        closed(p) ? last(p.url) + 600_000 : Math.max(last(p.url), last(repo)) + interval;
-      const due = Math.max(blocks.get(repo)?.until ?? 0, Math.min(...prs.map(at)));
-      return { repo, key, due, prs: prs.filter((p) => at(p) <= now()) };
-    });
+    [...Map.groupBy(store.githubTracked(now(), opts.requiresApproval), (pr) => pr.repo)].map(
+      ([repo, prs]) => {
+        const interval = prs.some((p) => p.delivered && !closed(p)) ? 15_000 : normal;
+        const key = (p: TrackedPr) => (closed(p) ? p.url : repo); // open PRs share a deadline and a query
+        const last = (k: string) => observedAt.get(k) ?? -Infinity;
+        // A PR also keeps its own time, so closing or reopening it never makes it due at once.
+        const at = (p: TrackedPr) =>
+          closed(p) ? last(p.url) + 600_000 : Math.max(last(p.url), last(repo)) + interval;
+        const due = Math.max(blocks.get(repo)?.until ?? 0, Math.min(...prs.map(at)));
+        return { repo, key, due, prs: prs.filter((p) => at(p) <= now()) };
+      },
+    );
   const schedule = () => {
     if (stopped) return;
     clear(timer);
@@ -565,7 +572,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         // A repository a rate limit interrupted is due again as soon as the cooldown ends.
         if (now() >= cooldownUntil) for (const pr of prs) observedAt.set(pr.url, now()).set(key(pr), now());
       }
-      if (settled) await reconcileMergedRuns(store, observedPrs(store), log, now);
+      if (settled)
+        await reconcileMergedRuns(store, observedPrs(store, undefined, opts.requiresApproval), log, now);
       [settled, crashes, retryAt] = [false, 0, 0];
     } catch (e) {
       log(`GitHub poll failed: ${String(e)}`);

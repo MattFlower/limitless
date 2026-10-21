@@ -54,6 +54,7 @@ import {
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { quotedJson } from "../integrations/github.ts";
+import type { PrSnapshot } from "../integrations/github-poller.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
@@ -3060,8 +3061,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       .run(outcome, f.prUrl, f.sha, f.signature);
   }
 
-  /** Factory PRs still tracked by their runs, plus every active land (including external PRs). */
-  githubTracked(now = Date.now()): TrackedPr[] {
+  /** Factory PRs, plus active lands requiring operator-configured GitHub approval. */
+  githubTracked(now = Date.now(), requiresApproval: ReadonlySet<string> = new Set()): TrackedPr[] {
     const sql = `WITH tracked AS (SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
@@ -3077,18 +3078,36 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       UNION
       SELECT l.pr_url, l.repo, NULLIF(l.run_id, ''), g.node_id, g.data, 1
       FROM land_entries l LEFT JOIN github_prs g ON g.url = l.pr_url
-      WHERE (l.state IN ('queued', 'checking', 'waiting_ci', 'merging') OR l.approval_wait > 0)
+      WHERE lower(l.repo) IN (SELECT lower(value) FROM json_each(?2))
+        AND (l.state IN ('queued', 'checking', 'waiting_ci', 'merging') OR l.approval_wait > 0)
         AND NOT EXISTS (SELECT 1 FROM tracked WHERE url = l.pr_url)
       ORDER BY repo, url`;
-    return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
-      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
-      return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
-    });
+    return (this.db.query(sql).all(now, JSON.stringify([...requiresApproval])) as TrackedPr[]).filter(
+      (pr) => {
+        const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
+        return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
+      },
+    );
   }
 
   githubPrData(url: string): string | null {
     const query = this.db.query<{ data: string }, [string]>("SELECT data FROM github_prs WHERE url = ?");
     return query.get(url)?.data ?? null;
+  }
+
+  /** Review authority has its own monotonic record; direct reads must not baseline polling/feed data. */
+  githubReview(url: string): PrSnapshot | null {
+    const polled = parse<PrSnapshot | null>(this.githubPrData(url), null);
+    const review = this.getSetting<PrSnapshot | null>(`github.review:${url}`, null);
+    return (polled?.requestSeq ?? 0) > (review?.requestSeq ?? 0) ? polled : (review ?? polled);
+  }
+
+  saveGithubReview(url: string, snapshot: PrSnapshot): void {
+    this.transaction(() => {
+      const current = this.githubReview(url);
+      const newest = (snapshot.requestSeq ?? 0) > (current?.requestSeq ?? 0) ? snapshot : current;
+      if (newest?.requestSeq) this.setSetting(`github.review:${url}`, newest);
+    });
   }
 
   githubPrExpired(url: string, now = Date.now()): boolean {
@@ -3132,6 +3151,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       const save = this.db.query(`INSERT INTO github_prs (url, node_id, data, terminal) VALUES (?, ?, ?, ?)
         ON CONFLICT(url) DO UPDATE SET node_id = excluded.node_id, data = excluded.data, terminal = excluded.terminal`);
       if (pr) {
+        const snapshot = parse<PrSnapshot | null>(pr.data, null);
+        if (snapshot) this.saveGithubReview(pr.url, snapshot);
         save.run(pr.url, pr.nodeId, pr.data, terminal);
         const state = pr.data && (JSON.parse(pr.data) as { state?: string }).state;
         if (state) this.observeGithubPrState(pr.url, state, now);

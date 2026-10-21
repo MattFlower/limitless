@@ -224,7 +224,7 @@ export function pollerHarness(repos = ["o/r"]) {
       return run;
     },
     node: (repo: string, n: number) => gh.nodes.get(`PR_${repo}_${n}`) as PrNode,
-    start(seconds?: number, ciReruns?: boolean) {
+    start(seconds?: number, ciReruns?: boolean, requiresApproval?: ReadonlySet<string>) {
       stop = startGitHubPoller(h.store, {
         client: gh.client,
         gh: async (args) => {
@@ -241,6 +241,7 @@ export function pollerHarness(repos = ["o/r"]) {
         },
         seconds,
         ciReruns,
+        requiresApproval,
         log: (m) => logs.push(m),
         clock: {
           now: clock.now,
