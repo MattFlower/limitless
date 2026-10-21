@@ -106,3 +106,25 @@ for (const quotes of [4, 5])
     expect(text).toBe(original.replace("[]", '["acme/app"], merge = "pr"'));
     expect(Bun.TOML.parse(text)).toMatchObject({ github });
   });
+
+for (const owners of [
+  '[owners]\ndiscord = "keep" # comment\n',
+  '"owners"."discord" = "keep" # comment\n',
+  'owners = { discord = "keep", notes = { text = "},#" } } # comment\n',
+  '[owners]\ngithub = ""\ndiscord = "keep" # comment\n',
+])
+  test(`setup patches a missing owner without changing Discord or unrelated settings: ${owners.trim()}`, () => {
+    const settings = 'github = { repos = [], merge = "pr" }\n';
+    const original = settings + owners;
+    const text = patchSetupConfig(original, { repos: [], merge: "pr" }, [], [], false, "chosen-owner");
+    expect(Bun.TOML.parse(text)).toMatchObject({
+      github: { repos: [], merge: "pr" },
+      owners: { github: "chosen-owner", discord: "keep" },
+    });
+    expect(text).toContain(
+      owners.startsWith('"owners"') ? '"owners"."discord" = "keep"' : 'discord = "keep"',
+    );
+    if (owners.includes("notes")) expect(text).toContain('notes = { text = "},#" }');
+    expect(text).toContain("# comment");
+    expect(patchSetupConfig(text, { repos: [], merge: "pr" }, [], [], false)).toBe(text);
+  });

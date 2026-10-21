@@ -9,6 +9,7 @@ import {
   localExecutor,
 } from "./executor.ts";
 import type { GateRun } from "./run.ts";
+import { bindGateSlotScope, releaseGateSlotScope } from "./slots.ts";
 
 export function lanExecutor(workers: WorkerStore, repos: readonly string[]): GateExecutor {
   const local = localExecutor();
@@ -28,12 +29,18 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
     async start(req, signal) {
       signal.throwIfAborted();
       if (!repos.includes(req.repo)) return local.start(req, signal);
+      await releaseGateSlotScope();
+      signal.throwIfAborted();
       const id = workers.enqueue(req);
       starts.set(id, { signal, context: AsyncLocalStorage.snapshot() });
       return { kind: "lan", id, startedAt: workers.now() };
     },
     attach(handle, signal, req, hooks) {
       if (handle.kind === "local") return local.attach(handle, signal, req, hooks);
+      const initial = workers.job(handle.id);
+      if (!initial) throw new Error("Unknown LAN gate job");
+      const released =
+        initial.state === "queued" || initial.state === "leased" ? releaseGateSlotScope() : undefined;
       const known = live.get(handle.id);
       if (known) {
         if (signal.aborted) void known.cancel(signal.reason);
@@ -45,8 +52,6 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
         }
         return known;
       }
-      const initial = workers.job(handle.id);
-      if (!initial) throw new Error("Unknown LAN gate job");
       const start = starts.get(handle.id);
       if (start) signal = AbortSignal.any([signal, start.signal]);
       const controller = new AbortController();
@@ -60,6 +65,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
       signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted) abort();
       const result = (async (): Promise<GateRun> => {
+        await released;
         let index = 0;
         for (;;) {
           controller.signal.throwIfAborted();
@@ -79,7 +85,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
           if (job.state === "failed") {
             const request = JSON.parse(job.request) as GateRequest;
             workers.event(handle.id, { type: "status", text: "LAN gates falling back to local execution" });
-            const fallback = async () => {
+            const fallback = bindGateSlotScope(async () => {
               const h = await local.start(request, controller.signal);
               const execution = local.attach(h, controller.signal, undefined, hooks);
               const stream = (async () => {
@@ -93,7 +99,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
               controller.signal.throwIfAborted();
               if (!workers.complete(handle.id, run, true)) throw new Error("LAN gate job cancelled");
               return workers.sanitize(run);
-            };
+            });
             return start ? start.context(fallback) : fallback();
           }
           await Bun.sleep(workers.times.tick);

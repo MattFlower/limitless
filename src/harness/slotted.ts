@@ -23,7 +23,8 @@ export async function withSlottedCommands<T>(
   scratch: string,
   port: number,
   event: (data: TestWait) => void,
-  invoke: (path?: string) => Promise<T>,
+  invoke: (path?: string, idleNow?: () => number) => Promise<T>,
+  onWatchdog?: (active: boolean, elapsedMs: number) => void,
 ): Promise<T> {
   if (!commands.length) return invoke();
   const source = await wrapperBundle();
@@ -31,7 +32,7 @@ export async function withSlottedCommands<T>(
   // Every agent and gate profile denies reads under the shared root except to this directory's owner.
   const directory = commandDir(scratch, cwd);
   mkdirSync(directory, { mode: 0o700 });
-  const session = new AgentTestSession(event);
+  const session = new AgentTestSession(event, { onWatchdog });
   const unix = join(scratch, `slot-${crypto.randomUUID().slice(0, 8)}.sock`);
   let server: ReturnType<typeof Bun.serve> | undefined;
   try {
@@ -80,7 +81,7 @@ export async function withSlottedCommands<T>(
         `#!/bin/sh\nexec ${quote(process.execPath)} --no-env-file --config=${quote(bunfig)} --cwd ${quote(directory)} ${quote(entry)} "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`,
         { mode: 0o500 },
       );
-    return await invoke(`${directory}${delimiter}${process.env.PATH ?? ""}`);
+    return await invoke(`${directory}${delimiter}${process.env.PATH ?? ""}`, session.idleNow);
   } finally {
     session.close();
     server?.stop(true);

@@ -444,7 +444,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     landRequiresApproval,
-    githubOwner: str(owners.github, "MattFlower"),
+    githubOwner: str(owners.github, null),
     githubMerge: github.merge as Config["githubMerge"],
     githubPoll: github.poll !== false,
     githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),

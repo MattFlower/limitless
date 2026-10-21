@@ -11,7 +11,7 @@ import {
   type GateRun,
   runLocalGates,
 } from "./run.ts";
-import type { GatePriority } from "./slots.ts";
+import { bindGateSlotScope, type GatePriority } from "./slots.ts";
 
 export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
@@ -123,8 +123,9 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
         changed = Promise.withResolvers<void>();
         previous.resolve();
       };
+      const local = bindGateSlotScope(runLocalGates);
       const run = (...args: Parameters<typeof runLocalGates>) =>
-        started ? started.context(runLocalGates, ...args) : runLocalGates(...args);
+        started ? started.context(local, ...args) : local(...args);
       const result = run(
         req.cwd,
         {

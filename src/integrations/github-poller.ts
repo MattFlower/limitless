@@ -2,6 +2,7 @@ import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
 import { type ProcResult, redactCredentials, registerCredential, runProcess } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 import { ciDecision } from "./ci-classifier.ts";
 import type { GhRunner } from "./github.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
@@ -523,6 +524,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   const tick = async () => {
     if (stopped || running) return;
     running = true;
+    const end = beginActivity("poller.cycle");
     try {
       conflictCheckedAt = now();
       await processConflictTriggers(store, now, opts.gh, abort.signal).catch((error: unknown) => {
@@ -543,6 +545,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       log(`GitHub poll failed: ${String(e)}`);
       retryAt = now() + backoff(crashes++, 15_000);
     } finally {
+      end();
       running = false;
     }
     schedule();

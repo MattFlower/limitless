@@ -5,6 +5,7 @@ import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
+import { activity } from "./stall.ts";
 
 /** Only the innermost invocation's scratch is an ownership root. */
 export const invocationScratch = new AsyncLocalStorage<string>();
@@ -660,6 +661,7 @@ export interface ProcOptions {
   timeoutMs?: number;
   /** Kill when neither stdout nor stderr produced output for this long. */
   idleTimeoutMs?: number;
+  idleNow?: () => number;
   /** Strip terminal controls and redact decoded streams before line framing and tail cuts. */
   redactOutput?: boolean;
   /** Raw decoded chunks for internal checks only; never retain or forward them. */
@@ -676,9 +678,9 @@ export interface ProcResult {
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
-  /** The overall timeout began the shutdown, not an exit or a cancel before it. */
+  /** The overall timeout shutdown killed a running direct child. */
   timedOut: boolean;
-  /** The idle timeout began the shutdown, as for timedOut. */
+  /** The idle timeout shutdown killed a running direct child. */
   idleTimedOut: boolean;
   stdout: string; // tail, bounded by tailLimit
   stderr: string; // tail, bounded by tailLimit
@@ -695,6 +697,16 @@ export interface ProcResult {
 }
 
 const DEFAULT_TAIL = 64_000;
+/** Byte-idle and meaningful-progress watchdogs share the same pausable time accounting. */
+export function idleWatchdog(limit: number, now = Date.now) {
+  let last = now();
+  return {
+    reset: () => {
+      last = now();
+    },
+    expired: () => now() - last > limit,
+  };
+}
 const VT_ESCAPE = "\u001b";
 const MAX_PENDING_VT = 4_096;
 const INCOMPLETE_VT = new RegExp(
@@ -820,7 +832,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let timedOut = false;
     let idleTimedOut = false;
     let settled = false;
-    let lastActivity = Date.now();
+    const idle = idleWatchdog(opts.idleTimeoutMs ?? Infinity, opts.idleNow);
     const out = lineSplitter(opts.onStdoutLine, opts.maxLineLength);
     const err = lineSplitter(opts.onStderrLine, opts.maxLineLength);
 
@@ -831,8 +843,9 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         const release = await ownInvocationCleanup(marker);
         try {
           if (leaderInspectionError) throw leaderInspectionError;
+          let killedRunningChild = false;
           if (child.pid !== undefined) {
-            const killedRunningChild = await stopMarkedProcesses(
+            killedRunningChild = await stopMarkedProcesses(
               marker,
               child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
@@ -842,8 +855,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
               spawnedAt,
               directory,
             );
-            cancelKilled = cancelStarted && killedRunningChild;
           }
+          cancelKilled = cancelStarted && killedRunningChild;
+          timedOut &&= killedRunningChild;
+          idleTimedOut &&= killedRunningChild;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.
@@ -894,7 +909,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       const limit = opts.idleTimeoutMs;
       idleTimer = setInterval(
         () => {
-          if (shutdown === undefined && Date.now() - lastActivity > limit) {
+          if (shutdown === undefined && idle.expired()) {
             idleTimedOut = true;
             terminate();
           }
@@ -933,7 +948,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       };
       return {
         push(chunk: string) {
-          lastActivity = Date.now();
+          idle.reset();
           opts.onRawChunk?.(chunk, stream);
           if (!opts.redactOutput) return emit(chunk);
           const decoded = terminalPending + chunk;
@@ -1099,13 +1114,16 @@ export function registerCredential(name: string, value?: string): void {
       sortedCredentialVariants = [...credentialVariants].sort(([a], [b]) => b.length - a.length);
     }
 }
-export function redactCredentials(text: string): string {
+export const redactCredentials = (text: string): string =>
+  activity("credentials.redact", () => redactText(text));
+function redactText(text: string): string {
   // Substring matches require at least 8 characters to avoid redacting common short strings.
   for (const [secret, substring] of sortedCredentialVariants)
     if (substring || text === secret) text = text.split(secret).join("[redacted]");
   return text;
 }
-export const redactCredentialData = <T>(value: T): T =>
+export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
+const redactData = <T>(value: T): T =>
   JSON.parse(
     JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redactCredentials(v) : v)),
     (_key, v: unknown) =>

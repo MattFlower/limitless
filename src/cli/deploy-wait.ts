@@ -5,10 +5,10 @@ import { apiTokenHeaders } from "./api-token.ts";
 export const DEFAULT_MAX_WAIT_MS = 45 * 60_000;
 const REQUEST_TIMEOUT_MS = 5000;
 /** A loaded machine can stall one daemon response for seconds; only repeated silence fails a drain. */
-const MAX_POLL_ATTEMPTS = 3;
+const UNANSWERED_BUDGET_MS = 60_000;
 /** Resume is cleanup after a failed deploy, so a stalled daemon gets longer and repeated chances. */
 const RESUME_TIMEOUT_MS = 15_000;
-const RESUME_ATTEMPTS = 3;
+const RESUME_BUDGET_MS = 120_000;
 
 /** The daemon didn't answer within the request budget. */
 export class DaemonTimeoutError extends Error {
@@ -43,6 +43,16 @@ export const deployClock: DeployClock = {
 
 /** The running daemon has no drain endpoint: it predates graceful deploys. */
 export class DrainUnsupportedError extends Error {}
+
+/** No HTTP response was received; HTTP/body errors deliberately stay outside this class. */
+class DaemonTransportError extends Error {}
+const unanswered = (error: unknown): boolean =>
+  error instanceof DaemonTimeoutError ||
+  error instanceof DaemonTransportError ||
+  (error instanceof Error &&
+    /^(ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT)$/.test(
+      String((error as NodeJS.ErrnoException).code ?? error.message),
+    ));
 
 export interface DeployClient {
   admin(action: "drain" | "resume", signal: AbortSignal): Promise<DrainState>;
@@ -84,6 +94,8 @@ export function localDeployClient(port: number): DeployClient {
       method,
       signal,
       headers: { "content-type": "application/json", ...apiTokenHeaders(url) },
+    }).catch((cause: unknown) => {
+      throw new DaemonTransportError(redactCredentials(String(cause)), { cause });
     });
     if (response.status === 404 && path.startsWith("/api/admin/"))
       throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
@@ -142,16 +154,20 @@ export async function requestAdmin(
   action: "drain" | "resume",
 ): Promise<void> {
   const resume = action === "resume";
-  for (let attempt = 1; ; attempt++) {
+  const start = clock.now();
+  const remaining = () => RESUME_BUDGET_MS - (clock.now() - start);
+  for (;;) {
     try {
-      const ms = resume ? RESUME_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+      const ms = resume ? Math.min(RESUME_TIMEOUT_MS, remaining()) : REQUEST_TIMEOUT_MS;
       const state = await bounded(clock, (signal) => client.admin(action, signal), ms);
       if (!validDrain(state) || state.draining !== (action === "drain")) {
         throw new Error(`daemon did not acknowledge ${action}`);
       }
       return;
     } catch (error) {
-      if (!resume || !(error instanceof DaemonTimeoutError) || attempt >= RESUME_ATTEMPTS) throw error;
+      if (!resume || error instanceof DrainUnsupportedError || remaining() <= 0) throw error;
+      await clock.sleep(Math.min(2000, remaining()));
+      if (remaining() <= 0) throw error;
     }
   }
 }
@@ -169,20 +185,30 @@ export async function waitForDrain(
   const budget = () =>
     now || maxWaitMs === 0 ? REQUEST_TIMEOUT_MS : Math.min(REQUEST_TIMEOUT_MS, remaining());
   const poll = async () => {
-    for (let attempt = 1; ; attempt++) {
+    const unansweredAt = clock.now();
+    const left = () => UNANSWERED_BUDGET_MS - (clock.now() - unansweredAt);
+    for (;;) {
       try {
-        return validateHealth(await bounded(clock, (signal) => client.health(signal), budget()));
+        return validateHealth(
+          await bounded(clock, (signal) => client.health(signal), Math.min(budget(), left())),
+        );
       } catch (error) {
         // --now and zero-wait deploys keep their single, short attempt.
-        const retries = now || maxWaitMs === 0 ? 1 : MAX_POLL_ATTEMPTS;
-        if (!(error instanceof DaemonTimeoutError) || attempt >= retries) throw error;
-        await clock.sleep(Math.min(2000, remaining()));
-        if (remaining() === 0) throw error;
-        log(`Health poll timed out (attempt ${attempt} of ${MAX_POLL_ATTEMPTS}); retrying`);
+        if (!unanswered(error) || now || maxWaitMs === 0) throw error;
+        if (remaining() === 0) return;
+        if (left() <= 0) throw error;
+        log(
+          `Health poll unanswered (${clock.now() - unansweredAt}ms of ${UNANSWERED_BUDGET_MS}ms); retrying`,
+        );
+        await clock.sleep(Math.min(2000, remaining(), left()));
+        if (remaining() === 0) return;
+        if (left() <= 0) throw error;
       }
     }
   };
   let health = await poll();
+  const expired = () => log(`Drain timeout after ${Math.floor((clock.now() - start) / 1000)}s; restarting`);
+  if (!health) return expired();
   let lastProgress: string | undefined;
   let lastProgressAt = 0;
   for (;;) {
@@ -229,6 +255,7 @@ export async function waitForDrain(
       return;
     }
     health = await poll();
+    if (!health) return expired();
   }
 }
 

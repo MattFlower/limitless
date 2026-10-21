@@ -34,6 +34,7 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import * as proc from "../src/util/proc.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
+import { deferred } from "./evals-support.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
@@ -513,6 +514,108 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
   });
   expect(fake.requests).toHaveLength(3);
   expect(ghCalls("pr merge")).toHaveLength(1);
+});
+
+test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot (%s)", async (action) => {
+  const { pr, head } = await retryLandFixture();
+  const initial = deferred<void>();
+  const finishInitial = deferred<void>();
+  const retry = deferred<void>();
+  const finishRetry = deferred<void>();
+  const aborted = deferred<void>();
+  const cleanup = deferred<void>();
+  let acquired = false;
+  const commands: string[] = [];
+  const realProcess = proc.runProcess;
+  const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+    if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+    opts.onStdoutLine?.(opts.cmd[4] ?? "");
+    const command = opts.cmd.at(-1) ?? "";
+    commands.push(command);
+    if (command === "full-test") {
+      initial.resolve();
+      await finishInitial.promise;
+      const report = opts.env?.LIMITLESS_GATE_REPORT;
+      if (!report) throw new Error("missing report path");
+      writeFileSync(
+        report,
+        '<testsuites><testsuite file="README.md" failures="1" time="1"><testcase><failure/></testcase></testsuite></testsuites>',
+      );
+      for (const line of ["0 pass", "1 fail", "Ran 1 test across 1 file."]) opts.onStdoutLine?.(line);
+    }
+    if (command.startsWith("base-retry")) {
+      retry.resolve();
+      if (action === "pass") await finishRetry.promise;
+      else {
+        await new Promise<void>((resolve) =>
+          opts.signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        aborted.resolve();
+        await cleanup.promise;
+        opts.signal?.throwIfAborted();
+      }
+    }
+    return {
+      exitCode: command === "full-test" ? 1 : 0,
+      signal: null,
+      cancelled: false,
+      timedOut: false,
+      idleTimedOut: false,
+      truncated: false,
+      stdout: "output",
+      stderr: "",
+      durationMs: 1,
+    };
+  });
+  ci = () => null;
+  const q = queue();
+  let competitor: Promise<() => void> | undefined;
+  let release: (() => void) | undefined;
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await initial.promise;
+    competitor = gateSlots
+      .acquire(new AbortController().signal, undefined, "competitor", false, "ship")
+      .then((free) => {
+        acquired = true;
+        return free;
+      });
+    finishInitial.resolve();
+    expect(await Promise.race([retry.promise.then(() => "retry"), competitor.then(() => "competitor")])).toBe(
+      "retry",
+    );
+    expect(acquired).toBe(false);
+    expect(gateSlots.snapshot().occupied).toBe(1);
+    if (action === "pass") {
+      finishRetry.resolve();
+      release = await competitor;
+      await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+      expect(store.getLandEntry(entry.id)?.reason).toBe("flaky: test (README.md)");
+    } else {
+      const stopping = action === "stop" ? q.stop() : undefined;
+      if (action === "cancel") expect(q.cancel(entry.id)).toBe(true);
+      await aborted.promise;
+      expect(acquired).toBe(false);
+      cleanup.resolve();
+      await stopping;
+      release = await competitor;
+      await q.stop();
+      expect(store.getLandEntry(entry.id)?.state).toBe(action === "stop" ? "checking" : "cancelled");
+    }
+    expect(commands).toEqual(["prepare", "full-test", "full-other", "lint", "base-retry './README.md'"]);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+    release();
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    finishInitial.resolve();
+    finishRetry.resolve();
+    cleanup.resolve();
+    release?.();
+    await q.stop();
+    if (competitor) (await competitor)();
+    processSpy.mockRestore();
+  }
 });
 
 test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)", async (setupFails) => {

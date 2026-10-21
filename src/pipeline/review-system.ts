@@ -33,8 +33,9 @@ const LensSchema = z.strictObject(lensShape);
 const FinderSchema = z
   .strictObject({
     target: TargetSchema.optional(),
-    prompt: z.enum(["standard", "adversarial", "careful", "probe", "trace"], {
-      error: 'finder prompt must be "standard", "adversarial", "careful", "probe" or "trace"',
+    prompt: z.enum(["standard", "adversarial", "careful", "probe", "trace", "adversarial-checklist"], {
+      error:
+        'finder prompt must be "standard", "adversarial", "careful", "probe", "trace" or "adversarial-checklist"',
     }),
     lens: LensSchema.optional(),
     family: z.enum(["cross", "implementer"]).optional(),
@@ -106,10 +107,13 @@ const ReviewSystemBaseSchema = z
 export const ReviewSystemSchema = ReviewSystemBaseSchema.safeExtend({
   samples: z.never({ error: "samples is eval-only until adopted" }).optional(),
 })
-  .refine((system) => system.finders.every((f) => !["probe", "trace"].includes(f.prompt)), {
-    path: ["finders"],
-    message: 'the "probe" or "trace" prompt is eval-only',
-  })
+  .refine(
+    (system) => system.finders.every((f) => !["probe", "trace", "adversarial-checklist"].includes(f.prompt)),
+    {
+      path: ["finders"],
+      message: 'the "probe", "trace" or "adversarial-checklist" prompt is eval-only',
+    },
+  )
   .refine(
     (system) =>
       system.mode !== "single" ||
@@ -154,16 +158,22 @@ export const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
       message: "samples requires a single system without replayFrom and with exactly one finder",
     },
   )
+  .refine(
+    (system) =>
+      system.samples === undefined || system.finders.every((f) => f.prompt !== "adversarial-checklist"),
+    { path: ["samples"], message: "adversarial-checklist does not support samples; use k for repeats" },
+  )
   .refine((system) => system.mode !== "single" || system.finders.every((f) => f.local === undefined), {
     path: ["finders"],
     message: 'mode "single" takes no local finder option',
   })
   .refine(
     (system) =>
-      system.mode === "single" || system.finders.every((f) => !["probe", "trace"].includes(f.prompt)),
+      system.mode === "single" ||
+      system.finders.every((f) => !["probe", "trace", "adversarial-checklist"].includes(f.prompt)),
     {
       path: ["finders"],
-      message: 'the "probe" or "trace" prompt requires mode "single"',
+      message: 'the "probe", "trace" and "adversarial-checklist" prompts require mode "single"',
     },
   );
 
@@ -275,8 +285,8 @@ export const DEFAULT_ROSTERS: Record<ResolvedProfile, ReviewFinder[]> = {
 const RosterSchema = z
   .array(FinderSchema)
   .refine(
-    (roster) => roster.every((f) => !["probe", "trace"].includes(f.prompt)),
-    'the "probe" or "trace" prompt is eval-only',
+    (roster) => roster.every((f) => !["probe", "trace", "adversarial-checklist"].includes(f.prompt)),
+    'the "probe", "trace" or "adversarial-checklist" prompt is eval-only',
   )
   .refine((roster) => roster.some((f) => !f.local), "a roster needs at least one finder that is not local");
 const RostersSchema = z.strictObject({
