@@ -808,6 +808,100 @@ test("a line break inside a credential that ends a stray terminal string exposes
   }
 });
 
+test("runner redacts a credential around a terminated multiline DCS at every split", async () => {
+  const secret = "synthetic-newline-control-credential";
+  registerCredential("MULTILINE_DCS_RUNNER_TEST_TOKEN", secret);
+  for (const lineBreak of ["\n", "\r", "\r\n"]) {
+    const text = `error: ${secret.slice(0, 12)}\u001bPpayload${lineBreak}more\u001b\\${secret.slice(12)}\n(fail) terminal\n`;
+    for (const stream of ["stdout", "stderr"] as const) {
+      for (let offset = 0; offset <= text.length; offset++) {
+        const raw: string[] = [],
+          lines: string[] = [];
+        const result = await withChunks(
+          [
+            { stream, text: text.slice(0, offset) },
+            { stream, text: text.slice(offset) },
+          ],
+          () =>
+            runProcess({
+              ...options(),
+              redactOutput: true,
+              onRawChunk: (chunk) => raw.push(chunk),
+              onStdoutLine: (line) => lines.push(line),
+              onStderrLine: (line) => lines.push(line),
+            }),
+        );
+        expect(result[stream]).toBe("error: [redacted]\n(fail) terminal\n");
+        expect(lines).toEqual(["error: [redacted]", "(fail) terminal"]);
+        expect(raw.join("")).toBe(text);
+      }
+    }
+  }
+}, 60_000);
+
+test("terminated multiline terminal strings are payload for matching and output at every split", () => {
+  const secret = "synthetic-multiline-string-credential";
+  registerCredential("MULTILINE_STRING_TEST_TOKEN", secret);
+  const strings = [
+    ["\u001b]", "\u0007"],
+    ["\u001b]", "\u001b\\"],
+    ["\u009d", "\u009c"],
+    ["\u001bP", "\u001b\\"],
+    ["\u0090", "\u009c"],
+    ["\u001bX", "\u001b\\"],
+    ["\u001b^", "\u009c"],
+    ["\u001b_", "\u001b\\"],
+    ["\u009f", "\u0018"],
+  ];
+  for (const [introducer, terminator] of strings) {
+    for (const lineBreak of ["\n", "\r", "\r\n"]) {
+      const control = `${introducer}payload${lineBreak}more${lineBreak}${terminator}`;
+      for (const [text, expected] of [
+        [`error: ${secret.slice(0, 12)}${control}${secret.slice(12)}\nafter`, "error: [redacted]\nafter"],
+        [`error: ${control}${secret}`, "error: [redacted]"],
+        [`error: ${introducer}x${lineBreak}${secret}${terminator}after`, "error: [redacted]after"],
+        [`error: ${control}after`, "error: after"],
+      ] as const) {
+        for (let offset = 0; offset <= text.length; offset++) {
+          const output: string[] = [];
+          const redactor = outputRedactor((chunk) => output.push(chunk));
+          redactor.push(text.slice(0, offset));
+          redactor.push(text.slice(offset));
+          redactor.flush();
+          expect(output.join("")).toBe(expected);
+          expect(redactor.terminalPayloadLength).toBe(0);
+        }
+      }
+    }
+  }
+}, 60_000);
+
+test("text held after a line break in a terminal string stays bounded and is released past the hold", () => {
+  const secret = "synthetic-held-multiline-credential";
+  registerCredential("HELD_MULTILINE_TEST_TOKEN", secret);
+  const longest = Math.max(
+    ...registeredCredentials().flatMap((value) => [value.length, JSON.stringify(value).length - 2]),
+  );
+  for (const terminated of [false, true]) {
+    const output: string[] = [];
+    const redactor = outputRedactor((chunk) => output.push(chunk));
+    redactor.push(`error: \u001bPpayload\n${secret}`);
+    let peak = 0;
+    for (let i = 0; i < 1_000; i++) {
+      redactor.push("y".repeat(9));
+      peak = Math.max(peak, redactor.terminalPayloadLength);
+      expect(redactor.terminalPayloadLength).toBeLessThanOrEqual(4_096);
+      expect(redactor.carryLength).toBeLessThanOrEqual(longest - 1);
+    }
+    // Past the hold, the stray introducer ended at its line break: the held text joined the output.
+    expect(peak).toBeGreaterThan(4_000);
+    expect(redactor.terminalPayloadLength).toBe(0);
+    if (terminated) redactor.push(`\u001b\\${secret}`);
+    redactor.flush();
+    expect(output.join("")).toBe(`error: \n[redacted]${"y".repeat(9_000)}${terminated ? "[redacted]" : ""}`);
+  }
+});
+
 test.each(["\u001b]", "\u001bP"])(
   "long terminal payload %j is discarded with state preserved through ST and EOF",
   (control) => {

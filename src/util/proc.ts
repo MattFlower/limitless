@@ -705,19 +705,29 @@ function credentialMatcher(variants: readonly [string, boolean][]) {
     }
     return { text, substring, table, prefix: 0 };
   });
-  return (char: string) => {
-    let matched = 0;
-    for (const p of patterns) {
-      while (p.prefix && char !== p.text[p.prefix]) p.prefix = p.table[p.prefix - 1] ?? 0;
-      if (char === p.text[p.prefix]) p.prefix++;
-      if (p.prefix === p.text.length) {
-        if (p.substring) matched = Math.max(matched, p.prefix);
-        p.prefix = p.table[p.prefix - 1] ?? 0;
+  return {
+    match(char: string) {
+      let matched = 0;
+      for (const p of patterns) {
+        while (p.prefix && char !== p.text[p.prefix]) p.prefix = p.table[p.prefix - 1] ?? 0;
+        if (char === p.text[p.prefix]) p.prefix++;
+        if (p.prefix === p.text.length) {
+          if (p.substring) matched = Math.max(matched, p.prefix);
+          p.prefix = p.table[p.prefix - 1] ?? 0;
+        }
       }
-    }
-    return matched;
+      return matched;
+    },
+    save: () => patterns.map((p) => p.prefix),
+    restore(saved: number[]) {
+      for (const [i, p] of patterns.entries()) p.prefix = saved[i] ?? 0;
+    },
   };
 }
+
+const MAX_PENDING_VT = 4_096;
+const endsString = (char: string, kind: string) =>
+  "\u001b\u0018\u001a\u009c".includes(char) || (kind === "osc" && char === "\u0007");
 
 /** Incremental ECMA-48 recognition. String payload is discarded, never buffered. */
 function terminalParser() {
@@ -736,7 +746,7 @@ function terminalParser() {
     "\u009e": "string",
     "\u009f": "string",
   };
-  return (char: string) => {
+  const visible = (char: string) => {
     // ESC starts a new sequence even inside a command string; CAN/SUB cancel either kind.
     // This also recognizes ST across chunks without swallowing later diagnostics on malformed input.
     if (char === "\u0018" || char === "\u001a") {
@@ -748,8 +758,8 @@ function terminalParser() {
       return false;
     }
     if (state === "osc" || state === "string") {
-      // Real titles, links and strings never span lines, so a stray introducer ends at the line
-      // break rather than hiding uncoloured output until EOF; the break itself stays visible.
+      // A stray introducer ends at a line break rather than hiding output until EOF; the redactor
+      // holds the following text until a terminator shows it was multiline payload after all.
       const lineBreak = char === "\n" || char === "\r";
       if (lineBreak || char === "\u009c" || (state === "osc" && char === "\u0007")) state = "";
       return lineBreak;
@@ -769,17 +779,23 @@ function terminalParser() {
     }
     return true;
   };
+  return {
+    visible,
+    get state() {
+      return state;
+    },
+  };
 }
 
 type OutputCharacter = { text: string; position: number; marked?: number; before?: number };
 
-/** Internal observation seam: only unresolved printable characters are retained (at most L - 1). */
+/** Internal observation seam: unresolved printable characters (at most L - 1) plus a bounded hold. */
 export function outputRedactor(emit: (text: string) => void) {
   const variants = sortedCredentialVariants;
   const overlap = Math.max(0, (variants[0]?.[0].length ?? 0) - 1);
-  const rawMatch = credentialMatcher(variants);
-  const cleanMatch = credentialMatcher(variants);
-  const visible = terminalParser();
+  const raw = credentialMatcher(variants);
+  const clean = credentialMatcher(variants);
+  const parser = terminalParser();
   const short = variants.filter(([, substring]) => !substring).map(([text]) => text);
   let wholeRaw = short,
     wholeClean = short;
@@ -790,6 +806,8 @@ export function outputRedactor(emit: (text: string) => void) {
     count = 0,
     head = 0;
   let hidden: number | undefined, replacing: number | undefined;
+  // Text after a line break that ended a terminal string: payload if the string's terminator follows.
+  let held: { kind: string; length: number; clean: number[]; wholeClean: string[] } | undefined;
   const write = (text: string, marked: number | undefined, output: string[]) => {
     if (marked !== undefined) {
       if (replacing !== marked) output.push("[redacted]");
@@ -803,12 +821,18 @@ export function outputRedactor(emit: (text: string) => void) {
     if (entry.before !== undefined) write("", entry.before, output);
     write(entry.text, entry.marked, output);
   };
+  const writeDeferred = (output: string[]) => {
+    if (deferred === undefined) return;
+    if (deferredBefore !== undefined) write("", deferredBefore, output);
+    write(short[deferred]?.charAt(0) ?? "", deferredMarked, output);
+    deferred = undefined;
+  };
   return {
     get carryLength() {
-      return pending.size;
+      return pending.size - (held?.length ?? 0);
     },
     get terminalPayloadLength() {
-      return 0;
+      return held?.length ?? 0;
     },
     push(chunk: string) {
       const output: string[] = [];
@@ -816,19 +840,31 @@ export function outputRedactor(emit: (text: string) => void) {
       for (let i = 0; i < chunk.length; i++) {
         const char = chunk.charAt(i);
         wholeRaw = wholeRaw.filter((text) => text.charAt(position) === char);
-        const rawLength = rawMatch(char);
-        const isVisible = visible(char);
+        const rawLength = raw.match(char);
+        const kind = parser.state;
+        let isVisible = parser.visible(char);
+        if (held && endsString(char, held.kind)) {
+          // Terminated: the held text was payload, and matching resumes as if it never arrived.
+          for (; held.length; held.length--) {
+            const entry = pending.get(--count);
+            pending.delete(count);
+            const marker = Math.min(entry?.marked ?? Infinity, entry?.before ?? Infinity, hidden ?? Infinity);
+            hidden = marker === Infinity ? undefined : marker;
+          }
+          clean.restore(held.clean);
+          wholeClean = held.wholeClean;
+          held = undefined;
+          isVisible = false;
+        } else if (!held && isVisible && (kind === "osc" || kind === "string"))
+          held = { kind, length: 0, clean: clean.save(), wholeClean };
         let cleanLength = 0;
         if (isVisible) {
-          if (deferred !== undefined) {
-            if (deferredBefore !== undefined) write("", deferredBefore, output);
-            write(short[deferred]?.charAt(0) ?? "", deferredMarked, output);
-            deferred = undefined;
-          }
+          if (held) held.length++;
+          else writeDeferred(output);
           wholeClean = wholeClean.filter((text) => text.charAt(count) === char);
           pending.set(count++, { text: char, position, before: hidden });
           hidden = undefined;
-          cleanLength = cleanMatch(char);
+          cleanLength = clean.match(char);
         }
         if (rawLength || cleanLength) {
           let start = Math.min(
@@ -856,7 +892,12 @@ export function outputRedactor(emit: (text: string) => void) {
           if (rawLength && first === count) hidden = Math.min(hidden ?? Infinity, start);
         }
         position++;
-        if (pending.size > overlap) {
+        // Past the hold, the line break did end a stray introducer: the held text is output.
+        if (held && held.length > MAX_PENDING_VT) {
+          held = undefined;
+          writeDeferred(output);
+        }
+        while (pending.size - (held?.length ?? 0) > overlap) {
           // A whole-text short variant at length L is represented by its catalog index until EOF
           // or the next printable character, rather than retaining an Lth unresolved character.
           const entry = pending.get(head);
@@ -872,6 +913,8 @@ export function outputRedactor(emit: (text: string) => void) {
     },
     flush() {
       const output: string[] = [];
+      if (held) writeDeferred(output);
+      held = undefined;
       if (
         wholeRaw.some((text) => text.length === position) ||
         wholeClean.some((text) => text.length === count)
