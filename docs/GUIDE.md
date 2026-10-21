@@ -412,8 +412,9 @@ on exactly the approved SHA. An outstanding change request from any push-access 
 entry. Stale or dismissed reviews do not count; unavailable identity or review evidence leaves it
 waiting without a new timeout. Waiting entries do not block other PRs in the repository.
 
-The gate runs before checks and rechecks fresh reviews immediately before merging, including on
-restart. Approval on the approved SHA or the factory's pushed base-merge head counts at that recheck;
+The gate runs before checks and rechecks fresh reviews immediately before every merge attempt,
+including retries and restarts; incomplete review evidence never counts as approval.
+Approval on the approved SHA or the factory's pushed base-merge head counts at that recheck;
 a later factory base merge does not need another approval. After a rollback, the previous release
 shows waiting entries as `blocked`; re-queue them to continue. `limitless review --approve` only
 records the factory-side approval and never submits a GitHub review. Restart the daemon after

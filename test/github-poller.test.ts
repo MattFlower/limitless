@@ -743,7 +743,10 @@ test("SSO, 404, IP restrictions and missing nodes are access problems, once per 
   expect(kinds()).toEqual([]);
   const recovered = JSON.parse(snapshotOf(url("o/r", 1)));
   const previous = JSON.parse(before);
-  expect({ ...recovered, observedAt: previous.observedAt }).toEqual(previous);
+  expect(recovered.requestSeq).toBeGreaterThan(previous.requestSeq);
+  expect({ ...recovered, observedAt: previous.observedAt, requestSeq: previous.requestSeq }).toEqual(
+    previous,
+  );
   expect(recovered.observedAt).toBeGreaterThan(previous.observedAt);
   expect(h.store.getRun(run.id)).toMatchObject({
     status: "succeeded",
@@ -1654,7 +1657,7 @@ test.each([
   ["APPROVED", "other", SHA, null, false],
 ] as const)("approval eligibility: %s %s %s factory=%s", (state, login, commit, factory, eligible) => {
   const node = prNode("o/r", 1);
-  node.latestReviews.nodes.push({
+  node.latestOpinionatedReviews.nodes.push({
     state,
     author: login === null ? null : { login, __typename: "User" },
     authorCanPushToRepository: true,
@@ -1671,7 +1674,11 @@ test("polls explicitly queued PRs without runs, including first-observation revi
   h = pollerHarness();
   h.start(); // Initially nothing is tracked; land.queued must wake the poller.
   const node = h.gh.add("o/r", 42);
-  node.latestReviews.nodes.push({ state: "APPROVED", author: { login: "other" }, commit: { oid: SHA } });
+  node.latestOpinionatedReviews.nodes.push({
+    state: "APPROVED",
+    author: { login: "other" },
+    commit: { oid: SHA },
+  });
   const entry = h.store.createLandEntry({
     runId: null,
     repo: "o/r",
@@ -1691,7 +1698,11 @@ test("polls explicitly queued PRs without runs, including first-observation revi
   expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
   expect(h.store.githubTracked()).toMatchObject([{ runId: null, url: node.url }]);
   expect(kinds()).not.toContain("pr.review");
-  node.latestReviews.nodes[0] = { state: "DISMISSED", author: { login: "other" }, commit: { oid: SHA } };
+  node.latestOpinionatedReviews.nodes[0] = {
+    state: "DISMISSED",
+    author: { login: "other" },
+    commit: { oid: SHA },
+  };
   await h.advance(15000);
   expect(JSON.parse(snapshotOf(node.url)).reviewEvidence[0].state).toBe("DISMISSED");
 });
@@ -1704,7 +1715,7 @@ test.each([
   ["User", true, "COMMENTED", true],
 ] as const)("review authority %s push=%s state=%s", (authorType, canPush, state, expected) => {
   const node = prNode("o/r", 1);
-  node.latestReviews.nodes = [
+  node.latestOpinionatedReviews.nodes = [
     {
       state,
       author: { login: "reviewer", __typename: authorType },
@@ -1713,7 +1724,7 @@ test.each([
     },
   ];
   if (state === "CHANGES_REQUESTED" || state === "COMMENTED")
-    node.latestReviews.nodes.push({
+    node.latestOpinionatedReviews.nodes.push({
       state: "APPROVED",
       author: { login: "another", __typename: "User" },
       authorCanPushToRepository: true,
@@ -1724,4 +1735,98 @@ test.each([
   expect(hasOtherApproval(snapshot, "factory", SHA)).toBe(expected);
   expect(OBSERVE_QUERY).toContain("authorCanPushToRepository");
   expect(OBSERVE_QUERY).toContain("__typename");
+});
+
+test.each(["missing", "pageInfo", "truncated", "null node"])(
+  "incomplete opinionated review evidence never approves: %s",
+  (kind) => {
+    const node = prNode("o/r", 1);
+    node.latestOpinionatedReviews.nodes = Array.from({ length: 21 }, (_, i) => ({
+      state: "APPROVED",
+      author: { login: `reviewer-${i}`, __typename: "User" },
+      authorCanPushToRepository: true,
+      commit: { oid: SHA },
+    }));
+    const connection = node.latestOpinionatedReviews;
+    const evidence =
+      kind === "missing"
+        ? undefined
+        : {
+            ...connection,
+            pageInfo:
+              kind === "pageInfo" ? undefined : { hasNextPage: kind === "truncated", endCursor: "20" },
+            nodes: kind === "null node" ? [...connection.nodes, null] : connection.nodes,
+          };
+    const snapshot = normalizePr({ ...node, latestOpinionatedReviews: evidence });
+    if (!snapshot) throw new Error("missing normalized PR");
+    expect(snapshot.reviewEvidenceComplete).toBe(false);
+    expect(hasOtherApproval(snapshot, "factory", SHA)).toBe(false);
+  },
+);
+
+test("a later COMMENTED review does not clear an opinionated change request", () => {
+  const node = prNode("o/r", 1);
+  const author = { login: "reviewer", __typename: "User" };
+  node.latestReviews.nodes = [{ state: "COMMENTED", author }];
+  node.latestOpinionatedReviews.nodes = [
+    { state: "CHANGES_REQUESTED", author, authorCanPushToRepository: true, commit: { oid: SHA } },
+    {
+      state: "APPROVED",
+      author: { login: "other", __typename: "User" },
+      authorCanPushToRepository: true,
+      commit: { oid: SHA },
+    },
+  ];
+  const approval = node.latestOpinionatedReviews.nodes[1];
+  if (approval) node.latestReviews.nodes.push(approval);
+  const snapshot = normalizePr(node);
+  if (!snapshot) throw new Error("missing normalized PR");
+  expect(snapshot.reviewEvidenceComplete).toBe(true);
+  expect(hasOtherApproval(snapshot, "factory", SHA)).toBe(false);
+  expect(snapshot.reviews).toEqual(["reviewer:COMMENTED", "other:APPROVED"]);
+});
+
+test.each([["nodes", 0, "latestOpinionatedReviews", "nodes", 1], undefined, ["nodes", 0], ["nodes", -1]])(
+  "partial NOT_FOUND errors cannot authorize non-null PR evidence: %j",
+  async (path) => {
+    h = pollerHarness();
+    h.factoryPr("o/r", 1);
+    h.start();
+    await h.advance(0);
+    const before = snapshotOf(url("o/r", 1));
+    const node = h.node("o/r", 1);
+    const approval = {
+      state: "APPROVED",
+      author: { login: "other", __typename: "User" },
+      authorCanPushToRepository: true,
+      commit: { oid: SHA },
+    };
+    h.gh.next.push(
+      respond(200, {
+        data: {
+          nodes: [
+            {
+              ...node,
+              latestOpinionatedReviews: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [approval, null],
+              },
+            },
+          ],
+        },
+        errors: [{ type: "NOT_FOUND", ...(path ? { path } : {}) }],
+      }),
+    );
+    await h.advance(15000);
+    expect(snapshotOf(node.url)).toBe(before);
+    expect(h.logs.some((line) => line.includes("observation of o/r failed"))).toBe(true);
+  },
+);
+
+test("observation sequence survives reopening the store and nested transactions", () => {
+  h = pollerHarness();
+  const first = h.store.nextGithubObservationSeq();
+  h.reopen();
+  expect(h.store.nextGithubObservationSeq()).toBe(first + 1);
+  expect(h.store.transaction(() => h.store.nextGithubObservationSeq())).toBe(first + 2);
 });

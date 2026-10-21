@@ -56,17 +56,21 @@ export const ghClient: GitHubClient = async (path, body, signal) => {
   };
 };
 
-export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest {
+export const OBSERVE_QUERY = `query($ids: [ID!]!, $after: String) { nodes(ids: $ids) { ... on PullRequest {
   id url headRefOid headRefName isCrossRepository headRepository { nameWithOwner } state isDraft mergeable mergeStateStatus updatedAt mergedAt mergedBy { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion status completedAt url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
   latestReviews(first: 20) { nodes { state authorCanPushToRepository author { __typename login } commit { oid } } }
+  latestOpinionatedReviews(first: 20, after: $after) { pageInfo { hasNextPage endCursor } nodes { state authorCanPushToRepository author { __typename login } commit { oid } } }
   reviews(last: 10) { nodes { id createdAt updatedAt comments(last: 10) { nodes { id createdAt updatedAt } } } }
   comments(last: 10) { nodes { id createdAt updatedAt } } } } }`;
 // Activity pages hold the newest few items so an edit to a recent older one still moves the marker.
 
-type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
+type Conn<T> =
+  | { nodes?: (T | null)[]; pageInfo?: { hasNextPage: boolean; endCursor: string | null } }
+  | null
+  | undefined;
 type Activity = { id: string; createdAt?: string; updatedAt: string }; // createdAt: absent only in old markers
 /** One check: GraphQL's `name`/`conclusion`/`state`, or REST's `context`/`status`/`targetUrl`. */
 export type Context = {
@@ -99,6 +103,7 @@ type GqlPr = Base &
       authorCanPushToRepository?: boolean | null;
       commit?: { oid: string } | null;
     }>;
+    latestOpinionatedReviews?: GqlPr["latestReviews"];
   };
 /** A PR's normalized state; `failing` is reduced and sorted so reordering is not a change. */
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
@@ -114,6 +119,8 @@ export type PrSnapshot = Known &
     failing: { name: string; url: string | null }[];
     truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
     observedAt?: number;
+    requestSeq?: number;
+    reviewEvidenceComplete?: boolean;
     reviewEvidence?: {
       state: string;
       login: string | null;
@@ -189,7 +196,7 @@ const saved = (data: string | null | undefined) => {
 export function normalizePr(node: unknown, id?: string | null): PrSnapshot | null {
   const pr = node as GqlPr | null;
   if (!pr || REQUIRED.some((k) => typeof pr[k] !== "string") || (id && pr.id !== id)) return null;
-  const { commits, reviews, comments, latestReviews, ...base } = pr;
+  const { commits, reviews, comments, latestReviews, latestOpinionatedReviews, ...base } = pr;
   const head = nodes(commits).at(-1)?.commit?.statusCheckRollup ?? null;
   const all = nodes(reviews);
   const { ci, failing } = rollup(head);
@@ -213,8 +220,12 @@ export function normalizePr(node: unknown, id?: string | null): PrSnapshot | nul
       .flatMap((c) => (c.name ? [c.name] : [])),
     failing,
     truncated: nodes(head?.contexts).length >= 100 || undefined,
-    reviewEvidence: latestReviews
-      ? nodes(latestReviews).map((r) => ({
+    reviewEvidenceComplete:
+      latestOpinionatedReviews?.pageInfo?.hasNextPage === false &&
+      Array.isArray(latestOpinionatedReviews.nodes) &&
+      latestOpinionatedReviews.nodes.every((r) => r !== null),
+    reviewEvidence: latestOpinionatedReviews
+      ? nodes(latestOpinionatedReviews).map((r) => ({
           state: r.state,
           login: r.author?.login ?? null,
           authorType: r.author?.__typename ?? null,
@@ -274,7 +285,8 @@ export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   return out;
 }
 
-const errorsOf = (res: GitHubResponse) => (res.body as { errors?: { type?: string }[] } | null)?.errors ?? [];
+const errorsOf = (res: GitHubResponse) =>
+  (res.body as { errors?: { type?: string; path?: unknown[] }[] } | null)?.errors ?? [];
 /** SSO, IP-allow-list and not-found failures for `subject` are access problems, never PR changes. */
 function accessProblem(res: GitHubResponse, subject: string) {
   const text = JSON.stringify(res.status === 200 ? errorsOf(res) : (res.body ?? ""));
@@ -468,6 +480,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     for (let known = resolved.splice(0, 100); known.length; known = resolved.splice(0, 100)) {
       const ids = known.map((p) => p.nodeId);
       const since = known.map((p) => store.prHead(p.url)?.version ?? 0);
+      const requestSeq = store.nextGithubObservationSeq();
       const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
       if (!res) return;
       // An access failure of the whole query (SSO, IP allow list, HTTP 404) says nothing about any PR.
@@ -475,11 +488,24 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       if (access) store.setGithubAccess(repo, access, headOf(known[0]));
       const found = (res.body as { data?: { nodes?: unknown } } | null)?.data?.nodes;
       // Partial data is never trusted; only unresolvable node ids (NOT_FOUND) leave the rest usable.
-      const failed = access || res.status !== 200 || errorsOf(res).some((e) => e.type !== "NOT_FOUND");
+      const failed =
+        access ||
+        res.status !== 200 ||
+        errorsOf(res).some(
+          (e) =>
+            e.type !== "NOT_FOUND" ||
+            !Array.isArray(e.path) ||
+            e.path.length !== 2 ||
+            e.path[0] !== "nodes" ||
+            !Number.isInteger(e.path[1]) ||
+            !Array.isArray(found) ||
+            found[e.path[1] as number] !== null,
+        );
       if (failed || !Array.isArray(found) || found.length !== known.length)
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
         const snap = normalizePr(found[i], pr.nodeId);
+        if (snap) snap.requestSeq = requestSeq;
         const nudged = snap ? await record(pr, snap, since[i] ?? 0) : null;
         // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
         if (nudged === null) complete = false;

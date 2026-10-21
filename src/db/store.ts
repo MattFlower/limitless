@@ -104,6 +104,7 @@ const LAND_SELECT = `SELECT id, NULLIF(run_id, '') AS runId, title, repo, pr_url
   CASE WHEN state = 'blocked' AND approval_wait > 0 THEN 'waiting_approval' ELSE state END AS state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
   log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
   approval_wait AS approvalWaitStartedAt,
+  approval_wait_request_seq AS approvalWaitRequestSeq,
   CASE WHEN approval_wait > 0 THEN NULL ELSE finished_at END AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
   baseBranch: "base_branch",
@@ -2934,6 +2935,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
         | "attempts"
         | "reason"
         | "approvalWaitStartedAt"
+        | "approvalWaitRequestSeq"
       >
     >,
   ): LandEntry {
@@ -2942,6 +2944,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       LAND_PATCH_COLUMNS,
     );
     if (patch.state) {
+      sets.push("approval_wait_request_seq = ?");
+      values.push(patch.state === "waiting_approval" ? (patch.approvalWaitRequestSeq ?? 0) : 0);
       sets.push("approval_wait = ?");
       values.push(patch.state === "waiting_approval" ? (patch.approvalWaitStartedAt ?? Date.now()) : 0);
       sets.push("finished_at = ?");
@@ -2952,6 +2956,19 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     values.push(Date.now());
     this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     return this.getLandEntry(id) as LandEntry;
+  }
+
+  /** Orders observation requests and approval waits across processes and restarts. */
+  nextGithubObservationSeq(): number {
+    return this.transaction(() => {
+      const row = this.db
+        .query<{ value: number }, []>(
+          "UPDATE github_observation_sequence SET value = value + 1 WHERE id = 1 RETURNING value",
+        )
+        .get();
+      if (!row || !Number.isSafeInteger(row.value)) throw new Error("Invalid GitHub observation sequence");
+      return row.value;
+    });
   }
 
   /** Atomically retire rollback re-queues, or release this exact wait episode. */

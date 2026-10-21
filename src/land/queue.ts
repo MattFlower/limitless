@@ -58,6 +58,7 @@ import { redactCredentials } from "../util/proc.ts";
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
 class LandConflict extends LandBlocked {}
+class LandApprovalStopped extends Error {}
 class LandClaimLost extends Error {}
 
 /** What one observation says about the PR the entry is landing. */
@@ -79,6 +80,7 @@ export function hasOtherApproval(snapshot: PrSnapshot, factoryLogin: string | nu
   const authorized = (r: NonNullable<PrSnapshot["reviewEvidence"]>[number]) =>
     r.authorType === "User" && r.canPush === true && typeof r.login === "string" && !!r.login.trim();
   return (
+    snapshot.reviewEvidenceComplete === true &&
     !!factoryLogin?.trim() &&
     !reviews.some((r) => authorized(r) && r.state === "CHANGES_REQUESTED") &&
     reviews.some(
@@ -581,15 +583,14 @@ export class LandQueue {
       const login = identity.status === 200 && parsed.success ? parsed.data.login : null;
       if (saved) {
         const seen = savedSnapshot(this.store.githubPrData(entry.prUrl));
-        return {
-          login,
-          seen:
-            seen?.url === entry.prUrl &&
-            seen.observedAt !== undefined &&
-            seen.observedAt > (entry.approvalWaitStartedAt ?? Infinity)
-              ? seen
-              : null,
-        };
+        if (
+          seen?.url !== entry.prUrl ||
+          !seen.requestSeq ||
+          seen.requestSeq <= (entry.approvalWaitRequestSeq ?? Infinity)
+        )
+          return { login, seen: null };
+        if (seen.reviewEvidenceComplete) return { login, seen };
+        // A newer, truncated poll can wake the wait, but only complete direct evidence releases it.
       }
       const pr = await client(
         `repos/${entry.repo}/pulls/${entry.prUrl.split("/").at(-1)}`,
@@ -598,15 +599,51 @@ export class LandQueue {
       );
       if (pr.status !== 200) return { login, seen: null };
       const id = z.object({ node_id: z.string() }).parse(pr.body).node_id;
-      const response = await client("graphql", { query: OBSERVE_QUERY, variables: { ids: [id] } }, signal);
-      const data = z
-        .object({ data: z.object({ nodes: z.array(z.unknown()) }), errors: z.unknown().optional() })
-        .safeParse(response.body);
-      const seen =
-        response.status === 200 && data.success && !data.data.errors
-          ? normalizePr(data.data.data.nodes[0], id)
-          : null;
-      return { login, seen: seen?.url === entry.prUrl ? seen : null };
+      let after: string | null = null;
+      let first: PrSnapshot | null = null;
+      const reviews: NonNullable<PrSnapshot["reviewEvidence"]> = [];
+      const cursors = new Set<string>();
+      for (;;) {
+        const response = await client(
+          "graphql",
+          { query: OBSERVE_QUERY, variables: { ids: [id], after } },
+          signal,
+        );
+        const data = z
+          .object({
+            data: z.object({ nodes: z.array(z.unknown()).length(1) }),
+            errors: z.array(z.unknown()).nullish(),
+          })
+          .safeParse(response.body);
+        if (response.status !== 200 || !data.success || data.data.errors?.length)
+          return { login, seen: null };
+        const raw = data.data.data.nodes[0];
+        const seen = normalizePr(raw, id);
+        const page = z
+          .object({
+            latestOpinionatedReviews: z.object({
+              nodes: z.array(z.object({}).passthrough()),
+              pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+            }),
+          })
+          .safeParse(raw);
+        if (!seen || seen.url !== entry.prUrl || !page.success) return { login, seen: null };
+        if (
+          first &&
+          (seen.headRefOid !== first.headRefOid ||
+            seen.state !== first.state ||
+            seen.isDraft !== first.isDraft)
+        )
+          return { login, seen: { ...seen, reviewEvidenceComplete: false } };
+        first ??= seen;
+        reviews.push(...(seen.reviewEvidence ?? []));
+        const { hasNextPage, endCursor } = page.data.latestOpinionatedReviews.pageInfo;
+        if (!hasNextPage)
+          return { login, seen: { ...first, reviewEvidence: reviews, reviewEvidenceComplete: true } };
+        if (!endCursor || cursors.has(endCursor)) return { login, seen: null };
+        cursors.add(endCursor);
+        after = endCursor;
+      }
     } catch (error) {
       signal.throwIfAborted();
       this.log(redactCredentials(`[land] ${entry.id}: approval observation pending: ${String(error)}`));
@@ -622,6 +659,7 @@ export class LandQueue {
         state: "waiting_approval",
         reason,
         approvalWaitStartedAt: this.now(),
+        approvalWaitRequestSeq: this.store.nextGithubObservationSeq(),
       });
       this.store.landFeed(
         "land.waiting_approval",
@@ -644,7 +682,11 @@ export class LandQueue {
       for (;;) {
         signal.throwIfAborted();
         const current = this.store.releaseLandApproval(entry.id, entry.approvalWaitStartedAt ?? 0, false);
-        if (current?.state !== "waiting_approval") return;
+        if (
+          current?.state !== "waiting_approval" ||
+          current.approvalWaitRequestSeq !== entry.approvalWaitRequestSeq
+        )
+          return;
         const snapshot = this.store.githubPrData(entry.prUrl);
         const required = this.deps.requiresApproval?.has(entry.repo.toLowerCase());
         const evidence = required
@@ -653,7 +695,11 @@ export class LandQueue {
         signal.throwIfAborted();
         const released = this.store.transaction(() => {
           const still = this.store.releaseLandApproval(entry.id, entry.approvalWaitStartedAt ?? 0, false);
-          if (still?.state !== "waiting_approval") return null;
+          if (
+            still?.state !== "waiting_approval" ||
+            still.approvalWaitRequestSeq !== entry.approvalWaitRequestSeq
+          )
+            return null;
           try {
             this.checkApprovalHead(entry, evidence?.seen ?? null);
           } catch (error) {
@@ -984,7 +1030,9 @@ export class LandQueue {
     subject: string,
     signal: AbortSignal,
   ): Promise<void> {
-    if (this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
+    const guard = async () => {
+      this.assertClaim(entry.id);
+      if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) return;
       const evidence = await this.approvalEvidence({ ...entry, pushedSha: sha }, signal);
       signal.throwIfAborted();
       this.assertClaim(entry.id);
@@ -995,13 +1043,13 @@ export class LandQueue {
           head: evidence.seen.headRefOid,
           failing: evidence.seen.failing.map((f) => f.name),
         });
-        return;
+        throw new LandApprovalStopped();
       }
       if (!this.qualifies({ ...entry, pushedSha: sha }, evidence)) {
         this.parkApproval(entry, signal);
-        return;
+        throw new LandApprovalStopped();
       }
-    }
+    };
     const merging = this.owned(entry.id, () => {
       signal.throwIfAborted();
       this.store.assertNoRoundInFlight(entry.prUrl);
@@ -1026,12 +1074,16 @@ export class LandQueue {
         subject,
         body: run ? this.reportBody(run) : "",
         auto: false,
-        guard: () => this.assertClaim(entry.id),
+        guard,
         onFailure: (reason) => {
           failure = reason;
         },
       },
-    );
+    ).catch((error: unknown) => {
+      if (error instanceof LandApprovalStopped) return null;
+      throw error;
+    });
+    if (outcome === null) return;
     signal.throwIfAborted();
     this.assertClaim(entry.id);
     if (outcome !== "merged") {
