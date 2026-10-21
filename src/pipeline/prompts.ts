@@ -288,18 +288,18 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
   collectHoldoutDetails(holdout, (detail) => {
     if (isPrivate(detail)) details.add(detail);
   });
-  const compile = (extra: Set<string>) =>
-    details.size || extra.size
+  const compile = (literals: Set<string>) =>
+    literals.size
       ? new RegExp(
-          [...details, ...extra]
+          [...literals]
             .sort((a, b) => b.length - a.length)
             .map(holdoutBoundaryPattern)
             .join("|"),
           "giu",
         )
       : undefined;
-  const basePattern = compile(new Set());
-  // Retain only the last combined pattern: event IDs make observed sets mostly unique.
+  const basePattern = compile(details);
+  // Retain only the last observed pattern: event IDs make observed sets mostly unique.
   let lastKey = "";
   let lastPattern: RegExp | undefined;
   return (value: string, includeObservedLiterals = true): string => {
@@ -315,15 +315,38 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
       lastKey = key;
       lastPattern = compile(extra);
     }
-    const pattern = key ? lastPattern : basePattern;
-    if (!pattern) return value;
+    const observedPattern = key ? lastPattern : undefined;
+    if (basePattern) basePattern.lastIndex = 0;
+    if (observedPattern) observedPattern.lastIndex = 0;
+    let base = basePattern?.exec(value);
+    let observed = observedPattern?.exec(value);
+    let position = 0;
     let removed = 0;
-    // A single pass counts displayed replacements and never scans inserted placeholders.
-    const safe = value.replace(pattern, () => {
+    let safe = "";
+    // Merge against the original input, preserving the combined alternation's stable length sort.
+    while (base || observed) {
+      const match =
+        base &&
+        (!observed ||
+          base.index < observed.index ||
+          (base.index === observed.index && base[0].length >= observed[0].length))
+          ? base
+          : observed;
+      if (!match) break;
+      safe += `${value.slice(position, match.index)}[private detail]`;
+      position = match.index + match[0].length;
       removed++;
-      return "[private detail]";
-    });
-    return removed ? `${safe} [${removed} private details withheld]` : safe;
+      // An overlapping pending match may hide another match starting inside its own span.
+      if (base && base.index < position && basePattern) {
+        basePattern.lastIndex = position;
+        base = basePattern.exec(value);
+      }
+      if (observed && observed.index < position && observedPattern) {
+        observedPattern.lastIndex = position;
+        observed = observedPattern.exec(value);
+      }
+    }
+    return removed ? `${safe}${value.slice(position)} [${removed} private details withheld]` : value;
   };
 }
 
