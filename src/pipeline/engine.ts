@@ -56,7 +56,7 @@ import {
   githubRetry,
   headSha,
   isAncestor,
-  matchesPullRequest,
+  lookupUrl,
   mergeBase,
   mergePullRequest,
   type PullRequestIdentity,
@@ -97,7 +97,7 @@ import {
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { runGateExecution } from "./gate-execution.ts";
-import { deliveryMarker } from "./markers.ts";
+import { checkDiscreetCommits, DiscreetError, deliveryMarker, hasFactoryMark } from "./markers.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -702,6 +702,16 @@ function commitMessage(ctx: RunContext, round?: number): string {
   return `limitless: ${ctx.run.title}${round === undefined ? "" : ` (round ${round + 1})`}\n\nRun: ${ctx.run.id}`;
 }
 
+function commitIdentity(ctx: RunContext) {
+  return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "operator" : "factory";
+}
+
+function draftTitle(ctx: RunContext) {
+  return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet
+    ? ctx.run.title
+    : `[needs human] ${ctx.run.title}`;
+}
+
 function mergeMessage(ctx: RunContext, base: string): string {
   return `${repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "Merge" : "limitless: merge"} base ${base}`;
 }
@@ -738,7 +748,7 @@ async function mergeReviewBase(
       await ctx.save();
       return null;
     }
-    await completeMerge(cwd, head, tip, mergeMessage(ctx, tip));
+    await completeMerge(cwd, head, tip, mergeMessage(ctx, tip), commitIdentity(ctx));
     ctx.log(`Merged ${base} (${tip.slice(0, 8)}) into the PR branch before the round`);
   }
   return validateMerge(cwd, head, tip);
@@ -1209,7 +1219,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       }
       const sha =
         merge && previousHead
-          ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha))
+          ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha), commitIdentity(ctx))
           : await commitAll(cwd, commitMessage(ctx, round));
       ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
@@ -2233,6 +2243,11 @@ async function checkPublication(
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = privateEntries(ctx, cwd);
+    if (
+      repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet &&
+      hasFactoryMark(`${body}\n${pr?.title ?? ""}`, ctx.run.id, ctx.deps.cfg.uiUrl)
+    )
+      throw new DiscreetError(`Discreet mode blocked factory marks in ${location}`);
     checkPublicationText(body, location, entries);
     if (!pr) return;
     checkPublicationText(pr.title, "PR title", entries);
@@ -2249,6 +2264,14 @@ async function checkPublication(
       ctx.signal,
       deliveryBudget(ctx),
     );
+    if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)
+      await checkDiscreetCommits(
+        cwd,
+        range,
+        `refs/remotes/origin/${reviewRound(ctx)?.owner.baseBranch ?? (ctx.run.deliveryBranch ? ctx.repo.defaultBranch : ctx.run.baseBranch)}`,
+        ctx.run.id,
+        ctx.deps.cfg.uiUrl,
+      );
     await checkPrivateRange(cwd, range, entries);
     const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
       configDir: ctx.deps.cfg.paths.configDir,
@@ -2258,7 +2281,10 @@ async function checkPublication(
     const hit = findings.find((f) => f.rule === "private-string");
     if (hit) throw new PrivateError(hit.detail);
   } catch (error) {
-    const reason = error instanceof PrivateError ? error.message : "Private-string check blocked";
+    const reason =
+      error instanceof PrivateError || error instanceof DiscreetError
+        ? error.message
+        : "Private-string check blocked";
     throw new NeedsHumanError(reason);
   }
 }
@@ -2286,6 +2312,7 @@ async function deliverVerifiedDraft(
   const body = publicationText(ctx, stripReportManifest(rendered.report));
   saveReport(ctx, rendered);
   ctx.checkCancelled();
+  await checkPublication(ctx, body, { sha, title: draftTitle(ctx), branch });
   // The failed delivery may have opened its PR without hearing back, and its spent budget would
   // keep the draft below from finding it.
   if (!ctx.run.prUrl) {
@@ -2294,13 +2321,12 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await checkPublication(ctx, body, { sha, title: `[needs human] ${ctx.run.title}`, branch });
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
     base,
-    title: `[needs human] ${ctx.run.title}`,
+    title: draftTitle(ctx),
     body,
     cwd,
     draft: true,
@@ -2485,8 +2511,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         ctx.signal,
       );
       const data: unknown = JSON.parse(raw || "null");
-      const pr = (Array.isArray(data) ? data : [data]).find(
-        (pr) => !identity || matchesPullRequest(pr, identity),
+      const candidates: unknown[] = Array.isArray(data) ? data : [data];
+      const url = identity ? lookupUrl(JSON.stringify(candidates), identity) : undefined;
+      const pr = candidates.find(
+        (pr) => !identity || (!!pr && typeof pr === "object" && "url" in pr && pr.url === url),
       );
       if (pr && typeof pr === "object" && "state" in pr && pr.state === "MERGED") {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
@@ -2650,7 +2678,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     const rendered = buildReportArtifacts(ctx, success);
     const body = publicationText(ctx, stripReportManifest(rendered.report));
-    const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
+    const title = success ? ctx.run.title : draftTitle(ctx);
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
     if (success || blocked || !(review || ctx.run.deliveryBranch))
       await checkPublication(ctx, body, { sha: await headSha(cwd), title });
@@ -2805,7 +2833,8 @@ async function mergeForDelivery(
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }
-  if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched));
+  if ((await headSha(cwd)) === before)
+    await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
   await validateMerge(cwd, before, fetched);
   await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];

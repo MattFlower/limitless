@@ -1,8 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
-import { repoSettings } from "../src/config.ts";
+import { loadConfig, repoSettings } from "../src/config.ts";
+import { isBranchName } from "../src/core/delivery.ts";
+import * as repos from "../src/git/repos.ts";
 import {
   cachePath,
   createPullRequest,
@@ -13,8 +15,10 @@ import {
 import { sh } from "../src/util/proc.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 
+import { findingEvidence } from "./review-support.ts";
+
 const state = { home: "", repoDir: "", factory: null as Factory | null };
-const { start, githubFixture, registerGithub, wait } = pipelineSetup(state);
+const { start, githubFixture, registerGithub, wait, advanceBase } = pipelineSetup(state);
 
 test.each([true, false])("delivery publishes expected text (discreet: %s)", async (discreet) => {
   const bare = await githubFixture();
@@ -119,14 +123,14 @@ case "$*" in
 esac
 `,
   );
-  expect((await allocate()).branch).toBe("change/add-farewell-8");
+  expect((await allocate()).branch).toMatch(/^change\/add-farewell-[a-f0-9]{8}$/);
   f.cfg.repos["test/repo"] = { discreet: false, branchPrefix: "feat/" };
   const ordinary = await allocate();
   expect(ordinary.branch).toBe(`limitless/${ordinary.id}-add-farewell`);
   expect(repoSettings(f.cfg, repo.slug).discreet).toBe(false);
 });
 
-test.each(["unrelated", "matching head", "recorded URL"])(
+test.each(["unrelated", "matching head", "recorded URL", "ambiguous head", "missing recorded URL"])(
   "discreet PR lookup only recovers this delivery: %s",
   async (scenario) => {
     const bare = await githubFixture();
@@ -138,9 +142,23 @@ test.each(["unrelated", "matching head", "recorded URL"])(
     const oldUrl = "https://github.com/test/repo/pull/1";
     const ownUrl = "https://github.com/test/repo/pull/2";
     const headSha = "a".repeat(40);
-    const prs = [{ url: oldUrl, headRefOid: "b".repeat(40) }];
+    const prs = [
+      {
+        url: oldUrl,
+        headRefOid:
+          scenario === "recorded URL" || scenario === "ambiguous head" || scenario === "missing recorded URL"
+            ? headSha
+            : "b".repeat(40),
+      },
+    ];
     if (scenario !== "unrelated")
-      prs.push({ url: ownUrl, headRefOid: scenario === "matching head" ? headSha : "c".repeat(40) });
+      prs.push({
+        url: ownUrl,
+        headRefOid:
+          scenario === "matching head" || scenario === "ambiguous head" || scenario === "recorded URL"
+            ? headSha
+            : "c".repeat(40),
+      });
     writeFileSync(
       join(state.home, "bin", "gh"),
       `#!${process.execPath}
@@ -152,9 +170,36 @@ if (args[1] === "list") console.log(args.includes("--jq") ? prs[0]?.url : JSON.s
 if (args[1] === "create") console.log(${JSON.stringify(ownUrl)});
 `,
     );
-    const identity = { headSha, prUrl: scenario === "recorded URL" ? ownUrl : null };
+    const identity = {
+      headSha,
+      prUrl:
+        scenario === "recorded URL"
+          ? ownUrl
+          : scenario === "missing recorded URL"
+            ? "https://github.com/test/repo/pull/10"
+            : null,
+    };
+    const create = () =>
+      createPullRequest(repo, {
+        branch: "change/add-farewell",
+        base: "main",
+        title: "Add farewell",
+        body: "Report",
+        cwd: state.repoDir,
+        identity,
+      });
+    if (scenario === "ambiguous head") {
+      await expect(
+        findPullRequest(repo, "change/add-farewell", state.repoDir, undefined, identity),
+      ).rejects.toThrow(`several pull requests share head ${headSha}`);
+      await expect(create()).rejects.toThrow("several pull requests share head");
+      const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+      expect(calls).not.toMatch(/pr (?:create|edit)/);
+      return;
+    }
+
     expect(await findPullRequest(repo, "change/add-farewell", state.repoDir, undefined, identity)).toBe(
-      scenario === "unrelated" ? null : ownUrl,
+      scenario === "unrelated" || scenario === "missing recorded URL" ? null : ownUrl,
     );
     expect(
       await createPullRequest(repo, {
@@ -168,7 +213,7 @@ if (args[1] === "create") console.log(${JSON.stringify(ownUrl)});
     ).toBe(ownUrl);
     const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
     expect(calls).not.toContain(`pr edit ${oldUrl}`);
-    if (scenario === "unrelated") {
+    if (scenario === "unrelated" || scenario === "missing recorded URL") {
       expect(calls).toContain("pr create");
       expect(calls).not.toContain("pr edit");
     } else {
@@ -233,4 +278,235 @@ if (args[1] === "create") console.log("https://github.com/test/repo/pull/2");
   expect((await sh(["git", "rev-parse", "change/add-farewell"], { cwd: bare })).stdout.trim()).toBe(
     finished?.headSha ?? "",
   );
+});
+
+test("branch probes are bounded, stop on lookup errors and validate complete names", async () => {
+  const bare = await githubFixture();
+  const f = start(() => ({ text: "unused" }));
+  await f.scheduler.stop();
+  registerGithub(f, bare);
+  const repo = f.store.getRepoBySlug("test/repo");
+  if (!repo) throw new Error("missing repo");
+  await ensureCache(f.cfg.paths, repo);
+  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  let probes = 0;
+  await expect(
+    createWorktree(f.cfg.paths, repo, "taken", "Add farewell", "main", {
+      cfg: f.cfg,
+      gh: async () => {
+        probes++;
+        return "https://github.com/test/repo/pull/1";
+      },
+    }),
+  ).rejects.toThrow("change/add-farewell");
+  expect(probes).toBe(6);
+  probes = 0;
+  await expect(
+    createWorktree(f.cfg.paths, repo, "denied", "Add farewell", "main", {
+      cfg: f.cfg,
+      gh: async () => {
+        probes++;
+        throw new Error("lookup denied");
+      },
+    }),
+  ).rejects.toThrow("Cannot allocate branch change/add-farewell: PR lookup failed");
+  expect(probes).toBe(1);
+  const cfg = loadConfig({
+    home: f.cfg.paths.home,
+    configDir: f.cfg.paths.configDir,
+    raw: { repos: { "test/repo": { discreet: true, branch_prefix: "feature.l" } } },
+  });
+  const wt = await createWorktree(f.cfg.paths, repo, "valid", "ock", "main", { cfg, gh: async () => "" });
+  expect(wt.branch).not.toBe("feature.lock");
+  expect(isBranchName(wt.branch)).toBe(true);
+  expect((await sh(["git", "check-ref-format", "--branch", wt.branch], { cwd: bare })).exitCode).toBe(0);
+});
+
+test("discreet delivery merges an advanced base using the round commit's identity", async () => {
+  const bare = await githubFixture();
+  const f = start(async (s) => {
+    if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (roleOf(s) === "review") {
+      await advanceBase(bare, "base-only.txt", "base advanced\n");
+      return { structured: approve };
+    }
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  f.cfg.repos = { "test/repo": { discreet: true, branchPrefix: "change/" } };
+  registerGithub(f, bare);
+  const run = await f.createRun({
+    repo: "test/repo",
+    prompt: "Add farewell",
+    title: "Add farewell",
+    profile: "quick",
+  });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const branch = f.store.getRun(run.id)?.branch ?? "";
+  const identities = (
+    await sh(["git", "log", "--format=%an %ae %cn %ce", `main..${branch}`], { cwd: bare })
+  ).stdout
+    .trim()
+    .split("\n");
+  expect(identities).toHaveLength(2);
+  expect(identities[0]).toBe(identities[1] ?? "");
+  expect(identities.join("\n")).not.toMatch(/Limitless|limitless@localhost/);
+});
+
+test.each(["legacy text", "clean", "factory identity", "existing PR"])(
+  "resumed delivery checks historical commits and renders a fresh body (%s)",
+  async (scenario) => {
+    const initialDiscreet = scenario !== "legacy text";
+    const bare = await githubFixture();
+    mkdirSync(join(state.home, "cfg"));
+    const config = join(state.home, "cfg", "config.toml");
+    writeFileSync(config, `[repos."test/repo"]\ndiscreet = ${initialDiscreet}`);
+    const f = start(
+      async (s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") return { structured: approve };
+        if (scenario === "factory identity") {
+          writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
+          await sh(["git", "add", "farewell.txt"], { cwd: s.cwd });
+          await sh(
+            [
+              "git",
+              "-c",
+              "user.name=Limitless",
+              "-c",
+              "user.email=limitless@localhost",
+              "commit",
+              "-qm",
+              "Add farewell",
+            ],
+            { cwd: s.cwd },
+          );
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      },
+      false,
+      false,
+      { faults: { "stage:deliver:before": { action: "kill" } } },
+    );
+    registerGithub(f, bare);
+    const run = await f.createRun({
+      repo: "test/repo",
+      prompt: "Add farewell",
+      title: "Add farewell",
+      profile: "quick",
+    });
+    await wait(() => f.store.listStages(run.id).at(-1)?.status === "cancelled", {
+      timeoutMs: 10_000,
+      pollMs: null,
+      subscribe: (wake) => f.store.subscribe(wake),
+    });
+    await f.stop();
+    const branch = f.store.getRun(run.id)?.branch ?? "";
+    f.store.putArtifact(
+      run.id,
+      "report.md",
+      "report",
+      `Run: ${run.id}\n${f.cfg.uiUrl}/runs/${run.id}\nGenerated by Limitless`,
+    );
+    if (scenario === "existing PR") {
+      const prUrl = "https://github.com/test/repo/pull/10";
+      const headRefOid = f.store.getRun(run.id)?.headSha;
+      f.store.updateRun(run.id, { prUrl });
+      writeFileSync(
+        join(state.home, "bin", "gh"),
+        `#!${process.execPath}
+import { appendFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(join(state.home, "gh-calls"))}, args.join(" ")+"\\n");
+const pr = ${JSON.stringify({ url: prUrl, headRefOid, state: "OPEN" })};
+if (args[1] === "list") console.log(JSON.stringify([pr]));
+if (args[1] === "view") console.log(JSON.stringify(pr));
+if (args[1] === "edit") writeFileSync(${JSON.stringify(join(state.home, "gh-body"))}, await Bun.stdin.text());
+`,
+      );
+    }
+    f.store.close();
+    writeFileSync(config, '[repos."test/repo"]\ndiscreet = true');
+    const resumed = start(() => {
+      throw new Error("must resume without agents");
+    });
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      scenario === "clean" || scenario === "existing PR" ? "succeeded" : "needs_human",
+    );
+    const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+    if (scenario === "clean" || scenario === "existing PR") {
+      const body = readFileSync(join(state.home, "gh-body"), "utf8");
+      expect(body).toContain("## Checks");
+      expect(body).not.toMatch(/Limitless|\/runs\//);
+      expect(body).not.toContain(run.id);
+      if (scenario === "existing PR") {
+        expect(calls).toContain("pr edit https://github.com/test/repo/pull/10");
+        expect(calls).not.toContain("pr create");
+      }
+    } else {
+      expect(
+        (await sh(["git", "show-ref", "--verify", `refs/heads/${branch}`], { cwd: bare, allowFail: true }))
+          .exitCode,
+      ).not.toBe(0);
+      expect(calls).not.toMatch(/pr (?:create|edit)/);
+      expect(resumed.store.getRun(run.id)?.error).toMatch(/discreet.*commits/i);
+    }
+  },
+);
+
+test.each([
+  [true, false],
+  [false, false],
+  [true, true],
+  [false, true],
+])("draft title (discreet: %s, verified-work: %s)", async (discreet, verified) => {
+  const bare = await githubFixture();
+  let implementations = 0;
+  const f = start((s) => {
+    if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (roleOf(s) === "review") {
+      if (verified) {
+        const fetch = spyOn(repos, "fetchBase").mockImplementationOnce(async () => {
+          fetch.mockRestore();
+          throw new Error("Synthetic delivery failure after verification");
+        });
+        return { structured: approve };
+      }
+      return {
+        structured: {
+          verdict: "request_changes",
+          summary: "Fix the missing farewell content before approval",
+          findings: [
+            {
+              label: "new",
+              prior: "",
+              severity: "blocker",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Missing content",
+              detail: "Fix content",
+              suggestion: "Add content",
+            },
+          ],
+        },
+      };
+    }
+    return { files: { "farewell.txt": `goodbye ${++implementations}\n` } };
+  });
+  f.cfg.maxRounds = 1;
+  f.cfg.repos = { "test/repo": { discreet, branchPrefix: "change/" } };
+  registerGithub(f, bare);
+  writeFileSync(join(state.home, "gh-calls"), "");
+  const run = await f.createRun({
+    repo: "test/repo",
+    prompt: "Add farewell",
+    title: "Add farewell",
+    profile: "quick",
+  });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  const calls = readFileSync(join(state.home, "gh-calls"), "utf8");
+  expect(calls).toContain(`--title ${discreet ? "" : "[needs human] "}Add farewell`);
+  expect(calls).toContain("--draft");
+  if (discreet) expect(calls).not.toContain("[needs human]");
 });

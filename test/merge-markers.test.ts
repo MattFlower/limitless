@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
+import { rebaseOnto } from "../src/git/repos.ts";
+import { checkDiscreetCommits } from "../src/pipeline/markers.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -41,6 +43,9 @@ async function assertPending(dir: string, head: string, base: string) {
 
 async function assertCompleted(dir: string, head: string, base: string) {
   const sha = await completeMerge(dir, head, base);
+  expect((await mergeGit(dir, ["log", "-1", "--format=%an %ae %cn %ce"])).stdout.trim()).toBe(
+    "Limitless limitless@localhost Limitless limitless@localhost",
+  );
   expect((await mergeGit(dir, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout.trim()).toBe(
     `${sha} ${head} ${base}`,
   );
@@ -301,6 +306,44 @@ test("markers written into a modify/delete conflict block the merge", async () =
     await expect(completeMerge(dir, head, base)).rejects.toThrow("Unresolved conflict markers: gone.txt");
     writeFileSync(join(dir, "gone.txt"), "changed\n");
     await completeMerge(dir, head, base);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each(["factory", "operator"] as const)(
+  "rebase uses the selected %s committer identity",
+  async (identity) => {
+    const { dir, base } = await conflict(async (dir, side) => {
+      writeFileSync(join(dir, `${side}.txt`), side);
+    });
+    try {
+      await mergeGit(dir, ["merge", "--abort"]);
+      expect(await rebaseOnto(dir, base, identity)).toBe("clean");
+      const committer = (await mergeGit(dir, ["log", "-1", "--format=%cn %ce"])).stdout.trim();
+      expect(committer).toBe(
+        identity === "factory" ? "Limitless limitless@localhost" : "Test test@example.invalid",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("discreet commit inspection uses raw identities and UTF-8 regardless of log configuration", async () => {
+  const { dir, head, base } = await conflict(async (dir, side) => {
+    writeFileSync(join(dir, `${side}.txt`), side);
+  });
+  try {
+    const merge = await completeMerge(dir, head, base, "Merge base", "operator");
+    await mergeGit(dir, ["config", "i18n.logOutputEncoding", "UTF-16"]);
+    await expect(
+      checkDiscreetCommits(dir, `${head}..${merge}`, base, "private-run"),
+    ).resolves.toBeUndefined();
+    await mergeGit(dir, ["commit", "--allow-empty", "-qm", "Public subject"]);
+    await expect(checkDiscreetCommits(dir, `${merge}..HEAD`, base, "private-run")).rejects.toThrow(
+      /Discreet mode.*commits: [a-f0-9]+/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

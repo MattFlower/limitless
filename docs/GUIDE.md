@@ -202,7 +202,7 @@ use the file first, then the environment.
 | `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
-| `[repos."<owner>/<name>"] branch_prefix` | `"change/"` | In discreet mode, branches use `<branch_prefix><title-slug>` with `-2`, `-3`, … for collisions. Must form a valid branch when followed by `x`. Ignored unless `discreet = true`. |
+| `[repos."<owner>/<name>"] branch_prefix` | `"change/"` | In discreet mode, branches use `<branch_prefix><title-slug>` with `-2` through `-5`, then one random suffix for collisions (six probes maximum). Must form a valid branch when followed by `x`. Ignored unless `discreet = true`. |
 | `[workers] repos` | `[]` | Repositories allowed to send gate code to paired workers, for example `["owner/name"]`. Requires `[gates] executor = "lan"`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
@@ -216,6 +216,8 @@ use the file first, then the environment.
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Runtime routing, eval policy generation and the Evals matrix exclude models whose origin or baseOrigin is listed (exact, case-sensitive matching). Any configured list, even `[]`, also excludes unknown baseOrigin. There is no excluded-model fallback; explicit run/retry pins, routing saves and eval targets are refused. Omit for no origin filter. Edit config.toml and restart to change this read-only safety constraint. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] remote_model_path`, `remote_host`, `remote_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
+
+Unknown repository settings are ignored with a warning naming the repository and key, so later keys do not prevent rollback.
 
 Gates deny home reads except their checkout, scratch, recorded Git directories and approved
 toolchains; system paths remain readable. Exact ancestor manifest names and `node_modules`

@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import { type Config, type Paths, repoSettings } from "../config.ts";
+import { isBranchName } from "../core/delivery.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
@@ -25,6 +26,7 @@ import {
   worktreeGit,
   worktreeGitScope,
 } from "./command.ts";
+import { type CommitIdentity, mergeGit } from "./merge.ts";
 
 const BRANCH_PUSH = ["git", "push", "--no-follow-tags"];
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
@@ -353,20 +355,36 @@ export async function createWorktree(
       );
       const name = `${settings.branchPrefix}${slugify(title, 30)}`;
       const gh = options.gh;
-      branch = name;
-      for (
-        let suffix = 2;
-        recorded.has(branch) ||
-        taken.has(`refs/heads/${branch}`) ||
-        taken.has(`refs/remotes/origin/${branch}`) ||
-        (repo.kind === "github" &&
-          (gh
-            ? await withGitHubRetry(async () => (await gh(prLookup(repo, branch).slice(1))) ?? "")
-            : (await remoteSh(prLookup(repo, branch), { cwd: cache })).stdout
-          ).trim() !== "");
-        suffix++
-      )
-        branch = `${name}-${suffix}`;
+      const budget = { leftMs: githubRetry.budgetMs };
+      branch = "";
+      // Six candidates total; historical PRs with deleted branches must not hold the lock forever.
+      for (const suffix of ["", "-2", "-3", "-4", "-5", `-${randomUUID().slice(0, 8)}`]) {
+        const candidate = `${name}${suffix}`;
+        if (!isBranchName(candidate)) continue;
+        if (
+          recorded.has(candidate) ||
+          taken.has(`refs/heads/${candidate}`) ||
+          taken.has(`refs/remotes/origin/${candidate}`)
+        )
+          continue;
+        try {
+          if (
+            repo.kind === "github" &&
+            (gh
+              ? await withGitHubRetry(async () => (await gh(prLookup(repo, candidate).slice(1))) ?? "", {
+                  budget,
+                })
+              : (await remoteSh(prLookup(repo, candidate), { cwd: cache, budget })).stdout
+            ).trim()
+          )
+            continue;
+        } catch (cause) {
+          throw new Error(`Cannot allocate branch ${name}: PR lookup failed`, { cause });
+        }
+        branch = candidate;
+        break;
+      }
+      if (!branch) throw new Error(`Cannot allocate valid available branch for ${name} after six candidates`);
     }
     const base = await worktreeGit(["git", "rev-parse", baseRef], { cwd: cache });
     // Hooks are blanked where a command runs. `worktree add` would check out inside the new
@@ -477,14 +495,12 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
   return result.exitCode === 0;
 }
 
-export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" | "conflict"> {
-  const result = await worktreeGit(
-    ["git", "-c", "user.name=Limitless", "-c", "user.email=limitless@localhost", "rebase", baseSha],
-    {
-      cwd,
-      allowFail: true,
-    },
-  );
+export async function rebaseOnto(
+  cwd: string,
+  baseSha: string,
+  identity: CommitIdentity = "factory",
+): Promise<"clean" | "conflict"> {
+  const result = await mergeGit(cwd, ["rebase", baseSha], true, undefined, identity);
   if (result.exitCode === 0) return "clean";
   const state = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
   const apply = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
@@ -1505,16 +1521,19 @@ export function matchesPullRequest(
     typeof pr === "object" &&
     "url" in pr &&
     typeof pr.url === "string" &&
-    (pr.url === identity.prUrl ||
-      (!!identity.headSha && "headRefOid" in pr && pr.headRefOid === identity.headSha))
+    (identity.prUrl
+      ? pr.url === identity.prUrl
+      : !!identity.headSha && "headRefOid" in pr && pr.headRefOid === identity.headSha)
   );
 }
 
-function lookupUrl(raw: string, identity?: PullRequestIdentity): string {
+export function lookupUrl(raw: string, identity?: PullRequestIdentity): string {
   if (!identity) return raw.trim();
   const prs: unknown = JSON.parse(raw || "[]");
   if (!Array.isArray(prs)) throw new Error("PR lookup did not return a list");
-  return prs.find((pr): pr is { url: string } => matchesPullRequest(pr, identity))?.url ?? "";
+  const matches = prs.filter((pr) => matchesPullRequest(pr, identity));
+  if (matches.length > 1) throw new Error(`several pull requests share head ${identity.headSha}`);
+  return matches[0]?.url ?? "";
 }
 
 export async function createPullRequest(

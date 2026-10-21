@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, repoSettings } from "../src/config.ts";
-import { deliveryMarker } from "../src/pipeline/markers.ts";
+import { deliveryMarker, hasFactoryMark } from "../src/pipeline/markers.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { stripReportManifest } from "../src/pipeline/report-privacy.ts";
 import { roundSection } from "../src/pipeline/review-round.ts";
@@ -30,6 +30,18 @@ test("repository settings default, normalize slugs and honor custom prefixes", (
   expect(repoSettings(cfg, "other/repo")).toEqual({ discreet: false, branchPrefix: "change/" });
 });
 
+test("unknown repository keys warn while known settings still apply", () => {
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const cfg = config('[repos."acme/widgets"]\ndiscreet = true\nland_requires_approval = true');
+    expect(repoSettings(cfg, "acme/widgets").discreet).toBe(true);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("acme/widgets"));
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("land_requires_approval"));
+  } finally {
+    warning.mockRestore();
+  }
+});
+
 test.each([
   ['repos = "no"', "repos must be a table"],
   ["repos = 1979-05-27T07:32:00Z", "repos must be a table"],
@@ -40,7 +52,6 @@ test.each([
   ['[repos."acme/widgets"]\nbranch_prefix = ""', "valid branch prefix"],
   ['[repos."acme/widgets"]\nbranch_prefix = "a..b/"', "valid branch prefix"],
   ['[repos."acme/widgets"]\nbranch_prefix = false', "valid branch prefix"],
-  ['[repos."acme/widgets"]\ndiscret = true', "Unknown repos key: discret"],
 ])("rejects invalid repository settings: %s", (toml, message) => {
   expect(() => config(toml)).toThrow(message);
 });
@@ -93,4 +104,24 @@ test.each([
   expect(report).toStartWith(opening);
   expect(report).toContain("Closes #42");
   expect(report).not.toMatch(/limitless|private-run|\/runs\//i);
+});
+
+test.each([
+  ["limitless: Add farewell", []],
+  ["Add farewell\n\nRun: private-run", []],
+  ["Mention private-run", []],
+  ["See http://example.com/runs/other-run", []],
+  ["Public subject", ["Limitless", "test@example.invalid"]],
+  ["Public subject", ["Test", "limitless@localhost"]],
+] as [string, string[]][])("publication marks: %s", (text, identities) => {
+  expect(hasFactoryMark(text, "private-run", "http://example.com", identities)).toBe(true);
+});
+
+test("an operator's title may contain the word limitless", () => {
+  expect(
+    hasFactoryMark("Add limitless options", "private-run", "http://example.com", [
+      "Test",
+      "test@example.invalid",
+    ]),
+  ).toBe(false);
 });

@@ -49,6 +49,9 @@ import {
   savedSnapshot,
 } from "../integrations/github-poller.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
+import type { RunState } from "../pipeline/context.ts";
+import { checkDiscreetCommits, hasFactoryMark } from "../pipeline/markers.ts";
+import { renderReportArtifacts } from "../pipeline/report.ts";
 import { stripReportManifest } from "../pipeline/report-privacy.ts";
 import { redactCredentials } from "../util/proc.ts";
 
@@ -84,7 +87,7 @@ export interface LandDeps {
   gateExecutor?: GateExecutor;
   store: Store;
   paths: Paths;
-  cfg?: Pick<Config, "repos">;
+  cfg?: Pick<Config, "repos"> & Partial<Pick<Config, "uiUrl">>;
   readPolicy?: ReadPolicyOptions;
   /** GitHub polling is on: read the poller's saved observations instead of calling `gh` every cycle. */
   polling?: boolean;
@@ -478,10 +481,11 @@ export class LandQueue {
     try {
       const baseSha = await fetchBase(this.deps.paths, repo, entry.baseBranch, signal);
       let head = entry.pushedSha;
+      let body = "";
       if (!head) {
         head = await this.mergeBase(cwd, entry, baseSha);
         await this.checks(entry, cwd, baseSha, signal);
-        await this.checkPublication(entry, run, cwd, baseSha, head, subject);
+        body = await this.checkPublication(entry, run, cwd, baseSha, head, subject);
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
         const waiting = this.owned(entry.id, () => {
@@ -492,10 +496,10 @@ export class LandQueue {
         });
         if (!waiting) return;
       }
-      if (entry.pushedSha) await this.checkPublication(entry, run, cwd, baseSha, head, subject);
+      if (entry.pushedSha) body = await this.checkPublication(entry, run, cwd, baseSha, head, subject);
       const ci = await this.awaitCi(entry, head, signal);
       if (ci !== "green") return this.landed(entry, repo, head, ci);
-      await this.merge(entry, run, repo, cwd, head, subject, signal);
+      await this.merge(entry, repo, cwd, head, subject, body, signal);
     } finally {
       await this.discard(repo, cwd);
     }
@@ -531,6 +535,7 @@ export class LandQueue {
       entry.approvedSha,
       baseSha,
       `${repoSettings(this.deps.cfg ?? {}, entry.repo).discreet ? "Merge" : "limitless: merge"} base ${baseSha}`,
+      repoSettings(this.deps.cfg ?? {}, entry.repo).discreet ? "operator" : "factory",
     );
   }
 
@@ -799,11 +804,11 @@ export class LandQueue {
 
   private async merge(
     entry: LandEntry,
-    run: Run | null,
     repo: Repo,
     cwd: string,
     sha: string,
     subject: string,
+    body: string,
     signal: AbortSignal,
   ): Promise<void> {
     const merging = this.owned(entry.id, () => {
@@ -828,7 +833,7 @@ export class LandQueue {
       this.publication(entry, cwd),
       {
         subject,
-        body: run ? this.reportBody(run) : "",
+        body,
         auto: false,
         guard: () => this.assertClaim(entry.id),
         onFailure: (reason) => {
@@ -896,11 +901,42 @@ export class LandQueue {
   }
 
   private reportBody(run: Run): string {
-    return sanitizePublication(
-      redactCredentials(stripReportManifest(this.store.getArtifact(run.id, "report.md") ?? "")),
-      publicationWorktree(this.store.getRunState<{ worktreePath?: string }>(run.id) ?? {}),
+    const repo = this.store.getRepo(run.repoId);
+    const discreet = repoSettings(this.deps.cfg ?? {}, repo?.slug ?? "").discreet;
+    const state = this.store.getRunState<RunState>(run.id);
+    if (discreet && !state)
+      throw new LandBlocked("Discreet mode cannot render squash body: missing run state");
+    const worktree = publicationWorktree(state ?? {});
+    const report = discreet
+      ? renderReportArtifacts(
+          {
+            discreet: true,
+            success: true,
+            runId: run.id,
+            runUrl: "",
+            prompt: run.prompt,
+            state: state ?? {},
+            invocations: this.store.listInvocations(run.id),
+            totals: { costUsd: run.costUsd, costEquivUsd: run.costEquivUsd },
+            models: run.models,
+            signalWarnings: this.store.countEvents(run.id, "signal_attempt"),
+            ...(run.sourceRef?.kind === "issue" &&
+            run.sourceRef.repo === repo?.slug &&
+            typeof run.sourceRef.number === "number"
+              ? { closesIssue: run.sourceRef.number }
+              : {}),
+          },
+          (text) => sanitizePublication(redactCredentials(text), worktree, this.deps.paths.home),
+        ).report
+      : (this.store.getArtifact(run.id, "report.md") ?? "");
+    const body = sanitizePublication(
+      redactCredentials(stripReportManifest(report)),
+      worktree,
       this.deps.paths.home,
     );
+    if (discreet && hasFactoryMark(body, run.id, this.deps.cfg?.uiUrl))
+      throw new LandBlocked("Discreet mode blocked factory marks in squash body");
+    return body;
   }
 
   private async checkPublication(
@@ -911,16 +947,33 @@ export class LandQueue {
     head: string,
     subject: string,
   ) {
+    if (repoSettings(this.deps.cfg ?? {}, entry.repo).discreet) {
+      if (hasFactoryMark(subject, run?.id ?? ""))
+        throw new LandBlocked("Discreet mode blocked factory marks in squash title");
+      try {
+        await checkDiscreetCommits(
+          cwd,
+          `${entry.approvedSha}..${head}`,
+          base,
+          run?.id ?? "",
+          this.deps.cfg?.uiUrl,
+        );
+      } catch (error) {
+        throw new LandBlocked(`Discreet mode publication blocked: ${String(error)}`);
+      }
+    }
+    const body = run ? this.reportBody(run) : "";
     await checkPrivatePublication(cwd, this.publication(entry, cwd), {
       squash: {
         base,
         head,
         title: subject,
-        body: run ? this.reportBody(run) : "",
+        body,
       },
       // Select the factory's merge itself, never traverse either parent's existing history.
       ...(head !== entry.approvedSha ? { commits: `${head}^!` } : {}),
     });
+    return body;
   }
 
   private publication(entry: LandEntry, cwd: string) {

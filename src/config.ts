@@ -116,7 +116,8 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
     if (!repoName.test(slug)) throw new Error("repos keys must be owner/name slugs");
     if (!table(entry)) throw new Error("repos entries must be tables");
     for (const key of Object.keys(entry))
-      if (key !== "discreet" && key !== "branch_prefix") throw new Error(`Unknown repos key: ${key}`);
+      if (key !== "discreet" && key !== "branch_prefix")
+        console.warn(`Ignoring unknown repository setting for ${slug}: ${key}`);
     const { discreet = false, branch_prefix = "change/" } = entry;
     if (typeof discreet !== "boolean") throw new Error("repos.discreet must be a boolean");
     if (typeof branch_prefix !== "string" || !branch_prefix || !isBranchName(`${branch_prefix}x`))

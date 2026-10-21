@@ -3,17 +3,29 @@ import { join, resolve } from "node:path";
 import { agentEnv } from "../util/proc.ts";
 import { stageAll, worktreeGit, worktreeGitScope } from "./command.ts";
 
+export type CommitIdentity = "factory" | "operator";
+
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
-export function mergeGit(cwd: string, args: string[], allowFail = false, stdin?: string) {
+export function mergeGit(
+  cwd: string,
+  args: string[],
+  allowFail = false,
+  stdin?: string,
+  identity: CommitIdentity = "factory",
+) {
   return worktreeGit(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], {
     cwd,
     allowFail,
     stdin,
     env: agentEnv({
-      GIT_AUTHOR_NAME: "Limitless",
-      GIT_AUTHOR_EMAIL: "limitless@localhost",
-      GIT_COMMITTER_NAME: "Limitless",
-      GIT_COMMITTER_EMAIL: "limitless@localhost",
+      ...(identity === "factory"
+        ? {
+            GIT_AUTHOR_NAME: "Limitless",
+            GIT_AUTHOR_EMAIL: "limitless@localhost",
+            GIT_COMMITTER_NAME: "Limitless",
+            GIT_COMMITTER_EMAIL: "limitless@localhost",
+          }
+        : {}),
       GIT_MERGE_AUTOEDIT: "no",
     }),
   });
@@ -132,6 +144,7 @@ export async function completeMerge(
   head: string,
   base: string,
   message = `limitless: merge base ${base}`,
+  identity: CommitIdentity = "factory",
 ): Promise<string> {
   await requireMerge(cwd, head, base);
   const mergeBase = (await mergeGit(cwd, ["merge-base", "HEAD", "MERGE_HEAD"])).stdout.trim();
@@ -168,6 +181,6 @@ export async function completeMerge(
     await stageAll({ cwd, env: agentEnv() }, present);
   }
   await requireMerge(cwd, head, base);
-  await mergeGit(cwd, ["commit", "-q", "-m", message]);
+  await mergeGit(cwd, ["commit", "-q", "-m", message], false, undefined, identity);
   return validateMerge(cwd, head, base);
 }
