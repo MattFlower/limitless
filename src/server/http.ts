@@ -1,8 +1,10 @@
+import { profile, type SamplingProfileStackTraces } from "bun:jsc";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
+import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import { parseSince } from "../core/since.ts";
@@ -15,8 +17,10 @@ import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
+import { landWire } from "../land/wire.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { stallReporter } from "../util/stall.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { createApiToken, matchesApiToken } from "./api-token.ts";
@@ -26,6 +30,25 @@ import { Passkeys } from "./passkeys.ts";
 
 const eventLoopLag = new EventLoopLag();
 setInterval(() => stallReporter.sample(eventLoopLag.sample()), 1000).unref();
+let profileRunning = false;
+
+const profileText = (value: string) =>
+  new TextDecoder().decode(Buffer.from(redactCredentials(value)).subarray(0, 64 * 1024), { stream: true });
+
+function profileStacks({ traces }: SamplingProfileStackTraces): string {
+  const counts = new Map<string, number>();
+  for (const { frames } of traces) {
+    const stack = frames
+      .slice(0, 8)
+      .map(({ name, sourceURL, line }) => `${name || "<anonymous>"} (${sourceURL}:${line})`)
+      .join(" < ");
+    counts.set(stack, (counts.get(stack) ?? 0) + 1);
+  }
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .map(([stack, count]) => `${count}  ${stack}`)
+    .join("\n");
+}
 
 export interface HttpExtras {
   apiToken?: string;
@@ -355,6 +378,26 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/admin/drain": admin("drain"),
     "/api/admin/resume": admin("resume"),
+    "/api/admin/profile": {
+      POST: handle(async (req, server) => {
+        const { seconds } = z
+          .object({ seconds: z.number().min(0.2).max(120).default(30) })
+          .parse(await body<unknown>(req));
+        if (profileRunning) return error("A profile is already running", 409);
+        profileRunning = true;
+        try {
+          server.timeout(req, 0);
+          const result = await profile(() => Bun.sleep(seconds * 1000), 1000);
+          return json({
+            seconds,
+            functions: profileText(result.functions),
+            stackTraces: profileText(profileStacks(result.stackTraces)),
+          });
+        } finally {
+          profileRunning = false;
+        }
+      }, true),
+    },
     "/api/admin/auth/password": {
       POST: handle(async (req) => {
         await auth.setPassword((await body<{ password?: unknown }>(req)).password);
@@ -445,6 +488,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       json({
         ok: true,
         uptimeMs: Date.now() - factory.startedAt,
+        loadPerCore: factory.scheduler.loadPerCore,
+        admissionHeld: factory.scheduler.admissionHeld,
         eventLoopLagMaxMs: eventLoopLag.maxMs(),
         sha: factory.bootSha,
         gateSlots: gateSlots.snapshot(),
@@ -661,10 +706,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle((req) => {
         const params = new URL(req.url).searchParams;
         const prUrl = params.get("pr");
-        if (prUrl === null) return json(factory.land.list(params.get("run") ?? undefined));
+        if (prUrl === null) return json(factory.land.list(params.get("run") ?? undefined).map(landWire));
         const entry = store.latestLandEntry(null, prUrl);
         const prSnapshot: unknown = JSON.parse(store.githubPrData(prUrl) ?? "null");
-        return json(entry ? [{ ...entry, prSnapshot }] : []);
+        return json(entry ? [{ ...landWire(entry), prSnapshot }] : []);
       }),
       POST: handle(async (req) => {
         const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
@@ -672,7 +717,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (typeof target !== "string" || !target.trim())
           return error("target is required: a run id, a PR URL or a PR number");
         if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
-        return json(await factory.land.request({ target, sha: input.sha as string | undefined }), 201);
+        return json(
+          landWire(await factory.land.request({ target, sha: input.sha as string | undefined })),
+          201,
+        );
       }, true),
     },
     "/api/land/:id/log": handle(async (req) => {

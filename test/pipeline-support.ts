@@ -216,7 +216,7 @@ export function pipelineSetup(state: PipelineFixture) {
     handler: Handler,
     effortRouting = false,
     freeProviders = false,
-    options: Pick<FactoryOptions, "gateExecutor" | "faults"> = {},
+    options: Pick<FactoryOptions, "gateExecutor" | "faults" | "loadSource"> = {},
   ): Factory {
     const alpha = models[0];
     const beta = models[1];
@@ -224,6 +224,7 @@ export function pipelineSetup(state: PipelineFixture) {
     const cfg = loadConfig({ home: join(state.home, "data"), configDir: join(state.home, "cfg") });
     cfg.githubOwner = "MattFlower";
     state.factory = new Factory(cfg, {
+      loadSource: () => 0,
       confinement: fakeConfinement,
       harnesses: { fake: fakeHarness(handler) },
       providers: freeProviders

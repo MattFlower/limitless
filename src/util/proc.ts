@@ -679,9 +679,9 @@ export interface ProcResult {
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
-  /** The overall timeout shutdown killed a running direct child. */
+  /** The direct child was observed running when the overall deadline callback ran. */
   timedOut: boolean;
-  /** The idle timeout shutdown killed a running direct child. */
+  /** The direct child was observed running when the idle deadline callback ran. */
   idleTimedOut: boolean;
   stdout: string; // tail, bounded by tailLimit
   stderr: string; // tail, bounded by tailLimit
@@ -853,8 +853,6 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
             );
           }
           cancelKilled = cancelStarted && killedRunningChild;
-          timedOut &&= killedRunningChild;
-          idleTimedOut &&= killedRunningChild;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.
@@ -889,13 +887,22 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     };
     child.once("exit", terminate);
 
+    // A stalled event loop can delay both the timer and exit handler. If the child has already
+    // exited, its exit time is unavailable: conservatively keep its ordinary status, even if it
+    // actually exited after the deadline. Once observed running, natural exit during cleanup
+    // does not undo the timeout.
+    const runningAtDeadline = () =>
+      child.exitCode === null &&
+      child.signalCode === null &&
+      child.pid !== undefined &&
+      stillRunning(child.pid);
     const timers: ReturnType<typeof setTimeout>[] = [];
     if (opts.timeoutMs) {
       timers.push(
         setTimeout(() => {
           // A timer firing after an exit or a cancel began the shutdown didn't stop the child.
           if (shutdown !== undefined) return;
-          timedOut = true;
+          timedOut = runningAtDeadline();
           terminate();
         }, opts.timeoutMs),
       );
@@ -906,7 +913,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       idleTimer = setInterval(
         () => {
           if (shutdown === undefined && idle.expired()) {
-            idleTimedOut = true;
+            idleTimedOut = runningAtDeadline();
             terminate();
           }
         },
@@ -1035,14 +1042,15 @@ export async function sh(
     encoding?: BufferEncoding;
     redactOutput?: boolean;
   },
-): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut?: boolean }> {
   opts.signal?.throwIfAborted();
+  const timeoutMs = opts.timeoutMs ?? 120_000;
   const res = await runProcess({
     cmd,
     cwd: opts.cwd,
     signal: opts.signal,
     env: opts.env ?? (process.env as Record<string, string>),
-    timeoutMs: opts.timeoutMs ?? 120_000,
+    timeoutMs,
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
     tailLimit: SH_OUTPUT_LIMIT,
     encoding: opts.encoding,
@@ -1054,18 +1062,22 @@ export async function sh(
   if (res.truncated) {
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }
-  if ((res.exitCode !== 0 || res.timedOut) && !opts.allowFail) {
+  const timedOut = res.timedOut || res.idleTimedOut;
+  if ((res.exitCode !== 0 || timedOut) && !opts.allowFail) {
+    const failure = timedOut
+      ? `timed out after ${timeoutMs / 1000} s`
+      : `failed (${res.exitCode ?? res.signal})`;
     throw new CommandError(
       redactCredentials(
-        `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`,
+        `Command ${failure}: ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`,
       ).slice(0, 4000),
       res.exitCode,
       res.stdout,
       res.stderr,
-      res.timedOut,
+      timedOut,
     );
   }
-  return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode };
+  return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode, timedOut };
 }
 
 // Retain registrations across config reloads while older invocations may still be running.

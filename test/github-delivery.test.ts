@@ -182,12 +182,15 @@ test.each(["passing", "rejecting"])(
 );
 
 test.each([
-  { failure: "HTTP 502", throwsAt: 0 },
-  { failure: "checks required", throwsAt: 0 },
-  { failure: "HTTP 502", throwsAt: 1 },
-  { failure: "HTTP 502", throwsAt: 2 },
-  { failure: "checks required", throwsAt: 2 },
-])("merge guard covers attempts and propagates refusal: %j", async ({ failure, throwsAt }) => {
+  { failure: "HTTP 502", throwsAt: 0, asyncGuard: false },
+  { failure: "checks required", throwsAt: 0, asyncGuard: false },
+  { failure: "HTTP 502", throwsAt: 1, asyncGuard: false },
+  { failure: "HTTP 502", throwsAt: 2, asyncGuard: false },
+  { failure: "checks required", throwsAt: 2, asyncGuard: false },
+  { failure: "HTTP 502", throwsAt: 0, asyncGuard: true },
+  { failure: "HTTP 502", throwsAt: 1, asyncGuard: true },
+  { failure: "HTTP 502", throwsAt: 2, asyncGuard: true },
+])("merge guard covers attempts and propagates refusal: %j", async ({ failure, throwsAt, asyncGuard }) => {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   const calls = join(dir, "merge-calls");
@@ -224,8 +227,11 @@ if(args[1] === "view") {
       [],
       {
         guard: () => {
-          guards++;
-          if (guards === throwsAt) throw refused;
+          const check = () => {
+            guards++;
+            if (guards === throwsAt) throw refused;
+          };
+          return asyncGuard ? Promise.resolve().then(check) : check();
         },
       },
     );

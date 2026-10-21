@@ -460,10 +460,24 @@ export type FeedKind =
   | "daemon.started"
   | `review.${"round_started" | "round_delivered" | "approved"}`
   | GitHubFeedKind;
-export type LandFeedKind = "land.queued" | "land.landed" | "land.blocked";
+export type LandFeedKind = "land.queued" | "land.waiting_approval" | "land.landed" | "land.blocked";
 /** Where an approved pull request is in the land queue; the active states are resumed on restart. */
-export type LandState = "queued" | "checking" | "waiting_ci" | "merging" | "landed" | "blocked" | "cancelled";
-export const ACTIVE_LAND_STATES: readonly LandState[] = ["queued", "checking", "waiting_ci", "merging"];
+export type LandState =
+  | "queued"
+  | "checking"
+  | "waiting_approval"
+  | "waiting_ci"
+  | "merging"
+  | "landed"
+  | "blocked"
+  | "cancelled";
+export const ACTIVE_LAND_STATES: readonly LandState[] = [
+  "queued",
+  "checking",
+  "waiting_approval",
+  "waiting_ci",
+  "merging",
+];
 
 export interface LandEntry {
   id: number;
@@ -476,6 +490,10 @@ export interface LandEntry {
   /** The approved head: only it, or a base merge of it, may land. */
   approvedSha: string;
   state: LandState;
+  /** Compatibility wire flag: approval waits use state queued in HTTP responses. */
+  waitingApproval?: boolean;
+  approvalWaitStartedAt?: number;
+  approvalWaitRequestSeq?: number;
   /** The commit the queue pushed (the merge commit, or the approved one when it needed no merge). */
   pushedSha: string | null;
   /** Failed workflow attempts for the single durable CI rerun. */
@@ -493,7 +511,7 @@ export type GitHubFeedKind =
   | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
   | "github.access_problem";
 /** A factory PR the poller observes; `delivered` (0/1): a run waits on its merge; `data`: its saved state. */
-export type TrackedPr = { url: string; repo: string; runId: string; delivered: number } & {
+export type TrackedPr = { url: string; repo: string; runId: string | null; delivered: number } & {
   nodeId: string | null;
   data: string | null;
 };
@@ -541,6 +559,8 @@ export interface DrainState {
 }
 
 export interface HealthResponse extends DrainState {
+  loadPerCore?: number;
+  admissionHeld?: boolean;
   eventLoopLagMaxMs?: number;
   gateSlots?: { occupied: number; limit: number; holders: string[] };
   agentTestSlots?: { occupied: number; limit: number; holders: string[] };
