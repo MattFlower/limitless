@@ -37,6 +37,7 @@ import {
 } from "../util/proc.ts";
 import { AgentResultReport } from "./agent-protocol.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
+import { publicationFields, publishAgentChanges } from "./publication.ts";
 import { agentPathMask } from "./reporting.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
 import { updateWorker, WorkerUpdateError } from "./update.ts";
@@ -116,6 +117,7 @@ const WireRequest = z.object({
   }),
 });
 const AgentRequest = z.object({
+  ...publicationFields,
   runId: z.string(),
   invocationId: z.number().int(),
   parentSha: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
@@ -210,6 +212,7 @@ export async function runWorker(
   options: {
     confinement?: ConfinementBackend;
     harnesses?: Partial<Record<"claude" | "codex", Harness>>;
+    tokenLookup?: Parameters<typeof publishAgentChanges>[4];
     heartbeatMs?: number;
     leaseMs?: number;
     fenceTimer?: FenceTimer;
@@ -804,8 +807,16 @@ export async function runWorker(
           flush();
           await posts;
           jobSignal.throwIfAborted();
+          assertProcessesStopped();
+          const sha = await publishAgentChanges(
+            cwd,
+            { ...req, target: spec.target },
+            cfg,
+            jobSignal,
+            options.tokenLookup,
+          );
           const report = AgentResultReport.parse(
-            sanitize({ ...result, parentSha: req.parentSha, sha: req.parentSha, branch: req.branch }),
+            sanitize({ ...result, parentSha: req.parentSha, sha, branch: req.branch }),
           );
           assertProcessesStopped();
           return () => call(`${path}/result`, report, jobSignal);

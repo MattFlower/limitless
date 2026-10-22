@@ -74,6 +74,16 @@ export interface AgentJobRequest
   role?: Role;
   branch?: string;
   slottedCommands?: SlottedCommands;
+  commit?: {
+    message: string;
+    authorName: string;
+    authorEmail: string;
+    committerName: string;
+    committerEmail: string;
+  };
+  repoUrl?: string;
+  expectedRemoteSha?: string | null;
+  discreet?: boolean;
 }
 export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_order" | "events"> {
   invocation_id: number;

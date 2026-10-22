@@ -553,16 +553,30 @@ export async function clearInterruptedRebase(cwd: string, expected: boolean): Pr
 }
 
 /** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
-export async function commitAll(cwd: string, message: string): Promise<string | null> {
+export async function commitAll(
+  cwd: string,
+  message: string,
+  options: { env?: Record<string, string>; signal?: AbortSignal; verbatim?: boolean } = {},
+): Promise<string | null> {
+  const opts = { cwd, env: options.env, signal: options.signal };
   if (worktreeGitScope.getStore() !== false) {
-    const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], { cwd });
+    const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], opts);
     rmSync(resolve(cwd, index.stdout.trim()), { force: true });
-    await worktreeGit(["git", "read-tree", "HEAD"], { cwd });
+    await worktreeGit(["git", "read-tree", "HEAD"], opts);
   }
-  await stageAll({ cwd });
-  const status = await worktreeGit(["git", "status", "--porcelain"], { cwd });
+  await stageAll(opts);
+  const status = await worktreeGit(["git", "status", "--porcelain"], opts);
   if (!status.stdout.trim()) return null;
-  await worktreeGit(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
+  await worktreeGit(
+    [
+      "git",
+      "commit",
+      "--no-verify",
+      "-q",
+      ...(options.verbatim ? ["--cleanup=verbatim", "-F", "-"] : ["-m", message]),
+    ],
+    { ...opts, ...(options.verbatim ? { stdin: message } : {}) },
+  );
   return headSha(cwd);
 }
 
