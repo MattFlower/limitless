@@ -15,13 +15,14 @@ import { runClaude } from "../harness/claude.ts";
 import { runCodex } from "../harness/codex.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
-import { removeScratch, restoreDirectoryPermissions, spellings } from "../harness/scratch.ts";
+import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
 import { runToolAgent } from "../pipeline/agent-executor.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { agentEnv, redactCredentials, registerCredential, sh } from "../util/proc.ts";
 import { AgentResultReport } from "./agent-protocol.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
+import { agentPathMask } from "./reporting.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
 import { updateWorker, WorkerUpdateError } from "./update.ts";
 import { attemptBudget, requestedChecks } from "./validation.ts";
@@ -181,6 +182,11 @@ class CoordinatorRefusal extends Error {
   }
 }
 
+type FenceTimer = {
+  set: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clear: (timer: ReturnType<typeof setTimeout> | undefined) => void;
+};
+
 export async function runWorker(
   coordinator: string,
   cfg: Config,
@@ -191,6 +197,7 @@ export async function runWorker(
     harnesses?: Partial<Record<"claude" | "codex", Harness>>;
     heartbeatMs?: number;
     leaseMs?: number;
+    fenceTimer?: FenceTimer;
     machineState?: typeof machineState;
     request?: typeof workerRequest;
     retryMs?: number;
@@ -214,8 +221,9 @@ export async function runWorker(
       combined = AbortSignal.any([signal, stop.signal]);
     const jobs = new Map<string, { controller: AbortController; task: Promise<void>; reported: boolean }>();
     const agentJobs: typeof jobs = new Map();
-    let lastHeartbeat = 0;
     const leaseMs = options.leaseMs ?? timing.lease;
+    const fenceTimer: FenceTimer = options.fenceTimer ?? { set: setTimeout, clear: clearTimeout };
+    let fence: ReturnType<typeof setTimeout> | undefined;
     const allJobs = () => [...jobs, ...agentJobs];
     const cancel = (id: string) => {
       jobs.get(id)?.controller.abort();
@@ -311,7 +319,12 @@ export async function runWorker(
       const reply = z
         .object({ cancelled: z.array(z.string()), releaseSha: z.string().optional() })
         .parse(response.json());
-      lastHeartbeat = performance.now();
+      fenceTimer.clear(fence);
+      // A request may finish after shutdown; only live workers can renew the deadline.
+      if (!combined.aborted)
+        fence = fenceTimer.set(() => {
+          for (const job of agentJobs.values()) job.controller.abort();
+        }, leaseMs);
       for (const id of reply.cancelled) cancel(id);
       observeRelease(reply.releaseSha);
     };
@@ -458,14 +471,7 @@ export async function runWorker(
     const runAgent = async (id: string, req: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
       const path = `/worker/agent-jobs/${id}`;
       let root: string | undefined;
-      let paths: string[] = [];
-      const sanitize = <T>(data: T): T =>
-        JSON.parse(
-          paths.reduce(
-            (text, path) => text.replaceAll(JSON.stringify(path).slice(1, -1), "<worktree>"),
-            JSON.stringify(redactGateData(data)),
-          ),
-        );
+      let sanitize = agentPathMask([]);
       let posts = Promise.resolve(),
         seq = 0;
       let events: AgentEvent[] = [];
@@ -489,8 +495,9 @@ export async function runWorker(
           throw new Error("provider unavailable on worker");
         if (!req.branch || !isBranchName(req.branch)) throw new Error("Missing or invalid agent branch");
         root = mkdtempSync(join(cfg.paths.work, "worker-agent-"));
-        paths = spellings([root]);
+        sanitize = agentPathMask([root, join(root, "checkout")]);
         await withCheckout(id, root, join(root, "repo.git"), req.parentSha, path, jobSignal, async (cwd) => {
+          sanitize = agentPathMask([cwd, root ?? cwd]);
           const spec: AgentSpec = {
             ...req,
             target: { ...req.target, harness: name },
@@ -512,9 +519,7 @@ export async function runWorker(
               runToolAgent(
                 spec,
                 (spec) => {
-                  paths = spellings([cwd, ...(spec.scratchDir ? [spec.scratchDir] : []), root ?? cwd]).sort(
-                    (a, b) => b.length - a.length,
-                  );
+                  sanitize = agentPathMask([cwd, ...(spec.scratchDir ? [spec.scratchDir] : []), root ?? cwd]);
                   return harness(spec);
                 },
                 req.confineReads ? [] : (req.slottedCommands ?? []),
@@ -545,17 +550,8 @@ export async function runWorker(
       }
     };
     let beats: Promise<void> | undefined;
-    let fence: ReturnType<typeof setInterval> | undefined;
     try {
       await heartbeat();
-      // Heartbeat retries can wait indefinitely; fencing must run independently.
-      fence = setInterval(
-        () => {
-          if (performance.now() - lastHeartbeat > leaseMs)
-            for (const job of agentJobs.values()) job.controller.abort();
-        },
-        Math.min(options.heartbeatMs ?? timing.heartbeat, leaseMs),
-      );
       beats = (async () => {
         while (!combined.aborted) {
           await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal: combined });
@@ -653,8 +649,8 @@ export async function runWorker(
     } catch (error) {
       if (!signal.aborted) throw error;
     } finally {
-      clearInterval(fence);
       stop.abort();
+      fenceTimer.clear(fence);
       for (const [, job] of allJobs()) job.controller.abort();
       await Promise.allSettled([...(beats ? [beats] : []), ...allJobs().map(([, j]) => j.task)]);
     }

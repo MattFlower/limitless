@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -54,12 +55,14 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { CommandError, redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
+import { agentPathMask } from "../src/workers/reporting.ts";
 import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
+import { waitClock } from "./wait-clock.ts";
 
 let home: string, cfg: Config, store: Store, workers: WorkerStore;
 let listener: Awaited<ReturnType<typeof startWorkerListener>>;
@@ -3886,6 +3889,58 @@ async function queuedLocalAgent(overrides: Partial<AgentJobRequest> = {}) {
   });
 }
 
+function reportPathForms(paths: string[]) {
+  return [
+    ...new Set(
+      paths.flatMap((path) => {
+        const forms = [path];
+        for (const [a, b] of [
+          ["/tmp/", "/private/tmp/"],
+          ["/var/", "/private/var/"],
+        ] as const) {
+          if (path.startsWith(a)) forms.push(b + path.slice(a.length));
+          if (path.startsWith(b)) forms.push(a + path.slice(b.length));
+        }
+        return forms.flatMap((form) => [form, form.replaceAll("/", "\\/")]);
+      }),
+    ),
+  ];
+}
+
+test("agent reporting masks temporary aliases in both directions, escaped paths, keys and nested JSON", () => {
+  for (const prefix of ["/tmp/", "/private/tmp/", "/var/", "/private/var/"]) {
+    const root = `${prefix}report-job`,
+      checkout = `${root}/checkout`,
+      scratch = `${root}/scratch`;
+    const mask = agentPathMask([root, checkout, scratch]);
+    for (const form of reportPathForms([root, checkout, scratch])) {
+      const input = {
+        [form]: [{ path: form, json: JSON.stringify({ [form]: form }) }],
+        keep: [42, null, true, "unrelated /tmp/elsewhere"],
+      };
+      expect(mask(input)).toEqual({
+        "<worktree>": [{ path: "<worktree>", json: JSON.stringify({ "<worktree>": "<worktree>" }) }],
+        keep: input.keep,
+      });
+      expect(mask(`failure: ${form}`)).toBe("failure: <worktree>");
+    }
+  }
+});
+
+test("agent reporting captures supplied and canonical paths before scratch cleanup", () => {
+  const target = join(home, "canonical"),
+    alias = join(home, "alias");
+  mkdirSync(target);
+  symlinkSync(target, alias);
+  const canonical = realpathSync(alias);
+  // Checkout failures can be reported before the checkout itself exists.
+  const forms = reportPathForms([alias, canonical, join(alias, "checkout"), join(canonical, "checkout")]);
+  const mask = agentPathMask([alias, join(alias, "checkout")]);
+  rmSync(alias);
+  rmSync(target, { recursive: true });
+  expect(mask(forms)).toEqual(forms.map(() => "<worktree>"));
+});
+
 test.each([0, 450])(
   "worker batches agent events during an idle session (burst=%s)",
   async (count) => {
@@ -3978,12 +4033,121 @@ test("worker fences an agent after one lease period without a successful heartbe
   }
 }, 30_000);
 
+test("worker renews the fence at heartbeat success and aborts exactly at its deadline", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const clock = waitClock(),
+    scheduled = spyOn(clock.timer, "set");
+  const started = Promise.withResolvers<AgentSpec>(),
+    second = Promise.withResolvers<void>(),
+    releaseSecond = Promise.withResolvers<void>(),
+    failed = Promise.withResolvers<void>();
+  let heartbeats = 0,
+    results = 0;
+  const worker = await loop({
+    leaseMs: 400,
+    heartbeatMs: 200,
+    fenceTimer: clock.timer,
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        started.resolve(spec);
+        return { fault: "block" };
+      }),
+    },
+    async request(...args) {
+      if (args[1] === "/worker/heartbeat") {
+        heartbeats++;
+        if (heartbeats === 2) {
+          second.resolve();
+          await releaseSecond.promise;
+        } else if (heartbeats > 2) {
+          failed.resolve();
+          throw new Error("injected partition");
+        }
+      }
+      if (args[1] === agentPath(id, "result")) results++;
+      return workerRequest(...args);
+    },
+  });
+  try {
+    const spec = await started.promise;
+    await second.promise;
+    await clock.advance(200);
+    expect(scheduled).toHaveBeenCalledTimes(1);
+    await clock.advance(100);
+    releaseSecond.resolve();
+    await until(() => scheduled.mock.calls.length === 2);
+    expect(clock.pending).toBe(1);
+    await clock.advance(100); // The first heartbeat's deadline must have been cancelled.
+    expect(spec.signal.aborted).toBe(false);
+    await failed.promise;
+    await clock.advance(299);
+    expect(spec.signal.aborted).toBe(false);
+    expect(scheduled).toHaveBeenCalledTimes(2); // Retries and lease replies never renew it.
+    await clock.advance(1);
+    expect(spec.signal.aborted).toBe(true);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(results).toBe(0);
+    expect(worker.controller.signal.aborted).toBe(false);
+    await worker.stop();
+    expect(clock.pending).toBe(0);
+  } finally {
+    releaseSecond.resolve();
+    await worker.stop();
+    scheduled.mockRestore();
+  }
+}, 30_000);
+
+test("worker shutdown clears the fence and a late heartbeat cannot rearm it", async () => {
+  await listen();
+  const clock = waitClock(),
+    scheduled = spyOn(clock.timer, "set");
+  const pending = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  let beats = 0;
+  const worker = await loop({
+    leaseMs: 400,
+    fenceTimer: clock.timer,
+    async request(...args) {
+      const reply = await workerRequest(...args);
+      if (args[1] === "/worker/heartbeat" && ++beats === 2) {
+        pending.resolve();
+        await release.promise; // Deliberately return success even after the signal aborts.
+      }
+      return reply;
+    },
+  });
+  try {
+    await pending.promise;
+    expect(clock.pending).toBe(1);
+    worker.controller.abort();
+    await until(() => clock.pending === 0);
+    expect(clock.pending).toBe(0);
+    release.resolve();
+    await worker.task;
+    expect(clock.pending).toBe(0);
+    expect(scheduled).toHaveBeenCalledTimes(1);
+    await clock.advance(1000);
+    expect(clock.pending).toBe(0);
+  } finally {
+    release.resolve();
+    await worker.stop();
+    scheduled.mockRestore();
+  }
+});
+
 test("worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
   await listen();
   const id = await queuedLocalAgent({ slottedCommands: [["bun", "test"]] });
   let cwd = "",
     scratch = "";
+  let forms: string[] = [];
+  const posted: unknown[] = [];
   const worker = await loop({
+    async request(...args) {
+      if (args[1].endsWith("/events") || args[1].endsWith("/result")) posted.push(args[2]);
+      return workerRequest(...args);
+    },
     harnesses: {
       claude: fakeHarness(async (spec) => {
         cwd = spec.cwd;
@@ -4000,11 +4164,13 @@ test("worker agent runs at its parent, hides paths, uses local slots and discard
         const lease = await agentTestLease({ token: config.token, name: "bun test", lane: "gate" });
         expect(lease.acquired).toBe(true);
         await agentTestLease({ token: config.token, id: lease.id, release: true });
-        spec.onEvent({ type: "tool_call", id: "paths", name: "inspect", input: { [cwd]: scratch } });
+        forms = reportPathForms([cwd, scratch, dirname(cwd), realpathSync(cwd), realpathSync(scratch)]);
+        const structured = forms.map((form) => ({ [form]: [form, JSON.stringify({ path: form })] }));
+        spec.onEvent({ type: "tool_call", id: "paths", name: "inspect", input: structured });
         return {
           files: { edited: "discard this" },
-          text: `${cwd} ${scratch}`,
-          structured: { [cwd]: scratch },
+          text: forms.join(" "),
+          structured,
         };
       }),
     },
@@ -4016,12 +4182,17 @@ test("worker agent runs at its parent, hides paths, uses local slots and discard
     expect(job?.result_sha).toBe(job?.parent_sha);
     expect(JSON.parse(job?.result ?? "null")).toMatchObject({
       branch: "change/worker-agent",
-      finalText: "<worktree> <worktree>",
+      finalText: forms.map(() => "<worktree>").join(" "),
+      structured: forms.map(() => ({ "<worktree>": ["<worktree>", JSON.stringify({ path: "<worktree>" })] })),
     });
     const rows = batches();
     expect(rows.map((row) => row.seq)).toEqual(rows.map((_, i) => i));
     const events = rows.flatMap((row) => JSON.parse(row.events));
-    expect(events.at(-1)).toEqual({ type: "text", text: "<worktree> <worktree>" });
+    expect(events.at(-1)).toEqual({ type: "text", text: forms.map(() => "<worktree>").join(" ") });
+    expect(events.find((event) => event.id === "paths")?.input).toEqual(
+      forms.map(() => ({ "<worktree>": ["<worktree>", JSON.stringify({ path: "<worktree>" })] })),
+    );
+    for (const form of forms) expect(JSON.stringify(posted)).not.toContain(form);
     expect(JSON.stringify(events)).not.toContain(cwd);
     expect(JSON.stringify(events)).not.toContain(scratch);
     expect(existsSync(scratch)).toBe(false);
@@ -4059,6 +4230,7 @@ test("worker sanitizes harness failures and keeps running", async () => {
   let cwd = "",
     scratch = "",
     transmitted = "";
+  let expected = "";
   const worker = await loop({
     async request(...args) {
       if (args[1].endsWith("/failure")) transmitted = (args[2] as { reason: string }).reason;
@@ -4068,14 +4240,16 @@ test("worker sanitizes harness failures and keeps running", async () => {
       claude: fakeHarness((spec) => {
         cwd = spec.cwd;
         scratch = spec.scratchDir ?? "";
-        throw new Error(`${cwd} ${scratch} ${secret}`);
+        const forms = reportPathForms([cwd, scratch, dirname(cwd), realpathSync(cwd), realpathSync(scratch)]);
+        expected = `${forms.map(() => "<worktree>").join(" ")} [redacted] ${"x".repeat(5000)}`.slice(0, 4000);
+        throw new Error(`${forms.join(" ")} ${secret} ${"x".repeat(5000)}`);
       }),
     },
   });
   try {
     await until(() => workers.agentJob(id)?.failure_reason !== null);
     const reason = workers.agentJob(id)?.failure_reason;
-    expect(transmitted).toBe("<worktree> <worktree> [redacted]");
+    expect(transmitted).toBe(expected);
     expect(reason).toBe("[withheld: private text]");
     expect(reason).not.toContain(cwd);
     expect(reason).not.toContain(scratch);
