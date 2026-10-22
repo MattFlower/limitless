@@ -157,12 +157,12 @@ async function expectRecoveryRefusal(reason: string) {
 
 test("persisted scope ownership precedes spawn and survives explicit command environments", async () => {
   const marker = crypto.randomUUID();
-  let persisted = false;
+  let persisted: string | undefined;
   const current = {
     ...scope(),
     ownershipMarker: marker,
-    beforeSpawn: () => {
-      persisted = true;
+    beforeSpawn: (invocation?: string) => {
+      persisted = invocation;
     },
   };
   const result = await processScope.run(current, () =>
@@ -170,14 +170,16 @@ test("persisted scope ownership precedes spawn and survives explicit command env
       cmd: [
         process.execPath,
         "-e",
-        `console.log(process.env[${JSON.stringify(`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`)}])`,
+        `console.log(process.env[${JSON.stringify(`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`)}]); console.log(process.env.LIMITLESS_INVOCATION)`,
       ],
       cwd: directory,
       env: {},
-      onStdoutLine: () => expect(persisted).toBe(true),
+      onStdoutLine: () => expect(persisted).toEqual(expect.any(String)),
     }),
   );
-  expect(result.stdout.trim()).toBe("1");
+  const lines = result.stdout.trim().split("\n");
+  expect(lines[0]).toBe("1");
+  expect(lines[1]).toBe(persisted);
   const sentinel = join(directory, "must-not-spawn");
   await expect(
     processScope.run(

@@ -56,6 +56,7 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import {
   CommandError,
   invocationScratch,
+  type ProcessDiscovery,
   ProcessTerminationError,
   processBootInspection,
   processInspection,
@@ -2496,7 +2497,7 @@ test("worker cleanup restores locked directories without following symlinks and 
         try {
           expect(local.getSetting("worker.cleanups", {})).toMatchObject({
             [dirname(opts.cwd)]: {
-              confirmed: false,
+              pending: [],
               ownership: { marker: processScope.getStore()?.ownershipMarker },
             },
           });
@@ -2714,7 +2715,321 @@ test.each(["changed", "equal", "unavailable", "unrecorded"] as const)(
   },
 );
 
-test("worker retries a job with failed boot inspection on a later heartbeat", async () => {
+test("pending recovery requires a changed boot while saved null-leader context and new jobs recover independently", async () => {
+  const server = await listen();
+  const id = await queuedLocalAgent();
+  const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+  await pairWorker(server.url.origin, join(remote.paths.home, "worker"), "recovering", (text) =>
+    workers.approve(text.split(": ")[1] ?? ""),
+  );
+  const root = mkdtempSync(join(remote.paths.work, "worker-"));
+  const scratch = mkdtempSync(join(home, "pending-scratch-"));
+  const savedRoot = mkdtempSync(join(remote.paths.work, "worker-"));
+  const pending = crypto.randomUUID();
+  const database = join(remote.paths.home, "worker", "worker.db");
+  const local = new Store(database);
+  const entry = {
+    root,
+    cache: join(root, "repo.git"),
+    scratch: [scratch],
+    pending: [pending],
+    discoveries: [],
+    ownership: { marker: crypto.randomUUID(), runId: "pending", started: 0, boot: "test-boot" },
+  };
+  local.setSetting("worker.cleanups", {
+    [root]: entry,
+    [savedRoot]: {
+      root: savedRoot,
+      cache: join(savedRoot, "repo.git"),
+      scratch: [],
+      pending: [],
+      discoveries: [
+        {
+          invocation: crypto.randomUUID(),
+          runId: "saved",
+          directory: join(savedRoot, "checkout"),
+          boot: "test-boot",
+          createdAt: 0,
+          discovery: { group: 0, started: 0, directories: [], leader: null, spawnedAt: "0" },
+        },
+      ],
+    },
+  });
+  local.close();
+  for (const [attempt, boot] of ["test-boot", "test-boot", "next-boot"].entries()) {
+    const controller = new AbortController();
+    const diagnostics: string[] = [];
+    let heartbeats = 0;
+    const task = processBootInspection.run(
+      () => boot,
+      () =>
+        processRecoveryInspection.run(
+          { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
+          () =>
+            runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+              confinement: fakeConfinement,
+              heartbeatMs: 5,
+              machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+              log: (text) => diagnostics.push(text),
+              harnesses: { claude: fakeHarness(() => ({})) },
+              request: async (...args) => {
+                if (attempt > 0 && args[1] === "/worker/heartbeat" && ++heartbeats === 2) controller.abort();
+                return workerRequest(...args);
+              },
+            }),
+        ),
+    );
+    try {
+      if (attempt === 0) {
+        await until(() => workers.agentJob(id)?.state === "done");
+        controller.abort();
+      }
+      await task;
+    } finally {
+      controller.abort();
+      await task;
+    }
+    const changed = boot === "next-boot";
+    expect(existsSync(root)).toBe(!changed);
+    expect(existsSync(scratch)).toBe(!changed);
+    expect(existsSync(savedRoot)).toBe(false);
+    const reopened = new Store(database);
+    try {
+      expect(reopened.getSetting("worker.cleanups", {})).toEqual(changed ? {} : { [root]: entry });
+      expect(reopened.listProcessCleanups()).toEqual([]);
+    } finally {
+      reopened.close();
+    }
+    if (!changed) expect(diagnostics.some((text) => text.includes("awaiting changed boot"))).toBe(true);
+  }
+});
+
+test.each([true, false])(
+  "discovery save failure retains pending evidence unless live termination confirms it (%s)",
+  async (confirmed) => {
+    const server = await listen();
+    const id = await queuedLocalAgent();
+    const failed = Promise.withResolvers<void>();
+    let root = "",
+      scratch = "",
+      invocation = "";
+    const worker = await loop({
+      heartbeatMs: 60_000,
+      harnesses: {
+        claude: fakeHarness(async (spec) => {
+          root = dirname(spec.cwd);
+          scratch = spec.scratchDir ?? "";
+          const original = Store.prototype.setSetting;
+          const saving = spyOn(Store.prototype, "setSetting").mockImplementation(function (
+            this: Store,
+            key,
+            value,
+          ) {
+            const job = (value as Record<string, { discoveries?: ProcessDiscovery[] }>)[root];
+            const row = job?.discoveries?.[0];
+            if (key === "worker.cleanups" && row) {
+              invocation = row.invocation;
+              throw new Error("injected discovery save failure");
+            }
+            original.call(this, key, value);
+          });
+          try {
+            const command = () => runProcess({ cmd: [process.execPath, "-e", ""], cwd: spec.cwd, env: {} });
+            await expect(
+              confirmed
+                ? command()
+                : processInspection.run(async () => {
+                    throw new Error("injected termination failure");
+                  }, command),
+            ).rejects.toThrow(ProcessTerminationError.prefix);
+          } finally {
+            saving.mockRestore();
+          }
+          return {};
+        }),
+      },
+      request: async (...args) => {
+        const reply = await workerRequest(...args);
+        if (args[1] === agentPath(id, "failure")) failed.resolve();
+        return reply;
+      },
+    });
+    const database = join(worker.remote.paths.home, "worker", "worker.db");
+    try {
+      await failed.promise;
+      await worker.stop();
+      expect(workers.agentJob(id)?.state).not.toBe("done");
+      expect(existsSync(root)).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      const local = new Store(database);
+      try {
+        expect(invocation).not.toBe("");
+        expect(local.getSetting("worker.cleanups", {})).toMatchObject({
+          [root]: { pending: confirmed ? [] : [invocation], discoveries: [], scratch: [scratch] },
+        });
+      } finally {
+        local.close();
+      }
+      const controller = new AbortController();
+      const diagnostics: string[] = [];
+      await processRecoveryInspection.run(
+        { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
+        () =>
+          runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+            confinement: fakeConfinement,
+            machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+            log: (text) => diagnostics.push(text),
+            request: async (...args) => {
+              controller.abort();
+              return workerRequest(...args);
+            },
+          }),
+      );
+      expect(existsSync(root)).toBe(!confirmed);
+      expect(existsSync(scratch)).toBe(!confirmed);
+      const reopened = new Store(database);
+      try {
+        if (confirmed) expect(reopened.getSetting("worker.cleanups", {})).toEqual({});
+        else
+          expect(reopened.getSetting("worker.cleanups", {})).toMatchObject({
+            [root]: { pending: [invocation] },
+          });
+      } finally {
+        reopened.close();
+      }
+      if (!confirmed) expect(diagnostics.some((text) => text.includes("awaiting changed boot"))).toBe(true);
+    } finally {
+      await worker.stop();
+      removeScratch(scratch);
+    }
+  },
+  30_000,
+);
+
+test("worker persists concurrent invocation markers before spawn and clears only saved discoveries", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        const scope = processScope.getStore();
+        if (!scope?.cleanups?.recordProcessDiscovery) throw new Error("Missing process scope");
+        const read = () => {
+          const local = new Store(join(home, "remote", "worker", "worker.db"));
+          try {
+            return local.getSetting<
+              Record<string, { pending: string[]; discoveries: ProcessDiscovery[]; scratch: string[] }>
+            >("worker.cleanups", {})[dirname(spec.cwd)];
+          } finally {
+            local.close();
+          }
+        };
+        expect(read()?.pending).toEqual([]); // withScratch's markerless save owns scratch only.
+        expect(read()?.scratch).toContain(spec.scratchDir ?? "");
+        const sentinel = join(spec.cwd, "must-not-spawn");
+        const originalSave = Store.prototype.setSetting;
+        const preSpawn = spyOn(Store.prototype, "setSetting").mockImplementation(function (
+          this: Store,
+          key,
+          value,
+        ) {
+          if (key === "worker.cleanups") throw new Error("pre-spawn save failed");
+          originalSave.call(this, key, value);
+        });
+        try {
+          await expect(
+            runProcess({
+              cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+              cwd: spec.cwd,
+              env: {},
+            }),
+          ).rejects.toThrow("pre-spawn save failed");
+        } finally {
+          preSpawn.mockRestore();
+        }
+        expect(existsSync(sentinel)).toBe(false);
+        expect(read()?.pending).toEqual([]);
+        const rows: ProcessDiscovery[] = [];
+        const record = scope.cleanups.recordProcessDiscovery;
+        scope.cleanups.recordProcessDiscovery = (row) => {
+          rows.push(row);
+        };
+        const release = join(spec.cwd, "release");
+        const ready = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
+        const commands = ready.map((signal) =>
+          runProcess({
+            cmd: [
+              process.execPath,
+              "-e",
+              `console.log(process.env.LIMITLESS_INVOCATION); while (!require('fs').existsSync(${JSON.stringify(release)})) await Bun.sleep(10);`,
+            ],
+            cwd: spec.cwd,
+            env: {},
+            timeoutMs: 5000,
+            onStdoutLine: (marker) => {
+              expect(read()?.pending).toContain(marker);
+              signal.resolve(marker);
+            },
+          }),
+        );
+        try {
+          const markers = await Promise.all(ready.map((signal) => signal.promise));
+          expect(new Set(markers).size).toBe(2);
+          expect(read()?.pending?.sort()).toEqual([...markers].sort());
+          const first = rows[0],
+            second = rows[1];
+          if (!first || !second) throw new Error("Missing discovery context");
+          record(first);
+          expect(read()?.pending).toEqual([second.invocation]);
+          expect(read()?.discoveries).toEqual([first]);
+          // A failed save must retain the remaining marker and not publish discovery in memory.
+          const original = Store.prototype.setSetting;
+          const saving = spyOn(Store.prototype, "setSetting").mockImplementation(function (
+            this: Store,
+            key,
+            value,
+          ) {
+            if (key === "worker.cleanups") throw new Error("injected save failure");
+            original.call(this, key, value);
+          });
+          try {
+            expect(() => record(second)).toThrow("injected save failure");
+            expect(() => scope.cleanups?.deleteInvocationCleanups(second.invocation)).toThrow(
+              "injected save failure",
+            );
+            expect(() => scope.cleanups?.deleteInvocationCleanups(first.invocation)).toThrow(
+              "injected save failure",
+            );
+          } finally {
+            saving.mockRestore();
+          }
+          expect(read()?.pending).toEqual([second.invocation]);
+          expect(scope.cleanups.listProcessDiscoveries?.()).toContainEqual(first);
+          expect(scope.cleanups.listProcessDiscoveries?.()).not.toContainEqual(second);
+          record(second);
+          expect(read()?.pending).toEqual([]);
+        } finally {
+          writeFileSync(release, "");
+          await Promise.all(commands);
+          scope.cleanups.recordProcessDiscovery = record;
+        }
+        expect(read()?.pending).toEqual([]);
+        expect(read()?.discoveries).toEqual([]);
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    await worker.stop();
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker retains a pending job until a change from its first readable boot", async () => {
   const server = await listen();
   const id = await queuedLocalAgent();
   let initialBoot = true;
@@ -2740,7 +3055,13 @@ test("worker retries a job with failed boot inspection on a later heartbeat", as
               () => {
                 throw new Error("discovery boot unavailable");
               },
-              () => runProcess({ cmd: [process.execPath, "-e", ""], cwd: spec.cwd, env: {} }),
+              () =>
+                processInspection.run(
+                  async () => {
+                    throw new Error("termination inspection unavailable");
+                  },
+                  () => runProcess({ cmd: [process.execPath, "-e", ""], cwd: spec.cwd, env: {} }),
+                ),
             );
             return {};
           }),
@@ -2760,7 +3081,7 @@ test("worker retries a job with failed boot inspection on a later heartbeat", as
     try {
       expect(local.getSetting("worker.cleanups", {})).toMatchObject({
         [root]: {
-          confirmed: false,
+          pending: [expect.any(String)],
           discoveries: [],
           scratch: [scratch],
           ownership: { marker: expect.any(String) },
@@ -2771,51 +3092,50 @@ test("worker retries a job with failed boot inspection on a later heartbeat", as
     } finally {
       local.close();
     }
-    const controller = new AbortController();
-    const diagnostics: string[] = [];
-    let available = false,
-      heartbeats = 0;
-    await processBootInspection.run(
-      () => {
-        if (!available) throw new Error("recovery boot unavailable");
-        return "test-boot";
-      },
-      () =>
-        processRecoveryInspection.run(
-          {
-            stopped: recoveryProcessStopped,
-            timeoutMs: 1000,
-            discover: async () => {
-              if (!available) throw new Error("recovery scan unavailable");
-              return [];
-            },
-          },
-          () =>
-            runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
-              confinement: fakeConfinement,
-              heartbeatMs: 5,
-              machineState: async () => ({ onAC: true, idleSeconds: 0 }),
-              log: (text) => diagnostics.push(text),
-              request: async (...args) => {
-                if (args[1] === "/worker/heartbeat") {
-                  if (++heartbeats === 1) {
-                    expect(existsSync(root)).toBe(true);
-                    expect(existsSync(scratch)).toBe(true);
-                    available = true;
-                  } else if (!existsSync(root)) {
-                    expect(existsSync(root)).toBe(false);
-                    expect(existsSync(scratch)).toBe(false);
-                    expect(workerCleanupRecords(worker.remote)).toEqual([]);
-                    controller.abort();
-                  }
-                }
-                return workerRequest(...args);
-              },
-            }),
-        ),
-    );
-    expect(heartbeats).toBeGreaterThanOrEqual(2);
-    expect(diagnostics.some((text) => text.includes("recovery scan unavailable"))).toBe(true);
+    for (const boot of [undefined, "test-boot", "test-boot", "next-boot"]) {
+      const controller = new AbortController();
+      const diagnostics: string[] = [];
+      let heartbeats = 0;
+      await processBootInspection.run(
+        () => {
+          if (!boot) throw new Error("recovery boot unavailable");
+          return boot;
+        },
+        () =>
+          processRecoveryInspection.run(
+            { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
+            () =>
+              runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+                confinement: fakeConfinement,
+                heartbeatMs: 5,
+                machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+                log: (text) => diagnostics.push(text),
+                request: async (...args) => {
+                  if (args[1] === "/worker/heartbeat" && ++heartbeats === 2) controller.abort();
+                  return workerRequest(...args);
+                },
+              }),
+          ),
+      );
+      const changed = boot === "next-boot";
+      expect(existsSync(root)).toBe(!changed);
+      expect(existsSync(scratch)).toBe(!changed);
+      const reopened = new Store(database);
+      try {
+        const jobs = reopened.getSetting<Record<string, { pending: string[]; ownership: { boot?: string } }>>(
+          "worker.cleanups",
+          {},
+        );
+        if (changed) expect(jobs).toEqual({});
+        else {
+          expect(jobs[root]?.pending).toEqual([expect.any(String)]);
+          expect(jobs[root]?.ownership.boot).toBe(boot);
+        }
+      } finally {
+        reopened.close();
+      }
+      if (!changed) expect(diagnostics.some((text) => text.includes("awaiting changed boot"))).toBe(true);
+    }
     expect(workers.agentJob(id)?.state).not.toBe("done");
   } finally {
     await worker.stop();
@@ -5020,9 +5340,14 @@ test("worker update drains the agent session and its checkout before replacing i
   }
 }, 30_000);
 
-test.each(["agent", "gate"] as const)(
-  "worker recovers a live %s process after a crash between spawn and shutdown",
-  async (kind) => {
+test.each([
+  ["agent", true],
+  ["gate", true],
+  ["agent", false],
+  ["gate", false],
+] as const)(
+  "worker recovers a crashed %s invocation only with discovery evidence or a changed boot (saved=%s)",
+  async (kind, savedDiscovery) => {
     const server = await listen();
     const req = await request(true);
     req.gates.setup = [];
@@ -5057,12 +5382,12 @@ test.each(["agent", "gate"] as const)(
         await runProcess({ cmd: [process.execPath, '-e', ''], cwd, env: {} });
         const local = new (await import(${source("../src/db/store.ts")})).Store(${JSON.stringify(join(remote.paths.home, "worker", "worker.db"))});
         const kept = local.getSetting('worker.cleanups', {})[cwd.slice(0, -'/checkout'.length)];
-        if (kept.confirmed || kept.ownership.marker !== scope.ownershipMarker) throw new Error('premature confirmation');
+        if (kept.pending.length || kept.ownership.marker !== scope.ownershipMarker) throw new Error('premature confirmation');
         local.close();
-        scope.cleanups.recordProcessDiscovery = () => {
-          // Simulate a worker dying while handling a post-spawn persistence failure.
-          try { throw new Error('injected discovery save failure'); }
-          catch { for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+        const record = scope.cleanups.recordProcessDiscovery;
+        scope.cleanups.recordProcessDiscovery = (row) => {
+          if (${savedDiscovery}) record(row);
+          for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
         };
         return runProcess({
           cmd: [process.execPath, '-e',
@@ -5115,9 +5440,9 @@ test.each(["agent", "gate"] as const)(
         expect(local.listProcessCleanups()).toEqual([]);
         unresolved = local.getSetting("worker.cleanups", {});
         expect(unresolved[dirname(cwd)]).toMatchObject({
-          confirmed: false,
+          pending: savedDiscovery ? [] : [expect.any(String)],
           scratch: [scratch],
-          discoveries: [],
+          discoveries: savedDiscovery ? [expect.objectContaining({ invocation: expect.any(String) })] : [],
           ownership: expect.objectContaining({ runId: id, marker: expect.any(String) }),
         });
       } finally {
@@ -5131,7 +5456,8 @@ test.each(["agent", "gate"] as const)(
           stopped: recoveryProcessStopped,
           timeoutMs: 1000,
           discover: async () => {
-            throw new Error("recovery inspection unavailable");
+            if (savedDiscovery) throw new Error("recovery inspection unavailable");
+            return [];
           },
         },
         () =>
@@ -5147,7 +5473,11 @@ test.each(["agent", "gate"] as const)(
           }),
       );
       expect(requests).toBe(1);
-      expect(diagnostics.some((text) => text.includes("recovery inspection unavailable"))).toBe(true);
+      expect(
+        diagnostics.some((text) =>
+          text.includes(savedDiscovery ? "recovery inspection unavailable" : "awaiting changed boot"),
+        ),
+      ).toBe(true);
       expect(recoveryProcessStopped(pid)).toBe(false);
       expect(existsSync(cwd)).toBe(true);
       expect(existsSync(scratch)).toBe(true);
@@ -5159,19 +5489,28 @@ test.each(["agent", "gate"] as const)(
       }
       requests = 0;
       const controller = new AbortController();
-      await runWorker(server.url.origin, remote, releaseSha, controller.signal, {
-        confinement: fakeConfinement,
-        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
-        request: async (...args) => {
-          requests++;
-          expect(recoveryProcessStopped(pid)).toBe(true);
-          expect(existsSync(dirname(cwd))).toBe(false);
-          expect(existsSync(scratch)).toBe(false);
-          expect(workerCleanupRecords(remote)).toEqual([]);
-          controller.abort();
-          return workerRequest(...args);
-        },
-      });
+      // A reboot would stop the orphan; emulate that using only the PID this test started.
+      if (!savedDiscovery) {
+        process.kill(pid, "SIGKILL");
+        await until(() => recoveryProcessStopped(pid));
+      }
+      await processBootInspection.run(
+        () => (savedDiscovery ? "test-boot" : "next-boot"),
+        () =>
+          runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+            confinement: fakeConfinement,
+            machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+            request: async (...args) => {
+              requests++;
+              expect(recoveryProcessStopped(pid)).toBe(true);
+              expect(existsSync(dirname(cwd))).toBe(false);
+              expect(existsSync(scratch)).toBe(false);
+              expect(workerCleanupRecords(remote)).toEqual([]);
+              controller.abort();
+              return workerRequest(...args);
+            },
+          }),
+      );
       expect(requests).toBe(1);
     } finally {
       if (supervisor.exitCode === null) supervisor.kill("SIGKILL");
@@ -5468,7 +5807,7 @@ test("worker retains scratch when a harness directly throws a termination error"
           cache: join(dirname(cwd), "repo.git"),
           scratch: [scratch],
           discoveries: [],
-          confirmed: false,
+          pending: [],
           ownership: expect.objectContaining({ marker: expect.any(String), runId: id }),
         },
       });

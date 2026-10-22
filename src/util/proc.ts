@@ -21,7 +21,7 @@ export const processScope = new AsyncLocalStorage<{
   checkout?: () => string | undefined;
   cleanups?: ProcessCleanupStore;
   ownershipMarker?: string;
-  beforeSpawn?: () => void;
+  beforeSpawn?: (invocation?: string) => void;
 }>();
 
 export interface ProcessCleanup {
@@ -815,7 +815,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
         : [];
     const spawnedAt = darwin?.darwinClock() ?? 0n;
-    scope?.beforeSpawn?.();
+    scope?.beforeSpawn?.(marker);
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
@@ -837,6 +837,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     } catch (error) {
       discoveryError = error;
     }
+    let persistenceError: unknown;
     // A crash before shutdown must still leave enough ownership context for recovery.
     try {
       if (child.pid !== undefined)
@@ -849,7 +850,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
           discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
         });
     } catch (error) {
-      discoveryError ??= error;
+      persistenceError = error;
     }
     let resolveStopped: (() => void) | undefined;
     scope?.children.set(
@@ -898,8 +899,9 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
               spawnedAt,
               directory,
             );
-          }
+          } else (scope?.cleanups ?? processCleanupStore.getStore())?.deleteInvocationCleanups(marker);
           cancelKilled = cancelStarted && killedRunningChild;
+          if (persistenceError) throw persistenceError;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.

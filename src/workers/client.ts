@@ -232,11 +232,16 @@ export async function runWorker(
     cache: string;
     scratch: string[];
     discoveries?: ProcessDiscovery[];
-    confirmed?: boolean;
+    pending?: string[];
     ownership?: { marker: string; runId: string; started: number; boot?: string };
   };
   const retained = store.getSetting<Record<string, RetainedJob>>("worker.cleanups", {});
   const save = () => store.setSetting("worker.cleanups", retained);
+  const updateJob = (job: RetainedJob, changes: Partial<RetainedJob>) => {
+    const next = { ...job, ...changes };
+    store.setSetting("worker.cleanups", { ...retained, [job.root]: next });
+    Object.assign(job, next);
+  };
   const unresolved = (error: unknown) =>
     (options.log ?? console.error)(redactCredentials(`Worker cleanup unresolved: ${String(error)}`));
   const cleanups: ProcessCleanupStore = {
@@ -245,20 +250,31 @@ export async function runWorker(
     deleteProcessCleanup: store.deleteProcessCleanup.bind(store),
     listProcessDiscoveries: () => Object.values(retained).flatMap((job) => job.discoveries ?? []),
     deleteInvocationCleanups(invocation) {
+      const next = Object.fromEntries(
+        Object.entries(retained).map(([root, job]) => [
+          root,
+          {
+            ...job,
+            discoveries: job.discoveries?.filter((row) => row.invocation !== invocation),
+            pending: job.pending?.filter((marker) => marker !== invocation),
+          },
+        ]),
+      );
       store.db.transaction(() => {
         store.deleteInvocationCleanups(invocation);
-        for (const job of Object.values(retained)) {
-          if (!job.discoveries?.some((row) => row.invocation === invocation)) continue;
-          job.discoveries = job.discoveries.filter((row) => row.invocation !== invocation);
-        }
-        save();
+        store.setSetting("worker.cleanups", next);
       })();
+      for (const [root, job] of Object.entries(next)) {
+        const current = retained[root];
+        if (current) Object.assign(current, job);
+      }
     },
   };
   const active = new Set<string>();
   const belongsTo = (row: ProcessCleanup, job: RetainedJob) =>
     row.directory === join(job.root, "checkout") ||
     row.invocation === job.ownership?.marker ||
+    job.pending?.includes(row.invocation) ||
     job.discoveries?.some((discovery) => discovery.invocation === row.invocation);
   const inspectBoot = () => {
     try {
@@ -278,9 +294,23 @@ export async function runWorker(
     if (owner) {
       const boot = inspectBoot();
       if (boot && owner.boot && boot !== owner.boot) {
-        for (const row of [...records, ...(job.discoveries ?? [])])
-          cleanups.deleteInvocationCleanups(row.invocation);
+        for (const invocation of new Set([
+          ...records.map((row) => row.invocation),
+          ...(job.discoveries ?? []).map((row) => row.invocation),
+          ...(job.pending ?? []),
+        ]))
+          cleanups.deleteInvocationCleanups(invocation);
       } else {
+        if (
+          job.pending?.some(
+            (marker) =>
+              !job.discoveries?.some((row) => row.invocation === marker) &&
+              !records.some((row) => row.invocation === marker && row.discovery),
+          )
+        ) {
+          if (boot && !owner.boot) updateJob(job, { ownership: { ...owner, boot } });
+          throw new Error("missing worker discovery evidence for pending invocation; awaiting changed boot");
+        }
         await recoverProcessCleanups(local, undefined, undefined, undefined, {
           runId: owner.runId,
           invocation: owner.marker,
@@ -348,17 +378,20 @@ export async function runWorker(
           recordProcessDiscovery(row) {
             const job = retained[root];
             if (!job) throw new Error("Missing worker ownership evidence");
-            job.discoveries = [...(job.discoveries ?? []), row];
-            save();
+            updateJob(job, {
+              discoveries: [...(job.discoveries ?? []), row],
+              pending: job.pending?.filter((marker) => marker !== row.invocation),
+            });
           },
         } satisfies ProcessCleanupStore,
         ownershipMarker: retained[root]?.ownership?.marker,
-        beforeSpawn() {
+        beforeSpawn(invocation) {
           const job = retained[root];
           if (!job) throw new Error("Missing worker ownership evidence");
-          job.scratch = [...(processScope.getStore()?.scratchDirs ?? [])];
-          job.confirmed = false;
-          save();
+          updateJob(job, {
+            scratch: [...(processScope.getStore()?.scratchDirs ?? [])],
+            pending: [...new Set([...(job.pending ?? []), ...(invocation ? [invocation] : [])])],
+          });
         },
       },
       run,
@@ -541,7 +574,7 @@ export async function runWorker(
         cache,
         scratch: [],
         discoveries: [],
-        confirmed: false,
+        pending: [],
         ownership: { marker: randomUUID(), runId: id, started: Date.now(), boot: inspectBoot() },
       };
       return scoped(id, root, jobSignal, async () => {
@@ -565,7 +598,6 @@ export async function runWorker(
                 root,
                 cache,
                 scratch: [...scope.scratchDirs],
-                confirmed: false,
               };
               save();
               throw scope.terminationError ?? error;
