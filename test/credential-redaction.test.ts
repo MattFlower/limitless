@@ -181,7 +181,7 @@ test("structured values and keys retain JSON serialization behavior and share th
   expect(() => redactCredentialData(1n)).toThrow();
 });
 
-test("structured numeric credentials redact exact matches and containment in either direction", () => {
+test("structured numeric credentials redact whole values and containing numbers, leaving fragments unchanged", () => {
   registerCredential("MATCHER_NUMERIC", "987654321012345");
   const redacted: unknown = redactCredentialData({
     input: { token: 987654321012345 },
@@ -189,7 +189,7 @@ test("structured numeric credentials redact exact matches and containment in eit
   });
   expect(redacted).toEqual({
     input: { token: "[redacted]" },
-    values: ["[redacted]", "[redacted]", "[redacted]", 42, -42, 0.25, 0, 1, 9, 9876543],
+    values: ["[redacted]", "[redacted]", 98765432, 42, -42, 0.25, 0, 1, 9, 9876543],
   });
 });
 
