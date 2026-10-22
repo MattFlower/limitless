@@ -27,17 +27,7 @@ export const AgentEvents = z
   .strict();
 const result = z
   .object({
-    status: z.enum([
-      "running",
-      "ok",
-      "error",
-      "cancelled",
-      "timeout",
-      "stuck",
-      "quota",
-      "unavailable",
-      "declined",
-    ]),
+    status: z.enum(["ok", "error", "cancelled", "timeout", "stuck", "quota", "unavailable", "declined"]),
     finalText: z.string(),
     structured: z.json(),
     sessionId: z.string().nullable(),

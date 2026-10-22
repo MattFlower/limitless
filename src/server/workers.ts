@@ -34,7 +34,7 @@ async function readJson(req: Request, limit = 2 * 1024 * 1024): Promise<unknown>
       reader.releaseLock();
     }
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
 }
 async function jobBundle(cache: string, id: string, commits: string[], signal: AbortSignal) {
   const dir = mkdtempSync(join(tmpdir(), "worker-bundle-"));

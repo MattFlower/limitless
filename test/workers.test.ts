@@ -51,7 +51,7 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { CommandError, redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
-import { certificate, workerRequest } from "../src/workers/tls.ts";
+import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
@@ -3376,14 +3376,18 @@ const batches = () =>
     .all();
 
 // Streaming requests exercise the byte limit and authorization across body-reading awaits.
-function streamingReport(path: string, token: string, contentLength?: number) {
+function streamingReport(path: string, token: string, contentLength?: number, expectedPin?: string) {
   if (!listener) throw new Error("Missing listener");
+  const pin = expectedPin ?? listener.tls.fingerprint;
   const response = Promise.withResolvers<number>();
   const req = httpsRequest(
     new URL(path, listener.url),
     {
       method: "POST",
-      rejectUnauthorized: false,
+      agent: false,
+      ca: listener.tls.cert,
+      checkServerIdentity: (_host, cert) =>
+        fingerprint(cert.raw) === pin ? undefined : new Error("Coordinator certificate fingerprint changed"),
       headers: {
         authorization: `Bearer ${token}`,
         "content-type": "application/json",
@@ -3401,6 +3405,15 @@ function streamingReport(path: string, token: string, contentLength?: number) {
   req.on("error", response.reject);
   return { req, response: response.promise };
 }
+
+test("streaming reports reject an incorrect listener fingerprint", async () => {
+  await listen();
+  const token = await paired();
+  const { req, response } = streamingReport("/worker/heartbeat", token, undefined, "0".repeat(64));
+  req.end(JSON.stringify(caps()));
+  await expect(response).rejects.toThrow("Coordinator certificate fingerprint changed");
+  expect(workers.list()[0]?.capabilities).toBeNull();
+});
 
 test("gate-first leases preserve both payload fields, agent inputs and cancellation", async () => {
   await listen();
@@ -3524,6 +3537,62 @@ test.each(["events", "result", "failure"])(
   },
 );
 
+test.each(["events", "result"])("agent %s requires valid UTF-8 across body chunks", async (action) => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = enqueueAgent();
+  workers.leaseAgentJob("runner");
+  await call(agentPath(id, "events"), { seq: 0, events: [{ type: "text", text: "earlier" }] }, token);
+  const saved = batches(),
+    leased = workers.agentJob(id);
+  const body = (text: string) =>
+    JSON.stringify(
+      action === "events"
+        ? { seq: 1, events: [{ type: "text", text }] }
+        : { ...agentResult(), finalText: text },
+    );
+  const [prefix, suffix] = body("REPLACE").split("REPLACE");
+  const malformed = Buffer.concat([
+    Buffer.from(prefix ?? ""),
+    Buffer.from([0xff]),
+    Buffer.from(suffix ?? ""),
+  ]);
+  const invalid = streamingReport(agentPath(id, action), token, malformed.byteLength);
+  invalid.req.end(malformed);
+  expect(await invalid.response).toBe(400);
+  expect(batches()).toEqual(saved);
+  expect(workers.agentJob(id)).toEqual(leased);
+
+  const text = "before 🌍 after",
+    payload = Buffer.from(body(text)),
+    split = payload.indexOf(Buffer.from("🌍")) + 1,
+    started = Promise.withResolvers<void>(),
+    original = workers.holdsAgentJob.bind(workers);
+  const spy = spyOn(workers, "holdsAgentJob").mockImplementation((...args) => {
+    started.resolve();
+    return original(...args);
+  });
+  const valid = streamingReport(agentPath(id, action), token);
+  try {
+    valid.req.write(payload.subarray(0, split));
+    await started.promise;
+    valid.req.end(payload.subarray(split));
+    expect(await valid.response).toBe(200);
+    if (action === "events") {
+      expect(JSON.parse(batches()[1]?.events ?? "null")).toEqual([{ type: "text", text }]);
+      expect(workers.agentJob(id)).toEqual(leased);
+    } else {
+      expect(JSON.parse(workers.agentJob(id)?.result ?? "null").finalText).toBe(text);
+      expect(workers.agentJob(id)).toMatchObject({ state: "done", result_sha: agentResult().sha });
+      expect(batches()).toEqual(saved);
+    }
+  } finally {
+    valid.req.destroy();
+    spy.mockRestore();
+  }
+});
+
 test("agent event batches validate every variant, redact nested data, deduplicate and survive reopening", async () => {
   await listen();
   const token = await paired();
@@ -3600,6 +3669,7 @@ test("agent reports validate result metadata and persist changed and unchanged c
       ...["short", "g".repeat(40), "a".repeat(41), "a".repeat(63)].map((sha) => ({ sha })),
       ...["-branch", "a..b", "a.lock", "a/", "@{-1}", "a b", "HEAD"].map((branch) => ({ branch })),
       { extra: true },
+      { status: "running" },
       { status: "unknown" },
       { usage: { ...result.usage, extra: 1 } },
       { quota: { windows: { short: { utilization: "bad", resetsAt: null } }, exhaustedUntil: null } },
@@ -3607,7 +3677,7 @@ test("agent reports validate result metadata and persist changed and unchanged c
       { confinement: { ok: false, path: null, version: null, reason: "unknown", exitCode: null } },
     ]) {
       expect((await call(agentPath(id, "result"), { ...result, ...bad }, token)).status).toBe(400);
-      expect(workers.agentJob(id)?.state).toBe("leased");
+      expect(workers.agentJob(id)).toMatchObject({ state: "leased", result: null, result_sha: null });
     }
     const report = {
       ...result,
