@@ -4622,6 +4622,158 @@ test("worker update drains the agent session and its checkout before replacing i
   }
 }, 30_000);
 
+test.each(["agent", "gate"] as const)(
+  "worker recovers a live %s process after a crash between spawn and shutdown",
+  async (kind) => {
+    const server = await listen();
+    const req = await request(true);
+    req.gates.setup = [];
+    req.gates.checks = [{ name: "probe", run: "true" }];
+    const id =
+      kind === "agent"
+        ? enqueueAgent({
+            runId: req.runId,
+            parentSha: req.headSha,
+            branch: "change/worker-agent",
+            target: { ...agentRequest().target, harness: "claude" },
+          })
+        : workers.enqueue(req);
+    const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+    await pairWorker(server.url.origin, join(remote.paths.home, "worker"), "crashing-worker", (text) =>
+      workers.approve(text.split(": ")[1] ?? ""),
+    );
+    const ready = join(home, "ready.json");
+    const script = join(home, "worker.ts");
+    const source = (path: string) => JSON.stringify(new URL(path, import.meta.url).pathname);
+    writeFileSync(
+      script,
+      `
+      import ${source("./git-preload.ts")};
+      import { writeFileSync } from 'node:fs';
+      import { loadConfig } from ${source("../src/config.ts")};
+      import { fakeHarness } from ${source("../src/harness/fake.ts")};
+      import { invocationScratch, processBootInspection, runProcess } from ${source("../src/util/proc.ts")};
+      import { runWorker } from ${source("../src/workers/client.ts")};
+      const invoke = (cwd) => runProcess({
+        cmd: [process.execPath, '-e', ${JSON.stringify(`
+          console.log(JSON.stringify({pid: process.pid, invocation: process.env.LIMITLESS_INVOCATION}));
+          setInterval(() => {}, 1000);
+        `)}], cwd, env: {},
+        onStdoutLine(line) {
+          writeFileSync(${JSON.stringify(ready)}, JSON.stringify({
+            ...JSON.parse(line), cwd, scratch: invocationScratch.getStore(),
+          }));
+        },
+      });
+      await processBootInspection.run(() => 'test-boot', () => runWorker(${JSON.stringify(server.url.origin)}, loadConfig({
+        home: ${JSON.stringify(remote.paths.home)}, configDir: ${JSON.stringify(cfg.paths.configDir)}, raw: {},
+      }), ${JSON.stringify(releaseSha)}, new AbortController().signal, {
+        heartbeatMs: 10, retryMs: 5,
+        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+        confinement: {
+          wrap: (cmd) => cmd,
+          async verify(_roots, opts) { if (${JSON.stringify(kind)} === 'gate') await invoke(opts.cwd); },
+        },
+        harnesses: { claude: fakeHarness(async (spec) => { await invoke(spec.cwd); return {}; }) },
+      }));
+      `,
+    );
+    const supervisor = Bun.spawn([process.execPath, script], {
+      cwd: home,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "inherit",
+    });
+    try {
+      await until(() => existsSync(ready));
+      const { pid, invocation, cwd, scratch } = JSON.parse(readFileSync(ready, "utf8")) as {
+        pid: number;
+        invocation: string;
+        cwd: string;
+        scratch: string;
+      };
+      // Checkout setup has already completed several successful scoped commands.
+      expect(existsSync(join(cwd, "tracked"))).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      supervisor.kill("SIGKILL");
+      await supervisor.exited;
+      expect(recoveryProcessStopped(pid)).toBe(false);
+      const database = join(remote.paths.home, "worker", "worker.db");
+      const local = new Store(database);
+      let unresolved: Record<string, unknown>;
+      try {
+        expect(local.listProcessCleanups()).toEqual([]);
+        unresolved = local.getSetting("worker.cleanups", {});
+        expect(unresolved[dirname(cwd)]).toMatchObject({
+          confirmed: false,
+          scratch: [scratch],
+          discoveries: [expect.objectContaining({ invocation, runId: id })],
+        });
+      } finally {
+        local.close();
+      }
+      let requests = 0;
+      await expect(
+        processRecoveryInspection.run(
+          {
+            stopped: recoveryProcessStopped,
+            timeoutMs: 1000,
+            discover: async () => {
+              throw new Error("recovery inspection unavailable");
+            },
+          },
+          () =>
+            runWorker(server.url.origin, remote, releaseSha, new AbortController().signal, {
+              confinement: fakeConfinement,
+              request: async () => {
+                requests++;
+                throw new Error("Unexpected request before recovery");
+              },
+            }),
+        ),
+      ).rejects.toThrow(ProcessTerminationError.prefix);
+      expect(requests).toBe(0);
+      expect(recoveryProcessStopped(pid)).toBe(false);
+      expect(existsSync(cwd)).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      const reopened = new Store(database);
+      try {
+        expect(reopened.getSetting("worker.cleanups", {})).toEqual(unresolved);
+      } finally {
+        reopened.close();
+      }
+      const controller = new AbortController();
+      await runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+        confinement: fakeConfinement,
+        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+        request: async (...args) => {
+          requests++;
+          expect(recoveryProcessStopped(pid)).toBe(true);
+          expect(existsSync(dirname(cwd))).toBe(false);
+          expect(existsSync(scratch)).toBe(false);
+          expect(workerCleanupRecords(remote)).toEqual([]);
+          controller.abort();
+          return workerRequest(...args);
+        },
+      });
+      expect(requests).toBe(1);
+    } finally {
+      if (supervisor.exitCode === null) supervisor.kill("SIGKILL");
+      await supervisor.exited;
+      if (existsSync(ready)) {
+        const { pid, scratch } = JSON.parse(readFileSync(ready, "utf8")) as {
+          pid: number;
+          scratch: string;
+        };
+        if (!recoveryProcessStopped(pid)) process.kill(pid, "SIGKILL");
+        await until(() => recoveryProcessStopped(pid));
+        removeScratch(scratch);
+      }
+    }
+  },
+  30_000,
+);
+
 test.each([
   ["agent", 0],
   ["gate", 0],

@@ -810,11 +810,25 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let leader: DarwinInvocationLeader | null = null;
-    let leaderInspectionError: unknown;
+    let discoveryError: unknown;
     try {
       if (darwin && child.pid !== undefined) leader = darwin.captureDarwinInvocationLeader(child.pid);
     } catch (error) {
-      leaderInspectionError = error;
+      discoveryError = error;
+    }
+    // A crash before shutdown must still leave enough ownership context for recovery.
+    try {
+      if (child.pid !== undefined)
+        (scope?.cleanups ?? processCleanupStore.getStore())?.recordProcessDiscovery?.({
+          runId: scope?.runId ?? null,
+          invocation: marker,
+          directory,
+          boot: bootIdentity(),
+          createdAt: Date.now(),
+          discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
+        });
+    } catch (error) {
+      discoveryError ??= error;
     }
     let resolveStopped: (() => void) | undefined;
     scope?.children.set(
@@ -850,16 +864,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       shutdown ??= (async () => {
         const release = await ownInvocationCleanup(marker);
         try {
-          if (child.pid !== undefined)
-            (scope?.cleanups ?? processCleanupStore.getStore())?.recordProcessDiscovery?.({
-              runId: scope?.runId ?? null,
-              invocation: marker,
-              directory,
-              boot: bootIdentity(),
-              createdAt: Date.now(),
-              discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
-            });
-          if (leaderInspectionError) throw leaderInspectionError;
+          if (discoveryError) throw discoveryError;
           let killedRunningChild = false;
           if (child.pid !== undefined) {
             killedRunningChild = await stopMarkedProcesses(
@@ -1032,6 +1037,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
+    if (discoveryError) void terminate();
   });
 }
 
