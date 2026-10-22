@@ -162,6 +162,135 @@ describe("pipeline (fake agents, real git + gates)", () => {
     return { f, run, state, bare, base, merge, cwd: state.worktreePath };
   }
 
+  test.each(["confirmed", "different tip", "absent branch", "lookup fails"])(
+    "delivery reconciles an interrupted push before merging the newer base (%s)",
+    async (scenario) => {
+      const bare = await githubFixture();
+      const f = start(
+        (s) => {
+          if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+          if (roleOf(s) === "review") return { structured: approve };
+          return { files: { "farewell.txt": "goodbye\n" } };
+        },
+        false,
+        false,
+        { faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pushed" } } },
+      );
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      await wait(
+        () => f.store.listStages(run.id).findLast((s) => s.name === "deliver")?.status === "cancelled",
+        { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => f.store.subscribe(wake) },
+      );
+      await f.stop();
+      const state = f.store.getRunState<RunState>(run.id);
+      const saved = f.store.getRun(run.id);
+      if (!state?.worktreePath || !state.publishingSha || !saved?.branch || !saved.baseSha)
+        throw new Error("missing interrupted push state");
+      const pending = state.publishingSha;
+      const prior = saved.baseSha;
+      const ref = `refs/heads/${saved.branch}`;
+      expect((await sh(["git", "rev-parse", ref], { cwd: bare })).stdout.trim()).toBe(pending);
+      expect(state.publishedSha).toBeUndefined();
+      expect(existsSync(join(home, "gh-calls"))).toBe(false);
+      const nextBase = await advanceBase(bare, "next.txt", "base advanced after push\n");
+      if (scenario !== "confirmed") {
+        // An earlier confirmed publication must survive an unconfirmed pending intent.
+        state.publishedSha = prior;
+        f.store.setRunState(run.id, state);
+        if (scenario !== "lookup fails")
+          await sh(
+            scenario === "different tip"
+              ? ["git", "update-ref", ref, nextBase]
+              : ["git", "update-ref", "-d", ref],
+            { cwd: bare },
+          );
+      }
+      f.store.close();
+      const push = repos.pushBranch;
+      const checkpoints: RunState[] = [];
+      const reconciled: RunState[] = [];
+      let resumed: Factory;
+      const lookup =
+        scenario === "lookup fails"
+          ? spyOn(repos, "remoteBranchSha").mockRejectedValue(new Error("injected remote lookup failure"))
+          : undefined;
+      const publication = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+        const checkpoint = resumed.store.getRunState<RunState>(run.id);
+        if (!checkpoint) throw new Error("missing pre-push checkpoint");
+        checkpoints.push(checkpoint);
+        expect(checkpoint.publishingSha).toBe(args[3]);
+        expect(checkpoint.publishedSha).toBe(scenario === "confirmed" ? pending : prior);
+        expect(args[6]).toBe(checkpoint.publishedSha);
+        return push(...args);
+      });
+      try {
+        resumed = start(
+          () => {
+            throw new Error("delivery must not invoke agents");
+          },
+          false,
+          false,
+          {
+            faults: {
+              "store:save": {
+                action: "continue",
+                when: (c) => c.checkpoint === "delivery-publishing",
+                onHit: () => {
+                  const checkpoint = resumed.store.getRunState<RunState>(run.id);
+                  if (checkpoint) reconciled.push(checkpoint);
+                },
+              },
+            },
+          },
+        );
+        const status = await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"]);
+        const finished = resumed.store.getRun(run.id);
+        const final = resumed.store.getRunState<RunState>(run.id);
+        if (scenario === "lookup fails") {
+          expect(status).toBe("needs_human");
+          expect(finished?.error).toContain("injected remote lookup failure");
+          expect(final?.publishedSha).toBe(prior);
+          expect(final?.publishingSha).toBe(pending);
+          expect(checkpoints).toHaveLength(0);
+          expect(reconciled).toHaveLength(0);
+          expect((await sh(["git", "rev-parse", ref], { cwd: bare })).stdout.trim()).toBe(pending);
+          expect(finished?.prUrl).toBeNull();
+          return;
+        }
+        expect(checkpoints.length).toBeGreaterThan(0);
+        expect(reconciled[0]).toMatchObject({
+          publishedSha: scenario === "confirmed" ? pending : prior,
+        });
+        expect(reconciled[0]?.publishingSha).toBeUndefined();
+        if (scenario === "confirmed") {
+          expect(status).toBe("succeeded");
+          expect(finished?.prUrl).toContain("/pull/1");
+          expect(finished?.baseSha).toBe(nextBase);
+          expect(final?.publishedSha).toBe(finished?.headSha ?? "missing");
+          expect(final?.publishingSha).toBeUndefined();
+          const head = (await sh(["git", "rev-parse", ref], { cwd: bare })).stdout.trim();
+          expect(head).toBe(final?.publishedSha ?? "missing");
+          expect(
+            (await sh(["git", "show", "-s", "--format=%P", head], { cwd: bare })).stdout.trim().split(" "),
+          ).toEqual([pending, nextBase]);
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("pr create");
+        } else {
+          expect(status).toBe("needs_human");
+          expect(final?.publishedSha).toBe(saved.baseSha);
+          expect(finished?.prUrl).toBeNull();
+          const remote = await sh(["git", "show-ref", "--verify", ref], { cwd: bare, allowFail: true });
+          if (scenario === "different tip") expect(remote.stdout.trim()).toBe(`${nextBase} ${ref}`);
+          else expect(remote.exitCode).not.toBe(0);
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).not.toContain("pr create");
+        }
+      } finally {
+        publication.mockRestore();
+        lookup?.mockRestore();
+      }
+    },
+  );
+
   test.each(["recorded", "legacy", "worker published", "HEAD moved before push"])(
     "delivery resumes a gated merge when the base advances a second time (%s)",
     async (scenario) => {

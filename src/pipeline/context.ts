@@ -80,6 +80,8 @@ export interface RunState {
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
+  /** Exact intended delivery commit saved before a push whose outcome may need reconciliation. */
+  publishingSha?: string;
   /** Worktree spellings used by report rendering, so removed worktrees stay rewritable. */
   worktreeAliases?: string[];
   gatesConfig?: GateConfig;

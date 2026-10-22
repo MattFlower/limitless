@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Paths } from "../src/config.ts";
 import type { Repo } from "../src/core/types.ts";
+import * as command from "../src/git/command.ts";
 import { addDetachedWorktree, adoptWorkerCommit, commitAll, headSha } from "../src/git/repos.ts";
 import { agentEnv, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
@@ -65,17 +66,54 @@ beforeEach(async () => {
   await addDetachedWorktree(cache, parentSha, cwd);
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
-const adopt = () => adoptWorkerCommit(paths, repo, cwd, { branch: "worker", parentSha, sha, commit });
+const adopt = (signal?: AbortSignal) =>
+  adoptWorkerCommit(paths, repo, cwd, { branch: "worker", parentSha, sha, commit }, signal);
 const publish = async (tip = sha) =>
   git(source, "push", "--force", repo.url ?? "", `${tip}:refs/heads/worker`);
 
-test("adopts the exact worker commit with no extra commit", async () => {
-  await publish();
-  await adopt();
-  expect(await headSha(cwd)).toBe(sha);
-  expect(await git(cwd, "rev-list", "--count", `${parentSha}..HEAD`)).toBe("1");
-  expect(await git(cwd, "status", "--porcelain", "--untracked-files=all")).toBe("");
-});
+test.each(["success", "reset preparation fails", "cancel after checks", "cancel at reset"])(
+  "adoption has one cancellable mutation and no cleanup (%s)",
+  async (scenario) => {
+    await publish();
+    const controller = new AbortController();
+    const execute = command.worktreeGit;
+    const mutations: string[][] = [];
+    const signals: (AbortSignal | undefined)[] = [];
+    const boundary = spyOn(command, "worktreeGit").mockImplementation(async (args, opts, ...rest) => {
+      if (args.includes("clean")) throw new Error("cleanup must not run");
+      if (args[1] === "reset") {
+        mutations.push(args);
+        signals.push(opts.signal);
+        if (scenario === "reset preparation fails") throw new Error("reset preparation failed");
+        if (scenario === "cancel at reset") controller.abort(new Error("adoption cancelled"));
+        opts.signal?.throwIfAborted();
+      }
+      const result = await execute(args, opts, ...rest);
+      if (args[1] === "status" && scenario === "cancel after checks")
+        controller.abort(new Error("adoption cancelled"));
+      return result;
+    });
+    try {
+      if (scenario === "success") await adopt(controller.signal);
+      else
+        await expect(adopt(controller.signal)).rejects.toThrow(
+          scenario === "reset preparation fails" ? "reset preparation failed" : "adoption cancelled",
+        );
+    } finally {
+      boundary.mockRestore();
+    }
+    expect(mutations).toEqual(
+      scenario === "cancel after checks" ? [] : [["git", "reset", "--hard", "-q", sha]],
+    );
+    expect(signals).toHaveLength(scenario === "cancel after checks" ? 0 : 1);
+    if (signals.length) expect(signals[0]).toBe(controller.signal);
+    expect(await headSha(cwd)).toBe(scenario === "success" ? sha : parentSha);
+    expect(await git(cwd, "rev-list", "--count", `${parentSha}..HEAD`)).toBe(
+      scenario === "success" ? "1" : "0",
+    );
+    expect(await git(cwd, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  },
+);
 
 test.each([
   "tip moved",

@@ -640,7 +640,7 @@ export async function adoptWorkerCommit(
   )
     throw new Error("Worker adoption worktree is dirty");
   signal?.throwIfAborted();
-  await resetTo(cwd, sha);
+  await worktreeGit(["git", "reset", "--hard", "-q", sha], { cwd, signal });
 }
 
 /** Move the worktree's branch back to a known commit, discarding everything after it. */
