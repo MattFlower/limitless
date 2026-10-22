@@ -1111,8 +1111,10 @@ const redactData = <T>(value: T): T =>
       if (typeof v === "string") return redactCredentials(v);
       if (typeof v === "number") {
         const text = String(v);
-        for (const secret of credentialValues)
-          if (text.includes(secret) || secret.includes(text)) return "[redacted]";
+        if (redactCredentials(text) !== text) return "[redacted]";
+        // Like string substrings, numeric fragments must be at least eight characters.
+        if (text.length >= 8)
+          for (const secret of credentialValues) if (secret.includes(text)) return "[redacted]";
       }
       return v;
     }),

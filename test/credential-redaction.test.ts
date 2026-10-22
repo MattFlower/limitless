@@ -185,12 +185,18 @@ test("structured numeric credentials redact exact matches and containment in eit
   registerCredential("MATCHER_NUMERIC", "987654321012345");
   const redacted: unknown = redactCredentialData({
     input: { token: 987654321012345 },
-    values: [987654321012345, 1987654321012345, 9876543210, 42, -42, 0.25],
+    values: [987654321012345, 1987654321012345, 98765432, 42, -42, 0.25, 0, 1, 9, 9876543],
   });
   expect(redacted).toEqual({
     input: { token: "[redacted]" },
-    values: ["[redacted]", "[redacted]", "[redacted]", 42, -42, 0.25],
+    values: ["[redacted]", "[redacted]", "[redacted]", 42, -42, 0.25, 0, 1, 9, 9876543],
   });
+});
+
+test("short numeric credentials redact whole values without matching substrings", () => {
+  registerCredential("MATCHER_SHORT_NUMERIC", "6352");
+  const redacted: unknown = redactCredentialData([6352, 16352, 635]);
+  expect(redacted).toEqual(["[redacted]", 16352, 635]);
 });
 
 test("digit credentials beyond exact JSON number precision still redact as strings", () => {
