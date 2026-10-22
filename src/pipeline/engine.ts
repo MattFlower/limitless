@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { z } from "zod";
 import { repoSettings } from "../config.ts";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
@@ -23,7 +24,7 @@ import {
 } from "../gates/detect.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
-import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
+import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import {
   compareGates,
@@ -40,6 +41,7 @@ import { gateSlotScope } from "../gates/slots.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
+  adoptWorkerCommit,
   checkoutCommitted,
   checkPrivateRange,
   commitAll,
@@ -83,6 +85,8 @@ import {
   recoverScopedProcesses,
   redactCredentials,
 } from "../util/proc.ts";
+import { publicationFields } from "../workers/publication.ts";
+import type { AgentPublication, AgentPublicationHooks } from "./agent-executor.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -1115,6 +1119,79 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
   );
 }
 
+function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPublicationHooks {
+  const branch = ctx.run.branch as string;
+  const clean = async () =>
+    (await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd })).stdout === "";
+  const remoteSha = () => remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch(() => undefined);
+  return {
+    remoteSha,
+    async prepare() {
+      const parentSha = await headSha(cwd);
+      if (!(await clean())) return null;
+      const remote = await remoteSha();
+      if (remote === undefined) return null;
+      if (remote !== (ctx.state.publishedSha ?? null)) {
+        if (remote !== parentSha)
+          throw new NeedsHumanError(
+            `Run branch ${branch} is at ${remote}, expected ${ctx.state.publishedSha ?? "no branch"}; another push moved it or a worker commit was not adopted (re-attach is S6)`,
+          );
+        ctx.state.publishedSha = parentSha;
+        await ctx.save();
+      }
+      const identity = async (variable: string) => {
+        const result = await worktreeGit(["git", "var", variable], { cwd, allowFail: true });
+        return result.exitCode === 0 ? /^(.+) <([^<>]+)> -?\d+ [+-]\d{4}\n?$/.exec(result.stdout) : null;
+      };
+      const author = await identity("GIT_AUTHOR_IDENT");
+      const committer = await identity("GIT_COMMITTER_IDENT");
+      if (!author?.[1] || !author[2] || !committer?.[1] || !committer[2]) return null;
+      const cfg = ctx.deps.cfg;
+      const request: AgentPublication = {
+        parentSha,
+        baseSha: ctx.run.baseSha as string,
+        branch,
+        commit: {
+          message: `${commitMessage(ctx, round)}\n`,
+          authorName: author[1],
+          authorEmail: author[2],
+          committerName: committer[1],
+          committerEmail: committer[2],
+        },
+        repoUrl:
+          ctx.repo.url && isAbsolute(ctx.repo.url) ? ctx.repo.url : `https://github.com/${ctx.repo.slug}.git`,
+        expectedRemoteSha: ctx.state.publishedSha ?? null,
+        discreet: repoSettings(cfg, ctx.repo.slug).discreet,
+        uiUrl: cfg.uiUrl,
+        privateStringsDigest: privateStringsDigest(privateEntries(ctx, cwd)),
+      };
+      const validation = z.object(publicationFields).safeParse(request);
+      if (!validation.success) {
+        ctx.log(`Worker publication field invalid: ${validation.error.issues[0]?.path.join(".")}`, "warn");
+        return null;
+      }
+      return request;
+    },
+    async adopt(sha, request) {
+      try {
+        if (sha === request.parentSha) {
+          if ((await headSha(cwd)) !== sha || !(await clean()))
+            throw new Error("Coordinator HEAD or worktree changed during worker session");
+          return;
+        }
+        await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+      } catch (error) {
+        throw new NeedsHumanError(
+          `Cannot adopt worker commit ${sha} for round ${round}: ${redactCredentials((error as Error).message)}`,
+        );
+      }
+      ctx.state.publishedSha = sha;
+      ctx.state.workerCommitRound = round;
+      await ctx.save("worker-commit-adopted");
+    },
+  };
+}
+
 async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
   const gates = assertDistinctGateNames(ctx.state.gatesConfig as GateConfig);
@@ -1171,6 +1248,16 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           mode: "edit",
           complexity: ctx.complexity,
           constraints,
+          ...(!merge &&
+          !reviewRound(ctx) &&
+          !ctx.run.deliveryBranch &&
+          !ctx.run.prUrl &&
+          ctx.state.flow !== "verify-change" &&
+          ctx.repo.kind === "github" &&
+          ctx.run.branch &&
+          ctx.run.baseSha
+            ? { publication: workerPublication(ctx, cwd, round) }
+            : {}),
           prompt: implementPrompt({
             prompt:
               merge && ctx.state.reviewResolution
@@ -1237,7 +1324,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
       return {
-        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}; ${sha ?? "no changes"}`,
+        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}; ${sha ?? (ctx.state.workerCommitRound === round ? ctx.run.headSha : "no changes")}`,
         value: undefined,
       };
     },
