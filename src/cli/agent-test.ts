@@ -16,7 +16,7 @@ import {
 export interface WrapperConfig {
   commands: SlottedCommands;
   directory: string;
-  port: number;
+  port?: number;
   unix: string;
   token: string;
 }
@@ -146,6 +146,7 @@ export function wrapperLeaseClient(
   http = localLeaseClient(config.port),
   unix = localLeaseClient(config.port, config.unix),
 ): LeaseClient {
+  if (config.port === undefined) return unix;
   let socket = false;
   return async (body, signal, onLateReply, onFailure) => {
     const usingSocket = socket,

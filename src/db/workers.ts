@@ -1,7 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import type { Role } from "../core/types.ts";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateRun } from "../gates/run.ts";
+import type { SlottedCommands } from "../harness/slotted-config.ts";
 import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { redactCredentialData, registerCredential } from "../util/proc.ts";
@@ -50,11 +52,28 @@ export interface JobRow {
 }
 
 /** Persisted session inputs; runtime callbacks and confinement are supplied by a later dispatcher. */
-export interface AgentJobRequest extends Pick<AgentSpec, "prompt" | "target" | "timeoutMs"> {
+export interface AgentJobRequest
+  extends Pick<AgentSpec, "prompt" | "target" | "timeoutMs">,
+    Partial<
+      Pick<
+        AgentSpec,
+        | "mode"
+        | "systemAppend"
+        | "jsonSchema"
+        | "idleTimeoutMs"
+        | "maxToolCalls"
+        | "fast"
+        | "privateSession"
+        | "confineReads"
+      >
+    > {
   runId: string;
   invocationId: number;
   parentSha: string;
   baseSha?: string;
+  role?: Role;
+  branch?: string;
+  slottedCommands?: SlottedCommands;
 }
 export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_order" | "events"> {
   invocation_id: number;
