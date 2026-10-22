@@ -37,7 +37,10 @@ import {
 } from "../src/gates/private.ts";
 import {
   compareGates,
+  type GateComparison,
+  type GateResult,
   type GateRun,
+  isSlowRegression,
   retryBaselineFailures as productionBaselineRetry,
   runGates as productionGates,
   retryRegressions as productionRetry,
@@ -938,6 +941,64 @@ describe("gate slots and flaky retry", () => {
     const runs = readFileSync(join(dir, "runs"), "utf8").trim().split("\n").length;
     return { c, summary: [c?.verdict, c?.blocking, c?.firstAttempt?.ok ?? "not retried", runs] };
   }
+
+  const slowCases: {
+    name: string;
+    duration?: number;
+    referenceMs?: number;
+    referenceOk?: boolean;
+    missing?: boolean;
+    result?: Partial<GateResult>;
+    firstOk?: boolean;
+    comparisonFirst?: boolean;
+    verdict?: GateComparison["verdict"];
+    expected: boolean;
+  }[] = [
+    { name: "exactly 3x", duration: 300_000, expected: false },
+    { name: "under the increase floor", duration: 79_999, referenceMs: 20_000, expected: false },
+    { name: "exactly the increase floor", duration: 80_000, referenceMs: 20_000, expected: true },
+    { name: "failing counterpart", referenceOk: false, expected: false },
+    { name: "missing counterpart", missing: true, expected: false },
+    { name: "zero duration counterpart", referenceMs: 0, expected: false },
+    { name: "timeout", result: { timedOut: true }, expected: false },
+    { name: "confinement", result: { confinementError: true }, expected: false },
+    {
+      name: "output confinement",
+      result: { output: ["sandbox_apply:", "Operation not permitted"].join(" ") },
+      expected: false,
+    },
+    { name: "failed first attempt", firstOk: false, expected: false },
+    { name: "passing first attempt hidden on comparison", firstOk: true, expected: false },
+    { name: "comparison first attempt alone", comparisonFirst: true, expected: true },
+    { name: "other verdict", verdict: "new_failure", expected: false },
+    { name: "slow regression", expected: true },
+  ];
+  test.each(slowCases)("slow regression: $name", (row) => {
+    const reference: GateResult = {
+      name: "test",
+      command: "fake-test",
+      ok: row.referenceOk ?? true,
+      exitCode: 0,
+      durationMs: row.referenceMs ?? 100_000,
+      output: "passed",
+    };
+    const result: GateResult = {
+      ...reference,
+      ok: false,
+      exitCode: 1,
+      durationMs: row.duration ?? 400_000,
+      ...row.result,
+      ...(row.firstOk !== undefined ? { firstAttempt: { ...reference, ok: row.firstOk } } : {}),
+    };
+    const c: GateComparison = {
+      name: "test",
+      verdict: row.verdict ?? "regressed",
+      blocking: true,
+      result,
+      ...(row.comparisonFirst ? { firstAttempt: reference } : {}),
+    };
+    expect(isSlowRegression(c, [c], row.missing ? [] : [reference])).toBe(row.expected);
+  });
 
   test("fail → retry → pass is flaky and does not block", async () => {
     const { c, summary } = await retried(
