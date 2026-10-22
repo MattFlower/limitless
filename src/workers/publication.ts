@@ -3,10 +3,11 @@ import { z } from "zod";
 import type { Config } from "../config.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
 import { loadPrivateStrings, PrivateError } from "../gates/private.ts";
+import { checkPublicationText } from "../gates/publication.ts";
 import { cacheGit, stageAll, worktreeGit } from "../git/command.ts";
-import { checkPrivateRange, commitAll } from "../git/repos.ts";
+import { checkPrivateRange, commitAll, publicationRange } from "../git/repos.ts";
 import { githubToken } from "../integrations/github-token.ts";
-import { checkDiscreetCommits } from "../pipeline/markers.ts";
+import { checkDiscreetBranch, checkDiscreetCommits } from "../pipeline/markers.ts";
 import { agentEnv, registerCredential, registeredCredentials } from "../util/proc.ts";
 
 const identity = z
@@ -43,6 +44,7 @@ export const publicationFields = {
     .nullable()
     .optional(),
   discreet: z.boolean().optional(),
+  uiUrl: z.string().url().optional(),
 };
 
 /** Publish only the immutable commit inspected here; session credentials are acquired afterwards. */
@@ -54,12 +56,27 @@ export async function publishAgentChanges(
   tokenLookup = githubToken,
 ): Promise<string> {
   if (req.mode === "readonly") return req.parentSha;
+  const head = await worktreeGit(["git", "rev-parse", "--verify", "HEAD"], {
+    cwd,
+    signal,
+    allowFail: true,
+  }).catch(() => null);
+  if (head?.exitCode !== 0) throw new Error("Cannot inspect worker HEAD");
+  if (head.stdout.trim() !== req.parentSha) throw new Error("Worker session moved HEAD from parentSha");
   await stageAll({ cwd, signal });
   const changed = await worktreeGit(["git", "diff", "--cached", "--quiet"], { cwd, signal, allowFail: true });
   if (changed.exitCode === 0) return req.parentSha;
   if (changed.exitCode !== 1) throw new Error("Cannot inspect worker changes");
-  const { commit, repoUrl, expectedRemoteSha, discreet, branch } = req;
-  if (!commit || !repoUrl || expectedRemoteSha === undefined || discreet === undefined || !branch)
+  const { commit, repoUrl, expectedRemoteSha, discreet, branch, baseSha, uiUrl } = req;
+  if (
+    !commit ||
+    !repoUrl ||
+    expectedRemoteSha === undefined ||
+    discreet === undefined ||
+    !branch ||
+    !baseSha ||
+    !uiUrl
+  )
     throw new Error("Changed edit session is missing publication metadata");
   const sha = await commitAll(cwd, commit.message, {
     signal,
@@ -75,9 +92,20 @@ export async function publishAgentChanges(
   if (!sha) return req.parentSha;
   const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", sha], { cwd, signal });
   if (parents.stdout.trim() !== `${sha} ${req.parentSha}`) throw new Error("Worker commit parent mismatch");
-  const range = `${req.parentSha}..${sha}`;
-  await checkPrivateRange(cwd, range, loadPrivateStrings(cfg.paths.configDir, [cwd]));
-  if (discreet) await checkDiscreetCommits(cwd, range, req.parentSha, req.runId, cfg.uiUrl);
+  const entries = loadPrivateStrings(cfg.paths.configDir, [cwd]);
+  checkPublicationText(branch, "Branch name", entries);
+  if (discreet) checkDiscreetBranch(branch, req.runId, expectedRemoteSha !== null);
+  if (expectedRemoteSha) {
+    const remote = await worktreeGit(["git", "cat-file", "-e", `${expectedRemoteSha}^{commit}`], {
+      cwd,
+      signal,
+      allowFail: true,
+    });
+    if (remote.exitCode !== 0) throw new Error("Cannot inspect expected remote commit; publication blocked");
+  }
+  const range = await publicationRange(cwd, baseSha, sha, expectedRemoteSha);
+  await checkPrivateRange(cwd, range, entries);
+  if (discreet) await checkDiscreetCommits(cwd, range, baseSha, req.runId, uiUrl);
   const token = await tokenLookup(signal);
   registerCredential("GH_TOKEN", token);
   const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
@@ -94,6 +122,11 @@ export async function publishAgentChanges(
     throw error;
   }
   signal.throwIfAborted();
+  const env = agentEnv();
+  const index = Number(env.GIT_CONFIG_COUNT);
+  env.GIT_CONFIG_COUNT = String(index + 1);
+  env[`GIT_CONFIG_KEY_${index}`] = "http.extraHeader";
+  env[`GIT_CONFIG_VALUE_${index}`] = `Authorization: Basic ${basic}`;
   const ref = `refs/heads/${branch}`;
   const pushed = await cacheGit(
     [
@@ -111,12 +144,9 @@ export async function publishAgentChanges(
       timeoutMs: 300_000,
       allowFail: true,
       env: {
-        ...agentEnv(),
+        ...env,
         LC_ALL: "C",
         GIT_TERMINAL_PROMPT: "0",
-        GIT_CONFIG_COUNT: "1",
-        GIT_CONFIG_KEY_0: "http.extraHeader",
-        GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
       },
     },
   );

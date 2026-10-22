@@ -122,6 +122,7 @@ const AgentRequest = z.object({
   repoUrl: z.unknown().optional(),
   expectedRemoteSha: z.unknown().optional(),
   discreet: z.unknown().optional(),
+  uiUrl: z.unknown().optional(),
   runId: z.string(),
   invocationId: z.number().int(),
   parentSha: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
@@ -776,6 +777,7 @@ export async function runWorker(
           repoUrl: publication.data.repoUrl,
           expectedRemoteSha: publication.data.expectedRemoteSha,
           discreet: publication.data.discreet,
+          uiUrl: publication.data.uiUrl,
         };
         const name = req.target.harness;
         const harness =

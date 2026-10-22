@@ -84,6 +84,7 @@ export interface AgentJobRequest
   repoUrl?: string;
   expectedRemoteSha?: string | null;
   discreet?: boolean;
+  uiUrl?: string;
 }
 export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_order" | "events"> {
   invocation_id: number;
