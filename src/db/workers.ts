@@ -363,6 +363,16 @@ export class WorkerStore {
       )
       .all(id, id);
   }
+  agentJobEventsAfter(id: string, cursor = { attempt: -1, seq: -1 }) {
+    return this.store.db
+      .query<
+        { attempt: number; seq: number; events: string; created_at: number },
+        [string, string, number, number, number]
+      >(
+        "SELECT * FROM (SELECT -1 AS attempt,seq,events,created_at FROM agent_job_events WHERE job_id=? UNION ALL SELECT attempt,seq,events,created_at FROM agent_job_attempt_events WHERE job_id=?) WHERE attempt>? OR (attempt=? AND seq>?) ORDER BY attempt,seq",
+      )
+      .all(id, id, cursor.attempt, cursor.attempt, cursor.seq);
+  }
   failAgentJob(id: string, reason: string) {
     this.store.db
       .transaction(() => {
