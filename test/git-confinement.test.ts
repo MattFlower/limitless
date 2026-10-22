@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -22,7 +23,16 @@ import {
   pushBranch,
   rebaseOnto,
 } from "../src/git/repos.ts";
-import { CommandError, invocationScratch, sh } from "../src/util/proc.ts";
+import {
+  CommandError,
+  invocationScratch,
+  ProcessTerminationError,
+  processBirth,
+  processInspection,
+  processScope,
+  recoveryProcessStopped,
+  sh,
+} from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { fakeGitConfinement } from "./git-preload.ts";
 import { seeded } from "./seeded.ts";
@@ -48,6 +58,15 @@ beforeEach(async () => {
   cwd = join(root, "source");
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+function scope() {
+  return {
+    signal: new AbortController().signal,
+    killGraceMs: 0,
+    children: new Map<ChildProcess, Promise<void>>(),
+    scratchDirs: new Set<string>(),
+  };
+}
 
 test.each(["linux", "missing", "apply"])(
   "confinement refuses %s before launching repository code",
@@ -829,6 +848,7 @@ for (const allowFail of [false, true]) {
 
 for (const failure of [false, true]) {
   test(`private per-call scratch is removed after ${failure ? "failure" : "success"}`, async () => {
+    const current = scope();
     const inherited = join(root, "inherited-temp");
     mkdirSync(inherited);
     const executable = join(root, "sandbox-stand-in");
@@ -841,24 +861,100 @@ for (const failure of [false, true]) {
     );
     let canonicalScratch = "";
     const run: typeof sh = async (_cmd, opts) => {
+      expect(current.scratchDirs.has(opts.env?.TMPDIR ?? "")).toBe(true);
       canonicalScratch = realpathSync(opts.env?.TMPDIR ?? "");
       return { stdout: cwd, stderr: "", exitCode: 0 };
     };
     const call = () =>
-      gitConfinement.run(seatbeltGit("darwin", executable, run), () =>
-        gitSh([process.execPath, "status"], { cwd, env: { ...process.env, TMPDIR: inherited } }),
+      processScope.run(current, () =>
+        gitConfinement.run(seatbeltGit("darwin", executable, run), () =>
+          gitSh([process.execPath, "status"], { cwd, env: { ...process.env, TMPDIR: inherited } }),
+        ),
       );
     if (failure) await expect(call()).rejects.toBeInstanceOf(CommandError);
     else await call();
     const scratch = readFileSync(captured, "utf8");
     expect(scratch).not.toBe(inherited);
     expect(existsSync(scratch)).toBe(false);
+    expect(current.scratchDirs.size).toBe(0);
     const writes = readFileSync(profile, "utf8")
       .split("\n")
       .find((line) => line.startsWith("(allow file-write*"));
     expect(writes).toContain(`(subpath "${canonicalScratch}")`);
     expect(writes).not.toContain(`(subpath "${realpathSync(inherited)}")`);
     expect(writes).not.toContain(`(subpath "${realpathSync(tmpdir())}")`);
+  });
+}
+
+test("git preserves caller-owned invocation scratch and its registration", async () => {
+  const current = scope();
+  const scratch = join(root, "caller-scratch");
+  mkdirSync(scratch);
+  current.scratchDirs.add(scratch);
+  await processScope.run(current, () =>
+    invocationScratch.run(scratch, async () => {
+      await gitSh(["git", "status"], { cwd });
+      await expect(gitSh(["git", "unknown-command"], { cwd })).rejects.toBeInstanceOf(CommandError);
+    }),
+  );
+  expect(existsSync(scratch)).toBe(true);
+  expect([...current.scratchDirs]).toEqual([scratch]);
+});
+
+for (const preparation of [false, true]) {
+  test(`git retains scratch after unconfirmed termination during ${preparation ? "preparation" : "execution"}`, async () => {
+    const current = scope();
+    const memberFile = join(root, "descendant");
+    const launcher = [
+      process.execPath,
+      "-e",
+      `const child = require('node:child_process').spawn(process.execPath,
+        ['-e', "console.log('ready'); setInterval(() => {}, 1000)"],
+        {detached: true, stdio: ['ignore','pipe','ignore']});
+      child.stdout.once('data', () => {
+        require('fs').writeFileSync(${JSON.stringify(memberFile)}, String(child.pid));
+        process.exit(0);
+      });`,
+    ];
+    let scratch = "";
+    let scans = 0;
+    try {
+      const pending = processScope.run(current, () =>
+        processInspection.run(
+          async () => {
+            scans++;
+            throw new Error("injected first discovery failure");
+          },
+          () =>
+            gitConfinement.run(
+              {
+                wrap: async (_cmd, opts) => {
+                  scratch = invocationScratch.getStore() ?? "";
+                  if (preparation) await sh(launcher, opts);
+                  return launcher;
+                },
+              },
+              () => gitSh(["git", "status"], { cwd }),
+            ),
+        ),
+      );
+      await expect(pending).rejects.toBeInstanceOf(ProcessTerminationError);
+      await expect(pending).rejects.toThrow("injected first discovery failure");
+      const member = Number(readFileSync(memberFile, "utf8"));
+      expect(await processBirth(member)).not.toBeNull();
+      expect(recoveryProcessStopped(member)).toBe(false);
+      expect(scans).toBe(1);
+      expect(existsSync(scratch)).toBe(true);
+      expect([...current.scratchDirs]).toEqual([scratch]);
+    } finally {
+      if (existsSync(memberFile)) {
+        const member = Number(readFileSync(memberFile, "utf8"));
+        if (!recoveryProcessStopped(member)) process.kill(member, "SIGKILL");
+        const deadline = performance.now() + 5000;
+        while (!recoveryProcessStopped(member) && performance.now() < deadline) await Bun.sleep(10);
+      }
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
   });
 }
 
