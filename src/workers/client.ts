@@ -24,6 +24,7 @@ import {
   agentEnv,
   assertProcessesStopped,
   type ProcessCleanupStore,
+  type ProcessDiscovery,
   ProcessTerminationError,
   processScope,
   recoverProcessCleanups,
@@ -223,9 +224,32 @@ export async function runWorker(
   mkdirSync(home, { recursive: true });
   const held = [protectPrivateFile(join(home, "key.pem"))];
   const store = new Store(join(home, "worker.db"));
-  type RetainedJob = { root: string; cache: string; scratch: string[] };
+  type RetainedJob = {
+    root: string;
+    cache: string;
+    scratch: string[];
+    discoveries?: ProcessDiscovery[];
+    confirmed?: boolean;
+  };
   const retained = store.getSetting<Record<string, RetainedJob>>("worker.cleanups", {});
   const save = () => store.setSetting("worker.cleanups", retained);
+  const cleanups: ProcessCleanupStore = {
+    recordProcessCleanup: store.recordProcessCleanup.bind(store),
+    listProcessCleanups: store.listProcessCleanups.bind(store),
+    deleteProcessCleanup: store.deleteProcessCleanup.bind(store),
+    listProcessDiscoveries: () => Object.values(retained).flatMap((job) => job.discoveries ?? []),
+    deleteInvocationCleanups(invocation) {
+      store.db.transaction(() => {
+        store.deleteInvocationCleanups(invocation);
+        for (const job of Object.values(retained)) {
+          if (!job.discoveries?.some((row) => row.invocation === invocation)) continue;
+          job.discoveries = job.discoveries.filter((row) => row.invocation !== invocation);
+          job.confirmed = job.discoveries.length === 0;
+        }
+        save();
+      })();
+    },
+  };
   const cleanup = async ({ root, cache, scratch }: RetainedJob) => {
     if (dirname(root) !== cfg.paths.work || !basename(root).startsWith("worker-"))
       throw new Error("Invalid worker cleanup directory");
@@ -262,23 +286,50 @@ export async function runWorker(
         runId: id,
         checkout: () => join(root, "checkout"),
         cleanups: {
+          ...cleanups,
+          recordProcessDiscovery(row) {
+            retained[root] = {
+              root,
+              cache,
+              scratch: [...(processScope.getStore()?.scratchDirs ?? [])],
+              discoveries: [...(retained[root]?.discoveries ?? []), row],
+              confirmed: false,
+            };
+            save();
+          },
           recordProcessCleanup(row) {
             store.db.transaction(() => {
-              retained[root] = { root, cache, scratch: [...(processScope.getStore()?.scratchDirs ?? [])] };
+              retained[root] = {
+                ...retained[root],
+                root,
+                cache,
+                scratch: [...(processScope.getStore()?.scratchDirs ?? [])],
+              };
               save();
               store.recordProcessCleanup(row);
             })();
           },
-          listProcessCleanups: store.listProcessCleanups.bind(store),
-          deleteProcessCleanup: store.deleteProcessCleanup.bind(store),
-          deleteInvocationCleanups: store.deleteInvocationCleanups.bind(store),
         } satisfies ProcessCleanupStore,
       },
       run,
     );
   try {
-    await recoverProcessCleanups(store);
+    for (const job of Object.values(retained)) {
+      if (job.confirmed || job.discoveries?.length) continue;
+      // Older workers retained only identities. Rediscover from their context when available.
+      job.discoveries = store
+        .listProcessCleanups(undefined, join(job.root, "checkout"))
+        .flatMap((row) => (row.discovery ? [{ ...row, discovery: row.discovery }] : []));
+      if (!job.discoveries.length)
+        throw new ProcessTerminationError(
+          `${ProcessTerminationError.prefix}: missing worker discovery evidence`,
+        );
+    }
+    save();
+    await recoverProcessCleanups(cleanups);
     for (const [id, job] of Object.entries(retained)) {
+      if (!job.confirmed)
+        throw new ProcessTerminationError(`${ProcessTerminationError.prefix}: unresolved worker cleanup`);
       await scoped(
         id,
         job.root,
@@ -436,7 +487,13 @@ export async function runWorker(
             await cleanup({ root, cache, scratch: [...scope.scratchDirs] });
           } catch (error) {
             if (error instanceof ProcessTerminationError || scope.terminationError) {
-              retained[root] = { root, cache, scratch: [...scope.scratchDirs] };
+              retained[root] = {
+                ...retained[root],
+                root,
+                cache,
+                scratch: [...scope.scratchDirs],
+                confirmed: false,
+              };
               save();
               throw scope.terminationError ?? error;
             }

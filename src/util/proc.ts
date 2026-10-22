@@ -39,11 +39,16 @@ export interface ProcessCleanup {
   } | null;
 }
 export interface ProcessCleanupStore {
+  recordProcessDiscovery?(record: ProcessDiscovery): void;
+  listProcessDiscoveries?(): ProcessDiscovery[];
   recordProcessCleanup(record: ProcessCleanup): void;
   listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[];
   deleteProcessCleanup(invocation: string, pid: number): void;
   deleteInvocationCleanups(invocation: string): void;
 }
+export type ProcessDiscovery = Omit<ProcessCleanup, "pid" | "birth" | "discovery"> & {
+  discovery: NonNullable<ProcessCleanup["discovery"]>;
+};
 export const processCleanupStore = new AsyncLocalStorage<ProcessCleanupStore>();
 
 const invocationCleanups = new Map<string, Promise<void>>();
@@ -108,12 +113,14 @@ export const processRecoveryInspection = new AsyncLocalStorage<{
 
 export async function recoverProcessCleanups(
   store: ProcessCleanupStore,
-  records = store.listProcessCleanups(),
+  records?: ProcessCleanup[],
   stopped = processRecoveryInspection.getStore()?.stopped ?? recoveryProcessStopped,
   timeoutMs = processRecoveryInspection.getStore()?.timeoutMs ?? 10_000,
 ): Promise<void> {
-  if (!records.length) return;
-  const invocations = new Set(records.map((row) => row.invocation));
+  let discoveries = store.listProcessDiscoveries?.() ?? [];
+  const invocations = new Set((records ?? store.listProcessCleanups()).map((row) => row.invocation));
+  if (records === undefined) for (const row of discoveries) invocations.add(row.invocation);
+  if (!invocations.size) return;
   // Waiting for one invocation must not reserve unrelated invocations in this batch.
   for (;;) {
     const active = [...invocations].flatMap((invocation) => invocationCleanups.get(invocation) ?? []);
@@ -123,20 +130,25 @@ export async function recoverProcessCleanups(
   // Reserve the entire batch synchronously so overlapping recovery batches cannot deadlock.
   const release = await Promise.all([...invocations].map(ownInvocationCleanup));
   try {
-    records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
-    if (!records.length) return;
+    const records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
+    discoveries = (store.listProcessDiscoveries?.() ?? []).filter((row) => invocations.has(row.invocation));
+    if (!records.length && !discoveries.length) return;
     const boot = bootIdentity();
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
     const deadline = performance.now() + timeoutMs;
     for (const row of records) if (row.boot !== boot) store.deleteProcessCleanup(row.invocation, row.pid);
-    if (!records.some((row) => row.boot === boot)) return;
+    for (const row of discoveries) if (row.boot !== boot) store.deleteInvocationCleanups(row.invocation);
+    if (![...records, ...discoveries].some((row) => row.boot === boot)) return;
     const protectedPids = callerAncestors();
     const results = await Promise.allSettled(
       [...invocations].map(async (invocation) => {
         const members = records.filter((row) => row.invocation === invocation && row.boot === boot);
-        if (!members.length) return;
-        const anchor = members.find((row) => row.discovery);
+        const anchor =
+          discoveries.find((row) => row.invocation === invocation && row.boot === boot) ??
+          members.find((row) => row.discovery);
+        if (!members.length && !anchor) return;
         const context = anchor?.discovery;
+        if (anchor && !context) throw new Error(`Missing process discovery context for ${invocation}`);
         if (!context)
           console.warn(
             redactCredentials(
@@ -838,6 +850,15 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       shutdown ??= (async () => {
         const release = await ownInvocationCleanup(marker);
         try {
+          if (child.pid !== undefined)
+            (scope?.cleanups ?? processCleanupStore.getStore())?.recordProcessDiscovery?.({
+              runId: scope?.runId ?? null,
+              invocation: marker,
+              directory,
+              boot: bootIdentity(),
+              createdAt: Date.now(),
+              discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
+            });
           if (leaderInspectionError) throw leaderInspectionError;
           let killedRunningChild = false;
           if (child.pid !== undefined) {

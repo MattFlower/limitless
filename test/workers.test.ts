@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -859,6 +858,7 @@ async function loop(options: Parameters<typeof runWorker>[4] = {}, name = "loop-
 function workerCleanupRecords(remote: Config) {
   const local = new Store(join(remote.paths.home, "worker", "worker.db"));
   try {
+    expect(local.getSetting("worker.cleanups", {})).toEqual({});
     return local.listProcessCleanups();
   } finally {
     local.close();
@@ -2547,7 +2547,9 @@ test.each(["changed work path", "removal error"] as const)(
     writeFileSync(marker, "retained directory");
     mkdirSync(join(remote.paths.home, "worker"));
     const local = new Store(join(remote.paths.home, "worker", "worker.db"));
-    local.setSetting("worker.cleanups", { [root]: { root, cache: join(root, "repo.git"), scratch: [] } });
+    local.setSetting("worker.cleanups", {
+      [root]: { root, cache: join(root, "repo.git"), scratch: [], confirmed: true },
+    });
     local.close();
     const scratch = await import("../src/harness/scratch.ts"),
       original = scratch.removeScratch;
@@ -2583,6 +2585,41 @@ test.each(["changed work path", "removal error"] as const)(
   },
   30_000,
 );
+
+test("worker startup retains legacy cleanup without termination evidence across restarts", async () => {
+  const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+  const root = mkdtempSync(join(remote.paths.work, "worker-"));
+  const scratch = mkdtempSync(join(home, "scratch-"));
+  mkdirSync(join(root, "checkout"));
+  mkdirSync(join(remote.paths.home, "worker"));
+  const database = join(remote.paths.home, "worker", "worker.db");
+  const legacy = { [root]: { root, cache: join(root, "repo.git"), scratch: [scratch] } };
+  const local = new Store(database);
+  local.setSetting("worker.cleanups", legacy);
+  local.close();
+  let requests = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await expect(
+      runWorker("https://localhost", remote, releaseSha, new AbortController().signal, {
+        confinement: fakeConfinement,
+        request: async () => {
+          requests++;
+          throw new Error("Unexpected worker request");
+        },
+      }),
+    ).rejects.toThrow("missing worker discovery evidence");
+    expect(requests).toBe(0);
+    expect(existsSync(join(root, "checkout"))).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
+    const reopened = new Store(database);
+    try {
+      expect(reopened.listProcessCleanups()).toEqual([]);
+      expect(reopened.getSetting("worker.cleanups", {})).toEqual(legacy);
+    } finally {
+      reopened.close();
+    }
+  }
+});
 
 test("a job's ordinary directory cleanup failure drops retained metadata after confirmed termination", async () => {
   await listen();
@@ -4585,9 +4622,14 @@ test("worker update drains the agent session and its checkout before replacing i
   }
 }, 30_000);
 
-test.each(["agent", "gate"] as const)(
-  "worker retains a %s job after discovery failure and recovers it before accepting work",
-  async (kind) => {
+test.each([
+  ["agent", 0],
+  ["gate", 0],
+  ["agent", 1],
+  ["gate", 1],
+] as const)(
+  "worker retains a %s job after discovery fails with %i recorded scans and recovers before work",
+  async (kind, recordedScans) => {
     const server = await listen();
     const req = await request(true);
     req.gates.setup = [];
@@ -4601,13 +4643,9 @@ test.each(["agent", "gate"] as const)(
             target: { ...agentRequest().target, harness: "claude" },
           })
         : workers.enqueue(req);
-    const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
-      cwd: home,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    await new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
-    const pid = child.pid;
-    if (pid === undefined) throw new Error("Missing test process");
+    const pidFile = join(home, "owned-descendant");
+    let pid: number | undefined;
+    let invocation = "";
     let root = "",
       scratch = "",
       database = "",
@@ -4626,16 +4664,40 @@ test.each(["agent", "gate"] as const)(
       await expect(
         processInspection.run(
           async (withEnvironment, marker) => {
-            if (withEnvironment && ++scans > 1) throw new Error("injected discovery failure");
+            if (withEnvironment && ++scans > recordedScans) throw new Error("injected discovery failure");
+            const owned = JSON.parse(readFileSync(pidFile, "utf8")) as { pid: number; marker: string };
             const uid = process.getuid?.();
             return (
               `${process.pid} ${uid} S scanner LIMITLESS_PROCESS_SCAN=${marker}\n` +
-              `${pid} ${uid} S member${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`
+              `${owned.pid} ${uid} S member${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`
             );
           },
-          () => runProcess({ cmd: [process.execPath, "-e", ""], cwd, env: {} }),
+          () =>
+            runProcess({
+              cmd: [
+                process.execPath,
+                "-e",
+                `
+              const { spawn } = require('node:child_process');
+              const { existsSync } = require('node:fs');
+              const child = spawn(process.execPath, ['-e', ${JSON.stringify(`
+                require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({
+                  pid: process.pid, marker: process.env.LIMITLESS_INVOCATION,
+                }));
+                setInterval(() => {}, 1000);
+              `)}], { detached: true, stdio: 'ignore' });
+              child.unref();
+              while (!existsSync(${JSON.stringify(pidFile)})) await Bun.sleep(10);
+            `,
+              ],
+              cwd,
+              env: {},
+            }),
         ),
       ).rejects.toThrow(ProcessTerminationError.prefix);
+      const owned = JSON.parse(readFileSync(pidFile, "utf8")) as { pid: number; marker: string };
+      pid = owned.pid;
+      invocation = owned.marker;
       // Even a harness which catches the error must not turn this into success.
     };
     const worker = await loop({
@@ -4658,6 +4720,17 @@ test.each(["agent", "gate"] as const)(
         return reply;
       },
     });
+    const retained = () => {
+      const local = new Store(database);
+      try {
+        return local.getSetting<Record<string, { discoveries: { invocation: string; runId: string }[] }>>(
+          "worker.cleanups",
+          {},
+        );
+      } finally {
+        local.close();
+      }
+    };
     const records = () => {
       const local = new Store(database);
       try {
@@ -4685,7 +4758,16 @@ test.each(["agent", "gate"] as const)(
       expect(existsSync(root)).toBe(true);
       expect(existsSync(join(root, "checkout"))).toBe(true);
       expect(existsSync(scratch)).toBe(true);
-      expect(records()).toEqual([expect.objectContaining({ runId: id, pid, discovery: expect.any(Object) })]);
+      if (pid === undefined) throw new Error("Missing descendant PID");
+      const descendantPid = pid;
+      expect(recoveryProcessStopped(pid)).toBe(recordedScans > 0);
+      expect(records()).toEqual(
+        recordedScans ? [expect.objectContaining({ runId: id, pid, discovery: expect.any(Object) })] : [],
+      );
+      expect(retained()[root]?.discoveries).toEqual([
+        expect.objectContaining({ invocation, runId: id, discovery: expect.any(Object) }),
+      ]);
+      const unresolved = retained();
       for (const path of [database, `${database}-wal`, `${database}-shm`])
         expect(privateReadPaths()).not.toContain(path);
       let requests = 0;
@@ -4698,48 +4780,68 @@ test.each(["agent", "gate"] as const)(
           machineState: async () => ({ onAC: true, idleSeconds: 0 }),
           request,
         });
-      await expect(
-        processRecoveryInspection.run(
-          {
-            stopped: recoveryProcessStopped,
-            timeoutMs: 1000,
-            discover: async () => {
-              throw new Error("recovery inspection unavailable");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(
+          processRecoveryInspection.run(
+            {
+              stopped: recoveryProcessStopped,
+              timeoutMs: 1000,
+              discover: async () => {
+                throw new Error("recovery inspection unavailable");
+              },
             },
+            () =>
+              restart(new AbortController().signal, async (...args) => {
+                requests++;
+                return workerRequest(...args);
+              }),
+          ),
+        ).rejects.toThrow(ProcessTerminationError.prefix);
+        expect(requests).toBe(0);
+        expect(records()).toHaveLength(recordedScans);
+        expect(retained()).toEqual(unresolved);
+        expect(recoveryProcessStopped(pid)).toBe(recordedScans > 0);
+        expect(existsSync(join(root, "checkout"))).toBe(true);
+        expect(existsSync(scratch)).toBe(true);
+      }
+      const controller = new AbortController();
+      const kill = process.kill;
+      let recordedBeforeKill = false;
+      const signaling = spyOn(process, "kill").mockImplementation((target, signal) => {
+        if (target === pid && signal === "SIGKILL") {
+          expect(records()).toContainEqual(expect.objectContaining({ pid, invocation }));
+          expect(existsSync(root)).toBe(true);
+          expect(existsSync(scratch)).toBe(true);
+          recordedBeforeKill = true;
+        }
+        return kill(target, signal);
+      });
+      try {
+        await processRecoveryInspection.run(
+          {
+            stopped: (target) => {
+              expect(existsSync(root)).toBe(true);
+              expect(existsSync(scratch)).toBe(true);
+              return recoveryProcessStopped(target);
+            },
+            timeoutMs: 2000,
           },
           () =>
-            restart(new AbortController().signal, async (...args) => {
+            restart(controller.signal, async (...args) => {
               requests++;
+              expect(recoveryProcessStopped(descendantPid)).toBe(true);
+              expect(existsSync(root)).toBe(false);
+              expect(existsSync(scratch)).toBe(false);
+              expect(records()).toEqual([]);
+              expect(retained()).toEqual({});
+              controller.abort();
               return workerRequest(...args);
             }),
-        ),
-      ).rejects.toThrow(ProcessTerminationError.prefix);
-      expect(requests).toBe(0);
-      expect(records()).toHaveLength(1);
-      expect(existsSync(root)).toBe(true);
-      expect(existsSync(scratch)).toBe(true);
-      const controller = new AbortController();
-      await processRecoveryInspection.run(
-        {
-          stopped: recoveryProcessStopped,
-          timeoutMs: 2000,
-          discover: async () => {
-            expect(existsSync(root)).toBe(true);
-            expect(existsSync(scratch)).toBe(true);
-            return [];
-          },
-        },
-        () =>
-          restart(controller.signal, async (...args) => {
-            requests++;
-            expect(recoveryProcessStopped(pid)).toBe(true);
-            expect(existsSync(root)).toBe(false);
-            expect(existsSync(scratch)).toBe(false);
-            expect(records()).toEqual([]);
-            controller.abort();
-            return workerRequest(...args);
-          }),
-      );
+        );
+        expect(recordedBeforeKill).toBe(recordedScans === 0);
+      } finally {
+        signaling.mockRestore();
+      }
       expect(requests).toBe(1);
       if (kind === "gate") {
         const cache = join(worker.remote.paths.repos, `${encodeURIComponent(req.repo)}.git`);
@@ -4750,9 +4852,10 @@ test.each(["agent", "gate"] as const)(
       }
     } finally {
       await worker.stop();
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-      if (child.exitCode === null && child.signalCode === null)
-        await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      if (existsSync(pidFile)) {
+        const owned = JSON.parse(readFileSync(pidFile, "utf8")) as { pid: number };
+        if (!recoveryProcessStopped(owned.pid)) process.kill(owned.pid, "SIGKILL");
+      }
     }
   },
   30_000,
@@ -4789,7 +4892,13 @@ test("worker retains scratch when a harness directly throws a termination error"
     const local = new Store(join(worker.remote.paths.home, "worker", "worker.db"));
     try {
       expect(local.getSetting("worker.cleanups", {})).toEqual({
-        [dirname(cwd)]: { root: dirname(cwd), cache: join(dirname(cwd), "repo.git"), scratch: [scratch] },
+        [dirname(cwd)]: {
+          root: dirname(cwd),
+          cache: join(dirname(cwd), "repo.git"),
+          scratch: [scratch],
+          discoveries: [],
+          confirmed: false,
+        },
       });
     } finally {
       local.close();
