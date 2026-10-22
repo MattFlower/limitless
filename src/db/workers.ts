@@ -4,7 +4,7 @@ import { redactGateData } from "../gates/output.ts";
 import type { GateRun } from "../gates/run.ts";
 import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
-import { registerCredential } from "../util/proc.ts";
+import { redactCredentialData, registerCredential } from "../util/proc.ts";
 import {
   type Capabilities,
   Claim,
@@ -54,6 +54,7 @@ export interface AgentJobRequest extends Pick<AgentSpec, "prompt" | "target" | "
   runId: string;
   invocationId: number;
   parentSha: string;
+  baseSha?: string;
 }
 export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_order" | "events"> {
   invocation_id: number;
@@ -316,6 +317,13 @@ export class WorkerStore {
     const j = this.agentJob(id);
     return j?.state === "leased" && j.worker === name ? j : null;
   }
+  agentJobEvents(id: string, seq: number, events: unknown) {
+    this.store.db
+      .query(
+        "INSERT INTO agent_job_events (job_id,seq,events,created_at) VALUES (?,?,?,?) ON CONFLICT(job_id,seq) DO NOTHING",
+      )
+      .run(id, seq, JSON.stringify(redactCredentialData(events)), this.now());
+  }
   failAgentJob(id: string, reason: string) {
     this.store.db
       .transaction(() => {
@@ -386,7 +394,7 @@ export class WorkerStore {
     const owned = new Set(
       this.store.db
         .query<{ id: string }, [string, string]>(
-          "SELECT id FROM gate_jobs WHERE state='leased' AND worker=? AND id IN (SELECT value FROM json_each(?))",
+          "SELECT id FROM (SELECT id,worker,state FROM gate_jobs UNION ALL SELECT id,worker,state FROM agent_jobs) WHERE state='leased' AND worker=? AND id IN (SELECT value FROM json_each(?))",
         )
         .all(name, JSON.stringify(ids))
         .map((j) => j.id),
