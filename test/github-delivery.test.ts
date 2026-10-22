@@ -246,3 +246,45 @@ if(args[1] === "view") {
     githubRetry.baseDelayMs = delay;
   }
 });
+
+test("explicit run-branch lease permits updates and rewinds and recovers an already-landed push", async () => {
+  const branch = "dependabot/npm/pkg-2";
+  const ref = `refs/heads/${branch}`;
+  const base = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  writeFileSync(join(work, "file.txt"), "next\n");
+  await git(work, "commit", "-qam", "next");
+  const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  const bareLease = await sh(["git", "push", "--force-with-lease", bare, `${head}:${ref}`], {
+    cwd: work,
+    allowFail: true,
+  });
+  expect(bareLease.exitCode).not.toBe(0);
+  expect(bareLease.stderr).toContain("stale info");
+  await expect(pushBranch(repo, work, branch, head, undefined, undefined, null)).rejects.toThrow();
+  expect(await remoteBranchSha(repo, work, branch)).toBe(base);
+  await pushBranch(repo, work, branch, head, undefined, undefined, base);
+  expect(await remoteBranchSha(repo, work, branch)).toBe(head);
+  await pushBranch(repo, work, branch, base, undefined, undefined, head);
+  expect(await remoteBranchSha(repo, work, branch)).toBe(base);
+  await pushBranch(repo, work, "new-branch", head, undefined, undefined, null);
+  expect(await remoteBranchSha(repo, work, "new-branch")).toBe(head);
+  await pushBranch(repo, work, "new-branch", head, undefined, undefined, head);
+  // Force the refusal path, even on Git versions that accept an up-to-date push with a stale lease.
+  const original = command.cacheGit;
+  let refused = false;
+  const refusal = new Error("synthetic stale lease");
+  const spy = spyOn(command, "cacheGit").mockImplementation((args, ...rest) => {
+    if (args.includes("push")) {
+      refused = true;
+      throw refusal;
+    }
+    return original(args, ...rest);
+  });
+  try {
+    await pushBranch(repo, work, "new-branch", head, undefined, undefined, null);
+    expect(refused).toBe(true);
+    await expect(pushBranch(repo, work, branch, head, undefined, undefined, null)).rejects.toBe(refusal);
+  } finally {
+    spy.mockRestore();
+  }
+});

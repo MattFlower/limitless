@@ -83,6 +83,7 @@ export interface AgentJobRequest
   };
   repoUrl?: string;
   expectedRemoteSha?: string | null;
+  privateStringsDigest?: string;
   discreet?: boolean;
   uiUrl?: string;
 }
@@ -412,6 +413,11 @@ export class WorkerStore {
         "UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','leased','failed')",
       )
       .run(this.now(), id);
+  }
+  cancelOpenAgentJobs() {
+    this.store.db
+      .query("UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE state IN ('queued','leased')")
+      .run(this.now());
   }
   cancelRunAgentJobs(runId: string) {
     this.store.db

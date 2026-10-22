@@ -32,6 +32,7 @@ import {
   localExecutor,
 } from "../src/gates/executor.ts";
 import { redactGateData } from "../src/gates/output.ts";
+import { loadPrivateStrings, privateStringsDigest } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -4447,6 +4448,7 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
     branch: "change/agent",
     baseSha: releaseSha,
     commit: publicationCommit,
+    privateStringsDigest: privateStringsDigest([]),
     repoUrl: "https://github.com/example/repository.git",
     expectedRemoteSha: null,
     discreet: true,
@@ -4756,6 +4758,75 @@ test("agent failure validates the supplied reason and preserves sanitized retry 
     excluded: '["runner","second"]',
   });
 });
+
+test("publishing result requires the assigned branch and matching private-list echo", async () => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const digest = privateStringsDigest([]);
+  for (const requestDigest of [digest, undefined]) {
+    const id = enqueueAgent({
+      commit: publicationCommit,
+      branch: "change/example",
+      privateStringsDigest: requestDigest,
+    });
+    expect(workers.leaseAgentJob("runner")?.id).toBe(id);
+    for (const invalid of [
+      {},
+      { privateStringsDigest: "0".repeat(64) },
+      { privateStringsDigest: digest, branch: "change/other" },
+      ...(requestDigest ? [] : [{ privateStringsDigest: digest }]),
+    ]) {
+      expect((await call(agentPath(id, "result"), { ...agentResult(), ...invalid }, token)).status).toBe(400);
+      expect(workers.agentJob(id)?.state).toBe("leased");
+    }
+    if (requestDigest) {
+      expect(
+        (await call(agentPath(id, "result"), { ...agentResult(), privateStringsDigest: digest }, token))
+          .status,
+      ).toBe(200);
+      expect(workers.agentJob(id)?.state).toBe("done");
+    } else workers.cancelAgentJob(id);
+  }
+  const legacy = enqueueAgent();
+  workers.leaseAgentJob("runner");
+  expect((await call(agentPath(legacy, "result"), agentResult(), token)).status).toBe(200);
+  expect(workers.agentJob(legacy)?.state).toBe("done");
+});
+
+test.each(["start", "stop"])(
+  "Factory %s cancels only open agent jobs and heartbeats report cancellation",
+  async (action) => {
+    await listen();
+    const token = await paired();
+    await call("/worker/heartbeat", caps(), token);
+    const done = enqueueAgent();
+    workers.leaseAgentJob("runner");
+    workers.completeAgentJob(done, {}, releaseSha);
+    const failed = enqueueAgent();
+    workers.failAgentJob(failed, "failed");
+    workers.failAgentJob(failed, "failed");
+    const leased = enqueueAgent();
+    workers.leaseAgentJob("runner");
+    const queued = enqueueAgent();
+    const factory = new Factory(cfg, { store, bootSha: releaseSha, models: [], providers: [] });
+    expect(workers.agentJob(leased)?.state).toBe("leased");
+    expect(workers.agentJob(queued)?.state).toBe("queued");
+    try {
+      if (action === "start") factory.start();
+      else await factory.stop();
+      expect(workers.agentJob(done)?.state).toBe("done");
+      expect(workers.agentJob(failed)?.state).toBe("failed");
+      expect(workers.agentJob(leased)?.state).toBe("cancelled");
+      expect(workers.agentJob(queued)?.state).toBe("cancelled");
+      expect((await call("/worker/heartbeat", caps([leased]), token)).json()).toMatchObject({
+        cancelled: [leased],
+      });
+    } finally {
+      await factory.stop();
+    }
+  },
+);
 
 test("agent event volume stores 2,000 ordered events in 10 durable batches", async () => {
   for (let i = 0; i < 600; i++) registerCredential(`AGENT_VOLUME_${i}`, randomBytes(24).toString("hex"));
@@ -6071,6 +6142,9 @@ test.each([
   "readonly legacy",
   "legacy",
   "legacy changed",
+  "missing digest",
+  "different digest",
+  "list changed during session",
   "missing lease",
   "missing base",
   "missing ui",
@@ -6080,6 +6154,7 @@ test.each([
   "private ancestor diff",
   "private branch",
   "private published ancestor",
+  "nonancestor remote",
   "private nonancestor remote",
   "discreet message",
   "discreet identity",
@@ -6120,6 +6195,12 @@ test.each([
           : undefined,
       ...(!kind.includes("legacy")
         ? {
+            privateStringsDigest:
+              kind === "missing digest"
+                ? undefined
+                : kind === "different digest"
+                  ? "0".repeat(64)
+                  : privateStringsDigest(loadPrivateStrings(workerConfig)),
             repoUrl: remote,
             expectedRemoteSha: kind === "missing lease" ? undefined : null,
             discreet: kind.includes("discreet") || kind === "private branch",
@@ -6220,13 +6301,14 @@ test.each([
           .run(JSON.stringify({ ...req, expectedRemoteSha: parent }), id);
       }
     }
-    if (kind === "private nonancestor remote") {
+    if (kind.endsWith("nonancestor remote")) {
       remoteBefore = (
         await sh(["git", "commit-tree", `${base}^{tree}`, "-p", base, "-m", "Independent remote head"], {
           cwd: remote,
         })
       ).stdout.trim();
       await sh(["git", "update-ref", ref, remoteBefore], { cwd: remote });
+      await sh(["git", "fetch", remote, remoteBefore], { cwd: join(cfg.paths.repos, "test__repo.git") });
       const req: AgentJobRequest = JSON.parse(workers.agentJob(id)?.request ?? "{}");
       store.db
         .query("UPDATE agent_jobs SET request=? WHERE id=?")
@@ -6282,8 +6364,8 @@ test.each([
             expect(lookups).toBe(0);
             session = JSON.stringify({ spec, env: proc.agentEnv() });
             expect(session).not.toContain(token);
-            if (kind === "private nonancestor remote")
-              await sh(["git", "fetch", "--no-tags", remote, remoteBefore], { cwd: spec.cwd });
+            if (kind === "list changed during session")
+              writeFileSync(join(workerConfig, "private-strings.txt"), "changed-list-entry");
             if (kind.startsWith("session committed")) {
               writeFileSync(join(spec.cwd, "session-change"), "Session commit\n");
               await realWorktreeGit(["git", "add", "."], { cwd: spec.cwd });
@@ -6319,6 +6401,7 @@ test.each([
         "replace",
         "clean discreet",
         "private published ancestor",
+        "nonancestor remote",
         "discreet existing branch",
       ].includes(kind);
       const unchanged = ["unchanged", "readonly", "readonly legacy", "legacy"].includes(kind);
@@ -6342,30 +6425,38 @@ test.each([
           sha,
           branch,
           status: "error",
+          privateStringsDigest: originalRequest.privateStringsDigest,
         });
       } else {
         expect(actual).toBe(remoteBefore);
-        if (unchanged) expect(job?.result_sha).toBe(parent);
-        else {
-          const reason = kind.startsWith("private")
-            ? "private string"
-            : kind.startsWith("discreet")
-              ? "factory-marked"
-              : kind.startsWith("credential")
-                ? "credential"
-                : kind.includes("existing") || kind === "moved"
-                  ? "branch moved"
-                  : kind === "legacy changed" || kind.startsWith("missing")
-                    ? "publication metadata"
-                    : kind === "HEAD inspection failure"
-                      ? "Cannot inspect worker HEAD"
-                      : kind.startsWith("session committed")
-                        ? "session moved HEAD"
-                        : kind === "unknown remote"
-                          ? "Cannot inspect expected remote commit"
-                          : kind === "auth failure"
-                            ? "gh auth token failed: non-zero exit"
-                            : "withheld";
+        if (unchanged) {
+          expect(job?.result_sha).toBe(parent);
+          if (originalRequest.commit)
+            expect(JSON.parse(job?.result ?? "{}").privateStringsDigest).toBe(
+              originalRequest.privateStringsDigest,
+            );
+        } else {
+          const reason = ["missing digest", "different digest", "list changed during session"].includes(kind)
+            ? "Worker private-strings list differs from the coordinator's; publication blocked"
+            : kind.startsWith("private")
+              ? "private string"
+              : kind.startsWith("discreet")
+                ? "factory-marked"
+                : kind.startsWith("credential")
+                  ? "credential"
+                  : kind.includes("existing") || kind === "moved"
+                    ? "branch moved"
+                    : kind === "legacy changed" || kind.startsWith("missing")
+                      ? "publication metadata"
+                      : kind === "HEAD inspection failure"
+                        ? "Cannot inspect worker HEAD"
+                        : kind.startsWith("session committed")
+                          ? "session moved HEAD"
+                          : kind === "unknown remote"
+                            ? "Coordinator refused worker request (400)"
+                            : kind === "auth failure"
+                              ? "gh auth token failed: non-zero exit"
+                              : "withheld";
           expect(job?.failure_reason).toContain(reason);
           if (kind === "credential branch") {
             expect(job?.failure_reason).toBe("Registered worker credential in publication; push blocked");
@@ -6379,7 +6470,7 @@ test.each([
       if (shouldPush) {
         const args = pushCalls[0]?.[0] ?? [];
         expect(args).toContain(
-          `--force-with-lease=${ref}:${["replace", "moved", "private published ancestor", "discreet existing branch"].includes(kind) ? parent : ""}`,
+          `--force-with-lease=${ref}:${kind === "nonancestor remote" ? remoteBefore : ["replace", "moved", "private published ancestor", "discreet existing branch"].includes(kind) ? parent : ""}`,
         );
         expect(args.at(-1)).toMatch(new RegExp(`^[a-f0-9]{40}:${ref}$`));
         expect(args).toContain("--no-follow-tags");
@@ -6421,6 +6512,13 @@ test.each([
         expect(commits).toHaveLength(0);
         expect(lookups).toBe(0);
       }
+      if (["missing digest", "different digest"].includes(kind)) {
+        expect(session).toBe("");
+        expect(argv.some((args) => args.includes("bundle"))).toBe(false);
+        expect(remoteRef.exitCode).not.toBe(0);
+      }
+      if (originalRequest.privateStringsDigest)
+        expect(session).not.toContain(originalRequest.privateStringsDigest);
       expect(existsSync(sentinel)).toBe(false);
       expect(JSON.stringify(argv)).not.toContain(token);
       expect(JSON.stringify(argv)).not.toContain(Buffer.from(`x-access-token:${token}`).toString("base64"));

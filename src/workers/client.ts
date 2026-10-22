@@ -9,6 +9,7 @@ import { isBranchName } from "../core/delivery.ts";
 import { Store } from "../db/store.ts";
 import type { GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
+import { loadPrivateStrings, privateStringsDigest } from "../gates/private.ts";
 import { runLocalGates } from "../gates/run.ts";
 import { gateSlots } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
@@ -118,6 +119,7 @@ const WireRequest = z.object({
 });
 const AgentRequest = z.object({
   // Validate publication metadata per job so a malformed lease cannot stop the worker.
+  privateStringsDigest: z.unknown().optional(),
   commit: z.unknown().optional(),
   repoUrl: z.unknown().optional(),
   expectedRemoteSha: z.unknown().optional(),
@@ -773,12 +775,19 @@ export async function runWorker(
         if (!publication.success) throw new Error("Invalid agent publication metadata");
         const req = {
           ...request,
+          privateStringsDigest: publication.data.privateStringsDigest,
           commit: publication.data.commit,
           repoUrl: publication.data.repoUrl,
           expectedRemoteSha: publication.data.expectedRemoteSha,
           discreet: publication.data.discreet,
           uiUrl: publication.data.uiUrl,
         };
+        if (
+          req.commit &&
+          req.privateStringsDigest !== privateStringsDigest(loadPrivateStrings(cfg.paths.configDir))
+        )
+          throw new Error("Worker private-strings list differs from the coordinator's; publication blocked");
+        const { privateStringsDigest: digest, ...session } = req;
         const name = req.target.harness;
         const harness =
           name === "claude" || name === "codex"
@@ -792,7 +801,7 @@ export async function runWorker(
         await withCheckout(id, root, join(root, "repo.git"), req.parentSha, path, jobSignal, async (cwd) => {
           sanitize = agentPathMask([cwd, root ?? cwd]);
           const spec: AgentSpec = {
-            ...req,
+            ...session,
             target: { ...req.target, harness: name },
             cwd,
             mode: req.mode ?? "edit",
@@ -831,7 +840,13 @@ export async function runWorker(
             options.tokenLookup,
           );
           const report = AgentResultReport.parse(
-            sanitize({ ...result, parentSha: req.parentSha, sha, branch: req.branch }),
+            sanitize({
+              ...result,
+              parentSha: req.parentSha,
+              sha,
+              branch: req.branch,
+              ...(req.commit ? { privateStringsDigest: digest } : {}),
+            }),
           );
           assertProcessesStopped();
           return () => call(`${path}/result`, report, jobSignal);

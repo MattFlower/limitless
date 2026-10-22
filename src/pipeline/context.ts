@@ -78,6 +78,8 @@ export interface RunState {
   verdictCommentPending?: boolean;
   phase: Phase;
   worktreePath?: string;
+  /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
+  publishedSha?: string;
   /** Worktree spellings used by report rendering, so removed worktrees stay rewritable. */
   worktreeAliases?: string[];
   gatesConfig?: GateConfig;

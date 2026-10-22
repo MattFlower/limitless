@@ -2342,7 +2342,9 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
+  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget, ctx.state.publishedSha ?? null);
+  ctx.state.publishedSha = sha;
+  await ctx.save("delivery-pushed");
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
@@ -2771,7 +2773,17 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${branch}`, value: undefined };
     }
     ctx.checkCancelled();
-    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, head, ctx.signal, budget);
+    await pushBranch(
+      ctx.repo,
+      cwd,
+      ctx.run.branch as string,
+      head,
+      ctx.signal,
+      budget,
+      ctx.state.publishedSha ?? null,
+    );
+    ctx.state.publishedSha = head;
+    await ctx.save("delivery-pushed");
     ctx.checkCancelled();
     const url = await createPullRequest(ctx.repo, {
       branch: ctx.run.branch as string,

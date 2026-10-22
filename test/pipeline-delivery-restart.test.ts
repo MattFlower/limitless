@@ -162,12 +162,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
     return { f, run, state, bare, base, merge, cwd: state.worktreePath };
   }
 
-  test.each(["recorded", "legacy", "HEAD moved before push"])(
+  test.each(["recorded", "legacy", "worker published", "HEAD moved before push"])(
     "delivery resumes a gated merge when the base advances a second time (%s)",
     async (scenario) => {
       const { f, run, state, bare, base, merge, cwd } = await interruptGatedMerge();
       if (scenario === "legacy") {
         state.deliveryMerges = undefined;
+        f.store.setRunState(run.id, state);
+      }
+      if (scenario === "worker published") {
+        const branch = f.store.getRun(run.id)?.branch;
+        await sh(["git", "push", bare, `${state.reviewedSha}:refs/heads/${branch}`], { cwd });
+        state.publishedSha = state.reviewedSha;
         f.store.setRunState(run.id, state);
       }
       const nextBase = await advanceBase(bare, "again.txt", "second base\n");
@@ -207,6 +213,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(
           resumed.store.listStages(run.id).filter((s) => s.name === "gates" && s.status === "succeeded"),
         ).toHaveLength(3);
+        expect(resumed.store.getRunState<RunState>(run.id)?.publishedSha).toBe(newest);
         expect(finished?.error).toBeNull();
         expect(status).toBe("succeeded");
         expect(

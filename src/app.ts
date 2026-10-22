@@ -277,6 +277,7 @@ export class Factory {
         .filter((p) => p.sshForward && this.tracker.isEnabled(p.id))
         .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
     );
+    this.workers.cancelOpenAgentJobs();
     this.scheduler.start();
   }
 
@@ -287,6 +288,7 @@ export class Factory {
     await this.gcInFlight;
     this.tunnels.stop();
     await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
+    this.workers.cancelOpenAgentJobs();
   }
 
   gc(dryRun = false): Promise<GcResult> {

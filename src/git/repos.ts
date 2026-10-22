@@ -9,6 +9,7 @@ import { type Config, type Paths, repoSettings } from "../config.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import type { AgentJobRequest } from "../db/workers.ts";
 import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
@@ -453,12 +454,20 @@ export async function fetchBase(
   const cache = cachePath(paths, repo);
   return withRepoLock(cache, async () => {
     const ref = `refs/heads/${branch}`;
-    await remoteSh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
-      cwd: cache,
-      timeoutMs: 300_000,
-      signal,
-      budget,
-    });
+    await remoteSh(
+      [
+        "git",
+        "fetch",
+        repo.kind === "github" ? (repo.url ?? "origin") : "origin",
+        `+${ref}:refs/remotes/origin/${branch}`,
+      ],
+      {
+        cwd: cache,
+        timeoutMs: 300_000,
+        signal,
+        budget,
+      },
+    );
     return (
       await worktreeGit(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })
     ).stdout.trim();
@@ -578,6 +587,60 @@ export async function commitAll(
     { ...opts, ...(options.verbatim ? { stdin: message } : {}) },
   );
   return headSha(cwd);
+}
+
+/** Adopt only the exact, coordinator-authored shape published on the worker branch. */
+export async function adoptWorkerCommit(
+  paths: Paths,
+  repo: Repo,
+  cwd: string,
+  {
+    branch,
+    parentSha,
+    sha,
+    commit,
+  }: { branch: string; parentSha: string; sha: string; commit: NonNullable<AgentJobRequest["commit"]> },
+  signal?: AbortSignal,
+): Promise<void> {
+  if ((await fetchBase(paths, repo, branch, signal)) !== sha)
+    throw new Error("Worker branch tip is not the reported commit");
+  const raw = await worktreeGit(["git", "--no-replace-objects", "cat-file", "commit", sha], {
+    cwd,
+    signal,
+    encoding: "latin1",
+  });
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(raw.stdout, "latin1"));
+  } catch {
+    throw new Error("Worker commit is not valid UTF-8");
+  }
+  const split = text.indexOf("\n\n");
+  const headers = text.slice(0, split).split("\n");
+  if (
+    split < 0 ||
+    headers.length !== 4 ||
+    !/^tree [a-f0-9]+$/.test(headers[0] ?? "") ||
+    headers[1] !== `parent ${parentSha}`
+  )
+    throw new Error("Worker commit headers are not adoptable");
+  for (const [index, field, name, email] of [
+    [2, "author", commit.authorName, commit.authorEmail],
+    [3, "committer", commit.committerName, commit.committerEmail],
+  ] as const) {
+    const identity = /^(author|committer) (.+) <([^<>]+)> -?\d+ [+-]\d{4}$/.exec(headers[index] ?? "");
+    if (!identity || identity[1] !== field || identity[2] !== name || identity[3] !== email)
+      throw new Error("Worker commit identity mismatch");
+  }
+  if (text.slice(split + 2) !== commit.message) throw new Error("Worker commit message mismatch");
+  if ((await headSha(cwd)) !== parentSha) throw new Error("Worker adoption HEAD is not parentSha");
+  if (
+    (await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd, signal })).stdout !==
+    ""
+  )
+    throw new Error("Worker adoption worktree is dirty");
+  signal?.throwIfAborted();
+  await resetTo(cwd, sha);
 }
 
 /** Move the worktree's branch back to a known commit, discarding everything after it. */
@@ -1465,6 +1528,7 @@ export async function pushBranch(
   sha = "HEAD",
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  expected: string | null = null,
 ): Promise<void> {
   if (repo.kind === "local") {
     if (!repo.localPath) throw new Error("local repository path is missing");
@@ -1494,14 +1558,19 @@ export async function pushBranch(
   const url = repo.url;
   if (!url) return;
   const head = (await worktreeGit(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
-  await withTransportRepo(cwd, head, signal, (transport) =>
-    remoteSh([...BRANCH_PUSH, "--force-with-lease", url, `${head}:refs/heads/${branch}`], {
-      cwd: transport,
-      timeoutMs: 300_000,
-      signal,
-      budget,
-    }),
-  );
+  const ref = `refs/heads/${branch}`;
+  try {
+    await withTransportRepo(cwd, head, signal, (transport) =>
+      remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${expected ?? ""}`, url, `${head}:${ref}`], {
+        cwd: transport,
+        timeoutMs: 300_000,
+        signal,
+        budget,
+      }),
+    );
+  } catch (error) {
+    if ((await remoteBranchSha(repo, cwd, branch, signal, budget).catch(() => null)) !== head) throw error;
+  }
 }
 
 export async function remoteBranchSha(
