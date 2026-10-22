@@ -17,6 +17,40 @@ import { privateReadPaths } from "../src/util/private-reads.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
 
+test.each(['"implement"', "[1]", '["unknown"]', "true"])("workers.agents refuses %s", (value) => {
+  const fixture = providerFixture();
+  try {
+    writeFileSync(fixture.file, `[workers]\nagents = ${value}\n`);
+    expect(fixture.load).toThrow("workers.agents");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("workers agents opt in independently of gates and known unsupported roles warn once", async () => {
+  const fixture = providerFixture();
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  let factory: Factory | undefined;
+  try {
+    writeFileSync(fixture.file, '[workers]\nlisten = "127.0.0.1:7443"\nagents = ["implement"]\n');
+    const cfg = fixture.load();
+    expect(cfg.workers.agents).toEqual(["implement"]);
+    factory = new Factory(cfg, { bootSha: "f".repeat(40) });
+    expect(factory.deps.agentExecutor?.kind).toBe("lan");
+    expect(cfg.gateExecutor).toBe("local");
+    writeFileSync(fixture.file, '[workers]\nagents = ["review", "review"]\n');
+    warn.mockClear();
+    expect(fixture.load().workers.agents).toEqual(["review", "review"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("review stays local in this release");
+  } finally {
+    await factory?.stop();
+    factory?.store.close();
+    warn.mockRestore();
+    fixture.close();
+  }
+});
+
 test.each([
   [undefined, 2],
   ["0", 0],
