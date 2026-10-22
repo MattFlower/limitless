@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdtempSync, realpathSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { ConfinementError } from "../harness/read-policy.ts";
-import { CommandError, invocationScratch, sh } from "../util/proc.ts";
+import { CommandError, invocationScratch, ProcessTerminationError, processScope, sh } from "../util/proc.ts";
 
 export { ConfinementError };
 
@@ -126,6 +126,9 @@ function checkApply(result: { exitCode: number | null; stderr: string }): void {
 export const gitSh = async (cmd: string[], opts: GitOptions): ReturnType<typeof sh> => {
   const inherited = invocationScratch.getStore();
   const scratch = inherited ?? mkdtempSync(join(tmpdir(), "limitless-git-"));
+  const scope = processScope.getStore();
+  if (!inherited) scope?.scratchDirs.add(scratch);
+  let unconfirmed = false;
   try {
     return await invocationScratch.run(scratch, async () => {
       opts = { ...opts, env: { ...(opts.env ?? process.env), TMPDIR: scratch } };
@@ -133,6 +136,7 @@ export const gitSh = async (cmd: string[], opts: GitOptions): ReturnType<typeof 
       try {
         wrapped = await (gitConfinement.getStore() ?? gitBackend.default).wrap(cmd, opts);
       } catch (error) {
+        if (error instanceof ProcessTerminationError) throw error;
         opts.signal?.throwIfAborted();
         if (error instanceof ConfinementError) throw error;
         throw new ConfinementError("Cannot prepare Git confinement");
@@ -146,7 +150,13 @@ export const gitSh = async (cmd: string[], opts: GitOptions): ReturnType<typeof 
         throw error;
       }
     });
+  } catch (error) {
+    unconfirmed = error instanceof ProcessTerminationError;
+    throw error;
   } finally {
-    if (!inherited) rmSync(scratch, { recursive: true, force: true });
+    if (!inherited && !unconfirmed && !scope?.terminationError) {
+      rmSync(scratch, { recursive: true, force: true });
+      scope?.scratchDirs.delete(scratch);
+    }
   }
 };

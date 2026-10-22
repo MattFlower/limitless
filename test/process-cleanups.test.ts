@@ -7,11 +7,13 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/db/store.ts";
+import { withRepoLock } from "../src/git/repos.ts";
 import {
   bootIdentity,
   type ProcessCleanup,
@@ -19,6 +21,7 @@ import {
   processBirth,
   processBirthInspection,
   processBootInspection,
+  processCleanupStore,
   processInspection,
   processRecoveryInspection,
   processScope,
@@ -86,9 +89,9 @@ async function expectProcessFrozen(pid: number) {
   expect(await processState(pid)).toBe("T");
 }
 
-async function sleeper(): Promise<ProcessCleanup> {
+async function sleeper(cwd = directory): Promise<ProcessCleanup> {
   const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
-    cwd: directory,
+    cwd,
     stdio: ["ignore", "pipe", "ignore"],
   });
   children.push(child);
@@ -100,12 +103,12 @@ async function sleeper(): Promise<ProcessCleanup> {
   return {
     runId: "a",
     invocation: crypto.randomUUID(),
-    directory,
+    directory: cwd,
     pid,
     birth,
     boot: bootIdentity(),
     createdAt: Date.now(),
-    discovery: { group: pid, started: Date.now(), directories: [directory], leader: null, spawnedAt: "0" },
+    discovery: { group: pid, started: Date.now(), directories: [cwd], leader: null, spawnedAt: "0" },
   };
 }
 
@@ -808,6 +811,143 @@ test("shared directories and path siblings do not link runs; missing checkouts s
   await processScope.run(current, recoverScopedProcesses);
   expect(store.listProcessCleanups("a")).toEqual([]);
   expect(store.listProcessCleanups()).toHaveLength(2);
+});
+
+for (const ambient of [false, true]) {
+  test(`repository lock recovers shared cache ownership using ${ambient ? "ambient" : "scoped"} store`, async () => {
+    const cache = join(directory, "cache.git");
+    const alias = join(directory, "alias");
+    const checkout = join(directory, "next-checkout");
+    for (const path of [cache, checkout]) mkdirSync(path);
+    symlinkSync(directory, alias);
+    const row = await sleeper(cache);
+    const sibling = { ...(await sleeper()), directory: `${cache}-sibling` };
+    store.recordProcessCleanup({ ...row, directory: join(alias, "cache.git") });
+    store.recordProcessCleanup(sibling);
+    const current = { ...scope(), runId: "next-job", checkout: () => checkout };
+    const recover = mock(processBirth);
+    const operation = () =>
+      withRepoLock(cache, async () => {
+        expectProcessStopped(row.pid);
+        expect(store.listProcessCleanups()).toEqual([sibling]);
+        expect(recoveryProcessStopped(sibling.pid)).toBe(false);
+        return "ran";
+      });
+    const result = await processRecoveryInspection.run(
+      { stopped: recoveryProcessStopped, timeoutMs: 10_000, birth: recover },
+      () =>
+        processInspection.run(
+          async (environment, marker) => snapshot([], environment, marker),
+          () => (ambient ? processCleanupStore.run(store, operation) : processScope.run(current, operation)),
+        ),
+    );
+    expect(result).toBe("ran");
+    expect(recover).toHaveBeenCalledWith(row.pid);
+    expect(recover).not.toHaveBeenCalledWith(sibling.pid);
+  });
+}
+
+test("queued cache callers inspect after release and retry a failed cleanup before entering", async () => {
+  const cache = join(directory, "cache.git");
+  const alias = join(directory, "alias");
+  symlinkSync(directory, alias);
+  // Lock aliases must agree even before the cache exists.
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const inspect = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const retryInspect = Promise.withResolvers<void>();
+  const retryResume = Promise.withResolvers<void>();
+  const recovered = mock(async (environment: boolean, marker: string) => {
+    retryInspect.resolve();
+    await retryResume.promise;
+    return snapshot([], environment, marker);
+  });
+  const callback = mock(async () => {});
+  const holder = withRepoLock(cache, async () => {
+    entered.resolve();
+    await release.promise;
+  });
+  let pending: Promise<PromiseSettledResult<unknown>[]> | undefined;
+  let failed: Promise<void> | undefined;
+  let retry: Promise<string> | undefined;
+  try {
+    await entered.promise;
+    failed = processScope.run({ ...scope(), runId: "failed-job" }, () =>
+      processInspection.run(
+        async () => {
+          inspect.resolve();
+          await resume.promise;
+          throw new Error("injected cache discovery failure");
+        },
+        () => withRepoLock(join(alias, "cache.git"), callback),
+      ),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(callback).not.toHaveBeenCalled();
+    // This record appears only after the next caller has queued for the lock.
+    mkdirSync(cache);
+    const row = await sleeper(cache);
+    store.recordProcessCleanup(row);
+    const records = store.listProcessCleanups();
+    retry = processScope.run({ ...scope(), runId: "retry-job" }, () =>
+      processInspection.run(recovered, () =>
+        withRepoLock(cache, async () => {
+          expectProcessStopped(row.pid);
+          expect(store.listProcessCleanups()).toEqual([]);
+          return "recovered";
+        }),
+      ),
+    );
+    pending = Promise.allSettled([failed, retry]);
+    release.resolve();
+    await inspect.promise;
+    expect(callback).not.toHaveBeenCalled();
+    expect(recovered).not.toHaveBeenCalled();
+    expect(store.listProcessCleanups()).toEqual(records);
+    expect(recoveryProcessStopped(row.pid)).toBe(false);
+    resume.resolve();
+    await retryInspect.promise;
+    await expect(failed).rejects.toBeInstanceOf(ProcessTerminationError);
+    expect(store.listProcessCleanups()).toEqual(records);
+    expect(recoveryProcessStopped(row.pid)).toBe(false);
+    retryResume.resolve();
+    const [failure, success] = await pending;
+    expect(failure?.status).toBe("rejected");
+    if (failure?.status === "rejected") {
+      expect(failure.reason).toBeInstanceOf(ProcessTerminationError);
+      expect(failure.reason.message).toContain("injected cache discovery failure");
+    }
+    expect(success).toEqual({ status: "fulfilled", value: "recovered" });
+    expect(callback).not.toHaveBeenCalled();
+    expect(recovered).toHaveBeenCalled();
+  } finally {
+    release.resolve();
+    resume.resolve();
+    retryResume.resolve();
+    await (pending ?? Promise.allSettled([failed, retry]));
+    await holder;
+  }
+});
+
+test("cache cleanup inspection failure refuses the callback and keeps pending records", async () => {
+  const row = await sleeper();
+  store.recordProcessCleanup(row);
+  const callback = mock(async () => {});
+  const list = spyOn(store, "listProcessCleanups").mockImplementation(() => {
+    throw new Error("cleanup store unavailable");
+  });
+  try {
+    await processCleanupStore.run(store, async () => {
+      await expect(withRepoLock(directory, callback)).rejects.toThrow(
+        `${ProcessTerminationError.prefix}: repository cache cleanup: cleanup store unavailable`,
+      );
+    });
+    expect(callback).not.toHaveBeenCalled();
+  } finally {
+    list.mockRestore();
+  }
+  expect(store.listProcessCleanups()).toEqual([row]);
 });
 
 test("records inside the checkout are recovered even when owned by another run", async () => {

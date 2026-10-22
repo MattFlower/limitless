@@ -17,7 +17,16 @@ import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import { DiscreetError } from "../pipeline/markers.ts";
-import { CommandError, redactCredentials, registeredCredentials, sh } from "../util/proc.ts";
+import {
+  CommandError,
+  ProcessTerminationError,
+  processCleanupStore,
+  processScope,
+  recoverProcessCleanups,
+  redactCredentials,
+  registeredCredentials,
+  sh,
+} from "../util/proc.ts";
 import {
   cacheGit,
   emptyTreeId,
@@ -205,7 +214,26 @@ const cacheLocks = new Map<string, Promise<unknown>>();
 export async function withRepoLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const key = lockKey(path);
   const previous = cacheLocks.get(key) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(fn);
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const store = processScope.getStore()?.cleanups ?? processCleanupStore.getStore();
+      if (store) {
+        try {
+          const records = store
+            .listProcessCleanups()
+            .filter((row) => lockKey(row.directory) === lockKey(path));
+          await recoverProcessCleanups(store, records);
+        } catch (error) {
+          if (error instanceof ProcessTerminationError) throw error;
+          throw new ProcessTerminationError(
+            `${ProcessTerminationError.prefix}: repository cache cleanup: ${redactCredentials((error as Error).message)}`,
+            { cause: error },
+          );
+        }
+      }
+      return fn();
+    });
   cacheLocks.set(key, next);
   try {
     return await next;
