@@ -5997,6 +5997,66 @@ test("worker publication fields reject malformed identities, destinations and le
   expect(publicationFields.discreet.safeParse("true").success).toBe(false);
 });
 
+test("invalid publication metadata fails only its job while another session stays active", async () => {
+  await listen();
+  const active = await queuedLocalAgent({ timeoutMs: 20_000 });
+  const activeRequest: AgentJobRequest = JSON.parse(workers.agentJob(active)?.request ?? "{}");
+  const started = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>();
+  const invoked: string[] = [];
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        invoked.push(spec.prompt);
+        if (spec.prompt === "Edit code") {
+          started.resolve();
+          await finish.promise;
+        }
+        return {};
+      }),
+    },
+    tokenLookup: async () => {
+      throw new Error("Unexpected token lookup");
+    },
+  });
+  const enqueue = () =>
+    enqueueAgent({
+      ...activeRequest,
+      prompt: "Next session",
+    });
+  try {
+    await Promise.race([started.promise, worker.task]);
+    for (const invalid of [
+      { commit: { ...publicationCommit, authorName: "<invalid>" } },
+      { commit: { ...publicationCommit, authorEmail: "missing-address" } },
+      { commit: null },
+      { repoUrl: "https://token@github.com/o/r.git" },
+      { repoUrl: 42 },
+      { expectedRemoteSha: "short" },
+      { discreet: "true" },
+    ]) {
+      const id = enqueue();
+      const req: AgentJobRequest = JSON.parse(workers.agentJob(id)?.request ?? "{}");
+      store.db
+        .query("UPDATE agent_jobs SET request=? WHERE id=?")
+        .run(JSON.stringify({ ...req, ...invalid }), id);
+      await Promise.race([until(() => !!workers.agentJob(id)?.failure_reason), worker.task]);
+      expect(workers.agentJob(id)?.failure_reason).toBe("Invalid agent publication metadata");
+      expect(workers.agentJob(id)?.result).toBeNull();
+      expect(workers.agentJob(active)?.state).toBe("leased");
+    }
+    const next = enqueue();
+    await Promise.race([until(() => workers.agentJob(next)?.state === "done"), worker.task]);
+    expect(workers.agentJob(next)?.result_sha).toBe(workers.agentJob(active)?.parent_sha ?? "");
+    expect(invoked).toEqual(["Edit code", "Next session"]);
+    finish.resolve();
+    await until(() => workers.agentJob(active)?.state === "done");
+  } finally {
+    finish.resolve();
+    await worker.stop();
+  }
+}, 30_000);
+
 test.each([
   "create",
   "replace",

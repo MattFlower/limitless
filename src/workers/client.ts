@@ -117,7 +117,11 @@ const WireRequest = z.object({
   }),
 });
 const AgentRequest = z.object({
-  ...publicationFields,
+  // Validate publication metadata per job so a malformed lease cannot stop the worker.
+  commit: z.unknown().optional(),
+  repoUrl: z.unknown().optional(),
+  expectedRemoteSha: z.unknown().optional(),
+  discreet: z.unknown().optional(),
   runId: z.string(),
   invocationId: z.number().int(),
   parentSha: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
@@ -746,7 +750,7 @@ export async function runWorker(
         if (job) job.reported = false;
       }
     };
-    const runAgent = async (id: string, req: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
+    const runAgent = async (id: string, request: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
       const path = `/worker/agent-jobs/${id}`;
       let root: string | undefined;
       let sanitize = agentPathMask([]);
@@ -764,6 +768,15 @@ export async function runWorker(
         void posts.catch(() => agentJobs.get(id)?.controller.abort());
       };
       try {
+        const publication = z.object(publicationFields).safeParse(request);
+        if (!publication.success) throw new Error("Invalid agent publication metadata");
+        const req = {
+          ...request,
+          commit: publication.data.commit,
+          repoUrl: publication.data.repoUrl,
+          expectedRemoteSha: publication.data.expectedRemoteSha,
+          discreet: publication.data.discreet,
+        };
         const name = req.target.harness;
         const harness =
           name === "claude" || name === "codex"
