@@ -54,7 +54,9 @@ import {
   findPullRequest,
   formatTopLevel,
   type GitHubBudget,
+  GitHubUnavailableError,
   githubRetry,
+  githubWait,
   headSha,
   isAncestor,
   mergeBase,
@@ -208,6 +210,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
+  if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
   ctx.run = deps.store.updateRun(
     runId,
     {
@@ -318,11 +321,16 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         !reason &&
         !deps.store.getRun(runId)?.error?.startsWith("cancelled by");
       const status = shutdown ? "queued" : "cancelled";
-      deps.store.updateRun(runId, {
-        status,
-        finishedAt: shutdown ? null : Date.now(),
-        ...(reason ? { error: redactGateOutput(reason) } : {}),
-      });
+      if (!shutdown) ctx.state.githubWait = undefined;
+      deps.store.updateRun(
+        runId,
+        {
+          status,
+          finishedAt: shutdown ? null : Date.now(),
+          ...(reason ? { error: redactGateOutput(reason) } : {}),
+        },
+        ctx.state,
+      );
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;
     };
@@ -337,6 +345,38 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     const terminationBlocked =
       !!processScope.getStore()?.terminationError ||
       ctx.state.needsHumanReason?.startsWith(ProcessTerminationError.prefix);
+    const unavailable = githubUnavailable(e);
+    const now = Date.now();
+    const since = ctx.state.githubWait?.since ?? now;
+    if (
+      unavailable &&
+      ctx.state.phase === "deliver" &&
+      ctx.repo.kind === "github" &&
+      !ctx.run.deliveryBranch &&
+      !reviewRound(ctx) &&
+      !ctx.state.verification &&
+      !terminationBlocked &&
+      githubWait.maxMs > 0 &&
+      now < since + githubWait.maxMs
+    ) {
+      if (deps.store.getRun(runId)?.error?.startsWith("cancelled by")) return cancelled();
+      const reason = redactCredentials((e as Error).message).slice(0, 300);
+      ctx.state.githubWait = { since, nextAttemptAt: now + githubWait.intervalMs, reason };
+      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.log(
+        `GitHub unavailable; delivery retries at ${new Date(ctx.state.githubWait.nextAttemptAt).toISOString()}, gives up at ${new Date(since + githubWait.maxMs).toISOString()}: ${reason}`,
+        "warn",
+      );
+      return "queued";
+    }
+    const waited =
+      unavailable && ctx.state.githubWait
+        ? `; waited ${Math.floor((now - since) / 60_000)} minutes for GitHub`
+        : "";
+    if (ctx.state.githubWait) {
+      ctx.state.githubWait = undefined;
+      deps.store.setRunState(runId, ctx.state);
+    }
     const verifiedFailure =
       verifiedSha &&
       ctx.repo.kind === "github" &&
@@ -350,7 +390,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !!verifiedFailure ||
       resolvingReview ||
       terminationBlocked;
-    let message = redactGateOutput((e as Error).message);
+    let message = redactGateOutput((e as Error).message) + waited;
     if (resolvingReview) {
       message = redactGateOutput(
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
@@ -2250,6 +2290,13 @@ function publicationText(ctx: RunContext, text: string): string {
   );
 }
 
+function githubUnavailable(error: unknown): boolean {
+  return (
+    error instanceof GitHubUnavailableError ||
+    (error instanceof Error && error.cause instanceof GitHubUnavailableError)
+  );
+}
+
 /** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
@@ -2302,6 +2349,13 @@ async function checkPublication(
     const hit = findings.find((f) => f.rule === "private-string");
     if (hit) throw new PrivateError(hit.detail);
   } catch (error) {
+    if (
+      githubUnavailable(error) ||
+      error instanceof CancelledError ||
+      ctx.signal.aborted ||
+      (error instanceof Error && error.name === "AbortError")
+    )
+      throw error;
     const reason =
       error instanceof PrivateError || error instanceof DiscreetError
         ? error.message
@@ -2790,15 +2844,20 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.checkCancelled();
     ctx.state.publishingSha = head;
     await ctx.save("delivery-publishing");
-    await pushBranch(
-      ctx.repo,
-      cwd,
-      ctx.run.branch as string,
-      head,
-      ctx.signal,
-      budget,
-      ctx.state.publishedSha ?? null,
-    );
+    if (
+      !ctx.state.githubWait ||
+      ctx.state.publishedSha !== head ||
+      (await remoteBranchSha(ctx.repo, cwd, ctx.run.branch as string, ctx.signal, budget)) !== head
+    )
+      await pushBranch(
+        ctx.repo,
+        cwd,
+        ctx.run.branch as string,
+        head,
+        ctx.signal,
+        budget,
+        ctx.state.publishedSha ?? null,
+      );
     ctx.state.publishedSha = head;
     ctx.state.publishingSha = undefined;
     await ctx.save("delivery-pushed");
@@ -2897,6 +2956,7 @@ async function mergeForDelivery(
       `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`,
     );
     ctx.state.phase = "loop";
+    ctx.state.githubWait = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }

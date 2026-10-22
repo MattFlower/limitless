@@ -77,6 +77,7 @@ export interface RunState {
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
   phase: Phase;
+  githubWait?: { since: number; nextAttemptAt: number; reason: string };
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
@@ -417,6 +418,7 @@ export class RunContext {
   }
 
   async save(checkpoint?: string): Promise<void> {
+    if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
       await this.faults.hit(

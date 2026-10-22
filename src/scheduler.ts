@@ -1,6 +1,6 @@
 import { availableParallelism, loadavg } from "node:os";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import type { EngineDeps } from "./pipeline/context.ts";
+import type { EngineDeps, RunState } from "./pipeline/context.ts";
 import { executeRun } from "./pipeline/engine.ts";
 
 /**
@@ -152,7 +152,9 @@ export class Scheduler {
     if (active) {
       active.controller.abort();
     } else {
-      this.deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
+      const state = this.deps.store.getRunState<RunState>(runId);
+      if (state) state.githubWait = undefined;
+      this.deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() }, state ?? undefined);
     }
     this.deps.store.addEvent({ runId, type: "log", level: "warn", message: `Cancel requested by ${by}` });
     return true;

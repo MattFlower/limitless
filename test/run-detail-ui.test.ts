@@ -104,3 +104,37 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Run Detail shows the GitHub wait only for queued runs with an outage episode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-github-wait-ui-"));
+  const store = new Store(":memory:");
+  const repo = store.upsertRepo({
+    slug: "owner/repo",
+    kind: "github",
+    url: "unused",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "Wait" });
+  const detail = store.getRunDetail(run.id);
+  if (!detail) throw new Error("missing detail");
+  const page = await buildNeedsYouUi(dir);
+  const githubWait = { since: 100, nextAttemptAt: 200, deadline: 300, reason: "unavailable" };
+  try {
+    page.mount({ ...detail, run: { ...run, status: "queued", githubWait } });
+    const html = renderToString(() => page.render());
+    expect(html).toContain("waiting for GitHub since");
+    expect(html).toContain("next try");
+    expect(html).toContain("gives up");
+    for (const time of [100, 200, 300]) expect(html).toContain(new Date(time).toLocaleString());
+    page.mount(detail);
+    expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
+    page.mount({ ...detail, run: { ...run, status: "running", githubWait } });
+    expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
+  } finally {
+    page.dispose();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

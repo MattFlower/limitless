@@ -312,6 +312,15 @@ export const RunDetail: Component = () => {
                     <RunStatusPill status={r().status} />
                     <span class="run-title">{r().title}</span>
                   </div>
+                  <Show when={r().status === "queued" && r().githubWait}>
+                    {(wait) => (
+                      <div class="text-dim">
+                        waiting for GitHub since {new Date(wait().since).toLocaleString()}; next try{" "}
+                        {new Date(wait().nextAttemptAt).toLocaleString()}; gives up{" "}
+                        {new Date(wait().deadline).toLocaleString()}
+                      </div>
+                    )}
+                  </Show>
                   <Show when={r().status === "waiting"}>
                     <p>waiting for {r().dependsOn.join(", ")} to merge</p>
                   </Show>

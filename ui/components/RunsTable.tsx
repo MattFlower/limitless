@@ -44,6 +44,15 @@ export const RunsTable: Component<{ runs: Run[] }> = (props) => {
               <tr class="clickable" onClick={() => navigate(`/runs/${run.id}`)}>
                 <td>
                   <RunStatusPill status={run.status} />
+                  <Show when={run.status === "queued" && run.githubWait}>
+                    {(wait) => (
+                      <div class="text-dim">
+                        waiting for GitHub since {new Date(wait().since).toLocaleString()}; next try{" "}
+                        {new Date(wait().nextAttemptAt).toLocaleString()}; gives up{" "}
+                        {new Date(wait().deadline).toLocaleString()}
+                      </div>
+                    )}
+                  </Show>
                   <Show when={run.status === "waiting"}>
                     <div>waiting for {run.dependsOn.join(", ")} to merge</div>
                   </Show>
