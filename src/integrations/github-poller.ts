@@ -1,11 +1,12 @@
 import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
-import { type ProcResult, redactCredentials, registerCredential, runProcess } from "../util/proc.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 import { ciDecision } from "./ci-classifier.ts";
 import type { GhRunner } from "./github.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
+import { githubToken } from "./github-token.ts";
 
 export type GitHubResponse = {
   status: number;
@@ -19,27 +20,7 @@ export type GitHubClient = (path: string, body?: unknown, signal?: AbortSignal) 
 
 /** Uses the gh CLI's OAuth token (read per request, so refreshes apply), so no webhook or App is needed. */
 export const ghClient: GitHubClient = async (path, body, signal) => {
-  // Secret output must never enter sh's output-quoting error path.
-  let lookup: ProcResult;
-  try {
-    lookup = await runProcess({
-      cmd: ["gh", "auth", "token"],
-      cwd: process.cwd(),
-      env: process.env as Record<string, string>,
-      timeoutMs: 30_000,
-      signal,
-    });
-  } catch {
-    throw new Error("gh auth token failed: process error");
-  }
-  const token = lookup.stdout.trim();
-  registerCredential("GH_TOKEN", token);
-  if (lookup.timedOut) throw new Error("gh auth token failed: timeout");
-  if (lookup.cancelled) throw new Error("gh auth token failed: cancelled");
-  if (lookup.signal) throw new Error("gh auth token failed: signal");
-  if (lookup.exitCode !== 0) throw new Error("gh auth token failed: non-zero exit");
-  if (lookup.truncated) throw new Error("gh auth token failed: truncated output");
-  if (!token) throw new Error("gh auth token failed: empty output");
+  const token = await githubToken(signal);
   const res = await fetch(`https://api.github.com/${path}`, {
     headers: {
       authorization: `bearer ${token}`,

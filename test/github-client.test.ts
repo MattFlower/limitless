@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ghClient, startGitHubPoller } from "../src/integrations/github-poller.ts";
+import { githubToken } from "../src/integrations/github-token.ts";
 import * as proc from "../src/util/proc.ts";
 import { pollerHarness } from "./github-poller-support.ts";
 
@@ -109,4 +110,16 @@ test("successful token lookup registers the credential before using it", async (
   } finally {
     fetch.mockRestore();
   }
+});
+
+test.each(["cancelled", "truncated output"])("shared token lookup safely rejects %s", async (failure) => {
+  const token = `fake-token-${randomUUID()}`;
+  fakeGh(token, 0, token);
+  await expect(
+    githubToken(undefined, async (opts) => {
+      const result = await proc.runProcess(opts);
+      return { ...result, cancelled: failure === "cancelled", truncated: failure === "truncated output" };
+    }),
+  ).rejects.toThrow(`gh auth token failed: ${failure}`);
+  expect(proc.redactCredentials(token)).toBe("[redacted]");
 });

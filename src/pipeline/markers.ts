@@ -14,6 +14,16 @@ export function deliveryMarker(kind: string, runId: string, discreet = false) {
 
 export class DiscreetError extends Error {}
 
+/** Return the mark for publication-status checks, refusing when it is not already public. */
+export function checkDiscreetBranch(branch: string, runId: string, published: boolean): boolean {
+  const marked = branch.startsWith("limitless/") || branch.includes(runId);
+  if (marked && !published)
+    throw new DiscreetError(
+      "Discreet mode blocked unpublished factory-marked branch name; use a neutral branch",
+    );
+  return marked;
+}
+
 // Explicit addresses only: a person's email local part is not evidence of tooling.
 const toolingEmails = new Set([
   "limitless@localhost",

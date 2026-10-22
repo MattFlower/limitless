@@ -16,7 +16,7 @@ import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { GhRunner } from "../integrations/github.ts";
-import { DiscreetError } from "../pipeline/markers.ts";
+import { checkDiscreetBranch, DiscreetError } from "../pipeline/markers.ts";
 import {
   CommandError,
   ProcessTerminationError,
@@ -553,16 +553,30 @@ export async function clearInterruptedRebase(cwd: string, expected: boolean): Pr
 }
 
 /** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
-export async function commitAll(cwd: string, message: string): Promise<string | null> {
+export async function commitAll(
+  cwd: string,
+  message: string,
+  options: { env?: Record<string, string>; signal?: AbortSignal; verbatim?: boolean } = {},
+): Promise<string | null> {
+  const opts = { cwd, env: options.env, signal: options.signal };
   if (worktreeGitScope.getStore() !== false) {
-    const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], { cwd });
+    const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], opts);
     rmSync(resolve(cwd, index.stdout.trim()), { force: true });
-    await worktreeGit(["git", "read-tree", "HEAD"], { cwd });
+    await worktreeGit(["git", "read-tree", "HEAD"], opts);
   }
-  await stageAll({ cwd });
-  const status = await worktreeGit(["git", "status", "--porcelain"], { cwd });
+  await stageAll(opts);
+  const status = await worktreeGit(["git", "status", "--porcelain"], opts);
   if (!status.stdout.trim()) return null;
-  await worktreeGit(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
+  await worktreeGit(
+    [
+      "git",
+      "commit",
+      "--no-verify",
+      "-q",
+      ...(options.verbatim ? ["--cleanup=verbatim", "-F", "-"] : ["-m", message]),
+    ],
+    { ...opts, ...(options.verbatim ? { stdin: message } : {}) },
+  );
   return headSha(cwd);
 }
 
@@ -972,7 +986,7 @@ export async function deliveryPublicationRange(
   const url = repo.kind === "local" ? repo.localPath : repo.url;
   if (!url) throw new privacy.PrivateError("Cannot inspect destination branch; publication blocked");
   const opts = { cwd, signal, budget };
-  const marked = discreet && (branch.startsWith("limitless/") || branch.includes(discreet.runId));
+  const marked = discreet && checkDiscreetBranch(branch, discreet.runId, true);
   const remote = await remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], opts).catch((error) => {
     if (marked && !signal?.aborted)
       throw new DiscreetError("Discreet mode cannot establish branch-name publication status");
@@ -981,10 +995,7 @@ export async function deliveryPublicationRange(
   const remoteHead = remote.stdout.trim().split(/\s+/)[0] || null;
   if (marked && remoteHead && remote.stdout.trim() !== `${remoteHead}\trefs/heads/${branch}`)
     throw new DiscreetError("Discreet mode cannot establish branch-name publication status");
-  if (marked && !remoteHead && !discreet.published)
-    throw new DiscreetError(
-      "Discreet mode blocked unpublished factory-marked branch name; use a neutral branch",
-    );
+  if (discreet) checkDiscreetBranch(branch, discreet.runId, !!remoteHead || discreet.published);
   if (remoteHead) {
     if (!/^[a-f0-9]{40,64}$/.test(remoteHead)) throw new privacy.PrivateError("Cannot inspect remote head");
     // An unknown object is not evidence of a rewrite; fetch it before deciding ancestry.

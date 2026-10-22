@@ -37,6 +37,7 @@ import {
 } from "../util/proc.ts";
 import { AgentResultReport } from "./agent-protocol.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
+import { publicationFields, publishAgentChanges } from "./publication.ts";
 import { agentPathMask } from "./reporting.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
 import { updateWorker, WorkerUpdateError } from "./update.ts";
@@ -116,6 +117,12 @@ const WireRequest = z.object({
   }),
 });
 const AgentRequest = z.object({
+  // Validate publication metadata per job so a malformed lease cannot stop the worker.
+  commit: z.unknown().optional(),
+  repoUrl: z.unknown().optional(),
+  expectedRemoteSha: z.unknown().optional(),
+  discreet: z.unknown().optional(),
+  uiUrl: z.unknown().optional(),
   runId: z.string(),
   invocationId: z.number().int(),
   parentSha: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
@@ -210,6 +217,7 @@ export async function runWorker(
   options: {
     confinement?: ConfinementBackend;
     harnesses?: Partial<Record<"claude" | "codex", Harness>>;
+    tokenLookup?: Parameters<typeof publishAgentChanges>[4];
     heartbeatMs?: number;
     leaseMs?: number;
     fenceTimer?: FenceTimer;
@@ -743,7 +751,7 @@ export async function runWorker(
         if (job) job.reported = false;
       }
     };
-    const runAgent = async (id: string, req: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
+    const runAgent = async (id: string, request: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
       const path = `/worker/agent-jobs/${id}`;
       let root: string | undefined;
       let sanitize = agentPathMask([]);
@@ -761,6 +769,16 @@ export async function runWorker(
         void posts.catch(() => agentJobs.get(id)?.controller.abort());
       };
       try {
+        const publication = z.object(publicationFields).safeParse(request);
+        if (!publication.success) throw new Error("Invalid agent publication metadata");
+        const req = {
+          ...request,
+          commit: publication.data.commit,
+          repoUrl: publication.data.repoUrl,
+          expectedRemoteSha: publication.data.expectedRemoteSha,
+          discreet: publication.data.discreet,
+          uiUrl: publication.data.uiUrl,
+        };
         const name = req.target.harness;
         const harness =
           name === "claude" || name === "codex"
@@ -804,8 +822,16 @@ export async function runWorker(
           flush();
           await posts;
           jobSignal.throwIfAborted();
+          assertProcessesStopped();
+          const sha = await publishAgentChanges(
+            cwd,
+            { ...req, target: spec.target },
+            cfg,
+            jobSignal,
+            options.tokenLookup,
+          );
           const report = AgentResultReport.parse(
-            sanitize({ ...result, parentSha: req.parentSha, sha: req.parentSha, branch: req.branch }),
+            sanitize({ ...result, parentSha: req.parentSha, sha, branch: req.branch }),
           );
           assertProcessesStopped();
           return () => call(`${path}/result`, report, jobSignal);

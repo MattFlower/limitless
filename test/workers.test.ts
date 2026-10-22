@@ -41,18 +41,21 @@ import {
   runLocalGates,
 } from "../src/gates/run.ts";
 import { acquireGateSlot, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
+import * as gitCommand from "../src/git/command.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { removeScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { githubToken } from "../src/integrations/github-token.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { createApiToken } from "../src/server/api-token.ts";
 import { startHttp } from "../src/server/http.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
+import * as proc from "../src/util/proc.ts";
 import {
   CommandError,
   invocationScratch,
@@ -70,6 +73,7 @@ import {
 } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
+import { publicationFields } from "../src/workers/publication.ts";
 import { agentPathMask } from "../src/workers/reporting.ts";
 import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
@@ -827,11 +831,15 @@ test("worker routes authenticate first and reject jobs without the caller's leas
   expect(store.db.query("SELECT COUNT(*) n FROM gate_jobs").get()).toEqual({ n: 0 });
 }, 30_000);
 
-async function loop(options: Parameters<typeof runWorker>[4] = {}, name = "loop-runner") {
+async function loop(
+  options: Parameters<typeof runWorker>[4] = {},
+  name = "loop-runner",
+  configDir = cfg.paths.configDir,
+) {
   if (!listener) throw new Error("Missing listener");
   const remote = loadConfig({
     home: join(home, name === "loop-runner" ? "remote" : name),
-    configDir: cfg.paths.configDir,
+    configDir,
     raw: {},
   });
   await pairWorker(listener.url.origin, join(remote.paths.home, "worker"), name, (text) =>
@@ -3027,6 +3035,7 @@ test("worker persists concurrent invocation markers before spawn and clears only
         } finally {
           writeFileSync(release, "");
           await Promise.all(commands);
+          rmSync(release);
           scope.cleanups.recordProcessDiscovery = record;
         }
         expect(read()?.pending).toEqual([]);
@@ -4436,6 +4445,12 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
     confineReads: true,
     slottedCommands: [["bun", "test"]],
     branch: "change/agent",
+    baseSha: releaseSha,
+    commit: publicationCommit,
+    repoUrl: "https://github.com/example/repository.git",
+    expectedRemoteSha: null,
+    discreet: true,
+    uiUrl: "https://coordinator.example.com",
   };
   const agent = enqueueAgent(fields);
   const stored = workers.agentJob(agent);
@@ -5226,9 +5241,9 @@ test("worker shutdown clears the fence and a late heartbeat cannot rearm it", as
   }
 });
 
-test("worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
+test("readonly worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
   await listen();
-  const id = await queuedLocalAgent({ slottedCommands: [["bun", "test"]] });
+  const id = await queuedLocalAgent({ mode: "readonly", slottedCommands: [["bun", "test"]] });
   let cwd = "",
     scratch = "";
   let forms: string[] = [];
@@ -5960,3 +5975,468 @@ test("worker retains scratch when a harness directly throws a termination error"
     removeScratch(scratch);
   }
 }, 30_000);
+
+const publicationCommit = {
+  message: "Worker change\n\nKeep this body.  \n# preserve this line\n",
+  authorName: "Requested Author",
+  authorEmail: "author@example.com",
+  committerName: "Requested Committer",
+  committerEmail: "committer@example.com",
+};
+
+test("worker publication fields reject malformed identities, destinations and leases", () => {
+  for (const invalid of [
+    { message: "bad\0message" },
+    { authorName: "" },
+    { committerName: "Other\nidentity" },
+    { authorEmail: "missing-address" },
+    { committerEmail: "name <email@example.com>" },
+  ])
+    expect(publicationFields.commit.safeParse({ ...publicationCommit, ...invalid }).success).toBe(false);
+  for (const repoUrl of ["--help", "http://github.com/o/r.git", "https://token@github.com/o/r.git"])
+    expect(publicationFields.repoUrl.safeParse(repoUrl).success).toBe(false);
+  expect(publicationFields.expectedRemoteSha.safeParse("short").success).toBe(false);
+  expect(publicationFields.discreet.safeParse("true").success).toBe(false);
+  expect(publicationFields.uiUrl.safeParse("not-a-url").success).toBe(false);
+});
+
+test("invalid publication metadata fails only its job while another session stays active", async () => {
+  await listen();
+  const active = await queuedLocalAgent({ timeoutMs: 20_000 });
+  const activeRequest: AgentJobRequest = JSON.parse(workers.agentJob(active)?.request ?? "{}");
+  const started = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>();
+  const invoked: string[] = [];
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        invoked.push(spec.prompt);
+        if (spec.prompt === "Edit code") {
+          started.resolve();
+          await finish.promise;
+        }
+        return {};
+      }),
+    },
+    tokenLookup: async () => {
+      throw new Error("Unexpected token lookup");
+    },
+  });
+  const enqueue = () =>
+    enqueueAgent({
+      ...activeRequest,
+      prompt: "Next session",
+    });
+  try {
+    await Promise.race([started.promise, worker.task]);
+    for (const invalid of [
+      { commit: { ...publicationCommit, authorName: "<invalid>" } },
+      { commit: { ...publicationCommit, authorEmail: "missing-address" } },
+      { commit: null },
+      { repoUrl: "https://token@github.com/o/r.git" },
+      { repoUrl: 42 },
+      { expectedRemoteSha: "short" },
+      { discreet: "true" },
+      { uiUrl: "not-a-url" },
+      { uiUrl: 42 },
+    ]) {
+      const id = enqueue();
+      const req: AgentJobRequest = JSON.parse(workers.agentJob(id)?.request ?? "{}");
+      store.db
+        .query("UPDATE agent_jobs SET request=? WHERE id=?")
+        .run(JSON.stringify({ ...req, ...invalid }), id);
+      await Promise.race([until(() => !!workers.agentJob(id)?.failure_reason), worker.task]);
+      expect(workers.agentJob(id)?.failure_reason).toBe("Invalid agent publication metadata");
+      expect(workers.agentJob(id)?.result).toBeNull();
+      expect(workers.agentJob(active)?.state).toBe("leased");
+    }
+    const next = enqueue();
+    await Promise.race([until(() => workers.agentJob(next)?.state === "done"), worker.task]);
+    expect(workers.agentJob(next)?.result_sha).toBe(workers.agentJob(active)?.parent_sha ?? "");
+    expect(invoked).toEqual(["Edit code", "Next session"]);
+    finish.resolve();
+    await until(() => workers.agentJob(active)?.state === "done");
+  } finally {
+    finish.resolve();
+    await worker.stop();
+  }
+}, 30_000);
+
+test.each([
+  "create",
+  "replace",
+  "clean discreet",
+  "unchanged",
+  "readonly",
+  "readonly legacy",
+  "legacy",
+  "legacy changed",
+  "missing lease",
+  "missing base",
+  "missing ui",
+  "private diff",
+  "private message",
+  "private ancestor message",
+  "private ancestor diff",
+  "private branch",
+  "private published ancestor",
+  "private nonancestor remote",
+  "discreet message",
+  "discreet identity",
+  "discreet ancestor",
+  "discreet coordinator link",
+  "discreet branch prefix",
+  "discreet branch run id",
+  "discreet existing branch",
+  "credential",
+  "credential ancestor",
+  "credential branch",
+  "unknown remote",
+  "session committed",
+  "session committed dirty",
+  "HEAD inspection failure",
+  "moved",
+  "null existing",
+  "auth failure",
+  "push failure",
+])(
+  "worker publication: %s",
+  async (kind) => {
+    await listen();
+    const remote = join(home, "published.git");
+    const workerConfig = join(home, "publication-worker-config");
+    mkdirSync(workerConfig);
+    const secret = `synthetic-worker-secret-${randomBytes(16).toString("hex")}`;
+    const token = `synthetic-gh-token-${randomBytes(16).toString("hex")}`;
+    registerCredential("PUBLICATION_TOKEN", token);
+    if (kind.startsWith("credential")) registerCredential("PUBLICATION_SECRET", secret);
+    if (kind.startsWith("private")) writeFileSync(join(workerConfig, "private-strings.txt"), `${secret}\n`);
+    const id = await queuedLocalAgent({
+      timeoutMs: 20_000,
+      mode: kind.startsWith("readonly")
+        ? "readonly"
+        : kind === "session committed dirty"
+          ? "edit"
+          : undefined,
+      ...(!kind.includes("legacy")
+        ? {
+            repoUrl: remote,
+            expectedRemoteSha: kind === "missing lease" ? undefined : null,
+            discreet: kind.includes("discreet") || kind === "private branch",
+            uiUrl: kind === "missing ui" ? undefined : "https://coordinator.example.com",
+            commit: {
+              ...publicationCommit,
+              ...(kind === "private message" ? { message: `Change\n\n${secret}\n` } : {}),
+              ...(kind === "discreet message"
+                ? { message: "Change\n\nCo-Authored-By: Claude Code <claude@example.com>\n" }
+                : {}),
+              ...(kind === "discreet identity" ? { authorName: "Limitless" } : {}),
+              ...(kind === "discreet coordinator link"
+                ? { message: "See https://coordinator.example.com/runs/another-run" }
+                : {}),
+            },
+          }
+        : {}),
+    });
+    const originalRequest: AgentJobRequest = JSON.parse(workers.agentJob(id)?.request ?? "{}");
+    const source = join(home, "repo");
+    const base = originalRequest.parentSha;
+    let parent = base;
+    if (kind.includes("ancestor")) {
+      writeFileSync(
+        join(source, "ancestor"),
+        ["discreet ancestor", "private ancestor message"].includes(kind) ? "clean" : secret,
+      );
+      await sh(["git", "add", "ancestor"], { cwd: source });
+      await sh(
+        [
+          "git",
+          "commit",
+          "-qm",
+          kind === "private ancestor message"
+            ? secret
+            : kind === "discreet ancestor"
+              ? "Generated by Limitless"
+              : "Earlier change",
+        ],
+        { cwd: source },
+      );
+      // A net-diff scan would miss this ancestor's private blob entirely.
+      await sh(["git", "rm", "ancestor"], { cwd: source });
+      await sh(["git", "commit", "-qm", "Remove earlier file"], { cwd: source });
+      parent = (await sh(["git", "rev-parse", "HEAD"], { cwd: source })).stdout.trim();
+      await sh(["git", "fetch", source, "HEAD"], { cwd: join(cfg.paths.repos, "test__repo.git") });
+    }
+    const branch =
+      kind === "private branch" || kind === "credential branch"
+        ? `change/${secret}`
+        : kind === "discreet branch prefix" || kind === "discreet existing branch"
+          ? "limitless/worker-agent"
+          : kind === "discreet branch run id"
+            ? `change/${originalRequest.runId}`
+            : "change/worker-agent";
+    const expectedRemoteSha =
+      kind === "private published ancestor"
+        ? parent
+        : kind === "unknown remote"
+          ? "0".repeat(40)
+          : originalRequest.expectedRemoteSha;
+    store.db.query("UPDATE agent_jobs SET parent_sha=?, request=? WHERE id=?").run(
+      parent,
+      JSON.stringify({
+        ...originalRequest,
+        parentSha: parent,
+        baseSha: kind === "missing base" || kind.includes("legacy") ? undefined : base,
+        branch,
+        expectedRemoteSha,
+      }),
+      id,
+    );
+    await sh(["git", "clone", "--bare", join(home, "repo"), remote], { cwd: home });
+    const ref = `refs/heads/${branch}`;
+    let remoteBefore = "";
+    if (
+      [
+        "replace",
+        "moved",
+        "null existing",
+        "private published ancestor",
+        "discreet existing branch",
+      ].includes(kind)
+    ) {
+      remoteBefore = parent;
+      if (kind === "moved") {
+        await sh(["git", "commit", "--allow-empty", "-qm", "independent change"], {
+          cwd: join(home, "repo"),
+        });
+        remoteBefore = (await sh(["git", "rev-parse", "HEAD"], { cwd: join(home, "repo") })).stdout.trim();
+        await sh(["git", "fetch", join(home, "repo"), "HEAD"], { cwd: remote });
+      }
+      await sh(["git", "update-ref", ref, remoteBefore], { cwd: remote });
+      if (kind !== "null existing") {
+        const req = JSON.parse(workers.agentJob(id)?.request ?? "{}");
+        store.db
+          .query("UPDATE agent_jobs SET request=? WHERE id=?")
+          .run(JSON.stringify({ ...req, expectedRemoteSha: parent }), id);
+      }
+    }
+    if (kind === "private nonancestor remote") {
+      remoteBefore = (
+        await sh(["git", "commit-tree", `${base}^{tree}`, "-p", base, "-m", "Independent remote head"], {
+          cwd: remote,
+        })
+      ).stdout.trim();
+      await sh(["git", "update-ref", ref, remoteBefore], { cwd: remote });
+      const req: AgentJobRequest = JSON.parse(workers.agentJob(id)?.request ?? "{}");
+      store.db
+        .query("UPDATE agent_jobs SET request=? WHERE id=?")
+        .run(JSON.stringify({ ...req, expectedRemoteSha: remoteBefore }), id);
+    }
+    const argv: string[][] = [],
+      transmitted: unknown[] = [],
+      commits: string[][] = [];
+    let pushEnv: Record<string, string> | undefined,
+      session = "",
+      lookups = 0;
+    const realProcess = proc.runProcess;
+    const processes = spyOn(proc, "runProcess").mockImplementation((opts) => {
+      argv.push(opts.cmd);
+      return realProcess(opts);
+    });
+    const realGit = gitCommand.cacheGit;
+    const push = spyOn(gitCommand, "cacheGit").mockImplementation((args, opts, guard) => {
+      if (args.includes("push")) {
+        pushEnv = opts.env;
+        if (kind === "push failure")
+          return Promise.reject(
+            new Error(`push rejected ${token} ${Buffer.from(`x-access-token:${token}`).toString("base64")}`),
+          );
+      }
+      return realGit(args, opts, guard);
+    });
+    const realWorktreeGit = gitCommand.worktreeGit;
+    const commitSpy = spyOn(gitCommand, "worktreeGit").mockImplementation((args, opts, retry) => {
+      if (kind === "HEAD inspection failure" && args.join(" ") === "git rev-parse --verify HEAD")
+        return Promise.reject(new Error("Injected HEAD inspection failure"));
+      if (args.includes("commit")) commits.push(args);
+      return realWorktreeGit(args, opts, retry);
+    });
+    const sentinel = join(home, "hook-ran");
+    const worker = await loop(
+      {
+        tokenLookup: (signal) =>
+          githubToken(signal, async (opts) => {
+            lookups++;
+            expect(opts.cmd).toEqual(["gh", "auth", "token"]);
+            expect(opts.timeoutMs).toBe(30_000);
+            const result = await realProcess({ ...opts, cmd: [process.execPath, "-e", ""] });
+            return { ...result, stdout: token, stderr: token, exitCode: kind === "auth failure" ? 1 : 0 };
+          }),
+        async request(...args) {
+          if (args[1].endsWith("/events") || args[1].endsWith("/result") || args[1].endsWith("/failure"))
+            transmitted.push(args[2]);
+          return workerRequest(...args);
+        },
+        harnesses: {
+          claude: fakeHarness(async (spec) => {
+            expect(lookups).toBe(0);
+            session = JSON.stringify({ spec, env: proc.agentEnv() });
+            expect(session).not.toContain(token);
+            if (kind === "private nonancestor remote")
+              await sh(["git", "fetch", "--no-tags", remote, remoteBefore], { cwd: spec.cwd });
+            if (kind.startsWith("session committed")) {
+              writeFileSync(join(spec.cwd, "session-change"), "Session commit\n");
+              await realWorktreeGit(["git", "add", "."], { cwd: spec.cwd });
+              await realWorktreeGit(["git", "commit", "-qm", "Session made its own commit"], {
+                cwd: spec.cwd,
+              });
+            }
+            const hooks = join(dirname(spec.cwd), "repo.git", "hooks");
+            mkdirSync(hooks, { recursive: true });
+            for (const hook of ["pre-commit", "pre-push"])
+              writeFileSync(join(hooks, hook), `#!/bin/sh\ntouch '${sentinel}'\n`, { mode: 0o755 });
+            return {
+              files: ["unchanged", "legacy", "session committed"].includes(kind)
+                ? undefined
+                : { edited: kind === "private diff" || kind === "credential" ? secret : "new bytes\n" },
+              text: token,
+              status: "error",
+              error: token,
+            };
+          }),
+        },
+      },
+      "loop-runner",
+      workerConfig,
+    );
+    try {
+      await until(
+        () => workers.agentJob(id)?.state === "done" || workers.agentJob(id)?.failure_reason !== null,
+      );
+      const job = workers.agentJob(id);
+      const published = [
+        "create",
+        "replace",
+        "clean discreet",
+        "private published ancestor",
+        "discreet existing branch",
+      ].includes(kind);
+      const unchanged = ["unchanged", "readonly", "readonly legacy", "legacy"].includes(kind);
+      expect(job?.result !== null).toBe(published || unchanged);
+      const remoteRef = await sh(["git", "rev-parse", "--verify", ref], { cwd: remote, allowFail: true });
+      const actual = remoteRef.stdout.trim();
+      if (published) {
+        const sha = job?.result_sha ?? "";
+        expect(sha).not.toBe(parent);
+        expect(actual).toBe(sha);
+        expect(
+          (await sh(["git", "rev-list", "--parents", "-n", "1", sha], { cwd: remote })).stdout.trim(),
+        ).toBe(`${sha} ${parent}`);
+        expect(
+          (await sh(["git", "show", "-s", "--format=%B%x00%an%x00%ae%x00%cn%x00%ce", sha], { cwd: remote }))
+            .stdout,
+        ).toBe(
+          `${publicationCommit.message}\0${publicationCommit.authorName}\0${publicationCommit.authorEmail}\0${publicationCommit.committerName}\0${publicationCommit.committerEmail}\n`,
+        );
+        expect(JSON.parse(job?.result ?? "null")).toMatchObject({
+          sha,
+          branch,
+          status: "error",
+        });
+      } else {
+        expect(actual).toBe(remoteBefore);
+        if (unchanged) expect(job?.result_sha).toBe(parent);
+        else {
+          const reason = kind.startsWith("private")
+            ? "private string"
+            : kind.startsWith("discreet")
+              ? "factory-marked"
+              : kind.startsWith("credential")
+                ? "credential"
+                : kind.includes("existing") || kind === "moved"
+                  ? "branch moved"
+                  : kind === "legacy changed" || kind.startsWith("missing")
+                    ? "publication metadata"
+                    : kind === "HEAD inspection failure"
+                      ? "Cannot inspect worker HEAD"
+                      : kind.startsWith("session committed")
+                        ? "session moved HEAD"
+                        : kind === "unknown remote"
+                          ? "Cannot inspect expected remote commit"
+                          : kind === "auth failure"
+                            ? "gh auth token failed: non-zero exit"
+                            : "withheld";
+          expect(job?.failure_reason).toContain(reason);
+          if (kind === "credential branch") {
+            expect(job?.failure_reason).toBe("Registered worker credential in publication; push blocked");
+            expect(remoteRef.exitCode).not.toBe(0);
+          }
+        }
+      }
+      const shouldPush = published || ["moved", "null existing", "push failure"].includes(kind);
+      const pushCalls = push.mock.calls.filter(([args]) => args.includes("push"));
+      expect(pushCalls).toHaveLength(shouldPush ? 1 : 0);
+      if (shouldPush) {
+        const args = pushCalls[0]?.[0] ?? [];
+        expect(args).toContain(
+          `--force-with-lease=${ref}:${["replace", "moved", "private published ancestor", "discreet existing branch"].includes(kind) ? parent : ""}`,
+        );
+        expect(args.at(-1)).toMatch(new RegExp(`^[a-f0-9]{40}:${ref}$`));
+        expect(args).toContain("--no-follow-tags");
+        const authIndex = Number(pushEnv?.GIT_CONFIG_COUNT) - 1;
+        expect(pushEnv?.[`GIT_CONFIG_KEY_${authIndex}`]).toBe("http.extraHeader");
+        expect(pushEnv?.[`GIT_CONFIG_VALUE_${authIndex}`]).toBe(
+          `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
+        );
+        if (kind === "create") {
+          // Exercise effective config with a lower-precedence helper that must be reset.
+          const global = join(home, "push-gitconfig");
+          writeFileSync(global, "[credential]\n\thelper = synthetic-helper\n");
+          const env = { ...pushEnv, GIT_CONFIG_GLOBAL: global };
+          const helpers = await sh(["git", "config", "--get-all", "credential.helper"], { cwd: remote, env });
+          expect(helpers.stdout.endsWith("synthetic-helper\n\n")).toBe(true);
+          expect(
+            (await sh(["git", "config", "--get", "diff.autoRefreshIndex"], { cwd: remote, env })).stdout,
+          ).toBe("false\n");
+          expect(
+            (
+              await sh(["git", "config", "--name-only", "--get-regexp", "^http\\.extraHeader$"], {
+                cwd: remote,
+                env,
+              })
+            ).stdout,
+          ).toBe("http.extraheader\n");
+        }
+      }
+      if (kind === "unknown remote")
+        expect(
+          argv.filter((args) => args.includes("fetch")).some((args) => args.includes("0".repeat(40))),
+        ).toBe(false);
+      if (
+        unchanged ||
+        kind === "legacy changed" ||
+        kind.startsWith("missing") ||
+        kind.startsWith("session committed")
+      ) {
+        expect(commits).toHaveLength(0);
+        expect(lookups).toBe(0);
+      }
+      expect(existsSync(sentinel)).toBe(false);
+      expect(JSON.stringify(argv)).not.toContain(token);
+      expect(JSON.stringify(argv)).not.toContain(Buffer.from(`x-access-token:${token}`).toString("base64"));
+      expect(JSON.stringify(transmitted)).not.toContain(token);
+      expect(JSON.stringify(transmitted)).not.toContain(
+        Buffer.from(`x-access-token:${token}`).toString("base64"),
+      );
+      expect(JSON.stringify(job)).not.toContain(token);
+      expect(JSON.stringify(transmitted)).not.toContain(secret);
+      expect(JSON.stringify(process.env)).not.toContain(token);
+    } finally {
+      await worker.stop();
+      processes.mockRestore();
+      push.mockRestore();
+      commitSpy.mockRestore();
+    }
+  },
+  30_000,
+);

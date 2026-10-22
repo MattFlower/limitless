@@ -147,6 +147,11 @@ export async function startWorkerListener(
               confineReads,
               slottedCommands,
               branch,
+              commit,
+              repoUrl,
+              expectedRemoteSha,
+              discreet,
+              uiUrl,
             }: AgentJobRequest = JSON.parse(agentJob.request);
             return json({
               job: null,
@@ -172,6 +177,11 @@ export async function startWorkerListener(
                   confineReads,
                   slottedCommands,
                   branch,
+                  commit,
+                  repoUrl,
+                  expectedRemoteSha,
+                  discreet,
+                  uiUrl,
                 },
               },
             });
