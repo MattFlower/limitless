@@ -6090,6 +6090,7 @@ test.each([
   "discreet existing branch",
   "credential",
   "credential ancestor",
+  "credential branch",
   "unknown remote",
   "session committed",
   "session committed dirty",
@@ -6167,7 +6168,7 @@ test.each([
       await sh(["git", "fetch", source, "HEAD"], { cwd: join(cfg.paths.repos, "test__repo.git") });
     }
     const branch =
-      kind === "private branch"
+      kind === "private branch" || kind === "credential branch"
         ? `change/${secret}`
         : kind === "discreet branch prefix" || kind === "discreet existing branch"
           ? "limitless/worker-agent"
@@ -6322,9 +6323,8 @@ test.each([
       ].includes(kind);
       const unchanged = ["unchanged", "readonly", "readonly legacy", "legacy"].includes(kind);
       expect(job?.result !== null).toBe(published || unchanged);
-      const actual = (
-        await sh(["git", "rev-parse", "--verify", ref], { cwd: remote, allowFail: true })
-      ).stdout.trim();
+      const remoteRef = await sh(["git", "rev-parse", "--verify", ref], { cwd: remote, allowFail: true });
+      const actual = remoteRef.stdout.trim();
       if (published) {
         const sha = job?.result_sha ?? "";
         expect(sha).not.toBe(parent);
@@ -6367,6 +6367,10 @@ test.each([
                             ? "gh auth token failed: non-zero exit"
                             : "withheld";
           expect(job?.failure_reason).toContain(reason);
+          if (kind === "credential branch") {
+            expect(job?.failure_reason).toBe("Registered worker credential in publication; push blocked");
+            expect(remoteRef.exitCode).not.toBe(0);
+          }
         }
       }
       const shouldPush = published || ["moved", "null existing", "push failure"].includes(kind);

@@ -111,11 +111,9 @@ export async function publishAgentChanges(
   const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
   registerCredential("WORKER_GIT_AUTH", basic);
   try {
-    await checkPrivateRange(
-      cwd,
-      range,
-      registeredCredentials().map((value) => ({ value, entry: 1 })),
-    );
+    const credentials = registeredCredentials().map((value) => ({ value, entry: 1 }));
+    checkPublicationText(branch, "Branch name", credentials);
+    await checkPrivateRange(cwd, range, credentials);
   } catch (error) {
     if (error instanceof PrivateError)
       throw new Error("Registered worker credential in publication; push blocked");
