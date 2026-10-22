@@ -1107,7 +1107,14 @@ export function redactCredentials(text: string, window?: { start: number; end: n
 export const redactCredentialData = <T>(value: T): T => activity("credentials.data", () => redactData(value));
 const redactData = <T>(value: T): T =>
   JSON.parse(
-    JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redactCredentials(v) : v)),
+    JSON.stringify(value, (_key, v: unknown) => {
+      if (typeof v === "string") return redactCredentials(v);
+      if (typeof v === "number") {
+        const text = String(v);
+        if (redactCredentials(text) !== text) return "[redacted]";
+      }
+      return v;
+    }),
     (_key, v: unknown) =>
       v && typeof v === "object" && !Array.isArray(v)
         ? Object.fromEntries(Object.entries(v).map(([k, x]) => [redactCredentials(k), x]))

@@ -34,6 +34,11 @@ if (process.argv[2] === "--worker") {
   const colored = text.replaceAll("event", "\u001b[32mevent\u001b[0m").slice(0, text.length);
   const split = (s: string) =>
     Array.from({ length: Math.ceil(s.length / 32768) }, (_, i) => s.slice(i * 32768, (i + 1) * 32768));
+  const events = Array.from({ length: 20000 }, (_, i) => ({
+    timestamp: 1700000000000 + i,
+    input: [12345678 + i, 23456789 + i, 34567890 + i],
+    output: [45678901 + i, 56789012 + i, 67890123 + i],
+  }));
   let chunks = split(text);
   const spawnFixture = () => {
     const child = Object.assign(new EventEmitter(), {
@@ -52,12 +57,19 @@ if (process.argv[2] === "--worker") {
   const fixture = spyOn(subprocess, "spawn").mockImplementation(spawnFixture as typeof subprocess.spawn);
   try {
     const result: Record<string, number> = {};
-    for (const kind of ["redactCredentials", "runProcess", "runProcessSGR"] as const) {
+    for (const kind of [
+      "redactCredentials",
+      "redactCredentialData",
+      "runProcess",
+      "runProcessSGR",
+    ] as const) {
       chunks = split(kind === "runProcessSGR" ? colored : text);
       const samples: number[] = [];
       for (let trial = 0; trial < 7; trial++) {
         const start = performance.now();
         if (kind === "redactCredentials") proc.redactCredentials(text);
+        else if (kind === "redactCredentialData")
+          for (const event of events) proc.redactCredentialData(event);
         else
           await proc.runProcess({
             cmd: ["fixture"],
@@ -92,6 +104,7 @@ if (process.argv[2] === "--worker") {
         ),
       );
     console.log(`Bun ${Bun.version}; milliseconds, median of 5 after 2 warmups; 5 MiB, 32 KiB chunks`);
+    console.log("redactCredentialData: 20,000 events, seven numbers of eight or more digits per event");
     for (const [version, path] of [
       ["before", pathToFileURL(snapshot).href],
       ["after", new URL("../src/util/proc.ts", import.meta.url).href],
