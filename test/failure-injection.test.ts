@@ -1504,7 +1504,7 @@ for (const operation of [
     const pids = new Map<number, string>();
     try {
       const pattern = {
-        fetch: "git fetch origin +refs/heads/*",
+        fetch: `git fetch ${source} +refs/heads/*`,
         push: "git push *",
         list: "gh pr list *",
         edit: "gh pr edit *",
