@@ -7,6 +7,7 @@ import {
   createProviderWorkloadController,
   initialWorkloadState,
   workloadCell,
+  workloadFor,
   workloadTables,
 } from "../ui/lib/provider-workload.ts";
 import type { subscribeLiveUpdates } from "../ui/store.ts";
@@ -223,6 +224,122 @@ test("compatibility, null propagation and opaque names preserve independent know
     [],
   );
 });
+
+for (const section of ["production", "eval"] as const) {
+  const valid = { provider: "valid", [section]: { totals, roles: [{ ...totals, role: "spec" }] } };
+  test.each([undefined, null, {}, "roles", 5].map((value) => [value]))(
+    `${section}: roles collection %j is absent`,
+    (roles) => {
+      const result = workloadTables([valid, { provider: "other", [section]: { roles } }], section);
+      expect(result.roles.rows).toEqual([{ name: "spec", ...totals }]);
+      expect(result.roles.total).toEqual({ name: "Total", ...totals });
+    },
+  );
+  test.each([null, [], "role", 5, true].map((value) => [value]))(
+    `${section}: role entry %j is skipped`,
+    (entry) => {
+      const result = workloadTables([valid, { provider: "other", [section]: { roles: [entry] } }], section);
+      expect(result.roles.rows).toEqual([{ name: "spec", ...totals }]);
+      expect(result.roles.total).toEqual({ name: "Total", ...totals });
+    },
+  );
+  test.each([undefined, null, 5, {}, [], true].map((value) => [value]))(
+    `${section}: role name %j groups and sorts as unknown`,
+    (role) => {
+      const result = workloadTables(
+        [valid, { provider: "other", [section]: { roles: [{ ...totals, role }, { ...totals }] } }],
+        section,
+      );
+      expect(result.roles.rows).toEqual([
+        {
+          name: "(unknown role)",
+          invocations: 2,
+          tokensIn: 200,
+          tokensOut: 20,
+          wallTimeMs: 2000,
+          costEquivUsd: 2,
+        },
+        { name: "spec", ...totals },
+      ]);
+      expect(result.roles.total).toEqual({
+        name: "Total",
+        invocations: 3,
+        tokensIn: 300,
+        tokensOut: 30,
+        wallTimeMs: 3000,
+        costEquivUsd: 3,
+      });
+      expect(
+        workloadCell("tokensIn", result.roles.rows[0]?.tokensIn, result.roles.total.tokensIn).share,
+      ).toBe("67%");
+      const tied = workloadTables([valid, { [section]: { roles: [{ ...totals, role }] } }], section);
+      expect(tied.roles.rows.map((row) => row.name)).toEqual(["(unknown role)", "spec"]);
+    },
+  );
+  test.each([undefined, null, 5, {}, [], true, ""].map((value) => [value]))(
+    `${section}: provider name %j is safe`,
+    (provider) => {
+      const name = typeof provider === "string" ? provider : "(unknown)";
+      const result = workloadTables([valid, { provider, [section]: { totals } }, { provider }], section);
+      expect(result.providers.rows).toEqual([
+        { name, ...totals },
+        { name: "valid", ...totals },
+      ]);
+      expect(result.providers.total).toEqual({
+        name: "Total",
+        invocations: 2,
+        tokensIn: 200,
+        tokensOut: 20,
+        wallTimeMs: 2000,
+        costEquivUsd: 2,
+      });
+      expect(result.unavailable).toEqual([name]);
+    },
+  );
+  test.each([undefined, null, [], "section", 5, false].map((value) => [value]))(
+    `${section}: section %j is unavailable`,
+    (history) => {
+      const result = workloadTables([valid, { provider: "legacy", [section]: history }], section);
+      expect(result.unavailable).toEqual(["legacy"]);
+      expect(result.providers.rows).toEqual([{ name: "valid", ...totals }]);
+      expect(result.providers.total).toEqual({ name: "Total", ...totals });
+    },
+  );
+  test.each(
+    [undefined, null, [], "totals", 5, {}, { invocations: "1" }, { invocations: 0 }].map((value) => [value]),
+  )(`${section}: totals %j contribute no provider row but retain roles`, (invalidTotals) => {
+    const result = workloadTables(
+      [valid, { provider: "other", [section]: { totals: invalidTotals, roles: [{ ...totals, role: "" }] } }],
+      section,
+    );
+    expect(result.unavailable).toEqual([]);
+    expect(result.providers.rows).toEqual([{ name: "valid", ...totals }]);
+    expect(result.providers.total).toEqual({ name: "Total", ...totals });
+    expect(result.roles.rows).toEqual([
+      { name: "", ...totals },
+      { name: "spec", ...totals },
+    ]);
+  });
+}
+
+test.each([null, [], "provider", 5, true].map((value) => [value]))(
+  "provider entry %j is skipped in tables and card lookup",
+  (entry) => {
+    const valid = { provider: "valid", today: totals, sevenDays: totals, production: { totals } };
+    const rows = [entry, valid];
+    const result = workloadTables(rows, "production");
+    expect(result.providers.rows).toEqual([{ name: "valid", ...totals }]);
+    expect(result.providers.total).toEqual({ name: "Total", ...totals });
+    expect(result.unavailable).toEqual([]);
+    const cardRows = rows as unknown as ProviderWorkload[];
+    expect(workloadFor("valid", cardRows) === valid).toBe(true);
+    expect(workloadFor("absent", cardRows)).toEqual({
+      provider: "absent",
+      today: { invocations: 0, tokensIn: 0, tokensOut: 0, wallTimeMs: 0, costEquivUsd: 0 },
+      sevenDays: { invocations: 0, tokensIn: 0, tokensOut: 0, wallTimeMs: 0, costEquivUsd: 0 },
+    });
+  },
+);
 
 test("missing and malformed metrics stay unknown, and shares use whole-percent boundaries", () => {
   for (const bad of [null, undefined, "12", NaN, Infinity, -Infinity, {}]) {

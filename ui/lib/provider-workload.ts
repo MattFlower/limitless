@@ -12,12 +12,12 @@ export const workloadMetrics = [
 type Metric = (typeof workloadMetrics)[number];
 type Metrics = Record<Metric, number | null>;
 type InputMetrics = Partial<Record<Metric, unknown>>;
-type Section = { totals?: InputMetrics; roles?: (InputMetrics & { role?: string })[] };
-type WorkloadInput = { provider: string; production?: Section; eval?: Section };
 export type WorkloadSection = "production" | "eval";
 export type WorkloadWindow = "today" | "sevenDays";
 export type WorkloadRow = Metrics & { name: string };
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const object = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
 const metrics = (row: InputMetrics): Metrics =>
   Object.fromEntries(workloadMetrics.map((key) => [key, finite(row[key]) ? row[key] : null])) as Metrics;
 const sum = (rows: Metrics[]): Metrics =>
@@ -34,20 +34,24 @@ const table = (rows: WorkloadRow[]) => ({
   total: { name: "Total", ...sum(rows) },
 });
 
-export function workloadTables(rows: readonly WorkloadInput[], section: WorkloadSection) {
+export function workloadTables(rows: readonly unknown[], section: WorkloadSection) {
   const providers: WorkloadRow[] = [];
   const roles = new Map<string, Metrics[]>();
   const unavailable: string[] = [];
   for (const row of rows) {
+    if (!object(row)) continue;
+    const provider = typeof row.provider === "string" ? row.provider : "(unknown)";
     const history = row[section];
-    if (!history) {
-      unavailable.push(row.provider);
+    if (!object(history)) {
+      unavailable.push(provider);
       continue;
     }
-    if (finite(history.totals?.invocations) && history.totals.invocations > 0)
-      providers.push({ name: row.provider, ...metrics(history.totals) });
-    for (const role of history.roles ?? []) {
-      const name = role.role ?? "(unknown role)";
+    const totals = history.totals;
+    if (object(totals) && finite(totals.invocations) && totals.invocations > 0)
+      providers.push({ name: provider, ...metrics(totals) });
+    for (const role of Array.isArray(history.roles) ? history.roles : []) {
+      if (!object(role)) continue;
+      const name = typeof role.role === "string" ? role.role : "(unknown role)";
       const group = roles.get(name) ?? [];
       group.push(metrics(role));
       roles.set(name, group);
@@ -157,7 +161,7 @@ const zero = (): WorkloadTotals => ({
 
 export function workloadFor(providerId: string, rows: ProviderWorkload[]): ProviderWorkload {
   return (
-    rows.find((row) => row.provider === providerId) ?? {
+    rows.find((row) => object(row) && row.provider === providerId) ?? {
       provider: providerId,
       today: zero(),
       sevenDays: zero(),

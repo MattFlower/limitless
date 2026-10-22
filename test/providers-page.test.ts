@@ -488,6 +488,55 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     expect(text(workloadRoot)).toContain("codex: historical statistics unavailable");
     expect(text(workloadRoot)).toContain("No workload in this window.");
     expect(cards(workloadRoot).map(text).join("")).toContain("Invocations1717");
+    for (const { roles, unknownRole } of [
+      { roles: {}, unknownRole: false },
+      { roles: [null], unknownRole: false },
+      { roles: [[], 5, true, "role"], unknownRole: false },
+      { roles: [{ ...totals, invocations: 1, role: 5 }], unknownRole: true },
+    ]) {
+      const section = { totals: { ...totals, invocations: 1 }, roles };
+      fixture.setWorkload([
+        null,
+        [],
+        5,
+        "provider",
+        true,
+        { ...workload, production: history(1, 1, "spec"), eval: history(1, 1, "review_shadow") },
+        { provider: 5, production: section, eval: section },
+        { production: [], eval: null },
+        { provider: "legacy" },
+      ]);
+      fixture.publishLiveUpdate({ kind: "reconnected" });
+      await flush();
+      await flush();
+      const malformedReads = fixture.workloadReads;
+      click("Production");
+      expect(bodyRows(workloadTables()[0]).map((row) => row.slice(0, 2))).toEqual([
+        ["(unknown)", "1 (50%)"],
+        ["codex", "1 (50%)"],
+        ["Total", "2 (100%)"],
+      ]);
+      expect(text(workloadRoot)).toContain("spec");
+      expect(text(workloadRoot)).toContain("(unknown): historical statistics unavailable");
+      expect(text(workloadRoot)).toContain("legacy: historical statistics unavailable");
+      expect(cards(workloadRoot).map(text).join("")).toContain("Invocations1717");
+      expect(bodyRows(workloadTables()[1]).map((row) => row.slice(0, 2))).toEqual(
+        unknownRole
+          ? [
+              ["(unknown role)", "1 (50%)"],
+              ["spec", "1 (50%)"],
+              ["Total", "2 (100%)"],
+            ]
+          : [
+              ["spec", "1 (100%)"],
+              ["Total", "1 (100%)"],
+            ],
+      );
+      click("Eval");
+      expect(fixture.workloadReads).toBe(malformedReads);
+      expect(text(workloadRoot)).toContain("review_shadow");
+      expect(text(workloadRoot)).toContain("Executions");
+    }
     const empty = deferred<ProviderWorkload[]>();
     fixture.holdWorkload(empty.promise);
     click("Today");

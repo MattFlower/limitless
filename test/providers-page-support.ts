@@ -71,7 +71,7 @@ export function publishLiveUpdate(message: StreamMessage | { kind: "reconnected"
   for (const listener of listeners) listener(message);
 }
 
-let workload: ProviderWorkload[] = [];
+let workload: unknown[] = [];
 let failure = false;
 export let workloadReads = 0;
 export const workloadSince: (number | undefined)[] = [];
@@ -80,7 +80,7 @@ export function holdWorkload(read: Promise<ProviderWorkload[]>) {
   heldWorkload = read;
 }
 export const listenerCount = () => listeners.size;
-export function setWorkload(rows: ProviderWorkload[], fail = false) {
+export function setWorkload(rows: unknown[], fail = false) {
   workload = rows;
   failure = fail;
 }
