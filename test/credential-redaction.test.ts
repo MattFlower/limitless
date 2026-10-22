@@ -181,6 +181,30 @@ test("structured values and keys retain JSON serialization behavior and share th
   expect(() => redactCredentialData(1n)).toThrow();
 });
 
+test("structured numeric credentials redact whole values and containing numbers, leaving fragments unchanged", () => {
+  registerCredential("MATCHER_NUMERIC", "987654321012345");
+  const redacted: unknown = redactCredentialData({
+    input: { token: 987654321012345 },
+    values: [987654321012345, 1987654321012345, 98765432, 42, -42, 0.25, 0, 1, 9, 9876543],
+  });
+  expect(redacted).toEqual({
+    input: { token: "[redacted]" },
+    values: ["[redacted]", "[redacted]", 98765432, 42, -42, 0.25, 0, 1, 9, 9876543],
+  });
+});
+
+test("short numeric credentials redact whole values without matching substrings", () => {
+  registerCredential("MATCHER_SHORT_NUMERIC", "6352");
+  const redacted: unknown = redactCredentialData([6352, 16352, 635]);
+  expect(redacted).toEqual(["[redacted]", 16352, 635]);
+});
+
+test("digit credentials beyond exact JSON number precision still redact as strings", () => {
+  const secret = "987654321012345678901234567890";
+  registerCredential("MATCHER_LARGE_NUMERIC", secret);
+  expect(redactCredentialData({ token: secret })).toEqual({ token: "[redacted]" });
+});
+
 const work = (): MatchingWork => ({ transitions: 0, outputs: 0, boundaries: 0 });
 function measure(patterns: string[], input: string) {
   const matcher = new CredentialMatcher(variants(patterns));
