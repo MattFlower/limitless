@@ -1060,7 +1060,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
-    if (discoveryError) void terminate();
+    if (discoveryError || persistenceError) void terminate();
   });
 }
 

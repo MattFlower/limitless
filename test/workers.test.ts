@@ -2813,6 +2813,7 @@ test.each([true, false])(
     let root = "",
       scratch = "",
       invocation = "";
+    let delayedTermination = false;
     const worker = await loop({
       heartbeatMs: 60_000,
       harnesses: {
@@ -2833,8 +2834,20 @@ test.each([true, false])(
             }
             original.call(this, key, value);
           });
+          const controller = new AbortController();
+          // Bound a regression's long-running child without letting the watchdog count as prompt cleanup.
+          const watchdog = setTimeout(() => {
+            delayedTermination = true;
+            controller.abort();
+          }, 5000);
           try {
-            const command = () => runProcess({ cmd: [process.execPath, "-e", ""], cwd: spec.cwd, env: {} });
+            const command = () =>
+              runProcess({
+                cmd: [process.execPath, "-e", "setInterval(() => {}, 1000)"],
+                cwd: spec.cwd,
+                env: {},
+                signal: controller.signal,
+              });
             await expect(
               confirmed
                 ? command()
@@ -2843,6 +2856,8 @@ test.each([true, false])(
                   }, command),
             ).rejects.toThrow(ProcessTerminationError.prefix);
           } finally {
+            clearTimeout(watchdog);
+            controller.abort();
             saving.mockRestore();
           }
           return {};
@@ -2858,6 +2873,7 @@ test.each([true, false])(
     try {
       await failed.promise;
       await worker.stop();
+      expect(delayedTermination).toBe(false);
       expect(workers.agentJob(id)?.state).not.toBe("done");
       expect(existsSync(root)).toBe(true);
       expect(existsSync(scratch)).toBe(true);
