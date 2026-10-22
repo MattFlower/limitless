@@ -13,7 +13,12 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { privateReadPaths } from "../util/private-reads.ts";
-import { assertProcessesStopped, invocationScratch, processScope } from "../util/proc.ts";
+import {
+  assertProcessesStopped,
+  invocationScratch,
+  ProcessTerminationError,
+  processScope,
+} from "../util/proc.ts";
 import { ConfinementError, homeReadPolicy, policySpellings } from "./read-policy.ts";
 import type { AgentSpec } from "./types.ts";
 
@@ -304,7 +309,11 @@ export async function withScratch<T>(cwd: string, run: (scratchDir: string) => P
   const scope = processScope.getStore();
   scope?.scratchDirs.add(scratchDir);
   try {
+    scope?.beforeSpawn?.();
     return await invocationScratch.run(scratchDir, () => run(scratchDir));
+  } catch (error) {
+    if (scope && error instanceof ProcessTerminationError) scope.terminationError = error;
+    throw error;
   } finally {
     removeScratch(scratchDir);
     scope?.scratchDirs.delete(scratchDir);

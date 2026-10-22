@@ -17,6 +17,7 @@ import { withRepoLock } from "../src/git/repos.ts";
 import {
   bootIdentity,
   type ProcessCleanup,
+  type ProcessDiscovery,
   ProcessTerminationError,
   processBirth,
   processBirthInspection,
@@ -153,6 +154,102 @@ async function expectRecoveryRefusal(reason: string) {
   });
   return current.terminationError;
 }
+
+test("persisted scope ownership precedes spawn and survives explicit command environments", async () => {
+  const marker = crypto.randomUUID();
+  let persisted: string | undefined;
+  const current = {
+    ...scope(),
+    ownershipMarker: marker,
+    beforeSpawn: (invocation?: string) => {
+      persisted = invocation;
+    },
+  };
+  const result = await processScope.run(current, () =>
+    runProcess({
+      cmd: [
+        process.execPath,
+        "-e",
+        `console.log(process.env[${JSON.stringify(`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`)}]); console.log(process.env.LIMITLESS_INVOCATION)`,
+      ],
+      cwd: directory,
+      env: {},
+      onStdoutLine: () => expect(persisted).toEqual(expect.any(String)),
+    }),
+  );
+  const lines = result.stdout.trim().split("\n");
+  expect(lines[0]).toBe("1");
+  expect(lines[1]).toBe(persisted);
+  const sentinel = join(directory, "must-not-spawn");
+  await expect(
+    processScope.run(
+      {
+        ...current,
+        beforeSpawn: () => {
+          throw new Error("persistence failed");
+        },
+      },
+      () =>
+        runProcess({
+          cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+          cwd: directory,
+          env: {},
+        }),
+    ),
+  ).rejects.toThrow("persistence failed");
+  expect(existsSync(sentinel)).toBe(false);
+});
+
+test("unknown boot requires current ownership before signalling recorded identities", async () => {
+  const row = await sleeper();
+  store.recordProcessCleanup(row);
+  const owner: ProcessDiscovery = {
+    ...row,
+    boot: "",
+    discovery: {
+      group: 0,
+      started: 0,
+      directories: [directory],
+      leader: null,
+      spawnedAt: "0",
+    },
+  };
+  const kill = spyOn(process, "kill");
+  try {
+    await processBootInspection.run(
+      () => {
+        throw new Error("boot unavailable");
+      },
+      async () => {
+        await processRecoveryInspection.run(
+          {
+            stopped: recoveryProcessStopped,
+            timeoutMs: 1000,
+            discover: async () => [],
+          },
+          () =>
+            expect(recoverProcessCleanups(store, undefined, undefined, undefined, owner)).rejects.toThrow(
+              "Process boot identity could not be confirmed",
+            ),
+        );
+        expect(kill).not.toHaveBeenCalled();
+        expect(store.listProcessCleanups()).toEqual([row]);
+        await processRecoveryInspection.run(
+          {
+            stopped: recoveryProcessStopped,
+            timeoutMs: 1000,
+            discover: async () => (recoveryProcessStopped(row.pid) ? [] : [row.pid]),
+          },
+          () => recoverProcessCleanups(store, undefined, undefined, undefined, owner),
+        );
+      },
+    );
+    expectProcessStopped(row.pid);
+    expect(store.listProcessCleanups()).toEqual([]);
+  } finally {
+    kill.mockRestore();
+  }
+});
 
 test("discovery context survives reopening and legacy-column inserts remain compatible", async () => {
   const row = await sleeper();

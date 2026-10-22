@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
@@ -45,6 +45,7 @@ import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
+import { removeScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
@@ -52,7 +53,21 @@ import { createApiToken } from "../src/server/api-token.ts";
 import { startHttp } from "../src/server/http.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
-import { CommandError, redactCredentials, registerCredential, sh } from "../src/util/proc.ts";
+import {
+  CommandError,
+  invocationScratch,
+  type ProcessDiscovery,
+  ProcessTerminationError,
+  processBootInspection,
+  processInspection,
+  processRecoveryInspection,
+  processScope,
+  recoveryProcessStopped,
+  redactCredentials,
+  registerCredential,
+  runProcess,
+  sh,
+} from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
 import { agentPathMask } from "../src/workers/reporting.ts";
@@ -842,6 +857,16 @@ async function loop(options: Parameters<typeof runWorker>[4] = {}, name = "loop-
   };
 }
 
+function workerCleanupRecords(remote: Config) {
+  const local = new Store(join(remote.paths.home, "worker", "worker.db"));
+  try {
+    expect(local.getSetting("worker.cleanups", {})).toEqual({});
+    return local.listProcessCleanups();
+  } finally {
+    local.close();
+  }
+}
+
 test("the idle worker pairs, heartbeats and long-polls until cleanly aborted", async () => {
   await listen();
   const paths: string[] = [];
@@ -1097,6 +1122,8 @@ test("a worker runs real checks from the exact bundle head and returns the local
     expect(fields(run)).toEqual(fields(redactGateData(local)));
     expect(run.checks[0]?.name).toBe("pass");
     expect(run.checks[1]?.exitCode).toBe(7);
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
     expect(run.checks[0]?.output).toContain("gate bytes");
     expect(run.checks[0]?.output).toContain(req.headSha);
     const jobs = workers.jobs("1=1");
@@ -1269,70 +1296,124 @@ test.each([
   150_000,
 );
 
-test.each(["done", "cancelled", "failed"] as const)(
-  "worker stops reporting a %s job while repository cleanup is blocked",
-  async (state) => {
+test.each([
+  ["gate", "done"],
+  ["gate", "failed"],
+  ["gate", "cancelled"],
+  ["agent", "done"],
+  ["agent", "failed"],
+  ["agent", "cancelled"],
+] as const)(
+  "worker renews a %s job through cleanup and %s reporting, excluding cancellation",
+  async (kind, state) => {
+    let now = Date.now();
+    workers = new WorkerStore(store, releaseSha, { poll: 30, tick: 5 }, () => now);
     await listen();
     const req = await request(true);
     req.gates.setup = [];
     req.gates.checks = [{ name: "check", run: "true" }];
     const locked = Promise.withResolvers<void>(),
       release = Promise.withResolvers<void>(),
-      finished = Promise.withResolvers<void>();
+      finished = Promise.withResolvers<void>(),
+      posting = Promise.withResolvers<void>();
     const reports = new Map(
       ["/worker/heartbeat", "/worker/lease"].map((path) => [path, Promise.withResolvers<string[]>()]),
     );
+    const postingReports = new Map(
+      ["/worker/heartbeat", "/worker/lease"].map((path) => [path, Promise.withResolvers<string[]>()]),
+    );
     let lock: Promise<void> | undefined,
-      terminal = false;
-    const id = workers.enqueue(req);
+      terminal = false,
+      executing = false,
+      allowReport = false;
+    const id =
+      kind === "gate"
+        ? workers.enqueue(req)
+        : enqueueAgent({
+            runId: req.runId,
+            parentSha: req.headSha,
+            branch: "change/worker-agent",
+            target: { ...agentRequest().target, harness: "claude" },
+          });
+    const row = () => (kind === "gate" ? workers.job(id) : workers.agentJob(id));
+    const execute = async (cwd: string, signal?: AbortSignal) => {
+      const cache =
+        kind === "gate"
+          ? join(home, "remote", "repos", `${encodeURIComponent(req.repo)}.git`)
+          : join(dirname(cwd), "repo.git");
+      // Hold cleanup at the real cache lock, after bundle import has released it.
+      lock = withRepoLock(cache, async () => {
+        locked.resolve();
+        await release.promise;
+      });
+      await locked.promise;
+      if (state === "cancelled") {
+        if (kind === "gate") workers.cancel(id);
+        else workers.cancelAgentJob(id);
+        await new Promise<void>((resolve) =>
+          signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      }
+      executing = true;
+      finished.resolve();
+      if (state === "failed") throw new Error("Worker execution failed");
+      signal?.throwIfAborted();
+      return {};
+    };
     const worker = await loop({
+      harnesses: { claude: fakeHarness((spec) => execute(spec.cwd, spec.signal)) },
       confinement: {
         ...fakeConfinement,
         async verify(_roots, opts) {
-          // Hold cleanup at the real cache lock, after bundle import has released it.
-          const cache = join(home, "remote", "repos", `${encodeURIComponent(req.repo)}.git`);
-          lock = withRepoLock(cache, async () => {
-            locked.resolve();
-            await release.promise;
-          });
-          await locked.promise;
-          if (state === "failed") throw new Error("Worker execution failed");
-          if (state === "cancelled") {
-            workers.cancel(id);
-            await new Promise<void>((resolve) =>
-              opts.signal?.addEventListener("abort", () => resolve(), { once: true }),
-            );
-            terminal = true;
-            finished.resolve();
-            opts.signal?.throwIfAborted();
-          }
+          if (kind === "gate") await execute(opts.cwd, opts.signal);
         },
       },
       async request(...args) {
         const [_, path, body] = args;
-        if (terminal && reports.has(path)) reports.get(path)?.resolve((body as { jobs: string[] }).jobs);
-        const reply = await workerRequest(...args);
         if (path.endsWith("/result") || path.endsWith("/failure")) {
           terminal = true;
-          finished.resolve();
+          posting.resolve();
+          if (!allowReport) throw new Error("Coordinator temporarily unavailable");
         }
+        const observing = executing ? (terminal ? postingReports : reports).get(path) : undefined;
+        const reply = await workerRequest(...args);
+        observing?.resolve((body as { jobs: string[] }).jobs);
         return reply;
       },
     });
     try {
       await finished.promise;
-      for (const report of reports.values()) expect(await report.promise).not.toContain(id);
-      expect(workers.job(id)?.state).toBe(state === "failed" ? "queued" : state);
-      // The worker must still await cleanup when shutting down.
-      let stopped = false;
-      worker.controller.abort();
-      const stopping = worker.task.then(() => {
-        stopped = true;
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(stopped).toBe(false);
-      release.resolve();
-      await stopping;
+      now += 1000;
+      for (const report of reports.values()) {
+        const ids = await report.promise;
+        if (state === "cancelled") expect(ids).not.toContain(id);
+        else expect(ids).toContain(id);
+      }
+      // Results and failures wait until directory cleanup has settled.
+      expect(row()?.state).toBe(state === "cancelled" ? "cancelled" : "leased");
+      if (state === "cancelled") {
+        // The worker must still await cleanup when shutting down.
+        let stopped = false;
+        const stopping = worker.stop().then(() => {
+          stopped = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(stopped).toBe(false);
+        release.resolve();
+        await stopping;
+      } else {
+        const expiry = row()?.lease_expires_at ?? 0;
+        release.resolve();
+        await posting.promise;
+        now += 1000;
+        for (const report of postingReports.values()) expect(await report.promise).toContain(id);
+        expect(row()?.lease_expires_at).toBeGreaterThan(expiry);
+        expect(row()?.state).toBe("leased");
+        allowReport = true;
+        await until(() => row()?.state === (state === "done" ? "done" : "queued"));
+      }
+      expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+      expect(workerCleanupRecords(worker.remote)).toEqual([]);
     } finally {
       release.resolve();
       await worker.stop();
@@ -1956,12 +2037,14 @@ test("cancelling execution aborts the worker's running gate on a held-job reply"
   const started = Promise.withResolvers<{ signal: AbortSignal; cwd: string }>(),
     stopped = Promise.withResolvers<void>();
   const cancelledReply = Promise.withResolvers<void>();
-  let id = "";
+  let id = "",
+    scratch = "";
   const worker = await loop({
     confinement: {
       ...fakeConfinement,
       async verify(_roots, opts) {
         if (!opts.signal) throw new Error("Missing job signal");
+        scratch = invocationScratch.getStore() ?? "";
         opts.signal.addEventListener("abort", () => stopped.resolve(), { once: true });
         started.resolve({ signal: opts.signal, cwd: opts.cwd });
       },
@@ -2008,6 +2091,10 @@ test("cancelling execution aborts the worker's running gate on a held-job reply"
     }
     expect(workers.job(id)?.state).toBe("cancelled");
     expect(workers.lease("loop-runner")).toBeNull();
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(scratch).not.toBe("");
+    expect(existsSync(scratch)).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
   } finally {
     controller.abort();
     await worker.stop();
@@ -2386,6 +2473,7 @@ test("worker cleanup restores locked directories without following symlinks and 
   mkdirSync(outside);
   chmodSync(outside, 0o500);
   const checkouts: string[] = [],
+    scratches: string[] = [],
     diagnostics: string[] = [];
   const command = await import("../src/git/command.ts"),
     original = command.worktreeGit;
@@ -2405,8 +2493,20 @@ test("worker cleanup restores locked directories without following symlinks and 
     confinement: {
       ...fakeConfinement,
       async verify(_roots, opts) {
+        const local = new Store(join(home, "remote", "worker", "worker.db"));
+        try {
+          expect(local.getSetting("worker.cleanups", {})).toMatchObject({
+            [dirname(opts.cwd)]: {
+              pending: [],
+              ownership: { marker: processScope.getStore()?.ownershipMarker },
+            },
+          });
+        } finally {
+          local.close();
+        }
         if (!checkouts.includes(opts.cwd)) {
           checkouts.push(opts.cwd);
+          scratches.push(invocationScratch.getStore() ?? "");
           symlinkSync(outside, join(opts.cwd, "outside"));
         }
       },
@@ -2431,6 +2531,12 @@ test("worker cleanup restores locked directories without following symlinks and 
     await until(() => readdirSync(worker.remote.paths.work).length === 0);
     expect(checkouts).toHaveLength(3);
     expect(checkouts.every((path) => !existsSync(path))).toBe(true);
+    expect(scratches).toHaveLength(3);
+    for (const path of scratches) {
+      expect(path).not.toBe("");
+      expect(existsSync(path)).toBe(false);
+    }
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
     expect(externalWrites.filter(({ args }) => args[1] === "bundle")).toHaveLength(3);
     expect(externalWrites.filter(({ args }) => args[1] === "worktree")).toHaveLength(3);
     for (const { args, roots } of externalWrites)
@@ -2443,6 +2549,897 @@ test("worker cleanup restores locked directories without following symlinks and 
     chmodSync(outside, 0o700);
   }
 }, 60_000);
+
+test.each(["changed work path", "removal error"] as const)(
+  "worker startup discards completed cleanup after a %s and accepts jobs",
+  async (kind) => {
+    await listen();
+    const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+    const root = mkdtempSync(join(kind === "changed work path" ? home : remote.paths.work, "worker-"));
+    const marker = join(root, "keep");
+    writeFileSync(marker, "retained directory");
+    mkdirSync(join(remote.paths.home, "worker"));
+    const local = new Store(join(remote.paths.home, "worker", "worker.db"));
+    local.setSetting("worker.cleanups", {
+      [root]: {
+        root,
+        cache: join(root, "repo.git"),
+        scratch: [],
+        confirmed: true,
+        ownership: { marker: crypto.randomUUID(), runId: "completed", started: 0, boot: "old-boot" },
+      },
+    });
+    local.close();
+    const scratch = await import("../src/harness/scratch.ts"),
+      original = scratch.removeScratch;
+    const spy = spyOn(scratch, "removeScratch").mockImplementation((directory) => {
+      if (directory === root) throw new Error("private-cleanup-diagnostic");
+      original(directory);
+    });
+    const diagnostics: string[] = [];
+    const id = await queuedLocalAgent();
+    const worker = await loop({
+      log: (text) => diagnostics.push(text),
+      harnesses: { claude: fakeHarness(() => ({})) },
+    });
+    try {
+      await until(() => workers.agentJob(id)?.state === "done");
+      await worker.stop();
+      expect(diagnostics).toEqual(["Worker checkout cleanup failed"]);
+      expect(readFileSync(marker, "utf8")).toBe("retained directory");
+      const reopened = new Store(join(remote.paths.home, "worker", "worker.db"));
+      try {
+        expect(reopened.getSetting("worker.cleanups", {})).toEqual({});
+        expect(reopened.listProcessCleanups()).toEqual([]);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      try {
+        await worker.stop();
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  },
+  30_000,
+);
+
+test.each(["changed", "equal", "unavailable", "unrecorded"] as const)(
+  "worker confirms retained ownership only from a scan or changed boot (%s)",
+  async (kind) => {
+    const server = await listen();
+    const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+    await pairWorker(server.url.origin, join(remote.paths.home, "worker"), "recovering", (text) =>
+      workers.approve(text.split(": ")[1] ?? ""),
+    );
+    const root = mkdtempSync(join(remote.paths.work, "worker-"));
+    const scratch = mkdtempSync(join(home, "kept-scratch-"));
+    const legacyRoot = mkdtempSync(join(remote.paths.work, "worker-"));
+    const database = join(remote.paths.home, "worker", "worker.db");
+    const local = new Store(database);
+    const marker = crypto.randomUUID();
+    local.setSetting("worker.cleanups", {
+      [legacyRoot]: { root: legacyRoot, cache: join(legacyRoot, "repo.git"), scratch: [] },
+      [root]: {
+        root,
+        cache: join(root, "repo.git"),
+        scratch: [scratch],
+        confirmed: false,
+        ownership: {
+          marker,
+          runId: "retained",
+          started: 0,
+          ...(kind === "unrecorded" ? {} : { boot: "previous-boot" }),
+        },
+      },
+    });
+    // Old PID evidence must be discarded on a reboot without signalling it.
+    local.recordProcessCleanup({
+      runId: "retained",
+      invocation: marker,
+      directory: join(root, "checkout"),
+      pid: 2_000_000_000,
+      birth: "old-birth",
+      boot: "previous-boot",
+      createdAt: 0,
+    });
+    local.close();
+    const controller = new AbortController();
+    const diagnostics: string[] = [];
+    let scansAvailable = false,
+      heartbeats = 0,
+      signals = 0;
+    const kill = spyOn(process, "kill").mockImplementation(() => {
+      signals++;
+      return true;
+    });
+    try {
+      await processBootInspection.run(
+        () => {
+          if (kind === "unavailable") throw new Error("boot unavailable");
+          return kind === "changed" ? "new-boot" : "previous-boot";
+        },
+        () =>
+          processRecoveryInspection.run(
+            {
+              stopped: recoveryProcessStopped,
+              timeoutMs: 100,
+              discover: async () => {
+                if (!scansAvailable) throw new Error("scan unavailable");
+                return [];
+              },
+            },
+            () =>
+              runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+                confinement: fakeConfinement,
+                heartbeatMs: 5,
+                machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+                log: (text) => diagnostics.push(text),
+                request: async (...args) => {
+                  if (args[1] === "/worker/heartbeat") {
+                    heartbeats++;
+                    if (heartbeats === 1) {
+                      expect(existsSync(root)).toBe(kind !== "changed");
+                      expect(existsSync(scratch)).toBe(kind !== "changed");
+                      expect(existsSync(legacyRoot)).toBe(true);
+                      scansAvailable = true;
+                    } else if (!existsSync(root)) {
+                      expect(existsSync(root)).toBe(false);
+                      expect(existsSync(scratch)).toBe(false);
+                      expect(existsSync(legacyRoot)).toBe(true);
+                      const reopened = new Store(database);
+                      try {
+                        expect(Object.keys(reopened.getSetting("worker.cleanups", {}))).toEqual([legacyRoot]);
+                        expect(reopened.listProcessCleanups()).toEqual([]);
+                      } finally {
+                        reopened.close();
+                      }
+                      controller.abort();
+                    }
+                  }
+                  return workerRequest(...args);
+                },
+              }),
+          ),
+      );
+      expect(heartbeats).toBeGreaterThanOrEqual(2);
+      expect(signals).toBe(0);
+      expect(diagnostics.some((text) => text.includes("missing worker discovery evidence"))).toBe(true);
+      if (kind !== "changed")
+        expect(diagnostics.some((text) => text.includes("scan unavailable"))).toBe(true);
+    } finally {
+      controller.abort();
+      kill.mockRestore();
+    }
+  },
+);
+
+test("pending recovery requires a changed boot while saved null-leader context and new jobs recover independently", async () => {
+  const server = await listen();
+  const id = await queuedLocalAgent();
+  const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+  await pairWorker(server.url.origin, join(remote.paths.home, "worker"), "recovering", (text) =>
+    workers.approve(text.split(": ")[1] ?? ""),
+  );
+  const root = mkdtempSync(join(remote.paths.work, "worker-"));
+  const scratch = mkdtempSync(join(home, "pending-scratch-"));
+  const savedRoot = mkdtempSync(join(remote.paths.work, "worker-"));
+  const pending = crypto.randomUUID();
+  const database = join(remote.paths.home, "worker", "worker.db");
+  const local = new Store(database);
+  const entry = {
+    root,
+    cache: join(root, "repo.git"),
+    scratch: [scratch],
+    pending: [pending],
+    discoveries: [],
+    ownership: { marker: crypto.randomUUID(), runId: "pending", started: 0, boot: "test-boot" },
+  };
+  local.setSetting("worker.cleanups", {
+    [root]: entry,
+    [savedRoot]: {
+      root: savedRoot,
+      cache: join(savedRoot, "repo.git"),
+      scratch: [],
+      pending: [],
+      discoveries: [
+        {
+          invocation: crypto.randomUUID(),
+          runId: "saved",
+          directory: join(savedRoot, "checkout"),
+          boot: "test-boot",
+          createdAt: 0,
+          discovery: { group: 0, started: 0, directories: [], leader: null, spawnedAt: "0" },
+        },
+      ],
+    },
+  });
+  local.close();
+  for (const [attempt, boot] of ["test-boot", "test-boot", "next-boot"].entries()) {
+    const controller = new AbortController();
+    const diagnostics: string[] = [];
+    let heartbeats = 0;
+    const task = processBootInspection.run(
+      () => boot,
+      () =>
+        processRecoveryInspection.run(
+          { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
+          () =>
+            runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+              confinement: fakeConfinement,
+              heartbeatMs: 5,
+              machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+              log: (text) => diagnostics.push(text),
+              harnesses: { claude: fakeHarness(() => ({})) },
+              request: async (...args) => {
+                if (attempt > 0 && args[1] === "/worker/heartbeat" && ++heartbeats === 2) controller.abort();
+                return workerRequest(...args);
+              },
+            }),
+        ),
+    );
+    try {
+      if (attempt === 0) {
+        await until(() => workers.agentJob(id)?.state === "done");
+        controller.abort();
+      }
+      await task;
+    } finally {
+      controller.abort();
+      await task;
+    }
+    const changed = boot === "next-boot";
+    expect(existsSync(root)).toBe(!changed);
+    expect(existsSync(scratch)).toBe(!changed);
+    expect(existsSync(savedRoot)).toBe(false);
+    const reopened = new Store(database);
+    try {
+      expect(reopened.getSetting("worker.cleanups", {})).toEqual(changed ? {} : { [root]: entry });
+      expect(reopened.listProcessCleanups()).toEqual([]);
+    } finally {
+      reopened.close();
+    }
+    if (!changed) expect(diagnostics.some((text) => text.includes("awaiting changed boot"))).toBe(true);
+  }
+});
+
+test.each([true, false])(
+  "discovery save failure retains pending evidence unless live termination confirms it (%s)",
+  async (confirmed) => {
+    const server = await listen();
+    const id = await queuedLocalAgent();
+    const failed = Promise.withResolvers<void>();
+    let root = "",
+      scratch = "",
+      invocation = "";
+    let delayedTermination = false;
+    const worker = await loop({
+      heartbeatMs: 60_000,
+      harnesses: {
+        claude: fakeHarness(async (spec) => {
+          root = dirname(spec.cwd);
+          scratch = spec.scratchDir ?? "";
+          const original = Store.prototype.setSetting;
+          const saving = spyOn(Store.prototype, "setSetting").mockImplementation(function (
+            this: Store,
+            key,
+            value,
+          ) {
+            const job = (value as Record<string, { discoveries?: ProcessDiscovery[] }>)[root];
+            const row = job?.discoveries?.[0];
+            if (key === "worker.cleanups" && row) {
+              invocation = row.invocation;
+              throw new Error("injected discovery save failure");
+            }
+            original.call(this, key, value);
+          });
+          const controller = new AbortController();
+          // Bound a regression's long-running child without letting the watchdog count as prompt cleanup.
+          const watchdog = setTimeout(() => {
+            delayedTermination = true;
+            controller.abort();
+          }, 5000);
+          try {
+            const command = () =>
+              runProcess({
+                cmd: [process.execPath, "-e", "setInterval(() => {}, 1000)"],
+                cwd: spec.cwd,
+                env: {},
+                signal: controller.signal,
+              });
+            await expect(
+              confirmed
+                ? command()
+                : processInspection.run(async () => {
+                    throw new Error("injected termination failure");
+                  }, command),
+            ).rejects.toThrow(ProcessTerminationError.prefix);
+          } finally {
+            clearTimeout(watchdog);
+            controller.abort();
+            saving.mockRestore();
+          }
+          return {};
+        }),
+      },
+      request: async (...args) => {
+        const reply = await workerRequest(...args);
+        if (args[1] === agentPath(id, "failure")) failed.resolve();
+        return reply;
+      },
+    });
+    const database = join(worker.remote.paths.home, "worker", "worker.db");
+    try {
+      await failed.promise;
+      await worker.stop();
+      expect(delayedTermination).toBe(false);
+      expect(workers.agentJob(id)?.state).not.toBe("done");
+      expect(existsSync(root)).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      const local = new Store(database);
+      try {
+        expect(invocation).not.toBe("");
+        expect(local.getSetting("worker.cleanups", {})).toMatchObject({
+          [root]: { pending: confirmed ? [] : [invocation], discoveries: [], scratch: [scratch] },
+        });
+      } finally {
+        local.close();
+      }
+      const controller = new AbortController();
+      const diagnostics: string[] = [];
+      await processRecoveryInspection.run(
+        { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
+        () =>
+          runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+            confinement: fakeConfinement,
+            machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+            log: (text) => diagnostics.push(text),
+            request: async (...args) => {
+              controller.abort();
+              return workerRequest(...args);
+            },
+          }),
+      );
+      expect(existsSync(root)).toBe(!confirmed);
+      expect(existsSync(scratch)).toBe(!confirmed);
+      const reopened = new Store(database);
+      try {
+        if (confirmed) expect(reopened.getSetting("worker.cleanups", {})).toEqual({});
+        else
+          expect(reopened.getSetting("worker.cleanups", {})).toMatchObject({
+            [root]: { pending: [invocation] },
+          });
+      } finally {
+        reopened.close();
+      }
+      if (!confirmed) expect(diagnostics.some((text) => text.includes("awaiting changed boot"))).toBe(true);
+    } finally {
+      await worker.stop();
+      removeScratch(scratch);
+    }
+  },
+  30_000,
+);
+
+test("worker persists concurrent invocation markers before spawn and clears only saved discoveries", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        const scope = processScope.getStore();
+        if (!scope?.cleanups?.recordProcessDiscovery) throw new Error("Missing process scope");
+        const read = () => {
+          const local = new Store(join(home, "remote", "worker", "worker.db"));
+          try {
+            return local.getSetting<
+              Record<string, { pending: string[]; discoveries: ProcessDiscovery[]; scratch: string[] }>
+            >("worker.cleanups", {})[dirname(spec.cwd)];
+          } finally {
+            local.close();
+          }
+        };
+        expect(read()?.pending).toEqual([]); // withScratch's markerless save owns scratch only.
+        expect(read()?.scratch).toContain(spec.scratchDir ?? "");
+        const sentinel = join(spec.cwd, "must-not-spawn");
+        const originalSave = Store.prototype.setSetting;
+        const preSpawn = spyOn(Store.prototype, "setSetting").mockImplementation(function (
+          this: Store,
+          key,
+          value,
+        ) {
+          if (key === "worker.cleanups") throw new Error("pre-spawn save failed");
+          originalSave.call(this, key, value);
+        });
+        try {
+          await expect(
+            runProcess({
+              cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+              cwd: spec.cwd,
+              env: {},
+            }),
+          ).rejects.toThrow("pre-spawn save failed");
+        } finally {
+          preSpawn.mockRestore();
+        }
+        expect(existsSync(sentinel)).toBe(false);
+        expect(read()?.pending).toEqual([]);
+        const rows: ProcessDiscovery[] = [];
+        const record = scope.cleanups.recordProcessDiscovery;
+        scope.cleanups.recordProcessDiscovery = (row) => {
+          rows.push(row);
+        };
+        const release = join(spec.cwd, "release");
+        const ready = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
+        const commands = ready.map((signal) =>
+          runProcess({
+            cmd: [
+              process.execPath,
+              "-e",
+              `console.log(process.env.LIMITLESS_INVOCATION); while (!require('fs').existsSync(${JSON.stringify(release)})) await Bun.sleep(10);`,
+            ],
+            cwd: spec.cwd,
+            env: {},
+            timeoutMs: 5000,
+            onStdoutLine: (marker) => {
+              expect(read()?.pending).toContain(marker);
+              signal.resolve(marker);
+            },
+          }),
+        );
+        try {
+          const markers = await Promise.all(ready.map((signal) => signal.promise));
+          expect(new Set(markers).size).toBe(2);
+          expect(read()?.pending?.sort()).toEqual([...markers].sort());
+          const first = rows[0],
+            second = rows[1];
+          if (!first || !second) throw new Error("Missing discovery context");
+          record(first);
+          expect(read()?.pending).toEqual([second.invocation]);
+          expect(read()?.discoveries).toEqual([first]);
+          // A failed save must retain the remaining marker and not publish discovery in memory.
+          const original = Store.prototype.setSetting;
+          const saving = spyOn(Store.prototype, "setSetting").mockImplementation(function (
+            this: Store,
+            key,
+            value,
+          ) {
+            if (key === "worker.cleanups") throw new Error("injected save failure");
+            original.call(this, key, value);
+          });
+          try {
+            expect(() => record(second)).toThrow("injected save failure");
+            expect(() => scope.cleanups?.deleteInvocationCleanups(second.invocation)).toThrow(
+              "injected save failure",
+            );
+            expect(() => scope.cleanups?.deleteInvocationCleanups(first.invocation)).toThrow(
+              "injected save failure",
+            );
+          } finally {
+            saving.mockRestore();
+          }
+          expect(read()?.pending).toEqual([second.invocation]);
+          expect(scope.cleanups.listProcessDiscoveries?.()).toContainEqual(first);
+          expect(scope.cleanups.listProcessDiscoveries?.()).not.toContainEqual(second);
+          record(second);
+          expect(read()?.pending).toEqual([]);
+        } finally {
+          writeFileSync(release, "");
+          await Promise.all(commands);
+          scope.cleanups.recordProcessDiscovery = record;
+        }
+        expect(read()?.pending).toEqual([]);
+        expect(read()?.discoveries).toEqual([]);
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    await worker.stop();
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker retains a pending job until a change from its first readable boot", async () => {
+  const server = await listen();
+  const id = await queuedLocalAgent();
+  let initialBoot = true;
+  let root = "",
+    scratch = "";
+  const failed = Promise.withResolvers<void>();
+  const worker = await processBootInspection.run(
+    () => {
+      if (initialBoot) {
+        initialBoot = false;
+        throw new Error("initial boot unavailable");
+      }
+      return "test-boot";
+    },
+    () =>
+      loop({
+        heartbeatMs: 60_000,
+        harnesses: {
+          claude: fakeHarness(async (spec) => {
+            root = dirname(spec.cwd);
+            scratch = spec.scratchDir ?? "";
+            await processBootInspection.run(
+              () => {
+                throw new Error("discovery boot unavailable");
+              },
+              () =>
+                processInspection.run(
+                  async () => {
+                    throw new Error("termination inspection unavailable");
+                  },
+                  () => runProcess({ cmd: [process.execPath, "-e", ""], cwd: spec.cwd, env: {} }),
+                ),
+            );
+            return {};
+          }),
+        },
+        request: async (...args) => {
+          const reply = await workerRequest(...args);
+          if (args[1] === agentPath(id, "failure")) failed.resolve();
+          return reply;
+        },
+      }),
+  );
+  try {
+    await failed.promise;
+    await worker.stop();
+    const database = join(worker.remote.paths.home, "worker", "worker.db");
+    const local = new Store(database);
+    try {
+      expect(local.getSetting("worker.cleanups", {})).toMatchObject({
+        [root]: {
+          pending: [expect.any(String)],
+          discoveries: [],
+          scratch: [scratch],
+          ownership: { marker: expect.any(String) },
+        },
+      });
+      const jobs = local.getSetting<Record<string, { ownership: { boot?: string } }>>("worker.cleanups", {});
+      expect(jobs[root]?.ownership.boot).toBeUndefined();
+    } finally {
+      local.close();
+    }
+    for (const boot of [undefined, "test-boot", "test-boot", "next-boot"]) {
+      const controller = new AbortController();
+      const diagnostics: string[] = [];
+      let heartbeats = 0;
+      await processBootInspection.run(
+        () => {
+          if (!boot) throw new Error("recovery boot unavailable");
+          return boot;
+        },
+        () =>
+          processRecoveryInspection.run(
+            { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
+            () =>
+              runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+                confinement: fakeConfinement,
+                heartbeatMs: 5,
+                machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+                log: (text) => diagnostics.push(text),
+                request: async (...args) => {
+                  if (args[1] === "/worker/heartbeat" && ++heartbeats === 2) controller.abort();
+                  return workerRequest(...args);
+                },
+              }),
+          ),
+      );
+      const changed = boot === "next-boot";
+      expect(existsSync(root)).toBe(!changed);
+      expect(existsSync(scratch)).toBe(!changed);
+      const reopened = new Store(database);
+      try {
+        const jobs = reopened.getSetting<Record<string, { pending: string[]; ownership: { boot?: string } }>>(
+          "worker.cleanups",
+          {},
+        );
+        if (changed) expect(jobs).toEqual({});
+        else {
+          expect(jobs[root]?.pending).toEqual([expect.any(String)]);
+          expect(jobs[root]?.ownership.boot).toBe(boot);
+        }
+      } finally {
+        reopened.close();
+      }
+      if (!changed) expect(diagnostics.some((text) => text.includes("awaiting changed boot"))).toBe(true);
+    }
+    expect(workers.agentJob(id)?.state).not.toBe("done");
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test.each(["legacy job", "orphan identities"] as const)(
+  "worker startup recovers existing %s evidence from its local store",
+  async (kind) => {
+    await listen();
+    const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+    mkdirSync(join(remote.paths.home, "worker"));
+    const root = mkdtempSync(join(remote.paths.work, "worker-"));
+    const database = join(remote.paths.home, "worker", "worker.db");
+    const local = new Store(database);
+    if (kind === "legacy job")
+      local.setSetting("worker.cleanups", {
+        [root]: { root, cache: join(root, "repo.git"), scratch: [] },
+      });
+    local.recordProcessCleanup({
+      invocation: crypto.randomUUID(),
+      runId: "legacy",
+      directory: join(root, "checkout"),
+      boot: "test-boot",
+      pid: 2_000_000_000,
+      birth: "old",
+      createdAt: 0,
+      discovery: { group: 0, started: 0, directories: [root], leader: null, spawnedAt: "0" },
+    });
+    local.close();
+    const observed = Promise.withResolvers<void>();
+    const diagnostics: string[] = [];
+    const worker = await loop({
+      log: (text) => diagnostics.push(text),
+      request: async (...args) => {
+        if (args[1] === "/worker/heartbeat") observed.resolve();
+        return workerRequest(...args);
+      },
+    });
+    try {
+      await observed.promise;
+      await worker.stop();
+      expect(workerCleanupRecords(remote)).toEqual([]);
+      expect(existsSync(root)).toBe(kind === "orphan identities");
+      expect(diagnostics).toEqual([]);
+    } finally {
+      await worker.stop();
+    }
+  },
+);
+
+test("worker startup retains legacy cleanup without termination evidence across restarts", async () => {
+  const server = await listen();
+  const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+  const root = mkdtempSync(join(remote.paths.work, "worker-"));
+  const scratch = mkdtempSync(join(home, "scratch-"));
+  mkdirSync(join(root, "checkout"));
+  mkdirSync(join(remote.paths.home, "worker"));
+  const database = join(remote.paths.home, "worker", "worker.db");
+  const legacy = { [root]: { root, cache: join(root, "repo.git"), scratch: [scratch], confirmed: true } };
+  const local = new Store(database);
+  local.setSetting("worker.cleanups", legacy);
+  local.close();
+  await pairWorker(server.url.origin, join(remote.paths.home, "worker"), "restarted", (text) =>
+    workers.approve(text.split(": ")[1] ?? ""),
+  );
+  const req = await request(true);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const diagnostics: string[] = [];
+    const id = enqueueAgent({
+      runId: req.runId,
+      parentSha: req.headSha,
+      branch: "change/worker-agent",
+      target: { ...agentRequest().target, harness: "claude" },
+    });
+    const controller = new AbortController();
+    const task = runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+      confinement: fakeConfinement,
+      heartbeatMs: 10,
+      retryMs: 5,
+      machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+      log: (text) => diagnostics.push(text),
+      harnesses: {
+        claude: fakeHarness((spec) => {
+          expect(dirname(spec.cwd)).not.toBe(root);
+          expect(existsSync(join(root, "checkout"))).toBe(true);
+          return {};
+        }),
+      },
+    });
+    try {
+      await until(() => workers.agentJob(id)?.state === "done");
+      controller.abort();
+      await task;
+      expect(diagnostics.some((text) => text.includes("missing worker discovery evidence"))).toBe(true);
+      expect(existsSync(join(root, "checkout"))).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      const reopened = new Store(database);
+      try {
+        expect(reopened.listProcessCleanups()).toEqual([]);
+        expect(reopened.getSetting("worker.cleanups", {})).toEqual(legacy);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      controller.abort();
+      await task;
+    }
+  }
+});
+
+test("worker removes a NUL-argument job's directories and pending marker after synchronous spawn failure", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  let cwd = "",
+    scratch = "";
+  let pending: string[] | undefined;
+  const worker = await loop({
+    heartbeatMs: 60_000,
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        cwd = spec.cwd;
+        scratch = spec.scratchDir ?? "";
+        try {
+          await runProcess({ cmd: [process.execPath, "-e", "\0"], cwd, env: {} });
+        } finally {
+          const local = new Store(join(home, "remote", "worker", "worker.db"));
+          try {
+            pending = local.getSetting<Record<string, { pending: string[] }>>("worker.cleanups", {})[
+              dirname(cwd)
+            ]?.pending;
+          } finally {
+            local.close();
+          }
+        }
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.failure_reason != null);
+    await worker.stop();
+    expect(workers.agentJob(id)?.failure_reason).toContain("null bytes");
+    expect(pending).toEqual([]);
+    expect(cwd).not.toBe("");
+    expect(scratch).not.toBe("");
+    for (const directory of [dirname(cwd), cwd, scratch]) expect(existsSync(directory)).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker retains a job after an ordinary final confirmation error and later recovers its directories", async () => {
+  const server = await listen();
+  const id = await queuedLocalAgent();
+  const secret = "synthetic-confirmation-secret";
+  registerCredential("worker-confirmation-test", secret);
+  const failure = new Error(`final discovery unavailable ${secret}`);
+  let cwd = "",
+    scratch = "",
+    transmitted = "";
+  const proc = await import("../src/util/proc.ts"),
+    original = proc.recoverProcessCleanups;
+  // Recovery normally wraps discovery errors. Expose the plain error at confirm's boundary.
+  const recover = spyOn(proc, "recoverProcessCleanups").mockImplementation((...args) => {
+    const owner = args[4];
+    if (!cwd || owner?.runId !== id) return original(...args);
+    const inspection = processRecoveryInspection.getStore();
+    if (!inspection?.discover) throw new Error("Missing recovery inspection");
+    return inspection
+      .discover(owner.invocation, 0, owner.createdAt, owner.discovery.directories, null, new Set(), 0n)
+      .then(() => {});
+  });
+  const worker = await processRecoveryInspection.run(
+    {
+      stopped: recoveryProcessStopped,
+      timeoutMs: 100,
+      discover: async () => {
+        throw failure;
+      },
+    },
+    () =>
+      loop({
+        heartbeatMs: 60_000,
+        request: async (...args) => {
+          if (args[1] === agentPath(id, "failure")) transmitted = (args[2] as { reason: string }).reason;
+          return workerRequest(...args);
+        },
+        harnesses: {
+          claude: fakeHarness((spec) => {
+            cwd = spec.cwd;
+            scratch = mkdtempSync(join(home, "final-confirm-scratch-"));
+            processScope.getStore()?.scratchDirs.add(scratch);
+            return {};
+          }),
+        },
+      }),
+  );
+  try {
+    await until(() => workers.agentJob(id)?.state === "done" || workers.agentJob(id)?.failure_reason != null);
+    await worker.stop();
+    expect(workers.agentJob(id)?.state).not.toBe("done");
+    expect(transmitted).toBe(`${ProcessTerminationError.prefix}: final discovery unavailable [redacted]`);
+    for (const directory of [dirname(cwd), cwd, scratch]) expect(existsSync(directory)).toBe(true);
+    const local = new Store(join(worker.remote.paths.home, "worker", "worker.db"));
+    try {
+      expect(local.getSetting("worker.cleanups", {})).toMatchObject({
+        [dirname(cwd)]: { root: dirname(cwd), scratch: [scratch], pending: [] },
+      });
+    } finally {
+      local.close();
+    }
+    recover.mockRestore();
+    const controller = new AbortController();
+    await processRecoveryInspection.run(
+      { stopped: recoveryProcessStopped, timeoutMs: 100, discover: async () => [] },
+      () =>
+        runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+          confinement: fakeConfinement,
+          machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+          request: async (...args) => {
+            controller.abort();
+            return workerRequest(...args);
+          },
+        }),
+    );
+    for (const directory of [dirname(cwd), cwd, scratch]) expect(existsSync(directory)).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
+  } finally {
+    await worker.stop();
+    recover.mockRestore();
+  }
+}, 30_000);
+
+test("a job's ordinary directory cleanup failure drops retained metadata after confirmed termination", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  let root = "";
+  const scratch = await import("../src/harness/scratch.ts"),
+    original = scratch.removeScratch;
+  const spy = spyOn(scratch, "removeScratch").mockImplementation((directory) => {
+    if (directory === root) throw new Error("private-cleanup-diagnostic");
+    original(directory);
+  });
+  const diagnostics: string[] = [];
+  const worker = await loop({
+    log: (text) => diagnostics.push(text),
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        root = dirname(spec.cwd);
+        const cleanups = processScope.getStore()?.cleanups;
+        if (!cleanups) throw new Error("Missing cleanup store");
+        // Model an ownership record whose process has already been confirmed stopped.
+        cleanups.recordProcessCleanup({
+          runId: id,
+          invocation: id,
+          directory: spec.cwd,
+          pid: 1,
+          birth: "test",
+          boot: "test",
+          createdAt: 0,
+        });
+        cleanups.deleteInvocationCleanups(id);
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    await worker.stop();
+    expect(diagnostics).toEqual(["Worker checkout cleanup failed"]);
+    expect(existsSync(root)).toBe(true);
+    const local = new Store(join(worker.remote.paths.home, "worker", "worker.db"));
+    try {
+      expect(local.getSetting("worker.cleanups", {})).toEqual({});
+      expect(local.listProcessCleanups()).toEqual([]);
+    } finally {
+      local.close();
+    }
+  } finally {
+    try {
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+}, 30_000);
 
 test.each(["failure", "cancellation"] as const)(
   "temporary bundle refs are removed after success and checkout %s",
@@ -2500,6 +3497,7 @@ test.each(["failure", "cancellation"] as const)(
           readdirSync(worker.remote.paths.work).length === 0,
       );
       expect(workers.job(failedId)?.state).toBe(kind === "failure" ? "queued" : "cancelled");
+      expect(workerCleanupRecords(worker.remote)).toEqual([]);
       expect((await refs()).stdout.trim()).toBe("refs/limitless-bundles/unrelated/0");
     } finally {
       await worker.stop();
@@ -2612,12 +3610,12 @@ test("a release change drains reporting and cleanup and rejects an in-flight lea
     expect(commands).toEqual([]);
     releaseLease.resolve();
     finish.resolve();
-    await reported.promise;
     expect(commands).toEqual([]);
     advertised = target;
     await until(() => latestObserved);
     expect(commands).toEqual([]);
     cleanup.resolve();
+    await reported.promise;
     await replaced.promise;
     expect(commands).toEqual([
       ["git", "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"],
@@ -4033,6 +5031,98 @@ test("worker fences an agent after one lease period without a successful heartbe
   }
 }, 30_000);
 
+test("retained recovery does not delay active lease renewal and drains before the store closes", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+  mkdirSync(join(remote.paths.home, "worker"), { recursive: true });
+  mkdirSync(remote.paths.work, { recursive: true });
+  const root = mkdtempSync(join(remote.paths.work, "worker-"));
+  const scratch = mkdtempSync(join(home, "kept-scratch-"));
+  const marker = crypto.randomUUID();
+  const local = new Store(join(remote.paths.home, "worker", "worker.db"));
+  local.setSetting("worker.cleanups", {
+    [root]: {
+      root,
+      cache: join(root, "repo.git"),
+      scratch: [scratch],
+      confirmed: false,
+      ownership: { marker, runId: "retained", started: 0, boot: "test-boot" },
+    },
+  });
+  local.close();
+  const clock = waitClock(),
+    scheduled = spyOn(clock.timer, "set");
+  const started = Promise.withResolvers<AgentSpec>(),
+    releaseRecovery = Promise.withResolvers<number[]>();
+  let running = false,
+    scans = 0;
+  const worker = await processBootInspection.run(
+    () => "test-boot",
+    () =>
+      processRecoveryInspection.run(
+        {
+          stopped: recoveryProcessStopped,
+          timeoutMs: 1000,
+          discover: async (invocation) => {
+            if (invocation !== marker) return [];
+            if (!running) throw new Error("recovery scan unavailable");
+            scans++;
+            return releaseRecovery.promise;
+          },
+        },
+        () =>
+          loop({
+            heartbeatMs: 5,
+            leaseMs: 400,
+            fenceTimer: clock.timer,
+            log: () => {},
+            harnesses: {
+              claude: fakeHarness((spec) => {
+                running = true;
+                started.resolve(spec);
+                return { fault: "block" };
+              }),
+            },
+          }),
+      ),
+  );
+  try {
+    const spec = await started.promise;
+    await until(() => scans > 0);
+    for (let i = 0; i < 2; i++) {
+      const renewals = scheduled.mock.calls.length;
+      await until(() => scheduled.mock.calls.length > renewals);
+      await clock.advance(300);
+      expect(spec.signal.aborted).toBe(false);
+      expect(workers.agentJob(id)?.state).toBe("leased");
+    }
+    expect(scans).toBe(1); // Other heartbeats reuse the pending recovery attempt.
+    expect(existsSync(root)).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
+    expect(existsSync(spec.cwd)).toBe(true);
+    expect(existsSync(spec.scratchDir ?? "")).toBe(true);
+    worker.controller.abort();
+    await until(() => !existsSync(spec.cwd));
+    let stopped = false;
+    void worker.task.finally(() => {
+      stopped = true;
+    });
+    await clock.flush();
+    expect(stopped).toBe(false);
+    releaseRecovery.resolve([]);
+    await worker.task;
+    expect(existsSync(root)).toBe(false);
+    expect(existsSync(scratch)).toBe(false);
+    expect(workerCleanupRecords(remote)).toEqual([]);
+    expect(clock.pending).toBe(0);
+  } finally {
+    releaseRecovery.resolve([]);
+    await worker.stop();
+    scheduled.mockRestore();
+  }
+}, 30_000);
+
 test("worker renews the fence at heartbeat success and aborts exactly at its deadline", async () => {
   await listen();
   const id = await queuedLocalAgent();
@@ -4197,6 +5287,7 @@ test("worker agent runs at its parent, hides paths, uses local slots and discard
     expect(JSON.stringify(events)).not.toContain(scratch);
     expect(existsSync(scratch)).toBe(false);
     expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
   } finally {
     await worker.stop();
   }
@@ -4256,6 +5347,8 @@ test("worker sanitizes harness failures and keeps running", async () => {
     expect(reason).not.toContain(secret);
     expect(worker.controller.signal.aborted).toBe(false);
     expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+    expect(existsSync(scratch)).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
   } finally {
     await worker.stop();
   }
@@ -4305,6 +5398,9 @@ test("worker cancels agent sessions while gates retain all their slots", async (
     });
     await until(() => workers.agentJob(next)?.state === "done");
     expect(worker.controller.signal.aborted).toBe(false);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(existsSync(spec.scratchDir ?? "")).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
   } finally {
     await worker.stop();
   }
@@ -4381,5 +5477,486 @@ test("worker update drains the agent session and its checkout before replacing i
   } finally {
     finish.resolve();
     await worker.stop();
+  }
+}, 30_000);
+
+test.each([
+  ["agent", true],
+  ["gate", true],
+  ["agent", false],
+  ["gate", false],
+] as const)(
+  "worker recovers a crashed %s invocation only with discovery evidence or a changed boot (saved=%s)",
+  async (kind, savedDiscovery) => {
+    const server = await listen();
+    const req = await request(true);
+    req.gates.setup = [];
+    req.gates.checks = [{ name: "probe", run: "true" }];
+    const id =
+      kind === "agent"
+        ? enqueueAgent({
+            runId: req.runId,
+            parentSha: req.headSha,
+            branch: "change/worker-agent",
+            target: { ...agentRequest().target, harness: "claude" },
+          })
+        : workers.enqueue(req);
+    const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+    await pairWorker(server.url.origin, join(remote.paths.home, "worker"), "crashing-worker", (text) =>
+      workers.approve(text.split(": ")[1] ?? ""),
+    );
+    const ready = join(home, "ready.json");
+    const script = join(home, "worker.ts");
+    const source = (path: string) => JSON.stringify(new URL(path, import.meta.url).pathname);
+    writeFileSync(
+      script,
+      `
+      import ${source("./git-preload.ts")};
+      import { writeFileSync } from 'node:fs';
+      import { loadConfig } from ${source("../src/config.ts")};
+      import { fakeHarness } from ${source("../src/harness/fake.ts")};
+      import { invocationScratch, processBootInspection, processScope, runProcess } from ${source("../src/util/proc.ts")};
+      import { runWorker } from ${source("../src/workers/client.ts")};
+      const invoke = async (cwd) => {
+        const scope = processScope.getStore();
+        await runProcess({ cmd: [process.execPath, '-e', ''], cwd, env: {} });
+        const local = new (await import(${source("../src/db/store.ts")})).Store(${JSON.stringify(join(remote.paths.home, "worker", "worker.db"))});
+        const kept = local.getSetting('worker.cleanups', {})[cwd.slice(0, -'/checkout'.length)];
+        if (kept.pending.length || kept.ownership.marker !== scope.ownershipMarker) throw new Error('premature confirmation');
+        local.close();
+        const record = scope.cleanups.recordProcessDiscovery;
+        scope.cleanups.recordProcessDiscovery = (row) => {
+          if (${savedDiscovery}) record(row);
+          for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        };
+        return runProcess({
+          cmd: [process.execPath, '-e',
+            "require('node:fs').writeFileSync(" + ${JSON.stringify(JSON.stringify(ready))} + ", JSON.stringify({" +
+            "pid: process.pid, invocation: process.env.LIMITLESS_INVOCATION, ownership: process.env[" +
+            JSON.stringify('LIMITLESS_INVOCATION_' + scope.ownershipMarker.replaceAll('-', '_')) + "]," +
+            "cwd: " + JSON.stringify(cwd) + ", scratch: " + JSON.stringify(invocationScratch.getStore()) +
+            "})); setInterval(() => {}, 1000);"],
+          cwd, env: {},
+        });
+      };
+      await processBootInspection.run(() => 'test-boot', () => runWorker(${JSON.stringify(server.url.origin)}, loadConfig({
+        home: ${JSON.stringify(remote.paths.home)}, configDir: ${JSON.stringify(cfg.paths.configDir)}, raw: {},
+      }), ${JSON.stringify(releaseSha)}, new AbortController().signal, {
+        heartbeatMs: 10, retryMs: 5,
+        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+        confinement: {
+          wrap: (cmd) => cmd,
+          async verify(_roots, opts) { if (${JSON.stringify(kind)} === 'gate') await invoke(opts.cwd); },
+        },
+        harnesses: { claude: fakeHarness(async (spec) => { await invoke(spec.cwd); return {}; }) },
+      }));
+      `,
+    );
+    const supervisor = Bun.spawn([process.execPath, script], {
+      cwd: home,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "inherit",
+    });
+    try {
+      await until(() => existsSync(ready));
+      const { pid, ownership, cwd, scratch } = JSON.parse(readFileSync(ready, "utf8")) as {
+        pid: number;
+        ownership: string;
+        cwd: string;
+        scratch: string;
+      };
+      expect(ownership).toBe("1");
+      // Checkout setup has already completed several successful scoped commands.
+      expect(existsSync(join(cwd, "tracked"))).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      supervisor.kill("SIGKILL");
+      await supervisor.exited;
+      expect(recoveryProcessStopped(pid)).toBe(false);
+      const database = join(remote.paths.home, "worker", "worker.db");
+      const local = new Store(database);
+      let unresolved: Record<string, unknown>;
+      try {
+        expect(local.listProcessCleanups()).toEqual([]);
+        unresolved = local.getSetting("worker.cleanups", {});
+        expect(unresolved[dirname(cwd)]).toMatchObject({
+          pending: savedDiscovery ? [] : [expect.any(String)],
+          scratch: [scratch],
+          discoveries: savedDiscovery ? [expect.objectContaining({ invocation: expect.any(String) })] : [],
+          ownership: expect.objectContaining({ runId: id, marker: expect.any(String) }),
+        });
+      } finally {
+        local.close();
+      }
+      let requests = 0;
+      const unavailable = new AbortController();
+      const diagnostics: string[] = [];
+      await processRecoveryInspection.run(
+        {
+          stopped: recoveryProcessStopped,
+          timeoutMs: 1000,
+          discover: async () => {
+            if (savedDiscovery) throw new Error("recovery inspection unavailable");
+            return [];
+          },
+        },
+        () =>
+          runWorker(server.url.origin, remote, releaseSha, unavailable.signal, {
+            confinement: fakeConfinement,
+            log: (text) => diagnostics.push(text),
+            machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+            request: async (...args) => {
+              requests++;
+              unavailable.abort();
+              return workerRequest(...args);
+            },
+          }),
+      );
+      expect(requests).toBe(1);
+      expect(
+        diagnostics.some((text) =>
+          text.includes(savedDiscovery ? "recovery inspection unavailable" : "awaiting changed boot"),
+        ),
+      ).toBe(true);
+      expect(recoveryProcessStopped(pid)).toBe(false);
+      expect(existsSync(cwd)).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      const reopened = new Store(database);
+      try {
+        expect(reopened.getSetting("worker.cleanups", {})).toEqual(unresolved);
+      } finally {
+        reopened.close();
+      }
+      requests = 0;
+      const controller = new AbortController();
+      // A reboot would stop the orphan; emulate that using only the PID this test started.
+      if (!savedDiscovery) {
+        process.kill(pid, "SIGKILL");
+        await until(() => recoveryProcessStopped(pid));
+      }
+      await processBootInspection.run(
+        () => (savedDiscovery ? "test-boot" : "next-boot"),
+        () =>
+          runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+            confinement: fakeConfinement,
+            machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+            request: async (...args) => {
+              requests++;
+              expect(recoveryProcessStopped(pid)).toBe(true);
+              expect(existsSync(dirname(cwd))).toBe(false);
+              expect(existsSync(scratch)).toBe(false);
+              expect(workerCleanupRecords(remote)).toEqual([]);
+              controller.abort();
+              return workerRequest(...args);
+            },
+          }),
+      );
+      expect(requests).toBe(1);
+    } finally {
+      if (supervisor.exitCode === null) supervisor.kill("SIGKILL");
+      await supervisor.exited;
+      if (existsSync(ready)) {
+        const { pid, scratch } = JSON.parse(readFileSync(ready, "utf8")) as {
+          pid: number;
+          scratch: string;
+        };
+        if (!recoveryProcessStopped(pid)) process.kill(pid, "SIGKILL");
+        await until(() => recoveryProcessStopped(pid));
+        removeScratch(scratch);
+      }
+    }
+  },
+  30_000,
+);
+
+test.each([
+  ["agent", 0],
+  ["gate", 0],
+  ["agent", 1],
+  ["gate", 1],
+] as const)(
+  "worker retains a %s job after discovery fails with %i recorded scans and recovers before work",
+  async (kind, recordedScans) => {
+    const server = await listen();
+    const req = await request(true);
+    req.gates.setup = [];
+    req.gates.checks = [{ name: "probe", run: "true" }];
+    const id =
+      kind === "agent"
+        ? enqueueAgent({
+            runId: req.runId,
+            parentSha: req.headSha,
+            branch: "change/worker-agent",
+            target: { ...agentRequest().target, harness: "claude" },
+          })
+        : workers.enqueue(req);
+    const pidFile = join(home, "owned-descendant");
+    let pid: number | undefined;
+    let invocation = "";
+    let root = "",
+      scratch = "",
+      database = "",
+      results = 0;
+    const failed = Promise.withResolvers<void>();
+    const inject = async (cwd: string) => {
+      if (root) return;
+      root = dirname(cwd);
+      scratch = invocationScratch.getStore() ?? "";
+      database = join(home, "remote", "worker", "worker.db");
+      expect(scratch).not.toBe("");
+      expect(processScope.getStore()?.runId).toBe(id);
+      for (const path of [database, `${database}-wal`, `${database}-shm`])
+        expect(privateReadPaths()).toContain(path);
+      let scans = 0;
+      await expect(
+        processInspection.run(
+          async (withEnvironment, marker) => {
+            if (withEnvironment && ++scans > recordedScans) throw new Error("injected discovery failure");
+            const owned = JSON.parse(readFileSync(pidFile, "utf8")) as { pid: number; marker: string };
+            const uid = process.getuid?.();
+            return (
+              `${process.pid} ${uid} S scanner LIMITLESS_PROCESS_SCAN=${marker}\n` +
+              `${owned.pid} ${uid} S member${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`
+            );
+          },
+          () =>
+            runProcess({
+              cmd: [
+                process.execPath,
+                "-e",
+                `
+              const { spawn } = require('node:child_process');
+              const { existsSync } = require('node:fs');
+              const child = spawn(process.execPath, ['-e', ${JSON.stringify(`
+                require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({
+                  pid: process.pid, marker: process.env.LIMITLESS_INVOCATION,
+                }));
+                setInterval(() => {}, 1000);
+              `)}], { detached: true, stdio: 'ignore' });
+              child.unref();
+              while (!existsSync(${JSON.stringify(pidFile)})) await Bun.sleep(10);
+            `,
+              ],
+              cwd,
+              env: {},
+            }),
+        ),
+      ).rejects.toThrow(ProcessTerminationError.prefix);
+      const owned = JSON.parse(readFileSync(pidFile, "utf8")) as { pid: number; marker: string };
+      pid = owned.pid;
+      invocation = owned.marker;
+      // Even a harness which catches the error must not turn this into success.
+    };
+    const worker = await loop({
+      heartbeatMs: 60_000,
+      harnesses: {
+        claude: fakeHarness(async (spec) => {
+          await inject(spec.cwd);
+          return {};
+        }),
+      },
+      confinement: {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          if (kind === "gate") await inject(opts.cwd);
+        },
+      },
+      async request(...args) {
+        if (args[1].endsWith("/result")) results++;
+        const reply = await workerRequest(...args);
+        if (args[1].endsWith("/failure")) failed.resolve();
+        return reply;
+      },
+    });
+    const retained = () => {
+      const local = new Store(database);
+      try {
+        return local.getSetting<Record<string, { discoveries: { invocation: string; runId: string }[] }>>(
+          "worker.cleanups",
+          {},
+        );
+      } finally {
+        local.close();
+      }
+    };
+    const records = () => {
+      const local = new Store(database);
+      try {
+        return local.listProcessCleanups();
+      } finally {
+        local.close();
+      }
+    };
+    try {
+      await failed.promise;
+      expect(results).toBe(0);
+      // A retained attempt must not poison the other kind of job on this worker.
+      const next =
+        kind === "agent"
+          ? workers.enqueue(req)
+          : enqueueAgent({
+              runId: req.runId,
+              parentSha: req.headSha,
+              branch: "change/next",
+              target: { ...agentRequest().target, harness: "claude" },
+            });
+      await until(() => (kind === "agent" ? workers.job(next) : workers.agentJob(next))?.state === "done");
+      expect(readdirSync(worker.remote.paths.work)).toEqual([basename(root)]);
+      await worker.stop();
+      expect(existsSync(root)).toBe(true);
+      expect(existsSync(join(root, "checkout"))).toBe(true);
+      expect(existsSync(scratch)).toBe(true);
+      if (pid === undefined) throw new Error("Missing descendant PID");
+      const descendantPid = pid;
+      expect(recoveryProcessStopped(pid)).toBe(recordedScans > 0);
+      expect(records()).toEqual(
+        recordedScans ? [expect.objectContaining({ runId: id, pid, discovery: expect.any(Object) })] : [],
+      );
+      expect(retained()[root]?.discoveries).toEqual([
+        expect.objectContaining({ invocation, runId: id, discovery: expect.any(Object) }),
+      ]);
+      const unresolved = retained();
+      for (const path of [database, `${database}-wal`, `${database}-shm`])
+        expect(privateReadPaths()).not.toContain(path);
+      let requests = 0;
+      const restart = (
+        signal: AbortSignal,
+        request: NonNullable<Parameters<typeof runWorker>[4]>["request"],
+      ) =>
+        runWorker(server.url.origin, worker.remote, releaseSha, signal, {
+          confinement: fakeConfinement,
+          machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+          request,
+        });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const controller = new AbortController();
+        await processRecoveryInspection.run(
+          {
+            stopped: recoveryProcessStopped,
+            timeoutMs: 1000,
+            discover: async () => {
+              throw new Error("recovery inspection unavailable");
+            },
+          },
+          () =>
+            restart(controller.signal, async (...args) => {
+              requests++;
+              controller.abort();
+              return workerRequest(...args);
+            }),
+        );
+        expect(requests).toBe(attempt + 1);
+        expect(records()).toHaveLength(recordedScans);
+        expect(retained()).toEqual(unresolved);
+        expect(recoveryProcessStopped(pid)).toBe(recordedScans > 0);
+        expect(existsSync(join(root, "checkout"))).toBe(true);
+        expect(existsSync(scratch)).toBe(true);
+      }
+      requests = 0;
+      const controller = new AbortController();
+      const kill = process.kill;
+      let recordedBeforeKill = false;
+      const signaling = spyOn(process, "kill").mockImplementation((target, signal) => {
+        if (target === pid && signal === "SIGKILL") {
+          expect(records()).toContainEqual(expect.objectContaining({ pid }));
+          expect(existsSync(root)).toBe(true);
+          expect(existsSync(scratch)).toBe(true);
+          recordedBeforeKill = true;
+        }
+        return kill(target, signal);
+      });
+      try {
+        await processRecoveryInspection.run(
+          {
+            stopped: (target) => {
+              expect(existsSync(root)).toBe(true);
+              expect(existsSync(scratch)).toBe(true);
+              return recoveryProcessStopped(target);
+            },
+            timeoutMs: 2000,
+          },
+          () =>
+            restart(controller.signal, async (...args) => {
+              requests++;
+              expect(recoveryProcessStopped(descendantPid)).toBe(true);
+              expect(existsSync(root)).toBe(false);
+              expect(existsSync(scratch)).toBe(false);
+              expect(records()).toEqual([]);
+              expect(retained()).toEqual({});
+              controller.abort();
+              return workerRequest(...args);
+            }),
+        );
+        expect(recordedBeforeKill).toBe(recordedScans === 0);
+      } finally {
+        signaling.mockRestore();
+      }
+      expect(requests).toBe(1);
+      if (kind === "gate") {
+        const cache = join(worker.remote.paths.repos, `${encodeURIComponent(req.repo)}.git`);
+        expect(existsSync(cache)).toBe(true);
+        expect(
+          (await worktreeGit(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout,
+        ).not.toContain(join(root, "checkout"));
+      }
+    } finally {
+      await worker.stop();
+      if (existsSync(pidFile)) {
+        const owned = JSON.parse(readFileSync(pidFile, "utf8")) as { pid: number };
+        if (!recoveryProcessStopped(owned.pid)) process.kill(owned.pid, "SIGKILL");
+      }
+    }
+  },
+  30_000,
+);
+
+test("worker retains scratch when a harness directly throws a termination error", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  let cwd = "",
+    scratch = "",
+    results = 0;
+  const failed = Promise.withResolvers<void>();
+  const worker = await loop({
+    heartbeatMs: 60_000,
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        cwd = spec.cwd;
+        scratch = spec.scratchDir ?? "";
+        throw new ProcessTerminationError(ProcessTerminationError.prefix);
+      }),
+    },
+    async request(...args) {
+      if (args[1].endsWith("/result")) results++;
+      const reply = await workerRequest(...args);
+      if (args[1] === agentPath(id, "failure")) failed.resolve();
+      return reply;
+    },
+  });
+  try {
+    await failed.promise;
+    await worker.stop();
+    expect(results).toBe(0);
+    expect(existsSync(cwd)).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
+    const local = new Store(join(worker.remote.paths.home, "worker", "worker.db"));
+    try {
+      expect(local.getSetting("worker.cleanups", {})).toEqual({
+        [dirname(cwd)]: {
+          root: dirname(cwd),
+          cache: join(dirname(cwd), "repo.git"),
+          scratch: [scratch],
+          discoveries: [],
+          pending: [],
+          ownership: expect.objectContaining({ marker: expect.any(String), runId: id }),
+        },
+      });
+    } finally {
+      local.close();
+    }
+  } finally {
+    await worker.stop();
+    // This injected error has no live process to recover.
+    removeScratch(scratch);
   }
 }, 30_000);

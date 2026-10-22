@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { type ChildProcess, type ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -20,6 +20,8 @@ export const processScope = new AsyncLocalStorage<{
   runId?: string;
   checkout?: () => string | undefined;
   cleanups?: ProcessCleanupStore;
+  ownershipMarker?: string;
+  beforeSpawn?: (invocation?: string) => void;
 }>();
 
 export interface ProcessCleanup {
@@ -39,11 +41,16 @@ export interface ProcessCleanup {
   } | null;
 }
 export interface ProcessCleanupStore {
+  recordProcessDiscovery?(record: ProcessDiscovery): void;
+  listProcessDiscoveries?(): ProcessDiscovery[];
   recordProcessCleanup(record: ProcessCleanup): void;
   listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[];
   deleteProcessCleanup(invocation: string, pid: number): void;
   deleteInvocationCleanups(invocation: string): void;
 }
+export type ProcessDiscovery = Omit<ProcessCleanup, "pid" | "birth" | "discovery"> & {
+  discovery: NonNullable<ProcessCleanup["discovery"]>;
+};
 export const processCleanupStore = new AsyncLocalStorage<ProcessCleanupStore>();
 
 const invocationCleanups = new Map<string, Promise<void>>();
@@ -108,12 +115,19 @@ export const processRecoveryInspection = new AsyncLocalStorage<{
 
 export async function recoverProcessCleanups(
   store: ProcessCleanupStore,
-  records = store.listProcessCleanups(),
+  records?: ProcessCleanup[],
   stopped = processRecoveryInspection.getStore()?.stopped ?? recoveryProcessStopped,
   timeoutMs = processRecoveryInspection.getStore()?.timeoutMs ?? 10_000,
+  ownership?: ProcessDiscovery,
 ): Promise<void> {
-  if (!records.length) return;
-  const invocations = new Set(records.map((row) => row.invocation));
+  const listDiscoveries = () => [
+    ...(store.listProcessDiscoveries?.() ?? []),
+    ...(ownership ? [ownership] : []),
+  ];
+  let discoveries = listDiscoveries();
+  const invocations = new Set((records ?? store.listProcessCleanups()).map((row) => row.invocation));
+  if (records === undefined) for (const row of discoveries) invocations.add(row.invocation);
+  if (!invocations.size) return;
   // Waiting for one invocation must not reserve unrelated invocations in this batch.
   for (;;) {
     const active = [...invocations].flatMap((invocation) => invocationCleanups.get(invocation) ?? []);
@@ -123,20 +137,33 @@ export async function recoverProcessCleanups(
   // Reserve the entire batch synchronously so overlapping recovery batches cannot deadlock.
   const release = await Promise.all([...invocations].map(ownInvocationCleanup));
   try {
-    records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
-    if (!records.length) return;
-    const boot = bootIdentity();
+    const records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
+    discoveries = listDiscoveries().filter((row) => invocations.has(row.invocation));
+    if (!records.length && !discoveries.length) return;
+    let boot: string | undefined;
+    try {
+      boot = bootIdentity();
+    } catch (error) {
+      if (!ownership) throw error;
+    }
+    // A persisted job marker can be scanned even when its boot identity was unavailable.
+    const sameBoot = (row: ProcessCleanup | ProcessDiscovery) =>
+      ownership ? !boot || !row.boot || row.boot === boot : row.boot === boot;
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
     const deadline = performance.now() + timeoutMs;
-    for (const row of records) if (row.boot !== boot) store.deleteProcessCleanup(row.invocation, row.pid);
-    if (!records.some((row) => row.boot === boot)) return;
+    for (const row of records) if (!sameBoot(row)) store.deleteProcessCleanup(row.invocation, row.pid);
+    for (const row of discoveries) if (!sameBoot(row)) store.deleteInvocationCleanups(row.invocation);
+    if (![...records, ...discoveries].some(sameBoot)) return;
     const protectedPids = callerAncestors();
     const results = await Promise.allSettled(
       [...invocations].map(async (invocation) => {
-        const members = records.filter((row) => row.invocation === invocation && row.boot === boot);
-        if (!members.length) return;
-        const anchor = members.find((row) => row.discovery);
-        const context = anchor?.discovery;
+        const members = records.filter((row) => row.invocation === invocation && sameBoot(row));
+        const anchor =
+          discoveries.find((row) => row.invocation === invocation && sameBoot(row)) ??
+          members.find((row) => row.discovery);
+        if (!members.length && !anchor) return;
+        const context = ownership && !boot ? ownership.discovery : anchor?.discovery;
+        if (anchor && !context) throw new Error(`Missing process discovery context for ${invocation}`);
         if (!context)
           console.warn(
             redactCredentials(
@@ -175,7 +202,7 @@ export async function recoverProcessCleanups(
               continue;
             }
             if (!anchor) throw new Error(`Missing process discovery context for ${invocation}`);
-            const row = { ...anchor, pid, birth, createdAt: Date.now() };
+            const row = { ...anchor, pid, birth, boot: boot ?? "", createdAt: Date.now() };
             store.recordProcessCleanup(row);
             claimed.set(pid, row);
             discovered = true;
@@ -183,6 +210,8 @@ export async function recoverProcessCleanups(
           for (const row of claimed.values()) {
             if (protectedPids.has(row.pid)) throw new Error(`Protected cleanup process ${row.pid}`);
             if (stopped(row.pid)) continue;
+            if (ownership && !boot && !pids.includes(row.pid))
+              throw new Error(`Process boot identity could not be confirmed for ${row.pid}`);
             if (killed.has(row)) {
               pending.push(row.pid);
               continue;
@@ -786,23 +815,48 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
         : [];
     const spawnedAt = darwin?.darwinClock() ?? 0n;
-    const child = spawn(bin, args, {
-      cwd: opts.cwd,
-      // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
-      env: {
-        ...opts.env,
-        LIMITLESS_INVOCATION: marker,
-        [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
-      },
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    scope?.beforeSpawn?.(marker);
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(bin, args, {
+        cwd: opts.cwd,
+        // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
+        env: {
+          ...opts.env,
+          ...(scope?.ownershipMarker
+            ? { [`LIMITLESS_INVOCATION_${scope.ownershipMarker.replaceAll("-", "_")}`]: "1" }
+            : {}),
+          LIMITLESS_INVOCATION: marker,
+          [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
+        },
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      (scope?.cleanups ?? processCleanupStore.getStore())?.deleteInvocationCleanups(marker);
+      throw error;
+    }
     let leader: DarwinInvocationLeader | null = null;
-    let leaderInspectionError: unknown;
+    let discoveryError: unknown;
     try {
       if (darwin && child.pid !== undefined) leader = darwin.captureDarwinInvocationLeader(child.pid);
     } catch (error) {
-      leaderInspectionError = error;
+      discoveryError = error;
+    }
+    let persistenceError: unknown;
+    // A crash before shutdown must still leave enough ownership context for recovery.
+    try {
+      if (child.pid !== undefined)
+        (scope?.cleanups ?? processCleanupStore.getStore())?.recordProcessDiscovery?.({
+          runId: scope?.runId ?? null,
+          invocation: marker,
+          directory,
+          boot: bootIdentity(),
+          createdAt: Date.now(),
+          discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
+        });
+    } catch (error) {
+      persistenceError = error;
     }
     let resolveStopped: (() => void) | undefined;
     scope?.children.set(
@@ -838,7 +892,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       shutdown ??= (async () => {
         const release = await ownInvocationCleanup(marker);
         try {
-          if (leaderInspectionError) throw leaderInspectionError;
+          if (discoveryError) throw discoveryError;
           let killedRunningChild = false;
           if (child.pid !== undefined) {
             killedRunningChild = await stopMarkedProcesses(
@@ -851,8 +905,9 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
               spawnedAt,
               directory,
             );
-          }
+          } else (scope?.cleanups ?? processCleanupStore.getStore())?.deleteInvocationCleanups(marker);
           cancelKilled = cancelStarted && killedRunningChild;
+          if (persistenceError) throw persistenceError;
         } catch (error) {
           let message = (error as Error).message;
           // The live ChildProcess handle proves ownership even when inspection or recording failed.
@@ -1011,6 +1066,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
+    if (discoveryError || persistenceError) void terminate();
   });
 }
 
