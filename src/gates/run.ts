@@ -423,6 +423,29 @@ function pointsAt(output: string, changed: string[]): boolean {
   });
 }
 
+const SLOW_REGRESSION_FACTOR = 3;
+const SLOW_REGRESSION_INCREASE_MS = 60_000;
+
+/** Only an unretried regression far slower than its own passing reference earns a re-check. */
+export function isSlowRegression(
+  c: GateComparison,
+  comparisons: GateComparison[],
+  reference: GateResult[],
+): boolean {
+  const r = c.result;
+  const before = findGateCounterpart(c, comparisons, reference);
+  return (
+    c.verdict === "regressed" &&
+    !r.timedOut &&
+    !confinementFailed(r) &&
+    !r.firstAttempt &&
+    !!before?.ok &&
+    before.durationMs > 0 &&
+    r.durationMs > SLOW_REGRESSION_FACTOR * before.durationMs &&
+    r.durationMs - before.durationMs >= SLOW_REGRESSION_INCREASE_MS
+  );
+}
+
 /**
  * Re-run once, inside a slot, each check that passed on the baseline but failed after the change
  * without its output pointing at a changed file. A pass on retry is `flaky` and doesn't block.
@@ -436,15 +459,11 @@ export async function retryRegressions(
   onWait?: GateHooks["onWait"],
   runner?: GateRunner,
   freshCheckout = false,
+  select: (c: GateComparison) => boolean = (c) => !pointsAt(c.result.output, changed),
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const selected = cmp.flatMap((c) => {
-    if (
-      c.verdict !== "regressed" ||
-      c.result.timedOut ||
-      confinementFailed(c.result) ||
-      pointsAt(c.result.output, changed)
-    )
+    if (c.verdict !== "regressed" || c.result.timedOut || confinementFailed(c.result) || !select(c))
       return [];
     const check = findGateCounterpart(c, cmp, cfg.checks);
     return check?.run === c.result.command ? [{ check, original: c.result }] : [];

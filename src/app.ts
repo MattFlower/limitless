@@ -22,6 +22,7 @@ import { type Harness, protectCredentials } from "./harness/types.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
+import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
@@ -36,6 +37,7 @@ import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  agentExecutor?: EngineDeps["agentExecutor"];
   gateExecutor?: EngineDeps["gateExecutor"];
   confinement?: EngineDeps["confinement"];
   faults?: EngineDeps["faults"];
@@ -174,6 +176,9 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
+      agentExecutor:
+        opts.agentExecutor ??
+        (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined),
       gateExecutor: opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos),
       confinement: opts.confinement ?? seatbeltForPort(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },

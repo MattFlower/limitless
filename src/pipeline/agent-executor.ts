@@ -1,9 +1,32 @@
 import type { Invocation, Role, Run } from "../core/types.ts";
+import type { AgentJobRequest } from "../db/workers.ts";
 import type { TestWait } from "../gates/agent-tests.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { withSlottedCommands } from "../harness/slotted.ts";
 import type { SlottedCommands } from "../harness/slotted-config.ts";
 import type { AgentResult, AgentSpec, Harness } from "../harness/types.ts";
+
+/** Publication inputs owned by the engine; session inputs are supplied by the executor. */
+export type AgentPublication = Required<
+  Pick<
+    AgentJobRequest,
+    | "parentSha"
+    | "baseSha"
+    | "branch"
+    | "commit"
+    | "repoUrl"
+    | "expectedRemoteSha"
+    | "discreet"
+    | "privateStringsDigest"
+  >
+> &
+  Pick<AgentJobRequest, "uiUrl">;
+
+export interface AgentPublicationHooks {
+  prepare(): Promise<AgentPublication | null>;
+  adopt(sha: string, request: AgentPublication): Promise<void>;
+  remoteSha(): Promise<string | null | undefined>;
+}
 
 export interface AgentCall {
   runId: Run["id"];
@@ -17,6 +40,8 @@ export interface AgentCall {
   private: boolean;
   denyRead: AgentSpec["denyRead"];
   dispatch: () => void;
+  publication?: AgentPublicationHooks;
+  round?: number;
 }
 
 export interface AgentExecutor {

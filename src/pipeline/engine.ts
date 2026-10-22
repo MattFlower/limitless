@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { z } from "zod";
 import { repoSettings } from "../config.ts";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
@@ -23,7 +24,7 @@ import {
 } from "../gates/detect.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
-import { loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
+import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import {
   compareGates,
@@ -32,6 +33,7 @@ import {
   type GateHooks,
   type GateRun,
   gateEnv,
+  isSlowRegression,
   retryBaselineFailures,
   retryRegressions,
   runLocalGates,
@@ -40,6 +42,7 @@ import { gateSlotScope } from "../gates/slots.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
+  adoptWorkerCommit,
   checkoutCommitted,
   checkPrivateRange,
   commitAll,
@@ -85,6 +88,8 @@ import {
   recoverScopedProcesses,
   redactCredentials,
 } from "../util/proc.ts";
+import { publicationFields } from "../workers/publication.ts";
+import type { AgentPublication, AgentPublicationHooks } from "./agent-executor.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
@@ -1159,6 +1164,79 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
   );
 }
 
+function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPublicationHooks {
+  const branch = ctx.run.branch as string;
+  const clean = async () =>
+    (await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd })).stdout === "";
+  const remoteSha = () => remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch(() => undefined);
+  return {
+    remoteSha,
+    async prepare() {
+      const parentSha = await headSha(cwd);
+      if (!(await clean())) return null;
+      const remote = await remoteSha();
+      if (remote === undefined) return null;
+      if (remote !== (ctx.state.publishedSha ?? null)) {
+        if (remote !== parentSha)
+          throw new NeedsHumanError(
+            `Run branch ${branch} is at ${remote}, expected ${ctx.state.publishedSha ?? "no branch"}; another push moved it or a worker commit was not adopted (re-attach is S6)`,
+          );
+        ctx.state.publishedSha = parentSha;
+        await ctx.save();
+      }
+      const identity = async (variable: string) => {
+        const result = await worktreeGit(["git", "var", variable], { cwd, allowFail: true });
+        return result.exitCode === 0 ? /^(.+) <([^<>]+)> -?\d+ [+-]\d{4}\n?$/.exec(result.stdout) : null;
+      };
+      const author = await identity("GIT_AUTHOR_IDENT");
+      const committer = await identity("GIT_COMMITTER_IDENT");
+      if (!author?.[1] || !author[2] || !committer?.[1] || !committer[2]) return null;
+      const cfg = ctx.deps.cfg;
+      const request: AgentPublication = {
+        parentSha,
+        baseSha: ctx.run.baseSha as string,
+        branch,
+        commit: {
+          message: `${commitMessage(ctx, round)}\n`,
+          authorName: author[1],
+          authorEmail: author[2],
+          committerName: committer[1],
+          committerEmail: committer[2],
+        },
+        repoUrl:
+          ctx.repo.url && isAbsolute(ctx.repo.url) ? ctx.repo.url : `https://github.com/${ctx.repo.slug}.git`,
+        expectedRemoteSha: ctx.state.publishedSha ?? null,
+        discreet: repoSettings(cfg, ctx.repo.slug).discreet,
+        uiUrl: cfg.uiUrl,
+        privateStringsDigest: privateStringsDigest(privateEntries(ctx, cwd)),
+      };
+      const validation = z.object(publicationFields).safeParse(request);
+      if (!validation.success) {
+        ctx.log(`Worker publication field invalid: ${validation.error.issues[0]?.path.join(".")}`, "warn");
+        return null;
+      }
+      return request;
+    },
+    async adopt(sha, request) {
+      try {
+        if (sha === request.parentSha) {
+          if ((await headSha(cwd)) !== sha || !(await clean()))
+            throw new Error("Coordinator HEAD or worktree changed during worker session");
+          return;
+        }
+        await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+      } catch (error) {
+        throw new NeedsHumanError(
+          `Cannot adopt worker commit ${sha} for round ${round}: ${redactCredentials((error as Error).message)}`,
+        );
+      }
+      ctx.state.publishedSha = sha;
+      ctx.state.workerCommitRound = round;
+      await ctx.save("worker-commit-adopted");
+    },
+  };
+}
+
 async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
   const gates = assertDistinctGateNames(ctx.state.gatesConfig as GateConfig);
@@ -1215,6 +1293,16 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           mode: "edit",
           complexity: ctx.complexity,
           constraints,
+          ...(!merge &&
+          !reviewRound(ctx) &&
+          !ctx.run.deliveryBranch &&
+          !ctx.run.prUrl &&
+          ctx.state.flow !== "verify-change" &&
+          ctx.repo.kind === "github" &&
+          ctx.run.branch &&
+          ctx.run.baseSha
+            ? { publication: workerPublication(ctx, cwd, round) }
+            : {}),
           prompt: implementPrompt({
             prompt:
               merge && ctx.state.reviewResolution
@@ -1281,7 +1369,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
       return {
-        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}; ${sha ?? "no changes"}`,
+        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}; ${sha ?? (ctx.state.workerCommitRound === round ? ctx.run.headSha : "no changes")}`,
         value: undefined,
       };
     },
@@ -3009,16 +3097,51 @@ async function mergeForDelivery(
             firstAttempt: findGateCounterpart(r, after.checks, first.checks),
           }));
         }
-        await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
-        await mergeGit(cwd, ["clean", "-fdq"]);
         // A check fixed by the implementation must stay fixed after merging, even when
         // it failed on the original base. Persist that regression in the evidence too.
-        const comparison = compareGates(
-          previous.length
-            ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
-            : (ctx.state.baseline ?? null),
-          after,
-        ).map((c) => ({ ...c, firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt }));
+        const reference = previous.length
+          ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+          : (ctx.state.baseline ?? null);
+        const initial = compareGates(reference, after).map((c) => ({
+          ...c,
+          firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
+        }));
+        const events = gateEvents(ctx);
+        const comparison = await retryRegressions(
+          initial,
+          cwd,
+          ctx.state.gatesConfig as GateConfig,
+          [],
+          ctx.signal,
+          events.onWait,
+          (retry, options) =>
+            runGateExecution(
+              ctx,
+              "gates",
+              options?.targeted ? "regression-retry-targeted" : "regression-retry",
+              cwd,
+              retry,
+              { ...events, skipGateSlot: options?.skipGateSlot },
+            ),
+          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+          (c) => isSlowRegression(c, initial, reference?.checks ?? []),
+        );
+        ctx.checkCancelled();
+        for (const c of comparison) {
+          if (!c.firstAttempt || c.result === initial.find((before) => before.name === c.name)?.result)
+            continue;
+          const before = findGateCounterpart(c, comparison, reference?.checks ?? []);
+          if (!before) continue;
+          ctx.event({
+            runId: ctx.run.id,
+            type: "gate",
+            level: "warn",
+            message: `${c.name} post-merge re-check: ran ${(c.firstAttempt.durationMs / before.durationMs).toFixed(1)}x its pre-merge time (${c.firstAttempt.durationMs / 1000}s vs ${before.durationMs / 1000}s): ${c.verdict === "flaky" ? "pass (flaky, not blocking)" : "FAIL again"}`,
+            data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
+          });
+        }
+        await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
+        await mergeGit(cwd, ["clean", "-fdq"]);
         ctx.state.lastGates = comparison;
         await ctx.save();
         ctx.artifact(
@@ -3029,7 +3152,7 @@ async function mergeForDelivery(
         const regressed =
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
-          previous.some((c) => c.result.ok && !findGateCounterpart(c, previous, after.checks)?.ok);
+          previous.some((c) => c.result.ok && !findGateCounterpart(c, previous, comparison)?.result.ok);
         if (regressed)
           throw new MergeRegressedError(
             timeoutOnly(after) ? "post-merge gate timed out" : "post-merge gates regressed",

@@ -36,8 +36,13 @@ import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
-import { redactCredentialData } from "../util/proc.ts";
-import { type AgentExecutor, localAgentExecutor, runToolAgent } from "./agent-executor.ts";
+import { redactCredentialData, redactCredentials } from "../util/proc.ts";
+import {
+  type AgentExecutor,
+  type AgentPublicationHooks,
+  localAgentExecutor,
+  runToolAgent,
+} from "./agent-executor.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
@@ -81,6 +86,7 @@ export interface RunState {
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
+  workerCommitRound?: number;
   /** Exact intended delivery commit saved before a push whose outcome may need reconciliation. */
   publishingSha?: string;
   /** Worktree spellings used by report rendering, so removed worktrees stay rewritable. */
@@ -219,6 +225,7 @@ export const invokeGuard = new AsyncLocalStorage<{
 }>();
 
 export interface InvokeOptions {
+  publication?: AgentPublicationHooks;
   role: Role;
   stage: Stage;
   prompt: string;
@@ -773,6 +780,7 @@ export class RunContext {
         dispatched = true;
       };
       let result: AgentResult;
+      let needsHuman: NeedsHumanError | undefined;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
       const redact =
@@ -884,6 +892,8 @@ export class RunContext {
               private: Boolean(opts.privateOutput || opts.redactHoldout || opts.privateSession),
               denyRead: opts.denyRead,
               dispatch,
+              publication: opts.publication,
+              round: opts.stage.round,
             },
             local,
           );
@@ -892,6 +902,7 @@ export class RunContext {
           result = await harness(spec);
         }
       } catch (e) {
+        if (e instanceof NeedsHumanError) needsHuman = e;
         if (e instanceof SimulatedTermination) {
           this.termination = e;
           this.interruption.abort();
@@ -922,6 +933,14 @@ export class RunContext {
           (!this.parallelChecks || shadow)
         )
           await discardChanges(checkout);
+      }
+      if (needsHuman) {
+        store.updateInvocation(invocation.id, {
+          status: "error",
+          error: redactCredentials(needsHuman.message),
+          finishedAt: Date.now(),
+        });
+        throw needsHuman;
       }
       if (callSignal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
