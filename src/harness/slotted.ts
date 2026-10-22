@@ -21,7 +21,7 @@ export async function withSlottedCommands<T>(
   commands: SlottedCommands,
   cwd: string,
   scratch: string,
-  port: number,
+  port: number | undefined,
   event: (data: TestWait) => void,
   invoke: (path?: string, idleNow?: () => number) => Promise<T>,
   onWatchdog?: (active: boolean, elapsedMs: number) => void,

@@ -28,9 +28,7 @@ import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
-import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
-import { withSlottedCommands } from "../harness/slotted.ts";
 import type { SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
@@ -39,7 +37,7 @@ import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
 import { redactCredentialData } from "../util/proc.ts";
-import { type AgentExecutor, localAgentExecutor } from "./agent-executor.ts";
+import { type AgentExecutor, localAgentExecutor, runToolAgent } from "./agent-executor.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
@@ -851,33 +849,22 @@ export class RunContext {
           const slottedCommands = opts.confineReads ? [] : (this.state.slottedCommands ?? []);
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
           const local = () =>
-            withScratch(spec.cwd, (scratchDir) => {
-              dispatch();
-              return withSlottedCommands(
-                slottedCommands,
-                spec.cwd,
-                scratchDir,
-                this.deps.cfg.port,
-                (data) =>
-                  this.event({
-                    runId: this.run.id,
-                    invocationId: invocation.id,
-                    type: "log",
-                    level: "info",
-                    message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
-                    data,
-                  }),
-                (commandPath, idleNow) =>
-                  harness({ ...spec, scratchDir, idleNow, ...(commandPath ? { commandPath } : {}) }),
-                (active, elapsedMs) =>
-                  spec.onEvent({
-                    type: "status",
-                    text: active
-                      ? "Idle watchdog held off for slotted command"
-                      : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
-                  }),
-              );
-            });
+            runToolAgent(
+              spec,
+              harness,
+              slottedCommands,
+              this.deps.cfg.port,
+              (data) =>
+                this.event({
+                  runId: this.run.id,
+                  invocationId: invocation.id,
+                  type: "log",
+                  level: "info",
+                  message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
+                  data,
+                }),
+              dispatch,
+            );
           result = await (this.deps.agentExecutor ?? localAgentExecutor).run(
             {
               runId: this.run.id,

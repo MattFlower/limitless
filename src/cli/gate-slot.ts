@@ -45,7 +45,9 @@ export class LeaseTransportFailures extends Error {
 export const localLeaseClient =
   (port?: number, unix?: string): LeaseClient =>
   async (body, signal) => {
-    const url = `http://127.0.0.1:${port ?? resolveClientPort()}/api/admin/gate-slot`;
+    const url = unix
+      ? "http://localhost/api/admin/gate-slot"
+      : `http://127.0.0.1:${port ?? resolveClientPort()}/api/admin/gate-slot`;
     const response = await fetch(url, {
       method: "POST",
       // An agent's per-invocation capability is its only credential; the daemon accepts it for this route only.

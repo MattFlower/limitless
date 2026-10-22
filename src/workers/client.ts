@@ -4,17 +4,23 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import type { Config } from "../config.ts";
+import { isBranchName } from "../core/delivery.ts";
 import type { GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import { runLocalGates } from "../gates/run.ts";
 import { gateSlots } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree, withRepoLock } from "../git/repos.ts";
+import { runClaude } from "../harness/claude.ts";
+import { runCodex } from "../harness/codex.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
-import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
+import { removeScratch, restoreDirectoryPermissions, spellings } from "../harness/scratch.ts";
+import type { AgentSpec, Harness } from "../harness/types.ts";
+import { runToolAgent } from "../pipeline/agent-executor.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { agentEnv, redactCredentials, registerCredential, sh } from "../util/proc.ts";
+import { AgentResultReport } from "./agent-protocol.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { certificate, privateFile, registerWorkerToken, workerRequest } from "./tls.ts";
 import { updateWorker, WorkerUpdateError } from "./update.ts";
@@ -93,7 +99,62 @@ const WireRequest = z.object({
     merge: z.enum(["auto", "pr", "none"]).optional(),
   }),
 });
+const AgentRequest = z.object({
+  runId: z.string(),
+  invocationId: z.number().int(),
+  parentSha: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
+  baseSha: z
+    .string()
+    .regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i)
+    .optional(),
+  prompt: z.string(),
+  timeoutMs: z.number().finite().positive(),
+  target: z.object({
+    modelId: z.string(),
+    provider: z.string(),
+    harness: z.string(),
+    model: z.string(),
+    vendor: z.string(),
+    tier: z.number(),
+    billing: z.enum(["free", "subscription", "metered"]),
+    effort: z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]).optional(),
+    targetId: z.string().optional(),
+    effortMapping: z.enum(["openrouter", "generic", "qwen"]).optional(),
+    price: z.object({ input: z.number(), output: z.number(), cacheRead: z.number().optional() }).optional(),
+  }),
+  role: z
+    .enum([
+      "triage",
+      "spec",
+      "plan",
+      "plan_review",
+      "holdout",
+      "implement",
+      "review",
+      "verify",
+      "summarize",
+      "chat",
+    ])
+    .optional(),
+  mode: z.enum(["edit", "readonly"]).optional(),
+  systemAppend: z.string().optional(),
+  jsonSchema: z.record(z.string(), z.unknown()).optional(),
+  idleTimeoutMs: z.number().finite().nonnegative().optional(),
+  maxToolCalls: z.number().int().nonnegative().optional(),
+  fast: z.boolean().optional(),
+  privateSession: z.boolean().optional(),
+  confineReads: z.boolean().optional(),
+  slottedCommands: z.array(z.array(z.string())).optional(),
+  branch: z.string().optional(),
+});
 const Lease = z.object({
+  agentJob: z
+    .object({
+      id: z.string().uuid(),
+      request: AgentRequest,
+      remainingMs: z.number().finite().nonnegative().optional(),
+    })
+    .nullish(),
   job: z
     .object({
       id: z.string().uuid(),
@@ -127,6 +188,7 @@ export async function runWorker(
   signal: AbortSignal,
   options: {
     confinement?: ConfinementBackend;
+    harnesses?: Partial<Record<"claude" | "codex", Harness>>;
     heartbeatMs?: number;
     machineState?: typeof machineState;
     request?: typeof workerRequest;
@@ -150,6 +212,12 @@ export async function runWorker(
     const stop = new AbortController(),
       combined = AbortSignal.any([signal, stop.signal]);
     const jobs = new Map<string, { controller: AbortController; task: Promise<void>; reported: boolean }>();
+    const agentJobs: typeof jobs = new Map();
+    const allJobs = () => [...jobs, ...agentJobs];
+    const cancel = (id: string) => {
+      jobs.get(id)?.controller.abort();
+      agentJobs.get(id)?.controller.abort();
+    };
     type UpdateEpisode = {
       target: string;
       deadline?: number;
@@ -182,7 +250,9 @@ export async function runWorker(
       if (!updating && !restorationFailed) updateWarning = undefined;
     };
     const heldJobs = () =>
-      [...jobs].filter(([, job]) => job.reported && !job.controller.signal.aborted).map(([id]) => id);
+      allJobs()
+        .filter(([, job]) => job.reported && !job.controller.signal.aborted)
+        .map(([id]) => id);
     const call = async (path: string, body?: unknown, requestSignal = combined) => {
       let delay = options.retryMs ?? 1000;
       for (;;) {
@@ -238,19 +308,23 @@ export async function runWorker(
       const reply = z
         .object({ cancelled: z.array(z.string()), releaseSha: z.string().optional() })
         .parse(response.json());
-      for (const id of reply.cancelled) jobs.get(id)?.controller.abort();
+      for (const id of reply.cancelled) cancel(id);
       observeRelease(reply.releaseSha);
     };
-    const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
-      const deadline = new AbortController();
-      const timer = setTimeout(() => deadline.abort(), Math.min(budget, 2_147_483_647));
-      const jobSignal = AbortSignal.any([cancelled, deadline.signal]);
-      const root = mkdtempSync(join(cfg.paths.work, "worker-")),
-        cwd = join(root, "checkout"),
-        cache = join(cfg.paths.repos, `${encodeURIComponent(req.repo)}.git`);
+    const withCheckout = async (
+      id: string,
+      root: string,
+      cache: string,
+      expectedSha: string,
+      path: string,
+      jobSignal: AbortSignal,
+      invoke: (cwd: string) => Promise<void>,
+      onError?: (error: unknown) => Promise<void>,
+    ): Promise<void> => {
+      const cwd = join(root, "checkout");
       try {
         const bundle = join(root, "job.bundle");
-        writeFileSync(bundle, (await call(`/worker/jobs/${id}/bundle`, undefined, jobSignal)).data);
+        writeFileSync(bundle, (await call(`${path}/bundle`, undefined, jobSignal)).data);
         await withRepoLock(cache, async () => {
           if (!existsSync(cache)) {
             for (const dir of ["objects", "refs"]) mkdirSync(join(cache, dir), { recursive: true });
@@ -261,7 +335,7 @@ export async function runWorker(
                 "init",
                 "--bare",
                 "--template=",
-                `--object-format=${req.headSha.length === 64 ? "sha256" : "sha1"}`,
+                `--object-format=${expectedSha.length === 64 ? "sha256" : "sha1"}`,
               ],
               { cwd: cache, signal: jobSignal },
             );
@@ -273,7 +347,7 @@ export async function runWorker(
               cwd: cache,
               signal: jobSignal,
             });
-            await addDetachedWorktree(cache, req.headSha, cwd, jobSignal);
+            await addDetachedWorktree(cache, expectedSha, cwd, jobSignal);
           } finally {
             const refs = await worktreeGit(["git", "for-each-ref", "--format=%(refname)", prefix], {
               cwd: cache,
@@ -285,49 +359,13 @@ export async function runWorker(
         const sha = (
           await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal: jobSignal })
         ).stdout.trim();
-        if (sha !== req.headSha) throw new Error("Worker checkout SHA mismatch");
-        let posts = Promise.resolve();
-        const gates = { ...req.gates, checks: requestedChecks(req) };
-        const run = await readPolicyScope.run(cfg.readPolicy, () =>
-          confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
-            runLocalGates(cwd, gates, jobSignal, {
-              priority: req.priority,
-              onResult(result, phase) {
-                posts = posts.then(async () => {
-                  await call(
-                    `/worker/jobs/${id}/events`,
-                    redactGateData({ type: "check", phase, result }),
-                    jobSignal,
-                  );
-                });
-                void posts.catch(() => jobs.get(id)?.controller.abort());
-              },
-            }),
-          ),
-        );
-        await posts;
-        jobSignal.throwIfAborted();
-        await call(`/worker/jobs/${id}/result`, redactGateData({ run, sha }), jobSignal);
+        if (sha !== expectedSha) throw new Error("Worker checkout SHA mismatch");
+        await invoke(cwd);
       } catch (error) {
-        if (!jobSignal.aborted) await call(`/worker/jobs/${id}/failure`, {}, jobSignal).catch(() => {});
-        else if (deadline.signal.aborted && !combined.aborted) {
-          // One bounded, best-effort notification after expiry; store expiry remains authoritative.
-          await (options.request ?? workerRequest)(
-            coordinator,
-            `/worker/jobs/${id}/failure`,
-            {},
-            {
-              token: token.value,
-              pin: pin.value,
-              signal: AbortSignal.any([combined, AbortSignal.timeout(1000)]),
-              timeoutMs: 1000,
-            },
-          ).catch(() => {});
-        }
-        if (combined.aborted) throw error;
+        if (!onError) throw error;
+        await onError(error);
       } finally {
-        clearTimeout(timer);
-        const job = jobs.get(id);
+        const job = jobs.get(id) ?? agentJobs.get(id);
         if (job) job.reported = false;
         const diagnostic = () => (options.log ?? console.error)("Worker checkout cleanup failed");
         try {
@@ -349,6 +387,145 @@ export async function runWorker(
         }
       }
     };
+    const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
+      const deadline = new AbortController();
+      const timer = setTimeout(() => deadline.abort(), Math.min(budget, 2_147_483_647));
+      const jobSignal = AbortSignal.any([cancelled, deadline.signal]);
+      const root = mkdtempSync(join(cfg.paths.work, "worker-")),
+        cache = join(cfg.paths.repos, `${encodeURIComponent(req.repo)}.git`);
+      const failure = async (error: unknown) => {
+        if (!jobSignal.aborted) await call(`/worker/jobs/${id}/failure`, {}, jobSignal).catch(() => {});
+        else if (deadline.signal.aborted && !combined.aborted) {
+          // One bounded, best-effort notification after expiry; store expiry remains authoritative.
+          await (options.request ?? workerRequest)(
+            coordinator,
+            `/worker/jobs/${id}/failure`,
+            {},
+            {
+              token: token.value,
+              pin: pin.value,
+              signal: AbortSignal.any([combined, AbortSignal.timeout(1000)]),
+              timeoutMs: 1000,
+            },
+          ).catch(() => {});
+        }
+        if (combined.aborted) throw error;
+      };
+      try {
+        await withCheckout(
+          id,
+          root,
+          cache,
+          req.headSha,
+          `/worker/jobs/${id}`,
+          jobSignal,
+          async (cwd) => {
+            let posts = Promise.resolve();
+            const gates = { ...req.gates, checks: requestedChecks(req) };
+            const run = await readPolicyScope.run(cfg.readPolicy, () =>
+              confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
+                runLocalGates(cwd, gates, jobSignal, {
+                  priority: req.priority,
+                  onResult(result, phase) {
+                    posts = posts.then(async () => {
+                      await call(
+                        `/worker/jobs/${id}/events`,
+                        redactGateData({ type: "check", phase, result }),
+                        jobSignal,
+                      );
+                    });
+                    void posts.catch(() => jobs.get(id)?.controller.abort());
+                  },
+                }),
+              ),
+            );
+            await posts;
+            jobSignal.throwIfAborted();
+            await call(`/worker/jobs/${id}/result`, redactGateData({ run, sha: req.headSha }), jobSignal);
+          },
+          failure,
+        );
+      } finally {
+        clearTimeout(timer);
+        const job = jobs.get(id);
+        if (job) job.reported = false;
+      }
+    };
+    const runAgent = async (id: string, req: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
+      const path = `/worker/agent-jobs/${id}`;
+      let root: string | undefined;
+      let paths: string[] = [];
+      const sanitize = <T>(data: T): T =>
+        JSON.parse(
+          paths.reduce(
+            (text, path) => text.replaceAll(JSON.stringify(path).slice(1, -1), "<worktree>"),
+            JSON.stringify(redactGateData(data)),
+          ),
+        );
+      let posts = Promise.resolve(),
+        seq = 0;
+      try {
+        const name = req.target.harness;
+        const harness =
+          name === "claude" || name === "codex"
+            ? (options.harnesses ?? { claude: runClaude, codex: runCodex })[name]
+            : undefined;
+        if (!harness || (name !== "claude" && name !== "codex"))
+          throw new Error("provider unavailable on worker");
+        if (!req.branch || !isBranchName(req.branch)) throw new Error("Missing or invalid agent branch");
+        root = mkdtempSync(join(cfg.paths.work, "worker-agent-"));
+        paths = spellings([root]);
+        await withCheckout(id, root, join(root, "repo.git"), req.parentSha, path, jobSignal, async (cwd) => {
+          const spec: AgentSpec = {
+            ...req,
+            target: { ...req.target, harness: name },
+            cwd,
+            mode: req.mode ?? "edit",
+            idleTimeoutMs: req.idleTimeoutMs ?? 600_000,
+            maxToolCalls: req.maxToolCalls ?? (req.mode === "readonly" ? 150 : 400),
+            signal: jobSignal,
+            logPath: join(root ?? cwd, "agent.jsonl"),
+            onEvent(event) {
+              const body = sanitize({ seq: seq++, events: [event] });
+              posts = posts.then(() => call(`${path}/events`, body, jobSignal)).then(() => {});
+              void posts.catch(() => agentJobs.get(id)?.controller.abort());
+            },
+          };
+          const result = await readPolicyScope.run(cfg.readPolicy, () =>
+            confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
+              runToolAgent(
+                spec,
+                (spec) => {
+                  paths = spellings([cwd, ...(spec.scratchDir ? [spec.scratchDir] : []), root ?? cwd]).sort(
+                    (a, b) => b.length - a.length,
+                  );
+                  return harness(spec);
+                },
+                req.confineReads ? [] : (req.slottedCommands ?? []),
+              ),
+            ),
+          );
+          await posts;
+          jobSignal.throwIfAborted();
+          const report = AgentResultReport.parse(
+            sanitize({ ...result, parentSha: req.parentSha, sha: req.parentSha, branch: req.branch }),
+          );
+          await call(`${path}/result`, report, jobSignal);
+        });
+      } catch (error) {
+        if (!jobSignal.aborted)
+          await call(
+            `${path}/failure`,
+            { reason: sanitize(String(error instanceof Error ? error.message : error)).slice(0, 4000) },
+            jobSignal,
+          ).catch(() => {});
+        if (combined.aborted) throw error;
+      } finally {
+        await posts.catch(() => {});
+        const job = agentJobs.get(id);
+        if (job) job.reported = false;
+      }
+    };
     let beats: Promise<void> | undefined;
     try {
       await heartbeat();
@@ -361,7 +538,7 @@ export async function runWorker(
       void beats.catch((error: unknown) => stop.abort(error));
       while (!combined.aborted) {
         if (updateBlocked()) {
-          await Promise.all([...jobs.values()].map((job) => job.task));
+          await Promise.all(allJobs().map(([, job]) => job.task));
           // Heartbeats may have changed the target while jobs and cleanup drained.
           const episode = update;
           if (!updateBlocked()) continue;
@@ -409,7 +586,27 @@ export async function runWorker(
           continue;
         }
         const leased = Lease.parse((await call("/worker/lease", { jobs: heldJobs() })).json());
-        for (const id of leased.cancelled) jobs.get(id)?.controller.abort();
+        for (const id of leased.cancelled) cancel(id);
+        if (leased.agentJob) {
+          const { id, request, remainingMs } = leased.agentJob;
+          if (updateBlocked())
+            await call(`/worker/agent-jobs/${id}/failure`, { reason: "Worker update pending" }).catch(
+              () => {},
+            );
+          else {
+            const controller = new AbortController();
+            const timer = setTimeout(
+              () => controller.abort(),
+              Math.min(remainingMs ?? request.timeoutMs + 360_000, 2_147_483_647),
+            );
+            const task = runAgent(id, request, AbortSignal.any([combined, controller.signal])).finally(() => {
+              clearTimeout(timer);
+              agentJobs.delete(id);
+            });
+            agentJobs.set(id, { controller, task, reported: true });
+            void task.catch(() => stop.abort());
+          }
+        }
         if (!leased.job) continue;
         if (updateBlocked()) {
           await call(`/worker/jobs/${leased.job.id}/failure`, {}).catch(() => {});
@@ -430,8 +627,8 @@ export async function runWorker(
       if (!signal.aborted) throw error;
     } finally {
       stop.abort();
-      for (const job of jobs.values()) job.controller.abort();
-      await Promise.allSettled([...(beats ? [beats] : []), ...[...jobs.values()].map((j) => j.task)]);
+      for (const [, job] of allJobs()) job.controller.abort();
+      await Promise.allSettled([...(beats ? [beats] : []), ...allJobs().map(([, j]) => j.task)]);
     }
   } finally {
     for (const release of held) release();

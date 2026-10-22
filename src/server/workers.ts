@@ -128,14 +128,51 @@ export async function startWorkerListener(
           }
           const agentJob = workers.leaseAgentJob(worker.name);
           if (agentJob) {
-            const { runId, invocationId, parentSha, baseSha, prompt, target, timeoutMs }: AgentJobRequest =
-              JSON.parse(agentJob.request);
+            const {
+              runId,
+              invocationId,
+              parentSha,
+              baseSha,
+              prompt,
+              target,
+              timeoutMs,
+              role,
+              mode,
+              systemAppend,
+              jsonSchema,
+              idleTimeoutMs,
+              maxToolCalls,
+              fast,
+              privateSession,
+              confineReads,
+              slottedCommands,
+              branch,
+            }: AgentJobRequest = JSON.parse(agentJob.request);
             return json({
               job: null,
               agentJob: {
                 id: agentJob.id,
                 remainingMs: Math.max(0, (agentJob.attempt_deadline_at ?? workers.now()) - workers.now()),
-                request: { runId, invocationId, parentSha, baseSha, prompt, target, timeoutMs },
+                request: {
+                  runId,
+                  invocationId,
+                  parentSha,
+                  baseSha,
+                  prompt,
+                  target,
+                  timeoutMs,
+                  role,
+                  mode,
+                  systemAppend,
+                  jsonSchema,
+                  idleTimeoutMs,
+                  maxToolCalls,
+                  fast,
+                  privateSession,
+                  confineReads,
+                  slottedCommands,
+                  branch,
+                },
               },
             });
           }

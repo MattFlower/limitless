@@ -21,6 +21,7 @@ import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { type AgentJobRequest, tokenHash, WorkerStore } from "../src/db/workers.ts";
+import { agentTestLease } from "../src/gates/agent-tests.ts";
 import {
   type ExecutionHandle,
   executeGate,
@@ -41,7 +42,9 @@ import {
 import { acquireGateSlot, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
+import { fakeHarness } from "../src/harness/fake.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
+import type { AgentSpec } from "../src/harness/types.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { createApiToken } from "../src/server/api-token.ts";
@@ -3420,7 +3423,20 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
   const token = await paired();
   await call("/worker/heartbeat", caps(), token);
   const gate = workers.enqueue(await request());
-  const agent = enqueueAgent();
+  const fields: Partial<AgentJobRequest> = {
+    role: "implement",
+    mode: "edit",
+    systemAppend: "System instructions",
+    jsonSchema: { type: "object" },
+    idleTimeoutMs: 5000,
+    maxToolCalls: 10,
+    fast: true,
+    privateSession: true,
+    confineReads: true,
+    slottedCommands: [["bun", "test"]],
+    branch: "change/agent",
+  };
+  const agent = enqueueAgent(fields);
   const stored = workers.agentJob(agent);
   store.db
     .query("UPDATE agent_jobs SET request=? WHERE id=?")
@@ -3440,7 +3456,7 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
   expect(reply.job).toBeNull();
   expect(reply.agentJob.id).toBe(agent);
   expect(reply.agentJob.remainingMs).toBeGreaterThanOrEqual(0);
-  expect(reply.agentJob.request).toEqual(agentRequest());
+  expect(reply.agentJob.request).toEqual(agentRequest(fields));
   expect(JSON.stringify(reply)).not.toContain(home);
   expect((await call("/worker/lease", { jobs: [agent] }, token)).json()).toEqual({
     job: null,
@@ -3858,3 +3874,246 @@ test.each(["revoked", "cancelled"])(
     }
   },
 );
+
+async function queuedLocalAgent(overrides: Partial<AgentJobRequest> = {}) {
+  const req = await request(true);
+  return enqueueAgent({
+    runId: req.runId,
+    parentSha: req.headSha,
+    branch: "change/worker-agent",
+    target: { ...agentRequest().target, harness: "claude" },
+    ...overrides,
+  });
+}
+
+test("worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
+  await listen();
+  const id = await queuedLocalAgent({ slottedCommands: [["bun", "test"]] });
+  let cwd = "",
+    scratch = "";
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        cwd = spec.cwd;
+        scratch = spec.scratchDir ?? "";
+        expect((await worktreeGit(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(
+          workers.agentJob(id)?.parent_sha ?? "",
+        );
+        expect(
+          (await worktreeGit(["git", "symbolic-ref", "-q", "HEAD"], { cwd, allowFail: true })).exitCode,
+        ).not.toBe(0);
+        const wrappers = spec.commandPath?.split(":")[0] ?? "";
+        const config = JSON.parse(readFileSync(join(wrappers, "config.json"), "utf8"));
+        expect(config).not.toHaveProperty("port");
+        const lease = await agentTestLease({ token: config.token, name: "bun test", lane: "gate" });
+        expect(lease.acquired).toBe(true);
+        await agentTestLease({ token: config.token, id: lease.id, release: true });
+        spec.onEvent({ type: "tool_call", id: "paths", name: "inspect", input: { [cwd]: scratch } });
+        return {
+          files: { edited: "discard this" },
+          text: `${cwd} ${scratch}`,
+          structured: { [cwd]: scratch },
+        };
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    const job = workers.agentJob(id);
+    expect(job?.result_sha).toBe(job?.parent_sha);
+    expect(JSON.parse(job?.result ?? "null")).toMatchObject({
+      branch: "change/worker-agent",
+      finalText: "<worktree> <worktree>",
+    });
+    const rows = batches();
+    expect(rows.map((row) => row.seq)).toEqual(rows.map((_, i) => i));
+    const events = rows.flatMap((row) => JSON.parse(row.events));
+    expect(events.at(-1)).toEqual({ type: "text", text: "<worktree> <worktree>" });
+    expect(JSON.stringify(events)).not.toContain(cwd);
+    expect(JSON.stringify(events)).not.toContain(scratch);
+    expect(existsSync(scratch)).toBe(false);
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker rejects unsupported providers without invoking a harness", async () => {
+  await listen();
+  const id = enqueueAgent();
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(() => {
+        throw new Error("unexpected harness");
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.failure_reason !== null);
+    expect(workers.agentJob(id)?.failure_reason).toBe("provider unavailable on worker");
+    expect(JSON.parse(workers.agentJob(id)?.excluded ?? "[]")).toContain("loop-runner");
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("worker sanitizes harness failures and keeps running", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const secret = "synthetic-worker-agent-secret-733";
+  registerCredential("worker-agent-test", secret);
+  let cwd = "",
+    scratch = "",
+    transmitted = "";
+  const worker = await loop({
+    async request(...args) {
+      if (args[1].endsWith("/failure")) transmitted = (args[2] as { reason: string }).reason;
+      return workerRequest(...args);
+    },
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        cwd = spec.cwd;
+        scratch = spec.scratchDir ?? "";
+        throw new Error(`${cwd} ${scratch} ${secret}`);
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.failure_reason !== null);
+    const reason = workers.agentJob(id)?.failure_reason;
+    expect(transmitted).toBe("<worktree> <worktree> [redacted]");
+    expect(reason).toBe("[withheld: private text]");
+    expect(reason).not.toContain(cwd);
+    expect(reason).not.toContain(scratch);
+    expect(reason).not.toContain(secret);
+    expect(worker.controller.signal.aborted).toBe(false);
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker cancels agent sessions while gates retain all their slots", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const started = Promise.withResolvers<AgentSpec>();
+  const beat = Promise.withResolvers<Capabilities>();
+  const worker = await loop({
+    harnesses: {
+      codex: fakeHarness(() => ({ text: "Next job" })),
+      claude: fakeHarness((spec) => {
+        started.resolve(spec);
+        return { fault: "block" };
+      }),
+    },
+    async request(...args) {
+      if (args[1] === "/worker/heartbeat") {
+        const body = args[2] as Capabilities;
+        if (body.jobs.includes(id)) beat.resolve(body);
+      }
+      return workerRequest(...args);
+    },
+  });
+  try {
+    const spec = await started.promise;
+    expect((await beat.promise).freeSlots).toBe(gateSlots.snapshot().limit);
+    const gate = workers.enqueue({
+      repo: "test/repo",
+      cwd: "",
+      headSha: workers.agentJob(id)?.parent_sha ?? "",
+      baseSha: "",
+      gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+    });
+    await until(() => workers.job(gate)?.state === "done");
+    workers.cancelAgentJob(id);
+    await until(() => spec.signal.aborted);
+    expect(workers.agentJob(id)?.state).toBe("cancelled");
+    const next = enqueueAgent({
+      ...agentRequest(),
+      runId: workers.agentJob(id)?.run_id ?? "",
+      parentSha: workers.agentJob(id)?.parent_sha ?? "",
+      target: { ...agentRequest().target, harness: "codex" },
+      branch: "change/next",
+    });
+    await until(() => workers.agentJob(next)?.state === "done");
+    expect(worker.controller.signal.aborted).toBe(false);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker never reports an agent result after its events are rejected", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  let results = 0;
+  const worker = await loop({
+    harnesses: { claude: fakeHarness(() => ({ text: "Progress" })) },
+    async request(...args) {
+      if (args[1] === agentPath(id, "result")) results++;
+      const reply = await workerRequest(...args);
+      return args[1] === agentPath(id, "events") ? { ...reply, status: 409 } : reply;
+    },
+  });
+  try {
+    await until(() => batches().length > 0);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(results).toBe(0);
+    expect(workers.agentJob(id)?.state).not.toBe("done");
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker update drains the agent session and its checkout before replacing itself", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const started = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>(),
+    observed = Promise.withResolvers<void>();
+  let advertised = releaseSha,
+    commands = 0,
+    replaced = false;
+  const target = "b".repeat(40);
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async () => {
+        started.resolve();
+        await finish.promise;
+        return { text: "Done" };
+      }),
+    },
+    async request(...args) {
+      const reply = await workerRequest(...args);
+      if (args[1] === "/worker/heartbeat") {
+        if (advertised === target) observed.resolve();
+        return { ...reply, json: () => ({ ...(reply.json() as object), releaseSha: advertised }) };
+      }
+      return reply;
+    },
+    update: {
+      async command(args) {
+        commands++;
+        expect(workers.agentJob(id)?.state).toBe("done");
+        expect(readdirSync(join(home, "remote", "work"))).toEqual([]);
+        return { stdout: args.includes(`${target}^{commit}`) ? target : releaseSha, stderr: "", exitCode: 0 };
+      },
+      exec() {
+        replaced = true;
+      },
+    },
+  });
+  try {
+    await started.promise;
+    advertised = target;
+    await observed.promise;
+    expect(commands).toBe(0);
+    finish.resolve();
+    await until(() => replaced);
+    expect(commands).toBeGreaterThan(0);
+  } finally {
+    finish.resolve();
+    await worker.stop();
+  }
+}, 30_000);

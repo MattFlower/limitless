@@ -1205,3 +1205,31 @@ test.each(["timeout", "late busy", "silent lease", "late lease", "offline"])(
     expect(time.pending).toBe(0);
   },
 );
+
+test("a wrapper without a port leases only through its invocation socket", async () => {
+  const f = fixture(),
+    scratch = join(f.root, SCRATCH_NAME);
+  mkdirSync(scratch);
+  await withSlottedCommands(
+    f.config.commands,
+    f.root,
+    scratch,
+    undefined,
+    () => {},
+    async (path) => {
+      const directory = path?.split(delimiter)[0] ?? "";
+      const config: WrapperConfig = JSON.parse(readFileSync(join(directory, "config.json"), "utf8"));
+      expect(config).not.toHaveProperty("port");
+      let httpCalls = 0;
+      const client = wrapperLeaseClient(config, undefined, async () => {
+        httpCalls++;
+        throw new Error("Unexpected HTTP request");
+      });
+      const signal = new AbortController().signal;
+      const lease = await client({ token: config.token, name: "bun test", lane: "gate" }, signal);
+      expect(lease.acquired).toBe(true);
+      await client({ token: config.token, id: lease.id, release: true }, signal);
+      expect(httpCalls).toBe(0);
+    },
+  );
+});
