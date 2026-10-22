@@ -348,12 +348,20 @@ export class WorkerStore {
     const j = this.agentJob(id);
     return j?.state === "leased" && j.worker === name ? j : null;
   }
-  agentJobEvents(id: string, seq: number, events: unknown) {
+  agentJobEvents(id: string, attempt: number, seq: number, events: unknown) {
     this.store.db
       .query(
-        "INSERT INTO agent_job_events (job_id,seq,events,created_at) VALUES (?,?,?,?) ON CONFLICT(job_id,seq) DO NOTHING",
+        "INSERT INTO agent_job_attempt_events (job_id,attempt,seq,events,created_at) VALUES (?,?,?,?,?) ON CONFLICT(job_id,attempt,seq) DO NOTHING",
       )
-      .run(id, seq, JSON.stringify(redactCredentialData(events)), this.now());
+      .run(id, attempt, seq, JSON.stringify(redactCredentialData(events)), this.now());
+  }
+  listAgentJobEvents(id: string) {
+    // Legacy batches have no recorded attempt; retain them before the known attempts.
+    return this.store.db
+      .query<{ attempt: number | null; seq: number; events: string; created_at: number }, [string, string]>(
+        "SELECT NULL AS attempt,seq,events,created_at FROM agent_job_events WHERE job_id=? UNION ALL SELECT attempt,seq,events,created_at FROM agent_job_attempt_events WHERE job_id=? ORDER BY attempt,seq",
+      )
+      .all(id, id);
   }
   failAgentJob(id: string, reason: string) {
     this.store.db

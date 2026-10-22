@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { Store } from "../src/db/store.ts";
 import { type AgentJobRequest, WorkerStore } from "../src/db/workers.ts";
 import { registerCredential } from "../src/util/proc.ts";
@@ -60,6 +61,99 @@ function enqueue(req = request) {
   if (!id) throw new Error("Request refused");
   return id;
 }
+
+test.each(["failure", "expiry"])("agent event batches survive %s and reopening in attempt order", (kind) => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-events-")),
+    path = join(dir, "store.db");
+  store.close();
+  store = new Store(path);
+  workers = new WorkerStore(store, releaseSha, {}, () => now);
+  workers.pairingKey = "test-pairing-key";
+  try {
+    pair("one");
+    pair("two");
+    const id = enqueue(),
+      other = enqueue();
+    expect(workers.leaseAgentJob("one")?.id).toBe(id);
+    for (const seq of [0, 1, 2])
+      workers.agentJobEvents(id, workers.holdsAgentJob(id, "one")?.attempt ?? 0, seq, [
+        { type: "text", text: `first-${seq}` },
+      ]);
+    if (kind === "failure") workers.failAgentJob(id, "Failed");
+    else now += workers.times.lease;
+    beat("two");
+    expect(workers.leaseAgentJob("two")?.id).toBe(id);
+    for (const seq of [2, 0, 1]) {
+      now++;
+      workers.agentJobEvents(id, workers.holdsAgentJob(id, "two")?.attempt ?? 0, seq, [
+        { type: "text", text: `retry-${seq}` },
+      ]);
+    }
+    workers.agentJobEvents(other, 1, 0, []);
+    expect(workers.completeAgentJob(id, {}, releaseSha)).toBe(true);
+    const saved = workers.listAgentJobEvents(id);
+    expect(saved.map(({ attempt, seq, events }) => ({ attempt, seq, events: JSON.parse(events) }))).toEqual(
+      ["first", "retry"].flatMap((prefix, i) =>
+        [0, 1, 2].map((seq) => ({
+          attempt: i + 1,
+          seq,
+          events: [{ type: "text", text: `${prefix}-${seq}` }],
+        })),
+      ),
+    );
+    store.close();
+    store = new Store(path);
+    workers = new WorkerStore(store, releaseSha);
+    expect(workers.listAgentJobEvents(id)).toEqual(saved);
+  } finally {
+    store.close();
+    store = new Store(":memory:");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent event migration preserves legacy rows, inserts and reads after rollback", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-events-migration-")),
+    path = join(dir, "store.db"),
+    before = join(dir, "before");
+  cpSync(MIGRATION_DIR, before, {
+    recursive: true,
+    filter: (src) => !src.endsWith("-agent-job-attempt-events.sql"),
+  });
+  const insert =
+    "INSERT INTO agent_job_events (job_id,seq,events,created_at) VALUES (?,?,?,?) ON CONFLICT(job_id,seq) DO NOTHING";
+  store.close();
+  store = new Store(path, before);
+  try {
+    store.db.query(insert).run("legacy", 0, '[{"type":"text","text":"existing"}]', 10);
+    store.close();
+    store = new Store(path);
+    workers = new WorkerStore(store, releaseSha, {}, () => now);
+    workers.agentJobEvents("legacy", 2, 0, []);
+    store.close();
+    store = new Store(path, before);
+    store.db.query(insert).run("legacy", 1, '[{"type":"text","text":"rollback"}]', 20);
+    store.db.query(insert).run("legacy", 1, "[]", 30);
+    const legacy = store.db
+      .query<{ seq: number; events: string; created_at: number }, [string]>(
+        "SELECT seq,events,created_at FROM agent_job_events WHERE job_id=? ORDER BY seq",
+      )
+      .all("legacy");
+    expect(legacy).toEqual([
+      { seq: 0, events: '[{"type":"text","text":"existing"}]', created_at: 10 },
+      { seq: 1, events: '[{"type":"text","text":"rollback"}]', created_at: 20 },
+    ]);
+    workers = new WorkerStore(store, releaseSha);
+    expect(workers.listAgentJobEvents("legacy")).toEqual([
+      ...legacy.map((row) => ({ ...row, attempt: null })),
+      { attempt: 2, seq: 0, events: "[]", created_at: now },
+    ]);
+  } finally {
+    store.close();
+    store = new Store(":memory:");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("schema is independent, and queued and retried leased jobs survive a store reopen", () => {
   const dir = mkdtempSync(join(tmpdir(), "agent-jobs-"));

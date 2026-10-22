@@ -4382,12 +4382,7 @@ const agentResult = (parentSha = releaseSha) => ({
   branch: "change/example",
 });
 const agentPath = (id: string, action: string) => `/worker/agent-jobs/${id}/${action}`;
-const batches = () =>
-  store.db
-    .query<{ seq: number; events: string; created_at: number }, []>(
-      "SELECT seq,events,created_at FROM agent_job_events ORDER BY seq",
-    )
-    .all();
+const batches = (id: string) => workers.listAgentJobEvents(id);
 
 // Streaming requests exercise the byte limit and authorization across body-reading awaits.
 function streamingReport(path: string, token: string, contentLength?: number, expectedPin?: string) {
@@ -4508,7 +4503,7 @@ test("all agent routes authenticate holders and reject a token revoked during a 
   workers.revoke("runner");
   for (const action of ["bundle", "events", "result", "failure"])
     expect((await call(agentPath(id, action), action === "bundle" ? undefined : {}, owner)).status).toBe(401);
-  expect(batches()).toEqual([]);
+  expect(batches(id)).toEqual([]);
 });
 
 test.each(["events", "result", "failure"])(
@@ -4525,7 +4520,7 @@ test.each(["events", "result", "failure"])(
       req.end(payload);
       expect(await response).toBe(413);
     }
-    expect(batches()).toEqual([]);
+    expect(batches(id)).toEqual([]);
     expect(workers.agentJob(id)?.state).toBe("leased");
   },
 );
@@ -4533,12 +4528,16 @@ test.each(["events", "result", "failure"])(
 test.each(["events", "result", "failure"])(
   "agent %s rechecks ownership and revocation after reading a body",
   async (action) => {
+    let now = 1_000_000;
+    workers = new WorkerStore(store, releaseSha, {}, () => now);
     await listen();
-    const token = await paired();
+    const token = await paired(),
+      retryToken = await paired("retry");
     await call("/worker/heartbeat", caps(), token);
-    for (const revoked of [false, true]) {
+    for (const change of ["cancelled", "reassigned", "revoked"]) {
+      await call("/worker/heartbeat", caps(), token);
       const id = enqueueAgent();
-      workers.leaseAgentJob("runner");
+      expect(workers.leaseAgentJob("runner")?.id).toBe(id);
       const started = Promise.withResolvers<void>(),
         original = workers.holdsAgentJob.bind(workers);
       const spy = spyOn(workers, "holdsAgentJob").mockImplementation((...args) => {
@@ -4557,12 +4556,21 @@ test.each(["events", "result", "failure"])(
       try {
         req.write(payload.slice(0, 1));
         await started.promise;
-        if (revoked) workers.revoke("runner");
-        else workers.cancelAgentJob(id);
+        if (change === "revoked") workers.revoke("runner");
+        else if (change === "reassigned") {
+          now += workers.times.lease;
+          await call("/worker/heartbeat", caps(), retryToken);
+          expect(workers.leaseAgentJob("retry")?.id).toBe(id);
+        } else workers.cancelAgentJob(id);
         req.end(payload.slice(1));
-        expect(await response).toBe(revoked ? 401 : 409);
+        expect(await response).toBe(change === "revoked" ? 401 : 409);
         expect(workers.agentJob(id)?.state).not.toBe("done");
-        expect(batches()).toEqual([]);
+        expect(batches(id)).toEqual([]);
+        if (change === "reassigned" && action === "events") {
+          expect((await call(agentPath(id, action), JSON.parse(payload), token)).status).toBe(409);
+          expect((await call(agentPath(id, action), JSON.parse(payload), retryToken)).status).toBe(200);
+          expect(batches(id)).toMatchObject([{ attempt: 2, seq: 0, events: "[]" }]);
+        }
       } finally {
         req.destroy();
         spy.mockRestore();
@@ -4578,7 +4586,7 @@ test.each(["events", "result"])("agent %s requires valid UTF-8 across body chunk
   const id = enqueueAgent();
   workers.leaseAgentJob("runner");
   await call(agentPath(id, "events"), { seq: 0, events: [{ type: "text", text: "earlier" }] }, token);
-  const saved = batches(),
+  const saved = batches(id),
     leased = workers.agentJob(id);
   const body = (text: string) =>
     JSON.stringify(
@@ -4595,7 +4603,7 @@ test.each(["events", "result"])("agent %s requires valid UTF-8 across body chunk
   const invalid = streamingReport(agentPath(id, action), token, malformed.byteLength);
   invalid.req.end(malformed);
   expect(await invalid.response).toBe(400);
-  expect(batches()).toEqual(saved);
+  expect(batches(id)).toEqual(saved);
   expect(workers.agentJob(id)).toEqual(leased);
 
   const text = "before 🌍 after",
@@ -4614,12 +4622,12 @@ test.each(["events", "result"])("agent %s requires valid UTF-8 across body chunk
     valid.req.end(payload.subarray(split));
     expect(await valid.response).toBe(200);
     if (action === "events") {
-      expect(JSON.parse(batches()[1]?.events ?? "null")).toEqual([{ type: "text", text }]);
+      expect(JSON.parse(batches(id)[1]?.events ?? "null")).toEqual([{ type: "text", text }]);
       expect(workers.agentJob(id)).toEqual(leased);
     } else {
       expect(JSON.parse(workers.agentJob(id)?.result ?? "null").finalText).toBe(text);
       expect(workers.agentJob(id)).toMatchObject({ state: "done", result_sha: agentResult().sha });
-      expect(batches()).toEqual(saved);
+      expect(batches(id)).toEqual(saved);
     }
   } finally {
     valid.req.destroy();
@@ -4628,6 +4636,8 @@ test.each(["events", "result"])("agent %s requires valid UTF-8 across body chunk
 });
 
 test("agent event batches validate every variant, redact nested data, deduplicate and survive reopening", async () => {
+  let now = 1_000_000;
+  workers = new WorkerStore(store, releaseSha, {}, () => now);
   await listen();
   const token = await paired();
   await call("/worker/heartbeat", caps(), token);
@@ -4669,25 +4679,31 @@ test("agent event batches validate every variant, redact nested data, deduplicat
     { seq: 0, events: [{ type: "unknown" }] },
   ])
     expect((await call(agentPath(id, "events"), body, token)).status).toBe(400);
-  expect(batches()).toEqual([]);
+  expect(batches(id)).toEqual([]);
   expect((await call(agentPath(id, "events"), { seq: 7, events }, token)).json()).toEqual({ ok: true });
-  const saved = batches();
+  const saved = batches(id);
   expect(saved).toHaveLength(1);
   expect(saved[0]?.events).not.toContain(secret);
   expect(JSON.parse(saved[0]?.events ?? "[]").map((e: { type: string }) => e.type)).toEqual(
     events.map((e) => e.type),
   );
+  now++;
   expect((await call(agentPath(id, "events"), { seq: 7, events: [] }, token)).status).toBe(200);
-  expect(batches()).toEqual(saved);
+  expect(batches(id)).toEqual(saved);
   const retryToken = await paired("retry");
   await call("/worker/heartbeat", caps(), retryToken);
   workers.failAgentJob(id, "Disconnected");
   expect(workers.leaseAgentJob("retry")?.id).toBe(id);
   expect((await call(agentPath(id, "events"), { seq: 7, events: [] }, retryToken)).status).toBe(200);
-  expect(batches()).toEqual(saved);
+  const retried = batches(id);
+  expect(retried).toEqual([...saved, { attempt: 2, seq: 7, events: "[]", created_at: now }]);
+  now++;
+  expect((await call(agentPath(id, "events"), { seq: 7, events }, retryToken)).status).toBe(200);
+  expect(batches(id)).toEqual(retried);
   store.close();
   store = new Store(cfg.paths.db);
-  expect(batches()).toEqual(saved);
+  workers = new WorkerStore(store, releaseSha);
+  expect(batches(id)).toEqual(retried);
 });
 
 test("agent reports validate result metadata and persist changed and unchanged completions without fetching", async () => {
@@ -4846,7 +4862,7 @@ test("agent event volume stores 2,000 ordered events in 10 durable batches", asy
   console.log(
     `Agent events: 2,000 events / 10 batches stored in ${(performance.now() - start).toFixed(1)} ms`,
   );
-  const rows = batches();
+  const rows = batches(id);
   expect(rows).toHaveLength(10);
   const events = rows.flatMap((row) => JSON.parse(row.events) as { text: string }[]);
   expect(events).toHaveLength(2000);
@@ -5046,12 +5062,12 @@ test.each([0, 450])(
     });
     try {
       await started.promise;
-      await until(() => batches().length === Math.ceil((count + 1) / 200));
+      await until(() => batches(id).length === Math.ceil((count + 1) / 200));
       const elapsed = performance.now() - emittedAt;
       expect(elapsed).toBeGreaterThanOrEqual(200);
       expect(elapsed).toBeLessThan(2000);
       expect(workers.agentJob(id)?.state).toBe("leased");
-      const rows = batches();
+      const rows = batches(id);
       expect(rows.map((row) => row.seq)).toEqual(count ? [0, 1, 2] : [0]);
       const events = rows.map((row) => JSON.parse(row.events) as { type: string; text?: string }[]);
       expect(events.map((batch) => batch.length)).toEqual(count ? [200, 200, 51] : [1]);
@@ -5361,7 +5377,7 @@ test("readonly worker agent runs at its parent, hides paths, uses local slots an
       finalText: forms.map(() => "<worktree>").join(" "),
       structured: forms.map(() => ({ "<worktree>": ["<worktree>", JSON.stringify({ path: "<worktree>" })] })),
     });
-    const rows = batches();
+    const rows = batches(id);
     expect(rows.map((row) => row.seq)).toEqual(rows.map((_, i) => i));
     const events = rows.flatMap((row) => JSON.parse(row.events));
     expect(events.at(-1)).toEqual({ type: "text", text: forms.map(() => "<worktree>").join(" ") });
@@ -5505,7 +5521,7 @@ test("worker never reports an agent result after its events are rejected", async
     },
   });
   try {
-    await until(() => batches().length > 0);
+    await until(() => batches(id).length > 0);
     await until(() => readdirSync(worker.remote.paths.work).length === 0);
     expect(results).toBe(0);
     expect(workers.agentJob(id)?.state).not.toBe("done");

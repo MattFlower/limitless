@@ -226,9 +226,11 @@ export async function startWorkerListener(
         const body = await readJson(req, (action === "events" ? 1 : 2) * 1024 * 1024);
         const lateDenied = held();
         if (lateDenied) return lateDenied;
+        if (workers.agentJob(id)?.attempt !== job.attempt)
+          return json({ error: "Job lease is no longer held" }, 409);
         if (action === "events") {
           const { seq, events } = AgentEvents.parse(body);
-          workers.agentJobEvents(id, seq, events);
+          workers.agentJobEvents(id, job.attempt, seq, events);
         } else if (action === "failure") workers.failAgentJob(id, AgentFailure.parse(body).reason);
         else {
           const result = AgentResultReport.parse(body);
