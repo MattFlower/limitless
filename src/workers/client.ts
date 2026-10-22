@@ -279,7 +279,22 @@ export async function runWorker(
   try {
     await recoverProcessCleanups(store);
     for (const [id, job] of Object.entries(retained)) {
-      await scoped(id, job.root, job.cache, new AbortController().signal, () => cleanup(job), job.scratch);
+      await scoped(
+        id,
+        job.root,
+        job.cache,
+        new AbortController().signal,
+        async () => {
+          try {
+            await cleanup(job);
+          } catch (error) {
+            const termination = processScope.getStore()?.terminationError;
+            if (error instanceof ProcessTerminationError || termination) throw termination ?? error;
+            (options.log ?? console.error)("Worker checkout cleanup failed");
+          }
+        },
+        job.scratch,
+      );
       delete retained[id];
       save();
     }
@@ -412,8 +427,6 @@ export async function runWorker(
       scoped(id, root, cache, jobSignal, async () => {
         const cwd = join(root, "checkout");
         const finish = async () => {
-          const job = jobs.get(id) ?? agentJobs.get(id);
-          if (job) job.reported = false;
           const scope = processScope.getStore();
           if (!scope) return;
           // Cleanup must finish even when the job's deadline or cancellation has fired.
@@ -421,8 +434,6 @@ export async function runWorker(
           try {
             assertProcessesStopped();
             await cleanup({ root, cache, scratch: [...scope.scratchDirs] });
-            delete retained[root];
-            save();
           } catch (error) {
             if (error instanceof ProcessTerminationError || scope.terminationError) {
               retained[root] = { root, cache, scratch: [...scope.scratchDirs] };
@@ -431,6 +442,8 @@ export async function runWorker(
             }
             (options.log ?? console.error)("Worker checkout cleanup failed");
           }
+          delete retained[root];
+          save();
         };
         try {
           let report: (() => Promise<unknown>) | undefined;

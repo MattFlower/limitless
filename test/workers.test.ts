@@ -1294,77 +1294,124 @@ test.each([
   150_000,
 );
 
-test.each(["done", "cancelled", "failed"] as const)(
-  "worker stops reporting a %s job while repository cleanup is blocked",
-  async (state) => {
+test.each([
+  ["gate", "done"],
+  ["gate", "failed"],
+  ["gate", "cancelled"],
+  ["agent", "done"],
+  ["agent", "failed"],
+  ["agent", "cancelled"],
+] as const)(
+  "worker renews a %s job through cleanup and %s reporting, excluding cancellation",
+  async (kind, state) => {
+    let now = Date.now();
+    workers = new WorkerStore(store, releaseSha, { poll: 30, tick: 5 }, () => now);
     await listen();
     const req = await request(true);
     req.gates.setup = [];
     req.gates.checks = [{ name: "check", run: "true" }];
     const locked = Promise.withResolvers<void>(),
       release = Promise.withResolvers<void>(),
-      finished = Promise.withResolvers<void>();
+      finished = Promise.withResolvers<void>(),
+      posting = Promise.withResolvers<void>();
     const reports = new Map(
+      ["/worker/heartbeat", "/worker/lease"].map((path) => [path, Promise.withResolvers<string[]>()]),
+    );
+    const postingReports = new Map(
       ["/worker/heartbeat", "/worker/lease"].map((path) => [path, Promise.withResolvers<string[]>()]),
     );
     let lock: Promise<void> | undefined,
       terminal = false,
-      executing = false;
-    const id = workers.enqueue(req);
+      executing = false,
+      allowReport = false;
+    const id =
+      kind === "gate"
+        ? workers.enqueue(req)
+        : enqueueAgent({
+            runId: req.runId,
+            parentSha: req.headSha,
+            branch: "change/worker-agent",
+            target: { ...agentRequest().target, harness: "claude" },
+          });
+    const row = () => (kind === "gate" ? workers.job(id) : workers.agentJob(id));
+    const execute = async (cwd: string, signal?: AbortSignal) => {
+      const cache =
+        kind === "gate"
+          ? join(home, "remote", "repos", `${encodeURIComponent(req.repo)}.git`)
+          : join(dirname(cwd), "repo.git");
+      // Hold cleanup at the real cache lock, after bundle import has released it.
+      lock = withRepoLock(cache, async () => {
+        locked.resolve();
+        await release.promise;
+      });
+      await locked.promise;
+      if (state === "cancelled") {
+        if (kind === "gate") workers.cancel(id);
+        else workers.cancelAgentJob(id);
+        await new Promise<void>((resolve) =>
+          signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      }
+      executing = true;
+      finished.resolve();
+      if (state === "failed") throw new Error("Worker execution failed");
+      signal?.throwIfAborted();
+      return {};
+    };
     const worker = await loop({
+      harnesses: { claude: fakeHarness((spec) => execute(spec.cwd, spec.signal)) },
       confinement: {
         ...fakeConfinement,
         async verify(_roots, opts) {
-          executing = true;
-          // Hold cleanup at the real cache lock, after bundle import has released it.
-          const cache = join(home, "remote", "repos", `${encodeURIComponent(req.repo)}.git`);
-          lock = withRepoLock(cache, async () => {
-            locked.resolve();
-            await release.promise;
-          });
-          await locked.promise;
-          if (state === "failed") throw new Error("Worker execution failed");
-          if (state === "cancelled") {
-            workers.cancel(id);
-            await new Promise<void>((resolve) =>
-              opts.signal?.addEventListener("abort", () => resolve(), { once: true }),
-            );
-            terminal = true;
-            finished.resolve();
-            opts.signal?.throwIfAborted();
-          }
+          if (kind === "gate") await execute(opts.cwd, opts.signal);
         },
       },
       async request(...args) {
         const [_, path, body] = args;
-        if (executing && reports.has(path) && !(body as { jobs: string[] }).jobs.includes(id)) {
-          terminal = true;
-          finished.resolve();
-        }
-        if (terminal && reports.has(path)) reports.get(path)?.resolve((body as { jobs: string[] }).jobs);
-        const reply = await workerRequest(...args);
         if (path.endsWith("/result") || path.endsWith("/failure")) {
           terminal = true;
-          finished.resolve();
+          posting.resolve();
+          if (!allowReport) throw new Error("Coordinator temporarily unavailable");
         }
+        const observing = executing ? (terminal ? postingReports : reports).get(path) : undefined;
+        const reply = await workerRequest(...args);
+        observing?.resolve((body as { jobs: string[] }).jobs);
         return reply;
       },
     });
     try {
       await finished.promise;
-      for (const report of reports.values()) expect(await report.promise).not.toContain(id);
+      now += 1000;
+      for (const report of reports.values()) {
+        const ids = await report.promise;
+        if (state === "cancelled") expect(ids).not.toContain(id);
+        else expect(ids).toContain(id);
+      }
       // Results and failures wait until directory cleanup has settled.
-      expect(workers.job(id)?.state).toBe(state === "cancelled" ? "cancelled" : "leased");
-      // The worker must still await cleanup when shutting down.
-      let stopped = false;
-      worker.controller.abort();
-      const stopping = worker.task.then(() => {
-        stopped = true;
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(stopped).toBe(false);
-      release.resolve();
-      await stopping;
+      expect(row()?.state).toBe(state === "cancelled" ? "cancelled" : "leased");
+      if (state === "cancelled") {
+        // The worker must still await cleanup when shutting down.
+        let stopped = false;
+        const stopping = worker.stop().then(() => {
+          stopped = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(stopped).toBe(false);
+        release.resolve();
+        await stopping;
+      } else {
+        const expiry = row()?.lease_expires_at ?? 0;
+        release.resolve();
+        await posting.promise;
+        now += 1000;
+        for (const report of postingReports.values()) expect(await report.promise).toContain(id);
+        expect(row()?.lease_expires_at).toBeGreaterThan(expiry);
+        expect(row()?.state).toBe("leased");
+        allowReport = true;
+        await until(() => row()?.state === (state === "done" ? "done" : "queued"));
+      }
+      expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+      expect(workerCleanupRecords(worker.remote)).toEqual([]);
     } finally {
       release.resolve();
       await worker.stop();
@@ -2489,6 +2536,107 @@ test("worker cleanup restores locked directories without following symlinks and 
     chmodSync(outside, 0o700);
   }
 }, 60_000);
+
+test.each(["changed work path", "removal error"] as const)(
+  "worker startup discards completed cleanup after a %s and accepts jobs",
+  async (kind) => {
+    await listen();
+    const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
+    const root = mkdtempSync(join(kind === "changed work path" ? home : remote.paths.work, "worker-"));
+    const marker = join(root, "keep");
+    writeFileSync(marker, "retained directory");
+    mkdirSync(join(remote.paths.home, "worker"));
+    const local = new Store(join(remote.paths.home, "worker", "worker.db"));
+    local.setSetting("worker.cleanups", { [root]: { root, cache: join(root, "repo.git"), scratch: [] } });
+    local.close();
+    const scratch = await import("../src/harness/scratch.ts"),
+      original = scratch.removeScratch;
+    const spy = spyOn(scratch, "removeScratch").mockImplementation((directory) => {
+      if (directory === root) throw new Error("private-cleanup-diagnostic");
+      original(directory);
+    });
+    const diagnostics: string[] = [];
+    const id = await queuedLocalAgent();
+    const worker = await loop({
+      log: (text) => diagnostics.push(text),
+      harnesses: { claude: fakeHarness(() => ({})) },
+    });
+    try {
+      await until(() => workers.agentJob(id)?.state === "done");
+      await worker.stop();
+      expect(diagnostics).toEqual(["Worker checkout cleanup failed"]);
+      expect(readFileSync(marker, "utf8")).toBe("retained directory");
+      const reopened = new Store(join(remote.paths.home, "worker", "worker.db"));
+      try {
+        expect(reopened.getSetting("worker.cleanups", {})).toEqual({});
+        expect(reopened.listProcessCleanups()).toEqual([]);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      try {
+        await worker.stop();
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  },
+  30_000,
+);
+
+test("a job's ordinary directory cleanup failure drops retained metadata after confirmed termination", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  let root = "";
+  const scratch = await import("../src/harness/scratch.ts"),
+    original = scratch.removeScratch;
+  const spy = spyOn(scratch, "removeScratch").mockImplementation((directory) => {
+    if (directory === root) throw new Error("private-cleanup-diagnostic");
+    original(directory);
+  });
+  const diagnostics: string[] = [];
+  const worker = await loop({
+    log: (text) => diagnostics.push(text),
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        root = dirname(spec.cwd);
+        const cleanups = processScope.getStore()?.cleanups;
+        if (!cleanups) throw new Error("Missing cleanup store");
+        // Model an ownership record whose process has already been confirmed stopped.
+        cleanups.recordProcessCleanup({
+          runId: id,
+          invocation: id,
+          directory: spec.cwd,
+          pid: 1,
+          birth: "test",
+          boot: "test",
+          createdAt: 0,
+        });
+        cleanups.deleteInvocationCleanups(id);
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    await worker.stop();
+    expect(diagnostics).toEqual(["Worker checkout cleanup failed"]);
+    expect(existsSync(root)).toBe(true);
+    const local = new Store(join(worker.remote.paths.home, "worker", "worker.db"));
+    try {
+      expect(local.getSetting("worker.cleanups", {})).toEqual({});
+      expect(local.listProcessCleanups()).toEqual([]);
+    } finally {
+      local.close();
+    }
+  } finally {
+    try {
+      await worker.stop();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+}, 30_000);
 
 test.each(["failure", "cancellation"] as const)(
   "temporary bundle refs are removed after success and checkout %s",
