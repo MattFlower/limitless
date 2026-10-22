@@ -3886,6 +3886,98 @@ async function queuedLocalAgent(overrides: Partial<AgentJobRequest> = {}) {
   });
 }
 
+test.each([0, 450])(
+  "worker batches agent events during an idle session (burst=%s)",
+  async (count) => {
+    await listen();
+    const id = await queuedLocalAgent();
+    const started = Promise.withResolvers<void>(),
+      finish = Promise.withResolvers<void>();
+    let emittedAt = 0;
+    const worker = await loop({
+      harnesses: {
+        claude: fakeHarness(async (spec) => {
+          emittedAt = performance.now();
+          for (let i = 0; i < count; i++) spec.onEvent({ type: "text", text: String(i) });
+          started.resolve();
+          await finish.promise;
+          return {};
+        }),
+      },
+    });
+    try {
+      await started.promise;
+      await until(() => batches().length === Math.ceil((count + 1) / 200));
+      const elapsed = performance.now() - emittedAt;
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(elapsed).toBeLessThan(2000);
+      expect(workers.agentJob(id)?.state).toBe("leased");
+      const rows = batches();
+      expect(rows.map((row) => row.seq)).toEqual(count ? [0, 1, 2] : [0]);
+      const events = rows.map((row) => JSON.parse(row.events) as { type: string; text?: string }[]);
+      expect(events.map((batch) => batch.length)).toEqual(count ? [200, 200, 51] : [1]);
+      expect(
+        events
+          .flat()
+          .filter((event) => event.type === "text")
+          .map((event) => event.text),
+      ).toEqual(Array.from({ length: count }, (_, i) => String(i)));
+      finish.resolve();
+      await until(() => workers.agentJob(id)?.state === "done");
+    } finally {
+      finish.resolve();
+      await worker.stop();
+    }
+  },
+  30_000,
+);
+
+test("worker fences an agent after one lease period without a successful heartbeat", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  const started = Promise.withResolvers<AgentSpec>(),
+    partitioned = Promise.withResolvers<void>();
+  const leaseMs = 400;
+  let partition = false,
+    lastSuccess = 0,
+    results = 0;
+  const worker = await loop({
+    leaseMs,
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        started.resolve(spec);
+        return { fault: "block" };
+      }),
+    },
+    async request(...args) {
+      if (args[1] === "/worker/heartbeat" && partition) {
+        partitioned.resolve();
+        throw new Error("injected partition");
+      }
+      if (args[1] === agentPath(id, "result")) results++;
+      const reply = await workerRequest(...args);
+      if (args[1] === "/worker/heartbeat" && reply.status === 200) lastSuccess = performance.now();
+      return reply;
+    },
+  });
+  try {
+    const spec = await started.promise;
+    partition = true;
+    await partitioned.promise;
+    await Bun.sleep(100);
+    expect(spec.signal.aborted).toBe(false);
+    await until(() => spec.signal.aborted);
+    expect(performance.now() - lastSuccess).toBeGreaterThanOrEqual(leaseMs);
+    expect(performance.now() - lastSuccess).toBeLessThan(2000);
+    await until(() => readdirSync(worker.remote.paths.work).length === 0);
+    expect(results).toBe(0);
+    expect(workers.agentJob(id)?.state).not.toBe("done");
+    expect(worker.controller.signal.aborted).toBe(false);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
 test("worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
   await listen();
   const id = await queuedLocalAgent({ slottedCommands: [["bun", "test"]] });
@@ -4049,7 +4141,7 @@ test("worker never reports an agent result after its events are rejected", async
   const id = await queuedLocalAgent();
   let results = 0;
   const worker = await loop({
-    harnesses: { claude: fakeHarness(() => ({ text: "Progress" })) },
+    harnesses: { claude: fakeHarness(() => ({ text: "Progress", fault: "block" })) },
     async request(...args) {
       if (args[1] === agentPath(id, "result")) results++;
       const reply = await workerRequest(...args);

@@ -16,7 +16,7 @@ import { runCodex } from "../harness/codex.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { removeScratch, restoreDirectoryPermissions, spellings } from "../harness/scratch.ts";
-import type { AgentSpec, Harness } from "../harness/types.ts";
+import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
 import { runToolAgent } from "../pipeline/agent-executor.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { agentEnv, redactCredentials, registerCredential, sh } from "../util/proc.ts";
@@ -190,6 +190,7 @@ export async function runWorker(
     confinement?: ConfinementBackend;
     harnesses?: Partial<Record<"claude" | "codex", Harness>>;
     heartbeatMs?: number;
+    leaseMs?: number;
     machineState?: typeof machineState;
     request?: typeof workerRequest;
     retryMs?: number;
@@ -213,6 +214,8 @@ export async function runWorker(
       combined = AbortSignal.any([signal, stop.signal]);
     const jobs = new Map<string, { controller: AbortController; task: Promise<void>; reported: boolean }>();
     const agentJobs: typeof jobs = new Map();
+    let lastHeartbeat = 0;
+    const leaseMs = options.leaseMs ?? timing.lease;
     const allJobs = () => [...jobs, ...agentJobs];
     const cancel = (id: string) => {
       jobs.get(id)?.controller.abort();
@@ -308,6 +311,7 @@ export async function runWorker(
       const reply = z
         .object({ cancelled: z.array(z.string()), releaseSha: z.string().optional() })
         .parse(response.json());
+      lastHeartbeat = performance.now();
       for (const id of reply.cancelled) cancel(id);
       observeRelease(reply.releaseSha);
     };
@@ -464,6 +468,17 @@ export async function runWorker(
         );
       let posts = Promise.resolve(),
         seq = 0;
+      let events: AgentEvent[] = [];
+      let flushTimer: ReturnType<typeof setTimeout> | undefined;
+      const flush = () => {
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+        if (!events.length) return;
+        const body = sanitize({ seq: seq++, events });
+        events = [];
+        posts = posts.then(() => call(`${path}/events`, body, jobSignal)).then(() => {});
+        void posts.catch(() => agentJobs.get(id)?.controller.abort());
+      };
       try {
         const name = req.target.harness;
         const harness =
@@ -486,9 +501,10 @@ export async function runWorker(
             signal: jobSignal,
             logPath: join(root ?? cwd, "agent.jsonl"),
             onEvent(event) {
-              const body = sanitize({ seq: seq++, events: [event] });
-              posts = posts.then(() => call(`${path}/events`, body, jobSignal)).then(() => {});
-              void posts.catch(() => agentJobs.get(id)?.controller.abort());
+              if (jobSignal.aborted) return;
+              events.push(event);
+              if (events.length === 200) flush();
+              else flushTimer ??= setTimeout(flush, 250);
             },
           };
           const result = await readPolicyScope.run(cfg.readPolicy, () =>
@@ -505,6 +521,7 @@ export async function runWorker(
               ),
             ),
           );
+          flush();
           await posts;
           jobSignal.throwIfAborted();
           const report = AgentResultReport.parse(
@@ -521,14 +538,24 @@ export async function runWorker(
           ).catch(() => {});
         if (combined.aborted) throw error;
       } finally {
+        clearTimeout(flushTimer);
         await posts.catch(() => {});
         const job = agentJobs.get(id);
         if (job) job.reported = false;
       }
     };
     let beats: Promise<void> | undefined;
+    let fence: ReturnType<typeof setInterval> | undefined;
     try {
       await heartbeat();
+      // Heartbeat retries can wait indefinitely; fencing must run independently.
+      fence = setInterval(
+        () => {
+          if (performance.now() - lastHeartbeat > leaseMs)
+            for (const job of agentJobs.values()) job.controller.abort();
+        },
+        Math.min(options.heartbeatMs ?? timing.heartbeat, leaseMs),
+      );
       beats = (async () => {
         while (!combined.aborted) {
           await sleep(options.heartbeatMs ?? timing.heartbeat, undefined, { signal: combined });
@@ -626,6 +653,7 @@ export async function runWorker(
     } catch (error) {
       if (!signal.aborted) throw error;
     } finally {
+      clearInterval(fence);
       stop.abort();
       for (const [, job] of allJobs()) job.controller.abort();
       await Promise.allSettled([...(beats ? [beats] : []), ...allJobs().map(([, j]) => j.task)]);
