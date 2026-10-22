@@ -2,7 +2,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
-import { loadPrivateStrings, PrivateError } from "../gates/private.ts";
+import { loadPrivateStrings, PrivateError, privateStringsDigest } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { cacheGit, stageAll, worktreeGit } from "../git/command.ts";
 import { checkPrivateRange, commitAll, publicationRange } from "../git/repos.ts";
@@ -18,6 +18,10 @@ const identity = z
   );
 const email = identity.refine((s) => /^[^\s@]+@[^\s@]+$/.test(s));
 export const publicationFields = {
+  privateStringsDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   commit: z
     .object({
       message: z
@@ -69,6 +73,7 @@ export async function publishAgentChanges(
   if (changed.exitCode !== 1) throw new Error("Cannot inspect worker changes");
   const { commit, repoUrl, expectedRemoteSha, discreet, branch, baseSha, uiUrl } = req;
   if (
+    !req.privateStringsDigest ||
     !commit ||
     !repoUrl ||
     expectedRemoteSha === undefined ||
@@ -106,6 +111,8 @@ export async function publishAgentChanges(
   const range = await publicationRange(cwd, baseSha, sha, expectedRemoteSha);
   await checkPrivateRange(cwd, range, entries);
   if (discreet) await checkDiscreetCommits(cwd, range, baseSha, req.runId, uiUrl);
+  if (privateStringsDigest(entries) !== req.privateStringsDigest)
+    throw new Error("Worker private-strings list differs from the coordinator's; publication blocked");
   const token = await tokenLookup(signal);
   registerCredential("GH_TOKEN", token);
   const basic = Buffer.from(`x-access-token:${token}`).toString("base64");

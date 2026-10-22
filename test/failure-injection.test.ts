@@ -18,6 +18,7 @@ import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { loadPrivateStrings } from "../src/gates/private.ts";
+import * as repos from "../src/git/repos.ts";
 import {
   createPullRequest,
   GitHubUnavailableError,
@@ -1504,7 +1505,7 @@ for (const operation of [
     const pids = new Map<number, string>();
     try {
       const pattern = {
-        fetch: "git fetch origin +refs/heads/*",
+        fetch: `git fetch ${source} +refs/heads/*`,
         push: "git push *",
         list: "gh pr list *",
         edit: "gh pr edit *",
@@ -2244,10 +2245,25 @@ for (const checkpoint of ["resolution-start", "implementation-committed"] as con
     }
   }, 60_000);
 
-for (const cancel of [false, true])
-  test(`verified-work draft retains its verified target across ${cancel ? "cancellation" : "PR checkpoint restart"}`, async () => {
+for (const checkpoint of ["cancellation", "delivery-pr-created", "delivery-publishing", "delivery-pushed"])
+  test(`verified-work draft retains its verified target across ${checkpoint}`, async () => {
+    const cancel = checkpoint === "cancellation";
     const pr = join(root, "pr");
+    const bare = join(root, "draft.git");
+    await sh(["git", "clone", "--bare", source, bare], { cwd: root });
     const restore = fakeGh(pr);
+    rmSync(join(root, "bin", "git")); // Exercise the real push and explicit lease against the bare remote.
+    const push = repos.pushBranch;
+    const pushes: { sha: string | undefined; expected: string | null | undefined }[] = [];
+    let active: Factory;
+    let runId = "";
+    const publication = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+      const saved = active.store.getRunState<RunState>(runId);
+      expect(saved?.publishingSha).toBe(args[3]);
+      expect(args[3]).toBe(saved?.lastVerifiedSha);
+      pushes.push({ sha: args[3], expected: args[6] });
+      return push(...args);
+    });
     try {
       let implementations = 0;
       const handler = async (s: AgentSpec): Promise<FakeReply> => {
@@ -2255,6 +2271,7 @@ for (const cancel of [false, true])
         if (implementations++ === 0) {
           writeFileSync(join(source, "README.md"), "base advanced\n");
           await sh(["git", "commit", "-qam", "advance base"], { cwd: source });
+          await sh(["git", "push", bare, "HEAD:refs/heads/main"], { cwd: source });
           return { files: { "README.md": "implementation\n" } };
         }
         // An unresolved factory merge cannot replace the verified implementation in the draft.
@@ -2272,11 +2289,13 @@ for (const cancel of [false, true])
                 },
               },
             }
-          : { "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" } },
+          : { "store:save": { action: "kill", when: (c) => c.checkpoint === checkpoint } },
         handler,
       );
-      const repo = githubRun(f);
+      active = f;
+      const repo = githubRun(f, bare);
       const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+      runId = r.id;
       f.scheduler.start();
       if (cancel) {
         await wait(() => reached);
@@ -2287,25 +2306,46 @@ for (const cancel of [false, true])
       expect(state?.lastVerifiedSha).toBe(state?.preRebaseHead);
       expect(state?.needsHumanReason).toContain("Unresolved conflict markers");
       expect(f.store.getRun(r.id)?.status).toBe(cancel ? "cancelled" : "running");
+      if (checkpoint === "delivery-publishing") {
+        expect(pushes).toHaveLength(0);
+        expect(state?.publishingSha).toBeUndefined();
+        expect((await sh(["git", "for-each-ref", "refs/heads/limitless"], { cwd: bare })).stdout).toBe("");
+      }
+      if (checkpoint === "delivery-pushed") {
+        expect(pushes).toHaveLength(1);
+        expect(state?.publishingSha).toBe(state?.lastVerifiedSha);
+        expect(state?.publishedSha).toBeUndefined();
+        expect(
+          (
+            await sh(["git", "rev-parse", `refs/heads/${f.store.getRun(r.id)?.branch}`], { cwd: bare })
+          ).stdout.trim(),
+        ).toBe(state?.publishingSha ?? "missing");
+      }
       const next = await reopen(f, handler);
+      active = next;
       await settled(next, r.id);
       expect(next.store.getRun(r.id)?.status).toBe(cancel ? "cancelled" : "needs_human");
       expect(next.store.getRunState<RunState>(r.id)?.lastVerifiedSha).toBe(state?.lastVerifiedSha);
       if (cancel) expect(existsSync(pr)).toBe(false);
       else {
         expect(next.store.getRun(r.id)?.prUrl).toContain("/pull/1");
-        const pushes = readFileSync(join(root, "pushes"), "utf8")
-          .split("\n")
-          .filter((line) => line.includes(":refs/heads/"));
-        expect(pushes).toEqual(
-          Array(2).fill(`${state?.lastVerifiedSha}:refs/heads/${next.store.getRun(r.id)?.branch}`),
+        expect(pushes.map((p) => p.sha)).toEqual(
+          Array(checkpoint === "delivery-publishing" ? 1 : 2).fill(state?.lastVerifiedSha),
         );
+        expect(pushes.at(-1)?.expected).toBe(
+          checkpoint === "delivery-publishing" ? null : state?.lastVerifiedSha,
+        );
+        const final = next.store.getRunState<RunState>(r.id);
+        expect(final?.publishedSha).toBe(state?.lastVerifiedSha);
+        expect(final?.publishingSha).toBeUndefined();
+        expect(ghCalls(pr, "pr create").some((c) => c.includes("--draft"))).toBe(true);
         expect(next.store.getArtifact(r.id, "report.md")).toContain(state?.lastVerifiedSha ?? "missing");
       }
       expect(implementations).toBe(2);
       expect(existsSync(state?.worktreePath ?? "")).toBe(true);
       history(next, r.id);
     } finally {
+      publication.mockRestore();
       await restore();
     }
   });

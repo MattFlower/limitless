@@ -118,7 +118,9 @@ describe("routing bounded slot waits", () => {
       );
       await expect(f.invoke(undefined, "implement")).rejects.toThrow(SimulatedTermination);
       expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+      await factory?.stop();
       f.context.store.close();
+      factory = null;
       const reopened = new Store(f.cfg.paths.db);
       try {
         const tracker = new ProviderTracker(providers, reopened, f.cfg.reserves, {}, {});

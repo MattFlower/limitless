@@ -2316,6 +2316,15 @@ function deliveryIdentity(ctx: RunContext, headSha = ctx.run.headSha): PullReque
     : undefined;
 }
 
+async function reconcilePublication(ctx: RunContext, cwd: string, budget: GitHubBudget): Promise<void> {
+  const pending = ctx.state.publishingSha;
+  if (!pending) return;
+  const remote = await remoteBranchSha(ctx.repo, cwd, ctx.run.branch as string, ctx.signal, budget);
+  if (remote === pending) ctx.state.publishedSha = pending;
+  ctx.state.publishingSha = undefined;
+  await ctx.save("delivery-reconciled");
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -2342,7 +2351,13 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
+  await reconcilePublication(ctx, cwd, budget);
+  ctx.state.publishingSha = sha;
+  await ctx.save("delivery-publishing");
+  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget, ctx.state.publishedSha ?? null);
+  ctx.state.publishedSha = sha;
+  ctx.state.publishingSha = undefined;
+  await ctx.save("delivery-pushed");
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
@@ -2509,6 +2524,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
     const budget = deliveryBudget(ctx);
+    if (ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review)
+      await reconcilePublication(ctx, cwd, budget);
     const runner = ctx.deps.gh ?? runGh;
     const gh: GhRunner = (args, signal, stdin) =>
       withGitHubRetry(async () => (await runner(args, signal, stdin)) ?? "", { budget, signal });
@@ -2771,7 +2788,20 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${branch}`, value: undefined };
     }
     ctx.checkCancelled();
-    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, head, ctx.signal, budget);
+    ctx.state.publishingSha = head;
+    await ctx.save("delivery-publishing");
+    await pushBranch(
+      ctx.repo,
+      cwd,
+      ctx.run.branch as string,
+      head,
+      ctx.signal,
+      budget,
+      ctx.state.publishedSha ?? null,
+    );
+    ctx.state.publishedSha = head;
+    ctx.state.publishingSha = undefined;
+    await ctx.save("delivery-pushed");
     ctx.checkCancelled();
     const url = await createPullRequest(ctx.repo, {
       branch: ctx.run.branch as string,

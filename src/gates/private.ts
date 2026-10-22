@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   closeSync,
   fstatSync,
@@ -139,6 +140,12 @@ export function loadPrivateStrings(
   }
 }
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
+export function privateStringsDigest(entries: PrivateStrings): string {
+  const values = [...new Set(entries.map(({ value }) => value))].sort();
+  return createHash("sha256")
+    .update(JSON.stringify(["limitless-private-strings/1", ...values]))
+    .digest("hex");
+}
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 const decoded = (text: string) =>
   text

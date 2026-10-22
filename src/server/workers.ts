@@ -150,6 +150,7 @@ export async function startWorkerListener(
               commit,
               repoUrl,
               expectedRemoteSha,
+              privateStringsDigest,
               discreet,
               uiUrl,
             }: AgentJobRequest = JSON.parse(agentJob.request);
@@ -180,6 +181,7 @@ export async function startWorkerListener(
                   commit,
                   repoUrl,
                   expectedRemoteSha,
+                  privateStringsDigest,
                   discreet,
                   uiUrl,
                 },
@@ -211,7 +213,11 @@ export async function startWorkerListener(
           const bundle = await jobBundle(
             cachePath(paths, repo),
             id,
-            [job.parent_sha, ...(request.baseSha ? [request.baseSha] : [])],
+            [
+              job.parent_sha,
+              ...(request.baseSha ? [request.baseSha] : []),
+              ...(request.expectedRemoteSha ? [request.expectedRemoteSha] : []),
+            ],
             AbortSignal.any([req.signal, closing.signal]),
           );
           return held() ?? new Response(bundle, { headers: { "content-type": "application/x-git-bundle" } });
@@ -229,6 +235,14 @@ export async function startWorkerListener(
         else {
           const result = AgentResultReport.parse(body);
           if (result.parentSha !== job.parent_sha) return json({ error: "Result parent SHA mismatch" }, 400);
+          const request: AgentJobRequest = JSON.parse(job.request);
+          if (
+            request.commit &&
+            (result.branch !== request.branch ||
+              !result.privateStringsDigest ||
+              result.privateStringsDigest !== request.privateStringsDigest)
+          )
+            return json({ error: "Result publication metadata mismatch" }, 400);
           workers.completeAgentJob(id, result, result.sha);
         }
         return json({ ok: true });

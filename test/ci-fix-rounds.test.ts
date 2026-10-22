@@ -56,6 +56,7 @@ const seed = seeded(async (root) => {
 });
 let root: string;
 let factory: Factory;
+let factoryStopped: boolean;
 let owner: Run;
 let clock: ReturnType<typeof waitClock>;
 let calls: string[][];
@@ -68,6 +69,7 @@ let implementerReport: string;
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
 beforeEach(async () => {
+  factoryStopped = false;
   branch = "limitless/owner-feature";
   root = mkdtempSync(join(tmpdir(), "ci-fix-rounds-"));
   observerRoots.add(realpathSync(root));
@@ -209,7 +211,7 @@ beforeEach(async () => {
 afterEach(async () => {
   mock.restore();
   registerCredential("CI_TEST", "");
-  await factory.stop();
+  if (!factoryStopped) await factory.stop();
   factory.store.close();
   observerRoots.clear();
   rmSync(root, { recursive: true, force: true });
@@ -373,6 +375,8 @@ test.each(["draft", "needs_human", "security", "main-red", "land-main-red", "rev
 test("durable trigger resumes exactly once on a reopened store", async () => {
   await record();
   await record();
+  await factory.stop();
+  factoryStopped = true;
   factory.store.close();
   const store = new Store(factory.cfg.paths.db);
   try {

@@ -60,6 +60,7 @@ const seed = seeded(async (root) => {
 });
 let root: string;
 let factory: Factory;
+let factoryStopped: boolean;
 let owner: Run;
 let clock: ReturnType<typeof waitClock>;
 let calls: string[][];
@@ -75,6 +76,7 @@ const git = async (cwd: string, ...args: string[]) => (await sh(["git", ...args]
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
 
 beforeEach(async () => {
+  factoryStopped = false;
   branch = "limitless/owner-feature";
   root = mkdtempSync(join(tmpdir(), "conflict-rounds-"));
   observerRoots.add(realpathSync(root));
@@ -229,7 +231,7 @@ beforeEach(async () => {
 afterEach(async () => {
   mock.restore();
   await queue?.stop();
-  await factory.stop();
+  if (!factoryStopped) await factory.stop();
   factory.store.close();
   observerRoots.clear();
   rmSync(root, { recursive: true, force: true });
@@ -432,6 +434,8 @@ test("active rounds, delivered heads and the rolling daily cap suppress new roun
 test("a pending trigger starts exactly once across reopening the database", async () => {
   factory.store.recordConflictTrigger(url, await remoteHead(), "land", clock.now());
   const db = factory.cfg.paths.db;
+  await factory.stop();
+  factoryStopped = true;
   factory.store.close();
   const reopened = new Store(db);
   try {
@@ -635,6 +639,8 @@ test("startup consumes pending triggers and a restarted consumer never repeats s
     [],
     clock.now(),
   );
+  await factory.stop();
+  factoryStopped = true;
   factory.store.close();
   let reopened = new Store(factory.cfg.paths.db);
   try {

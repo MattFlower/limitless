@@ -71,6 +71,10 @@ const result = z
   .strict() satisfies z.ZodType<AgentResult>;
 export const AgentResultReport = result
   .extend({
+    privateStringsDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     parentSha: z.string(),
     sha: z.string().regex(/^(?:[a-f\d]{40}|[a-f\d]{64})$/i),
     branch: z.string().refine(isBranchName),
