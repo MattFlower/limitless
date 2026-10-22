@@ -589,7 +589,15 @@ export async function runWorker(
             assertProcessesStopped();
             const job = retained[root];
             if (!job) throw new Error("Missing worker ownership evidence");
-            await confirm(job);
+            try {
+              await confirm(job);
+            } catch (error) {
+              if (error instanceof ProcessTerminationError) throw error;
+              throw new ProcessTerminationError(
+                `${ProcessTerminationError.prefix}: ${redactCredentials(error instanceof Error ? error.message : String(error))}`,
+                { cause: error },
+              );
+            }
             await cleanup({ root, cache, scratch: [...scope.scratchDirs] });
           } catch (error) {
             if (error instanceof ProcessTerminationError || scope.terminationError) {

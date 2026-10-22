@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { type ChildProcess, type ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -816,20 +816,26 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         : [];
     const spawnedAt = darwin?.darwinClock() ?? 0n;
     scope?.beforeSpawn?.(marker);
-    const child = spawn(bin, args, {
-      cwd: opts.cwd,
-      // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
-      env: {
-        ...opts.env,
-        ...(scope?.ownershipMarker
-          ? { [`LIMITLESS_INVOCATION_${scope.ownershipMarker.replaceAll("-", "_")}`]: "1" }
-          : {}),
-        LIMITLESS_INVOCATION: marker,
-        [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
-      },
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(bin, args, {
+        cwd: opts.cwd,
+        // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
+        env: {
+          ...opts.env,
+          ...(scope?.ownershipMarker
+            ? { [`LIMITLESS_INVOCATION_${scope.ownershipMarker.replaceAll("-", "_")}`]: "1" }
+            : {}),
+          LIMITLESS_INVOCATION: marker,
+          [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
+        },
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      (scope?.cleanups ?? processCleanupStore.getStore())?.deleteInvocationCleanups(marker);
+      throw error;
+    }
     let leader: DarwinInvocationLeader | null = null;
     let discoveryError: unknown;
     try {

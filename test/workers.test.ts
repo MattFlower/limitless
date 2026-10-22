@@ -3263,6 +3263,130 @@ test("worker startup retains legacy cleanup without termination evidence across 
   }
 });
 
+test("worker removes a NUL-argument job's directories and pending marker after synchronous spawn failure", async () => {
+  await listen();
+  const id = await queuedLocalAgent();
+  let cwd = "",
+    scratch = "";
+  let pending: string[] | undefined;
+  const worker = await loop({
+    heartbeatMs: 60_000,
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        cwd = spec.cwd;
+        scratch = spec.scratchDir ?? "";
+        try {
+          await runProcess({ cmd: [process.execPath, "-e", "\0"], cwd, env: {} });
+        } finally {
+          const local = new Store(join(home, "remote", "worker", "worker.db"));
+          try {
+            pending = local.getSetting<Record<string, { pending: string[] }>>("worker.cleanups", {})[
+              dirname(cwd)
+            ]?.pending;
+          } finally {
+            local.close();
+          }
+        }
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.failure_reason != null);
+    await worker.stop();
+    expect(workers.agentJob(id)?.failure_reason).toContain("null bytes");
+    expect(pending).toEqual([]);
+    expect(cwd).not.toBe("");
+    expect(scratch).not.toBe("");
+    for (const directory of [dirname(cwd), cwd, scratch]) expect(existsSync(directory)).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker retains a job after an ordinary final confirmation error and later recovers its directories", async () => {
+  const server = await listen();
+  const id = await queuedLocalAgent();
+  const secret = "synthetic-confirmation-secret";
+  registerCredential("worker-confirmation-test", secret);
+  const failure = new Error(`final discovery unavailable ${secret}`);
+  let cwd = "",
+    scratch = "",
+    transmitted = "";
+  const proc = await import("../src/util/proc.ts"),
+    original = proc.recoverProcessCleanups;
+  // Recovery normally wraps discovery errors. Expose the plain error at confirm's boundary.
+  const recover = spyOn(proc, "recoverProcessCleanups").mockImplementation((...args) => {
+    const owner = args[4];
+    if (!cwd || owner?.runId !== id) return original(...args);
+    const inspection = processRecoveryInspection.getStore();
+    if (!inspection?.discover) throw new Error("Missing recovery inspection");
+    return inspection
+      .discover(owner.invocation, 0, owner.createdAt, owner.discovery.directories, null, new Set(), 0n)
+      .then(() => {});
+  });
+  const worker = await processRecoveryInspection.run(
+    {
+      stopped: recoveryProcessStopped,
+      timeoutMs: 100,
+      discover: async () => {
+        throw failure;
+      },
+    },
+    () =>
+      loop({
+        heartbeatMs: 60_000,
+        request: async (...args) => {
+          if (args[1] === agentPath(id, "failure")) transmitted = (args[2] as { reason: string }).reason;
+          return workerRequest(...args);
+        },
+        harnesses: {
+          claude: fakeHarness((spec) => {
+            cwd = spec.cwd;
+            scratch = mkdtempSync(join(home, "final-confirm-scratch-"));
+            processScope.getStore()?.scratchDirs.add(scratch);
+            return {};
+          }),
+        },
+      }),
+  );
+  try {
+    await until(() => workers.agentJob(id)?.state === "done" || workers.agentJob(id)?.failure_reason != null);
+    await worker.stop();
+    expect(workers.agentJob(id)?.state).not.toBe("done");
+    expect(transmitted).toBe(`${ProcessTerminationError.prefix}: final discovery unavailable [redacted]`);
+    for (const directory of [dirname(cwd), cwd, scratch]) expect(existsSync(directory)).toBe(true);
+    const local = new Store(join(worker.remote.paths.home, "worker", "worker.db"));
+    try {
+      expect(local.getSetting("worker.cleanups", {})).toMatchObject({
+        [dirname(cwd)]: { root: dirname(cwd), scratch: [scratch], pending: [] },
+      });
+    } finally {
+      local.close();
+    }
+    recover.mockRestore();
+    const controller = new AbortController();
+    await processRecoveryInspection.run(
+      { stopped: recoveryProcessStopped, timeoutMs: 100, discover: async () => [] },
+      () =>
+        runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+          confinement: fakeConfinement,
+          machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+          request: async (...args) => {
+            controller.abort();
+            return workerRequest(...args);
+          },
+        }),
+    );
+    for (const directory of [dirname(cwd), cwd, scratch]) expect(existsSync(directory)).toBe(false);
+    expect(workerCleanupRecords(worker.remote)).toEqual([]);
+  } finally {
+    await worker.stop();
+    recover.mockRestore();
+  }
+}, 30_000);
+
 test("a job's ordinary directory cleanup failure drops retained metadata after confirmed termination", async () => {
   await listen();
   const id = await queuedLocalAgent();
