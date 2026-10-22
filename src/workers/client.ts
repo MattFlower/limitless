@@ -484,7 +484,8 @@ export async function runWorker(
       }
     };
     const heartbeat = async () => {
-      await recover();
+      // Retained cleanup must not delay lease renewal for unrelated active jobs.
+      void recover().catch(unresolved);
       const slots = gateSlots.snapshot(),
         state = await (options.machineState ?? machineState)();
       const body: Capabilities = {
@@ -887,7 +888,11 @@ export async function runWorker(
       stop.abort();
       fenceTimer.clear(fence);
       for (const [, job] of allJobs()) job.controller.abort();
-      await Promise.allSettled([...(beats ? [beats] : []), ...allJobs().map(([, j]) => j.task)]);
+      await Promise.allSettled([
+        ...(beats ? [beats] : []),
+        ...allJobs().map(([, j]) => j.task),
+        ...(recovery ? [recovery] : []),
+      ]);
     }
   } finally {
     store.close();
