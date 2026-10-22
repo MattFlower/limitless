@@ -53,7 +53,7 @@ import {
 } from "../core/types.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
-import { githubWait } from "../git/repos.ts";
+import { githubWait } from "../git/github-wait.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
 import type { RunState } from "../pipeline/context.ts";

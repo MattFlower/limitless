@@ -44,7 +44,7 @@ const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
 /** Retry policy for GitHub and remote git (tests shorten it). */
 export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 };
-export const githubWait = { intervalMs: 300_000, maxMs: 21_600_000 };
+export { githubWait } from "./github-wait.ts";
 /**
  * In-memory GitHub time shared by every call in one delivery attempt. It only drains while a
  * remote command or a backoff pause runs, so local work in between never eats into it. It bounds

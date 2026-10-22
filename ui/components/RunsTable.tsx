@@ -2,7 +2,7 @@ import { useNavigate } from "@solidjs/router";
 import type { Component } from "solid-js";
 import { For, Show } from "solid-js";
 import type { Run } from "../../src/core/types.ts";
-import { duration, relativeTime, truncate } from "../lib/format.ts";
+import { duration, formatDateTime, relativeTime, truncate } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 import { CostCell } from "./CostCell.tsx";
 import { RunStatusPill } from "./StatusPill.tsx";
@@ -47,9 +47,8 @@ export const RunsTable: Component<{ runs: Run[] }> = (props) => {
                   <Show when={run.status === "queued" && run.githubWait}>
                     {(wait) => (
                       <div class="text-dim">
-                        waiting for GitHub since {new Date(wait().since).toLocaleString()}; next try{" "}
-                        {new Date(wait().nextAttemptAt).toLocaleString()}; gives up{" "}
-                        {new Date(wait().deadline).toLocaleString()}
+                        waiting for GitHub since {formatDateTime(wait().since)}; next try{" "}
+                        {formatDateTime(wait().nextAttemptAt)}; gives up {formatDateTime(wait().deadline)}
                       </div>
                     )}
                   </Show>

@@ -321,6 +321,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         !reason &&
         !deps.store.getRun(runId)?.error?.startsWith("cancelled by");
       const status = shutdown ? "queued" : "cancelled";
+      // An interrupted save can leave in-memory state ahead of its durable checkpoint.
+      const state = shutdown ? undefined : deps.store.getRunState<RunState>(runId);
+      if (state) state.githubWait = undefined;
       if (!shutdown) ctx.state.githubWait = undefined;
       deps.store.updateRun(
         runId,
@@ -329,7 +332,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           finishedAt: shutdown ? null : Date.now(),
           ...(reason ? { error: redactGateOutput(reason) } : {}),
         },
-        ctx.state,
+        state ?? undefined,
       );
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;

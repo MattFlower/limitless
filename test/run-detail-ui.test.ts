@@ -6,6 +6,7 @@ import { renderToString } from "solid-js/web";
 import type { RunModels } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { MODELS } from "../src/router/catalog.ts";
+import { formatDateTime } from "../ui/lib/format.ts";
 import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
 import { buildSetupUi, settle } from "./setup-ui-support.ts";
 
@@ -120,14 +121,21 @@ test("Run Detail shows the GitHub wait only for queued runs with an outage episo
   const detail = store.getRunDetail(run.id);
   if (!detail) throw new Error("missing detail");
   const page = await buildNeedsYouUi(dir);
-  const githubWait = { since: 100, nextAttemptAt: 200, deadline: 300, reason: "unavailable" };
+  const since = Date.UTC(2026, 0, 1, 12);
+  const githubWait = {
+    since,
+    nextAttemptAt: since + 300_000,
+    deadline: since + 21_600_000,
+    reason: "unavailable",
+  };
   try {
     page.mount({ ...detail, run: { ...run, status: "queued", githubWait } });
     const html = renderToString(() => page.render());
     expect(html).toContain("waiting for GitHub since");
     expect(html).toContain("next try");
     expect(html).toContain("gives up");
-    for (const time of [100, 200, 300]) expect(html).toContain(new Date(time).toLocaleString());
+    for (const time of [githubWait.since, githubWait.nextAttemptAt, githubWait.deadline])
+      expect(html).toContain(formatDateTime(time));
     page.mount(detail);
     expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
     page.mount({ ...detail, run: { ...run, status: "running", githubWait } });
