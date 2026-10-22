@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { cpus, hostname, release, totalmem } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import { isBranchName } from "../core/delivery.ts";
+import { Store } from "../db/store.ts";
 import type { GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import { runLocalGates } from "../gates/run.ts";
@@ -19,7 +20,17 @@ import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.t
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
 import { runToolAgent } from "../pipeline/agent-executor.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
-import { agentEnv, redactCredentials, registerCredential, sh } from "../util/proc.ts";
+import {
+  agentEnv,
+  assertProcessesStopped,
+  type ProcessCleanupStore,
+  ProcessTerminationError,
+  processScope,
+  recoverProcessCleanups,
+  redactCredentials,
+  registerCredential,
+  sh,
+} from "../util/proc.ts";
 import { AgentResultReport } from "./agent-protocol.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { agentPathMask } from "./reporting.ts";
@@ -211,7 +222,67 @@ export async function runWorker(
   const home = join(cfg.paths.home, "worker");
   mkdirSync(home, { recursive: true });
   const held = [protectPrivateFile(join(home, "key.pem"))];
+  const store = new Store(join(home, "worker.db"));
+  type RetainedJob = { root: string; cache: string; scratch: string[] };
+  const retained = store.getSetting<Record<string, RetainedJob>>("worker.cleanups", {});
+  const save = () => store.setSetting("worker.cleanups", retained);
+  const cleanup = async ({ root, cache, scratch }: RetainedJob) => {
+    if (dirname(root) !== cfg.paths.work || !basename(root).startsWith("worker-"))
+      throw new Error("Invalid worker cleanup directory");
+    const cwd = join(root, "checkout");
+    try {
+      if (existsSync(cwd))
+        await withRepoLock(cache, async () => {
+          restoreDirectoryPermissions(cwd);
+          await worktreeGit(["git", "worktree", "remove", "--force", cwd], {
+            cwd: cache,
+            additionalWriteRoots: [cwd],
+          });
+        });
+    } catch (error) {
+      if (error instanceof ProcessTerminationError) throw error;
+      (options.log ?? console.error)("Worker checkout cleanup failed");
+    }
+    for (const directory of [...scratch, root]) removeScratch(directory);
+  };
+  const scoped = (
+    id: string,
+    root: string,
+    cache: string,
+    jobSignal: AbortSignal,
+    run: () => Promise<void>,
+    scratch: string[] = [],
+  ) =>
+    processScope.run(
+      {
+        signal: jobSignal,
+        killGraceMs: 100,
+        children: new Map(),
+        scratchDirs: new Set(scratch),
+        runId: id,
+        checkout: () => join(root, "checkout"),
+        cleanups: {
+          recordProcessCleanup(row) {
+            store.db.transaction(() => {
+              retained[root] = { root, cache, scratch: [...(processScope.getStore()?.scratchDirs ?? [])] };
+              save();
+              store.recordProcessCleanup(row);
+            })();
+          },
+          listProcessCleanups: store.listProcessCleanups.bind(store),
+          deleteProcessCleanup: store.deleteProcessCleanup.bind(store),
+          deleteInvocationCleanups: store.deleteInvocationCleanups.bind(store),
+        } satisfies ProcessCleanupStore,
+      },
+      run,
+    );
   try {
+    await recoverProcessCleanups(store);
+    for (const [id, job] of Object.entries(retained)) {
+      await scoped(id, job.root, job.cache, new AbortController().signal, () => cleanup(job), job.scratch);
+      delete retained[id];
+      save();
+    }
     const token = privateFile(join(home, "token"));
     held.push(token.release);
     const pin = privateFile(join(home, "coordinator-fingerprint"));
@@ -335,75 +406,93 @@ export async function runWorker(
       expectedSha: string,
       path: string,
       jobSignal: AbortSignal,
-      invoke: (cwd: string) => Promise<void>,
+      invoke: (cwd: string) => Promise<() => Promise<unknown>>,
       onError?: (error: unknown) => Promise<void>,
-    ): Promise<void> => {
-      const cwd = join(root, "checkout");
-      try {
-        const bundle = join(root, "job.bundle");
-        writeFileSync(bundle, (await call(`${path}/bundle`, undefined, jobSignal)).data);
-        await withRepoLock(cache, async () => {
-          if (!existsSync(cache)) {
-            for (const dir of ["objects", "refs"]) mkdirSync(join(cache, dir), { recursive: true });
-            writeFileSync(join(cache, "HEAD"), "ref: refs/heads/main\n");
-            await worktreeGit(
-              [
-                "git",
-                "init",
-                "--bare",
-                "--template=",
-                `--object-format=${expectedSha.length === 64 ? "sha256" : "sha1"}`,
-              ],
-              { cwd: cache, signal: jobSignal },
-            );
-          }
-          const prefix = `refs/limitless-bundles/${id}/`;
+    ): Promise<void> =>
+      scoped(id, root, cache, jobSignal, async () => {
+        const cwd = join(root, "checkout");
+        const finish = async () => {
+          const job = jobs.get(id) ?? agentJobs.get(id);
+          if (job) job.reported = false;
+          const scope = processScope.getStore();
+          if (!scope) return;
+          // Cleanup must finish even when the job's deadline or cancellation has fired.
+          scope.signal = new AbortController().signal;
           try {
-            await worktreeGit(["git", "bundle", "verify", bundle], { cwd: cache, signal: jobSignal });
-            await worktreeGit(["git", "fetch", "--no-tags", bundle, `+${prefix}*:${prefix}*`], {
-              cwd: cache,
-              signal: jobSignal,
-            });
-            await addDetachedWorktree(cache, expectedSha, cwd, jobSignal);
-          } finally {
-            const refs = await worktreeGit(["git", "for-each-ref", "--format=%(refname)", prefix], {
-              cwd: cache,
-            });
-            for (const ref of refs.stdout.trim().split("\n").filter(Boolean))
-              await worktreeGit(["git", "update-ref", "-d", ref], { cwd: cache });
+            assertProcessesStopped();
+            await cleanup({ root, cache, scratch: [...scope.scratchDirs] });
+            delete retained[root];
+            save();
+          } catch (error) {
+            if (error instanceof ProcessTerminationError || scope.terminationError) {
+              retained[root] = { root, cache, scratch: [...scope.scratchDirs] };
+              save();
+              throw scope.terminationError ?? error;
+            }
+            (options.log ?? console.error)("Worker checkout cleanup failed");
           }
-        });
-        const sha = (
-          await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal: jobSignal })
-        ).stdout.trim();
-        if (sha !== expectedSha) throw new Error("Worker checkout SHA mismatch");
-        await invoke(cwd);
-      } catch (error) {
-        if (!onError) throw error;
-        await onError(error);
-      } finally {
-        const job = jobs.get(id) ?? agentJobs.get(id);
-        if (job) job.reported = false;
-        const diagnostic = () => (options.log ?? console.error)("Worker checkout cleanup failed");
+        };
         try {
-          if (existsSync(cwd))
+          let report: (() => Promise<unknown>) | undefined;
+          try {
+            const bundle = join(root, "job.bundle");
+            writeFileSync(bundle, (await call(`${path}/bundle`, undefined, jobSignal)).data);
             await withRepoLock(cache, async () => {
-              restoreDirectoryPermissions(cwd);
-              await worktreeGit(["git", "worktree", "remove", "--force", cwd], {
-                cwd: cache,
-                additionalWriteRoots: [cwd],
-              });
+              if (!existsSync(cache)) {
+                for (const dir of ["objects", "refs"]) mkdirSync(join(cache, dir), { recursive: true });
+                writeFileSync(join(cache, "HEAD"), "ref: refs/heads/main\n");
+                await worktreeGit(
+                  [
+                    "git",
+                    "init",
+                    "--bare",
+                    "--template=",
+                    `--object-format=${expectedSha.length === 64 ? "sha256" : "sha1"}`,
+                  ],
+                  { cwd: cache, signal: jobSignal },
+                );
+              }
+              const prefix = `refs/limitless-bundles/${id}/`;
+              try {
+                await worktreeGit(["git", "bundle", "verify", bundle], { cwd: cache, signal: jobSignal });
+                await worktreeGit(["git", "fetch", "--no-tags", bundle, `+${prefix}*:${prefix}*`], {
+                  cwd: cache,
+                  signal: jobSignal,
+                });
+                await addDetachedWorktree(cache, expectedSha, cwd, jobSignal);
+              } finally {
+                const scope = processScope.getStore();
+                if (scope) scope.signal = new AbortController().signal;
+                try {
+                  const refs = await worktreeGit(["git", "for-each-ref", "--format=%(refname)", prefix], {
+                    cwd: cache,
+                  });
+                  for (const ref of refs.stdout.trim().split("\n").filter(Boolean))
+                    await worktreeGit(["git", "update-ref", "-d", ref], { cwd: cache });
+                } finally {
+                  if (scope) scope.signal = jobSignal;
+                }
+              }
             });
-        } catch {
-          diagnostic();
+            const sha = (
+              await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal: jobSignal })
+            ).stdout.trim();
+            if (sha !== expectedSha) throw new Error("Worker checkout SHA mismatch");
+            report = await invoke(cwd);
+            assertProcessesStopped();
+          } catch (error) {
+            const scope = processScope.getStore();
+            if (scope && error instanceof ProcessTerminationError) scope.terminationError = error;
+            throw error;
+          } finally {
+            await finish();
+          }
+          await report?.();
+        } catch (error) {
+          if (!onError) throw error;
+          await onError(error);
         }
-        try {
-          removeScratch(root);
-        } catch {
-          diagnostic();
-        }
-      }
-    };
+      });
     const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
       const deadline = new AbortController();
       const timer = setTimeout(() => deadline.abort(), Math.min(budget, 2_147_483_647));
@@ -458,7 +547,9 @@ export async function runWorker(
             );
             await posts;
             jobSignal.throwIfAborted();
-            await call(`/worker/jobs/${id}/result`, redactGateData({ run, sha: req.headSha }), jobSignal);
+            assertProcessesStopped();
+            return () =>
+              call(`/worker/jobs/${id}/result`, redactGateData({ run, sha: req.headSha }), jobSignal);
           },
           failure,
         );
@@ -532,7 +623,8 @@ export async function runWorker(
           const report = AgentResultReport.parse(
             sanitize({ ...result, parentSha: req.parentSha, sha: req.parentSha, branch: req.branch }),
           );
-          await call(`${path}/result`, report, jobSignal);
+          assertProcessesStopped();
+          return () => call(`${path}/result`, report, jobSignal);
         });
       } catch (error) {
         if (!jobSignal.aborted)
@@ -655,6 +747,7 @@ export async function runWorker(
       await Promise.allSettled([...(beats ? [beats] : []), ...allJobs().map(([, j]) => j.task)]);
     }
   } finally {
+    store.close();
     for (const release of held) release();
   }
 }
