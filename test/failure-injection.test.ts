@@ -1275,15 +1275,19 @@ test("startup finalizes abandoned running rows before retrying the stage", async
 
 // `cancel` records its reason on an active run and leaves the cancelled status to the engine; a
 // crash between the two leaves exactly this state behind.
-for (const status of ["running", "waiting_input"] as const)
-  test(`a cancel recorded before a crash stays cancelled on restart (${status})`, async () => {
+for (const [status, phase] of [
+  ["running", "triage"],
+  ["waiting_input", "clarify"],
+  ["running", "deliver"],
+] as const)
+  test(`a cancel recorded before a crash stays cancelled on restart (${phase})`, async () => {
     const waiting = status === "waiting_input";
     const f = factory();
     const r = await f.createRun({ repo: source, prompt: "Change" });
     // Past prepare, so a run that resumed instead would really rerun its stage (test/AGENTS.md).
-    f.store.setRunState(r.id, {
+    const state = {
       flow: "build",
-      phase: waiting ? "clarify" : "triage",
+      phase,
       worktreePath: source,
       previewConfig: null,
       slottedCommands: [],
@@ -1293,9 +1297,17 @@ for (const status of ["running", "waiting_input"] as const)
       triedImplementers: [],
       feedback: null,
       toolCommands: [],
-    } satisfies RunState);
+      ...(phase === "deliver"
+        ? {
+            githubWait: { since: Date.now() - 1000, nextAttemptAt: Date.now() + 60_000, reason: "outage" },
+            publishingSha: "verified-head",
+            publishedSha: "published-head",
+          }
+        : {}),
+    } satisfies RunState;
+    f.store.setRunState(r.id, state);
     if (waiting) f.store.askQuestion(r.id, "Which file?");
-    const stage = f.store.startStage(r.id, waiting ? "clarify" : "triage");
+    const stage = f.store.startStage(r.id, phase);
     const inv = waiting
       ? null
       : f.store.createInvocation({
@@ -1317,6 +1329,8 @@ for (const status of ["running", "waiting_input"] as const)
     expect(after?.status).toBe("cancelled");
     expect(after?.error).toBe("cancelled by tester");
     expect(after?.finishedAt).toBeNumber();
+    expect(after?.githubWait).toBeUndefined();
+    expect(next.store.getRunState<RunState>(r.id)).toEqual({ ...state, githubWait: undefined });
     expect(next.scheduler.activeRunIds).toEqual([]);
     expect(next.store.getStage(stage.id)?.status).toBe("cancelled");
     if (inv) expect(next.store.getInvocation(inv.id)?.status).toBe("cancelled");
@@ -2781,6 +2795,95 @@ async function deliveryFaultFixture() {
     throw error;
   }
 }
+
+test("GitHub outage: cancellation during parking stays terminal across restart", async () => {
+  githubWait.intervalMs = 60_000;
+  githubWait.maxMs = 600_000;
+  const { f, r, pr, restore } = await deliveryFaultFixture();
+  let cancelled = false;
+  let activeAtCancel = false;
+  let nextAttemptAt = 0;
+  const unsubscribe = f.store.subscribe((msg) => {
+    if (cancelled || msg.kind !== "run" || msg.run.id !== r.id) return;
+    if (msg.run.status !== "queued" || !msg.run.githubWait) return;
+    cancelled = true;
+    nextAttemptAt = msg.run.githubWait.nextAttemptAt;
+    activeAtCancel = f.scheduler.activeRunIds.includes(r.id);
+    f.scheduler.cancel(r.id, "parking subscriber");
+  });
+  try {
+    writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr create", err: bad502 })));
+    f.scheduler.start();
+    await waits.until(() => cancelled && !f.scheduler.activeRunIds.includes(r.id), {
+      timeoutMs: 25_000,
+      subscribe: (wake) => f.store.subscribe(wake),
+    });
+    expect(cancelled).toBe(true);
+    expect(activeAtCancel).toBe(true);
+    expect(f.store.getRun(r.id)).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by parking subscriber",
+      finishedAt: expect.any(Number),
+      githubWait: undefined,
+    });
+    expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+    expect(ghCalls(pr, "pr create")).toHaveLength(3);
+    const calls = ghCalls(pr, "");
+    const stages = f.store.listStages(r.id);
+    const invocations = f.store.listInvocations(r.id);
+    const clock = spyOn(Date, "now").mockReturnValue(nextAttemptAt + 1);
+    try {
+      f.scheduler.tick();
+      const next = await reopen(f);
+      next.scheduler.tick();
+      expect(next.scheduler.activeRunIds).toEqual([]);
+      expect(next.store.getRun(r.id)).toMatchObject({
+        status: "cancelled",
+        error: "cancelled by parking subscriber",
+        githubWait: undefined,
+      });
+      expect(next.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+      expect(next.store.listStages(r.id)).toEqual(stages);
+      expect(next.store.listInvocations(r.id)).toEqual(invocations);
+      expect(ghCalls(pr, "")).toEqual(calls);
+    } finally {
+      clock.mockRestore();
+    }
+  } finally {
+    unsubscribe();
+    await restore();
+  }
+});
+
+test("GitHub outage: a due queued cancellation is finalized before execution", async () => {
+  const { f, r, before, pr, restore } = await deliveryFaultFixture();
+  const state: RunState = {
+    ...before,
+    githubWait: { since: Date.now() - 1000, nextAttemptAt: Date.now() - 1, reason: "outage" },
+  };
+  try {
+    f.store.updateRun(r.id, { status: "queued", error: "cancelled by tester" }, state);
+    writeFileSync(`${pr}.calls`, "");
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    const stages = f.store.listStages(r.id);
+    const invocations = f.store.listInvocations(r.id);
+    const calls = ghCalls(pr, "");
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(f.store.getRun(r.id)).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by tester",
+      finishedAt: expect.any(Number),
+      githubWait: undefined,
+    });
+    expect(f.store.getRunState<RunState>(r.id)).toEqual({ ...state, githubWait: undefined });
+    expect(f.store.listStages(r.id)).toEqual(stages);
+    expect(f.store.listInvocations(r.id)).toEqual(invocations);
+    expect(ghCalls(pr, "")).toEqual(calls);
+  } finally {
+    await restore();
+  }
+});
 
 test.each([
   "parks, then delivers",

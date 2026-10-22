@@ -85,6 +85,7 @@ import {
   recoverScopedProcesses,
   redactCredentials,
 } from "../util/proc.ts";
+import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -175,6 +176,7 @@ export async function executeRun(
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
+  if (finalizeRecordedCancellation(deps.store, runId)) return "cancelled";
   const repo = deps.store.getRepo(run.repoId);
   if (!repo) {
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
@@ -322,9 +324,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         !deps.store.getRun(runId)?.error?.startsWith("cancelled by");
       const status = shutdown ? "queued" : "cancelled";
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
-      const state = shutdown ? undefined : deps.store.getRunState<RunState>(runId);
-      if (state) state.githubWait = undefined;
-      if (!shutdown) ctx.state.githubWait = undefined;
+      const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
+      if (!shutdown) clearGitHubWait(ctx.state);
       deps.store.updateRun(
         runId,
         {
