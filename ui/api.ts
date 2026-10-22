@@ -131,8 +131,9 @@ export function getProviders(): Promise<ProviderStatus[]> {
   return request<ProviderStatus[]>("/api/providers");
 }
 
-export function getProviderWorkload(): Promise<ProviderWorkload[]> {
-  return request<ProviderWorkload[]>("/api/stats/providers");
+export function getProviderWorkload(since?: number): Promise<ProviderWorkload[]> {
+  const query = since === undefined ? "" : `?since=${encodeURIComponent(new Date(since).toISOString())}`;
+  return request<ProviderWorkload[]>(`/api/stats/providers${query}`);
 }
 
 export function setProviderFast(id: string, on: boolean): Promise<ProviderStatus> {

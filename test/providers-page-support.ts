@@ -74,12 +74,24 @@ export function publishLiveUpdate(message: StreamMessage | { kind: "reconnected"
 let workload: ProviderWorkload[] = [];
 let failure = false;
 export let workloadReads = 0;
+export const workloadSince: (number | undefined)[] = [];
+let heldWorkload: Promise<ProviderWorkload[]> | undefined;
+export function holdWorkload(read: Promise<ProviderWorkload[]>) {
+  heldWorkload = read;
+}
+export const listenerCount = () => listeners.size;
 export function setWorkload(rows: ProviderWorkload[], fail = false) {
   workload = rows;
   failure = fail;
 }
-export async function getProviderWorkload() {
+export async function getProviderWorkload(since?: number) {
   workloadReads++;
+  workloadSince.push(since);
+  if (heldWorkload) {
+    const read = heldWorkload;
+    heldWorkload = undefined;
+    return read;
+  }
   if (failure) throw new Error("Workload unavailable");
   return workload;
 }

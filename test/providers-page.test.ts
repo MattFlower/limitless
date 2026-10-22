@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -6,9 +6,10 @@ import { join } from "node:path";
 import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
 import type { ProviderStatus, QuotaAlert, StreamMessage } from "../src/core/types.ts";
-import type { ProviderWorkload } from "../src/db/stats.ts";
+import type { HistoricalWorkload, ProviderWorkload } from "../src/db/stats.ts";
 import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
+import { deferred } from "./evals-support.ts";
 import type { TestNode } from "./providers-page-support.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
@@ -43,6 +44,7 @@ const flush = async () => {
 test("Providers keeps controls, sorted live cards and polling; Dashboard retains only quota alerts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "limitless-providers-"));
   let dispose = () => {};
+  setSystemTime(new Date(2026, 9, 22, 12));
   try {
     const entry = join(dir, "entry.ts");
     await Bun.write(
@@ -113,6 +115,12 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     expect(fixture.liveStarts).toBe(1);
     expect(text(root)).toContain("No provider telemetry yet.");
     expect(fixture.workloadReads).toBe(1);
+    expect(text(root)).toContain("codex: historical statistics unavailable");
+    expect(text(root)).toContain("No workload in this window.");
+    const local = new Date();
+    expect(fixture.workloadSince[0]).toBe(
+      new Date(local.getFullYear(), local.getMonth(), local.getDate()).getTime(),
+    );
     fixture.setProviders({
       codex: provider,
       claude: { ...provider, id: "claude", label: "Claude", enabled: false, supportsFast: false },
@@ -127,7 +135,9 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     expect(text(codex)).toContain("Tokens out300300");
     expect(text(codex)).toContain("Fast mode");
     expect(nodes(root).filter((n) => n.props.role === "switch")).toHaveLength(1);
-    const buttons = nodes(root).filter((n) => n.tag === "button");
+    const buttons = cards(root)
+      .flatMap(nodes)
+      .filter((n) => n.tag === "button");
     expect(buttons.map(text)).toEqual(["Enable", "Disable"]);
     const toggle = nodes(codex).find((n) => n.tag === "button");
     const fast = nodes(codex).find((n) => n.props.role === "switch");
@@ -365,8 +375,138 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
         .filter((n) => n.tag === "button")
         .map(text),
     ).toEqual(["Sign out", "Sign out everywhere"]);
+    dispose();
+
+    const history = (count: number, cost: number | null, role: string): HistoricalWorkload => {
+      const metrics = {
+        invocations: count,
+        tokensIn: count * 100,
+        tokensOut: count * 10,
+        wallTimeMs: count * 1000,
+        costEquivUsd: cost,
+        inputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        costUsd: null,
+        successfulShare: 1,
+        p50WallTimeMs: null,
+        countingUnits: { invocation: count, round: 0, trial: 0 },
+      };
+      return {
+        totals: metrics,
+        models: [],
+        days: [],
+        roles: [{ ...metrics, role, provider: null, modelId: null }],
+      };
+    };
+    const historical: ProviderWorkload[] = [
+      { ...workload, production: history(3, null, "spec"), eval: history(8, 4, "review_shadow") },
+      {
+        ...workload,
+        provider: "other",
+        production: history(1, 1, "review_shadow"),
+        eval: history(0, 0, "unused"),
+      },
+    ];
+    const initial = deferred<ProviderWorkload[]>();
+    fixture.holdWorkload(initial.promise);
+    const workloadRoot = fixture.node();
+    dispose = fixture.render(() => fixture.Providers(), workloadRoot);
+    expect(text(workloadRoot)).toContain("loading…");
+    initial.resolve(historical);
+    await flush();
+    await flush();
+    const readCount = fixture.workloadReads;
+    const workloadTables = () =>
+      nodes(workloadRoot).filter((n) => n.tag === "table" && n.props.class === "table");
+    const bodyRows = (table: TestNode | undefined) => {
+      if (!table) throw new Error("missing workload table");
+      const body = nodes(table).find((n) => n.tag === "tbody");
+      if (!body) throw new Error("missing workload table body");
+      return body.children
+        .filter((n) => n.tag === "tr")
+        .map((r) => r.children.map(text).map((v) => v.trim()));
+    };
+    expect(workloadRoot.children[0]?.children.findIndex((n) => n.tag === "section")).toBeGreaterThan(
+      workloadRoot.children[0]?.children.findIndex((n) => n.props.class === "provider-grid") ?? -1,
+    );
+    expect(bodyRows(workloadTables()[0])).toEqual([
+      ["codex", "3 (75%)", "300 (75%)", "30 (75%)", "3s (75%)", "unknown (—)"],
+      ["other", "1 (25%)", "100 (25%)", "10 (25%)", "1s (25%)", "$1.00 (—)"],
+      ["Total", "4 (100%)", "400 (100%)", "40 (100%)", "4s (100%)", "unknown (—)"],
+    ]);
+    expect(bodyRows(workloadTables()[1]).map((r) => r.slice(0, 2))).toEqual([
+      ["spec", "3 (75%)"],
+      ["review_shadow", "1 (25%)"],
+      ["Total", "4 (100%)"],
+    ]);
+    const click = (label: string) => {
+      const button = nodes(workloadRoot).find((n) => n.tag === "button" && text(n) === label);
+      if (!button) throw new Error(`missing ${label} chip`);
+      (button.props.onClick as () => void)();
+    };
+    const week = deferred<ProviderWorkload[]>();
+    fixture.holdWorkload(week.promise);
+    click("7 days");
+    expect(fixture.workloadReads).toBe(readCount + 1);
+    expect(fixture.workloadSince.at(-1)).toBe(
+      new Date(local.getFullYear(), local.getMonth(), local.getDate() - 6).getTime(),
+    );
+    expect(text(workloadRoot)).toContain("loading…");
+    expect(workloadTables()).toHaveLength(0);
+    expect(cards(workloadRoot).map(text).join("")).toContain("Invocations1717");
+    week.resolve([
+      {
+        ...historical[0],
+        provider: "codex",
+        today: totals,
+        sevenDays: totals,
+        production: history(6, 6, "week_role"),
+        eval: history(8, 4, "review_shadow"),
+      },
+    ]);
+    await flush();
+    await flush();
+    expect(text(workloadRoot)).toContain("week_role");
+    click("Eval");
+    expect(fixture.workloadReads).toBe(readCount + 1);
+    expect(text(workloadRoot)).not.toContain("week_role");
+    expect(text(workloadRoot)).toContain("Executions");
+    expect(bodyRows(workloadTables()[1])[0]?.slice(0, 2)).toEqual(["review_shadow", "8 (100%)"]);
+    fixture.setWorkload([], true);
+    fixture.advanceTimers(30_000);
+    await flush();
+    await flush();
+    expect(text(workloadRoot)).toContain("Workload unavailable");
+    expect(text(workloadRoot)).toContain("review_shadow");
+    expect(cards(workloadRoot).map(text).join("")).toContain("Invocations1717");
+    fixture.setWorkload([workload]);
+    fixture.publishLiveUpdate({ kind: "reconnected" });
+    await flush();
+    await flush();
+    expect(text(workloadRoot)).not.toContain("Workload unavailable");
+    expect(text(workloadRoot)).toContain("codex: historical statistics unavailable");
+    expect(text(workloadRoot)).toContain("No workload in this window.");
+    expect(cards(workloadRoot).map(text).join("")).toContain("Invocations1717");
+    const empty = deferred<ProviderWorkload[]>();
+    fixture.holdWorkload(empty.promise);
+    click("Today");
+    expect(text(workloadRoot)).toContain("loading…");
+    empty.resolve([]);
+    await flush();
+    await flush();
+    expect(text(workloadRoot)).toContain("No workload in this window.");
+    expect(fixture.workloadSince.every((since) => since !== undefined)).toBe(true);
+    dispose();
+    expect(fixture.timerCount()).toBe(0);
+    expect(fixture.listenerCount()).toBe(0);
+    const afterDispose = fixture.workloadReads;
+    fixture.publishLiveUpdate({ kind: "reconnected" });
+    fixture.advanceTimers(30_000);
+    expect(fixture.workloadReads).toBe(afterDispose);
   } finally {
     dispose();
     rmSync(dir, { recursive: true, force: true });
+    setSystemTime();
   }
 });
