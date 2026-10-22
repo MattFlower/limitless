@@ -18,6 +18,7 @@ import { localOwnerDiagnostics, printOwnerDiagnostics } from "./owner-diagnostic
 const USAGE = `limitless — personal software factory
 
 Usage:
+  limitless version [--json]              Print release identity (--version also supported)
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
@@ -218,6 +219,7 @@ async function follow(runId: string, after = 0, diagnosticsAfter?: number): Prom
 
 async function serve(): Promise<void> {
   const { resolveBootSha } = await import("./boot-sha.ts");
+  const { resolveReleaseBootSha } = await import("../release.ts");
   const { loadConfig } = await import("../config.ts");
   const { Factory } = await import("../app.ts");
   const { startDaemon } = await import("./daemon.ts");
@@ -227,7 +229,7 @@ async function serve(): Promise<void> {
   sweepClassificationScratch();
   const orphans = sweepOrphanedSnapshots();
   if (orphans.length) console.log(`Removed ${orphans.length} holdout snapshot(s) left by a stopped daemon`);
-  const bootSha = await resolveBootSha(join(import.meta.dir, "../.."));
+  const bootSha = await resolveReleaseBootSha(resolveBootSha);
   const factory = new Factory(cfg, {
     bootSha,
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
@@ -280,6 +282,7 @@ async function serve(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const { release, resolveReleaseBootSha } = await import("../release.ts");
   if (Bun.argv[2] === "gate-slot") {
     process.exitCode = await (await import("./gate-slot.ts")).gateSlotCommand(Bun.argv.slice(3));
     return;
@@ -315,6 +318,7 @@ async function main(): Promise<void> {
       "no-baseline-cache": { type: "boolean" },
       allow: { type: "string", multiple: true },
       json: { type: "boolean" },
+      version: { type: "boolean" },
       after: { type: "string" },
       consumer: { type: "string" },
       wait: { type: "string" },
@@ -347,6 +351,17 @@ async function main(): Promise<void> {
   });
   const [cmd, ...rest] = positionals;
   const repo = values.repo?.at(-1);
+  if (cmd === "version" || values.version) {
+    const { resolveBootSha } = await import("./boot-sha.ts");
+    const sha = (await resolveReleaseBootSha(resolveBootSha)) ?? null;
+    const { version, kind, bun } = release;
+    console.log(
+      values.json
+        ? JSON.stringify({ version, sha, kind, bun })
+        : `limitless ${version} (${sha ?? "unknown"}, ${kind}, bun ${bun})`,
+    );
+    return;
+  }
   if (!cmd || values.help) {
     console.log(USAGE);
     return;
@@ -392,7 +407,7 @@ async function main(): Promise<void> {
         );
       if (rest.length) throw new Error("Usage: limitless worker [pair] --coordinator <url>");
       const { resolveBootSha } = await import("./boot-sha.ts");
-      const sha = await resolveBootSha(join(import.meta.dir, "../.."));
+      const sha = await resolveReleaseBootSha(resolveBootSha);
       if (!sha) throw new Error("Cannot determine worker release SHA");
       const { gateSlots } = await import("../gates/slots.ts");
       gateSlots.setLimit(cfg.maxConcurrentGates);
