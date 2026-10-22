@@ -20,6 +20,8 @@ export const processScope = new AsyncLocalStorage<{
   runId?: string;
   checkout?: () => string | undefined;
   cleanups?: ProcessCleanupStore;
+  ownershipMarker?: string;
+  beforeSpawn?: () => void;
 }>();
 
 export interface ProcessCleanup {
@@ -116,8 +118,13 @@ export async function recoverProcessCleanups(
   records?: ProcessCleanup[],
   stopped = processRecoveryInspection.getStore()?.stopped ?? recoveryProcessStopped,
   timeoutMs = processRecoveryInspection.getStore()?.timeoutMs ?? 10_000,
+  ownership?: ProcessDiscovery,
 ): Promise<void> {
-  let discoveries = store.listProcessDiscoveries?.() ?? [];
+  const listDiscoveries = () => [
+    ...(store.listProcessDiscoveries?.() ?? []),
+    ...(ownership ? [ownership] : []),
+  ];
+  let discoveries = listDiscoveries();
   const invocations = new Set((records ?? store.listProcessCleanups()).map((row) => row.invocation));
   if (records === undefined) for (const row of discoveries) invocations.add(row.invocation);
   if (!invocations.size) return;
@@ -131,23 +138,31 @@ export async function recoverProcessCleanups(
   const release = await Promise.all([...invocations].map(ownInvocationCleanup));
   try {
     const records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
-    discoveries = (store.listProcessDiscoveries?.() ?? []).filter((row) => invocations.has(row.invocation));
+    discoveries = listDiscoveries().filter((row) => invocations.has(row.invocation));
     if (!records.length && !discoveries.length) return;
-    const boot = bootIdentity();
+    let boot: string | undefined;
+    try {
+      boot = bootIdentity();
+    } catch (error) {
+      if (!ownership) throw error;
+    }
+    // A persisted job marker can be scanned even when its boot identity was unavailable.
+    const sameBoot = (row: ProcessCleanup | ProcessDiscovery) =>
+      ownership ? !boot || !row.boot || row.boot === boot : row.boot === boot;
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
     const deadline = performance.now() + timeoutMs;
-    for (const row of records) if (row.boot !== boot) store.deleteProcessCleanup(row.invocation, row.pid);
-    for (const row of discoveries) if (row.boot !== boot) store.deleteInvocationCleanups(row.invocation);
-    if (![...records, ...discoveries].some((row) => row.boot === boot)) return;
+    for (const row of records) if (!sameBoot(row)) store.deleteProcessCleanup(row.invocation, row.pid);
+    for (const row of discoveries) if (!sameBoot(row)) store.deleteInvocationCleanups(row.invocation);
+    if (![...records, ...discoveries].some(sameBoot)) return;
     const protectedPids = callerAncestors();
     const results = await Promise.allSettled(
       [...invocations].map(async (invocation) => {
-        const members = records.filter((row) => row.invocation === invocation && row.boot === boot);
+        const members = records.filter((row) => row.invocation === invocation && sameBoot(row));
         const anchor =
-          discoveries.find((row) => row.invocation === invocation && row.boot === boot) ??
+          discoveries.find((row) => row.invocation === invocation && sameBoot(row)) ??
           members.find((row) => row.discovery);
         if (!members.length && !anchor) return;
-        const context = anchor?.discovery;
+        const context = ownership && !boot ? ownership.discovery : anchor?.discovery;
         if (anchor && !context) throw new Error(`Missing process discovery context for ${invocation}`);
         if (!context)
           console.warn(
@@ -187,7 +202,7 @@ export async function recoverProcessCleanups(
               continue;
             }
             if (!anchor) throw new Error(`Missing process discovery context for ${invocation}`);
-            const row = { ...anchor, pid, birth, createdAt: Date.now() };
+            const row = { ...anchor, pid, birth, boot: boot ?? "", createdAt: Date.now() };
             store.recordProcessCleanup(row);
             claimed.set(pid, row);
             discovered = true;
@@ -195,6 +210,8 @@ export async function recoverProcessCleanups(
           for (const row of claimed.values()) {
             if (protectedPids.has(row.pid)) throw new Error(`Protected cleanup process ${row.pid}`);
             if (stopped(row.pid)) continue;
+            if (ownership && !boot && !pids.includes(row.pid))
+              throw new Error(`Process boot identity could not be confirmed for ${row.pid}`);
             if (killed.has(row)) {
               pending.push(row.pid);
               continue;
@@ -798,11 +815,15 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
         : [];
     const spawnedAt = darwin?.darwinClock() ?? 0n;
+    scope?.beforeSpawn?.();
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
       env: {
         ...opts.env,
+        ...(scope?.ownershipMarker
+          ? { [`LIMITLESS_INVOCATION_${scope.ownershipMarker.replaceAll("-", "_")}`]: "1" }
+          : {}),
         LIMITLESS_INVOCATION: marker,
         [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
       },

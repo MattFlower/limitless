@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { cpus, hostname, release, totalmem } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -23,6 +24,8 @@ import { protectPrivateFile } from "../util/private-reads.ts";
 import {
   agentEnv,
   assertProcessesStopped,
+  bootIdentity,
+  type ProcessCleanup,
   type ProcessCleanupStore,
   type ProcessDiscovery,
   ProcessTerminationError,
@@ -230,9 +233,12 @@ export async function runWorker(
     scratch: string[];
     discoveries?: ProcessDiscovery[];
     confirmed?: boolean;
+    ownership?: { marker: string; runId: string; started: number; boot?: string };
   };
   const retained = store.getSetting<Record<string, RetainedJob>>("worker.cleanups", {});
   const save = () => store.setSetting("worker.cleanups", retained);
+  const unresolved = (error: unknown) =>
+    (options.log ?? console.error)(redactCredentials(`Worker cleanup unresolved: ${String(error)}`));
   const cleanups: ProcessCleanupStore = {
     recordProcessCleanup: store.recordProcessCleanup.bind(store),
     listProcessCleanups: store.listProcessCleanups.bind(store),
@@ -244,11 +250,64 @@ export async function runWorker(
         for (const job of Object.values(retained)) {
           if (!job.discoveries?.some((row) => row.invocation === invocation)) continue;
           job.discoveries = job.discoveries.filter((row) => row.invocation !== invocation);
-          job.confirmed = job.discoveries.length === 0;
         }
         save();
       })();
     },
+  };
+  const active = new Set<string>();
+  const belongsTo = (row: ProcessCleanup, job: RetainedJob) =>
+    row.directory === join(job.root, "checkout") ||
+    row.invocation === job.ownership?.marker ||
+    job.discoveries?.some((discovery) => discovery.invocation === row.invocation);
+  const inspectBoot = () => {
+    try {
+      return bootIdentity();
+    } catch {
+      return undefined;
+    }
+  };
+  const confirm = async (job: RetainedJob) => {
+    const records = store.listProcessCleanups().filter((row) => belongsTo(row, job));
+    const local: ProcessCleanupStore = {
+      ...cleanups,
+      listProcessCleanups: () => records,
+      listProcessDiscoveries: () => job.discoveries ?? [],
+    };
+    const owner = job.ownership;
+    if (owner) {
+      const boot = inspectBoot();
+      if (boot && owner.boot && boot !== owner.boot) {
+        for (const row of [...records, ...(job.discoveries ?? [])])
+          cleanups.deleteInvocationCleanups(row.invocation);
+      } else {
+        await recoverProcessCleanups(local, undefined, undefined, undefined, {
+          runId: owner.runId,
+          invocation: owner.marker,
+          directory: join(job.root, "checkout"),
+          boot: owner.boot ?? "",
+          createdAt: owner.started,
+          discovery: {
+            group: 0,
+            started: owner.started,
+            directories: [job.root, ...job.scratch].map((directory) => {
+              try {
+                return realpathSync(directory);
+              } catch {
+                return directory;
+              }
+            }),
+            leader: null,
+            spawnedAt: "0",
+          },
+        });
+      }
+    } else {
+      // Legacy identities and invocation context remain useful, but an empty list proves nothing.
+      if (!job.discoveries?.length && !records.some((row) => row.discovery))
+        throw new Error("missing worker discovery evidence");
+      await recoverProcessCleanups(local);
+    }
   };
   const cleanup = async ({ root, cache, scratch }: RetainedJob) => {
     if (dirname(root) !== cfg.paths.work || !basename(root).startsWith("worker-"))
@@ -272,7 +331,6 @@ export async function runWorker(
   const scoped = (
     id: string,
     root: string,
-    cache: string,
     jobSignal: AbortSignal,
     run: () => Promise<void>,
     scratch: string[] = [],
@@ -288,67 +346,67 @@ export async function runWorker(
         cleanups: {
           ...cleanups,
           recordProcessDiscovery(row) {
-            retained[root] = {
-              root,
-              cache,
-              scratch: [...(processScope.getStore()?.scratchDirs ?? [])],
-              discoveries: [...(retained[root]?.discoveries ?? []), row],
-              confirmed: false,
-            };
+            const job = retained[root];
+            if (!job) throw new Error("Missing worker ownership evidence");
+            job.discoveries = [...(job.discoveries ?? []), row];
             save();
           },
-          recordProcessCleanup(row) {
-            store.db.transaction(() => {
-              retained[root] = {
-                ...retained[root],
-                root,
-                cache,
-                scratch: [...(processScope.getStore()?.scratchDirs ?? [])],
-              };
-              save();
-              store.recordProcessCleanup(row);
-            })();
-          },
         } satisfies ProcessCleanupStore,
+        ownershipMarker: retained[root]?.ownership?.marker,
+        beforeSpawn() {
+          const job = retained[root];
+          if (!job) throw new Error("Missing worker ownership evidence");
+          job.scratch = [...(processScope.getStore()?.scratchDirs ?? [])];
+          job.confirmed = false;
+          save();
+        },
       },
       run,
     );
+  let recovery: Promise<void> | undefined;
+  const recover = () => {
+    if (recovery) return recovery;
+    recovery = (async () => {
+      for (const [id, job] of Object.entries(retained)) {
+        if (active.has(id)) continue;
+        try {
+          await confirm(job);
+          if (active.has(id) || retained[id] !== job) continue;
+          await scoped(
+            id,
+            job.root,
+            new AbortController().signal,
+            async () => {
+              try {
+                await cleanup(job);
+              } catch (error) {
+                const termination = processScope.getStore()?.terminationError;
+                if (error instanceof ProcessTerminationError || termination) throw termination ?? error;
+                (options.log ?? console.error)("Worker checkout cleanup failed");
+              }
+            },
+            job.scratch,
+          );
+          delete retained[id];
+          save();
+        } catch (error) {
+          unresolved(error);
+        }
+      }
+    })().finally(() => {
+      recovery = undefined;
+    });
+    return recovery;
+  };
   try {
-    for (const job of Object.values(retained)) {
-      if (job.confirmed || job.discoveries?.length) continue;
-      // Older workers retained only identities. Rediscover from their context when available.
-      job.discoveries = store
-        .listProcessCleanups(undefined, join(job.root, "checkout"))
-        .flatMap((row) => (row.discovery ? [{ ...row, discovery: row.discovery }] : []));
-      if (!job.discoveries.length)
-        throw new ProcessTerminationError(
-          `${ProcessTerminationError.prefix}: missing worker discovery evidence`,
-        );
-    }
-    save();
-    await recoverProcessCleanups(cleanups);
-    for (const [id, job] of Object.entries(retained)) {
-      if (!job.confirmed)
-        throw new ProcessTerminationError(`${ProcessTerminationError.prefix}: unresolved worker cleanup`);
-      await scoped(
-        id,
-        job.root,
-        job.cache,
-        new AbortController().signal,
-        async () => {
-          try {
-            await cleanup(job);
-          } catch (error) {
-            const termination = processScope.getStore()?.terminationError;
-            if (error instanceof ProcessTerminationError || termination) throw termination ?? error;
-            (options.log ?? console.error)("Worker checkout cleanup failed");
-          }
-        },
-        job.scratch,
-      );
-      delete retained[id];
-      save();
-    }
+    // Also recover identities from older workers that have no retained-directory entry.
+    await recoverProcessCleanups(
+      store,
+      store
+        .listProcessCleanups()
+        .filter((row) => !Object.values(retained).some((job) => belongsTo(row, job))),
+    ).catch(unresolved);
+    await recover();
     const token = privateFile(join(home, "token"));
     held.push(token.release);
     const pin = privateFile(join(home, "coordinator-fingerprint"));
@@ -426,6 +484,7 @@ export async function runWorker(
       }
     };
     const heartbeat = async () => {
+      await recover();
       const slots = gateSlots.snapshot(),
         state = await (options.machineState ?? machineState)();
       const body: Capabilities = {
@@ -474,8 +533,18 @@ export async function runWorker(
       jobSignal: AbortSignal,
       invoke: (cwd: string) => Promise<() => Promise<unknown>>,
       onError?: (error: unknown) => Promise<void>,
-    ): Promise<void> =>
-      scoped(id, root, cache, jobSignal, async () => {
+    ): Promise<void> => {
+      active.add(root);
+      retained[root] = {
+        root,
+        cache,
+        scratch: [],
+        discoveries: [],
+        confirmed: false,
+        ownership: { marker: randomUUID(), runId: id, started: Date.now(), boot: inspectBoot() },
+      };
+      return scoped(id, root, jobSignal, async () => {
+        save();
         const cwd = join(root, "checkout");
         const finish = async () => {
           const scope = processScope.getStore();
@@ -484,6 +553,9 @@ export async function runWorker(
           scope.signal = new AbortController().signal;
           try {
             assertProcessesStopped();
+            const job = retained[root];
+            if (!job) throw new Error("Missing worker ownership evidence");
+            await confirm(job);
             await cleanup({ root, cache, scratch: [...scope.scratchDirs] });
           } catch (error) {
             if (error instanceof ProcessTerminationError || scope.terminationError) {
@@ -562,7 +634,8 @@ export async function runWorker(
           if (!onError) throw error;
           await onError(error);
         }
-      });
+      }).finally(() => active.delete(root));
+    };
     const run = async (id: string, req: GateRequest, cancelled: AbortSignal, budget: number) => {
       const deadline = new AbortController();
       const timer = setTimeout(() => deadline.abort(), Math.min(budget, 2_147_483_647));

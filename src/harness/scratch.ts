@@ -309,6 +309,7 @@ export async function withScratch<T>(cwd: string, run: (scratchDir: string) => P
   const scope = processScope.getStore();
   scope?.scratchDirs.add(scratchDir);
   try {
+    scope?.beforeSpawn?.();
     return await invocationScratch.run(scratchDir, () => run(scratchDir));
   } catch (error) {
     if (scope && error instanceof ProcessTerminationError) scope.terminationError = error;
