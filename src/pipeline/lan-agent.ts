@@ -1,8 +1,11 @@
 import type { Config } from "../config.ts";
 import type { AgentJobRequest, WorkerStore } from "../db/workers.ts";
+import type { AgentResult } from "../harness/types.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { AgentEvents, AgentResultReport } from "../workers/agent-protocol.ts";
 import type { AgentExecutor, AgentPublication } from "./agent-executor.ts";
 import { NeedsHumanError } from "./context.ts";
+import { SimulatedTermination } from "./faults.ts";
 
 function storedJson(text: string | null): unknown {
   try {
@@ -29,8 +32,34 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
         !["claude", "codex"].includes(spec.target.harness)
       )
         return local();
-      const prepared = await publication.prepare();
-      if (!prepared) return local();
+      const cancelled = (id?: string): AgentResult => {
+        if (id) workers.cancelAgentJob(id);
+        return {
+          status: "cancelled",
+          finalText: "",
+          structured: null,
+          sessionId: null,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          numTurns: 0,
+          costUsd: 0,
+          costEquivUsd: 0,
+          error: "cancelled",
+          quota: null,
+        };
+      };
+      const fallback = (id?: string) => (spec.signal.aborted ? cancelled(id) : local());
+      let prepared: AgentPublication | null;
+      try {
+        prepared = await publication.prepare();
+      } catch (error) {
+        if (error instanceof NeedsHumanError || error instanceof SimulatedTermination || spec.signal.aborted)
+          throw error;
+        throw new NeedsHumanError(
+          `Cannot prepare worker job: ${redactCredentials(error instanceof Error ? error.message : String(error))}`,
+        );
+      }
+      if (spec.signal.aborted) return cancelled();
+      if (!prepared) return fallback();
       const {
         prompt,
         systemAppend,
@@ -64,26 +93,12 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
       };
       call.dispatch();
       const id = workers.enqueueAgentJob(request);
-      if (!id) return local();
+      if (!id) return fallback();
       const log = (text: string) => spec.onEvent({ type: "status", text: workers.sanitize(text) });
       let cursor = { attempt: -1, seq: -1 },
         attempt = 0;
       for (;;) {
-        if (spec.signal.aborted) {
-          workers.cancelAgentJob(id);
-          return {
-            status: "cancelled",
-            finalText: "",
-            structured: null,
-            sessionId: null,
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            numTurns: 0,
-            costUsd: 0,
-            costEquivUsd: 0,
-            error: "cancelled",
-            quota: null,
-          };
-        }
+        if (spec.signal.aborted) return cancelled(id);
         workers.sweepAgentJobs();
         for (const row of workers.agentJobEventsAfter(id, cursor)) {
           const batch = AgentEvents.safeParse({ seq: row.seq, events: storedJson(row.events) });
@@ -112,9 +127,10 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
               ...result
             } = report.data;
             await publication.adopt(sha, request);
+            if (spec.signal.aborted) return cancelled(id);
             if (result.confinement?.ok !== false && result.status !== "cancelled") return result;
             log(`Worker job ${id} attempt ${attempt} could not run the session; running locally`);
-            return local();
+            return fallback(id);
           }
           reason = "Invalid worker result";
         } else if (job && !["failed", "cancelled"].includes(job.state)) {
@@ -122,12 +138,13 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
           continue;
         }
         const remote = await publication.remoteSha();
+        if (spec.signal.aborted) return cancelled(id);
         if (remote !== undefined && remote !== prepared.expectedRemoteSha)
           throw new NeedsHumanError(
             `Run branch ${prepared.branch} moved to ${remote} during a failed worker attempt (expected ${prepared.expectedRemoteSha ?? "no branch"}); a worker may have published round ${call.round ?? 0} without reporting it. Adopting unreported worker commits is S6`,
           );
         log(`Worker attempts failed (${reason}); running locally`);
-        return local();
+        return fallback(id);
       }
     },
   };

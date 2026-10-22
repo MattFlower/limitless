@@ -9,7 +9,9 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import type { AgentEvent } from "../src/harness/types.ts";
 import type { AgentCall, AgentPublication } from "../src/pipeline/agent-executor.ts";
 import { NeedsHumanError } from "../src/pipeline/context.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
+import { registerCredential } from "../src/util/proc.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -217,7 +219,10 @@ test.each([
     );
   }
   expect((await running).finalText).toBe("local");
-  expect(f.counts().locals).toBe(1);
+  expect(f.counts()).toMatchObject({
+    locals: 1,
+    adopted: reason === "confinement" || reason === "cancelled session" ? 1 : 0,
+  });
   expect(f.events.some((e) => e.type === "status" && e.text.includes("running locally"))).toBe(true);
 });
 
@@ -280,12 +285,131 @@ test("abort cancels the waiting job", async () => {
   expect(f.counts().locals).toBe(0);
 });
 
-test("preparation refusal does not dispatch", async () => {
+test.each([
+  ["error", "Cannot read [redacted]"],
+  ["string", "Cannot read [redacted]"],
+  ["number", "42"],
+  ["null", "null"],
+  ["undefined", "undefined"],
+  ["object", "[object Object]"],
+])("unexpected preparation failure stops without dispatch: %s", async (kind, detail) => {
   const f = fixture();
   if (!f.call.publication) throw new Error("Missing hooks");
+  const secret = "synthetic-lan-preparation-credential";
+  registerCredential("lan-preparation-test", secret);
+  const failure = {
+    error: new Error(`Cannot read ${secret}`),
+    string: `Cannot read ${secret}`,
+    number: 42,
+    null: null,
+    undefined: undefined,
+    object: { reason: "unreadable" },
+  }[kind];
   f.call.publication.prepare = async () => {
-    throw new NeedsHumanError("Branch moved");
+    throw failure;
   };
-  await expect(f.run()).rejects.toThrow("Branch moved");
+  const error: unknown = await f.run().catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(NeedsHumanError);
+  expect(error).toMatchObject({ message: `Cannot prepare worker job: ${detail}` });
+  expect(f.counts()).toMatchObject({ locals: 0, jobs: 0, adopted: 0 });
+});
+
+test.each([new NeedsHumanError("Branch moved"), new SimulatedTermination("Restart")])(
+  "preparation propagates %s unchanged without dispatch",
+  async (error) => {
+    const f = fixture();
+    if (!f.call.publication) throw new Error("Missing hooks");
+    f.call.publication.prepare = async () => {
+      throw error;
+    };
+    await expect(f.run()).rejects.toBe(error);
+    expect(f.counts()).toMatchObject({ locals: 0, jobs: 0, adopted: 0 });
+  },
+);
+
+test.each(["reject", "null", "prepared"])("abort during preparation: %s", async (outcome) => {
+  const f = fixture();
+  if (!f.call.publication) throw new Error("Missing hooks");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const prepare = f.call.publication.prepare;
+  const error = new Error("Preparation interrupted");
+  f.call.publication.prepare = async () => {
+    entered.resolve();
+    await release.promise;
+    if (outcome === "reject") throw error;
+    return outcome === "null" ? null : prepare();
+  };
+  const running = f.run();
+  await entered.promise;
+  f.controller.abort();
+  release.resolve();
+  if (outcome === "reject") await expect(running).rejects.toBe(error);
+  else expect(await running).toMatchObject({ status: "cancelled", error: "cancelled", numTurns: 0 });
+  expect(f.counts()).toMatchObject({ locals: 0, jobs: 0, adopted: 0 });
+});
+
+test("abort when enqueue rejects prevents local fallback", async () => {
+  const f = fixture();
+  const enqueue = spyOn(f.workers, "enqueueAgentJob").mockImplementation(() => {
+    f.controller.abort();
+    return null;
+  });
+  expect(await f.run()).toMatchObject({ status: "cancelled", error: "cancelled", numTurns: 0 });
+  expect(enqueue).toHaveBeenCalledTimes(1);
   expect(f.counts()).toMatchObject({ locals: 0, jobs: 0 });
 });
+
+test.each(["confinement", "cancelled session", "failed job", "cancelled job"])(
+  "abort during async worker handling prevents local fallback: %s",
+  async (reason) => {
+    const f = fixture();
+    if (!f.call.publication) throw new Error("Missing hooks");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const adoption = reason === "confinement" || reason === "cancelled session";
+    const adopt = spyOn(f.call.publication, "adopt");
+    if (adoption)
+      adopt.mockImplementation(async () => {
+        entered.resolve();
+        await release.promise;
+      });
+    else
+      f.call.publication.remoteSha = async () => {
+        entered.resolve();
+        await release.promise;
+        return sha;
+      };
+    const running = f.run();
+    await Promise.resolve();
+    const id = f.job();
+    if (adoption) {
+      const result = await f.report();
+      f.complete(
+        id,
+        reason === "confinement"
+          ? {
+              ...result,
+              confinement: {
+                ok: false,
+                path: null,
+                version: null,
+                reason: "probe inconclusive",
+                exitCode: 1,
+              },
+            }
+          : { ...result, status: "cancelled" },
+      );
+    } else if (reason === "cancelled job") f.workers.cancelAgentJob(id);
+    else {
+      f.workers.failAgentJob(id, "Disconnected");
+      f.workers.failAgentJob(id, "Disconnected");
+    }
+    await entered.promise;
+    f.controller.abort();
+    release.resolve();
+    expect(await running).toMatchObject({ status: "cancelled", error: "cancelled", numTurns: 0 });
+    expect(adopt).toHaveBeenCalledTimes(adoption ? 1 : 0);
+    expect(f.counts()).toMatchObject({ locals: 0, jobs: 1 });
+  },
+);

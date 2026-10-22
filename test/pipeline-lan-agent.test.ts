@@ -86,6 +86,103 @@ function boot(
   return { f, locals: () => locals };
 }
 
+test("unreadable private strings during worker preparation stop without changing provider health", async () => {
+  const bare = await githubFixture();
+  let f: Factory;
+  let provider = "";
+  let health: ReturnType<Factory["store"]["getProviderRow"]> = null;
+  const executor: AgentExecutor = {
+    kind: "test",
+    async run(call, local) {
+      const publication = call.publication;
+      if (call.role === "implement" && publication)
+        call.publication = {
+          ...publication,
+          async prepare() {
+            provider = call.spec.target.provider;
+            f.tracker.record(provider, "unavailable");
+            expect(f.tracker.status(provider)?.state).toBe("degraded");
+            health = f.store.getProviderRow(provider);
+            writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), Buffer.from([0xff]));
+            try {
+              return await publication.prepare();
+            } finally {
+              // Scope the read failure to preparation, before the draft-delivery privacy check.
+              writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "");
+            }
+          },
+        };
+      return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+    },
+  };
+  const instance = boot({ executor });
+  f = instance.f;
+  registerGithub(f, bare);
+  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["needs_human", "succeeded"])).toBe("needs_human");
+  const message = "Cannot prepare worker job: Cannot read private-strings.txt; publication blocked";
+  expect(f.store.getRun(run.id)?.error).toContain(message);
+  expect(f.store.listStages(run.id).find((s) => s.name === "implement")).toMatchObject({
+    status: "failed",
+    summary: expect.stringContaining(message),
+  });
+  expect(f.store.listInvocations(run.id).filter((i) => i.role === "implement")).toMatchObject([
+    { status: "error", error: message, finishedAt: expect.any(Number) },
+  ]);
+  expect(health).not.toBeNull();
+  expect(f.store.getProviderRow(provider)).toEqual(health);
+  expect(f.tracker.status(provider)?.inFlight).toBe(0);
+  expect(jobs(f)).toHaveLength(0);
+  expect(instance.locals()).toBe(0);
+});
+
+test.each(["reject", "null"])(
+  "cancelling during worker preparation preserves cancellation: %s",
+  async (outcome) => {
+    const bare = await githubFixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let f: Factory;
+    let provider = "";
+    let health: ReturnType<typeof snapshot> = {};
+    const snapshot = () => {
+      const { updatedAt: _time, inFlight: _slots, ...status } = f.tracker.status(provider) ?? {};
+      return status;
+    };
+    const executor: AgentExecutor = {
+      kind: "test",
+      async run(call, local) {
+        if (call.role === "implement" && call.publication)
+          call.publication.prepare = async () => {
+            provider = call.spec.target.provider;
+            f.tracker.record(provider, "unavailable");
+            health = snapshot();
+            entered.resolve();
+            await release.promise;
+            if (outcome === "reject") throw new Error("Preparation interrupted");
+            return null;
+          };
+        return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+      },
+    };
+    const instance = boot({ executor });
+    f = instance.f;
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    await entered.promise;
+    f.cancelRun(run.id);
+    release.resolve();
+    expect(await waitFor(f, run.id, ["cancelled", "needs_human"])).toBe("cancelled");
+    expect(f.store.listInvocations(run.id).filter((i) => i.role === "implement")).toMatchObject([
+      { status: "cancelled", finishedAt: expect.any(Number) },
+    ]);
+    expect(snapshot()).toEqual(health);
+    expect(f.tracker.status(provider)?.inFlight).toBe(0);
+    expect(jobs(f)).toHaveLength(0);
+    expect(instance.locals()).toBe(0);
+  },
+);
+
 test("real worker rounds publish, adopt, relay events and deliver over an advanced base", async () => {
   const bare = await githubFixture();
   const reviewed: string[] = [];
