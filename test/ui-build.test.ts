@@ -2,14 +2,18 @@ import { afterAll, expect, spyOn, test } from "bun:test";
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { buildConfig, stageUi, validateMetafile } from "../scripts/build-binary.ts";
+import { buildConfig, validateMetafile } from "../scripts/build-binary.ts";
 import { BUILD_DEFINES } from "../src/release.ts";
 import { buildUi } from "../src/server/ui.ts";
 import { UI_RESOURCE } from "../src/server/ui-build.ts";
 import { sh } from "../src/util/proc.ts";
 import { uiBuildFixture } from "./ui-build-support.ts";
 
-const uiMaps = uiBuildFixture();
+const uiMaps = uiBuildFixture((directory) => {
+  mkdirSync(join(directory, "stale-directory", "nested"), { recursive: true });
+  writeFileSync(join(directory, "stale.js"), "stale");
+  writeFileSync(join(directory, "stale-directory", "nested", "stale.css"), "stale");
+});
 
 test.each(["caller bunfig", "runtime globals"])(
   "source UI refuses a foreign define from %s",
@@ -73,20 +77,10 @@ test("shared UI options emit root-relative script and stylesheet URLs", async ()
 });
 
 test("UI staging removes stale files and nested directories", async () => {
-  const root = mkdtempSync(join(tmpdir(), "limitless-ui-staging-"));
-  const directory = join(root, UI_RESOURCE);
-  try {
-    mkdirSync(join(directory, "stale-directory", "nested"), { recursive: true });
-    writeFileSync(join(directory, "stale.js"), "stale");
-    writeFileSync(join(directory, "stale-directory", "nested", "stale.css"), "stale");
-    const staged = await stageUi(root);
-    expect(staged.directory).toBe(directory);
-    expect(readdirSync(directory, { recursive: true }).sort()).toEqual(
-      staged.outputs.map((file) => relative(directory, file.path)).sort(),
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  const { directory, outputs } = await uiMaps();
+  expect(readdirSync(directory, { recursive: true }).sort()).toEqual(
+    outputs.map((file) => relative(directory, file.path)).sort(),
+  );
 });
 
 test("packaged map preserves every source filename, byte and content type", async () => {
