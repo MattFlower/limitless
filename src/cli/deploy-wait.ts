@@ -264,10 +264,12 @@ export async function waitForHealthy(
   clock: DeployClock,
   target: string,
   log: (message: string) => void = console.warn,
+  before?: HealthResponse & { observedAt: number },
 ): Promise<HealthResponse> {
   const start = clock.now();
   let lastError: unknown;
   while (clock.now() - start < 45_000) {
+    const requestedAt = clock.now();
     try {
       const state = validateHealth(
         await bounded(
@@ -276,8 +278,16 @@ export async function waitForHealthy(
           Math.min(2000, 45_000 - (clock.now() - start)),
         ),
       );
-      if (state.sha !== "unknown" && state.sha !== target) {
+      if ((before || state.sha !== "unknown") && state.sha !== target) {
         lastError = new Error(`replacement daemon runs ${state.sha}, expected ${target}`);
+      } else if (
+        before &&
+        (before.startedAt !== undefined && state.startedAt !== undefined
+          ? state.startedAt === before.startedAt
+          : // Bound the old start from above and the candidate start from below, including request latency.
+            requestedAt - state.uptimeMs <= before.observedAt - before.uptimeMs)
+      ) {
+        lastError = new Error("daemon has not reported a new boot");
       } else if (!state.draining) {
         if (state.sha === "unknown")
           log("warning: replacement daemon does not report a boot SHA; cannot verify its commit");
