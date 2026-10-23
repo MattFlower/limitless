@@ -50,6 +50,73 @@ const { start } = pipelineSetup({
 
 describe("pipeline (fake agents, real git + gates)", () => {
   test.each([
+    [undefined, "claude/opus"],
+    [false, "codex/sol-6.1"],
+  ] as const)("single review vendor avoidance %s routes to %s", async (avoid, reviewer) => {
+    const configDir = join(home, "cfg");
+    mkdirSync(configDir);
+    if (avoid !== undefined)
+      writeFileSync(join(configDir, "config.toml"), `[review]\navoid_implementer_vendor = ${avoid}\n`);
+    const chain = { default: ["codex/sol-6.1", "claude/opus"] };
+    const f = new Factory(loadConfig({ home: join(home, "data"), configDir }), {
+      loadSource: () => 0,
+      confinement: fakeConfinement,
+      harnesses: {
+        fake: fakeHarness((s) => {
+          const role = roleOf(s);
+          if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+          if (role === "review") return { structured: approve };
+          return { files: { "farewell.txt": "goodbye\n" } };
+        }),
+      },
+      providers: providers.map((p, i) => ({ ...p, id: i === 0 ? "codex" : "claude" })),
+      models: models.map((m, i) => ({
+        ...m,
+        id: i === 0 ? "codex/sol-6.1" : "claude/opus",
+        provider: i === 0 ? "codex" : "claude",
+        vendor: i === 0 ? "openai" : "anthropic",
+      })),
+      policy: {
+        ...policy,
+        triage: chain,
+        spec: chain,
+        holdout: chain,
+        implement: chain,
+        review: chain,
+        verify: chain,
+      },
+      bootSha: "test-build",
+    });
+    factory = f;
+    f.start();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(["codex/sol-6.1"]);
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "review")
+        .map((i) => i.modelId),
+    ).toEqual([reviewer]);
+    const messages = f.store.listEvents(run.id).map((e) => e.message);
+    expect(messages).not.toContain("Review done by the implementer's vendor (no other vendor available)");
+    expect(
+      messages.filter(
+        (m) =>
+          m ===
+          (avoid === false
+            ? "review: same-vendor allowed by config"
+            : "review: avoiding implementer's vendor"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  test.each([
     ["sticks with it", 1, "alpha/m"],
     ["escalates beyond it", 2, "beta/m"],
   ])(
