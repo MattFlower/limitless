@@ -604,6 +604,19 @@ test("verifier leaves gate citations to the engine instead of rerunning whole su
   expect(withoutGates).toContain('blockedReason "sandbox"');
 });
 
+test.each([true, false, undefined])(
+  "verify prompt reflects local binding permission: %s",
+  (allowLocalBinding) => {
+    const prompt = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc", allowLocalBinding });
+    expect(prompt.includes("loopback servers")).toBe(!allowLocalBinding);
+    expect(prompt).toContain("nested Seatbelt");
+    expect(prompt).toContain('report status blocked with blockedReason "sandbox"');
+    expect(prompt).toContain('blockedReason "environment"');
+    expect(prompt).toContain("Do not cite factory gate runs");
+    expect(prompt).toContain("clean checks cover every required step on the exact verified commit");
+  },
+);
+
 const unmetHoldout = (extra: Partial<Verify["criteria"][number]>): Verify => ({
   criteria: [
     { id: "AC-1", status: "met", evidence: "ok", publicSummary: "" },

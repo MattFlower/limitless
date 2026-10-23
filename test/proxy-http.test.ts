@@ -8,8 +8,10 @@ import { githubWebhook } from "../src/integrations/github.ts";
 import { classifyRequest, publicHost } from "../src/server/access.ts";
 import { Auth } from "../src/server/auth.ts";
 import { createHttpRoutes, startHttp } from "../src/server/http.ts";
-import { buildUi } from "../src/server/ui.ts";
 import { fixture, type Route, requestWithParams } from "./mcp-support.ts";
+import { uiBuildFixture } from "./ui-build-support.ts";
+
+const uiMaps = uiBuildFixture();
 
 const proxy = "10.0.0.20",
   origin = "https://limitless.example.test";
@@ -363,7 +365,7 @@ test("every SSE stream asks a reverse proxy not to buffer or transform it", asyn
 
 test("direct navigation to every UI route serves the SPA shell; unknown API paths stay JSON 404s", async () => {
   const f = await fixture();
-  const ui = await buildUi();
+  const { source: ui } = await uiMaps();
   f.factory.cfg.port = 0;
   const server = await startHttp(f.factory, { ui });
   try {
@@ -393,7 +395,12 @@ test("direct navigation to every UI route serves the SPA shell; unknown API path
   }
 });
 
-test("guarded UI/assets, API, SSE, mutations and webhook transports", async () => {
+test.each(["source", "packaged"] as const)(
+  "guarded UI/assets, API, SSE, mutations and webhook transports (%s)",
+  guardedUi,
+);
+
+async function guardedUi(kind: "source" | "packaged") {
   const f = await fixture();
   try {
     const cfg = f.factory.cfg;
@@ -401,7 +408,7 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
     cfg.trustedProxies = [proxy];
     cfg.publicOrigins = [origin];
     cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
-    const ui = await buildUi();
+    const ui = (await uiMaps())[kind];
     const mcp = mock(() => new Response("dispatch"));
     const routes = createHttpRoutes(f.factory, {
       ui,
@@ -598,4 +605,4 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
   } finally {
     await f.close();
   }
-});
+}
