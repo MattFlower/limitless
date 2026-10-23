@@ -344,3 +344,5 @@ The five agent verbs are submit (`limitless_create_run`), inbox/ack (`limitless_
 Review takes `run`, `verdict` (`changes` or `approve`), `reviewedSha` (full SHA), and `findings`
 (nonempty for changes, omitted or empty for approve). Land takes `run` and optional `sha`; status takes
 `run` and explains the saved observations and next action. An absent PR observation is unknown.
+
+Licensed under the [MIT License](LICENSE).
