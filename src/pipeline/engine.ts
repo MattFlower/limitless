@@ -9,6 +9,7 @@ import {
   BASELINE_CACHE_TTL_MS,
   baselineCacheKey,
   cacheableBaseline,
+  gateBunVersion,
   gateEnvDigest,
   lockfileHash,
   singleFlight,
@@ -660,18 +661,26 @@ async function prepare(ctx: RunContext): Promise<void> {
       // Without a known build the gate environment can't be keyed: never read or write the cache.
       else if (!buildSha) ctx.state.baseline = await runBaseline();
       else {
+        const executor =
+          cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local";
+        const env = gateEnv();
+        const bunVersion =
+          executor === "lan"
+            ? (ctx.deps.bunVersion ?? Bun.version)
+            : await gateBunVersion(ctx.runDir, env, ctx.signal);
+        ctx.checkCancelled();
         // Keyed by the commit actually checked out, so verify-change caches its PR base.
         const key = baselineCacheKey({
-          executor: cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local",
+          executor,
           repoId: ctx.repo.id,
           baseSha: await headSha(wt.path),
           gates,
           lockfileHash: lockfileHash(wt.path),
-          bunVersion: Bun.version,
+          bunVersion,
           platform: process.platform,
           arch: process.arch,
           buildSha,
-          envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
+          envDigest: gateEnvDigest(env, cfg.baselineEnv),
         });
         // A bypass still runs the baseline and refreshes the entry if it passes.
         const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
