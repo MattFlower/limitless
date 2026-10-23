@@ -87,7 +87,7 @@ export function writeHostileDir(
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, ".env"),
-    `LIMITLESS_PORT=${opts.port}\nLIMITLESS_HOME=${opts.home}\nLIMITLESS_CONFIG_DIR=${opts.config}\n`,
+    `LIMITLESS_PORT=${opts.port}\nLIMITLESS_HOME=${opts.home}\nLIMITLESS_CONFIG_DIR=${opts.config}\nLIMITLESS_URL=http://127.0.0.1:${opts.port}\n`,
   );
   writeFileSync(join(dir, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
   writeFileSync(join(dir, "preload.ts"), `await Bun.write(${JSON.stringify(opts.marker)}, "preload ran");\n`);
@@ -264,6 +264,11 @@ async function main(): Promise<void> {
     };
     await run("no autoload while serving", async () => {
       requireHealth();
+      // Bun preserves launchd's values during dotenv loading. URL is absent from env,
+      // so loading the hostile .env redirects this client to the unused decoy port.
+      const probe = launch([binary, "routing", "show"]);
+      if ((await probe.done()) !== 0)
+        throw new Error(`dotenv isolation probe (hostile port ${decoy}) failed: ${probe.tail()}`);
       return checkAutoload(
         [traps.home, traps.config].map((path) => ({ path, exists: existsSync(path) })),
         { port: decoy, listening: await listening(decoy) },

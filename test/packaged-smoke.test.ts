@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -105,6 +113,7 @@ test("hostile directory contains effective dotenv, preload and valid JSON withou
     LIMITLESS_PORT: String(traps.port),
     LIMITLESS_HOME: traps.home,
     LIMITLESS_CONFIG_DIR: traps.config,
+    LIMITLESS_URL: `http://127.0.0.1:${traps.port}`,
   });
   const bunfig = Bun.TOML.parse(readFileSync(join(dir, "bunfig.toml"), "utf8")) as { preload: string[] };
   expect(bunfig.preload).toHaveLength(1);
@@ -114,6 +123,59 @@ test("hostile directory contains effective dotenv, preload and valid JSON withou
   for (const name of ["package.json", "tsconfig.json"])
     expect(JSON.parse(readFileSync(join(dir, name), "utf8"))).toEqual({});
   for (const path of [traps.home, traps.config, traps.marker]) expect(existsSync(path)).toBe(false);
+});
+
+test.each([false, true])("smoke detects dotenv loading with launchd values set: %s", async (autoload) => {
+  const checkout = join(import.meta.dir, "..");
+  const sha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: checkout }).stdout.toString().trim();
+  const daemon = join(root, "daemon.ts");
+  writeFileSync(
+    daemon,
+    `if (Bun.argv[2] === "serve") {
+      Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.LIMITLESS_PORT),
+        fetch: () => Response.json({ sha: ${JSON.stringify(sha)}, effective: {}, prefer: [] }) });
+      process.on("SIGTERM", () => process.exit(0));
+    } else console.log('{"kind":"source"}');`,
+  );
+  const config = join(root, "bunfig.toml");
+  writeFileSync(config, "");
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const binary = join(root, "limitless");
+  // Only serve/version are synthetic. The routing probe uses the real source CLI,
+  // with dotenv explicitly enabled or disabled; no binary is compiled by the test.
+  writeFileSync(
+    binary,
+    `#!/bin/sh
+if [ "$1" = routing ]; then
+  exec ${quote(process.execPath)} --config=${quote(config)} ${autoload ? '--env-file="$PWD/.env"' : "--no-env-file"} ${quote(join(checkout, "src/cli/main.ts"))} "$@"
+fi
+exec ${quote(process.execPath)} --config=${quote(config)} --no-env-file ${quote(daemon)} "$@"
+`,
+    { mode: 0o755 },
+  );
+  const child = Bun.spawn(
+    [process.execPath, join(checkout, "scripts/packaged-smoke.ts"), "--binary", binary],
+    {
+      cwd: checkout,
+      env: { ...process.env, TMPDIR: root },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  try {
+    const [output] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(output).toContain("serve/health\tPASS");
+    expect(output).toContain(`no autoload while serving\t${autoload ? "FAIL" : "PASS"}`);
+    if (autoload) expect(output).toContain("dotenv isolation probe (hostile port");
+    expect(readdirSync(root).filter((name) => name.startsWith("limitless-packaged-smoke-"))).toEqual([]);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await child.exited;
+  }
 });
 
 test("routing finder selects differing groups including cells missing from defaults", () => {
