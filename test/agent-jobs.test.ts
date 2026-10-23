@@ -55,7 +55,7 @@ function pair(name: string) {
 function beat(name: string, c = caps()) {
   const w = workers.worker(name);
   if (!w) throw new Error("Missing worker");
-  return workers.heartbeat(w, c);
+  return workers.heartbeat(w, c, "match");
 }
 function enqueue(req = request) {
   const id = workers.enqueueAgentJob(req);
@@ -444,6 +444,67 @@ test("agent deadlines retain the maximum timer bound, and queued retries expire 
   now += workers.times.pickup;
   workers.sweepAgentJobs();
   expect(workers.agentJob(queued)).toMatchObject({ state: "failed", attempt: 2 });
+});
+
+test.each([false, true])("restart grace preserves old leases and pickup (grace=%s)", (grace) => {
+  pair("one");
+  const id = enqueue();
+  workers.leaseAgentJob("one");
+  const queued = enqueue();
+  now += 90_000;
+  if (grace) workers.resumedAt = now;
+  workers.sweepAgentJobs();
+  if (grace) {
+    expect(workers.agentJob(id)).toMatchObject({ state: "leased", attempt: 1 });
+    expect(workers.agentJob(queued)).toMatchObject({ state: "queued", attempt: 1 });
+    expect(beat("one", caps([id])).cancelled).toEqual([]);
+    expect(workers.agentJob(id)?.lease_expires_at).toBe(now + workers.times.lease);
+    now += workers.times.lease;
+    workers.sweepAgentJobs();
+    expect(workers.agentJob(id)).toMatchObject({ state: "queued", failure_reason: "Lease expired" });
+  } else {
+    expect(workers.agentJob(id)).toMatchObject({ state: "queued", failure_reason: "Lease expired" });
+    expect(workers.agentJob(queued)).toMatchObject({ attempt: 2, failure_reason: "No worker picked up job" });
+  }
+});
+
+test.each([false, true])("restart heartbeat freshness and deadline (grace=%s)", (grace) => {
+  pair("one");
+  const id = enqueue();
+  workers.leaseAgentJob("one");
+  now += 90_000;
+  store.db.query("UPDATE agent_jobs SET lease_expires_at=? WHERE id=?").run(now + workers.times.lease, id);
+  if (grace) workers.resumedAt = now;
+  workers.sweepAgentJobs();
+  expect(workers.agentJob(id)).toMatchObject(
+    grace ? { state: "leased", attempt: 1 } : { state: "queued", failure_reason: "Worker disconnected" },
+  );
+  if (grace) {
+    store.db.query("UPDATE agent_jobs SET attempt_deadline_at=? WHERE id=?").run(now, id);
+    workers.sweepAgentJobs();
+    expect(workers.agentJob(id)).toMatchObject({
+      state: "queued",
+      failure_reason: "Attempt deadline expired",
+    });
+  }
+});
+
+test("orphan cancellation preserves handled open jobs and closed jobs", () => {
+  const kept = enqueue(),
+    orphan = enqueue(),
+    done = enqueue(),
+    failed = enqueue();
+  store.db.query("UPDATE agent_jobs SET state='leased' WHERE id=?").run(done);
+  workers.completeAgentJob(done, {}, releaseSha);
+  workers.failAgentJob(failed, "Failed");
+  workers.failAgentJob(failed, "Failed");
+  workers.cancelOpenAgentJobs(new Set([kept]));
+  expect([kept, orphan, done, failed].map((id) => workers.agentJob(id)?.state)).toEqual([
+    "queued",
+    "cancelled",
+    "done",
+    "failed",
+  ]);
 });
 
 test("agent matching skips older incompatible jobs and leases matching jobs oldest first", () => {
