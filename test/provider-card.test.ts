@@ -184,7 +184,7 @@ test("OpenRouter card keeps one budget gauge and reports only material differenc
   expect(empty).toContain("$0.00");
 });
 
-test("provider card renders each window's label, bar, and full-width details in order", async () => {
+test("provider card renders window labels, fresh bars, and full-width details in order", async () => {
   const now = 1_000_000;
   setSystemTime(now);
   dir = mkdtempSync(join(tmpdir(), "limitless-card-"));
@@ -240,18 +240,19 @@ test("provider card renders each window's label, bar, and full-width details in 
   expect(html).toContain("resets in 1m · updated 12 min ago");
   expect(html).toContain("updated unknown");
   expect(html).toContain("updated just now");
-  for (const [label, value] of [
-    ["5h", "73%"],
-    ["7d", "0%"],
-    ["7d overage included", "100%"],
+  for (const [label, value, nextClass] of [
+    ["5h", "73%", "gauge-track"],
+    ["7d", "0%", "gauge-details"],
+    ["7d overage included", "100%", "gauge-track"],
   ] as const) {
     const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     expect(html).toMatch(
       new RegExp(
-        `class="gauge-label"[^>]*><span>${escapedLabel}</span><span class="gauge-value">${value}</span></div><div class="gauge-track"`,
+        `class="gauge-label"[^>]*><span>${escapedLabel}</span><span class="gauge-value">${value}</span></div><div class="${nextClass}"`,
       ),
     );
   }
+  expect(html.match(/class="gauge-track"/g)).toHaveLength(2);
   expect(html.match(/class="gauge-details"/g)).toHaveLength(3);
   expect(html).not.toContain("Confined readers");
   expect(html).not.toContain("No limit (configured)");
