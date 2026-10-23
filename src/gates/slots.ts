@@ -1,6 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { availableParallelism } from "node:os";
+import { redactCredentials } from "../util/proc.ts";
 
 export const GATE_LEASE_EXPIRY_MS = 30_000;
 export type GatePriority = "ship" | "finish" | "start";
@@ -176,18 +177,24 @@ export class DatabaseSlotPool extends Semaphore {
       Math.max(1, Math.floor(defaultLimit)),
     );
     const pulse = () => {
-      this.refresh(() => {
-        if (this.now() - this.renewed < (options.renewMs ?? 10_000)) return;
-        this.write(
-          "UPDATE slot_requests SET renewed_at = ? WHERE pool = ? AND owner = ?",
-          this.now(),
-          pool,
-          this.owner,
-        );
-        this.renewed = this.now();
-      });
-      this.tick = this.timer(pulse, Math.min(250, options.pollMs ?? 250));
-      this.tick.unref?.();
+      try {
+        const renew = this.now() - this.renewed >= (options.renewMs ?? 10_000);
+        this.refresh(() => {
+          if (renew)
+            this.write(
+              "UPDATE slot_requests SET renewed_at = ? WHERE pool = ? AND owner = ?",
+              this.now(),
+              pool,
+              this.owner,
+            );
+        });
+        if (renew) this.renewed = this.now();
+      } catch (error) {
+        console.warn(redactCredentials(`Slot pool renewal/poll failed: ${String(error)}`));
+      } finally {
+        this.tick = this.timer(pulse, Math.min(250, options.pollMs ?? 250));
+        this.tick.unref?.();
+      }
     };
     this.tick = this.timer(pulse, Math.min(250, options.pollMs ?? 250));
     this.tick.unref?.();
@@ -391,19 +398,29 @@ export class DatabaseSlotPool extends Semaphore {
       clear(expiry);
       const row = this.row(id);
       if (done || !row || row.owner !== this.owner) {
+        // Keep cleanup armed until the database write succeeds.
+        if (row?.owner === this.owner) this.remove(id);
         this.touches.delete(id);
         this.leaseTimers.delete(id);
         abort();
-        if (row?.owner === this.owner) this.remove(id);
         return row?.state === "held";
       }
-      expiry = timer(() => touch(true), GATE_LEASE_EXPIRY_MS);
+      expiry = timer(expire, GATE_LEASE_EXPIRY_MS);
       expiry.unref?.();
       return row.state === "held";
     };
+    const expire = () => {
+      try {
+        touch(true);
+      } catch (error) {
+        console.warn(redactCredentials(`Slot lease expiry failed: ${String(error)}`));
+        expiry = timer(expire, 250);
+        expiry.unref?.();
+      }
+    };
     this.touches.set(id, touch);
     this.leaseTimers.set(id, () => clear(expiry));
-    expiry = timer(() => touch(true), GATE_LEASE_EXPIRY_MS);
+    expiry = timer(expire, GATE_LEASE_EXPIRY_MS);
     expiry.unref?.();
   }
 

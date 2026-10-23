@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,7 @@ function setup() {
   });
   const pool = (owner: string, key = "gate", limit = 1) => {
     const db = new Database(path);
+    db.exec("PRAGMA busy_timeout = 0");
     const slots = new DatabaseSlotPool(db, key, limit, {
       owner,
       now: clock.now,
@@ -45,6 +46,69 @@ function setup() {
   };
   return { clock, pool, store };
 }
+
+test("polling and owner renewal recover after a database write lock", async () => {
+  const { clock, pool, store } = setup();
+  const a = pool("a"),
+    b = pool("b");
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanups.push(() => warn.mockRestore());
+  const release = await a.acquire(signal, undefined, "live");
+  let acquired = false;
+  const pending = b.acquire(signal, undefined, "waiting").then((free) => {
+    acquired = true;
+    return free;
+  });
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    await clock.advance(10_000);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(acquired).toBe(false);
+  } finally {
+    store.db.exec("ROLLBACK");
+  }
+  await clock.advance(250);
+  expect(store.db.query("SELECT renewed_at FROM slot_requests WHERE holder = 'live'").get()).toEqual({
+    renewed_at: clock.now(),
+  });
+  for (let i = 0; i < 4; i++) await clock.advance(10_000);
+  expect(acquired).toBe(false);
+  expect(b.snapshot().holders).toEqual(["live"]);
+  release();
+  await clock.advance(250);
+  expect(acquired).toBe(true);
+  (await pending)();
+});
+
+test("lease expiry retries a database write lock without losing its cleanup timer", async () => {
+  const { clock, pool, store } = setup();
+  const a = pool("a");
+  const leaseClock = waitClock();
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  cleanups.push(() => warn.mockRestore());
+  const id = await a.lease("deploy", false, leaseClock.timer.set, leaseClock.timer.clear);
+  let acquired = false;
+  const pending = a.acquire(signal, undefined, "waiting").then((free) => {
+    acquired = true;
+    return free;
+  });
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    await leaseClock.advance(GATE_LEASE_EXPIRY_MS);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(leaseClock.pending).toBe(1);
+    expect(acquired).toBe(false);
+  } finally {
+    store.db.exec("ROLLBACK");
+  }
+  await leaseClock.advance(250);
+  expect(leaseClock.pending).toBe(0);
+  expect(acquired).toBe(true);
+  expect(a.heartbeat(id)).toBeUndefined();
+  expect(a.snapshot().holders).toEqual(["waiting"]);
+  (await pending)();
+  await clock.flush();
+});
 
 test("connections share capacity, wake on polling, and release exactly once", async () => {
   const { clock, pool } = setup();
