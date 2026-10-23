@@ -189,3 +189,24 @@ test("bundled marketplace resolves plugin, skills match, and documented TOML par
     expect(doc).toContain("LIMITLESS_URL");
   }
 });
+
+test("packaged installs read the embedded skill unless an explicit root is given", () => {
+  const embedded = join(dir, "bunfs");
+  mkdirSync(embedded);
+  writeFileSync(join(embedded, "SKILL.md"), "embedded skill\n");
+  const release = {
+    kind: "packaged",
+    version: "2.0.0",
+    sha: "a".repeat(40),
+    bun: "test",
+    root: embedded,
+  } as const;
+  const destination = (home: string) => join(dir, home, ".agents/skills/limitless/SKILL.md");
+  installIntegrations({ home: join(dir, "packaged"), write: true, release, print: () => {} });
+  expect(readFileSync(destination("packaged"), "utf8")).toBe("embedded skill\n");
+  const root = join(dir, "explicit");
+  mkdirSync(join(root, "integrations/codex/.agents/skills/limitless"), { recursive: true });
+  writeFileSync(join(root, "integrations/codex/.agents/skills/limitless/SKILL.md"), "explicit skill\n");
+  installIntegrations({ home: join(dir, "rooted"), root, write: true, release, print: () => {} });
+  expect(readFileSync(destination("rooted"), "utf8")).toBe("explicit skill\n");
+});

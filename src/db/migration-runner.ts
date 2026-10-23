@@ -2,9 +2,10 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { resourcePath } from "../release.ts";
 import { MIGRATIONS } from "./migrations.ts";
 
-export const MIGRATION_DIR = join(import.meta.dir, "migrations");
+export const MIGRATION_DIR = resourcePath("src/db/migrations");
 const FILE_NAME = /^\d{8}T\d{4}(?:\d{2})?-[a-z0-9]+(?:-[a-z0-9]+)*\.sql$/;
 
 export function migrationNames(directory: string, entries = readdirSync(directory)): string[] {
