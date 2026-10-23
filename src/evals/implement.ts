@@ -17,7 +17,7 @@ import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { stageAll, worktreeGit } from "../git/command.ts";
-import { diffSince, discardChanges, readFileAt, withGitBundle } from "../git/repos.ts";
+import { diffSince, readFileAt, withGitBundle } from "../git/repos.ts";
 import { runConfined } from "../harness/sandbox.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
@@ -26,39 +26,7 @@ import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
-import { prepareEvalGates } from "./prepare.ts";
-
-export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
-  const { gates, baseline } = await prepareEvalGates(item, cwd, signal);
-  if (!baseline.setupOk) throw new Error("baseline gate setup failed");
-  if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
-    throw new Error("baseline gate check timed out");
-  // A check already failing on the snapshot can never block (still_failing), so gates would
-  // stop grading anything; a repository whose checks read evals/ can't use snapshot mode.
-  const failing = item.snapshot ? baseline.checks.find((check) => !check.ok) : undefined;
-  if (failing)
-    throw new Error(
-      `snapshot mode removed evals/ and baseline check ${failing.name} fails; this case can't use snapshot mode`,
-    );
-  // Baseline gates already ran repository code that may have configured filters in .git/config
-  // and .gitattributes, so this checkout is no more trustworthy than a candidate's.
-  await discardChanges(cwd, agentEnv());
-  return {
-    gates,
-    baseline,
-    timeoutMs: 60 * 60_000,
-    prompt: implementPrompt({
-      prompt: item.prompt,
-      spec: item.spec,
-      gates,
-      baseline,
-      baseSha: item.base,
-      round: 0,
-      feedback: null,
-      hasHoldout: false,
-    }),
-  };
-}
+import type { prepareImplement } from "./prepare.ts";
 
 /** Reject symlink components, including the final file, before any hidden bytes are written. */
 export function injectHiddenFiles(cwd: string, files: ReturnType<typeof hiddenContents>) {

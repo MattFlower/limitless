@@ -2,25 +2,31 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { z } from "zod";
 import { loadConfig } from "../src/config.ts";
 import type { Run } from "../src/core/types.ts";
 import {
   defaultCasePath,
-  type hiddenContents,
+  hiddenContents,
   ImplementCaseFileSchema,
   ImplementCaseSchema,
 } from "../src/evals/cases.ts";
 import { injectHiddenFiles } from "../src/evals/implement.ts";
-import { prepareEvalGates } from "../src/evals/prepare.ts";
+import { prepareImplementCase } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
 import { cacheGit } from "../src/git/command.ts";
-import { addDetachedWorktree, ensureCache, withRepoLock } from "../src/git/repos.ts";
+import {
+  addDetachedWorktree,
+  createEvalWorktreeFromCache,
+  ensureCache,
+  withRepoLock,
+} from "../src/git/repos.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { withCommandScratch } from "../src/harness/sandbox.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
-import { redactCredentials } from "../src/util/proc.ts";
+import { redactCredentials, sh } from "../src/util/proc.ts";
 
 const optionsSchema = z.object({
   repo: z.string().regex(/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/),
@@ -90,7 +96,15 @@ export async function replayProduction(body: string, lookupRun?: Dependencies["l
   };
 }
 
-type Result = { pr: number; case: string; base: string; head: string; reason: string };
+type Result = {
+  pr: number;
+  case: string;
+  base: string;
+  head: string;
+  baseFailure: "assertion-failure" | "load-error" | "—";
+  reason: string;
+};
+const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 type Dependencies = {
   gh?: GhRunner;
   casePath?: string;
@@ -119,7 +133,7 @@ export async function generateReplayCases(
   let defaultTip = "";
   const seen = new Set<number>();
   for (const pr of prs) {
-    const row: Result = { pr, case: "—", base: "not-run", head: "not-run", reason: "" };
+    const row: Result = { pr, case: "—", base: "not-run", head: "not-run", baseFailure: "—", reason: "" };
     results.push(row);
     try {
       const duplicate = cases.find(
@@ -193,6 +207,7 @@ export async function generateReplayCases(
         base,
         head,
         prompt,
+        snapshot: true,
         spec: null,
         source: data.url,
         ...(await replayProduction(data.body, deps.lookupRun)),
@@ -221,45 +236,88 @@ export async function generateReplayCases(
       }
       const root = mkdtempSync(join(tmpdir(), "implement-replay-"));
       try {
-        for (const revision of ["base", "head"] as const) {
-          const cwd = join(root, revision);
-          try {
-            await withRepoLock(cache, () => addDetachedWorktree(repository, item[revision], cwd, signal));
-            row[revision] = await withCommandScratch(cwd, async () => {
-              const { gates, baseline } = await prepareEvalGates(item, cwd, signal, true);
-              if (!baseline.setupOk) {
-                row.reason += `${revision}: setup-failure; `;
-                return "not-run";
-              }
-              injectHiddenFiles(cwd, files);
-              const result = await runGates(
-                cwd,
-                {
-                  ...gates,
-                  setup: [],
-                  checks: [{ name: "hidden", run: item.hidden.command, timeoutSec: item.hidden.timeoutSec }],
-                },
-                signal,
+        const candidate = join(root, "base");
+        const { prepared, cleanup } = await prepareImplementCase(item, candidate, signal, (base, snapshot) =>
+          createEvalWorktreeFromCache(
+            repository,
+            base,
+            base,
+            candidate,
+            signal,
+            {
+              paths: ["evals/implement"],
+              contents: [
+                readFileSync(casePath),
+                ...cases.flatMap((existing) =>
+                  hiddenContents(existing, casePath).map((file) => file.content),
+                ),
+                ...files.map((file) => file.content),
+              ],
+            },
+            snapshot,
+          ),
+        ).catch((error: Error) => {
+          throw new Error(`excluded: runner preparation: ${error.message}`);
+        });
+        try {
+          for (const revision of ["base", "head"] as const) {
+            const cwd = join(root, revision);
+            try {
+              if (revision === "head")
+                await withRepoLock(repository, () => addDetachedWorktree(repository, item.head, cwd, signal));
+              row[revision] = await withCommandScratch(cwd, async () => {
+                const gates = prepared.gates;
+                const setup = await runGates(cwd, { ...gates, checks: [] }, signal);
+                if (!setup.setupOk) {
+                  row.reason += `${revision}: setup-failure; `;
+                  return "not-run";
+                }
+                injectHiddenFiles(cwd, files);
+                const result = await runGates(
+                  cwd,
+                  {
+                    ...gates,
+                    setup: [],
+                    checks: [
+                      { name: "hidden", run: item.hidden.command, timeoutSec: item.hidden.timeoutSec },
+                    ],
+                  },
+                  signal,
+                );
+                const out = result.checks[0];
+                if (!out || out.confinementError)
+                  throw new Error("Hidden command did not complete with confirmed confinement");
+                if (out.timedOut) return "timeout";
+                if (out.exitCode === null || out.exitCode === 126 || out.exitCode === 127) {
+                  row.reason += `${revision}: launch-failure; `;
+                  return "not-run";
+                }
+                if (revision === "base" && !out.ok)
+                  row.baseFailure =
+                    /Cannot find (?:module|package)|ModuleNotFound|error: (?:Could not resolve|Cannot resolve)|SyntaxError|does not provide an export|Export named .+ not found/i.test(
+                      out.output,
+                    )
+                      ? "load-error"
+                      : "assertion-failure";
+                return out.ok ? "pass" : "fail";
+              });
+            } catch (error) {
+              row[revision] = "not-run";
+              row.reason += `${revision}: error: ${(error as Error).message}; `;
+            }
+            if (revision === "head") {
+              await withRepoLock(repository, () =>
+                cacheGit(["git", "worktree", "remove", "--force", cwd], {
+                  cwd: repository,
+                  allowFail: true,
+                }),
               );
-              const out = result.checks[0];
-              if (!out || out.confinementError)
-                throw new Error("Hidden command did not complete with confirmed confinement");
-              if (out.timedOut) return "timeout";
-              if (out.exitCode === null || out.exitCode === 126 || out.exitCode === 127) {
-                row.reason += `${revision}: launch-failure; `;
-                return "not-run";
-              }
-              return out.ok ? "pass" : "fail";
-            });
-          } catch (error) {
-            row[revision] = "not-run";
-            row.reason += `${revision}: error: ${(error as Error).message}; `;
+              if (existsSync(cwd)) throw new Error("Could not remove validation worktree");
+              rmSync(`${cwd}.git-paths`, { force: true });
+            }
           }
-          await withRepoLock(repository, () =>
-            cacheGit(["git", "worktree", "remove", "--force", cwd], { cwd: repository, allowFail: true }),
-          );
-          if (existsSync(cwd)) throw new Error("Could not remove validation worktree");
-          rmSync(`${cwd}.git-paths`, { force: true });
+        } finally {
+          await cleanup();
         }
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -268,8 +326,9 @@ export async function generateReplayCases(
         throw new Error(
           `${row.reason}excluded: base ${row.base}, head ${row.head}; expected base fail and head pass`,
         );
+      if (row.baseFailure === "load-error") item.tags.push("base-load-error");
       const hidden = join(dirname(casePath), "hidden", id);
-      const temp = `${casePath}.${randomUUID()}.tmp`;
+      const temp = `${casePath}.${randomUUID()}.tmp.json`;
       for (const text of [JSON.stringify(item), ...files.map((file) => file.content.toString("utf8"))])
         if (redactCredentials(text) !== text)
           throw new Error("Replay contains registered credentials; refusing to rewrite original bytes");
@@ -280,6 +339,21 @@ export async function generateReplayCases(
         const updated = { ...envelope, cases: [...envelope.cases, item] };
         ImplementCaseFileSchema.parse(updated);
         writeFileSync(temp, `${JSON.stringify(updated, null, 2)}\n`);
+        try {
+          await sh(
+            [
+              join(repositoryRoot, "node_modules/.bin/biome"),
+              "check",
+              "--write",
+              "--config-path",
+              repositoryRoot,
+              temp,
+            ],
+            { cwd: repositoryRoot, signal },
+          );
+        } catch (error) {
+          throw new Error(`excluded: dataset formatter failed: ${(error as Error).message}`);
+        }
         renameSync(temp, casePath);
         envelope.cases.push(item);
         cases.push(item);

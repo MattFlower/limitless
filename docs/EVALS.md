@@ -334,16 +334,27 @@ and its first parent, and copies every added or modified `test/**/*.test.ts` fro
 (including renamed destinations). Deleted tests and support files are excluded. Hidden tests
 overwrite the candidate's versions at grading, as with other implement cases.
 
-Each proposed case gets independent detached worktrees at base and head. Both run setup
-selected from the base revision before receiving the hidden files. The hidden command must
-complete with a nonzero exit at base and zero at head. A base pass, head failure, setup failure,
-timeout, launch failure or other operational error excludes the case. The printed table shows
-both outcomes and exclusion or duplicate reasons. One excluded PR does not stop the others.
+Every generated case sets `snapshot: true` and first goes through the runner's shared implement
+preparation: an isolated checkout of base only, contamination checks, setup and baseline gates.
+Snapshot mode replaces history with neutral commits of the base tree minus `evals/`; the reference
+solution never enters the candidate's history. Preparation uses the snapshot's effective base SHA,
+while the dataset retains the original squash commit and first parent as provenance. Preparation
+failures exclude the case with the runner's reason, including remaining label contamination or a
+baseline check that fails after removing `evals/`.
+
+After preparation succeeds, hidden tests run independently on the prepared base snapshot and the
+actual reference head, using setup and gate configuration selected from base. The hidden command
+must complete with a nonzero exit at base and zero at head. The table distinguishes base assertion
+failures from test load errors (such as `Cannot find module`); both qualify. Load-error cases also
+receive the `base-load-error` tag. A base pass, head failure, setup failure, timeout, launch failure
+or confinement error excludes the case. The table shows both outcomes and exclusion or duplicate
+reasons. One excluded PR does not stop the others, and leaves no case or hidden files published.
 
 Accepted cases append to `evals/implement/cases.json`, with hidden bytes under
 `evals/implement/hidden/<case-id>/<repository-relative-path>`. IDs continue above the highest
 existing `impl-NNN`; repeated repository/PR identities are skipped. `replay` and `replay-v2`
-are tags in the existing version-1 envelope. Select the printed IDs explicitly, for example:
+are tags in the existing version-1 envelope. Successful dataset writes use the repository’s Biome
+formatting; a formatter failure excludes publication. Select the printed IDs explicitly, for example:
 
 ```sh
 limitless eval run implement --models codex/sol-6.1,claude/opus --cases impl-013,impl-014 --follow

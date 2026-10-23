@@ -1,4 +1,4 @@
-import { expect, setDefaultTimeout } from "bun:test";
+import { expect, setDefaultTimeout, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -17,10 +17,13 @@ import {
   replayRequest,
 } from "../scripts/implement-replay-cases.ts";
 import type { Invocation, Run } from "../src/core/types.ts";
-import { ImplementCaseFileSchema, loadRoleCases } from "../src/evals/cases.ts";
+import { hiddenContents, ImplementCaseFileSchema, loadRoleCases } from "../src/evals/cases.ts";
+import { prepareImplementCase } from "../src/evals/prepare.ts";
+import { createEvalWorktreeFromCache } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { type ReportInput, renderReport } from "../src/pipeline/report.ts";
+import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { recordingConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -80,20 +83,35 @@ const paths = [added, changed, renamed];
 const testSource = (expected: number) =>
   `import { expect, test } from 'bun:test';\nimport { answer } from '../answer.ts';\nimport { readFileSync } from 'node:fs';\ntest('answer and setup', () => { expect(answer).toBe(${expected}); expect(readFileSync('ready', 'utf8')).toBe('ready'); });\n`;
 
+const kinds = [
+  "valid",
+  "base-pass",
+  "head-fail",
+  "setup-failure",
+  "timeout",
+  "no-tests",
+  "snapshot-failure",
+  "load-error",
+  "contaminated",
+];
 const seed = seeded(async (root) => {
   const source = join(root, "source");
   mkdirSync(source);
   const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: source })).stdout.trim();
   await git("init", "-q", "-b", "main");
   const commits: Record<string, { base: string; head: string }> = {};
-  for (const kind of ["valid", "base-pass", "head-fail", "setup-failure", "timeout", "no-tests"]) {
+  mkdirSync(join(source, "evals/implement"), { recursive: true });
+  writeFileSync(join(source, "evals/implement/cases.json"), '{"labels":"fixture history"}');
+  for (const kind of kinds) {
     rmSync(join(source, "test"), { recursive: true, force: true });
     mkdirSync(join(source, "test"));
     writeFileSync(join(source, "answer.ts"), `export const answer = ${kind === "base-pass" ? 42 : 0};\n`);
     writeFileSync(
       join(source, ".limitless.toml"),
-      `[gates]\nsetup = ["${kind === "setup-failure" ? "false" : "printf ready > ready"}"]\n`,
+      `[gates]\nsetup = ["${kind === "setup-failure" ? "false" : "printf ready > ready"}"]\n${kind === "snapshot-failure" ? 'checks = [{ name = "reads-evals", run = "test -f evals/implement/cases.json" }]\n' : ""}`,
     );
+    if (kind === "load-error") rmSync(join(source, "answer.ts"));
+    if (kind === "contaminated") writeFileSync(join(source, "leaked.ts"), testSource(42));
     writeFileSync(join(source, changed), testSource(0));
     writeFileSync(
       join(source, "test/modified.test.ts-extra.test.ts"),
@@ -156,14 +174,7 @@ async function fixture() {
     number,
     { body: string; url: string; state: string; mergeCommit: { oid: string } | null }
   >();
-  for (const [index, kind] of [
-    "valid",
-    "base-pass",
-    "head-fail",
-    "setup-failure",
-    "timeout",
-    "no-tests",
-  ].entries())
+  for (const [index, kind] of kinds.entries())
     responses.set(index + 1, {
       body,
       url: `https://github.com/${repo}/pull/${index + 1}`,
@@ -224,7 +235,12 @@ test("squash replay preserves request, all hidden bytes, production evidence and
   try {
     const rows = await f.run([1, 1, 88]);
     expect(rows.map((r) => r.reason)).toEqual(["accepted", "duplicate PR; skipped", "duplicate PR; skipped"]);
-    expect(rows[0]).toMatchObject({ case: "impl-01000", base: "fail", head: "pass" });
+    expect(rows[0]).toMatchObject({
+      case: "impl-01000",
+      base: "fail",
+      head: "pass",
+      baseFailure: "assertion-failure",
+    });
     const file = f.read();
     expect(file.notes).toBe("Keep envelope metadata");
     expect(file.cases[0]).toEqual(f.original);
@@ -233,6 +249,7 @@ test("squash replay preserves request, all hidden bytes, production evidence and
       ...f.commits.valid,
       id: "impl-01000",
       prompt,
+      snapshot: true,
       spec: null,
       complexity: "small",
       source: `https://github.com/${repo}/pull/1`,
@@ -251,6 +268,44 @@ test("squash replay preserves request, all hidden bytes, production evidence and
         Buffer.from(testSource(42)),
       );
     expect(loadRoleCases("implement", f.casePath).cases).toHaveLength(2);
+    await sh(
+      [join(process.cwd(), "node_modules/.bin/biome"), "check", "--config-path", process.cwd(), f.casePath],
+      { cwd: process.cwd() },
+    );
+    if (!item) throw new Error("Missing generated case");
+    const cwd = join(f.root, "prepared");
+    const signal = new AbortController().signal;
+    const checkout = (base: string, snapshot: boolean) =>
+      createEvalWorktreeFromCache(
+        f.cache,
+        base,
+        base,
+        cwd,
+        signal,
+        {
+          paths: ["evals/implement"],
+          contents: [
+            readFileSync(f.casePath),
+            ...hiddenContents(item, f.casePath).map((file) => file.content),
+          ],
+        },
+        snapshot,
+      );
+    await expect(prepareImplementCase({ ...item, snapshot: false }, cwd, signal, checkout)).rejects.toThrow(
+      "pinned history contains eval labels",
+    );
+    const candidate = await confinementScope.run(f.backend, () =>
+      prepareImplementCase(item, cwd, signal, checkout),
+    );
+    try {
+      expect(candidate.effective.base).not.toBe(item.base);
+      expect(readFileSync(join(cwd, "answer.ts"), "utf8")).toContain("answer = 0");
+      expect(existsSync(join(cwd, "evals"))).toBe(false);
+      expect(existsSync(join(cwd, added))).toBe(false);
+      expect((await sh(["git", "cat-file", "-e", item.head], { cwd, allowFail: true })).exitCode).not.toBe(0);
+    } finally {
+      await candidate.cleanup();
+    }
     const before = readFileSync(f.casePath);
     expect((await f.run([1]))[0]?.reason).toContain("duplicate");
     expect(readFileSync(f.casePath)).toEqual(before);
@@ -275,11 +330,71 @@ test("base-pass, head-fail and setup failures are exclusions and do not suppress
       ["fail", "pass"],
     ]);
     for (const row of rows.slice(0, 3)) expect(row.reason).toContain("excluded");
-    expect(rows[2]?.reason).toContain("setup-failure");
+    expect(rows[2]?.reason).toContain("baseline gate setup failed");
     expect(f.read().cases).toHaveLength(2);
     expect(readdirSync(join(dirname(f.casePath), "hidden"))).toEqual(["impl-01000"]);
     await f.clean();
   } finally {
+    f.close();
+  }
+});
+
+test("snapshot baseline and contamination exclusions clean up and permit a later valid PR", async () => {
+  const f = await fixture();
+  try {
+    const before = readFileSync(f.casePath);
+    const rows = await f.run([7, 9]);
+    expect(rows[0]?.reason).toContain("snapshot mode removed evals/ and baseline check reads-evals fails");
+    expect(rows[1]?.reason).toContain("pinned history contains an eval dataset or seed patch");
+    expect(rows.every((row) => row.base === "not-run" && row.head === "not-run")).toBe(true);
+    expect(readFileSync(f.casePath)).toEqual(before);
+    expect(existsSync(join(dirname(f.casePath), "hidden"))).toBe(false);
+    await f.clean();
+    const continued = await f.run([7, 1]);
+    expect(continued[0]?.reason).toContain("baseline check reads-evals fails");
+    expect(continued[1]?.reason).toBe("accepted");
+    expect(f.read().cases).toHaveLength(2);
+    expect(readdirSync(join(dirname(f.casePath), "hidden"))).toEqual(["impl-01000"]);
+    await f.clean();
+  } finally {
+    f.close();
+  }
+});
+
+test("a missing module at base is an accepted load error with a distinct tag", async () => {
+  const f = await fixture();
+  try {
+    const rows = await f.run([8]);
+    expect(rows[0]).toMatchObject({
+      base: "fail",
+      head: "pass",
+      baseFailure: "load-error",
+      reason: "accepted",
+    });
+    expect(f.read().cases[1]?.tags).toContain("base-load-error");
+    expect(f.read().cases[1]?.tags).toContain("replay-v2");
+    await f.clean();
+  } finally {
+    f.close();
+  }
+});
+
+test("formatter failure excludes publication and leaves original dataset bytes intact", async () => {
+  const f = await fixture();
+  const original = proc.sh;
+  const format = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
+    if (cmd[0]?.endsWith("/biome")) throw new Error("fixture formatter failure");
+    return original(cmd, opts);
+  });
+  try {
+    const before = readFileSync(f.casePath);
+    expect((await f.run([1]))[0]?.reason).toContain("dataset formatter failed: fixture formatter failure");
+    expect(readFileSync(f.casePath)).toEqual(before);
+    expect(existsSync(join(dirname(f.casePath), "hidden/impl-01000"))).toBe(false);
+    expect(readdirSync(dirname(f.casePath)).sort()).toEqual(["cases.json", "hidden"]);
+    await f.clean();
+  } finally {
+    format.mockRestore();
     f.close();
   }
 });
