@@ -11,9 +11,13 @@ declare const LIMITLESS_BUILD_VERSION: string;
 declare const LIMITLESS_BUILD_SHA: string;
 declare const LIMITLESS_BUILD_PACKAGED: boolean;
 
-/** Compile-time: `true` only in the release build, to guard source-only branches. */
-export const PACKAGED_BUILD: boolean =
-  typeof LIMITLESS_BUILD_PACKAGED !== "undefined" && LIMITLESS_BUILD_PACKAGED;
+// Bun 1.4.3 folds a define only in the module that reads it, so a guard exported from here would keep
+// Babel in the binary. The source-only import therefore sits beside the define the release build sets.
+export async function sourceUiPlugin() {
+  if (typeof LIMITLESS_BUILD_PACKAGED === "undefined" || !LIMITLESS_BUILD_PACKAGED)
+    return (await import("../scripts/solid-plugin.ts")).default;
+  throw new Error("Packaged Limitless cannot compile its UI from source");
+}
 
 type BuildIdentity = { version?: string; sha?: string };
 export type Release = { version: string; bun: string } & (
