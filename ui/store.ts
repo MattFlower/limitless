@@ -11,10 +11,14 @@ import {
   type ProviderStatus,
   type QuotaAlert,
   type Run,
+  type RunStatus,
   type StreamMessage,
 } from "../src/core/types.ts";
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
 import { createCatchUp, type Timers } from "./lib/catch-up.ts";
+
+/** Runs that can still start, move between stages or wait on an answer. */
+const OPEN_STATUSES: RunStatus[] = ["queued", "waiting", "running", "waiting_input"];
 
 const [runsById, setRunsById] = createStore<Record<string, Run>>({});
 const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>(Object.create(null));
@@ -90,11 +94,14 @@ export function ensureLiveStore(
     async () => {
       alertsHydrated = false;
       pendingAlerts.clear();
-      const [runs, providers, alerts] = await Promise.all([
+      const [recent, open, providers, alerts] = await Promise.all([
         deps.listRuns({ limit: 200 }),
+        // Open runs older than the recent window still count toward the queue and stage counts.
+        deps.listRuns({ status: OPEN_STATUSES, limit: 200 }),
         deps.getProviders(),
         deps.getAlerts(),
       ]);
+      const runs = [...recent, ...open];
       // Cached runs outside that window, such as an old run resolved during a gap, are re-read by id.
       const listed = new Set(runs.map((r) => r.id));
       const omitted = Object.values(runsById)

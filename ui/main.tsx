@@ -4,6 +4,7 @@ import type { Component } from "solid-js";
 import { Show } from "solid-js";
 import { render } from "solid-js/web";
 import { NavBar } from "./components/NavBar.tsx";
+import { SidebarStatus } from "./components/SidebarStatus.tsx";
 import { Chat } from "./pages/Chat.tsx";
 import { Dashboard } from "./pages/Dashboard.tsx";
 import { EvalDetail, Evals } from "./pages/Evals.tsx";
@@ -16,22 +17,20 @@ import { Setup } from "./pages/Setup.tsx";
 import { live } from "./store.ts";
 
 const Shell: Component<RouteSectionProps> = (props) => (
-  <>
-    <NavBar />
-    <Show when={live.gateSlots()}>
-      {(slots) => (
-        <div class="gate-slots-banner" role="status">
-          Gate slots: {slots().occupied}/{slots().limit} {slots().holders.join(", ")}
+  <div class="app">
+    <aside class="sidebar">
+      <NavBar />
+      <SidebarStatus />
+    </aside>
+    <div class="app-main">
+      <Show when={live.draining()}>
+        <div class="draining-banner" role="status">
+          Draining for deployment: active runs continue; new runs are queued until scheduling resumes.
         </div>
-      )}
-    </Show>
-    <Show when={live.draining()}>
-      <div class="draining-banner" role="status">
-        Draining for deployment: active runs continue; new runs are queued until scheduling resumes.
-      </div>
-    </Show>
-    {props.children}
-  </>
+      </Show>
+      {props.children}
+    </div>
+  </div>
 );
 
 render(
