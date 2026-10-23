@@ -95,6 +95,7 @@ function offlineClient(config: WrapperConfig, detail = "offline") {
 
 test.each([
   { role: "verify", agentFullSuite: "refuse" },
+  { role: "verify", agentFullSuite: "gate" },
   { role: "implement" },
   { role: "implement", agentFullSuite: "slot" },
   { agentFullSuite: "refuse" },
@@ -228,12 +229,121 @@ test("full-suite policy defaults to slot and warns for invalid values", () => {
   expect(
     readAgentFullSuite('[limits]\nagent_full_suite = "refuse"', (warning) => warnings.push(warning)),
   ).toBe("refuse");
+  expect(readAgentFullSuite('[limits]\nagent_full_suite = "gate"', (warning) => warnings.push(warning))).toBe(
+    "gate",
+  );
   expect(warnings).toEqual([]);
   for (const value of ['"invalid"', "42", "false", "[]"])
     expect(
       readAgentFullSuite(`[limits]\nagent_full_suite = ${value}`, (warning) => warnings.push(warning)),
     ).toBe("slot");
   expect(warnings).toHaveLength(4);
+});
+
+test.each(["result", "unavailable", "offline", "malformed"])("factory gate wrapper: %s", async (scenario) => {
+  const f = fixture();
+  const events: TestWait[] = [];
+  const session = new AgentTestSession((e) => events.push(e), {
+    ...(scenario === "result"
+      ? { factoryGate: async () => ({ status: 7, text: "Factory gate run: FAIL\nfailure excerpt" }) }
+      : {}),
+  });
+  cleanup.push(() => session.close());
+  const stdout = spyOn(console, "log").mockImplementation(() => {});
+  const stderr = spyOn(console, "error").mockImplementation(() => {});
+  cleanup.push(() => {
+    stdout.mockRestore();
+    stderr.mockRestore();
+  });
+  const result = await agentTestCommand(
+    { ...f.config, token: session.token, role: "implement", agentFullSuite: "gate" },
+    ["bun", "test"],
+    async (body) => {
+      expect(body.gate).toEqual(expect.any(String));
+      expect(body.waiter).toBeUndefined();
+      if (scenario === "offline") throw new Error("transport failed");
+      if (scenario === "malformed") return { id: "bad", acquired: false };
+      return agentTestLease(body);
+    },
+  );
+  expect(result).toBe(scenario === "result" ? 7 : 1);
+  expect(existsSync(f.marker)).toBe(false);
+  if (scenario === "result") {
+    expect(stdout.mock.calls.flat().join()).toContain("failure excerpt");
+    expect(events.map((e) => e.phase)).toEqual(["gate", "gate-fail"]);
+  }
+});
+
+test("factory gate requests serialize, join request ids, hold idle time and cancel with the session", async () => {
+  const ready = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>();
+  const active: boolean[] = [];
+  let calls = 0;
+  const session = new AgentTestSession(() => {}, {
+    onWatchdog: (held) => active.push(held),
+    factoryGate: async (signal) => {
+      calls++;
+      ready.resolve();
+      await finish.promise;
+      signal.throwIfAborted();
+      return { status: 0, text: "factory pass" };
+    },
+  });
+  cleanup.push(() => session.close());
+  const body = { token: session.token, gate: "request", name: "bun test", lane: "gate" };
+  const first = session.request(body),
+    joined = session.request(body),
+    second = session.request({ ...body, gate: "second" });
+  await ready.promise;
+  expect(calls).toBe(1);
+  expect(active).toEqual([true]);
+  finish.resolve();
+  expect(await first).toEqual(await joined);
+  await second;
+  expect(calls).toBe(2);
+  expect(active).toEqual([true, false]);
+  const cancelledReady = Promise.withResolvers<void>();
+  const cancelled = new AgentTestSession(() => {}, {
+    factoryGate: async (signal) => {
+      cancelledReady.resolve();
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      signal.throwIfAborted();
+      return { status: 0, text: "unreachable" };
+    },
+  });
+  const outcome = cancelled.request({ ...body, token: cancelled.token }).catch((error: unknown) => error);
+  await cancelledReady.promise;
+  cancelled.close();
+  await cancelled.settled();
+  expect(await outcome).toBeInstanceOf(Error);
+  session.close();
+  await expect(session.request(body)).rejects.toThrow("invalid agent-test capability");
+});
+
+test("factory gate transport waits past the lease transport deadline", async () => {
+  const f = fixture(),
+    { time, clock } = fakeClock();
+  const finished = Promise.withResolvers<{
+    id: string;
+    acquired: boolean;
+    factoryGate: { status: number; text: string };
+  }>();
+  let httpCalls = 0;
+  const client = wrapperLeaseClient(
+    f.config,
+    clock,
+    async () => {
+      httpCalls++;
+      throw new Error("unexpected HTTP");
+    },
+    async () => finished.promise,
+  );
+  const reply = client({ token: f.config.token, gate: "request" }, new AbortController().signal);
+  await time.advance(60_000);
+  expect(time.pending).toBe(0);
+  expect(httpCalls).toBe(0);
+  finished.resolve({ id: "request", acquired: false, factoryGate: { status: 0, text: "factory result" } });
+  expect((await reply).factoryGate?.status).toBe(0);
 });
 
 test("unslotted argv executes immediately without requesting a lease", async () => {

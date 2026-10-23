@@ -19,6 +19,7 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  reused?: { executionId: string; treeHash: string; createdAt: number };
   name: string;
   command: string;
   ok: boolean;
@@ -463,7 +464,13 @@ export async function retryRegressions(
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const selected = cmp.flatMap((c) => {
-    if (c.verdict !== "regressed" || c.result.timedOut || confinementFailed(c.result) || !select(c))
+    if (
+      c.result.reused ||
+      c.verdict !== "regressed" ||
+      c.result.timedOut ||
+      confinementFailed(c.result) ||
+      !select(c)
+    )
       return [];
     const check = findGateCounterpart(c, cmp, cfg.checks);
     return check?.run === c.result.command ? [{ check, original: c.result }] : [];

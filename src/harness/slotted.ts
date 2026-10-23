@@ -1,7 +1,13 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { WrapperConfig } from "../cli/agent-test.ts";
-import { AgentTestSession, agentTestLease, type TestWait } from "../gates/agent-tests.ts";
+import {
+  AgentTestSession,
+  agentTestLease,
+  type FactoryGateHandler,
+  type TestWait,
+} from "../gates/agent-tests.ts";
 import { commandDir, createCommandRoot } from "./scratch.ts";
 import type { SlottedCommands } from "./slotted-config.ts";
 
@@ -26,6 +32,7 @@ export async function withSlottedCommands<T>(
   invoke: (path?: string, idleNow?: () => number) => Promise<T>,
   onWatchdog?: (active: boolean, elapsedMs: number) => void,
   policy: Pick<WrapperConfig, "role" | "agentFullSuite"> = {},
+  factoryGate?: FactoryGateHandler,
 ): Promise<T> {
   if (!commands.length) return invoke();
   const source = await wrapperBundle();
@@ -33,7 +40,10 @@ export async function withSlottedCommands<T>(
   // Every agent and gate profile denies reads under the shared root except to this directory's owner.
   const directory = commandDir(scratch, cwd);
   mkdirSync(directory, { mode: 0o700 });
-  const session = new AgentTestSession(event, { onWatchdog });
+  const session = new AgentTestSession(event, {
+    onWatchdog,
+    factoryGate: factoryGate && AsyncLocalStorage.bind(factoryGate),
+  });
   const unix = join(scratch, `slot-${crypto.randomUUID().slice(0, 8)}.sock`);
   let server: ReturnType<typeof Bun.serve> | undefined;
   try {
@@ -52,7 +62,8 @@ export async function withSlottedCommands<T>(
           if (body.token !== session.token) return new Response("forbidden", { status: 403 });
           req.signal.throwIfAborted();
           const lease = await agentTestLease(body);
-          if (req.signal.aborted) await agentTestLease({ ...body, id: lease.id, release: true });
+          if (req.signal.aborted && body.gate === undefined)
+            await agentTestLease({ ...body, id: lease.id, release: true });
           req.signal.throwIfAborted();
           return Response.json(lease);
         } catch {
@@ -87,6 +98,7 @@ export async function withSlottedCommands<T>(
   } finally {
     session.close();
     server?.stop(true);
+    await session.settled();
     rmSync(unix, { force: true });
     rmSync(directory, { recursive: true, force: true });
   }

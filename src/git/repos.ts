@@ -500,7 +500,7 @@ export async function exportCommit(
       ...(process.env as Record<string, string>),
       GIT_INDEX_FILE: join(scratch, "index"),
     };
-    await worktreeGit(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
+    await worktreeGit(["git", "read-tree", `${sha}^{tree}`], { cwd, env, signal, timeoutMs: 300_000 });
     await worktreeGit(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
       env,
@@ -508,6 +508,16 @@ export async function exportCommit(
       signal,
       timeoutMs: 300_000,
     });
+  });
+}
+
+/** The tree commitAll would produce, without changing HEAD, the index or working files. */
+export async function snapshotTree(cwd: string, signal?: AbortSignal): Promise<string> {
+  return withScratch(cwd, async (scratch) => {
+    const opts = { cwd, signal, env: { ...process.env, GIT_INDEX_FILE: join(scratch, "index") } };
+    await worktreeGit(["git", "read-tree", "HEAD"], opts);
+    await stageAll(opts);
+    return (await worktreeGit(["git", "write-tree"], opts)).stdout.trim();
   });
 }
 
