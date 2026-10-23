@@ -1,13 +1,12 @@
 import { existsSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
-import { type Release, release, resourcePath, sourceUiPlugin } from "../release.ts";
+import { PACKAGED_BUILD, type Release, release, resourcePath } from "../release.ts";
 import { UI_RESOURCE, uiBuildOptions } from "./ui-build.ts";
 
 /** Build once; direct Bun HTML mounts bypass the socket-peer authorization wrapper. */
 export async function buildUi(info: Release = release): Promise<Record<string, Blob>> {
-  if (info.kind === "source") {
-    const solidPlugin = await sourceUiPlugin();
-    if (!solidPlugin) throw new Error("Source UI compilation is unavailable in packaged Limitless");
+  if (!PACKAGED_BUILD && info.kind === "source") {
+    const { default: solidPlugin } = await import("../../scripts/solid-plugin.ts");
     const result = await Bun.build(uiBuildOptions(solidPlugin));
     if (!result.success) throw new AggregateError(result.logs, "UI build failed");
     return Object.fromEntries(result.outputs.map((file) => [`/${basename(file.path)}`, file]));
