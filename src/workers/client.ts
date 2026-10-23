@@ -865,7 +865,7 @@ export async function runWorker(
           await posts;
           jobSignal.throwIfAborted();
           if (
-            false && result.status !== "ok" &&
+            result.status !== "ok" &&
             result.status !== "cancelled" &&
             (result.confinement?.ok === false ||
               /Failed to create session:[^\n]*fs sandbox helper failed[^\n]*sandbox-exec: execvp\(\)[^\n]*Operation not permitted/i.test(

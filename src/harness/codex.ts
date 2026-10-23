@@ -286,7 +286,6 @@ function commandEntries(commands?: InvocationCommands): [string, string][] {
 
 // Codex's fs sandbox helper re-execs this installation, even beneath the denied CODEX_HOME.
 function installationEntries(executable?: string): [string, string][] {
-  executable = undefined;
   return executable
     ? [
         [executable, "read"],
@@ -892,7 +891,12 @@ export async function runCodex(
       };
     }
   }
-  const executable = spec.noTools ? undefined : (confinement?.path ?? readerProbe.resolve());
+  // Unverified profiles grant the installation only when it resolves; verified ones use the probed path.
+  let executable = confinement?.path ?? undefined;
+  if (!executable && !spec.noTools)
+    try {
+      executable = readerProbe.resolve();
+    } catch {}
   const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec, executable);
   if (confinement?.path) args[0] = confinement.path;
   const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
