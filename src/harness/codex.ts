@@ -45,6 +45,9 @@ import {
   redactJsonLine,
   type Usage,
 } from "./types.ts";
+import { CODEX_VERSION } from "./versions.ts";
+
+export { CODEX_VERSION } from "./versions.ts";
 
 type Json = Record<string, unknown>;
 
@@ -316,8 +319,6 @@ export function editorProfile(spec: AgentSpec): string[] {
 
 /** ENOENT is never a denial: every canary exists. */
 const MISSING = /no such file|\bENOENT\b/i;
-/** `codex --version` prints one line such as `codex-cli 0.157.1`. */
-export const CODEX_VERSION = /^codex(?:-cli)?\s+v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/;
 const NOT_ENFORCED: ConfinementFailure = "reader profile not enforced";
 const WRITE_NOT_ENFORCED: ConfinementFailure = "write profile not enforced";
 const INCONCLUSIVE: ConfinementFailure = "probe inconclusive";

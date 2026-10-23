@@ -6618,15 +6618,30 @@ test.each([
 test.each(["match", "differs", "absent", "unreadable"])(
   "heartbeat stores parity without retaining the digest (%s)",
   async (kind) => {
-    await listen();
+    const logs: string[] = [];
+    await listen("127.0.0.1:0", (text) => logs.push(text));
     const token = await paired();
     const file = join(cfg.paths.configDir, "private-strings.txt");
     writeFileSync(file, "one.example\n");
     const digest = privateStringsDigest(loadPrivateStrings(cfg.paths.configDir));
     if (kind === "differs") writeFileSync(file, "two.example\n");
     if (kind === "unreadable") linkSync(file, join(home, "private-link"));
-    const body = { ...caps(), privateStringsDigest: kind === "absent" ? undefined : digest };
-    expect((await call("/worker/heartbeat", body, token)).status).toBe(200);
+    const account = `account=${["synthetic", "worker"].join("-")}@example.com`;
+    const agents = {
+      claude: { version: null, loggedIn: true },
+      codex: { version: null, loggedIn: true },
+    };
+    const body = {
+      ...caps(),
+      agents: {
+        claude: { version: account, loggedIn: true },
+        codex: { version: account, loggedIn: true },
+      },
+      privateStringsDigest: kind === "absent" ? undefined : digest,
+    };
+    const heartbeat = await call("/worker/heartbeat", body, token);
+    expect(heartbeat.status).toBe(200);
+    expect(JSON.stringify(heartbeat.json())).not.toContain(account);
     const row = workers.worker("runner");
     if (!row) throw new Error("Missing worker");
     expect(
@@ -6638,12 +6653,17 @@ test.each(["match", "differs", "absent", "unreadable"])(
     const legacy = Heartbeat.omit({ agents: true, privateStringsDigest: true }).strict();
     expect(legacy.parse(JSON.parse(row.capabilities ?? "null"))).toEqual(legacy.strip().parse(caps()));
     expect(workers.available(row)).toBe(true);
+    const privateStrings = kind === "match" || kind === "differs" ? kind : "unknown";
+    expect(JSON.parse(row.agent_capabilities ?? "null")).toEqual({ agents, privateStrings });
     expect(workers.list()[0]).toMatchObject({
-      ...(kind === "unreadable" ? {} : { agents: caps().agents }),
-      privateStrings: kind === "match" || kind === "differs" ? kind : "unknown",
+      ...(kind === "unreadable" ? {} : { agents }),
+      privateStrings,
     });
     expect(JSON.stringify(row)).not.toContain(digest);
     expect(JSON.stringify(workers.list())).not.toContain(digest);
+    expect(JSON.stringify(row)).not.toContain(account);
+    expect(JSON.stringify(workers.list())).not.toContain(account);
+    expect(JSON.stringify(logs)).not.toContain(account);
     cfg.port = 0;
     const factory = new Factory(cfg, { store, bootSha: releaseSha, models: [], providers: [] });
     const credential = createApiToken(cfg.paths.home);
@@ -6653,7 +6673,28 @@ test.each(["match", "differs", "absent", "unreadable"])(
         headers: { authorization: `Bearer ${credential.token}` },
       });
       expect(response.status).toBe(200);
-      expect(await response.text()).not.toContain(digest);
+      const listing = await response.text();
+      expect(listing).not.toContain(digest);
+      expect(listing).not.toContain(account);
+      if (kind === "match") {
+        const cli = await runProcess({
+          cmd: [process.execPath, "src/cli/main.ts", "workers", "ls"],
+          cwd: join(import.meta.dir, ".."),
+          env: {
+            ...process.env,
+            LIMITLESS_HOME: cfg.paths.home,
+            LIMITLESS_CONFIG_DIR: cfg.paths.configDir,
+            LIMITLESS_URL: api.url.origin,
+          },
+          timeoutMs: 10_000,
+        });
+        expect(cli.exitCode).toBe(0);
+        expect(cli.stdout.trim()).toBe(
+          "runner\tavailable\tclaude:unknown\tcodex:unknown\tprivate-strings:match",
+        );
+        expect(cli.stdout).not.toContain(account);
+        expect(cli.stderr).not.toContain(account);
+      }
     } finally {
       await api.stop(true);
       credential.release();

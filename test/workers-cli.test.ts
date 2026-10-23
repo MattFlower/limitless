@@ -27,6 +27,12 @@ test("workers ls appends CLI versions, login state and private-strings parity", 
           agents: { claude: { version: null, loggedIn: true }, codex: { version: null, loggedIn: false } },
           privateStrings: "unknown",
         },
+        {
+          name: "unknown-codex-version",
+          state: "available",
+          agents: { codex: { version: null, loggedIn: true } },
+          privateStrings: "match",
+        },
       ]),
   });
   try {
@@ -46,6 +52,7 @@ test("workers ls appends CLI versions, login state and private-strings parity", 
       "ready\tavailable\tclaude:2.1.3 (Claude Code)\tcodex:logged out\tprivate-strings:match",
       "legacy\tavailable\tclaude:missing\tcodex:missing\tprivate-strings:unknown",
       "unknown-version\tavailable\tclaude:unknown\tcodex:missing\tprivate-strings:unknown",
+      "unknown-codex-version\tavailable\tclaude:missing\tcodex:unknown\tprivate-strings:match",
     ]);
   } finally {
     server.stop(true);

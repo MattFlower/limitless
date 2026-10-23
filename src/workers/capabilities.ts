@@ -1,4 +1,4 @@
-import { CODEX_VERSION } from "../harness/codex.ts";
+import { CLAUDE_VERSION, CODEX_VERSION } from "../harness/versions.ts";
 import { agentEnv, sh } from "../util/proc.ts";
 
 export type Cli = { version: string | null; loggedIn: boolean };
@@ -42,7 +42,7 @@ export async function probeAgents(
   const probe = async (name: keyof typeof loginArgs): Promise<Cli> => {
     const result = await command(name, ["--version"], run, signal);
     const line = result?.exitCode === 0 ? (result.stdout.split("\n")[0]?.trim() ?? "") : "";
-    const pattern = name === "codex" ? CODEX_VERSION : /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)? \(Claude Code\)$/;
+    const pattern = name === "codex" ? CODEX_VERSION : CLAUDE_VERSION;
     return {
       version: pattern.test(line) ? line : null,
       loggedIn: result?.exitCode === 0 && (await checkLogin(name, run, signal)),

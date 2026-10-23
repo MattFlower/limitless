@@ -2,11 +2,26 @@ import { expect, test } from "bun:test";
 import { checkLogin, loggedIn, probeAgents } from "../src/workers/capabilities.ts";
 import { Heartbeat } from "../src/workers/protocol.ts";
 
+const base = {
+  releaseSha: "release",
+  bunVersion: "bun",
+  os: "darwin",
+  osVersion: "test",
+  cpuCount: 1,
+  ramBytes: 1,
+  freeSlots: 0,
+  onAC: true,
+  idleSeconds: 0,
+  jobs: [],
+};
+
 for (const [claude, codex, accepted] of [
   ["2.1.3 (Claude Code)", "codex-cli 0.50.0", true],
   ["2.1.3-beta.1 (Claude Code)", "codex v0.50.0-beta.1", true],
   ["Claude Code", "codex foo", false],
   ["2.1.3 (Claude Code) account", "codex-cli 0.50.0 account", false],
+  ["account=user@example.com", "account=user@example.com", false],
+  ["codex-cli 0.50.0", "2.1.3 (Claude Code)", false],
 ] as const)
   test(`CLI version validation: ${claude}, ${codex}`, async () => {
     const calls: string[][] = [];
@@ -30,7 +45,32 @@ for (const [claude, codex, accepted] of [
     expect(calls).toContainEqual(["claude", "auth", "status"]);
     expect(calls).toContainEqual(["codex", "login", "status"]);
     expect(JSON.stringify(result)).not.toContain("user@example.com");
+    expect(Heartbeat.parse({ ...base, agents: result }).agents).toEqual(result);
   });
+
+test.each([
+  ["2.1.3 (Claude Code)", "codex-cli 0.50.0", true],
+  ["2.1.3-beta.1 (Claude Code)", "codex v0.50.0-beta.1", true],
+  ["2.1.3 (Claude Code)", "codex-cli v0.50.0", true],
+  ["2.1.3 (Claude Code)", "codex 0.50.0", true],
+  [null, null, true],
+  ["account=user@example.com", "account=user@example.com", false],
+  ["2.1.3 (Claude Code) account", "codex-cli 0.50.0 account", false],
+  ["2.1.3 (Claude Code)\naccount", "codex-cli 0.50.0\naccount", false],
+  ["codex-cli 0.50.0", "2.1.3 (Claude Code)", false],
+] as const)("heartbeat sanitizes CLI versions (%s, %s)", (claude, codex, accepted) => {
+  const parsed = Heartbeat.parse({
+    ...base,
+    agents: {
+      claude: { version: claude, loggedIn: true },
+      codex: { version: codex, loggedIn: false },
+    },
+  });
+  expect(parsed.agents).toEqual({
+    claude: { version: accepted ? claude : null, loggedIn: true },
+    codex: { version: accepted ? codex : null, loggedIn: false },
+  });
+});
 
 test.each([
   [0, "logged in", true],
@@ -57,18 +97,6 @@ test("missing or failed CLIs never log in or expose command failures", async () 
 });
 
 test("heartbeat additions are optional, strict, and validate digest shape", () => {
-  const base = {
-    releaseSha: "release",
-    bunVersion: "bun",
-    os: "darwin",
-    osVersion: "test",
-    cpuCount: 1,
-    ramBytes: 1,
-    freeSlots: 0,
-    onAC: true,
-    idleSeconds: 0,
-    jobs: [],
-  };
   expect(Heartbeat.safeParse(base).success).toBe(true);
   for (const fields of [
     { agents: { claude: { version: null, loggedIn: true, account: "user@example.com" } } },
@@ -77,4 +105,16 @@ test("heartbeat additions are optional, strict, and validate digest shape", () =
     { privateStringsDigest: "a".repeat(63) },
   ])
     expect(Heartbeat.safeParse({ ...base, ...fields }).success).toBe(false);
+  for (const name of ["claude", "codex"]) {
+    for (const version of [undefined, 1, true, {}, []])
+      expect(Heartbeat.safeParse({ ...base, agents: { [name]: { version, loggedIn: true } } }).success).toBe(
+        false,
+      );
+    expect(
+      Heartbeat.safeParse({
+        ...base,
+        agents: { [name]: { version: null, loggedIn: "true" } },
+      }).success,
+    ).toBe(false);
+  }
 });

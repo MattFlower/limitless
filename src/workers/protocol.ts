@@ -3,6 +3,7 @@ import { z } from "zod";
 import { launchFailure } from "../gates/output.ts";
 import type { GateResult } from "../gates/run.ts";
 import { MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
+import { CLAUDE_VERSION, CODEX_VERSION } from "../harness/versions.ts";
 
 export function pairingCode(coordinator: string, worker: string, nonce: string): string {
   const digest = createHash("sha256")
@@ -11,8 +12,19 @@ export function pairingCode(coordinator: string, worker: string, nonce: string):
   return [...digest.subarray(0, 16)].map((b) => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[b % 32]).join("");
 }
 
-const Cli = z.object({ version: z.string().nullable(), loggedIn: z.boolean() }).strict();
-export const Agents = z.object({ claude: Cli.optional(), codex: Cli.optional() }).strict();
+const cli = (pattern: RegExp) =>
+  z
+    .object({
+      version: z
+        .string()
+        .nullable()
+        .transform((value) => (value && pattern.test(value) ? value : null)),
+      loggedIn: z.boolean(),
+    })
+    .strict();
+export const Agents = z
+  .object({ claude: cli(CLAUDE_VERSION).optional(), codex: cli(CODEX_VERSION).optional() })
+  .strict();
 export const AgentCapabilities = z
   .object({
     agents: Agents.optional(),
