@@ -51,7 +51,7 @@ const SECRETS: [RegExp, string][] = [
 
 const ASSERTION = /\b(expect|assert\w*|should)\b|\bt\.(Error|Fatal|Fail)/;
 
-function globToRegex(glob: string): RegExp {
+export function globToRegex(glob: string): RegExp {
   const escaped = glob
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*\*\/?/g, "@@GLOBSTAR@@")

@@ -464,6 +464,67 @@ function fakeLandGates(
   return { executor, requests };
 }
 
+test.each(["targeted", "skipped", "mixed"])("land docs-only selection: %s", async (mode) => {
+  mkdirSync(join(seed, "test"));
+  writeFileSync(join(seed, "test/a.test.ts"), mode === "skipped" ? "unrelated" : "README.md");
+  writeFileSync(join(seed, "test/b.test.ts"), "unrelated");
+  writeFileSync(
+    join(seed, ".limitless.toml"),
+    `[gates]
+docs = ["*.md"]
+retry_files = "fake-targeted {files}"
+checks = [{name="lint",run="fake-lint"}, {name="test",run="fake-full $LIMITLESS_GATE_REPORT"}]
+`,
+  );
+  await sh(["git", "add", "."], { cwd: seed });
+  await sh(["git", "commit", "-qm", "docs gates"], { cwd: seed });
+  await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
+  const pr = delivered(1, "pr-1");
+  let head = await pushBranch("pr-1", "README.md", "updated\n");
+  if (mode === "mixed") head = await pushBranch("pr-1", "source.ts", "export {};\n");
+  observe(1, head);
+  approve(1, head);
+  const commands: string[] = [];
+  const realProcess = proc.runProcess;
+  const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+    if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+    opts.onStdoutLine?.(opts.cmd[4] ?? "");
+    commands.push(opts.cmd.at(-1) ?? "");
+    return {
+      exitCode: 0,
+      signal: null,
+      cancelled: false,
+      timedOut: false,
+      idleTimedOut: false,
+      truncated: false,
+      stdout: "passed",
+      stderr: "",
+      durationMs: 1,
+    };
+  });
+  const q = queue();
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "landed");
+    expect(commands).toEqual([
+      "fake-lint",
+      ...(mode === "skipped"
+        ? []
+        : [mode === "targeted" ? "fake-targeted './test/a.test.ts'" : "fake-full $LIMITLESS_GATE_REPORT"]),
+    ]);
+    const log = readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8");
+    expect(log).toContain(`"mode":"${mode === "mixed" ? "full" : mode}"`);
+    if (mode === "targeted") expect(log).toContain("test/a.test.ts");
+    if (mode === "skipped") expect(log).toContain("docs-only change; no test reads the changed files");
+    expect(
+      store.listEvents(pr.run.id).some((e) => e.type === "gate" && e.message.includes("Gate selection:")),
+    ).toBe(true);
+  } finally {
+    await q.stop();
+    processSpy.mockRestore();
+  }
+});
+
 test.each([false, true])("targeted land retries record flakes through CI (restart: %s)", async (restart) => {
   const { pr, head } = await retryLandFixture();
   const credential = "synthetic-targeted-land-secret";

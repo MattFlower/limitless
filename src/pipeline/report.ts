@@ -286,7 +286,7 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
       table(
         ["Check", "Result", ...(commands ? ["Command"] : [])],
         state.lastGates.map((g) => {
-          const warn = g.verdict === "still_failing" || g.verdict === "flaky";
+          const warn = g.verdict === "still_failing" || g.verdict === "flaky" || g.verdict === "not_run";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
           const row = [g.name, `${icon} ${g.result.timedOut ? "timed out" : g.verdict.replace("_", " ")}`];
           const command = clipCell(g.result.command);

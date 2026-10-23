@@ -5,6 +5,7 @@ import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
+import { type DocsSelection, quoteRetryFiles } from "./docs.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
 import { type FailedTestFiles, readJUnit, readJUnitSkips, validRetryFiles } from "./junit.ts";
@@ -37,6 +38,7 @@ export interface GateResult {
   /** Affirmative whole-stream and JUnit evidence, required only for targeted-only retries. */
   failureAttributionComplete?: boolean;
   targetedRetry?: GateResult;
+  docsOnly?: DocsSelection;
 }
 
 export interface GateRun {
@@ -288,7 +290,7 @@ export async function retryFailures(
         files.length <= UNSLOTTED_RETRY_MAX_FILES &&
         times.every((time) => time !== undefined && Number.isFinite(time) && time >= 0) &&
         times.reduce<number>((total, time) => total + (time ?? 0), 0) <= UNSLOTTED_RETRY_MAX_SECONDS;
-      const quoted = files.map((file) => `'./${file.replaceAll("'", "'\\''")}'`).join(" ");
+      const quoted = quoteRetryFiles(files);
       const run = cfg.retryFiles.replace("{files}", () => quoted);
       const timeoutSec = skipGateSlot
         ? Math.min(check.timeoutSec ?? 900, 2 * UNSLOTTED_RETRY_MAX_SECONDS)
@@ -391,6 +393,10 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     return out;
   }
   for (const r of after.checks) {
+    if (r.docsOnly?.mode === "skipped") {
+      out.push({ name: r.name, verdict: "not_run", blocking: false, result: r });
+      continue;
+    }
     const before = findGateCounterpart(r, after.checks, baseline?.checks ?? []);
     const baselineConfinementError = confinementFailed(before);
     let verdict: GateVerdict;
@@ -478,7 +484,7 @@ export async function retryRegressions(
       ...c,
       verdict: confinementError ? "confinement_error" : retry.ok ? "flaky" : "regressed",
       blocking: confinementError || !retry.ok,
-      result: retry,
+      result: { ...retry, ...(c.result.docsOnly ? { docsOnly: c.result.docsOnly } : {}) },
       firstAttempt: c.result,
     };
   });

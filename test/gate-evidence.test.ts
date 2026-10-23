@@ -65,6 +65,31 @@ function gates(): GateEvidence {
 const resolve = (value: Verify, evidence?: GateEvidence, publicSpec = spec, currentSha = sha) =>
   normalizeVerify(applyGateEvidence(value, publicSpec, holdout, currentSha, evidence), publicSpec, holdout);
 
+test.each(["targeted", "skipped"] as const)("docs-only %s cannot substitute for a full suite", (mode) => {
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw new Error("missing test check");
+  check.result.docsOnly = {
+    mode,
+    changedPaths: ["README.md"],
+    files: mode === "targeted" ? ["test/loopback.test.ts"] : [],
+    reason: "docs-only change",
+  };
+  if (mode === "skipped") {
+    check.verdict = "not_run";
+    check.result.ok = false;
+  }
+  const fullSpec = {
+    ...spec,
+    acceptance_criteria: [{ id: "AC-1", criterion: "tests pass", how_to_verify: "bun test" }],
+  };
+  expect(resolve(blocked, gates(), fullSpec).criteria[0]?.status).toBe("met");
+  const result = resolve(blocked, evidence, fullSpec).criteria[0];
+  expect(result?.status).toBe("blocked");
+  expect(result?.evidence).toStartWith("Factory gate substitution unavailable: docs-only");
+  expect(result?.evidence).toContain(mode === "skipped" ? "skip" : "targeting");
+});
+
 test("the model cannot supply gate provenance; model judgments and prose pass through unchanged", () => {
   const model = {
     overall: "pass",
