@@ -591,6 +591,29 @@ describe("runGates / compareGates", () => {
     ]);
   });
 
+  test.each([true, false])("a docs-skipped baseline provides no pass/fail evidence (ok=%s)", (ok) => {
+    const baseline: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [
+        {
+          ...r("test", false),
+          docsOnly: {
+            mode: "skipped",
+            changedPaths: ["docs/guide.md"],
+            files: [],
+            reason: "docs-only change; no test reads the changed files",
+          },
+        },
+      ],
+    };
+    const after: GateRun = { setupOk: true, setup: [], checks: [r("test", ok)] };
+    expect(compareGates(baseline, after)[0]).toMatchObject({
+      verdict: ok ? "new_pass" : "new_failure",
+      blocking: !ok,
+    });
+  });
+
   test.each(["flag", "output", "firstAttempt", "targetedRetry"] as const)(
     "baseline confinement failure makes only its check unusable (%s)",
     (kind) => {

@@ -401,7 +401,9 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     const baselineConfinementError = confinementFailed(before);
     let verdict: GateVerdict;
     if (confinementFailed(r)) verdict = "confinement_error";
-    else if (!before || baselineConfinementError) verdict = r.ok ? "new_pass" : "new_failure";
+    // A skipped reference provides no evidence that a later failure already existed.
+    else if (!before || before.docsOnly?.mode === "skipped" || baselineConfinementError)
+      verdict = r.ok ? "new_pass" : "new_failure";
     else if (before.ok && r.ok) verdict = "pass";
     else if (before.ok && !r.ok) verdict = "regressed";
     else if (!before.ok && r.ok) verdict = "fixed";
