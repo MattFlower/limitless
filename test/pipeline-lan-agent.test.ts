@@ -21,6 +21,7 @@ import { workerRequest } from "../src/workers/tls.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { approve, pipelineSetup, providers, roleOf, triage, waitFor } from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
+import { workerStartupFailures } from "./worker-startup-support.ts";
 
 let home = "",
   repoDir = "",
@@ -1618,3 +1619,88 @@ test("shutdown cancels review and resume runs review again", async () => {
     await stop();
   }
 });
+
+test.each(workerStartupFailures)(
+  "worker startup %s falls back without provider penalties",
+  async (_label, error) => {
+    const bare = await githubFixture();
+    let f: Factory;
+    let provider = "";
+    let before: ReturnType<typeof snapshot> | undefined;
+    let after: ReturnType<typeof snapshot> | undefined;
+    const snapshot = () => {
+      const { updatedAt: _time, inFlight: _slots, ...status } = f.tracker.status(provider) ?? {};
+      return { tracker: status, stored: f.store.getProviderRow(provider) };
+    };
+    const instance = boot({
+      executor: {
+        kind: "test",
+        async run(call, local) {
+          if (call.role === "implement") {
+            provider = call.spec.target.provider;
+            before = snapshot();
+          }
+          return lanAgentExecutor(f.workers, f.cfg).run(call, () => {
+            if (call.role === "implement") after = snapshot();
+            return local();
+          });
+        },
+      },
+    });
+    f = instance.f;
+
+    registerGithub(f, bare);
+    const listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+    if (!listener) throw new Error("Missing listener");
+    const remote = loadConfig({ home: join(home, "remote"), configDir: join(home, "cfg"), raw: {} });
+    const controller = new AbortController();
+    let task: Promise<void> | undefined;
+    let attempts = 0;
+    try {
+      await pairWorker(listener.url.origin, join(remote.paths.home, "worker"), "worker", (text) =>
+        f.workers.approve(text.split(": ")[1] ?? ""),
+      );
+      task = runWorker(listener.url.origin, remote, release, controller.signal, {
+        confinement: fakeConfinement,
+        heartbeatMs: 10,
+        retryMs: 5,
+        capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
+        tokenLookup: async () => "fixture-worker-token",
+        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+        harnesses: {
+          claude: fakeHarness(() => {
+            attempts++;
+            // The job is already leased; expire the unclaimed retry promptly after it fails.
+            f.workers.times.pickup = 1;
+            return { fault: "exit", error };
+          }),
+        },
+      });
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+      expect(attempts).toBe(1);
+      expect(instance.locals()).toBe(1);
+      expect(after).toEqual(before);
+      expect(jobs(f)).toMatchObject([
+        { state: "failed", result: null, result_sha: null, excluded: '["worker"]' },
+      ]);
+      expect(jobs(f)[0]?.failure_reason).toBeTruthy();
+      // Read the delivered branch: the run's worktree can be cleaned up once the run has finished.
+      const delivered = f.store.getRun(run.id);
+      expect(
+        (await sh(["git", "show", `refs/heads/${delivered?.branch}:farewell.txt`], { cwd: bare })).stdout,
+      ).toBe("local goodbye\n");
+      expect(f.store.listStages(run.id).filter((stage) => stage.name === "implement")).toMatchObject([
+        { status: "succeeded", summary: expect.not.stringContaining("no changes") },
+      ]);
+      expect(f.store.listInvocations(run.id).filter((i) => i.role === "implement")).toMatchObject([
+        { status: "ok", error: null },
+      ]);
+    } finally {
+      controller.abort();
+      await task;
+      await listener.stop();
+    }
+  },
+  60_000,
+);
