@@ -178,6 +178,48 @@ test("interrupted restart before kickstart resumes scheduling and releases signa
   expect(existsSync(f.opts.lockPath)).toBe(false);
 });
 
+for (const resumeFails of [false, true]) {
+  test(`failed kickstart recovers the draining scheduler (resume fails: ${resumeFails})`, async () => {
+    const f = setup();
+    const command = f.opts.command;
+    f.opts.command = async (args, opts) => {
+      if (args[0] === "launchctl" && args[1] === "kickstart") {
+        f.calls.push(args.join(" "));
+        throw new Error("kickstart failed: service not found");
+      }
+      return command(args, opts);
+    };
+    if (resumeFails) {
+      const admin = f.client.admin;
+      f.client.admin = async (action, signal) => {
+        if (action === "resume") {
+          f.calls.push(action);
+          throw new Error("resume denied");
+        }
+        return admin(action, signal);
+      };
+    }
+    await expect(restart(7400, { ...f.opts, now: true })).rejects.toThrow(
+      "kickstart failed: service not found",
+    );
+    expect(f.calls.slice(f.calls.indexOf(kickstart), f.calls.indexOf(kickstart) + 3)).toEqual([
+      kickstart,
+      "health",
+      "resume",
+    ]);
+    if (resumeFails) {
+      expect(f.logs.join("\n")).toContain("resume scheduler: Error: resume denied");
+      expect(f.logs.join("\n")).toContain("daemon is left DRAINING");
+      expect(f.logs.join("\n")).toContain("Recover with: curl");
+      expect(f.logs.join("\n")).toContain("http://127.0.0.1:7400/api/admin/resume");
+    } else {
+      expect((await f.client.health(new AbortController().signal)).draining).toBe(false);
+    }
+    expect(f.logs).toContain("custom.daemon: loaded");
+    expect(existsSync(f.opts.lockPath)).toBe(false);
+  });
+}
+
 for (const failure of ["old boot", "wrong SHA", "missing SHA", "unreachable"]) {
   test(`restart health timeout reports service status without rollback: ${failure}`, async () => {
     const f = setup();
@@ -188,6 +230,7 @@ for (const failure of ["old boot", "wrong SHA", "missing SHA", "unreachable"]) {
       if (failure === "unreachable") throw new Error("offline");
       return {
         ...state,
+        draining: failure === "old boot" ? !f.calls.includes("resume") : state.draining,
         startedAt: failure === "old boot" ? 1 : state.startedAt,
         sha: failure === "wrong SHA" ? "other" : failure === "missing SHA" ? "unknown" : state.sha,
       };
@@ -196,7 +239,7 @@ for (const failure of ["old boot", "wrong SHA", "missing SHA", "unreachable"]) {
     expect(f.calls.filter((call) => call === kickstart)).toHaveLength(1);
     expect(f.calls).toContain(`launchctl print gui/${userInfo().uid}/custom.daemon`);
     expect(f.calls).toContain("git log -1 --format=%h %s");
-    expect(f.calls).not.toContain("resume");
+    expect(f.calls.filter((call) => call === "resume")).toHaveLength(failure === "old boot" ? 1 : 0);
     expect(f.logs).toContain("custom.daemon: loaded");
     expect(f.logs).toContain("release: release subject");
     expect(f.logs).toContain(`health: ${failure === "unreachable" ? "unreachable" : "ok"}`);

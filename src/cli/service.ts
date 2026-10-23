@@ -511,6 +511,12 @@ async function kickstart(opts: ServiceOptions, label?: string): Promise<unknown>
   return (opts.command ?? sh)(["launchctl", "kickstart", "-k", `gui/${uid}/${label}`], { cwd: home });
 }
 
+function resumeFailure(port: number, error: unknown): string {
+  const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
+  const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
+  return `resume scheduler: ${String(error)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`;
+}
+
 export async function restart(port: number, opts: ServiceOptions = {}): Promise<void> {
   const client = opts.client ?? localDeployClient(port),
     clock = opts.clock ?? deployClock;
@@ -536,7 +542,21 @@ export async function restart(port: number, opts: ServiceOptions = {}): Promise<
       const replacement = await race(waitForHealthy(client, clock, running.sha, log, before));
       log(`daemon after: ${replacement.sha}; new boot healthy`);
     } catch (error) {
-      if (!restartAttempted) await requestAdmin(client, clock, "resume");
+      if (!restartAttempted || !interruption()) {
+        const draining =
+          !restartAttempted ||
+          (await bounded(clock, (signal) => client.health(signal)).then(
+            (state) => state.draining,
+            () => false,
+          ));
+        if (draining) {
+          try {
+            await requestAdmin(client, clock, "resume");
+          } catch (resume) {
+            log(resumeFailure(port, resume));
+          }
+        }
+      }
       if (restartAttempted && !interruption()) await status(port, opts);
       throw error;
     }
@@ -709,11 +729,7 @@ export async function deploy(
       try {
         await requestAdmin(client, clock, "resume");
       } catch (resume) {
-        const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
-        const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
-        cleanupErrors.push(
-          `resume scheduler: ${String(resume)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`,
-        );
+        cleanupErrors.push(resumeFailure(port, resume));
       }
     }
     throw new Error(
