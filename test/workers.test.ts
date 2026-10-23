@@ -2032,6 +2032,150 @@ test("daemon shutdown detaches a LAN handle, which reattaches without creating a
   expect(workers.job(handle.id)?.state).toBe("cancelled");
 }, 30_000);
 
+const gateTimers = ["fresh", "pickup", "lease"] as const;
+type GateTimer = (typeof gateTimers)[number];
+const gateFailure = {
+  fresh: "Worker disconnected",
+  pickup: "No worker picked up job",
+  lease: "Lease expired",
+};
+
+function restartGate(timer: GateTimer, resumedAt: number | null | undefined, persistedAt = 1000) {
+  let now = 1000;
+  workers = new WorkerStore(store, releaseSha, { fresh: 30, pickup: 40, lease: 60 }, () => now);
+  workers.pairingKey = "test-pairing-key";
+  workers.approve(workers.pair("runner", "a".repeat(64), "b".repeat(64)).code);
+  const worker = workers.worker("runner");
+  if (!worker) throw new Error("missing worker fixture");
+  workers.heartbeat(worker, caps());
+  const id = workers.enqueue({
+    repo: "test/repo",
+    cwd: home,
+    baseSha: releaseSha,
+    headSha: releaseSha,
+    gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+  });
+  if (timer !== "pickup") expect(workers.lease(worker.name)?.id).toBe(id);
+  store.db
+    .query("UPDATE workers SET last_heartbeat_at=? WHERE name=?")
+    .run(timer === "fresh" ? persistedAt : 100_000, worker.name);
+  store.db
+    .query("UPDATE gate_jobs SET updated_at=?,lease_expires_at=?,attempt_deadline_at=? WHERE id=?")
+    .run(persistedAt, timer === "lease" ? persistedAt + 60 : 100_000, 100_000, id);
+  workers.resumedAt = resumedAt;
+  return {
+    id,
+    worker,
+    at: (time: number) => {
+      now = time;
+    },
+  };
+}
+
+async function sweepGateVia(via: string, id: string, worker: NonNullable<ReturnType<WorkerStore["worker"]>>) {
+  if (via === "heartbeat") return workers.heartbeat(worker, caps([id])).cancelled;
+  if (via === "lease") workers.lease("unknown-worker");
+  else if (via === "holds") workers.holds(id, worker.name);
+  else {
+    const controller = new AbortController();
+    // End the attach loop after its first sweep without an elapsed-time sleep or cancelling the job.
+    const sleep = spyOn(Bun, "sleep").mockImplementation(async () => {
+      controller.abort(new Error("shutdown"));
+    });
+    try {
+      const execution = gateExecutorFor("lan", workers, ["test/repo"]).attach(
+        { kind: "lan", id, startedAt: 1000 },
+        controller.signal,
+      );
+      await expect(execution.result).rejects.toThrow("abort");
+    } finally {
+      sleep.mockRestore();
+    }
+  }
+  return undefined;
+}
+
+for (const timer of gateTimers) {
+  for (const via of ["heartbeat", "lease", "attach", "holds"]) {
+    test.each([false, true])(`gate ${timer} restart grace via ${via}, expired=%s`, async (expired) => {
+      const { id, worker, at } = restartGate(timer, 10_000);
+      at(10_000 + (expired ? workers.times[timer] + 1 : workers.times[timer] - 1));
+      const cancelled = await sweepGateVia(via, id, worker);
+      expect(workers.resumedAt).toBe(10_000);
+      expect(workers.job(id)).toMatchObject(
+        expired
+          ? {
+              state: "queued",
+              attempt: 2,
+              worker: null,
+              failure_reason: gateFailure[timer],
+              excluded: JSON.stringify(timer === "pickup" ? [] : ["runner"]),
+            }
+          : {
+              state: timer === "pickup" ? "queued" : "leased",
+              attempt: 1,
+              worker: timer === "pickup" ? null : "runner",
+              failure_reason: null,
+              excluded: "[]",
+            },
+      );
+      if (via === "heartbeat") expect(cancelled).toEqual(expired || timer === "pickup" ? [id] : []);
+      expect(workers.job(id)?.events).not.toContain("falling back");
+    });
+  }
+
+  for (const resumedAt of [undefined, null, 10_000]) {
+    test.each([-1, 0, 1])(`gate ${timer} boundary with resumedAt=${resumedAt}, offset=%s`, (offset) => {
+      const { id, at } = restartGate(timer, resumedAt);
+      at((resumedAt ?? 1000) + workers.times[timer] + offset);
+      workers.sweep();
+      const expired = timer === "fresh" ? offset > 0 : offset >= 0;
+      expect(workers.job(id)).toMatchObject(
+        expired
+          ? {
+              attempt: 2,
+              failure_reason: gateFailure[timer],
+              excluded: JSON.stringify(timer === "pickup" ? [] : ["runner"]),
+            }
+          : { attempt: 1, failure_reason: null, excluded: "[]" },
+      );
+    });
+  }
+
+  test(`gate ${timer} preserves timestamps newer than the restart`, () => {
+    const { id, at } = restartGate(timer, 10_000, 10_020);
+    at(10_000 + workers.times[timer] + 1);
+    workers.sweep();
+    expect(workers.job(id)?.attempt).toBe(1);
+    at(10_020 + workers.times[timer] + (timer === "fresh" ? 1 : 0));
+    workers.sweep();
+    expect(workers.job(id)).toMatchObject({ attempt: 2, failure_reason: gateFailure[timer] });
+  });
+}
+
+test.each(["deadline", "revoked", "legacy"])("gate restart grace preserves %s enforcement", (mode) => {
+  const { id, at } = restartGate("lease", 10_000);
+  at(10_001);
+  if (mode === "revoked") workers.revoke("runner");
+  else
+    store.db
+      .query("UPDATE gate_jobs SET attempt_deadline_at=? WHERE id=?")
+      .run(mode === "legacy" ? null : 10_001, id);
+  workers.sweep();
+  if (mode === "legacy") {
+    const job = workers.job(id);
+    expect(job).toMatchObject({ state: "leased", attempt: 1, failure_reason: null });
+    expect(job?.attempt_deadline_at).toBe(1000 + attemptBudget(JSON.parse(job?.request ?? "{}")));
+  } else
+    expect(workers.job(id)).toMatchObject({
+      state: "queued",
+      attempt: 2,
+      worker: null,
+      excluded: '["runner"]',
+      failure_reason: mode === "revoked" ? "Worker disconnected or revoked" : "Attempt deadline expired",
+    });
+});
+
 test("heartbeats renew held leases, while a disconnected worker loses them before renewal", async () => {
   let now = Date.now();
   workers = new WorkerStore(store, releaseSha, { poll: 0, fresh: 30, lease: 60 }, () => now);
@@ -2293,6 +2437,8 @@ test.each([1, 128])(
     await listen();
     const token = await paired(),
       other = await paired("other");
+    // Exercise expired leases after the listener's restart grace.
+    now += workers.times.lease;
     await call("/worker/heartbeat", { ...caps(), freeSlots: 128 }, token);
     await call("/worker/heartbeat", caps(), other);
     const req: GateRequest = {
