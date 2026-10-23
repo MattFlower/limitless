@@ -18,6 +18,7 @@ import {
 } from "../scripts/implement-replay-cases.ts";
 import type { Invocation, Run } from "../src/core/types.ts";
 import { hiddenContents, ImplementCaseFileSchema, loadRoleCases } from "../src/evals/cases.ts";
+import { gradeImplement } from "../src/evals/implement.ts";
 import { prepareImplementCase } from "../src/evals/prepare.ts";
 import { createEvalWorktreeFromCache } from "../src/git/repos.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -80,8 +81,8 @@ const changed = "test/modified.test.ts";
 const added = "test/added 'quoted'.test.ts";
 const renamed = "test/renamed.test.ts";
 const paths = [added, changed, renamed];
-const testSource = (expected: number) =>
-  `import { expect, test } from 'bun:test';\nimport { answer } from '../answer.ts';\nimport { readFileSync } from 'node:fs';\ntest('answer and setup', () => { expect(answer).toBe(${expected}); expect(readFileSync('ready', 'utf8')).toBe('ready'); });\n`;
+const testSource = (expected: number, title = "answer and setup") =>
+  `import { expect, test } from 'bun:test';\nimport { answer } from '../answer.ts';\nimport { readFileSync } from 'node:fs';\ntest('${title}', () => { expect(answer).toBe(${expected}); expect(readFileSync('setup-output/ready', 'utf8')).toBe('ready'); });\n`;
 
 const kinds = [
   "valid",
@@ -94,6 +95,12 @@ const kinds = [
   "load-error",
   "contaminated",
   "fresh-setup",
+  "untracked-ready",
+  "misleading-title",
+  "batch-first",
+  "batch-second",
+  "gate-failure",
+  "audit-failure",
 ];
 const seed = seeded(async (root) => {
   const source = join(root, "source");
@@ -110,10 +117,13 @@ const seed = seeded(async (root) => {
     writeFileSync(join(source, "answer.ts"), `export const answer = ${kind === "base-pass" ? 42 : 0};\n`);
     writeFileSync(
       join(source, ".limitless.toml"),
-      `[gates]\nsetup = ["${kind === "setup-failure" ? "false" : kind === "fresh-setup" ? "mkdir setup-output && printf ready > ready" : "printf ready > ready"}"]\n${kind === "snapshot-failure" ? 'checks = [{ name = "reads-evals", run = "test -f evals/implement/cases.json" }]\n' : ""}`,
+      `[gates]\nsetup = ["${kind === "setup-failure" ? "false" : kind === "untracked-ready" ? "printf ready > ready" : kind === "fresh-setup" ? "mkdir setup-output && printf ready > setup-output/ready" : "mkdir -p setup-output && printf ready > setup-output/ready"}"]\n${kind === "snapshot-failure" ? 'checks = [{ name = "reads-evals", run = "test -f evals/implement/cases.json" }]\n' : kind === "gate-failure" ? 'checks = [{ name = "gate", run = "test ! -f broken-gate" }]\n' : kind === "audit-failure" ? '[policy]\nprotected_paths = ["answer.ts"]\n' : ""}`,
     );
     if (kind === "load-error") rmSync(join(source, "answer.ts"));
     rmSync(join(source, "leaked.ts"), { force: true });
+    rmSync(join(source, "broken-gate"), { force: true });
+    if (kind === "batch-first")
+      writeFileSync(join(source, "leaked.ts"), `${testSource(42)}// batch second label\n`);
     if (kind === "contaminated") writeFileSync(join(source, "leaked.ts"), testSource(42));
     writeFileSync(join(source, changed), testSource(0));
     writeFileSync(
@@ -132,11 +142,18 @@ const seed = seeded(async (root) => {
           join(source, path),
           kind === "timeout"
             ? "import { test } from 'bun:test'; test('wait', async () => { await Bun.sleep(60000); });\n"
-            : testSource(kind === "head-fail" ? 43 : 42),
+            : kind === "untracked-ready"
+              ? testSource(42).replace("setup-output/ready", "ready")
+              : kind === "misleading-title"
+                ? testSource(42, "Cannot find module error handling")
+                : kind === "batch-second"
+                  ? `${testSource(42)}// batch second label\n`
+                  : testSource(kind === "head-fail" ? 43 : 42),
         );
       rmSync(join(source, "test/old.test.ts"));
       rmSync(join(source, "test/deleted.test.ts"));
     }
+    if (kind === "gate-failure") writeFileSync(join(source, "broken-gate"), "broken");
     writeFileSync(join(source, "test/helper.ts"), "// unrelated\n");
     writeFileSync(join(source, "unrelated.ts"), `// ${kind}\n`);
     // Proves that setup for both worktrees is selected from the base, even at head.
@@ -306,6 +323,31 @@ test("squash replay preserves request, all hidden bytes, production evidence and
       expect(existsSync(join(cwd, "evals"))).toBe(false);
       expect(existsSync(join(cwd, added))).toBe(false);
       expect((await sh(["git", "cat-file", "-e", item.head], { cwd, allowFail: true })).exitCode).not.toBe(0);
+      const reference = join(f.root, "reference");
+      const cleanup = await createEvalWorktreeFromCache(
+        f.cache,
+        item.base,
+        item.head,
+        reference,
+        signal,
+        { paths: ["evals/implement"], contents: [] },
+        true,
+      );
+      try {
+        const grade = await confinementScope.run(f.backend, () =>
+          gradeImplement(
+            candidate.effective,
+            reference,
+            hiddenContents(item, f.casePath),
+            candidate.prepared,
+            [],
+            signal,
+          ),
+        );
+        expect(grade.pass).toBe(true);
+      } finally {
+        await cleanup();
+      }
     } finally {
       await candidate.cleanup();
     }
@@ -333,6 +375,88 @@ test("setup that creates an ignored directory runs in fresh preparation, base an
       reason: "accepted",
     });
     expect(f.read().cases[1]).toMatchObject({ ...f.commits["fresh-setup"], snapshot: true });
+    await f.clean();
+  } finally {
+    f.close();
+  }
+});
+
+test("grading cleans setup-created untracked files and reports the reference failure without publication", async () => {
+  const f = await fixture();
+  try {
+    const before = readFileSync(f.casePath);
+    const [row] = await f.run([11]);
+    expect(row).toMatchObject({ base: "fail", head: "fail" });
+    expect(row?.reason).toContain("excluded");
+    expect(row?.reason).toContain("hidden_tests");
+    expect(row?.reason).toContain("ENOENT");
+    expect(row?.reason).toContain("ready");
+    expect(readFileSync(f.casePath)).toEqual(before);
+    expect(existsSync(join(dirname(f.casePath), "hidden"))).toBe(false);
+    await f.clean();
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  [13, 14],
+  [14, 13],
+])("batch contamination checks include later labels in PR order %j", async (first, second) => {
+  const f = await fixture();
+  try {
+    const rows = await f.run([first, second]);
+    expect(rows.find((row) => row.pr === 13)?.reason).toContain(
+      "pinned history contains an eval dataset or seed patch",
+    );
+    expect(rows.find((row) => row.pr === 14)?.reason).toBe("accepted");
+    const dataset = f.read();
+    expect(dataset.cases).toHaveLength(2);
+    const added = dataset.cases.slice(1);
+    expect(readdirSync(join(dirname(f.casePath), "hidden"))).toEqual(added.map((item) => item.id));
+    for (const item of added) {
+      const cwd = join(f.root, "completed-dataset");
+      const signal = new AbortController().signal;
+      const { cleanup } = await confinementScope.run(f.backend, () =>
+        prepareImplementCase(item, cwd, signal, (base, snapshot) =>
+          createEvalWorktreeFromCache(
+            f.cache,
+            base,
+            base,
+            cwd,
+            signal,
+            {
+              paths: ["evals/implement"],
+              contents: [
+                readFileSync(f.casePath),
+                ...dataset.cases.flatMap((entry) =>
+                  hiddenContents(entry, f.casePath).map((file) => file.content),
+                ),
+              ],
+            },
+            snapshot,
+          ),
+        ),
+      );
+      await cleanup();
+    }
+    await f.clean();
+  } finally {
+    f.close();
+  }
+});
+
+test("reference gate and audit failures retain runner evidence and permit unrelated valid cases", async () => {
+  const f = await fixture();
+  try {
+    const rows = await f.run([15, 16, 1]);
+    expect(rows[0]?.reason).toContain('"reason":"gates"');
+    expect(rows[0]?.reason).toContain("regressed");
+    expect(rows[1]?.reason).toContain('"reason":"audit"');
+    expect(rows[1]?.reason).toContain("protected-path");
+    expect(rows[2]?.reason).toBe("accepted");
+    expect(f.read().cases).toHaveLength(2);
+    expect(readdirSync(join(dirname(f.casePath), "hidden"))).toEqual(["impl-01000"]);
     await f.clean();
   } finally {
     f.close();
@@ -381,10 +505,10 @@ test("snapshot baseline and contamination exclusions clean up and permit a later
   }
 });
 
-test("a missing module at base is an accepted load error with a distinct tag", async () => {
+test("only Bun loader diagnostics classify base failures as load errors", async () => {
   const f = await fixture();
   try {
-    const rows = await f.run([8]);
+    const rows = await f.run([8, 12]);
     expect(rows[0]).toMatchObject({
       base: "fail",
       head: "pass",
@@ -393,6 +517,13 @@ test("a missing module at base is an accepted load error with a distinct tag", a
     });
     expect(f.read().cases[1]?.tags).toContain("base-load-error");
     expect(f.read().cases[1]?.tags).toContain("replay-v2");
+    expect(rows[1]).toMatchObject({
+      base: "fail",
+      head: "pass",
+      baseFailure: "assertion-failure",
+      reason: "accepted",
+    });
+    expect(f.read().cases[2]?.tags).not.toContain("base-load-error");
     await f.clean();
   } finally {
     f.close();
@@ -411,7 +542,7 @@ test("formatter failure excludes publication and leaves original dataset bytes i
     expect((await f.run([1]))[0]?.reason).toContain("dataset formatter failed: fixture formatter failure");
     expect(readFileSync(f.casePath)).toEqual(before);
     expect(existsSync(join(dirname(f.casePath), "hidden/impl-01000"))).toBe(false);
-    expect(readdirSync(dirname(f.casePath)).sort()).toEqual(["cases.json", "hidden"]);
+    expect(readdirSync(dirname(f.casePath)).sort()).toEqual(["cases.json"]);
     await f.clean();
   } finally {
     format.mockRestore();
@@ -471,7 +602,8 @@ test("a hidden command that cannot launch is operational, with both results not-
     const before = readFileSync(f.casePath);
     const rows = await f.run([1]);
     expect(rows[0]).toMatchObject({ base: "not-run", head: "not-run" });
-    expect(rows[0]?.reason).toContain("launch-failure");
+    expect(rows[0]?.reason).toContain("hidden_tests");
+    expect(rows[0]?.reason).toContain("missing-replay-test-command");
     expect(readFileSync(f.casePath)).toEqual(before);
     expect(existsSync(join(dirname(f.casePath), "hidden"))).toBe(false);
     await f.clean();

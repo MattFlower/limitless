@@ -342,14 +342,29 @@ while the dataset retains the original squash commit and first parent as provena
 failures exclude the case with the runner's reason, including remaining label contamination or a
 baseline check that fails after removing `evals/`.
 
-After preparation succeeds, hidden tests run independently on a fresh base snapshot and the
-actual reference head, using setup and gate configuration selected from base. Each validation
-checkout runs setup once, without reusing preparation's ignored outputs. The hidden command
-must complete with a nonzero exit at base and zero at head. The table distinguishes base assertion
-failures from test load errors (such as `Cannot find module`); both qualify. Load-error cases also
-receive the `base-load-error` tag. A base pass, head failure, setup failure, timeout, launch failure
-or confinement error excludes the case. The table shows both outcomes and exclusion or duplicate
-reasons. One excluded PR does not stop the others, and leaves no case or hidden files published.
+Both the unchanged base candidate and reference implementation then run through the runner's
+shared `gradeImplement`, relative to the snapshot's effective base, using gate configuration and
+baseline results from base. This includes audit, gates, reset and clean, and hidden-file injection.
+Reset and clean remove setup-created, non-ignored untracked files before hidden tests execute;
+setup dependencies must survive that cleanup. The reference and its history stay separate from
+candidate preparation.
+
+Base must produce a completed, non-timeout hidden-test failure, and the reference must pass
+full grading. The intentionally unchanged base receives the audit's `empty-diff` finding; only
+that single expected base finding is allowed when assessing its hidden-test result. Other audit
+failures exclude the case, and reference grading has no exceptions. The table distinguishes assertion failures from recognizable Bun import/module
+resolution diagnostics between tests; titles and assertion messages containing phrases such as
+`Cannot find module` do not count as loader diagnostics. Both kinds qualify, and load-error cases
+receive the `base-load-error` tag. Preparation, gate, audit, operational, timeout and confinement
+failures exclude the case, as do a base pass or reference failure. Exclusions retain the runner's
+reason and diagnostic evidence.
+
+The generator collects the whole proposed batch before validating contamination. Each candidate
+base is checked against existing labels and every proposed case's hidden bytes, including later
+PRs. Before publication, survivors go through preparation again against the exact formatted
+`cases.json` and all hidden labels that will be published. Conflicting cases are excluded with the
+contamination reason; unrelated valid cases can still publish. Excluded cases leave no published
+hidden files. The table shows both outcomes and exclusion or duplicate reasons.
 
 Accepted cases append to `evals/implement/cases.json`, with hidden bytes under
 `evals/implement/hidden/<case-id>/<repository-relative-path>`. IDs continue above the highest

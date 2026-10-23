@@ -13,18 +13,11 @@ import {
   ImplementCaseFileSchema,
   ImplementCaseSchema,
 } from "../src/evals/cases.ts";
-import { injectHiddenFiles } from "../src/evals/implement.ts";
+import { gradeImplement, injectHiddenFiles } from "../src/evals/implement.ts";
 import { prepareImplementCase } from "../src/evals/prepare.ts";
-import { runGates } from "../src/gates/run.ts";
 import { cacheGit } from "../src/git/command.ts";
-import {
-  addDetachedWorktree,
-  createEvalWorktreeFromCache,
-  ensureCache,
-  withRepoLock,
-} from "../src/git/repos.ts";
+import { createEvalWorktreeFromCache, ensureCache } from "../src/git/repos.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { withCommandScratch } from "../src/harness/sandbox.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { redactCredentials, sh } from "../src/util/proc.ts";
 
@@ -124,11 +117,17 @@ export async function generateReplayCases(
   const cases = ImplementCaseFileSchema.parse(envelope).cases;
   const ids = cases.flatMap((item) => /^impl-(\d+)$/.exec(item.id)?.[1] ?? []);
   let next = ids.reduce((max, id) => (BigInt(id) > max ? BigInt(id) : max), 0n) + 1n;
+  const firstId = next;
   const width = Math.max(3, ...ids.map((id) => id.length));
   const gh = deps.gh ?? runGh;
   const signal = new AbortController().signal;
   const json = async (args: string[]) => JSON.parse(String(await gh(args, signal)));
   const results: Result[] = [];
+  const proposed: {
+    row: Result;
+    item: z.infer<typeof ImplementCaseSchema>;
+    files: ReturnType<typeof hiddenContents>;
+  }[] = [];
   let cache: string | undefined;
   let defaultTip = "";
   const seen = new Set<number>();
@@ -175,7 +174,6 @@ export async function generateReplayCases(
         cache = fetched;
         defaultTip = tip.stdout.trim();
       }
-      const repository = cache;
       const head = data.mergeCommit.oid;
       const parents = (
         await cacheGit(["git", "rev-list", "--parents", "-n", "1", head], { cwd: cache, signal })
@@ -199,7 +197,7 @@ export async function generateReplayCases(
         .filter((path) => path.startsWith("test/") && path.endsWith(".test.ts"))
         .sort();
       if (!paths.length) throw new Error("No qualifying test files");
-      const id = `impl-${String(next).padStart(width, "0")}`;
+      const id = `impl-${String(next + BigInt(proposed.length)).padStart(width, "0")}`;
       row.case = id;
       const item = ImplementCaseSchema.parse({
         id,
@@ -234,146 +232,179 @@ export async function generateReplayCases(
           mode: Number.parseInt(mode, 8) & 0o777,
         });
       }
-      const root = mkdtempSync(join(tmpdir(), "implement-replay-"));
-      try {
-        const checkout = (cwd: string, base: string, snapshot: boolean) =>
-          createEvalWorktreeFromCache(
-            repository,
-            base,
-            base,
-            cwd,
-            signal,
-            {
-              paths: ["evals/implement"],
-              contents: [
-                readFileSync(casePath),
-                ...cases.flatMap((existing) =>
-                  hiddenContents(existing, casePath).map((file) => file.content),
-                ),
-                ...files.map((file) => file.content),
-              ],
-            },
-            snapshot,
-          );
-        const candidate = join(root, "candidate");
-        const { prepared, cleanup } = await prepareImplementCase(item, candidate, signal, (base, snapshot) =>
-          checkout(candidate, base, snapshot),
-        ).catch((error: Error) => {
-          throw new Error(`excluded: runner preparation: ${error.message}`);
-        });
-        try {
-          for (const revision of ["base", "head"] as const) {
-            const cwd = join(root, revision);
-            let cleanupBase: (() => Promise<void>) | undefined;
-            try {
-              // Preparation preserves ignored setup outputs; validation needs a fresh snapshot.
-              if (revision === "base") cleanupBase = await checkout(cwd, item.base, true);
-              else
-                await withRepoLock(repository, () => addDetachedWorktree(repository, item.head, cwd, signal));
-              row[revision] = await withCommandScratch(cwd, async () => {
-                const gates = prepared.gates;
-                const setup = await runGates(cwd, { ...gates, checks: [] }, signal);
-                if (!setup.setupOk) {
-                  row.reason += `${revision}: setup-failure; `;
-                  return "not-run";
-                }
-                injectHiddenFiles(cwd, files);
-                const result = await runGates(
-                  cwd,
-                  {
-                    ...gates,
-                    setup: [],
-                    checks: [
-                      { name: "hidden", run: item.hidden.command, timeoutSec: item.hidden.timeoutSec },
-                    ],
-                  },
-                  signal,
-                );
-                const out = result.checks[0];
-                if (!out || out.confinementError)
-                  throw new Error("Hidden command did not complete with confirmed confinement");
-                if (out.timedOut) return "timeout";
-                if (out.exitCode === null || out.exitCode === 126 || out.exitCode === 127) {
-                  row.reason += `${revision}: launch-failure; `;
-                  return "not-run";
-                }
-                if (revision === "base" && !out.ok)
-                  row.baseFailure =
-                    /Cannot find (?:module|package)|ModuleNotFound|error: (?:Could not resolve|Cannot resolve)|SyntaxError|does not provide an export|Export named .+ not found/i.test(
-                      out.output,
-                    )
-                      ? "load-error"
-                      : "assertion-failure";
-                return out.ok ? "pass" : "fail";
-              });
-            } catch (error) {
-              row[revision] = "not-run";
-              row.reason += `${revision}: error: ${(error as Error).message}; `;
-            }
-            await cleanupBase?.();
-            if (revision === "head") {
-              await withRepoLock(repository, () =>
-                cacheGit(["git", "worktree", "remove", "--force", cwd], {
-                  cwd: repository,
-                  allowFail: true,
-                }),
-              );
-              if (existsSync(cwd)) throw new Error("Could not remove validation worktree");
-              rmSync(`${cwd}.git-paths`, { force: true });
-            }
-          }
-        } finally {
-          await cleanup();
-        }
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-      if (row.base !== "fail" || row.head !== "pass")
-        throw new Error(
-          `${row.reason}excluded: base ${row.base}, head ${row.head}; expected base fail and head pass`,
-        );
-      if (row.baseFailure === "load-error") item.tags.push("base-load-error");
-      const hidden = join(dirname(casePath), "hidden", id);
-      const temp = `${casePath}.${randomUUID()}.tmp.json`;
       for (const text of [JSON.stringify(item), ...files.map((file) => file.content.toString("utf8"))])
         if (redactCredentials(text) !== text)
           throw new Error("Replay contains registered credentials; refusing to rewrite original bytes");
-      if (existsSync(hidden)) throw new Error(`Hidden destination already exists: ${id}`);
-      try {
-        mkdirSync(hidden, { recursive: true });
-        injectHiddenFiles(hidden, files);
-        const updated = { ...envelope, cases: [...envelope.cases, item] };
-        ImplementCaseFileSchema.parse(updated);
-        writeFileSync(temp, `${JSON.stringify(updated, null, 2)}\n`);
-        try {
-          await sh(
-            [
-              join(repositoryRoot, "node_modules/.bin/biome"),
-              "check",
-              "--write",
-              "--config-path",
-              repositoryRoot,
-              temp,
-            ],
-            { cwd: repositoryRoot, signal },
-          );
-        } catch (error) {
-          throw new Error(`excluded: dataset formatter failed: ${(error as Error).message}`);
-        }
-        renameSync(temp, casePath);
-        envelope.cases.push(item);
-        cases.push(item);
-        next++;
-        row.reason = "accepted";
-      } catch (error) {
-        rmSync(hidden, { recursive: true, force: true });
-        throw error;
-      } finally {
-        rmSync(temp, { force: true });
-      }
+      proposed.push({ row, item, files });
     } catch (error) {
       row.reason = redactCredentials((error as Error).message);
     }
+  }
+  if (!cache || !proposed.length) return results;
+  const repository = cache;
+  const labels = (dataset: Uint8Array, batch: typeof proposed) => ({
+    paths: ["evals/implement"],
+    contents: [
+      dataset,
+      ...cases.flatMap((existing) => hiddenContents(existing, casePath).map((file) => file.content)),
+      ...batch.flatMap(({ files }) => files.map((file) => file.content)),
+    ],
+  });
+  // Include later PRs even when an earlier case would pass in isolation.
+  const batchLabels = labels(readFileSync(casePath), proposed);
+  let survivors: typeof proposed = [];
+  for (const proposal of proposed) {
+    const { row, item, files } = proposal;
+    item.id = row.case = `impl-${String(next).padStart(width, "0")}`;
+    const root = mkdtempSync(join(tmpdir(), "implement-replay-"));
+    try {
+      if (existsSync(join(dirname(casePath), "hidden", item.id)))
+        throw new Error(`Hidden destination already exists: ${item.id}`);
+      const cwd = join(root, "candidate");
+      const { effective, prepared, cleanup } = await prepareImplementCase(
+        item,
+        cwd,
+        signal,
+        (base, snapshot) =>
+          createEvalWorktreeFromCache(repository, base, base, cwd, signal, batchLabels, snapshot),
+      ).catch((error: Error) => {
+        throw new Error(`excluded: runner preparation: ${error.message}`);
+      });
+      try {
+        for (const revision of ["base", "head"] as const) {
+          let reference: Awaited<ReturnType<typeof createEvalWorktreeFromCache>> | undefined;
+          try {
+            const grading = revision === "base" ? cwd : join(root, "reference");
+            // The reference is isolated from candidate preparation and shares its snapshot base.
+            if (revision === "head") {
+              reference = await createEvalWorktreeFromCache(
+                repository,
+                item.base,
+                item.head,
+                grading,
+                signal,
+                { paths: ["evals/implement"], contents: [] },
+                true,
+              );
+              if (reference.base !== effective.base) throw new Error("Reference snapshot base differs");
+            }
+            const grade = await gradeImplement(effective, grading, files, prepared, [], signal);
+            const evidence = grade.implement;
+            // The negative control is intentionally unchanged; its empty-diff finding is expected.
+            const unchangedBase =
+              revision === "base" &&
+              evidence?.reason === "audit" &&
+              evidence.auditBlocks.length === 1 &&
+              evidence.auditBlocks[0]?.rule === "empty-diff";
+            row[revision] =
+              grade.pass || (unchangedBase && evidence.hidden?.exitCode === 0 && !evidence.hidden.timedOut)
+                ? "pass"
+                : evidence?.reason === "timeout"
+                  ? "timeout"
+                  : (evidence?.reason === "hidden_tests" || unchangedBase) &&
+                      evidence?.hidden &&
+                      !evidence.hidden.timedOut &&
+                      evidence.hidden.exitCode !== null &&
+                      evidence.hidden.exitCode !== 126 &&
+                      evidence.hidden.exitCode !== 127
+                    ? "fail"
+                    : "not-run";
+            if (!grade.pass) row.reason += `${revision}: ${JSON.stringify(evidence)}; `;
+            if (revision === "base" && row.base === "fail") {
+              // Bun reports import failures between tests; test titles and assertion text are not loader diagnostics.
+              const output = evidence?.hidden?.output ?? "";
+              row.baseFailure =
+                /# Unhandled error between tests\r?\n-+\r?\n(?:error: Cannot find (?:module|package) ['"][^\r\n]+['"] from ['"][^\r\n]+['"]|error: (?:Could not|Cannot) resolve ['"][^\r\n]+['"]|(?:error|SyntaxError): Export named ['"][^\r\n]+['"] not found in module ['"][^\r\n]+['"])\.?\r?$/m.test(
+                  output,
+                )
+                  ? "load-error"
+                  : "assertion-failure";
+            }
+          } catch (error) {
+            row[revision] = "not-run";
+            row.reason += `${revision}: error: ${(error as Error).message}; `;
+          } finally {
+            await reference?.();
+          }
+        }
+      } finally {
+        await cleanup();
+      }
+      if (row.base !== "fail" || row.head !== "pass")
+        throw new Error(
+          `${row.reason}excluded: base ${row.base}, head ${row.head}; expected base hidden_tests failure and head pass`,
+        );
+      if (row.baseFailure === "load-error") item.tags.push("base-load-error");
+      survivors.push(proposal);
+      next++;
+    } catch (error) {
+      row.reason = redactCredentials((error as Error).message);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const temp = `${casePath}.${randomUUID()}.tmp.json`;
+  const published: string[] = [];
+  try {
+    while (survivors.length) {
+      for (const [index, { row, item }] of survivors.entries())
+        item.id = row.case = `impl-${String(firstId + BigInt(index)).padStart(width, "0")}`;
+      const updated = { ...envelope, cases: [...envelope.cases, ...survivors.map(({ item }) => item)] };
+      ImplementCaseFileSchema.parse(updated);
+      writeFileSync(temp, `${JSON.stringify(updated, null, 2)}\n`);
+      try {
+        await sh(
+          [
+            join(repositoryRoot, "node_modules/.bin/biome"),
+            "check",
+            "--write",
+            "--config-path",
+            repositoryRoot,
+            temp,
+          ],
+          { cwd: repositoryRoot, signal },
+        );
+      } catch (error) {
+        throw new Error(`excluded: dataset formatter failed: ${(error as Error).message}`);
+      }
+      const finalLabels = labels(readFileSync(temp), survivors);
+      const checked: typeof proposed = [];
+      for (const proposal of survivors) {
+        const root = mkdtempSync(join(tmpdir(), "implement-replay-final-"));
+        const cwd = join(root, "candidate");
+        try {
+          const { cleanup } = await prepareImplementCase(proposal.item, cwd, signal, (base, snapshot) =>
+            createEvalWorktreeFromCache(repository, base, base, cwd, signal, finalLabels, snapshot),
+          );
+          await cleanup();
+          checked.push(proposal);
+        } catch (error) {
+          proposal.row.reason = redactCredentials(
+            `excluded: runner preparation against final dataset: ${(error as Error).message}`,
+          );
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+      if (checked.length === survivors.length) break;
+      survivors = checked;
+    }
+    if (survivors.length) {
+      for (const { item, files } of survivors) {
+        const hidden = join(dirname(casePath), "hidden", item.id);
+        if (existsSync(hidden)) throw new Error(`Hidden destination already exists: ${item.id}`);
+        published.push(hidden);
+        mkdirSync(hidden, { recursive: true });
+        injectHiddenFiles(hidden, files);
+      }
+      renameSync(temp, casePath);
+      for (const { row } of survivors) row.reason = "accepted";
+    }
+  } catch (error) {
+    for (const hidden of published) rmSync(hidden, { recursive: true, force: true });
+    for (const { row } of survivors) row.reason = redactCredentials((error as Error).message);
+  } finally {
+    rmSync(temp, { force: true });
   }
   return results;
 }
