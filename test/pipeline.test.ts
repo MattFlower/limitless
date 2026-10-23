@@ -1,9 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
+import {
+  bootIdentity,
+  ProcessTerminationError,
+  processRecoveryInspection,
+  recoveryProcessStopped,
+} from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import {
@@ -43,6 +50,48 @@ const { start } = pipelineSetup({
   set factory(value) {
     factory = value;
   },
+});
+
+test("resumed run refuses discovery-only recovery failure before calling its stage harness", async () => {
+  const handler = mock(() => ({}));
+  const f = start(handler);
+  await f.stop();
+  const run = await f.createRun({ repo: repoDir, prompt: "Resume after crash" });
+  const repo = f.store.getRepo(run.repoId);
+  if (!repo) throw new Error("Missing repo");
+  const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+  f.store.setRunState(run.id, {
+    ...ctx.state,
+    phase: "triage",
+    worktreePath: repoDir,
+    previewConfig: null,
+    slottedCommands: [],
+  });
+  const evidence = {
+    invocation: crypto.randomUUID(),
+    runId: run.id,
+    directory: repoDir,
+    boot: bootIdentity(),
+    createdAt: 1,
+    discovery: { group: 0, started: 0, directories: [repoDir], leader: null, spawnedAt: "0" },
+  };
+  f.store.recordProcessDiscovery(evidence);
+  const status = await processRecoveryInspection.run(
+    {
+      stopped: recoveryProcessStopped,
+      timeoutMs: 0,
+      discover: async () => {
+        throw new Error("injected recovery inspection failure");
+      },
+    },
+    () => executeRun(f.deps, run.id, new AbortController().signal),
+  );
+  expect(status).toBe("needs_human");
+  expect(f.store.getRun(run.id)?.error).toContain(ProcessTerminationError.prefix);
+  expect(f.store.getRunState<RunState>(run.id)?.needsHumanReason).toContain(ProcessTerminationError.prefix);
+  expect(f.store.listProcessDiscoveries()).toEqual([evidence]);
+  expect(f.store.listStages(run.id)).toEqual([]);
+  expect(handler).not.toHaveBeenCalled();
 });
 
 test.each([
