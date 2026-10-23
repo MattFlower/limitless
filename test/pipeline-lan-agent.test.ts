@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Factory } from "../src/app.ts";
+import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Stage, StageName } from "../src/core/types.ts";
 import type { AgentJobRequest, AgentJobRow } from "../src/db/workers.ts";
+import { worktreeGit } from "../src/git/command.ts";
 import { headSha } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -15,6 +16,7 @@ import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
 import { sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
+import { workerRequest } from "../src/workers/tls.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { approve, pipelineSetup, providers, roleOf, triage, waitFor } from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
@@ -61,9 +63,17 @@ const jobs = (f: Factory) =>
   f.store.db.query<AgentJobRow, []>("SELECT * FROM agent_jobs ORDER BY rowid").all();
 const request = (j: AgentJobRow): AgentJobRequest => JSON.parse(j.request);
 function boot(
-  options: { executor?: AgentExecutor; review?: (s: AgentSpec) => Promise<void>; faults?: FaultPlan } = {},
+  options: {
+    executor?: AgentExecutor;
+    review?: (s: AgentSpec) => Promise<void>;
+    faults?: FaultPlan;
+    deferStart?: boolean;
+  } = {},
 ) {
   let locals = 0;
+  const startSpy = options.deferStart
+    ? spyOn(Factory.prototype, "start").mockImplementation(() => {})
+    : undefined;
   const f = start(() => ({}), false, false, {
     bootSha: release,
     providers: providers.map((p) => ({ ...p, harness: "claude" })),
@@ -81,6 +91,7 @@ function boot(
     agentExecutor: options.executor,
     faults: options.faults,
   });
+  startSpy?.mockRestore();
   f.workers.times.tick = 1;
   f.workers.times.poll = 10;
   return { f, locals: () => locals };
@@ -285,8 +296,8 @@ test("real worker rounds publish, adopt, relay events and deliver over an advanc
 function simulated(f: Factory, action: (job: AgentJobRow, req: AgentJobRequest) => Promise<void>) {
   const original = f.workers.enqueueAgentJob.bind(f.workers);
   const tasks: Promise<void>[] = [];
-  const enqueue = spyOn(f.workers, "enqueueAgentJob").mockImplementation((req) => {
-    const id = original(req);
+  const enqueue = spyOn(f.workers, "enqueueAgentJob").mockImplementation((req, suppliedId) => {
+    const id = original(req, suppliedId);
     if (id) {
       const job = f.workers.agentJob(id);
       if (!job) throw new Error("Missing job");
@@ -449,49 +460,73 @@ test("a quota result is adopted before invoke dispatches the next candidate", as
   }
 });
 
-test("restart after the adoption move recovers the lease from HEAD", async () => {
-  const bare = await githubFixture();
-  const { f } = boot({
-    faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "worker-commit-adopted" } },
-  });
-  registerGithub(f, bare);
-  const finish = simulated(f, async (job, req) => report(f, job, req, await publish(bare, req)));
-  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-  await wait(
-    () => f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "cancelled"),
-    { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => f.store.subscribe(wake) },
-  );
-  await finish();
-  await f.stop();
-  const state = f.store.getRunState<RunState>(run.id);
-  const first = jobs(f)[0];
-  if (!state?.worktreePath || !first?.result_sha) throw new Error("Missing interrupted adoption");
-  expect(await headSha(state.worktreePath)).toBe(first.result_sha);
-  expect(state.publishedSha).toBeUndefined();
-  f.store.close();
-  const { f: resumed, locals } = boot();
-  const complete = simulated(resumed, async (job, req) =>
-    report(resumed, job, req, await publish(bare, req)),
-  );
-  try {
-    expect(await waitFor(resumed, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
-    const second = jobs(resumed)[1];
-    if (!second?.result_sha) throw new Error("Missing resumed job");
-    expect(request(second)).toMatchObject({
-      parentSha: first.result_sha,
-      expectedRemoteSha: first.result_sha,
+test.each(["worker-commit-adopted", "implementation-ready", "different target"])(
+  "restart reuses the done result at %s",
+  async (checkpoint) => {
+    const bare = await githubFixture();
+    const { f } = boot({
+      faults: {
+        "store:save": {
+          action: "kill",
+          when: (c) =>
+            c.checkpoint === (checkpoint === "different target" ? "worker-commit-adopted" : checkpoint),
+        },
+      },
     });
-    expect(
-      (await sh(["git", "log", "--format=%H", "-3", second.result_sha], { cwd: bare })).stdout
-        .trim()
-        .split("\n"),
-    ).toEqual([second.result_sha, first.result_sha, first.parent_sha]);
-    expect(resumed.store.getRunState<RunState>(run.id)?.publishedSha).toBe(second.result_sha);
-    expect(locals()).toBe(0);
-  } finally {
-    await complete();
-  }
-});
+    registerGithub(f, bare);
+    const finish = simulated(f, async (job, req) => report(f, job, req, await publish(bare, req)));
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    await wait(
+      () => f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "cancelled"),
+      { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => f.store.subscribe(wake) },
+    );
+    await finish();
+    await f.stop();
+    const state = f.store.getRunState<RunState>(run.id);
+    const first = jobs(f)[0];
+    if (!state?.worktreePath || !first?.result_sha) throw new Error("Missing interrupted adoption");
+    expect(await headSha(state.worktreePath)).toBe(first.result_sha);
+    expect(state.publishedSha).toBe(checkpoint !== "implementation-ready" ? undefined : first.result_sha);
+    f.store.close();
+    const { f: resumed, locals } = boot({ deferStart: true });
+    if (checkpoint === "different target") resumed.tracker.setEnabled(request(first).target.provider, false);
+    const complete = simulated(resumed, async (job, req) =>
+      report(resumed, job, req, await publish(bare, req)),
+    );
+    try {
+      resumed.start();
+      expect(await waitFor(resumed, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+      expect(jobs(resumed)).toHaveLength(checkpoint === "different target" ? 2 : 1);
+      if (checkpoint === "different target") {
+        const second = jobs(resumed)[1];
+        if (!second?.result_sha) throw new Error("Missing new target result");
+        expect(request(second)).toMatchObject({
+          parentSha: first.result_sha,
+          expectedRemoteSha: first.result_sha,
+        });
+        expect(request(second).target.provider).not.toBe(request(first).target.provider);
+        expect(
+          resumed.store
+            .listInvocations(run.id)
+            .filter((i) => i.role === "implement")
+            .at(-1),
+        ).toMatchObject({ modelId: request(second).target.modelId, status: "ok" });
+        expect(resumed.store.getRunState<RunState>(run.id)?.publishedSha).toBe(second.result_sha);
+      }
+      expect(
+        (await sh(["git", "log", "--format=%H", "-2", first.result_sha], { cwd: bare })).stdout
+          .trim()
+          .split("\n"),
+      ).toEqual([first.result_sha, first.parent_sha]);
+      if (checkpoint !== "different target")
+        expect(resumed.store.getRunState<RunState>(run.id)?.publishedSha).toBe(first.result_sha);
+      expect(resumed.store.getRunState<RunState>(run.id)?.agentJob).toBeUndefined();
+      expect(locals()).toBe(0);
+    } finally {
+      await complete();
+    }
+  },
+);
 
 function approveSimulated(f: Factory) {
   f.workers.pairingKey = "fixture-pairing-key";
@@ -514,7 +549,12 @@ function approveSimulated(f: Factory) {
   return worker;
 }
 
-test.each([false, true])("restart cancels a leased job (pushed=%s)", async (pushed) => {
+test.each([
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+])("rollback cancels a leased job (pushed=%s, handle=%s)", async (pushed, handle) => {
   const bare = await githubFixture();
   const { f } = boot();
   registerGithub(f, bare);
@@ -529,9 +569,15 @@ test.each([false, true])("restart cancels a leased job (pushed=%s)", async (push
   const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
   await leased.promise;
   await f.stop();
-  f.workers.cancelOpenAgentJobs();
+  f.workers.cancelOpenAgentJobs(new Set());
   await finish();
   expect(jobs(f)[0]?.state).toBe("cancelled");
+  if (!handle) {
+    const state = f.store.getRunState<RunState>(run.id);
+    if (!state) throw new Error("Missing state");
+    delete state.agentJob;
+    f.store.setRunState(run.id, state);
+  }
   f.store.close();
   const { f: resumed, locals } = boot();
   const complete = simulated(resumed, async (job, req) =>
@@ -543,7 +589,9 @@ test.each([false, true])("restart cancels a leased job (pushed=%s)", async (push
     );
     expect(jobs(resumed)).toHaveLength(pushed ? 1 : 2);
     if (pushed) {
-      expect(resumed.store.getRun(run.id)?.error).toContain("worker commit was not adopted");
+      expect(resumed.store.getRun(run.id)?.error).toContain(
+        "worker commit was pushed without an accepted report",
+      );
       const branch = resumed.store.getRun(run.id)?.branch;
       expect((await sh(["git", "rev-parse", `refs/heads/${branch}`], { cwd: bare })).stdout.trim()).toBe(
         workerSha,
@@ -555,29 +603,47 @@ test.each([false, true])("restart cancels a leased job (pushed=%s)", async (push
   }
 });
 
-test("cancelling a waiting run reports its leased job on the next heartbeat", async () => {
-  const bare = await githubFixture();
-  const { f, locals } = boot();
-  registerGithub(f, bare);
-  const worker = approveSimulated(f);
-  const leased = Promise.withResolvers<string>();
-  const finish = simulated(f, async (job) => {
-    f.workers.leaseAgentJob("simulated");
-    leased.resolve(job.id);
-  });
-  try {
-    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-    const id = await leased.promise;
-    f.cancelRun(run.id);
-    expect(await waitFor(f, run.id, ["cancelled"])).toBe("cancelled");
-    expect(f.workers.agentJob(id)?.state).toBe("cancelled");
-    const caps = JSON.parse(f.workers.worker(worker.name)?.capabilities ?? "{}");
-    expect(f.workers.heartbeat(worker, { ...caps, jobs: [id] }).cancelled).toEqual([id]);
-    expect(locals()).toBe(0);
-  } finally {
-    await finish();
-  }
-});
+test.each([false, true])(
+  "cancelling a waiting run reports its leased job (reattached=%s)",
+  async (reattached) => {
+    const bare = await githubFixture();
+    let { f, locals } = boot();
+    registerGithub(f, bare);
+    const worker = approveSimulated(f);
+    const leased = Promise.withResolvers<string>();
+    const finish = simulated(f, async (job) => {
+      f.workers.leaseAgentJob("simulated");
+      leased.resolve(job.id);
+    });
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const id = await leased.promise;
+      if (reattached) {
+        await f.stop();
+        await finish();
+        f.store.close();
+        const resumed = boot();
+        f = resumed.f;
+        locals = resumed.locals;
+        await wait(
+          () =>
+            f.store
+              .listEvents(run.id)
+              .some((event) => event.message.includes(`Re-attached worker job ${id}`)),
+          { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => f.store.subscribe(wake) },
+        );
+      }
+      f.cancelRun(run.id);
+      expect(await waitFor(f, run.id, ["cancelled"])).toBe("cancelled");
+      expect(f.workers.agentJob(id)?.state).toBe("cancelled");
+      const caps = JSON.parse(f.workers.worker(worker.name)?.capabilities ?? "{}");
+      expect(f.workers.heartbeat(worker, { ...caps, jobs: [id] }).cancelled).toEqual([id]);
+      expect(locals()).toBe(0);
+    } finally {
+      await finish();
+    }
+  },
+);
 
 test("branch movement before dispatch refuses without enqueuing", async () => {
   const bare = await githubFixture();
@@ -702,5 +768,307 @@ test("delivery conflict resolution remains local after a worker publication", as
     expect(locals()).toBe(1);
   } finally {
     await finish();
+  }
+});
+
+test.each(["running", "pushed", "fenced"])(
+  "real worker survives restart while %s",
+  async (scenario) => {
+    const bare = await githubFixture();
+    let { f } = boot();
+    registerGithub(f, bare);
+    let listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+    if (!listener) throw new Error("Missing listener");
+    const origin = listener.url.origin;
+    const remote = loadConfig({ home: join(home, "remote"), configDir: join(home, "cfg"), raw: {} });
+    const entered = Promise.withResolvers<void>();
+    const releaseSession = Promise.withResolvers<void>();
+    const published = Promise.withResolvers<string>();
+    const reviewed = Promise.withResolvers<void>();
+    const releaseReview = Promise.withResolvers<void>();
+    let offline = false,
+      sessions = 0;
+    let fence: (() => void) | undefined;
+    const controller = new AbortController();
+    let task: Promise<void> | undefined;
+    try {
+      await pairWorker(origin, join(remote.paths.home, "worker"), "worker", (text) =>
+        f.workers.approve(text.split(": ")[1] ?? ""),
+      );
+      task = runWorker(origin, remote, release, controller.signal, {
+        confinement: fakeConfinement,
+        heartbeatMs: 10,
+        retryMs: 5,
+        fenceTimer: {
+          set(callback) {
+            fence = callback;
+            return setTimeout(() => {}, 2_147_483_647);
+          },
+          clear(timer) {
+            clearTimeout(timer);
+          },
+        },
+        request: async (_url, path, body, options) => {
+          if (offline) {
+            if (path.endsWith("/result")) published.resolve((body as { sha: string }).sha);
+            throw new Error("Coordinator offline");
+          }
+          if (!listener) throw new Error("Missing listener");
+          return workerRequest(listener.url.origin, path, body, options);
+        },
+        tokenLookup: async () => {
+          if (scenario !== "running") {
+            entered.resolve();
+            await releaseSession.promise;
+          }
+          return "fixture-worker-token";
+        },
+        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+        harnesses: {
+          claude: fakeHarness(async () => {
+            sessions++;
+            if (scenario === "running") {
+              entered.resolve();
+              await releaseSession.promise;
+            }
+            return { files: { "farewell.txt": "goodbye\n" } };
+          }),
+        },
+      });
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      await entered.promise;
+      const id = jobs(f)[0]?.id;
+      if (!id) throw new Error("Missing job");
+      await f.stop();
+      expect(f.workers.agentJob(id)?.state).toBe("leased");
+      offline = true;
+      await listener.stop();
+      listener = undefined;
+      let pushed: string | undefined;
+      if (scenario !== "running") {
+        releaseSession.resolve();
+        pushed = await published.promise;
+        if (scenario === "fenced") {
+          if (!fence) throw new Error("Missing fence");
+          fence();
+        }
+      }
+      f.store.db.query("UPDATE workers SET last_heartbeat_at=last_heartbeat_at-90000").run();
+      f.store.db.query("UPDATE agent_jobs SET lease_expires_at=lease_expires_at-90000 WHERE id=?").run(id);
+      f.store.close();
+      const resumed = boot({
+        deferStart: true,
+        review: async () => {
+          reviewed.resolve();
+          await releaseReview.promise;
+        },
+      });
+      f = resumed.f;
+      listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+      f.workers.sweepAgentJobs();
+      expect(f.workers.agentJob(id)?.state).toBe("leased");
+      offline = false;
+      f.start();
+      releaseSession.resolve();
+      await reviewed.promise;
+      const rows = jobs(f),
+        state = f.store.getRunState<RunState>(run.id);
+      const row = rows[0];
+      if (!row?.result_sha || !state?.worktreePath) throw new Error("Missing worker result");
+      expect(rows).toHaveLength(1);
+      expect(row).toMatchObject({ id, state: "done", attempt: 1 });
+      expect(sessions).toBe(1);
+      expect(resumed.locals()).toBe(0);
+      expect(state.publishedSha).toBe(row.result_sha);
+      expect(await headSha(state.worktreePath)).toBe(row.result_sha);
+      if (pushed) expect(row.result_sha).toBe(pushed);
+      const report = JSON.parse(row.result ?? "null");
+      expect(report.privateStringsDigest).toBe(request(row).privateStringsDigest);
+      expect(
+        (
+          await sh(["git", "rev-parse", `refs/heads/${f.store.getRun(run.id)?.branch}`], { cwd: bare })
+        ).stdout.trim(),
+      ).toBe(row.result_sha);
+      releaseReview.resolve();
+      expect(await waitFor(f, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+    } finally {
+      releaseReview.resolve();
+      releaseSession.resolve();
+      controller.abort();
+      await task;
+      await listener?.stop();
+    }
+  },
+  30_000,
+);
+
+test.each(["agent-job-started", "missing row", "queued"])("restart checkpoint: %s", async (checkpoint) => {
+  const bare = await githubFixture();
+  const { f } = boot(
+    checkpoint === "agent-job-started"
+      ? {
+          faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === checkpoint } },
+        }
+      : {},
+  );
+  registerGithub(f, bare);
+  const queued = Promise.withResolvers<void>();
+  const finish = simulated(f, async () => {
+    queued.resolve();
+  });
+  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+  if (checkpoint === "agent-job-started") {
+    await wait(
+      () => f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "cancelled"),
+      { timeoutMs: 10_000, pollMs: null, subscribe: (wake) => f.store.subscribe(wake) },
+    );
+    expect(f.store.getRunState<RunState>(run.id)?.agentJob).toBeUndefined();
+    expect(jobs(f)).toHaveLength(0);
+  } else await queued.promise;
+  await f.stop();
+  await finish();
+  const old = jobs(f)[0];
+  if (checkpoint === "missing row" && old) f.store.db.query("DELETE FROM agent_jobs WHERE id=?").run(old.id);
+  f.store.close();
+  const { f: resumed, locals } = boot({ deferStart: true });
+  const complete = simulated(resumed, async (job, req) =>
+    report(resumed, job, req, await publish(bare, req)),
+  );
+  try {
+    if (checkpoint === "queued") {
+      const worker = approveSimulated(resumed);
+      expect(resumed.workers.leaseAgentJob(worker.name)?.id).toBe(old?.id);
+      const job = jobs(resumed)[0];
+      if (!job) throw new Error("Missing queued job");
+      await report(resumed, job, request(job), await publish(bare, request(job)));
+    }
+    resumed.start();
+    expect(await waitFor(resumed, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+    expect(jobs(resumed)).toHaveLength(1);
+    if (checkpoint === "queued") expect(jobs(resumed)[0]?.id).toBe(old?.id);
+    expect(locals()).toBe(0);
+  } finally {
+    await complete();
+  }
+});
+
+test.each(["implement", "agents off", "listener off"])(
+  "factory keeps only live handles: %s",
+  async (mode) => {
+    const { f } = boot({ deferStart: true });
+    const repo = f.store.upsertRepo({
+      slug: "test/repo",
+      kind: "github",
+      url: null,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = f.store.createRun(repo, { repo: repo.slug, prompt: "Round" });
+    f.store.updateRun(run.id, { status: "waiting" });
+    const terminal = f.store.createRun(repo, { repo: repo.slug, prompt: "Finished" });
+    f.store.updateRun(terminal.id, { status: "succeeded" });
+    const enqueue = (runId: string) => {
+      const id = f.workers.enqueueAgentJob({
+        runId,
+        invocationId: 1,
+        parentSha: release,
+        prompt: "Round",
+        target: {
+          modelId: "test",
+          model: "test",
+          provider: "alpha",
+          vendor: "test",
+          tier: 1,
+          billing: "subscription",
+          harness: "claude",
+        },
+        timeoutMs: 1000,
+      });
+      if (!id) throw new Error("Missing job");
+      return id;
+    };
+    const kept = enqueue(run.id),
+      terminalJob = enqueue(terminal.id),
+      orphan = enqueue(run.id),
+      done = enqueue(run.id),
+      failed = enqueue(run.id);
+    f.store.setRunState(run.id, { agentJob: { round: 1, id: kept } });
+    f.store.setRunState(terminal.id, { agentJob: { round: 1, id: terminalJob } });
+    f.store.db.query("UPDATE agent_jobs SET state='leased' WHERE id=?").run(done);
+    f.workers.completeAgentJob(done, {}, release);
+    f.workers.failAgentJob(failed, "Failed");
+    f.workers.failAgentJob(failed, "Failed");
+    if (mode === "agents off") f.cfg.workers.agents = [];
+    if (mode === "listener off") f.cfg.workers.listen = undefined;
+    // Reuse the persisted store to observe construction separately from start.
+    const next = new Factory(f.cfg, {
+      store: f.store,
+      providers,
+      confinement: fakeConfinement,
+      loadSource: () => 0,
+    });
+    factory = next;
+    const scheduler = spyOn(next.scheduler, "start").mockImplementation(() => {});
+    expect([kept, terminalJob, orphan].map((id) => next.workers.agentJob(id)?.state)).toEqual([
+      "queued",
+      "queued",
+      "queued",
+    ]);
+    next.start();
+    expect([kept, terminalJob, orphan, done, failed].map((id) => next.workers.agentJob(id)?.state)).toEqual([
+      mode === "implement" ? "queued" : "cancelled",
+      "cancelled",
+      "cancelled",
+      "done",
+      "failed",
+    ]);
+    const stopOrphan = enqueue(run.id);
+    await next.stop();
+    expect(next.workers.agentJob(stopOrphan)?.state).toBe("cancelled");
+    expect(next.workers.agentJob(kept)?.state).toBe(mode === "implement" ? "queued" : "cancelled");
+    scheduler.mockRestore();
+  },
+);
+
+test("publication resume checks HEAD, cleanliness, expected SHA and the private list", async () => {
+  const bare = await githubFixture();
+  let f: Factory,
+    checked = false;
+  const executor: AgentExecutor = {
+    kind: "test",
+    async run(call, local) {
+      const hooks = call.publication;
+      if (hooks && !checked) {
+        checked = true;
+        const req = await hooks.prepare();
+        if (!req) throw new Error("Missing publication");
+        expect(await hooks.resume(req)).toBe(true);
+        expect(await hooks.resume({ ...req, privateStringsDigest: "d".repeat(64) })).toBe(false);
+        expect(await hooks.resume({ ...req, expectedRemoteSha: release })).toBe(false);
+        const file = join(call.worktree, "untracked.txt");
+        writeFileSync(file, "dirty\n");
+        expect(await hooks.resume(req)).toBe(false);
+        rmSync(file);
+        await worktreeGit(["git", "commit", "--allow-empty", "-qm", "moved HEAD"], { cwd: call.worktree });
+        expect(await hooks.resume(req)).toBe(false);
+        await worktreeGit(["git", "reset", "--hard", req.parentSha], { cwd: call.worktree });
+        expect(await hooks.resume(req)).toBe(true);
+      }
+      return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+    },
+  };
+  const instance = boot({ executor });
+  f = instance.f;
+  registerGithub(f, bare);
+  const complete = simulated(f, async (job, req) => report(f, job, req, await publish(bare, req)));
+  try {
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+    expect(checked).toBe(true);
+    expect(jobs(f)).toHaveLength(1);
+    expect(instance.locals()).toBe(0);
+  } finally {
+    await complete();
   }
 });

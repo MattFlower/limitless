@@ -73,6 +73,7 @@ export async function startWorkerListener(
   if (!listen) return undefined;
   const tls = await certificate(join(paths.home, "worker-tls"));
   workers.pairingKey = tls.key;
+  workers.resumedAt = workers.now();
   const limits = new Map<string, { at: number; count: number }>();
   const closing = new AbortController();
   const fetch = async (req: Request, server: Server<undefined>): Promise<Response> => {

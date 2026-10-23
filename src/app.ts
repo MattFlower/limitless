@@ -3,6 +3,7 @@ import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
+import { TERMINAL_STATUSES } from "./core/types.ts";
 import { Store } from "./db/store.ts";
 import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
@@ -21,7 +22,7 @@ import { seatbeltForPort } from "./harness/sandbox.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
-import type { EngineDeps } from "./pipeline/context.ts";
+import type { EngineDeps, RunState } from "./pipeline/context.ts";
 import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
@@ -282,7 +283,7 @@ export class Factory {
         .filter((p) => p.sshForward && this.tracker.isEnabled(p.id))
         .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
     );
-    this.workers.cancelOpenAgentJobs();
+    this.workers.cancelOpenAgentJobs(this.keptAgentJobs());
     this.scheduler.start();
   }
 
@@ -293,7 +294,18 @@ export class Factory {
     await this.gcInFlight;
     this.tunnels.stop();
     await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
-    this.workers.cancelOpenAgentJobs();
+    this.workers.cancelOpenAgentJobs(this.keptAgentJobs());
+  }
+
+  private keptAgentJobs(): ReadonlySet<string> {
+    const keep = new Set<string>();
+    if (this.cfg.workers.listen && this.cfg.workers.agents.includes("implement"))
+      for (const run of this.store.listRuns({ limit: Number.MAX_SAFE_INTEGER })) {
+        if (TERMINAL_STATUSES.includes(run.status)) continue;
+        const handle = this.store.getRunState<RunState>(run.id)?.agentJob;
+        if (handle) keep.add(handle.id);
+      }
+    return keep;
   }
 
   gc(dryRun = false): Promise<GcResult> {
