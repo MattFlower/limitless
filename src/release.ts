@@ -5,9 +5,14 @@ import { version } from "../package.json";
 export const BUILD_DEFINES = {
   version: "LIMITLESS_BUILD_VERSION",
   sha: "LIMITLESS_BUILD_SHA",
+  packaged: "LIMITLESS_BUILD_PACKAGED",
 } as const;
 declare const LIMITLESS_BUILD_VERSION: string;
 declare const LIMITLESS_BUILD_SHA: string;
+declare const LIMITLESS_BUILD_PACKAGED: boolean;
+
+// This compile-time guard lets release builds discard source-only build dependencies.
+export const SOURCE_BUILD = typeof LIMITLESS_BUILD_PACKAGED === "undefined" || !LIMITLESS_BUILD_PACKAGED;
 
 type BuildIdentity = { version?: string; sha?: string };
 export type Release = { version: string; bun: string } & (
