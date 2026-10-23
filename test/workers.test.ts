@@ -324,7 +324,10 @@ test.each([
     expect(JSON.parse(job?.result ?? "null")).toEqual(run);
     const warning = workers.list()[0]?.setupWarning;
     expect(workers.list()[0]?.state).toBe("available");
-    expect(warning).toContain("Worker runner setup failed");
+    expect(warning).toBe(
+      "Worker setup failed: [withheld: private text]; LAN gates falling back to local execution",
+    );
+    expect(JSON.stringify(store.listEvents(req.runId ?? ""))).not.toContain("runner");
     expect(warning).toContain("[withheld: private text]");
     expect(warning).toContain("falling back to local execution");
     expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toBe(warning);
@@ -382,7 +385,8 @@ test("successful worker setup clears a confirmed warning and preserves fallback 
   expect(workers.list()[0]?.setupWarning).toBeUndefined();
   expect(workers.complete(first.id, { setupOk: true, setup: [], checks: [] }, true)).toBe(true);
   const warning = workers.list()[0]?.setupWarning;
-  expect(warning).toContain("Worker runner setup failed");
+  expect(warning).toBe(`Worker setup failed: test -f tracked; LAN gates falling back to local execution`);
+  expect(JSON.stringify(store.listEvents(req.runId ?? ""))).not.toContain("runner");
   const events = workers.job(first.id)?.events;
   const runEvents = store.listEvents(req.runId ?? "");
   const command = "test -f another-setup";
@@ -480,7 +484,7 @@ test.each(["shutdown", "cancel", "stored cancel"])(
       await started.promise;
       expect(workers.job(handle.id)?.state).toBe("failed");
       expect(workers.list()[0]?.setupWarning).toBeUndefined();
-      expect(workers.job(handle.id)?.events).toContain("Worker runner setup failed: test -f tracked");
+      expect(workers.job(handle.id)?.events).toContain("Worker setup failed: test -f tracked");
       expect(workers.lease("runner")).toBeNull();
       expect(executor.attach(handle, new AbortController().signal)).toBe(execution);
       if (mode === "stored cancel") workers.cancel(handle.id);
@@ -509,9 +513,9 @@ test.each(["shutdown", "cancel", "stored cancel"])(
         expect(run.setupOk).toBe(true);
         expect(localStarts).toBe(2);
         expect(workers.job(handle.id)?.state).toBe("done");
-        expect(workers.list()[0]?.setupWarning).toContain("Worker runner setup failed");
+        expect(workers.list()[0]?.setupWarning).toContain("Worker setup failed");
         const events: { type: string; text?: string }[] = JSON.parse(workers.job(handle.id)?.events ?? "[]");
-        expect(events.filter((e) => e.text?.includes("Worker runner setup failed"))).toHaveLength(1);
+        expect(events.filter((e) => e.text?.includes("Worker setup failed"))).toHaveLength(1);
       } else {
         const resumed = gateExecutorFor("lan", workers, [req.repo]).attach(
           handle,
@@ -6706,7 +6710,7 @@ test.each(["match", "differs", "absent", "unreadable"])(
         });
         expect(cli.exitCode).toBe(0);
         expect(cli.stdout.trim()).toBe(
-          "runner\tavailable\tclaude:unknown\tcodex:unknown\tprivate-strings:match",
+          "runner\tavailable\tclaude:unknown\tcodex:unknown\tprivate-strings:match\tagent-jobs:0",
         );
         expect(cli.stdout).not.toContain(account);
         expect(cli.stderr).not.toContain(account);
