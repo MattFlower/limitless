@@ -588,3 +588,135 @@ test("done job for another target is adopted before a new dispatch", async () =>
   expect((await running).finalText).toBe("new target");
   expect(f.counts()).toMatchObject({ jobs: 2, adopted: 2, locals: 0 });
 });
+
+function reviewFixture() {
+  const f = fixture();
+  f.cfg.workers.agents = ["review", "verify", "holdout"];
+  f.call.role = "review";
+  f.call.spec.mode = "readonly";
+  f.call.publication = undefined;
+  f.call.checkout = { parentSha, baseSha: sha, branch: "change/review" };
+  return f;
+}
+
+test.each([
+  "eligible",
+  "agents off",
+  "repo excluded",
+  "shadow",
+  "private",
+  "backend",
+  "openai",
+  "decisions",
+  "verify",
+  "holdout",
+  "no checkout",
+  "publication",
+  "edit",
+  "other harness",
+])("readonly review eligibility: %s", async (reason) => {
+  const f = reviewFixture();
+  if (reason === "agents off") f.cfg.workers.agents = ["implement"];
+  if (reason === "repo excluded") f.cfg.workers.repos = [];
+  if (reason === "shadow") f.call.shadow = true;
+  if (reason === "private") f.call.private = true;
+  if (reason === "backend" || reason === "openai" || reason === "decisions")
+    Object.assign(f.call.spec.target, { [reason]: { baseUrl: "https://example.com" } });
+  if (reason === "verify" || reason === "holdout") f.call.role = reason;
+  if (reason === "no checkout") f.call.checkout = undefined;
+  if (reason === "publication")
+    f.call.publication = {
+      async started() {
+        throw new Error("Unexpected publication");
+      },
+      async resume() {
+        throw new Error("Unexpected publication");
+      },
+      async prepare() {
+        throw new Error("Unexpected publication");
+      },
+      async adopt() {
+        throw new Error("Unexpected publication");
+      },
+      async remoteSha() {
+        throw new Error("Unexpected publication");
+      },
+    };
+  if (reason === "edit") f.call.spec.mode = "edit";
+  if (reason === "other harness") f.call.spec.target.harness = "fake";
+  const running = f.run();
+  if (reason === "eligible") {
+    await f.enqueued;
+    const request = JSON.parse(f.workers.agentJob(f.job())?.request ?? "null");
+    expect(request).toMatchObject({ role: "review", mode: "readonly", ...f.call.checkout });
+    for (const key of ["commit", "repoUrl", "expectedRemoteSha", "privateStringsDigest", "discreet", "uiUrl"])
+      expect(request).not.toHaveProperty(key);
+    f.complete(f.job(), {
+      ...(await f.report()),
+      branch: "change/review",
+      sha: parentSha,
+      privateStringsDigest: undefined,
+    });
+  }
+  expect((await running).finalText).toBe(reason === "eligible" ? "remote" : "local");
+  expect(f.counts()).toMatchObject({
+    jobs: reason === "eligible" ? 1 : 0,
+    locals: reason === "eligible" ? 0 : 1,
+    prepared: 0,
+    adopted: 0,
+  });
+  expect(f.call.agentJob).toBeUndefined();
+});
+
+test.each([
+  "failed",
+  "malformed",
+  "parentSha",
+  "branch",
+  "sha",
+  "confinement",
+  "cancelled job",
+  "cancelled session",
+])("readonly review falls back once without provider health changes: %s", async (reason) => {
+  const f = reviewFixture();
+  const running = f.run();
+  await f.enqueued;
+  const id = f.job();
+  if (reason === "failed") {
+    f.workers.failAgentJob(id, "Disconnected");
+    f.workers.failAgentJob(id, "Disconnected");
+  } else if (reason === "cancelled job") f.workers.cancelAgentJob(id);
+  else if (reason === "malformed") f.complete(id, {});
+  else {
+    f.complete(id, {
+      ...(await f.report()),
+      parentSha,
+      branch: "change/review",
+      sha: parentSha,
+      privateStringsDigest: undefined,
+      ...(["parentSha", "branch", "sha"].includes(reason) ? { [reason]: sha } : {}),
+      ...(reason === "cancelled session" ? { status: "cancelled" } : {}),
+      ...(reason === "confinement"
+        ? {
+            confinement: { ok: false, path: null, version: null, reason: "probe inconclusive", exitCode: 1 },
+          }
+        : {}),
+    });
+  }
+  expect((await running).finalText).toBe("local");
+  expect(f.counts()).toMatchObject({ locals: 1, prepared: 0, adopted: 0 });
+  expect(f.events.some((e) => e.type === "status" && e.text.includes("running locally"))).toBe(true);
+});
+
+test.each(["queued", "leased"])("shutdown cancels %s review jobs without a durable handle", async (state) => {
+  const f = reviewFixture();
+  const running = f.run();
+  await f.enqueued;
+  const id = f.job();
+  f.store.db.query("UPDATE agent_jobs SET state=? WHERE id=?").run(state, id);
+  f.controller.abort(new Error("shutdown"));
+  expect((await running).status).toBe("cancelled");
+  expect(f.workers.agentJob(id)?.state).toBe("cancelled");
+  expect(f.counts()).toMatchObject({ locals: 0 });
+  expect(f.call.agentJob).toBeUndefined();
+});

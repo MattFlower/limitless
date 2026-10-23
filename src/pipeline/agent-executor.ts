@@ -43,6 +43,7 @@ export interface AgentCall {
   denyRead: AgentSpec["denyRead"];
   dispatch: () => void;
   publication?: AgentPublicationHooks;
+  checkout?: { parentSha: string; baseSha: string; branch: string };
   round?: number;
   agentJob?: { round: number; id: string };
 }

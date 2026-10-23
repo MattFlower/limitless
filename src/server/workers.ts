@@ -247,6 +247,8 @@ export async function startWorkerListener(
           const result = AgentResultReport.parse(body);
           if (result.parentSha !== job.parent_sha) return json({ error: "Result parent SHA mismatch" }, 400);
           const request: AgentJobRequest = JSON.parse(job.request);
+          if (!request.commit && result.sha !== job.parent_sha)
+            return json({ error: "Readonly result SHA mismatch" }, 400);
           if (
             request.commit &&
             (result.branch !== request.branch ||

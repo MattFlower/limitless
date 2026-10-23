@@ -1837,6 +1837,10 @@ async function oneRound(
           ...request,
           ...(deadline ? { deadline } : {}),
           shadow: invokeGuard.getStore(),
+          checkout:
+            ctx.repo.kind === "github" && ctx.run.branch
+              ? { parentSha: reviewedSha, baseSha, branch: ctx.run.branch }
+              : undefined,
           requireStructured: true,
         });
         if (!ctx.parallelChecks || invokeGuard.getStore())

@@ -5,7 +5,7 @@ import { gateShutdown } from "../gates/executor.ts";
 import type { AgentResult } from "../harness/types.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { AgentEvents, AgentResultReport } from "../workers/agent-protocol.ts";
-import type { AgentExecutor, AgentPublication } from "./agent-executor.ts";
+import type { AgentCall, AgentExecutor, AgentPublication } from "./agent-executor.ts";
 import { NeedsHumanError } from "./context.ts";
 import { SimulatedTermination } from "./faults.ts";
 
@@ -23,18 +23,24 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
     async run(call, local) {
       const publication = call.publication;
       const { spec } = call;
+      const readonly =
+        call.role === "review" &&
+        spec.mode === "readonly" &&
+        !!call.checkout &&
+        !publication &&
+        !spec.target.backend &&
+        !spec.target.openai &&
+        !spec.target.decisions;
       const eligible = !(
-        !publication ||
-        call.role !== "implement" ||
+        (!readonly && (!publication || call.role !== "implement" || spec.mode !== "edit")) ||
         !cfg.workers.agents.includes(call.role) ||
         !cfg.workers.repos.includes(call.repoSlug) ||
         call.shadow ||
         call.private ||
-        spec.mode !== "edit" ||
         !["claude", "codex"].includes(spec.target.harness)
       );
       const cancelled = (id?: string): AgentResult => {
-        if (id && !gateShutdown(spec.signal)) workers.cancelAgentJob(id);
+        if (id && (readonly || !gateShutdown(spec.signal))) workers.cancelAgentJob(id);
         return {
           status: "cancelled",
           finalText: "",
@@ -52,7 +58,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
       let id = publication && call.agentJob?.round === call.round ? call.agentJob?.id : undefined;
       const open = (state: string) => state === "queued" || state === "leased";
       if (spec.signal.aborted) return cancelled(id);
-      if (!eligible || !publication) {
+      if (!eligible) {
         if (id && open(workers.agentJob(id)?.state ?? "")) workers.cancelAgentJob(id);
         return local();
       }
@@ -60,7 +66,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
         request.target.provider === spec.target.provider &&
         request.target.modelId === spec.target.modelId &&
         request.target.effort === spec.target.effort;
-      let request: AgentJobRequest & AgentPublication;
+      let request: AgentJobRequest;
       let cursor = { attempt: -1, seq: -1 };
       while (id) {
         let job = workers.agentJob(id);
@@ -72,7 +78,11 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
         if (job.state === "done") break;
         let resume = false;
         try {
-          resume = open(job.state) && matches(request) && (await publication.resume(request));
+          resume = !!(
+            open(job.state) &&
+            matches(request) &&
+            (await publication?.resume(request as AgentPublication))
+          );
         } catch (error) {
           job = workers.agentJob(id);
           if (spec.signal.aborted) return cancelled(id);
@@ -94,9 +104,9 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
       }
       dispatchLoop: for (;;) {
         if (!id) {
-          let prepared: AgentPublication | null;
+          let prepared: AgentPublication | AgentCall["checkout"] | null;
           try {
-            prepared = await publication.prepare();
+            prepared = readonly ? call.checkout : await publication?.prepare();
           } catch (error) {
             if (
               error instanceof NeedsHumanError ||
@@ -142,7 +152,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
             slottedCommands: call.slottedCommands,
           };
           id = randomUUID();
-          await publication.started(id);
+          await publication?.started(id);
           if (spec.signal.aborted) return cancelled(id);
           if (!workers.enqueueAgentJob(request, id)) return fallback();
           cursor = { attempt: -1, seq: -1 };
@@ -177,6 +187,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
               report.success &&
               report.data.parentSha === request.parentSha &&
               report.data.branch === request.branch &&
+              (!readonly || report.data.sha === request.parentSha) &&
               report.data.privateStringsDigest === request.privateStringsDigest
             ) {
               const {
@@ -186,7 +197,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
                 privateStringsDigest: _digest,
                 ...result
               } = report.data;
-              await publication.adopt(sha, request);
+              await publication?.adopt(sha, request as AgentPublication);
               if (workers.agentJob(id)?.state !== "done") continue;
               if (spec.signal.aborted) return cancelled(id);
               if (!matches(request)) {
@@ -202,7 +213,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
             await Bun.sleep(workers.times.tick);
             continue;
           }
-          const remote = await publication.remoteSha();
+          const remote = await publication?.remoteSha();
           if (spec.signal.aborted) return cancelled(id);
           if (workers.agentJob(id)?.state === "done" && job?.state !== "done") continue;
           if (remote !== undefined && remote !== request.expectedRemoteSha)

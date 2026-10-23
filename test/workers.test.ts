@@ -4441,7 +4441,7 @@ const agentResult = (parentSha = releaseSha) => ({
   error: null,
   quota: null,
   parentSha,
-  sha: "a".repeat(40),
+  sha: parentSha,
   branch: "change/example",
 });
 const agentPath = (id: string, action: string) => `/worker/agent-jobs/${id}/${action}`;
@@ -4774,9 +4774,20 @@ test("agent reports validate result metadata and persist changed and unchanged c
   const token = await paired();
   await call("/worker/heartbeat", caps(), token);
   for (const unchanged of [false, true]) {
-    const id = enqueueAgent();
+    const id = enqueueAgent(
+      unchanged
+        ? {}
+        : {
+            commit: publicationCommit,
+            branch: "change/example",
+            privateStringsDigest: privateStringsDigest([]),
+          },
+    );
     workers.leaseAgentJob("runner");
-    const result = agentResult();
+    const result = {
+      ...agentResult(),
+      ...(unchanged ? {} : { privateStringsDigest: privateStringsDigest([]) }),
+    };
     for (const bad of [
       { parentSha: "b".repeat(40) },
       ...["short", "g".repeat(40), "a".repeat(41), "a".repeat(63)].map((sha) => ({ sha })),
@@ -4790,6 +4801,12 @@ test("agent reports validate result metadata and persist changed and unchanged c
       { confinement: { ok: false, path: null, version: null, reason: "unknown", exitCode: null } },
     ]) {
       expect((await call(agentPath(id, "result"), { ...result, ...bad }, token)).status).toBe(400);
+      expect(workers.agentJob(id)).toMatchObject({ state: "leased", result: null, result_sha: null });
+    }
+    if (unchanged) {
+      expect((await call(agentPath(id, "result"), { ...result, sha: "a".repeat(40) }, token)).status).toBe(
+        400,
+      );
       expect(workers.agentJob(id)).toMatchObject({ state: "leased", result: null, result_sha: null });
     }
     const report = {
@@ -6283,7 +6300,7 @@ test.each([
         : kind === "session committed dirty"
           ? "edit"
           : undefined,
-      ...(!kind.includes("legacy")
+      ...(!kind.includes("legacy") && kind !== "readonly"
         ? {
             privateStringsDigest:
               kind === "missing digest"
@@ -6853,6 +6870,45 @@ test("heartbeat optional fields return only after the observed coordinator relea
   try {
     await until(() => resumed);
     expect(rejected).toBe(1);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test.each([
+  { role: "review", mode: "edit" },
+  ...["review", "implement"].flatMap((role) => [
+    { role, mode: "readonly", commit: publicationCommit },
+    { role, mode: "readonly", repoUrl: "https://github.com/test/repo.git" },
+    { role, mode: "readonly", expectedRemoteSha: null },
+    { role, mode: "readonly", expectedRemoteSha: releaseSha },
+    { role, mode: "readonly", privateStringsDigest: privateStringsDigest([]) },
+    { role, mode: "readonly", discreet: false },
+    { role, mode: "readonly", uiUrl: "https://example.com" },
+  ]),
+])("worker refuses readonly publication before fetching: %j", async (fields) => {
+  await listen();
+  const id = enqueueAgent({
+    ...fields,
+    role: fields.role as AgentJobRequest["role"],
+    mode: fields.mode as AgentJobRequest["mode"],
+  });
+  let bundles = 0;
+  const harness = spyOn({ run: fakeHarness(() => ({})) }, "run");
+  const worker = await loop({
+    capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
+    harnesses: { claude: harness },
+    request: async (...args) => {
+      if (args[1].endsWith("/bundle")) bundles++;
+      return workerRequest(...args);
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.failure_reason !== null);
+    expect(workers.agentJob(id)?.failure_reason).toBe("Readonly jobs carry no publication fields");
+    expect(bundles).toBe(0);
+    expect(harness).not.toHaveBeenCalled();
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
   } finally {
     await worker.stop();
   }
