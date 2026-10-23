@@ -214,7 +214,10 @@ describe("per-run model chains", () => {
     },
   );
   test("explicit review, holdout and verify chains override independence and warn", async () => {
-    const f = start(reply);
+    const f = start((s) => {
+      expect(s.allowLocalBinding).toBe(roleOf(s) === "verify" ? true : undefined);
+      return reply(s);
+    });
     const models = { implement: ["alpha/m"], review: ["alpha/m"], holdout: ["alpha/m"], verify: ["alpha/m"] };
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard", models });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
@@ -236,6 +239,51 @@ describe("per-run model chains", () => {
           ),
       ).toBe(true);
     }
+  });
+  test.each([
+    ["alpha/m", "beta/m", "unavailable"],
+    ["beta/m", "alpha/m", "unavailable"],
+    ["beta/m", "alpha/m", "blocked"],
+  ] as const)("verify binding and prompt follow chain %s/%s after %s", async (first, second, failure) => {
+    const seen: string[] = [];
+    const handler: Handler = (s) => {
+      if (roleOf(s) !== "verify") {
+        expect(s.allowLocalBinding).toBeUndefined();
+        return reply(s);
+      }
+      seen.push(s.target.modelId);
+      expect(s.allowLocalBinding).toBe(true);
+      expect(s.mode).toBe("readonly");
+      expect(s.noTools).toBe(false);
+      expect(s.prompt.includes("loopback servers")).toBe(s.target.harness === "codex");
+      if (seen.length > 1) return { structured: pass };
+      return failure === "unavailable"
+        ? { status: "unavailable" }
+        : {
+            structured: {
+              ...pass,
+              criteria: pass.criteria.map((c) => ({
+                ...c,
+                status: "blocked",
+                blockedReason: "sandbox",
+                evidence: "command denied",
+              })),
+            },
+          };
+    };
+    const f = start(handler, false, false, {
+      providers: providers.map((p) => ({ ...p, harness: p.id === "alpha" ? "claude" : "codex" })),
+      harnesses: { claude: fakeHarness(handler), codex: fakeHarness(handler) },
+    });
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "standard",
+      models: { verify: [first, second] },
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    // A pinned chain deliberately overrides exclusions, including the environment retry's.
+    expect(seen).toEqual([first, failure === "blocked" ? first : second]);
   });
   test("a review chain replaces configured finder preferences and listed panel verifiers", async () => {
     const f = start((s) => {

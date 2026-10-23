@@ -2079,18 +2079,21 @@ async function oneRound(
         async (stage) => {
           const { result, target } = await ctx.invoke({
             role: "verify",
+            allowLocalBinding: true,
             stage,
             mode: "readonly",
             complexity: ctx.complexity,
             constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
             timeoutMs: readingTimeout(diff.added + diff.removed, 25),
-            prompt: verifyPrompt({
-              prompt: ctx.run.prompt,
-              spec: ctx.state.spec as Spec,
-              holdout: ctx.state.holdout as Holdout,
-              baseSha,
-              checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
-            }),
+            prompt: (allowLocalBinding) =>
+              verifyPrompt({
+                allowLocalBinding,
+                prompt: ctx.run.prompt,
+                spec: ctx.state.spec as Spec,
+                holdout: ctx.state.holdout as Holdout,
+                baseSha,
+                checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
+              }),
             jsonSchema: toStrictJsonSchema(VerifySchema),
             schema: VerifySchema,
             requireStructured: true,

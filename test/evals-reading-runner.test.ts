@@ -237,6 +237,7 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
     );
     f.save();
     f.respond(async (s) => {
+      expect(s.allowLocalBinding).toBeUndefined();
       expect(s.mode).toBe("readonly");
       expect(s.noTools).toBe(false);
       expect(s.systemAppend).toBe(FACTORY_PREAMBLE);
@@ -477,53 +478,66 @@ test.each([
   }
 });
 
-test("verify uses pipeline schema, prompt, private session and head content, retaining per-criterion grades", async () => {
-  const f = await fixture("verify");
-  try {
-    f.respond(async (s) => {
-      expect(s.privateSession).toBe(true);
-      expect(s.mode).toBe("readonly");
-      expect(s.noTools).toBe(false);
-      expect(s.schema).toBe(VerifySchema);
-      expect(s.jsonSchema).toEqual(toStrictJsonSchema(VerifySchema));
-      expect(s.systemAppend).toBe(FACTORY_PREAMBLE);
-      expect(s.prompt).toBe(
-        verifyPrompt({
-          ...f.verifyItem.input,
-          holdout: f.verifyItem.input.holdout ?? { scenarios: [] },
-          baseSha: f.sha,
-        }),
-      );
-      const diff = await diffSince(s.cwd, f.sha);
-      expect(s.timeoutMs).toBe(readingTimeout(diff.added + diff.removed, 25));
-      expect((await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim()).toBe(f.verifyItem.head);
-      expect(existsSync(join(s.cwd, "CURRENT.txt"))).toBe(true);
-      expect(existsSync(join(s.cwd, "PINNED.txt"))).toBe(false);
-      return {
-        structured: {
-          overall: "fail",
-          notes: "",
-          criteria: Object.entries(f.verifyItem.gold).map(([id, status]) => ({
-            id,
-            status,
-            evidence: "observed",
-            publicSummary: "",
-          })),
-        },
-      };
-    });
-    expect((await f.run()).trials[0]?.pass).toBe(true);
-    expect(f.harnessNames).toEqual(["fake"]);
-    await f.clean();
-    delete f.verifyItem.input.holdout;
-    f.verifyItem.gold = { "AC-1": "met" };
-    f.save();
-    expect((await f.run()).trials[0]?.pass).toBe(true);
-    await f.clean();
-  } finally {
-    await f.close();
-  }
-});
+test.each(["fake", "claude", "codex"] as const)(
+  "verify uses pipeline schema, prompt, private session and head content with %s",
+  async (harness) => {
+    const f = await fixture("verify");
+    try {
+      const provider = f.factory.tracker.def("provider-b");
+      if (!provider) throw new Error("missing provider");
+      provider.harness = harness;
+      const recording = f.factory.deps.harnesses.fake;
+      if (!recording) throw new Error("missing recording harness");
+      f.factory.deps.harnesses.claude = recording;
+      f.respond(async (s) => {
+        expect(s.allowLocalBinding).toBe(true);
+        expect(s.privateSession).toBe(true);
+        expect(s.mode).toBe("readonly");
+        expect(s.noTools).toBe(false);
+        expect(s.schema).toBe(VerifySchema);
+        expect(s.jsonSchema).toEqual(toStrictJsonSchema(VerifySchema));
+        expect(s.systemAppend).toBe(FACTORY_PREAMBLE);
+        expect(s.prompt).toBe(
+          verifyPrompt({
+            ...f.verifyItem.input,
+            holdout: f.verifyItem.input.holdout ?? { scenarios: [] },
+            baseSha: f.sha,
+            allowLocalBinding: harness === "claude",
+          }),
+        );
+        const diff = await diffSince(s.cwd, f.sha);
+        expect(s.timeoutMs).toBe(readingTimeout(diff.added + diff.removed, 25));
+        expect((await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim()).toBe(
+          f.verifyItem.head,
+        );
+        expect(existsSync(join(s.cwd, "CURRENT.txt"))).toBe(true);
+        expect(existsSync(join(s.cwd, "PINNED.txt"))).toBe(false);
+        return {
+          structured: {
+            overall: "fail",
+            notes: "",
+            criteria: Object.entries(f.verifyItem.gold).map(([id, status]) => ({
+              id,
+              status,
+              evidence: "observed",
+              publicSummary: "",
+            })),
+          },
+        };
+      });
+      expect((await f.run({ models: ["candidate-b"] })).trials[0]?.pass).toBe(true);
+      expect(f.harnessNames).toEqual([harness === "claude" ? "fake" : harness]);
+      await f.clean();
+      delete f.verifyItem.input.holdout;
+      f.verifyItem.gold = { "AC-1": "met" };
+      f.save();
+      expect((await f.run({ models: ["candidate-b"] })).trials[0]?.pass).toBe(true);
+      await f.clean();
+    } finally {
+      await f.close();
+    }
+  },
+);
 
 test("audit uses gate configuration from base, so a change cannot disable its own findings", async () => {
   const f = await fixture();
