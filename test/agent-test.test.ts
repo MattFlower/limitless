@@ -346,6 +346,54 @@ test("factory gate transport waits past the lease transport deadline", async () 
   expect((await reply).factoryGate?.status).toBe(0);
 });
 
+test("factory gate socket disables the server idle timeout while awaiting a result", async () => {
+  const f = fixture(),
+    scratch = join(f.root, SCRATCH_NAME);
+  mkdirSync(scratch);
+  const serve = Bun.serve;
+  let disabled = 0;
+  const server = spyOn(Bun, "serve").mockImplementation((options) => {
+    options.idleTimeout = 1;
+    const instance = serve(options);
+    const timeout = instance.timeout.bind(instance);
+    // Bun versions differ in how consuming the POST body affects their idle timer.
+    const override = spyOn(instance, "timeout").mockImplementation((request, seconds) => {
+      if (seconds === 0) disabled++;
+      return timeout(request, seconds);
+    });
+    cleanup.push(() => override.mockRestore());
+    return instance;
+  });
+  cleanup.push(() => server.mockRestore());
+  await withSlottedCommands(
+    f.config.commands,
+    f.root,
+    scratch,
+    undefined,
+    () => {},
+    async (path) => {
+      const directory = path?.split(delimiter)[0];
+      if (!directory) throw new Error("missing wrapper");
+      const result = await sh([join(directory, "bun"), "test"], {
+        cwd: f.root,
+        allowFail: true,
+        timeoutMs: 15_000,
+      });
+      expect(result.exitCode).toBe(7);
+      expect(result.stdout).toContain("Factory gate run: FAIL\nfailure excerpt");
+      expect(existsSync(f.marker)).toBe(false);
+      expect(disabled).toBe(1);
+    },
+    undefined,
+    { role: "implement", agentFullSuite: "gate" },
+    async () => {
+      // Bun checks socket idleness in coarse intervals; wait beyond the server's configured bound.
+      await Bun.sleep(6_000);
+      return { status: 7, text: "Factory gate run: FAIL\nfailure excerpt" };
+    },
+  );
+}, 20_000);
+
 test("unslotted argv executes immediately without requesting a lease", async () => {
   const f = fixture();
   let requests = 0;

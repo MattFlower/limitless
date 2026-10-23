@@ -9,7 +9,7 @@ import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { compareGates, confinementFailed, type GateResult, gateEnv, retryRegressions } from "../gates/run.ts";
 import { gateSlotScope } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
-import { exportCommit, snapshotTree } from "../git/repos.ts";
+import { exportGateSnapshot, snapshotTree } from "../git/repos.ts";
 import { commandScope } from "../harness/sandbox.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { RunContext } from "./context.ts";
@@ -128,7 +128,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
     const tree = await snapshotTree(cwd, signal);
     const checkout = join(scratch, "checkout");
     mkdirSync(checkout);
-    await exportCommit(cwd, tree, checkout, signal);
+    await exportGateSnapshot(cwd, tree, checkout, signal);
     return gateSlotScope(
       commandScope(checkout, async () => {
         const key = await agentGateKey(ctx, checkout, tree);

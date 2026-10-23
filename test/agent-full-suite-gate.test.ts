@@ -16,12 +16,15 @@ const fixture: { home: string; repoDir: string; factory: Factory | null } = {
 };
 const { start } = pipelineSetup(fixture);
 
-async function configure(onlyTest = false, noTest = false) {
+async function configure(onlyTest = false, noTest = false, gitCheck = false) {
+  const testRun = gitCheck
+    ? 'git ls-files --error-unmatch greeting.txt && git describe --tags && git rev-parse HEAD^{tree} && test -z "$(git status --porcelain)" && echo trusted-test'
+    : "echo trusted-test";
   writeFileSync(
     join(fixture.repoDir, ".limitless.toml"),
     `[gates]
 setup = ${onlyTest ? "[]" : '["echo setup"]'}
-checks = [${onlyTest ? "" : '{name="lint",run="echo lint"},'}${noTest ? "" : '{name="test",run="echo trusted-test"}'}]
+checks = [${onlyTest ? "" : '{name="lint",run="echo lint"},'}${noTest ? "" : `{name="test",run=${JSON.stringify(testRun)}}`}]
 [limits]
 slotted_commands = ["bun test"]
 agent_full_suite = "gate"
@@ -29,6 +32,7 @@ agent_full_suite = "gate"
   );
   await sh(["git", "add", ".limitless.toml"], { cwd: fixture.repoDir });
   await sh(["git", "commit", "-qm", "trusted gate policy"], { cwd: fixture.repoDir });
+  if (gitCheck) await sh(["git", "tag", "snapshot-base"], { cwd: fixture.repoDir });
 }
 
 test.each([
@@ -50,7 +54,7 @@ test.each([
   "confinement",
   "setup-fail",
 ])("implement snapshot and round gate reuse: %s", async (scenario) => {
-  await configure(scenario === "only-test", scenario === "no-test");
+  await configure(scenario === "only-test", scenario === "no-test", scenario === "same");
   const requests: GateRequest[] = [];
   let tree = "",
     worktree = "",
@@ -69,6 +73,18 @@ test.each([
         expect(readFileSync(join(request.cwd, "farewell.txt"), "utf8")).toBe("goodbye\n");
         expect(readFileSync(join(request.cwd, "greeting.txt"), "utf8")).toBe("edited\n");
         tree = request.headSha;
+        if (scenario === "same") {
+          const git = async (...args: string[]) =>
+            (await sh(["git", ...args], { cwd: request.cwd })).stdout.trim();
+          expect(await git("write-tree")).toBe(tree);
+          expect(await git("rev-parse", "HEAD^{tree}")).toBe(tree);
+          expect(await git("describe", "--tags")).toMatch(/^snapshot-base-1-g/);
+          expect(await git("ls-files", "--error-unmatch", "farewell.txt")).toBe("farewell.txt");
+          expect(await git("status", "--porcelain")).toBe("");
+          expect(existsSync(join(request.cwd, ".git/objects/info/alternates"))).toBe(false);
+          // A ref created in the snapshot must never appear in the session.
+          await sh(["git", "update-ref", "refs/heads/snapshot-only", "HEAD"], { cwd: request.cwd });
+        }
       }
       return executor.start(request, signal);
     },
@@ -140,11 +156,16 @@ test.each([
             `Factory gate run of check test on tree ${tree}: ${failed ? "FAIL" : "pass"}`,
           );
           expect(result.stdout).toContain(scenario === "setup-fail" ? "setup failed" : "trusted-test");
+          if (scenario === "same") {
+            expect(result.stdout).toContain(tree);
+            expect(result.stdout).toContain("snapshot-base-1-g");
+          }
         }
       } else agent.onEvent({ type: "text", text: "bun test: 100 pass, 0 fail (factory gate passed)" });
       expect(await git("rev-parse", "HEAD")).toBe(beforeHead);
       expect(await git("status", "--porcelain")).toBe(beforeStatus);
       expect(readFileSync(indexPath)).toEqual(beforeIndex);
+      if (scenario === "same") expect(await git("branch", "--list", "snapshot-only")).toBe("");
       expect(readFileSync(join(worktree, "farewell.txt"), "utf8")).toBe("goodbye\n");
       expect(readFileSync(join(worktree, "greeting.txt"), "utf8")).toBe("edited\n");
       if (scenario === "changed") writeFileSync(join(worktree, "later.txt"), "after snapshot\n");

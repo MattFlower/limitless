@@ -49,7 +49,7 @@ export async function withSlottedCommands<T>(
   try {
     server = Bun.serve({
       unix,
-      async fetch(req) {
+      async fetch(req, server) {
         if (
           req.method !== "POST" ||
           new URL(req.url).pathname !== "/api/admin/gate-slot" ||
@@ -60,6 +60,8 @@ export async function withSlottedCommands<T>(
           const body: Record<string, unknown> = await req.json();
           // This socket can only serve its owning invocation, even with another valid token.
           if (body.token !== session.token) return new Response("forbidden", { status: 403 });
+          // A factory gate may wait for a slot and run for much longer than Bun's idle timeout.
+          if (body.gate !== undefined) server.timeout(req, 0);
           req.signal.throwIfAborted();
           const lease = await agentTestLease(body);
           if (req.signal.aborted && body.gate === undefined)
