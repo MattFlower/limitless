@@ -270,12 +270,23 @@ const client: DeployClient = {
   async admin(action) {
     calls.push(action);
     if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
-    draining = action === "drain";
     if (action === "drain" && (scenario.endsWith("signal-drain") || scenario === "signal-journal")) {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
+      const interrupted = new Promise<void>((resolve) => {
+        const finish = () => {
+          process.off("SIGINT", finish);
+          process.off("SIGTERM", finish);
+          resolve();
+        };
+        process.once("SIGINT", finish);
+        process.once("SIGTERM", finish);
+      });
       console.log("READY");
-      await new Promise(() => {});
+      await interrupted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      calls.push("drain applied");
     }
+    draining = action === "drain";
     if (action === "drain" && ["drain", "resume-failure"].includes(scenario)) throw new Error("drain failed");
     if (action === "drain" && scenario === "unsupported")
       throw new DrainUnsupportedError("no drain endpoint");

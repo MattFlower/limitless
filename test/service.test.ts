@@ -625,7 +625,16 @@ for (const [scenario, signal] of [
   ["marked-signal-drain", "SIGKILL"],
 ] as const) {
   test(`${signal} during ${scenario} leaves the running agent alone and its rollback data intact`, async () => {
-    const { dir, original } = await interrupted(scenario, signal, false, "prepared");
+    const { dir, original, output } = await interrupted(scenario, signal, false, "prepared");
+    if (signal !== "SIGKILL") {
+      const stopped = JSON.parse(output.trim().split("\n").at(-1) ?? "") as MigrationResult;
+      expect(stopped.draining).toBe(false);
+      expect(stopped.calls.filter((call) => ["drain applied", "resume"].includes(call))).toEqual([
+        "drain applied",
+        "resume",
+      ]);
+      expect(stopped.calls.some((call) => call.startsWith("boot"))).toBe(false);
+    }
     const { result: r } = await migration("recover-deploy", "daemon", dir);
     expect(r.error).toBe("");
     expect(r.calls.filter((call) => call.startsWith("boot"))).toEqual([]);

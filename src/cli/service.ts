@@ -405,7 +405,7 @@ export async function install(
     try {
       if (old && label === LABEL && (await isLoaded(old.label))) {
         drainAttempted = true;
-        await race(requestAdmin(client, clock, "drain"));
+        await requestDrain(client, clock, race);
         await race(waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log));
       }
       if (state) save(Object.assign(state, { phase: "stopping" }));
@@ -544,6 +544,127 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
   if (smoke) await gate(SMOKE, 900_000);
 }
 
+async function kickstart(opts: ServiceOptions, label?: string): Promise<unknown> {
+  if (opts.restart) return opts.restart();
+  label ??= (await installedUnits(opts)).find((unit) => unit.kind === "daemon")?.label;
+  if (!label) throw new Error("no installed daemon agent; run limitless service install");
+  return (opts.command ?? sh)(["launchctl", "kickstart", "-k", `gui/${uid}/${label}`], { cwd: home });
+}
+
+function resumeFailure(port: number, error: unknown): string {
+  const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
+  const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
+  return `resume scheduler: ${String(error)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`;
+}
+
+async function requestDrain(
+  client: DeployClient,
+  clock: DeployClock,
+  race: <T>(work: Promise<T>) => Promise<T>,
+): Promise<void> {
+  const request = requestAdmin(client, clock, "drain");
+  try {
+    await race(request);
+  } catch (error) {
+    // Cleanup must not resume ahead of an in-flight drain; its request timeout still bounds this wait.
+    await request.catch(() => {});
+    throw error;
+  }
+}
+
+export async function restart(port: number, opts: ServiceOptions = {}): Promise<void> {
+  const client = opts.client ?? localDeployClient(port),
+    clock = opts.clock ?? deployClock;
+  const log = opts.log ?? console.log;
+  const maxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
+  const { run, race, interruption, release } = serviceControl(opts, "restart");
+  try {
+    const agent = (await installedUnits({ ...opts, command: run })).find((unit) => unit.kind === "daemon");
+    if (!agent) throw new Error("no installed daemon agent; run limitless service install");
+    const running = validateHealth(await race(bounded(clock, (signal) => client.health(signal))));
+    if (running.sha === "unknown") throw new Error("cannot restart: daemon boot SHA is unknown");
+    const before = { ...running, observedAt: clock.now() };
+    log(`daemon before: ${running.sha}`);
+    let restartAttempted = false;
+    try {
+      if (!running.draining) await requestDrain(client, clock, race);
+      await race(waitForDrain(client, clock, maxWaitMs, opts.now === true, log));
+      if (interruption()) throw interruption();
+      log("restarting daemon via launchd");
+      restartAttempted = true;
+      await race(kickstart({ ...opts, command: run }, agent.label));
+      const replacement = await race(waitForHealthy(client, clock, running.sha, log, before));
+      log(`daemon after: ${replacement.sha}; new boot healthy`);
+    } catch (error) {
+      if (!restartAttempted || !interruption()) {
+        const draining =
+          !restartAttempted ||
+          (await bounded(clock, (signal) => client.health(signal)).then(
+            (state) => state.draining,
+            () => false,
+          ));
+        if (draining) {
+          try {
+            await requestAdmin(client, clock, "resume");
+          } catch (resume) {
+            log(resumeFailure(port, resume));
+          }
+        }
+      }
+      if (restartAttempted && !interruption()) await status(port, opts);
+      throw error;
+    }
+  } finally {
+    release();
+  }
+}
+
+function serviceControl(opts: ServiceOptions, operation: "deploy" | "restart") {
+  const command = opts.command ?? sh;
+  const log = opts.log ?? console.log;
+  const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
+  let interrupted: Error | null = null;
+  const commandAbort = new AbortController();
+  let rejectSignal = (_error: Error) => {};
+  const signal = new Promise<never>((_, reject) => {
+    rejectSignal = reject;
+  });
+  void signal.catch(() => {});
+  const onSignal = (name: string) => {
+    if (interrupted) {
+      (opts.exit ?? process.exit)(name === "SIGINT" ? 130 : 143);
+      return;
+    }
+    interrupted = new Error(`${operation} interrupted by ${name}`);
+    log(operation === "deploy" ? "interrupted, rolling back..." : "interrupted, stopping restart...");
+    commandAbort.abort();
+    rejectSignal(interrupted);
+  };
+  const onInt = () => onSignal("SIGINT");
+  const onTerm = () => onSignal("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  const race = <T>(work: Promise<T>): Promise<T> => Promise.race([work, signal]);
+  const run: typeof sh = async (args, options) => {
+    if (interrupted) throw interrupted;
+    const result = await command(args, { ...options, signal: commandAbort.signal });
+    if (interrupted) throw interrupted;
+    return result;
+  };
+  return {
+    run,
+    race,
+    interruption: () => interrupted,
+    signal: commandAbort.signal,
+    release: () => {
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+      unlock();
+    },
+  };
+}
+
 /**
  * Deploy a ref to the release checkout: gate on the checks, restart, health-check, and roll
  * back to the previous commit if the new version does not come up.
@@ -574,44 +695,10 @@ export async function deploy(
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
   const client = opts.client ?? localDeployClient(port);
   const clock = opts.clock ?? deployClock;
-  const restart =
-    opts.restart ??
-    (async () => {
-      const agent = (await installedUnits(opts)).find((unit) => unit.kind === "daemon");
-      if (!agent) throw new Error("no installed daemon agent; run limitless service install");
-      return command(["launchctl", "kickstart", "-k", `gui/${uid}/${agent.label}`], { cwd: home });
-    });
+  const restart = () => kickstart(opts);
   const log = opts.log ?? console.log;
-  const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
-  let interrupted: Error | null = null;
-  const commandAbort = new AbortController();
-  const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal: commandAbort.signal };
-  let rejectSignal = (_error: Error) => {};
-  const signal = new Promise<never>((_, reject) => {
-    rejectSignal = reject;
-  });
-  void signal.catch(() => {});
-  const onSignal = (name: string) => {
-    if (interrupted) {
-      (opts.exit ?? process.exit)(name === "SIGINT" ? 130 : 143);
-      return;
-    }
-    interrupted = new Error(`deploy interrupted by ${name}`);
-    log("interrupted, rolling back...");
-    commandAbort.abort();
-    rejectSignal(interrupted);
-  };
-  const onInt = () => onSignal("SIGINT");
-  const onTerm = () => onSignal("SIGTERM");
-  process.on("SIGINT", onInt);
-  process.on("SIGTERM", onTerm);
-  const race = <T>(work: Promise<T>): Promise<T> => Promise.race([work, signal]);
-  const run: typeof sh = async (args, options) => {
-    if (interrupted) throw interrupted;
-    const result = await command(args, { ...options, signal: commandAbort.signal });
-    if (interrupted) throw interrupted;
-    return result;
-  };
+  const { run, race, interruption, signal, release } = serviceControl(opts, "deploy");
+  const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal };
   let previous = "";
   let drainAttempted = false;
   let restartAttempted = false;
@@ -659,7 +746,7 @@ export async function deploy(
     drainAttempted = true;
     try {
       if (running.draining) log(`daemon ${previous} is already draining; continuing deployment`);
-      else await race(requestAdmin(client, clock, "drain"));
+      else await requestDrain(client, clock, race);
       await race(waitForDrain(client, clock, maxWaitMs, opts.now === true, log));
     } catch (error) {
       if (!(error instanceof DrainUnsupportedError)) throw error;
@@ -671,14 +758,14 @@ export async function deploy(
         );
       log("--now: the running daemon has no drain endpoint; restarting without draining");
     }
-    if (interrupted) throw interrupted;
+    if (interruption()) throw interruption();
     restartAttempted = true;
     await race(restart());
     const replacement = await race(waitForHealthy(client, clock, target, log));
     log(`daemon after: ${replacement.sha}`);
     log(`deployed ${previous.slice(0, 8)} → ${target.slice(0, 8)}`);
   } catch (error) {
-    if (interrupted && restartAttempted) throw interrupted;
+    if (interruption() && restartAttempted) throw interruption();
     if (!previous) throw error;
     const cleanupErrors: string[] = [];
     const cleanup = async (name: string, action: () => Promise<unknown>) => {
@@ -697,11 +784,7 @@ export async function deploy(
       try {
         await requestAdmin(client, clock, "resume");
       } catch (resume) {
-        const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
-        const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
-        cleanupErrors.push(
-          `resume scheduler: ${String(resume)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`,
-        );
+        cleanupErrors.push(resumeFailure(port, resume));
       }
     }
     throw new Error(
@@ -710,19 +793,32 @@ export async function deploy(
       { cause: error },
     );
   } finally {
-    process.off("SIGINT", onInt);
-    process.off("SIGTERM", onTerm);
-    unlock();
+    release();
   }
 }
 
-export async function status(port: number): Promise<void> {
-  for (const { label } of await installedUnits())
-    console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
-  if (existsSync(join(appDir, ".git"))) {
-    // This release repository is written only by the user/deployer, never by an agent.
-    const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
-    console.log(`release: ${head}`);
+export async function status(port: number, opts: ServiceOptions = {}): Promise<void> {
+  const command = opts.command ?? sh,
+    log = opts.log ?? console.log;
+  const dir = opts.releaseDir ?? appDir;
+  for (const { label } of await installedUnits(opts)) {
+    const result = await command(["launchctl", "print", `gui/${uid}/${label}`], {
+      cwd: home,
+      allowFail: true,
+    });
+    log(`${label}: ${result.exitCode === 0 ? "loaded" : "not loaded"}`);
   }
-  console.log(`health: ${(await health(port, 2000)) ? "ok" : "unreachable"}`);
+  if (existsSync(join(dir, ".git"))) {
+    // This release repository is written only by the user/deployer, never by an agent.
+    const head = (await command(["git", "log", "-1", "--format=%h %s"], { cwd: dir })).stdout.trim();
+    log(`release: ${head}`);
+  }
+  const client = opts.client;
+  const healthy = client
+    ? await bounded(opts.clock ?? deployClock, (signal) => client.health(signal), 2000).then(
+        () => true,
+        () => false,
+      )
+    : await health(port, 2000);
+  log(`health: ${healthy ? "ok" : "unreachable"}`);
 }

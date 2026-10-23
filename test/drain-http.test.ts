@@ -30,6 +30,7 @@ test("admin drain uses real loopback peers and existing mutation protections", a
     expect(await read()).toMatchObject({
       ok: true,
       sha: "boot-commit",
+      startedAt: f.factory.startedAt,
       draining: false,
       active: [],
       parked: [],
