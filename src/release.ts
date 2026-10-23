@@ -5,9 +5,14 @@ import { version } from "../package.json";
 export const BUILD_DEFINES = {
   version: "LIMITLESS_BUILD_VERSION",
   sha: "LIMITLESS_BUILD_SHA",
+  packaged: "LIMITLESS_BUILD_PACKAGED",
 } as const;
 declare const LIMITLESS_BUILD_VERSION: string;
 declare const LIMITLESS_BUILD_SHA: string;
+declare const LIMITLESS_BUILD_PACKAGED: boolean;
+
+// The release build defines this true; callers guard source-only imports with it so Bun drops them.
+export const PACKAGED_BUILD = typeof LIMITLESS_BUILD_PACKAGED !== "undefined" && LIMITLESS_BUILD_PACKAGED;
 
 type BuildIdentity = { version?: string; sha?: string };
 export type Release = { version: string; bun: string } & (
