@@ -3,6 +3,7 @@ import { type ChildProcess, type ChildProcessWithoutNullStreams, execFile, spawn
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { sep } from "node:path";
 import { credentialMatcher, registerCredentialVariant } from "./credential-matcher.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
@@ -42,7 +43,7 @@ export interface ProcessCleanup {
 }
 export interface ProcessCleanupStore {
   recordProcessDiscovery?(record: ProcessDiscovery): void;
-  listProcessDiscoveries?(): ProcessDiscovery[];
+  listProcessDiscoveries?(runId?: string, directory?: string): ProcessDiscovery[];
   recordProcessCleanup(record: ProcessCleanup): void;
   listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[];
   deleteProcessCleanup(invocation: string, pid: number): void;
@@ -54,6 +55,7 @@ export type ProcessDiscovery = Omit<ProcessCleanup, "pid" | "birth" | "discovery
 export const processCleanupStore = new AsyncLocalStorage<ProcessCleanupStore>();
 
 const invocationCleanups = new Map<string, Promise<void>>();
+const activeInvocations = new Set<string>();
 
 async function ownInvocationCleanup(invocation: string): Promise<() => void> {
   const previous = invocationCleanups.get(invocation);
@@ -115,7 +117,7 @@ export const processRecoveryInspection = new AsyncLocalStorage<{
 
 export async function recoverProcessCleanups(
   store: ProcessCleanupStore,
-  records?: ProcessCleanup[],
+  records?: Pick<ProcessCleanup, "invocation">[],
   stopped = processRecoveryInspection.getStore()?.stopped ?? recoveryProcessStopped,
   timeoutMs = processRecoveryInspection.getStore()?.timeoutMs ?? 10_000,
   ownership?: ProcessDiscovery,
@@ -127,6 +129,8 @@ export async function recoverProcessCleanups(
   let discoveries = listDiscoveries();
   const invocations = new Set((records ?? store.listProcessCleanups()).map((row) => row.invocation));
   if (records === undefined) for (const row of discoveries) invocations.add(row.invocation);
+  // Spawn evidence also describes commands still owned by this process.
+  for (const invocation of activeInvocations) invocations.delete(invocation);
   if (!invocations.size) return;
   // Waiting for one invocation must not reserve unrelated invocations in this batch.
   for (;;) {
@@ -281,7 +285,15 @@ export function recoverScopedProcesses(): Promise<void> | undefined {
     if (path) checkout = realpathSync(path);
   } catch {}
   try {
-    const records = store.listProcessCleanups(scope.runId, checkout);
+    const prefix = checkout?.endsWith(sep) ? checkout : `${checkout}${sep}`;
+    const records = [
+      ...store.listProcessCleanups(scope.runId, checkout),
+      ...(store.listProcessDiscoveries?.(scope.runId, checkout) ?? []).filter(
+        (row) =>
+          row.runId === scope.runId ||
+          (checkout !== undefined && (row.directory === checkout || row.directory.startsWith(prefix))),
+      ),
+    ].filter((row) => !activeInvocations.has(row.invocation));
     return records.length ? recoverProcessCleanups(store, records).catch(refuse) : undefined;
   } catch (error) {
     return refuse(error);
@@ -837,6 +849,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       throw error;
     }
     let leader: DarwinInvocationLeader | null = null;
+    activeInvocations.add(marker);
     let discoveryError: unknown;
     try {
       if (darwin && child.pid !== undefined) leader = darwin.captureDarwinInvocationLeader(child.pid);
@@ -888,8 +901,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
 
     let shutdown: Promise<void> | undefined;
     let terminationError: ProcessTerminationError | undefined;
-    const terminate = () => {
+    // Aborts can arrive from outside the invocation's async context.
+    const terminate = AsyncLocalStorage.bind(() => {
       shutdown ??= (async () => {
+        activeInvocations.delete(marker);
         const release = await ownInvocationCleanup(marker);
         try {
           if (discoveryError) throw discoveryError;
@@ -939,7 +954,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         }
       })();
       return shutdown;
-    };
+    });
     child.once("exit", terminate);
 
     // A stalled event loop can delay both the timer and exit handler. If the child has already

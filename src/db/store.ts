@@ -59,7 +59,7 @@ import type { PrSnapshot } from "../integrations/github-poller.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
-import { type ProcessCleanup, redactCredentials } from "../util/proc.ts";
+import { type ProcessCleanup, type ProcessDiscovery, redactCredentials } from "../util/proc.ts";
 import { activity } from "../util/stall.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
@@ -463,6 +463,27 @@ export class Store {
       );
   }
 
+  recordProcessDiscovery(row: ProcessDiscovery): void {
+    this.db
+      .query(
+        "INSERT INTO process_discoveries (invocation, run_id, directory, boot, created_at, discovery) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(row.invocation, row.runId, row.directory, row.boot, row.createdAt, JSON.stringify(row.discovery));
+  }
+
+  listProcessDiscoveries(runId?: string, directory?: string): ProcessDiscovery[] {
+    const prefix =
+      directory === undefined ? null : directory.endsWith(sep) ? directory : `${directory}${sep}`;
+    return this.db
+      .query<Omit<ProcessDiscovery, "discovery"> & { discovery: string }, (string | null)[]>(
+        `SELECT invocation, run_id AS runId, directory, boot, created_at AS createdAt, discovery
+         FROM process_discoveries WHERE (? IS NULL AND ? IS NULL) OR run_id = ?
+         OR directory = ? OR substr(directory, 1, length(?)) = ?`,
+      )
+      .all(runId ?? null, directory ?? null, runId ?? null, directory ?? null, prefix, prefix)
+      .map((row) => ({ ...row, discovery: JSON.parse(row.discovery) }));
+  }
+
   listProcessCleanups(runId?: string, directory?: string): ProcessCleanup[] {
     const prefix =
       directory === undefined ? null : directory.endsWith(sep) ? directory : `${directory}${sep}`;
@@ -481,7 +502,10 @@ export class Store {
   }
 
   deleteInvocationCleanups(invocation: string): void {
-    this.db.query("DELETE FROM process_cleanups WHERE invocation = ?").run(invocation);
+    this.db.transaction(() => {
+      this.db.query("DELETE FROM process_cleanups WHERE invocation = ?").run(invocation);
+      this.db.query("DELETE FROM process_discoveries WHERE invocation = ?").run(invocation);
+    })();
   }
 
   recordOwnerDiagnostic(
