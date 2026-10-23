@@ -1838,7 +1838,7 @@ async function oneRound(
           ...(deadline ? { deadline } : {}),
           shadow: invokeGuard.getStore(),
           checkout:
-            ctx.repo.kind === "github" && ctx.run.branch
+            ctx.repo.kind === "github" && ctx.run.branch && constraints.billing !== "free_only"
               ? { parentSha: reviewedSha, baseSha, branch: ctx.run.branch }
               : undefined,
           requireStructured: true,

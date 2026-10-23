@@ -10,7 +10,7 @@ import { worktreeGit } from "../src/git/command.ts";
 import { headSha } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import type { AgentExecutor } from "../src/pipeline/agent-executor.ts";
+import type { AgentCall, AgentExecutor } from "../src/pipeline/agent-executor.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
 import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
@@ -71,15 +71,21 @@ function boot(
     faults?: FaultPlan;
     deferStart?: boolean;
     localImplement?: boolean;
+    freeProviders?: boolean;
   } = {},
 ) {
   let locals = 0;
   const startSpy = options.deferStart
     ? spyOn(Factory.prototype, "start").mockImplementation(() => {})
     : undefined;
-  const f = start(() => ({}), false, false, {
+  const f = start(() => ({}), false, options.freeProviders, {
     bootSha: release,
-    providers: providers.map((p) => ({ ...p, harness: "claude" })),
+    providers: [
+      ...providers,
+      ...(options.freeProviders
+        ? [{ id: "delta", label: "Delta", billing: "free" as const, maxConcurrent: 2 }]
+        : []),
+    ].map((p) => ({ ...p, harness: "claude" })),
     harnesses: {
       claude: fakeHarness(async (s) => {
         if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
@@ -1355,9 +1361,11 @@ function structure(value: unknown): unknown {
   return value === null ? null : typeof value;
 }
 
-test.each(["single", "panel"] as const)(
+test.each(["single", "panel", "panel pinned"] as const)(
   "real worker reviews readonly and delivers: %s",
-  async (mode) => {
+  async (scenario) => {
+    const mode = scenario === "single" ? "single" : "panel";
+    const pinned = scenario === "panel pinned";
     const bare = await githubFixture();
     let localReviews = 0;
     const review = async (s: AgentSpec): Promise<FakeReply> => {
@@ -1378,7 +1386,7 @@ test.each(["single", "panel"] as const)(
         };
       return {
         structured:
-          mode === "single" || s.target.modelId === "alpha/m"
+          mode === "single" || s.target.modelId === "alpha/m" || s.prompt.includes("# Lens: coordinator")
             ? approve
             : {
                 ...approve,
@@ -1402,12 +1410,16 @@ test.each(["single", "panel"] as const)(
     };
     let f: Factory;
     let checked = 0;
+    const reviewCalls: AgentCall[] = [];
     const refs = async () => (await sh(["git", "show-ref"], { cwd: bare })).stdout;
     const executor: AgentExecutor = {
       kind: "test",
       async run(call, local) {
         if (call.role === "implement") return local();
+        if (call.role === "review") reviewCalls.push(call);
         if (call.role !== "review" || !f.cfg.workers.agents.includes("review"))
+          return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+        if (call.spec.prompt.includes("# Lens: coordinator"))
           return lanAgentExecutor(f.workers, f.cfg).run(call, local);
         const before = await refs();
         const head = await headSha(call.worktree);
@@ -1430,6 +1442,7 @@ test.each(["single", "panel"] as const)(
     };
     const instance = boot({
       executor,
+      freeProviders: mode === "panel",
       reviewReply: async (s) => {
         localReviews++;
         return review(s);
@@ -1444,6 +1457,11 @@ test.each(["single", "panel"] as const)(
         finders: [
           { target: "alpha/m", prompt: "standard" },
           { target: "beta/m", prompt: "adversarial" },
+          {
+            prompt: "standard",
+            local: true,
+            lens: { name: "coordinator", focus: "Check the farewell locally." },
+          },
         ],
         verifier: {},
         implementerReport: "include",
@@ -1458,7 +1476,13 @@ test.each(["single", "panel"] as const)(
       return { ...(await review(s)), files: { "worker-only.txt": "discard me\n" } };
     });
     try {
-      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const runOptions = {
+        repo: "test/repo",
+        prompt: "Add farewell",
+        profile: "quick" as const,
+        ...(pinned ? { models: { review: ["beta/m", "alpha/m"] } } : {}),
+      };
+      const run = await f.createRun(runOptions);
       const status = await waitFor(f, run.id, ["succeeded", "needs_human"]);
       expect(f.store.getRun(run.id)?.error).toBeNull();
       expect(status).toBe("succeeded");
@@ -1466,9 +1490,31 @@ test.each(["single", "panel"] as const)(
       expect(rows).toHaveLength(mode === "single" ? 1 : 3);
       expect(checked).toBe(rows.length);
       expect(sessions).toHaveLength(rows.length);
-      expect(localReviews).toBe(0);
+      expect(localReviews).toBe(mode === "panel" ? 1 : 0);
       expect(instance.locals()).toBe(1);
       const state = f.store.getRunState<RunState>(run.id);
+      const localCalls = reviewCalls.filter((call) => call.spec.prompt.includes("# Lens: coordinator"));
+      expect(localCalls).toHaveLength(mode === "panel" ? 1 : 0);
+      for (const call of localCalls) {
+        expect(call.checkout).toBeUndefined();
+        expect(call.spec.target).toMatchObject({
+          harness: "claude",
+          billing: pinned ? "subscription" : "free",
+        });
+        for (const field of ["backend", "openai", "decisions"])
+          expect(call.spec.target).not.toHaveProperty(field);
+        expect(rows.some((row) => row.invocation_id === call.invocationId)).toBe(false);
+      }
+      const workerCalls = reviewCalls.filter((call) => !localCalls.includes(call));
+      expect(rows.map((row) => row.invocation_id).sort()).toEqual(
+        workerCalls.map((call) => call.invocationId).sort(),
+      );
+      if (mode === "panel") {
+        expect(workerCalls.filter((call) => roleOf(call.spec) === "review")).toHaveLength(2);
+        expect(
+          workerCalls.filter((call) => call.spec.prompt.startsWith("You are a code-review verifier")),
+        ).toHaveLength(1);
+      }
       for (const row of rows) {
         expect(request(row)).toMatchObject({ role: "review", mode: "readonly" });
         expect(request(row)).not.toHaveProperty("commit");
@@ -1479,8 +1525,9 @@ test.each(["single", "panel"] as const)(
       expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("pr create");
       const artifact = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "null");
       f.cfg.workers.agents = [];
-      const local = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const local = await f.createRun(runOptions);
       expect(await waitFor(f, local.id, ["succeeded", "needs_human"])).toBe("succeeded");
+      expect(jobs(f)).toHaveLength(rows.length);
       expect(structure(artifact)).toEqual(
         structure(JSON.parse(f.store.getArtifact(local.id, "review-1.json") ?? "null")),
       );
