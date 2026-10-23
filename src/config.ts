@@ -74,6 +74,8 @@ export interface Config {
   dependabotRouting: "free_first" | "policy";
   /** Whether review prompts (production and eval) carry the implementer's self-report. */
   reviewImplementerReport: "include" | "omit";
+  /** Prefer another vendor for production single reviews. */
+  reviewAvoidImplementerVendor: boolean;
   /** `single` (production today) or a verified finder panel with the profile's roster. */
   reviewMode: "single" | "panel";
   /** `panel`: single reviews still decide, and the profile's panel also runs and records `review-N.shadow.json`. */
@@ -170,6 +172,7 @@ function parseEnvFile(path: string): Record<string, string> {
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
 const REVIEW_KEYS: readonly string[] = [
+  "avoid_implementer_vendor",
   "implementer_report",
   "mode",
   "rosters",
@@ -331,6 +334,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   for (const key of Object.keys(review))
     if (!REVIEW_KEYS.includes(key))
       throw new Error(`review.${key}: unknown key (allowed: ${REVIEW_KEYS.join(", ")})`);
+  if (review.avoid_implementer_vendor !== undefined && typeof review.avoid_implementer_vendor !== "boolean")
+    throw new Error("review.avoid_implementer_vendor must be true or false");
   if (
     review.implementer_report !== undefined &&
     review.implementer_report !== "include" &&
@@ -502,6 +507,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     waitBudgetS,
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
+    reviewAvoidImplementerVendor: review.avoid_implementer_vendor !== false,
     reviewMode: review.mode === "panel" ? "panel" : "single",
     reviewShadow: review.shadow === "panel" ? "panel" : "off",
     reviewShadowGraceSeconds: grace,

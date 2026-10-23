@@ -361,6 +361,21 @@ test("the baseline cache kill switch defaults on and accepts only booleans", () 
   }
 });
 
+test("review vendor avoidance defaults to true and requires a boolean", () => {
+  const fixture = providerFixture();
+  try {
+    expect(fixture.load().reviewAvoidImplementerVendor).toBe(true);
+    for (const value of [true, false]) {
+      writeFileSync(fixture.file, `[review]\navoid_implementer_vendor = ${value}\n`);
+      expect(fixture.load().reviewAvoidImplementerVendor).toBe(value);
+    }
+    writeFileSync(fixture.file, '[review]\navoid_implementer_vendor = "false"\n');
+    expect(fixture.load).toThrow("review.avoid_implementer_vendor must be true or false");
+  } finally {
+    fixture.close();
+  }
+});
+
 test("review implementer report defaults to include and accepts only include or omit", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-review-config-"));
   const configDir = join(root, "config");
@@ -381,7 +396,7 @@ test("review implementer report defaults to include and accepts only include or 
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
     expect(config).toThrow(
-      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters, shadow, shadow_grace_seconds, trusted_reviewers)",
+      "review.implementer-report: unknown key (allowed: avoid_implementer_vendor, implementer_report, mode, rosters, shadow, shadow_grace_seconds, trusted_reviewers)",
     );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");

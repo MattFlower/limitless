@@ -258,7 +258,7 @@ detection, per-invocation budget, process-group kill on cancel.
   Seatbelt profile, covering native edits and overriding implicit CLI grants. Claude's internal
   Bash sandbox is disabled for editors because macOS cannot nest Seatbelt; Bash remains inside
   the mandatory, probed outer boundary. The outer profile also denies signals except to the process
-  itself and the same sandbox, and every launch runs a signal canary. Reader sandbox settings are unchanged. Project/local
+  itself and the same sandbox, and every launch runs a signal canary. Project/local
   settings, hooks and external MCP servers are disabled.
   Claude retains the original HOME and CLAUDE_CONFIG_DIR for its persistent authentication
   identity, including the macOS Keychain service. Credentials are never copied to scratch.
@@ -270,6 +270,16 @@ detection, per-invocation budget, process-group kill on cancel.
   require a real Bash command through each CLI and prove the run starts and completes while a
   write into the CLI's own config directory is denied; authentication and credential refresh
   compatibility still require validation on the deployment host.
+- Tool-enabled Claude verifiers opt into `sandbox.network.allowLocalBinding: true` so they can
+  run tests that start local servers, binding and connecting to loopback ports. Checked against
+  the installed Claude Code 2.1.304 schema and bundled sandbox implementation on 2026-10-23:
+  the setting is macOS-only and enables local IP binding, inbound connections and outbound
+  connections to localhost. Its bind/inbound rules use wildcard local addresses, so it does not
+  guarantee loopback-only listeners. Filesystem rules and outbound restrictions for external
+  hosts remain unchanged; other readers and editors do not receive this opt-in. Codex verifiers
+  remain unable to bind or connect to loopback: their reader permission profile has only a
+  network on/off switch (`network={enabled=false}`), so permitting loopback would open all network
+  access. See the upstream [setting reference](https://code.claude.com/docs/en/settings-reference#sandbox-network-allowlocalbinding).
 - Gates and implement-eval hidden commands use the same Seatbelt boundary. Each launch probes
   its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
   enforcement raises an operational error, even against a failing baseline. Only a launch our own
@@ -314,10 +324,12 @@ prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, 
 audit), `chat_messages`, `settings`, `land_entries` (the approved-PR queue). The frozen legacy
 migrations and timestamped SQL files are applied at startup.
 
-On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
-current stage (the worktree is preserved; Claude sessions can be resumed). Land entries left in
-flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps waiting on the recorded
-commit, and `merging` first asks GitHub whether the PR already merged.
+On startup, runs left `running` by a crash/restart are re-queued and start their interrupted stage
+over. The worktree retains a killed session's uncommitted edits, but the engine does not resume
+model sessions; confined Claude editors disable session persistence and refuse resume requests.
+Land entries left in flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps
+waiting on the recorded commit, and `merging` first asks GitHub whether the PR already merged.
+Changes to restart recovery are tracked in [#784](https://github.com/MattFlower/limitless/issues/784).
 
 ### Landing (the land queue)
 
