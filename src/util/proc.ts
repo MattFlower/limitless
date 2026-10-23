@@ -51,8 +51,35 @@ export interface ProcessCleanupStore {
 }
 export type ProcessDiscovery = Omit<ProcessCleanup, "pid" | "birth" | "discovery"> & {
   discovery: NonNullable<ProcessCleanup["discovery"]>;
+  ownerId?: string | null;
+  ownerPid?: number | null;
+  ownerBirth?: string | null;
 };
 export const processCleanupStore = new AsyncLocalStorage<ProcessCleanupStore>();
+export const processOwnerInspection = new AsyncLocalStorage<typeof processBirthSync>();
+const processOwner = randomUUID();
+const ownerWarnings = new Set<string>();
+
+function preserveProcessOwner(row: ProcessDiscovery): boolean {
+  const { ownerId, ownerPid, ownerBirth } = row;
+  if (ownerId == null && ownerPid == null && ownerBirth == null) return false;
+  const key = ownerId || row.invocation;
+  try {
+    if (!ownerId || !ownerPid || !Number.isInteger(ownerPid) || ownerPid < 1 || !ownerBirth)
+      throw new Error("Incomplete process owner identity");
+    const birth = (processOwnerInspection.getStore() ?? processBirthSync)(ownerPid);
+    if (birth !== null && !birth) throw new Error("Process owner identity is inconclusive");
+    ownerWarnings.delete(key);
+    ownerWarnings.delete(row.invocation);
+    return birth === ownerBirth;
+  } catch (error) {
+    if (!ownerWarnings.has(key)) {
+      ownerWarnings.add(key);
+      console.warn(redactCredentials(`Cleanup recovery owner ${key}: ${String(error)}`));
+    }
+    return true;
+  }
+}
 
 const invocationCleanups = new Map<string, Promise<void>>();
 const activeInvocations = new Set<string>();
@@ -141,7 +168,7 @@ export async function recoverProcessCleanups(
   // Reserve the entire batch synchronously so overlapping recovery batches cannot deadlock.
   const release = await Promise.all([...invocations].map(ownInvocationCleanup));
   try {
-    const records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
+    let records = store.listProcessCleanups().filter((row) => invocations.has(row.invocation));
     discoveries = listDiscoveries().filter((row) => invocations.has(row.invocation));
     if (!records.length && !discoveries.length) return;
     let boot: string | undefined;
@@ -153,6 +180,10 @@ export async function recoverProcessCleanups(
     // A persisted job marker can be scanned even when its boot identity was unavailable.
     const sameBoot = (row: ProcessCleanup | ProcessDiscovery) =>
       ownership ? !boot || !row.boot || row.boot === boot : row.boot === boot;
+    for (const row of discoveries)
+      if (sameBoot(row) && preserveProcessOwner(row)) invocations.delete(row.invocation);
+    records = records.filter((row) => invocations.has(row.invocation));
+    discoveries = discoveries.filter((row) => invocations.has(row.invocation));
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
     const deadline = performance.now() + timeoutMs;
     for (const row of records) if (!sameBoot(row)) store.deleteProcessCleanup(row.invocation, row.pid);
@@ -879,15 +910,22 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let persistenceError: unknown;
     // A crash before shutdown must still leave enough ownership context for recovery.
     try {
-      if (child.pid !== undefined)
-        (scope?.cleanups ?? processCleanupStore.getStore())?.recordProcessDiscovery?.({
+      const cleanups = scope?.cleanups ?? processCleanupStore.getStore();
+      if (child.pid !== undefined && cleanups?.recordProcessDiscovery) {
+        const ownerBirth = (processOwnerInspection.getStore() ?? processBirthSync)(process.pid);
+        if (!ownerBirth) throw new Error("Process owner identity is unavailable");
+        cleanups.recordProcessDiscovery({
           runId: scope?.runId ?? null,
           invocation: marker,
           directory,
           boot: bootIdentity(),
           createdAt: Date.now(),
+          ownerId: processOwner,
+          ownerPid: process.pid,
+          ownerBirth,
           discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
         });
+      }
     } catch (error) {
       persistenceError = error;
     }
