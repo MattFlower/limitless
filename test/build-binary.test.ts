@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildConfig, buildSha } from "../scripts/build-binary.ts";
+import { buildConfig, buildSha, checkAssets } from "../scripts/build-binary.ts";
 import { BUILD_DEFINES } from "../src/release.ts";
 import { sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
@@ -129,6 +129,11 @@ test("binary config seals autoloading and embeds only explicit identity", () => 
   expect(config.bytecode).toBeFalsy();
   expect(config.compile).toEqual({
     outfile: join(dir, "limitless"),
+    assets: [
+      "src/db/migrations",
+      "routing/policy.json",
+      "integrations/codex/.agents/skills/limitless/SKILL.md",
+    ].map((path) => join(import.meta.dir, "..", path)),
     autoloadDotenv: false,
     autoloadBunfig: false,
     autoloadTsconfig: false,
@@ -142,4 +147,32 @@ test("binary config seals autoloading and embeds only explicit identity", () => 
     [BUILD_DEFINES.version]: JSON.stringify(identity.version),
     [BUILD_DEFINES.sha]: JSON.stringify(identity.sha),
   });
+});
+
+test("the binary embeds the three runtime resources from the checkout, unchanged", () => {
+  const checkout = join(import.meta.dir, "..");
+  const expected = [
+    join(checkout, "src/db/migrations"),
+    join(checkout, "routing/policy.json"),
+    join(checkout, "integrations/codex/.agents/skills/limitless/SKILL.md"),
+  ];
+  const config = buildConfig({ version: "1.0.0", sha: "a".repeat(40) }, dir);
+  expect(typeof config.compile === "object" && config.compile.assets).toEqual(expected);
+  for (const asset of expected) expect(existsSync(asset)).toBe(true);
+  expect(config.loader).toBeUndefined();
+  expect(config.plugins).toBeUndefined();
+});
+
+test("asset validation refuses missing resources and shared basenames", () => {
+  mkdirSync(join(dir, "a"));
+  mkdirSync(join(dir, "b"));
+  writeFileSync(join(dir, "a", "policy.json"), "{}");
+  writeFileSync(join(dir, "b", "policy.json"), "{}");
+  expect(() => checkAssets([join(dir, "a", "policy.json"), join(dir, "missing")])).toThrow(
+    `missing embedded resource ${join(dir, "missing")}`,
+  );
+  expect(() => checkAssets([join(dir, "a", "policy.json"), join(dir, "b", "policy.json")])).toThrow(
+    "share the basename policy.json",
+  );
+  expect(checkAssets([join(dir, "a", "policy.json")])).toEqual([join(dir, "a", "policy.json")]);
 });

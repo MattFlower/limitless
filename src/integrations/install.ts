@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { type Release, resourcePath } from "../release.ts";
 
 export const repositoryRoot = resolve(import.meta.dir, "../..");
+const SKILL = "integrations/codex/.agents/skills/limitless/SKILL.md";
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export function sessionStartInstructions(root = repositoryRoot): string {
@@ -12,13 +14,22 @@ export function sessionStartInstructions(root = repositoryRoot): string {
 }
 
 export function installIntegrations(
-  options: { write?: boolean; home?: string; root?: string; print?: (message: string) => void } = {},
+  options: {
+    write?: boolean;
+    home?: string;
+    root?: string;
+    print?: (message: string) => void;
+    release?: Release;
+  } = {},
 ): void {
   const root = options.root ?? repositoryRoot;
   const home = options.home ?? homedir();
   const print = options.print ?? console.log;
   const destination = join(home, ".agents/skills/limitless/SKILL.md");
-  const skill = readFileSync(join(root, "integrations/codex/.agents/skills/limitless/SKILL.md"), "utf8");
+  const skill = readFileSync(
+    options.root ? join(options.root, SKILL) : resourcePath(SKILL, options.release),
+    "utf8",
+  );
   if (options.write) {
     if (existsSync(destination)) {
       if (readFileSync(destination, "utf8") !== skill) {

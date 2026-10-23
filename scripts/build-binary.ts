@@ -1,11 +1,29 @@
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { version } from "../package.json";
 import { BUILD_DEFINES } from "../src/release.ts";
 import { sh } from "../src/util/proc.ts";
 
 const root = resolve(import.meta.dir, "..");
+
+// Embedded unchanged (no loader); each lands at its basename under the binary's `import.meta.dir`.
+export const EMBEDDED_RESOURCES = [
+  "src/db/migrations",
+  "routing/policy.json",
+  "integrations/codex/.agents/skills/limitless/SKILL.md",
+];
+
+export function checkAssets(assets: string[]): string[] {
+  const seen = new Set<string>();
+  for (const asset of assets) {
+    if (!existsSync(asset)) throw new Error(`Cannot build Limitless: missing embedded resource ${asset}`);
+    if (seen.has(basename(asset)))
+      throw new Error(`Cannot build Limitless: embedded resources share the basename ${basename(asset)}`);
+    seen.add(basename(asset));
+  }
+  return assets;
+}
 
 export async function buildSha(cwd = root): Promise<string> {
   for (const name of [
@@ -45,6 +63,7 @@ export function buildConfig(identity: { version: string; sha: string }, outdir: 
     format: "esm",
     compile: {
       outfile: resolve(outdir, "limitless"),
+      assets: checkAssets(EMBEDDED_RESOURCES.map((path) => resolve(root, path))),
       autoloadDotenv: false,
       autoloadBunfig: false,
       autoloadTsconfig: false,
