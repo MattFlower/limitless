@@ -52,7 +52,7 @@ const SECRETS: [RegExp, string][] = [
 const ASSERTION = /\b(expect|assert\w*|should)\b|\bt\.(Error|Fatal|Fail)/;
 
 export function globToRegex(glob: string): RegExp {
-  const segments = glob.split("/");
+  const segments = (glob.endsWith("/") ? `${glob}**` : glob).split("/");
   const escaped = segments.map((segment, index) => {
     if (segment === "**") return index === segments.length - 1 ? ".*" : "(?:[^/]+/)*";
     const pattern = segment

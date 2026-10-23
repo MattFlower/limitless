@@ -29,6 +29,8 @@ test.each([
   "post-merge",
   "post-merge skip",
   "post-merge failure",
+  "post-merge slow retry",
+  "post-merge slow retry failure",
 ])("docs gates pipeline: %s", async (scenario) => {
   const cwd = fixture.repoDir;
   mkdirSync(join(cwd, "docs"));
@@ -47,6 +49,8 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
   await sh(["git", "add", "."], { cwd });
   await sh(["git", "commit", "-qm", "docs gate fixture"], { cwd });
   const postMerge = scenario.startsWith("post-merge");
+  const slow = scenario.startsWith("post-merge slow");
+  const retryFails = scenario === "post-merge slow retry failure";
   const bare = postMerge ? await githubFixture() : undefined;
   let reviews = 0;
   const f = start(async (s) => {
@@ -83,8 +87,11 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
     const targeted = opts.cmd.at(-1)?.startsWith("bun test './") ?? false;
     if (targeted) targetedAttempts++;
     const firstFailure = targeted && targetedAttempts === 1 && ["retry", "timeout"].includes(scenario);
+    const slowFailure =
+      targeted && slow && (targetedAttempts === 2 || (targetedAttempts === 3 && retryFails));
     const failed =
       firstFailure ||
+      slowFailure ||
       (targeted && scenario === "post-merge failure") ||
       (scenario === "failing baseline" && opts.cmd.at(-1)?.includes("$LIMITLESS_GATE_REPORT"));
     return {
@@ -96,7 +103,7 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
       truncated: false,
       stdout: "passed",
       stderr: "",
-      durationMs: 1,
+      durationMs: slowFailure ? 65_000 : slow ? 1000 : 1,
     };
   });
   try {
@@ -106,7 +113,7 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
       profile: "quick",
     });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-      scenario === "post-merge failure" ? "needs_human" : "succeeded",
+      scenario === "post-merge failure" || retryFails ? "needs_human" : "succeeded",
     );
     expect(reviews).toBe(1);
     const mode = ["mixed", "unconfigured", "untrusted", "invalid"].includes(scenario)
@@ -199,7 +206,34 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
         "fake-lint",
         "fake-types",
         ...(mergedMode === "targeted" ? ["bun test './test/a.test.ts'"] : []),
+        ...(slow ? ["bun test './test/a.test.ts'"] : []),
       ]);
+      if (slow) {
+        expect(targetedAttempts).toBe(3);
+        const docsOnly = {
+          mode: "targeted",
+          changedPaths: ["docs/guide.md"],
+          files: ["test/a.test.ts"],
+          reason: "docs-only change; test source references a changed path or basename",
+        };
+        expect(rebase.find((c) => c.name === "test")).toMatchObject({
+          verdict: retryFails ? "targeted_failure" : "flaky",
+          blocking: retryFails,
+          firstAttempt: { ok: false, durationMs: 65_000, docsOnly },
+          result: { ok: !retryFails, docsOnly },
+        });
+        const warnings = f.store.listEvents(run.id).filter((e) => e.message.includes("post-merge re-check"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toMatchObject({
+          level: "warn",
+          message: `test post-merge re-check: ran 65.0x its pre-merge time (65s vs 1s): ${retryFails ? "FAIL again" : "pass (flaky, not blocking)"}`,
+          data: {
+            flaky: !retryFails,
+            firstAttempt: { ok: false, durationMs: 65_000, docsOnly },
+            retry: { ok: !retryFails, docsOnly },
+          },
+        });
+      }
       if (scenario === "post-merge failure") {
         expect(rebase.find((c) => c.name === "test")).toMatchObject({
           verdict: "targeted_failure",

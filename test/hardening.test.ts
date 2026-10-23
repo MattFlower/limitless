@@ -2576,6 +2576,31 @@ test("adding a file under a protected path warns; editing one blocks", () => {
   ]);
 });
 
+test.each(["test/fixtures/**/", "test/fixtures/", "**/"])(
+  "directory protected pattern blocks edits: %s",
+  (pattern) => {
+    const findings = auditDiff(
+      {
+        patch: "",
+        files: [
+          { status: "M", path: "test/fixtures/a.json" },
+          { status: "M", path: "test/fixturesx/a.json" },
+        ],
+        stat: "",
+        added: 0,
+        removed: 0,
+      },
+      { taskClass: "feature", protectedPaths: [pattern] },
+    );
+    expect(findings).toHaveLength(pattern === "**/" ? 2 : 1);
+    expect(findings[0]).toMatchObject({
+      file: "test/fixtures/a.json",
+      rule: "protected-path",
+      severity: "block",
+    });
+  },
+);
+
 test("review/verify timeouts scale with the size of the change", async () => {
   const { readingTimeout } = await import("../src/pipeline/engine.ts");
   expect(readingTimeout(0)).toBe(20 * 60_000);

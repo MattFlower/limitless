@@ -1,5 +1,5 @@
 import { expect } from "bun:test";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { globToRegex } from "../src/gates/audit.ts";
@@ -176,6 +176,11 @@ test.each([
   ["docs/**", "docs/a/b/c.md", true],
   ["docs/**", "docsx/a.md", false],
   ["test/fixtures/**", "test/fixtures/a/b.ts", true],
+  ["test/fixtures/**/", "test/fixtures/a.json", true],
+  ["test/fixtures/", "test/fixtures/a.json", true],
+  ["**/", "test/fixtures/a.json", true],
+  ["test/fixtures/**/", "test/fixturesx/a.json", false],
+  ["test/fixtures/", "test/fixturesx/a.json", false],
   ["test/AGENTS.md", "test/AGENTS.md", true],
   ["test/AGENTS.md", "test/AGENTSxmd", false],
   ["test/AGENTS.md", "test/AGENTS.md\n", false],
@@ -205,6 +210,8 @@ test("docs glob boundaries and unknown runners keep the configured checks", asyn
       ["bun test $LIMITLESS_GATE_REPORT", "npx vitest run {files}"],
       ["bun testing $LIMITLESS_GATE_REPORT", "bun test {files}"],
       ["env CI=1 bun test $LIMITLESS_GATE_REPORT", "bun test {files}"],
+      ["\u00a0bun test $LIMITLESS_GATE_REPORT", "bun test {files}"],
+      ["\vbun test $LIMITLESS_GATE_REPORT", "bun test {files}"],
       ["bun test $LIMITLESS_GATE_REPORT", "bun testx {files}"],
     ] as const) {
       const config = { ...cfg, checks: [{ name: "test", run }], retryFiles };
@@ -224,6 +231,136 @@ async function commitDoc(cwd: string, path: string, text: string) {
   writeFileSync(join(cwd, path), text);
   return commit(cwd);
 }
+
+test.each(["docs/", "docs/**/", "**/"])("directory docs pattern: %s", async (pattern) => {
+  const cwd = mkdtempSync(join(tmpdir(), "docs-directory-"));
+  try {
+    await seed(cwd);
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const head = await commitDoc(cwd, "docs/guide.md", "edited");
+    const docs = await docsOnlyGates(cwd, { ...detectGates(cwd), docs: [pattern] }, base, head);
+    expect(docs.selection.mode).toBe("targeted");
+    expect(docs.selection.files).toEqual([
+      "test/a.test.ts",
+      "test/path.spec.ts",
+      "test/space ' quote.test.ts",
+    ]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  " && npm test",
+  " || npm test",
+  "; npm test",
+  " | cat",
+  " & npm test",
+  "\nnpm test",
+  " > output",
+  " < input",
+  " 2>> output",
+  " --workers=$(echo 4) && npm test",
+  ' --workers="$(echo 4)" > output',
+  " $(echo # '\n) && npm test 'ignored) ignored' # '",
+  " $(cat <<'END'\n4\nEND\n)",
+  " $'unknown quoting'",
+  ` \${WORKERS:-4}`,
+  " --workers=$(echo 4",
+  " --workers=$(echo 4))",
+  ' "unterminated',
+  " `echo 4`",
+])("composed or uncertain Bun command keeps full checks: %j", async (suffix) => {
+  const cwd = mkdtempSync(join(tmpdir(), "docs-composed-"));
+  try {
+    await seed(cwd);
+    const cfg = detectGates(cwd);
+    let base = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    for (const path of ["docs/guide.md", "docs/unread.md"]) {
+      const head = await commitDoc(cwd, path, "edited");
+      for (const field of ["check", "retry"] as const) {
+        const config = {
+          ...cfg,
+          checks: [
+            { name: "test", run: `bun test${field === "check" ? suffix : ""} $LIMITLESS_GATE_REPORT` },
+          ],
+          retryFiles: `bun test {files}${field === "retry" ? suffix : ""}`,
+        };
+        const docs = await docsOnlyGates(cwd, config, base, head);
+        expect(docs.selection).toMatchObject({ mode: "full", files: [] });
+        expect(docs.gates).toBe(config);
+      }
+      base = head;
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("balanced substitutions and quoted arguments remain single Bun commands", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "docs-shell-arguments-"));
+  try {
+    await seed(cwd);
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const head = await commitDoc(cwd, "docs/old.md", "edited");
+    const cfg = detectGates(cwd);
+    for (const args of [
+      '--workers="$(echo "$(echo 4)")"',
+      "--workers=$(printf '%s)' 4)",
+      "--workers=$(echo 4 >/dev/null; echo 4)",
+      '--label="a && b; c | d & e > f"',
+    ]) {
+      const docs = await docsOnlyGates(
+        cwd,
+        { ...cfg, checks: [{ name: "test", run: `bun test ${args} $LIMITLESS_GATE_REPORT` }] },
+        base,
+        head,
+      );
+      expect(docs.selection).toMatchObject({ mode: "targeted", files: ["test/a.test.ts"] });
+      expect(docs.gates.checks[0]?.run).toBe("bun test './test/a.test.ts'");
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("repository Bun command targets or skips without executing its substitution", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "docs-repo-command-"));
+  try {
+    await seed(cwd);
+    mkdirSync(join(cwd, "scripts"));
+    writeFileSync(
+      join(cwd, "scripts/test-workers.ts"),
+      'import { writeFileSync } from "node:fs"; writeFileSync("substitution-ran", ""); console.log(4);',
+    );
+    const cfg = {
+      ...detectGates(cwd),
+      checks: [
+        {
+          name: "test",
+          run: 'bun test --parallel=$(bun scripts/test-workers.ts) --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"',
+        },
+      ],
+      retryFiles: "bun test --isolate {files}",
+    };
+    let base = await commit(cwd);
+    for (const path of ["docs/old.md", "docs/unread.md"]) {
+      const head = await commitDoc(cwd, path, "edited");
+      const docs = await docsOnlyGates(cwd, cfg, base, head);
+      expect(docs.selection.mode).toBe(path === "docs/old.md" ? "targeted" : "skipped");
+      expect(docs.selection.files).toEqual(path === "docs/old.md" ? ["test/a.test.ts"] : []);
+      expect(docs.gates.checks.map((c) => c.run)).toEqual(
+        path === "docs/old.md" ? ["bun test --isolate './test/a.test.ts'"] : [],
+      );
+      if (path === "docs/unread.md")
+        expect(docs.selection.reason).toBe("docs-only change; no test reads the changed files");
+      expect(existsSync(join(cwd, "substitution-ran"))).toBe(false);
+      base = head;
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("Bun underscore test names and all supported extensions are targeted", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "docs-bun-tests-"));

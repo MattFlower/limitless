@@ -447,7 +447,7 @@ export function isSlowRegression(
   const r = c.result;
   const before = findGateCounterpart(c, comparisons, reference);
   return (
-    c.verdict === "regressed" &&
+    (c.verdict === "regressed" || c.verdict === "targeted_failure") &&
     !r.timedOut &&
     !confinementFailed(r) &&
     !r.firstAttempt &&

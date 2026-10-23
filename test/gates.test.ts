@@ -993,6 +993,7 @@ describe("gate slots and flaky retry", () => {
     duration?: number;
     referenceMs?: number;
     referenceOk?: boolean;
+    referenceName?: string;
     missing?: boolean;
     result?: Partial<GateResult>;
     firstOk?: boolean;
@@ -1005,6 +1006,7 @@ describe("gate slots and flaky retry", () => {
     { name: "exactly the increase floor", duration: 80_000, referenceMs: 20_000, expected: true },
     { name: "failing counterpart", referenceOk: false, expected: false },
     { name: "missing counterpart", missing: true, expected: false },
+    { name: "unmatched counterpart", referenceName: "other", expected: false },
     { name: "zero duration counterpart", referenceMs: 0, expected: false },
     { name: "timeout", result: { timedOut: true }, expected: false },
     { name: "confinement", result: { confinementError: true }, expected: false },
@@ -1019,32 +1021,34 @@ describe("gate slots and flaky retry", () => {
     { name: "other verdict", verdict: "new_failure", expected: false },
     { name: "slow regression", expected: true },
   ];
-  test.each(slowCases)("slow regression: $name", (row) => {
-    const reference: GateResult = {
-      name: "test",
-      command: "fake-test",
-      ok: row.referenceOk ?? true,
-      exitCode: 0,
-      durationMs: row.referenceMs ?? 100_000,
-      output: "passed",
-    };
-    const result: GateResult = {
-      ...reference,
-      ok: false,
-      exitCode: 1,
-      durationMs: row.duration ?? 400_000,
-      ...row.result,
-      ...(row.firstOk !== undefined ? { firstAttempt: { ...reference, ok: row.firstOk } } : {}),
-    };
-    const c: GateComparison = {
-      name: "test",
-      verdict: row.verdict ?? "regressed",
-      blocking: true,
-      result,
-      ...(row.comparisonFirst ? { firstAttempt: reference } : {}),
-    };
-    expect(isSlowRegression(c, [c], row.missing ? [] : [reference])).toBe(row.expected);
-  });
+  for (const verdict of ["regressed", "targeted_failure"] as const)
+    test.each(slowCases)(`slow ${verdict}: $name`, (row) => {
+      const reference: GateResult = {
+        name: row.referenceName ?? "test",
+        command: "fake-test",
+        ok: row.referenceOk ?? true,
+        exitCode: 0,
+        durationMs: row.referenceMs ?? 100_000,
+        output: "passed",
+      };
+      const result: GateResult = {
+        ...reference,
+        name: "test",
+        ok: false,
+        exitCode: 1,
+        durationMs: row.duration ?? 400_000,
+        ...row.result,
+        ...(row.firstOk !== undefined ? { firstAttempt: { ...reference, ok: row.firstOk } } : {}),
+      };
+      const c: GateComparison = {
+        name: "test",
+        verdict: row.verdict ?? verdict,
+        blocking: true,
+        result,
+        ...(row.comparisonFirst ? { firstAttempt: reference } : {}),
+      };
+      expect(isSlowRegression(c, [c], row.missing ? [] : [reference])).toBe(row.expected);
+    });
 
   test("fail → retry → pass is flaky and does not block", async () => {
     const { c, summary } = await retried(

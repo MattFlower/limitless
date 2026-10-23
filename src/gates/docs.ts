@@ -12,6 +12,35 @@ export interface DocsSelection {
   reason: string;
 }
 
+/** Recognize one invocation without evaluating shell content; unknown syntax keeps the full check. */
+function singleBunTest(command: string): boolean {
+  if (!/^[\t ]*bun[\t ]+test(?:[\t ]|$)/.test(command)) return false;
+  const stack = [{ quote: "", depth: 0 }];
+  for (let i = 0; i < command.length; i++) {
+    const frame = stack.at(-1);
+    const c = command[i];
+    if (!frame || c === "`" || (stack.length === 1 && /[\r\n]/.test(c ?? ""))) return false;
+    if (c === "\\" && frame.quote !== "'") {
+      const next = command[++i];
+      if (!next || (stack.length === 1 && /[\r\n]/.test(next))) return false;
+    } else if (c === "$" && frame.quote !== "'" && /['"{]/.test(command[i + 1] ?? "")) {
+      return false;
+    } else if (c === "$" && command[i + 1] === "(" && frame.quote !== "'") {
+      stack.push({ quote: "", depth: 1 });
+      i++;
+    } else if (frame.quote) {
+      if (c === frame.quote) frame.quote = "";
+    } else if (c === "'" || c === '"') frame.quote = c;
+    // Comments and heredocs need shell grammar beyond balanced substitutions.
+    else if (c === "#" || (c === "<" && command[i + 1] === "<")) return false;
+    else if (stack.length > 1) {
+      if (c === "(") frame.depth++;
+      if (c === ")" && --frame.depth === 0) stack.pop();
+    } else if (/[;&|<>()#]/.test(c ?? "")) return false;
+  }
+  return stack.length === 1 && stack[0]?.quote === "";
+}
+
 /** Inspect committed data only; a rename contributes both its old and new paths. */
 export async function docsOnlyGates(cwd: string, cfg: GateConfig, base: string, head: string) {
   const selection: DocsSelection = {
@@ -35,7 +64,7 @@ export async function docsOnlyGates(cwd: string, cfg: GateConfig, base: string, 
       selection.changedPaths.length &&
       selection.changedPaths.every((p) => patterns.some((r) => r.test(p)))
     ) {
-      if (![check.run, cfg.retryFiles].every((command) => /^bun test(?:\s|$)/.test(command.trim()))) {
+      if (![check.run, cfg.retryFiles].every(singleBunTest)) {
         selection.reason = `docs-only change; unrecognized test runner: ${check.run}; retry_files: ${cfg.retryFiles}`;
         return { gates, selection, annotate: (run: GateRun) => run };
       }
