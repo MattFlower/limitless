@@ -104,6 +104,13 @@ then retry. A second interrupt exits immediately; recovery may then require thos
 
 ## Live CLI smoke checks
 
+Run `bun scripts/packaged-smoke.ts [--binary <path>]` locally to check a real packaged binary:
+build identity, daemon health, embedded UI and assets, migration hashes, the routing overlay,
+SIGTERM shutdown, and dotenv/bunfig autoload isolation in a hostile working directory. Without
+`--binary` it builds the release binary and requires a clean tree. It uses isolated temporary
+directories and stubbed agent CLIs, with no paid model calls. CI runs it on every PR on Linux;
+the manual `packaged-smoke` workflow runs the same checks on macOS.
+
 Run `bun run smoke` manually from a checkout to check the installed `claude` and `codex` binaries
 through their real harnesses. Both CLIs must be installed, logged in, and have usable subscription
 quota. The runner uses the cheapest catalog model per provider, spends a small amount of quota,

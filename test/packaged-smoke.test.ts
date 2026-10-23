@@ -1,0 +1,196 @@
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import overlay from "../routing/policy.json";
+import {
+  checkAssets,
+  checkAutoload,
+  checkOverlay,
+  compareMigrations,
+  findOverlayCell,
+  formatRow,
+  referencedAssets,
+  writeHostileDir,
+} from "../scripts/packaged-smoke.ts";
+import { DEFAULT_POLICY } from "../src/router/catalog.ts";
+
+let root: string;
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), "packaged-smoke-test-"));
+});
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+const first = { name: "first.sql", sha256: "abc" };
+const second = { name: "second.sql", sha256: "def" };
+const files = [first, second];
+test("migration comparison accepts exact rows regardless of order", () => {
+  expect(compareMigrations([2, 1], [...files].reverse(), files, [1, 2])).toEqual({ pass: true });
+});
+test.each([
+  ["changed hash", [{ name: "first.sql", sha256: "changed" }, second], "first.sql"],
+  ["missing row", [first], "second.sql"],
+  ["extra row", [...files, { name: "extra.sql", sha256: "xyz" }], "extra.sql"],
+  ["duplicate row", [...files, first], "first.sql"],
+] as const)("migration comparison names the file with a %s", (_label, rows, culprit) => {
+  const check = compareMigrations([1, 2], [...rows], files, [1, 2]);
+  expect(check.pass).toBe(false);
+  expect(check.reason).toContain(culprit);
+});
+test.each([{ versions: [1] }, { versions: [1, 2, 3] }, { versions: [1, 2, 2] }])(
+  "schema migration version drift %j fails",
+  ({ versions }) => {
+    const check = compareMigrations([...versions], files, files, [1, 2]);
+    expect(check.pass).toBe(false);
+    expect(check.reason).toContain(String([...versions].some((v: number) => v === 3) ? 3 : 2));
+  },
+);
+
+test("HTML references include only deduplicated root-relative src and href in order", () => {
+  expect(
+    referencedAssets(`<script src="/a.js"></script><link href='/a.css'>
+    <script src="/a.js"></script><script src="https://example.com/y.js"></script>
+    <script src="//cdn.example.com/z.js"></script><a href="#top">top</a><script src="rel.js"></script>
+    <!-- <script src="/comment.js"></script> --><div data-src="/data.js"></div>`),
+  ).toEqual(["/a.js", "/a.css"]);
+  expect(checkAssets(["/a.js"])).toEqual({ pass: true });
+  const empty = checkAssets(referencedAssets("<html><body>No assets</body></html>"));
+  expect(empty.pass).toBe(false);
+  expect(empty.reason).toContain("no root-relative assets");
+});
+
+test("autoload checks accept absent paths and a refused port", () => {
+  expect(
+    checkAutoload([{ path: join(root, "absent"), exists: false }], { port: 12345, listening: false }),
+  ).toEqual({ pass: true });
+});
+test.each(["home", "config", "marker"])("autoload checks name an existing %s path", (name) => {
+  const path = join(root, name);
+  if (name === "marker") writeFileSync(path, "preloaded");
+  else {
+    mkdirSync(path);
+    writeFileSync(join(path, "created"), "dotenv loaded");
+  }
+  const check = checkAutoload([{ path, exists: existsSync(path) }]);
+  expect(check.pass).toBe(false);
+  expect(check.reason).toContain(path);
+});
+test("autoload checks reject a file at a decoy path and a listening port", () => {
+  const path = join(root, "home");
+  writeFileSync(path, "file");
+  expect(checkAutoload([{ path, exists: existsSync(path) }]).pass).toBe(false);
+  const check = checkAutoload([], { port: 12345, listening: true });
+  expect(check.pass).toBe(false);
+  expect(check.reason).toContain("12345");
+});
+
+test("hostile directory contains effective dotenv, preload and valid JSON without creating traps", () => {
+  const dir = join(root, "hostile");
+  const traps = writeHostileDir(dir, {
+    port: 12345,
+    home: join(root, "decoy-home"),
+    config: join(root, "decoy-config"),
+    marker: join(root, "marker"),
+  });
+  const dotenv = Object.fromEntries(
+    readFileSync(join(dir, ".env"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => line.split("=")),
+  );
+  expect(dotenv).toEqual({
+    LIMITLESS_PORT: String(traps.port),
+    LIMITLESS_HOME: traps.home,
+    LIMITLESS_CONFIG_DIR: traps.config,
+  });
+  const bunfig = Bun.TOML.parse(readFileSync(join(dir, "bunfig.toml"), "utf8")) as { preload: string[] };
+  expect(bunfig.preload).toHaveLength(1);
+  const preload = readFileSync(join(dir, bunfig.preload[0] ?? "missing"), "utf8");
+  expect(preload).toContain("Bun.write");
+  expect(preload).toContain(JSON.stringify(traps.marker));
+  for (const name of ["package.json", "tsconfig.json"])
+    expect(JSON.parse(readFileSync(join(dir, name), "utf8"))).toEqual({});
+  for (const path of [traps.home, traps.config, traps.marker]) expect(existsSync(path)).toBe(false);
+});
+
+test("routing finder selects differing groups including cells missing from defaults", () => {
+  expect(findOverlayCell({ spec: { large: ["new"] } }, { spec: { default: ["old"] } })).toEqual({
+    role: "spec",
+    cell: "large",
+    groups: ["new"],
+  });
+  const entry = findOverlayCell(overlay, DEFAULT_POLICY);
+  expect(entry).toBeDefined();
+  if (!entry) throw new Error("No differing routing cell");
+  const defaults: Record<string, Partial<Record<string, string[]>>> = DEFAULT_POLICY;
+  expect(isDeepStrictEqual(entry.groups, defaults[entry.role]?.[entry.cell])).toBe(false);
+  expect(
+    checkOverlay(
+      { spec: { default: ["new"] } },
+      { spec: { default: ["old"] } },
+      { spec: { default: { groups: ["new"] } } },
+    ).pass,
+  ).toBe(true);
+  const mismatch = checkOverlay(
+    { spec: { default: ["new"] } },
+    {},
+    { spec: { default: { groups: ["old"] } } },
+  );
+  expect(mismatch.pass).toBe(false);
+  expect(mismatch.reason).toContain("spec.default");
+});
+test.each([{}, DEFAULT_POLICY])(
+  "routing with no differing cell fails rather than passing vacuously",
+  (policy) => {
+    expect(findOverlayCell(policy, DEFAULT_POLICY)).toBeUndefined();
+    const check = checkOverlay(policy, DEFAULT_POLICY, {});
+    expect(check.pass).toBe(false);
+    expect(check.reason).toContain("no overlay cell differs");
+  },
+);
+test("formatter prints one row with the verdict and failure reason", () => {
+  expect(formatRow("version", { pass: true })).toBe("version\tPASS");
+  expect(formatRow("UI", { pass: false, reason: "/a.js\nHTTP 404" })).toBe("UI\tFAIL\t/a.js HTTP 404");
+});
+
+type Workflow = {
+  on: Record<string, unknown>;
+  permissions: Record<string, string>;
+  jobs: Record<
+    string,
+    {
+      "runs-on": string;
+      "timeout-minutes": number;
+      needs?: unknown;
+      steps: { uses?: string; run?: string; with?: { "bun-version": string } }[];
+    }
+  >;
+};
+test("packaged workflows pin toolchains, run Linux in parallel and reserve macOS for dispatch", () => {
+  const read = (name: string) =>
+    Bun.YAML.parse(readFileSync(join(import.meta.dir, "../.github/workflows", name), "utf8")) as Workflow;
+  const ci = read("ci.yml"),
+    manual = read("packaged-smoke.yml");
+  expect(Object.keys(manual.on)).toEqual(["workflow_dispatch"]);
+  expect(manual.permissions).toEqual({ contents: "read" });
+  const actions = ci.jobs.check?.steps.flatMap((step) => (step.uses ? [step.uses] : []));
+  for (const [workflow, platform] of [
+    [ci, "ubuntu-latest"],
+    [manual, "macos-15"],
+  ] as const) {
+    const job = workflow.jobs["packaged-smoke"];
+    expect(job?.["runs-on"]).toBe(platform);
+    expect(job?.["timeout-minutes"]).toBe(15);
+    expect(job?.needs).toBeUndefined();
+    const uses = job?.steps.flatMap((step) => (step.uses ? [step.uses] : []));
+    expect(uses).toEqual(actions);
+    for (const action of uses ?? []) expect(action).toMatch(/@[0-9a-f]{40}$/);
+    expect(job?.steps.some((step) => step.with?.["bun-version"] === "1.4.3")).toBe(true);
+    const commands = job?.steps.map((step) => step.run);
+    expect(commands).toContain("bun install --frozen-lockfile");
+    expect(commands).toContain("bun scripts/packaged-smoke.ts");
+  }
+});
