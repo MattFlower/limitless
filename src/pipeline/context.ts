@@ -1205,7 +1205,7 @@ export class RunContext {
         add("status", ev.text, { code: "signal_attempt", id: ev.id }, "warn");
         break;
       case "status":
-        add("status", ev.text, ev.data);
+        add("status", ev.text);
         break;
     }
   }

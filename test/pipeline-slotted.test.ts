@@ -86,13 +86,14 @@ test.each([false, true])(
     }
     expect(f.store.getRunState<RunState>(run.id)?.slottedCommands).toEqual(enabled ? [["bun", "test"]] : []);
     expect(f.store.getRunState<RunState>(run.id)?.agentFullSuite).toBe(enabled ? "refuse" : "slot");
-    const refusals = f.store.listEvents(run.id).filter((e) => e.message === "agent-test refused: full suite");
+    const refusals = f.store.listEvents(run.id).filter((e) => e.message.startsWith("agent-test refused:"));
     expect(refusals).toHaveLength(enabled ? 1 : 0);
     if (enabled) {
       expect(refusals[0]?.invocationId).toBe(
         f.store.listInvocations(run.id).find((inv) => inv.role === "implement")?.id,
       );
-      expect(refusals[0]?.data).toMatchObject({ command: "bun test -t [redacted]" });
+      expect(refusals[0]?.message).toBe("agent-test refused: full suite: bun test -t [redacted]");
+      expect(refusals[0]?.data).toBeNull();
       expect(f.store.listEvents(run.id).some((e) => e.message.startsWith("Agent test "))).toBe(false);
       expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain(secret);
     }

@@ -80,8 +80,7 @@ export function runToolAgent(
         if (data.phase === "refused")
           spec.onEvent({
             type: "status",
-            text: "agent-test refused: full suite",
-            data: { command: data.command },
+            text: `agent-test refused: full suite: ${data.command}`,
           });
         else onSlotEvent(data);
       },

@@ -74,6 +74,7 @@ import {
   runProcess,
   sh,
 } from "../src/util/proc.ts";
+import { AgentEvents } from "../src/workers/agent-protocol.ts";
 import { pairWorker, runWorker as runWorkerClient } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
 import { publicationFields } from "../src/workers/publication.ts";
@@ -5650,7 +5651,10 @@ test("worker implement full-suite refusal is forwarded once with a redacted comm
         const config: WrapperConfig = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
         expect(config).toMatchObject({ role: "implement", agentFullSuite: "refuse" });
         expect(
-          await agentTestCommand(config, ["bun", "test", "-t", secret], async (body) => agentTestLease(body)),
+          await agentTestCommand(config, ["bun", "test", "-t", secret], async (body) => {
+            await agentTestLease(body);
+            return agentTestLease(body);
+          }),
         ).not.toBe(0);
         return {};
       }),
@@ -5659,9 +5663,15 @@ test("worker implement full-suite refusal is forwarded once with a redacted comm
   try {
     await until(() => workers.agentJob(id)?.state === "done");
     const events = batches(id).flatMap((row) => JSON.parse(row.events));
-    expect(events.filter((event) => event.text === "agent-test refused: full suite")).toEqual([
-      { type: "status", text: "agent-test refused: full suite", data: { command: "bun test -t [redacted]" } },
+    const refusals = events.filter((event) => event.text?.startsWith("agent-test refused:"));
+    expect(refusals).toEqual([
+      { type: "status", text: "agent-test refused: full suite: bun test -t [redacted]" },
     ]);
+    expect(AgentEvents.safeParse({ seq: 0, events: refusals }).success).toBe(true);
+    expect(
+      AgentEvents.safeParse({ seq: 0, events: [{ ...refusals[0], data: { command: "bun test" } }] }).success,
+    ).toBe(false);
+    expect(JSON.parse(workers.agentJob(id)?.result ?? "null")).toMatchObject({ status: "ok" });
     expect(JSON.stringify(events)).not.toContain(secret);
   } finally {
     await worker.stop();
