@@ -935,6 +935,7 @@ test.each(["request", "retry wait"])(
       task = runWorker(listener.url.origin, remote, release, controller.signal, {
         confinement: fakeConfinement,
         heartbeatMs: 10,
+        capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
         retryMs: phase === "request" ? 1 : 60_000,
         tokenLookup: async () => "fixture-worker-token",
         machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -1017,6 +1018,7 @@ test.each(["running", "pushed", "fenced", "job-cancelled"])(
       task = runWorker(origin, remote, release, controller.signal, {
         confinement: fakeConfinement,
         heartbeatMs: 10,
+        capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
         retryMs: 5,
         fenceTimer: {
           set(callback) {
