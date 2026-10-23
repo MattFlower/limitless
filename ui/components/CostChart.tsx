@@ -19,6 +19,9 @@ export function costBarLabel(day: DayStats): string {
 }
 
 export const CostChart: Component<{ days: DayStats[] }> = (props) => {
+  const hasActivity = createMemo(() =>
+    props.days.some((d) => d.runs !== 0 || d.costUsd !== 0 || d.costEquivUsd !== 0),
+  );
   const max = createMemo(() => Math.max(0.01, ...props.days.map((d) => Math.max(d.costUsd, d.costEquivUsd))));
   const totals = createMemo(() =>
     props.days.reduce(
@@ -29,7 +32,7 @@ export const CostChart: Component<{ days: DayStats[] }> = (props) => {
 
   return (
     <div class={`cost-chart ${props.days.length > 7 ? "cost-chart-dense" : ""}`}>
-      <Show when={props.days.length} fallback={<div class="cost-empty">No cost data in this range.</div>}>
+      <Show when={hasActivity()} fallback={<div class="cost-empty">No cost data in this range.</div>}>
         <div class="cost-bars">
           <For each={props.days}>
             {(d) => {
@@ -90,7 +93,7 @@ export const CostChart: Component<{ days: DayStats[] }> = (props) => {
           </For>
         </div>
       </Show>
-      <Show when={props.days.length}>
+      <Show when={hasActivity()}>
         <div class="cost-totals">
           <span>
             Visible range · Metered <strong>{chartMoney(totals().metered)}</strong>
