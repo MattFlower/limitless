@@ -1,7 +1,8 @@
 import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, resolve } from "node:path";
+import type { Role } from "../core/types.ts";
 import type { TestLane } from "../gates/agent-tests.ts";
-import type { SlottedCommands } from "../harness/slotted-config.ts";
+import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { redactCredentials, registerCredential } from "../util/proc.ts";
 import { bounded, DaemonTimeoutError, type DeployClock, deployClock } from "./deploy-wait.ts";
 import {
@@ -14,6 +15,8 @@ import {
 } from "./gate-slot.ts";
 
 export interface WrapperConfig {
+  role?: Role;
+  agentFullSuite?: AgentFullSuite;
   commands: SlottedCommands;
   directory: string;
   port?: number;
@@ -196,16 +199,26 @@ export async function agentTestCommand(
 ): Promise<number> {
   registerCredential("LIMITLESS_AGENT_TEST_CAPABILITY", config.token);
   const name = argv[0];
+  const prefix = config.commands
+    .filter((p) => p.every((token, i) => argv[i] === token))
+    .sort((a, b) => b.length - a.length)[0];
+  const lane = prefix ? testLane(argv, prefix) : undefined;
+  if (lane === "gate" && config.role === "implement" && config.agentFullSuite === "refuse") {
+    console.error(
+      "agent-test: full suite refused; the factory's gates run the full suite after this round. Run the affected test files instead, for example: bun test test/<file>.test.ts",
+    );
+    await client(
+      { token: config.token, name: redactCredentials(argv.join(" ")), lane, refused: crypto.randomUUID() },
+      AbortSignal.timeout(1000),
+    );
+    return 1;
+  }
   const executable = name && realExecutable(name, process.env.PATH ?? "", config.directory);
   if (!executable) {
     console.error(redactCredentials(`agent-test: real executable not found: ${name ?? ""}`));
     return 127;
   }
-  const prefix = config.commands
-    .filter((p) => p.every((token, i) => argv[i] === token))
-    .sort((a, b) => b.length - a.length)[0];
-  if (!prefix) return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
-  const lane = testLane(argv, prefix);
+  if (!lane) return runLeasedCommand([executable, ...argv.slice(1)], undefined, true);
   const env = { ...process.env };
   const waiter = crypto.randomUUID();
   return runLeasedCommand(

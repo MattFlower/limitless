@@ -498,6 +498,26 @@ function linuxMarkedProcesses(
   return marked;
 }
 
+/** Admission needs synchronous inspection; include the Linux boot id because start ticks repeat. */
+export function processBirthSync(pid: number): string | null {
+  if (darwin) return darwin.darwinProcessBirth(pid);
+  if (inspectionPlatform !== "linux")
+    throw new Error("Process birth time inspection is unsupported on this platform");
+  let row: string;
+  try {
+    row = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (error) {
+    if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+    throw error;
+  }
+  const birth = row
+    .slice(row.lastIndexOf(")") + 2)
+    .trim()
+    .split(/\s+/)[19];
+  if (!birth) throw new Error(`Invalid process birth time for ${pid}`);
+  return `${bootIdentity()}:${birth}`;
+}
+
 /** Confirm identity and disappearance without relying on marker membership. */
 export async function processBirth(pid: number, name?: (value: string) => void): Promise<string | null> {
   if (inspectionPlatform === "darwin") {

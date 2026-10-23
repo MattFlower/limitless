@@ -25,6 +25,7 @@ export async function withSlottedCommands<T>(
   event: (data: TestWait) => void,
   invoke: (path?: string, idleNow?: () => number) => Promise<T>,
   onWatchdog?: (active: boolean, elapsedMs: number) => void,
+  policy: Pick<WrapperConfig, "role" | "agentFullSuite"> = {},
 ): Promise<T> {
   if (!commands.length) return invoke();
   const source = await wrapperBundle();
@@ -60,6 +61,7 @@ export async function withSlottedCommands<T>(
       },
     });
     const config: WrapperConfig = {
+      ...policy,
       directory,
       commands,
       port,
