@@ -8,14 +8,25 @@ import { sh } from "../src/util/proc.ts";
 const root = resolve(import.meta.dir, "..");
 
 export async function buildSha(cwd = root): Promise<string> {
-  if ("GIT_DIR" in process.env || "GIT_WORK_TREE" in process.env)
-    throw new Error("Cannot build Limitless with GIT_DIR or GIT_WORK_TREE overrides");
+  for (const name of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  ]) {
+    if (name in process.env) throw new Error(`Cannot build Limitless with ${name} override`);
+  }
   const worktree = await sh(["git", "config", "--get-all", "core.worktree"], { cwd, allowFail: true });
   if (worktree.exitCode === 0) throw new Error("Cannot build Limitless with core.worktree configured");
   if (worktree.exitCode !== 1) throw new Error("Cannot inspect build core.worktree configuration");
   const top = (await sh(["git", "rev-parse", "--show-toplevel"], { cwd })).stdout.trim();
   if (realpathSync(top) !== realpathSync(cwd))
     throw new Error("Cannot build Limitless: Git checkout root does not match build root");
+  const index = await sh(["git", "ls-files", "-v", "-z"], { cwd });
+  if (index.stdout.split("\0").some((entry) => /^[a-zS] /.test(entry)))
+    throw new Error("Cannot build Limitless with assume-unchanged or skip-worktree index entries");
   const status = await sh(
     ["git", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
     { cwd },

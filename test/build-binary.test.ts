@@ -48,6 +48,13 @@ test("modified tracked files refuse", async () => {
   await expect(buildSha(dir)).rejects.toThrow("dirty tree");
 });
 
+test.each(["assume-unchanged", "skip-worktree"])("%s cannot hide tracked changes", async (flag) => {
+  await seed(dir);
+  await sh(["git", "update-index", `--${flag}`, "tracked"], { cwd: dir });
+  writeFileSync(join(dir, "tracked"), "changed\n");
+  await expect(buildSha(dir)).rejects.toThrow("assume-unchanged or skip-worktree");
+});
+
 test.each([false, true])("untracked files refuse even with hidden status=%s", async (hidden) => {
   await seed(dir);
   if (hidden) await sh(["git", "config", "status.showUntrackedFiles", "no"], { cwd: dir });
@@ -79,13 +86,20 @@ test("core.worktree cannot redirect a dirty checkout to a clean copy", async () 
   await expect(buildSha(dirty)).rejects.toThrow("core.worktree");
 });
 
-test.each(["GIT_DIR", "GIT_WORK_TREE"])("%s overrides refuse even when empty", async (name) => {
+test.each([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+])("%s overrides refuse even when empty", async (name) => {
   await seed(dir);
   const original = process.env[name];
   try {
     for (const value of [dir, ""]) {
       process.env[name] = value;
-      await expect(buildSha(dir)).rejects.toThrow("GIT_DIR or GIT_WORK_TREE");
+      await expect(buildSha(dir)).rejects.toThrow(name);
     }
   } finally {
     if (original === undefined) delete process.env[name];
