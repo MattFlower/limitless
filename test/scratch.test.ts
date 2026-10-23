@@ -178,6 +178,18 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
     );
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
+    const binding = buildClaudeArgs({ ...spec, allowLocalBinding: true }, "id");
+    const settingsIndex = binding.indexOf("--settings") + 1;
+    expect(JSON.parse(binding[settingsIndex] ?? "{}")).toEqual({
+      ...settings,
+      sandbox: { ...settings.sandbox, network: { allowLocalBinding: true } },
+    });
+    expect(binding.map((arg, i) => (i === settingsIndex ? claude[i] : arg))).toEqual(claude);
+    expect(buildClaudeArgs({ ...spec, allowLocalBinding: false }, "id")).toEqual(claude);
+    expect(buildCodexArgs({ ...spec, allowLocalBinding: true })).toEqual(codex);
+    expect(buildClaudeArgs({ ...spec, noTools: true, allowLocalBinding: true }, "id")).toEqual(
+      buildClaudeArgs({ ...spec, noTools: true }, "id"),
+    );
     expect(settings.sandbox).toMatchObject({
       enabled: true,
       failIfUnavailable: true,
@@ -1804,6 +1816,9 @@ test("claude editors confine Bash and native edits to the same roots; project se
   for (const variant of [{}, { fast: true }]) {
     const t = { ...spec.target, provider: "claude" };
     const args = buildClaudeArgs({ ...spec, ...variant, target: t }, "session");
+    expect(buildClaudeArgs({ ...spec, ...variant, target: t, allowLocalBinding: true }, "session")).toEqual(
+      args,
+    );
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     expect(args).toContain("--strict-mcp-config");
     // The config directory is read-only inside the boundary: no transcript is written there.
