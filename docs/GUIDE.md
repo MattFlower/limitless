@@ -220,6 +220,7 @@ discovers an owner.
 | `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
 | `[sandbox] toolchain_paths` | `[]` | Additional gate-readable toolchain roots, from this factory configuration only. Only build subpaths of the Bun, Cargo and Rustup homes are included by default (using the factory's `BUN_INSTALL`, `CARGO_HOME` and `RUSTUP_HOME` when set); Cargo registry credentials stay denied. A root overlapping a denied credential path prevents launch. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
+| `[review] avoid_implementer_vendor` | `true` | `false` lets production single reviews follow the review routing chain regardless of the implementer's vendor. Panel finders, shadows, verification, verify-change and follow-up re-checks keep their vendor rules. Older releases refuse to start with this key set because `[review]` keys are validated strictly; remove it before rolling back past this release. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
 | `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
 | `[review] shadow_grace_seconds` | `300` | How long a shadow panel may run after its single review finishes before it is aborted and recorded as `timeout`. `0` stops it as soon as the single review finishes. |
@@ -257,7 +258,12 @@ heartbeat. Opted-in gates run from git bundles at the requested commit, without 
 on the worker. Leases renew with
 heartbeats and expire after sixty seconds. Infrastructure failures retry once on another worker,
 then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
-restarts re-attach to gate jobs, while cancelling a run tells its worker to stop.
+restarts re-attach only to baseline, initial and rebase LAN gate jobs for the same stage, round and
+SHA. The coordinator must return before the gate-job sweep fails the job for an expired lease or
+stale heartbeat (about thirty seconds since the last heartbeat, with no restart grace). Land checks
+have no durable gate handle and run again after a restart; a graceful land-queue stop cancels its
+LAN gate jobs. Cancelling a run tells its worker to stop. Changes to restart recovery are tracked
+in [#784](https://github.com/MattFlower/limitless/issues/784).
 Opted-in implement rounds publish a commit that the coordinator fetches and verifies before running
 gates, audit, review and delivery. Implement sessions for merge and resolution rounds, PR review
 rounds, existing-branch delivery, verify-change runs and local repositories stay local. Publishing
