@@ -57,6 +57,14 @@ Only requested tunnel and mtplx agents migrate; they restart with rollback witho
    (the worktree and run state are persisted; a round whose implementation already committed
    goes straight to its checks).
 
+Use `limitless restart [--now] [--max-wait <seconds>]` to restart the installed release
+for a config change, a stuck daemon or an operator request. Use `deploy` to ship a new commit.
+Config changes still need a restart until config reload exists (#784, W2). Restart takes the
+deploy lock, drains with the same 2700-second default wait (`--now` skips waiting), then waits
+for a new healthy boot running the same SHA. It leaves the release checkout in place and has
+nothing to roll back; a health timeout prints service status and exits non-zero. The existing
+`daemon.started` feed item records the new boot.
+
 Self-hosting can opt in to automatic deployment in `config.toml`:
 
 ```toml
