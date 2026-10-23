@@ -11,6 +11,15 @@ export function pairingCode(coordinator: string, worker: string, nonce: string):
   return [...digest.subarray(0, 16)].map((b) => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[b % 32]).join("");
 }
 
+const Cli = z.object({ version: z.string().nullable(), loggedIn: z.boolean() }).strict();
+export const Agents = z.object({ claude: Cli.optional(), codex: Cli.optional() }).strict();
+export const AgentCapabilities = z
+  .object({
+    agents: Agents.optional(),
+    privateStrings: z.enum(["match", "differs", "unknown"]).default("unknown"),
+  })
+  .strict();
+
 export const Heartbeat = z
   .object({
     releaseSha: z.string().min(1).max(128),
@@ -23,6 +32,11 @@ export const Heartbeat = z
     onAC: z.boolean(),
     idleSeconds: z.number().nonnegative(),
     jobs: z.array(z.string().uuid()).max(128),
+    agents: Agents.optional(),
+    privateStringsDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     updateWarning: z.string().max(4000).optional(),
   })
   .strict();

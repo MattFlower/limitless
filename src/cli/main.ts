@@ -9,6 +9,7 @@ import { parseSince } from "../core/since.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { landState } from "../land/wire.ts";
 import { redactCredentials } from "../util/proc.ts";
+import type { Cli } from "../workers/capabilities.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 import { resolveClientPort } from "./client-port.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
@@ -355,10 +356,21 @@ async function main(): Promise<void> {
     case "workers": {
       if (rest[0] === "ls") {
         const rows =
-          await api<{ name: string; state: string; code?: string; setupWarning?: string }[]>("/api/workers");
+          await api<
+            {
+              name: string;
+              state: string;
+              code?: string;
+              setupWarning?: string;
+              agents?: Partial<Record<"claude" | "codex", Cli>>;
+              privateStrings?: string;
+            }[]
+          >("/api/workers");
+        const cli = (c?: Cli) =>
+          c?.loggedIn ? (c.version ?? "unknown") : c?.version ? "logged out" : "missing";
         for (const w of rows)
           console.log(
-            `${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}${w.setupWarning ? `\t${w.setupWarning}` : ""}`,
+            `${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}${w.setupWarning ? `\t${w.setupWarning}` : ""}\tclaude:${cli(w.agents?.claude)}\tcodex:${cli(w.agents?.codex)}\tprivate-strings:${w.privateStrings ?? "unknown"}`,
           );
         return;
       }
