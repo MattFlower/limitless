@@ -720,6 +720,7 @@ export class EvalRunner {
               signal,
               system?.implementerReport,
               cfg.triageDecisionConfidence,
+              harnessName === "claude" && !noTools,
             );
       if (!prepared) throw new Error("missing trial preparation");
       if ("defects" in effective && system?.setup) {
@@ -995,6 +996,7 @@ export class EvalRunner {
                 mode: "hidden" in item ? "edit" : "readonly",
                 noTools: to.noTools,
                 privateSession: run.role === "verify",
+                ...(run.role === "verify" ? { allowLocalBinding: true } : {}),
                 idleTimeoutMs: 10 * 60_000,
                 maxToolCalls: "hidden" in item ? 400 : 150,
                 signal,

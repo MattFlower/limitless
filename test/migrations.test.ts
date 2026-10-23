@@ -443,6 +443,66 @@ test("a previous release can still open the database (deploy rollback)", () => {
   });
 });
 
+test("process discovery migration preserves pre-change data and rollback writes leave evidence intact", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-process-discoveries.sql"),
+    });
+    const old = new Store(path, before);
+    old.setSetting("sentinel", "unchanged");
+    const repo = old.upsertRepo({
+      slug: "local/legacy",
+      kind: "local",
+      localPath: directory,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const original = old.createRun(repo, { repo: repo.slug, prompt: "existing" });
+    old.close();
+    const current = new Store(path);
+    const evidence = {
+      invocation: "persisted",
+      runId: original.id,
+      directory,
+      boot: "old-boot",
+      createdAt: 1,
+      discovery: { group: 42, started: 1, directories: [directory], leader: null, spawnedAt: "0" },
+    };
+    current.recordProcessDiscovery(evidence);
+    expect(current.getRun(original.id)?.prompt).toBe("existing");
+    current.close();
+    const previous = new Store(path, before);
+    const run = previous.createRun(repo, { repo: repo.slug, prompt: "rollback work" });
+    previous.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "fake",
+      provider: "fake",
+      model: "fake",
+      modelId: "fake/model",
+    });
+    previous.db
+      .query("INSERT INTO process_cleanups VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(run.id, "legacy", directory, 42, "birth", "old-boot", 1, null);
+    previous.setSetting("rollback", "works");
+    previous.close();
+    const reopened = new Store(path);
+    try {
+      expect(reopened.getSetting("sentinel", "")).toBe("unchanged");
+      expect(reopened.getSetting("rollback", "")).toBe("works");
+      expect(reopened.listInvocations(run.id)).toHaveLength(1);
+      expect(reopened.listProcessCleanups()).toMatchObject([{ invocation: "legacy", discovery: null }]);
+      expect(reopened.listProcessDiscoveries()).toEqual([evidence]);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
 test("invocations recorded before cache writes were stored read as zero writes", () => {
   temporary((directory, path) => {
     const before = join(directory, "before");
