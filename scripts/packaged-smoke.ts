@@ -2,13 +2,14 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 import { version } from "../package.json";
 import { migrationNames } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { DEFAULT_POLICY } from "../src/router/catalog.ts";
+import { redactCredentials } from "../src/util/proc.ts";
 
 type Result = { pass: boolean; reason?: string };
 type Migration = { name: string; sha256: string };
@@ -144,10 +145,8 @@ async function stop(child: Bun.Subprocess): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
-  const { values } = parseArgs({ args: Bun.argv.slice(2), options: { binary: { type: "string" } } });
+async function smoke(root: string, binaryPath: string | undefined, diagnostic: (text: string) => string) {
   const checkout = resolve(import.meta.dir, "..");
-  const root = mkdtempSync(join(tmpdir(), "limitless-packaged-smoke-"));
   const children: Bun.Subprocess[] = [];
   let failed = false;
   const run = async (name: string, fn: () => Result | undefined | Promise<Result | undefined>) => {
@@ -158,7 +157,7 @@ async function main(): Promise<void> {
       check = result(false, String(error));
     }
     failed ||= !check.pass;
-    console.log(formatRow(name, check));
+    console.log(formatRow(name, { ...check, reason: check.reason && diagnostic(check.reason) }));
     return check.pass;
   };
   try {
@@ -203,15 +202,15 @@ async function main(): Promise<void> {
           return code;
         },
         stdout: () => readFileSync(out, "utf8"),
-        tail: () => (readFileSync(out, "utf8") + readFileSync(err, "utf8")).slice(-4000),
+        tail: () => diagnostic(readFileSync(out, "utf8") + readFileSync(err, "utf8")).slice(-4000),
       };
     };
     const git = launch(["git", "rev-parse", "HEAD"], checkout, 30_000);
     if ((await git.done()) !== 0) throw new Error(`Cannot read build SHA: ${git.tail()}`);
     const sha = git.stdout().trim();
-    const binary = values.binary ? resolve(values.binary) : join(root, "build", "limitless");
+    const binary = binaryPath ? resolve(binaryPath) : join(root, "build", "limitless");
     let buildError: string | undefined;
-    if (!values.binary) {
+    if (!binaryPath) {
       const build = launch(
         [process.execPath, "scripts/build-binary.ts", "--outdir", join(root, "build")],
         checkout,
@@ -342,8 +341,29 @@ async function main(): Promise<void> {
   }
 }
 
-if (import.meta.main)
-  main().catch((error: unknown) => {
-    console.error(String(error));
+async function main(): Promise<void> {
+  // Capture the runner's home before children receive their isolated HOME.
+  const home = homedir();
+  let root = "";
+  const diagnostic = (text: string) => {
+    let safe = redactCredentials(text);
+    // Replace the most specific prefix first, including when scratch is under HOME.
+    const prefixes: [string, string][] = [
+      [root, "<tmp>"],
+      [home, "<home>"],
+    ];
+    for (const [prefix, label] of prefixes.sort((a, b) => b[0].length - a[0].length))
+      if (prefix) safe = safe.replaceAll(prefix, label);
+    return safe;
+  };
+  try {
+    const { values } = parseArgs({ args: Bun.argv.slice(2), options: { binary: { type: "string" } } });
+    root = mkdtempSync(join(tmpdir(), "limitless-packaged-smoke-"));
+    await smoke(root, values.binary, diagnostic);
+  } catch (error) {
+    console.error(diagnostic(String(error)));
     process.exitCode = 1;
-  });
+  }
+}
+
+if (import.meta.main) await main();

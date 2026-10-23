@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -176,6 +177,115 @@ exec ${quote(process.execPath)} --config=${quote(config)} --no-env-file ${quote(
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await child.exited;
   }
+});
+
+async function diagnosticSmoke(mode: "exit" | "parsed" | "setup") {
+  const checkout = join(import.meta.dir, "..");
+  const home = realpathSync(root);
+  const secret = `smoke-${crypto.randomUUID()}`;
+  const boundary = `boundary-${crypto.randomUUID()}`;
+  const preload = join(root, "register.ts");
+  writeFileSync(
+    preload,
+    `import { registerCredential } from ${JSON.stringify(join(checkout, "src/util/proc.ts"))};
+     registerCredential("SMOKE_TEST", ${JSON.stringify(secret)});
+     registerCredential("SMOKE_BOUNDARY_TEST", ${JSON.stringify(boundary)});
+     if (${JSON.stringify(mode)} === "setup") registerCredential("SMOKE_FILE_TEST", "0.stdout");`,
+  );
+  const executable = join(root, "fake.ts");
+  writeFileSync(
+    executable,
+    `import { rmSync, writeFileSync } from "node:fs";
+     import { dirname, join } from "node:path";
+     const secret = ${JSON.stringify(secret)}, boundary = ${JSON.stringify(boundary)};
+     const scratch = dirname(process.env.LIMITLESS_HOME);
+     const detail = secret + " " + scratch + "/private-file " + ${JSON.stringify(`${home}/runner-file`)};
+     const footer = " stdout: " + detail + " stderr: " + detail;
+     if (${JSON.stringify(mode)} === "setup") {
+       // Make the parent's stdout read fail outside the per-check reporting path.
+       rmSync(join(scratch, "0.stdout"));
+       process.exit(0);
+     }
+     if (${JSON.stringify(mode)} === "parsed" && Bun.argv[2] === "version") {
+       writeFileSync(1, JSON.stringify({ kind: detail }));
+       process.exit(0);
+     }
+     // Raw tail truncation would start in the middle of this registered credential.
+     writeFileSync(1, boundary + "x".repeat(4000 - 20 - footer.length) + " stdout: " + detail);
+     writeFileSync(2, " stderr: " + detail);
+     process.exit(1);`,
+  );
+  const config = join(root, "bunfig.toml");
+  writeFileSync(config, "");
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const binary = join(root, mode === "setup" ? "git" : "limitless");
+  writeFileSync(
+    binary,
+    `#!/bin/sh\nexec ${quote(process.execPath)} --config=${quote(config)} --no-env-file ${quote(executable)} "$@"\n`,
+    { mode: 0o755 },
+  );
+  const child = Bun.spawn(
+    [process.execPath, "--preload", preload, join(checkout, "scripts/packaged-smoke.ts"), "--binary", binary],
+    {
+      cwd: checkout,
+      // The smoke root is beneath the runner's HOME, exercising overlapping prefixes.
+      env: { ...process.env, HOME: home, TMPDIR: home, PATH: `${root}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  try {
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(code).not.toBe(0);
+    expect(readdirSync(root).filter((name) => name.startsWith("limitless-packaged-smoke-"))).toEqual([]);
+    const output = stdout + stderr;
+    expect(output).not.toContain(home);
+    expect(output).not.toContain("limitless-packaged-smoke-");
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain(boundary.slice(-20));
+    expect(output).toContain("[redacted]");
+    if (mode === "setup") {
+      expect(output).not.toContain("0.stdout");
+      expect(output).toContain("<tmp>/[redacted]");
+    } else {
+      expect(output).toContain("<tmp>/private-file");
+      expect(output).toContain("<home>/runner-file");
+    }
+    return { stdout, stderr };
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await child.exited;
+  }
+}
+
+test.each(["exit", "parsed"] as const)(
+  "smoke sanitizes version and serve failure diagnostics before truncating: %s",
+  async (mode) => {
+    const { stdout, stderr } = await diagnosticSmoke(mode);
+    expect(stderr).toBe("");
+    expect(stdout.trim().split("\n")).toHaveLength(8);
+    for (const name of ["version", "serve/health"]) {
+      const row = stdout.split("\n").find((line) => line.startsWith(`${name}\tFAIL\t`));
+      expect(row).toContain("[redacted]");
+      expect(row).toContain("<tmp>/private-file");
+      expect(row).toContain("<home>/runner-file");
+      if (mode === "exit" || name === "serve/health") {
+        expect(row).toContain("stdout:");
+        expect(row).toContain("stderr:");
+      }
+    }
+  },
+);
+
+test("smoke sanitizes setup errors and removes its temporary directory", async () => {
+  const { stdout, stderr } = await diagnosticSmoke("setup");
+  expect(stdout).toBe("");
+  expect(stderr).toContain("ENOENT");
+  expect(stderr).toContain("open");
 });
 
 test("routing finder selects differing groups including cells missing from defaults", () => {
