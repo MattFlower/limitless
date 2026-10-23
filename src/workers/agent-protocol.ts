@@ -7,9 +7,16 @@ const window = z.object({ utilization: number, resetsAt: number.nullable() }).st
 const windows = z.record(z.string(), window);
 const event: z.ZodType<AgentEvent> = z.discriminatedUnion("type", [
   z.object({ type: z.literal("init"), sessionId: z.string(), model: z.string().optional() }).strict(),
-  ...(["text", "thinking", "stderr", "status"] as const).map((type) =>
+  ...(["text", "thinking", "stderr"] as const).map((type) =>
     z.object({ type: z.literal(type), text: z.string() }).strict(),
   ),
+  z
+    .object({
+      type: z.literal("status"),
+      text: z.string(),
+      data: z.object({ command: z.string() }).strict().optional(),
+    })
+    .strict(),
   z.object({ type: z.literal("tool_call"), id: z.string(), name: z.string(), input: z.json() }).strict(),
   z
     .object({ type: z.literal("tool_result"), id: z.string(), output: z.string(), isError: z.boolean() })

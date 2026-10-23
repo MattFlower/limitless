@@ -29,7 +29,7 @@ import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { selectHarness } from "../harness/select.ts";
-import type { SlottedCommands } from "../harness/slotted-config.ts";
+import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { GhRunner } from "../integrations/github.ts";
@@ -94,6 +94,7 @@ export interface RunState {
   gatesConfig?: GateConfig;
   previewConfig?: PreviewConfig | null;
   slottedCommands?: SlottedCommands;
+  agentFullSuite?: AgentFullSuite;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
@@ -881,6 +882,7 @@ export class RunContext {
                   data,
                 }),
               dispatch,
+              { role: opts.role, agentFullSuite: this.state.agentFullSuite },
             );
           result = await (this.deps.agentExecutor ?? localAgentExecutor).run(
             {
@@ -891,6 +893,7 @@ export class RunContext {
               worktree: spec.cwd,
               spec,
               slottedCommands,
+              agentFullSuite: this.state.agentFullSuite,
               shadow: Boolean(shadow),
               private: Boolean(opts.privateOutput || opts.redactHoldout || opts.privateSession),
               denyRead: opts.denyRead,
@@ -1196,7 +1199,7 @@ export class RunContext {
         add("status", ev.text, { code: "signal_attempt", id: ev.id }, "warn");
         break;
       case "status":
-        add("status", ev.text);
+        add("status", ev.text, ev.data);
         break;
     }
   }

@@ -3,7 +3,7 @@ import type { AgentJobRequest } from "../db/workers.ts";
 import type { TestWait } from "../gates/agent-tests.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { withSlottedCommands } from "../harness/slotted.ts";
-import type { SlottedCommands } from "../harness/slotted-config.ts";
+import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import type { AgentResult, AgentSpec, Harness } from "../harness/types.ts";
 
 /** Publication inputs owned by the engine; session inputs are supplied by the executor. */
@@ -38,6 +38,7 @@ export interface AgentCall {
   worktree: string;
   spec: AgentSpec;
   slottedCommands: SlottedCommands;
+  agentFullSuite?: AgentFullSuite;
   shadow: boolean;
   private: boolean;
   denyRead: AgentSpec["denyRead"];
@@ -66,6 +67,7 @@ export function runToolAgent(
   port?: number,
   onSlotEvent: (data: TestWait) => void = () => {},
   dispatch?: () => void,
+  policy: { role?: Role; agentFullSuite?: AgentFullSuite } = {},
 ): Promise<AgentResult> {
   return withScratch(spec.cwd, (scratchDir) => {
     dispatch?.();
@@ -74,7 +76,15 @@ export function runToolAgent(
       spec.cwd,
       scratchDir,
       port,
-      onSlotEvent,
+      (data) => {
+        if (data.phase === "refused")
+          spec.onEvent({
+            type: "status",
+            text: "agent-test refused: full suite",
+            data: { command: data.command },
+          });
+        else onSlotEvent(data);
+      },
       (commandPath, idleNow) =>
         harness({ ...spec, scratchDir, idleNow, ...(commandPath ? { commandPath } : {}) }),
       (active, elapsedMs) =>
@@ -84,6 +94,7 @@ export function runToolAgent(
             ? "Idle watchdog held off for slotted command"
             : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
         }),
+      policy,
     );
   });
 }

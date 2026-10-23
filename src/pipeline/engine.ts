@@ -76,7 +76,7 @@ import {
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
-import { readSlottedCommands } from "../harness/slotted-config.ts";
+import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -266,15 +266,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       );
       await ctx.save();
     }
-    if (ctx.state.phase !== "prepare" && ctx.state.slottedCommands === undefined) {
+    if (
+      ctx.state.phase !== "prepare" &&
+      (ctx.state.slottedCommands === undefined || ctx.state.agentFullSuite === undefined)
+    ) {
       const trustedSha =
         reviewRound(ctx)?.owner.baseSha ?? ctx.state.verification?.baseSha ?? ctx.run.baseSha;
       if (!trustedSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base slotted commands: missing base SHA or worktree");
-      ctx.state.slottedCommands = readSlottedCommands(
-        await readFileAt(ctx.state.worktreePath, trustedSha, ".limitless.toml"),
-        (message) => ctx.log(message, "warn"),
-      );
+      const contents = await readFileAt(ctx.state.worktreePath, trustedSha, ".limitless.toml");
+      ctx.state.slottedCommands ??= readSlottedCommands(contents, (message) => ctx.log(message, "warn"));
+      ctx.state.agentFullSuite ??= readAgentFullSuite(contents, (message) => ctx.log(message, "warn"));
       await ctx.save();
     }
     if (ctx.state.phase === "prepare") await prepare(ctx);
@@ -602,6 +604,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     try {
       const repoConfig = await readFileAt(wt.path, trustedSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
+      ctx.state.agentFullSuite = readAgentFullSuite(repoConfig, (message) => ctx.log(message, "warn"));
       ctx.state.slottedCommands = readSlottedCommands(repoConfig, (message) => ctx.log(message, "warn"));
       // Review lenses come from the base commit, never from the change under review.
       if (ctx.deps.cfg.reviewMode === "panel")

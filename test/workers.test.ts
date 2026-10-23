@@ -19,6 +19,7 @@ import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
+import { agentTestCommand, type WrapperConfig } from "../src/cli/agent-test.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
@@ -4508,6 +4509,7 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
     privateSession: true,
     confineReads: true,
     slottedCommands: [["bun", "test"]],
+    agentFullSuite: "refuse",
     branch: "change/agent",
     baseSha: releaseSha,
     commit: publicationCommit,
@@ -5415,7 +5417,12 @@ test("worker shutdown clears the fence and a late heartbeat cannot rearm it", as
 
 test("readonly worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
   await listen();
-  const id = await queuedLocalAgent({ mode: "readonly", slottedCommands: [["bun", "test"]] });
+  const id = await queuedLocalAgent({
+    mode: "readonly",
+    role: "verify",
+    agentFullSuite: "refuse",
+    slottedCommands: [["bun", "test"]],
+  });
   let cwd = "",
     scratch = "";
   let forms: string[] = [];
@@ -5438,6 +5445,7 @@ test("readonly worker agent runs at its parent, hides paths, uses local slots an
         const wrappers = spec.commandPath?.split(":")[0] ?? "";
         const config = JSON.parse(readFileSync(join(wrappers, "config.json"), "utf8"));
         expect(config).not.toHaveProperty("port");
+        expect(config).toMatchObject({ role: "verify", agentFullSuite: "refuse" });
         const lease = await agentTestLease({ token: config.token, name: "bun test", lane: "gate" });
         expect(lease.acquired).toBe(true);
         await agentTestLease({ token: config.token, id: lease.id, release: true });
@@ -5475,6 +5483,40 @@ test("readonly worker agent runs at its parent, hides paths, uses local slots an
     expect(existsSync(scratch)).toBe(false);
     expect(readdirSync(worker.remote.paths.work)).toEqual([]);
     expect(workerCleanupRecords(worker.remote)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker implement full-suite refusal is forwarded once with a redacted command", async () => {
+  await listen();
+  const secret = `credential-${crypto.randomUUID()}`;
+  registerCredential("WORKER_REFUSAL_TEST", secret);
+  const id = await queuedLocalAgent({
+    role: "implement",
+    agentFullSuite: "refuse",
+    slottedCommands: [["bun", "test"]],
+  });
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        const wrapper = spec.commandPath?.split(":")[0] ?? "";
+        const config: WrapperConfig = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+        expect(config).toMatchObject({ role: "implement", agentFullSuite: "refuse" });
+        expect(
+          await agentTestCommand(config, ["bun", "test", "-t", secret], async (body) => agentTestLease(body)),
+        ).not.toBe(0);
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    const events = batches(id).flatMap((row) => JSON.parse(row.events));
+    expect(events.filter((event) => event.text === "agent-test refused: full suite")).toEqual([
+      { type: "status", text: "agent-test refused: full suite", data: { command: "bun test -t [redacted]" } },
+    ]);
+    expect(JSON.stringify(events)).not.toContain(secret);
   } finally {
     await worker.stop();
   }
