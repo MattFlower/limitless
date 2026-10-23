@@ -10,10 +10,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { generateReplayCases, replayArguments, replayRequest } from "../scripts/implement-replay-cases.ts";
+import {
+  generateReplayCases,
+  replayArguments,
+  replayProduction,
+  replayRequest,
+} from "../scripts/implement-replay-cases.ts";
+import type { Invocation, Run } from "../src/core/types.ts";
 import { ImplementCaseFileSchema, loadRoleCases } from "../src/evals/cases.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
+import { type ReportInput, renderReport } from "../src/pipeline/report.ts";
 import { sh } from "../src/util/proc.ts";
 import { recordingConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -22,12 +29,50 @@ import { seeded } from "./seeded.ts";
 setDefaultTimeout(60_000);
 const repo = "fixture/replay";
 const prompt = "Repair answer.\n\n  Preserve indentation.\n> nested quote\n";
-const body = `Built by **Limitless** — every gate below passed.\n\n## Request\n\n${prompt
-  .split("\n")
-  .map((line) => `> ${line}`)
-  .join(
-    "\n",
-  )}\n\n## Triage\n\nComplexity: small\n\n## Code review (\`reviewer\`)\n\n- Panel review R1 — full change\n- Panel review R2 — fix diff\n\n## Routing — model experiment\n\n- implement: \`configured/unused\`\n\n## Work log\n\n| Role | Model | Status |\n|---|---|---|\n| implement | \`codex/sol-6.1\` | ok |\n| implement | \`claude/opus\` | ok |\n`;
+const invocation: Invocation = {
+  id: 1,
+  runId: "r1",
+  stageId: 1,
+  role: "implement",
+  harness: "codex",
+  provider: "codex",
+  model: "gpt-6.1-sol",
+  modelId: "codex/sol-6.1",
+  effort: null,
+  status: "ok",
+  fast: false,
+  fastModeState: null,
+  fastModeDisabledReason: null,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  costUsd: 0,
+  costEquivUsd: 0,
+  numTurns: 1,
+  waitMs: 0,
+  sessionId: null,
+  error: null,
+  startedAt: 0,
+  finishedAt: 1,
+};
+const report: ReportInput = {
+  success: true,
+  runId: "r1",
+  prompt,
+  state: { lastReview: { modelId: "reviewer", verdict: "approve", summary: "Reviewed", findings: [] } },
+  models: { implement: ["configured/unused"] },
+  invocations: [
+    invocation,
+    { ...invocation, role: "review", modelId: "reviewer" },
+    { ...invocation, harness: "claude", provider: "claude", modelId: "claude/opus" },
+    { ...invocation, role: "review", modelId: "reviewer" },
+    { ...invocation, role: "review_shadow", modelId: "shadow" },
+  ],
+  totals: { costUsd: 0, costEquivUsd: 0 },
+  runUrl: "https://example.com/runs/r1",
+};
+const body = renderReport(report);
 const changed = "test/modified.test.ts";
 const added = "test/added 'quoted'.test.ts";
 const renamed = "test/renamed.test.ts";
@@ -147,9 +192,21 @@ async function fixture() {
     original,
     calls: recording.calls,
     backend: recording.backend,
-    run: (prs: number[], timeoutSec?: number) =>
+    run: (prs: number[], timeoutSec?: number, complexity: Run["complexity"] = "small") =>
       confinementScope.run(recording.backend, () =>
-        generateReplayCases({ repo, prs }, { gh, casePath, cache: async () => cache, timeoutSec }),
+        generateReplayCases(
+          { repo, prs },
+          {
+            gh,
+            casePath,
+            cache: async () => cache,
+            timeoutSec,
+            lookupRun: async (id) => {
+              expect(id).toBe("r1");
+              return { complexity };
+            },
+          },
+        ),
       ),
     read: () => ImplementCaseFileSchema.parse(JSON.parse(readFileSync(casePath, "utf8"))),
     async clean() {
@@ -183,6 +240,8 @@ test("squash replay preserves request, all hidden bytes, production evidence and
     });
     expect(item?.tags).toEqual(["replay", "replay-v2", "needs_human:false", "review-rounds:2"]);
     expect(item?.notes).toContain("codex/sol-6.1, claude/opus");
+    expect(item?.notes).toContain("run record r1");
+    expect(item?.notes).toContain("review rounds: 2 (Work log review rows)");
     expect(item?.notes).not.toContain("configured/unused");
     expect(item?.hidden.command).toBe(
       "bun test './test/added '\\''quoted'\\''.test.ts' './test/modified.test.ts' './test/renamed.test.ts'",
@@ -240,22 +299,22 @@ test("a real hidden-command timeout cannot count as a base failure and publishes
   }
 });
 
-test("missing Request, unmerged PRs, no tests and unsupported complexity are refused before validation", async () => {
+test("missing Request, unmerged PRs, no tests, missing commits and unsupported run complexity are refused before validation", async () => {
   const f = await fixture();
   try {
     const valid = f.responses.get(1);
     if (!valid) throw new Error("Missing fixture PR");
     f.responses.set(7, { ...valid, body: "## Summary\nNo request" });
     f.responses.set(8, { ...valid, state: "OPEN", mergeCommit: null });
-    f.responses.set(9, { ...valid, body: body.replace("Complexity: small", "Complexity: large") });
+    f.responses.set(9, valid);
     f.responses.set(10, { ...valid, mergeCommit: { oid: "0".repeat(40) } });
     const before = readFileSync(f.casePath);
-    const rows = await f.run([7, 8, 6, 9, 10]);
+    const rows = [...(await f.run([7, 8, 6, 10])), ...(await f.run([9], undefined, "large"))];
     expect(rows[0]?.reason).toContain("Request");
     expect(rows[1]?.reason).toContain("merged");
     expect(rows[2]?.reason).toContain("No qualifying test");
-    expect(rows[3]?.reason).toContain("complexity");
-    expect(rows[4]?.reason).toContain("failed");
+    expect(rows[3]?.reason).toContain("failed");
+    expect(rows[4]?.reason).toContain("complexity");
     expect(rows.every((r) => r.base === "not-run" && r.head === "not-run")).toBe(true);
     expect(f.calls).toHaveLength(0);
     expect(readFileSync(f.casePath)).toEqual(before);
@@ -305,6 +364,43 @@ test("absent production fields stay unknown, use medium, and preserve needs_huma
     await f.clean();
   } finally {
     f.close();
+  }
+});
+
+test("panel review ordinals take precedence over Work log invocation counts", async () => {
+  const panel = renderReport({
+    ...report,
+    state: {
+      ...report.state,
+      reviewHistory: [1, 2, 3].map((panelReview) => ({
+        round: panelReview,
+        sha: "a".repeat(40),
+        blocking: [],
+        followUps: [],
+        panelReview,
+        scope: { kind: "full", range: "base..head" },
+      })),
+    },
+  });
+  const metadata = await replayProduction(panel);
+  expect(metadata.tags).toContain("review-rounds:3");
+  expect(metadata.notes).toContain("review rounds: 3 (highest recorded panel-review ordinal)");
+});
+
+test("missing or unavailable run records explicitly default complexity without inventing report evidence", async () => {
+  for (const lookup of [
+    undefined,
+    async () => null,
+    async () => ({ complexity: null }),
+    async () => {
+      throw new Error("Run record unavailable");
+    },
+  ]) {
+    const metadata = await replayProduction(body, lookup);
+    expect(metadata.complexity).toBe("medium");
+    expect(metadata.notes).toContain("Triage complexity: unknown (default medium)");
+    expect(metadata.notes).toContain("r1");
+    expect(metadata.notes).toMatch(/lookup not configured|complexity unavailable|lookup unavailable/);
   }
 });
 

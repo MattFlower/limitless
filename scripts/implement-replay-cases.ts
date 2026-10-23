@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { z } from "zod";
 import { loadConfig } from "../src/config.ts";
+import type { Run } from "../src/core/types.ts";
 import {
   defaultCasePath,
   type hiddenContents,
@@ -54,20 +55,28 @@ export function replayRequest(body: string): string {
   return request;
 }
 
-function production(body: string) {
+export async function replayProduction(body: string, lookupRun?: Dependencies["lookupRun"]) {
   // Only named report sections are evidence; routing chains and quoted requests are not usage.
   const section = (name: string) =>
     body.split(new RegExp(`^## ${name}[^\\n]*\\n`, "m"))[1]?.split(/^## /m)[0] ?? "";
-  const complexity = section("Triage")
-    .match(/\bcomplexity\b["'\s|:*`]*([a-z]+)/i)?.[1]
-    ?.toLowerCase();
+  const runId = body.match(/^Run `([^`\r\n]+)` · .+$/m)?.[1];
+  let complexity: Run["complexity"] = null;
+  let complexitySource = runId ? `run ${runId}: lookup not configured` : "no run footer";
+  if (runId && lookupRun) {
+    try {
+      complexity = (await lookupRun(runId))?.complexity ?? null;
+      complexitySource = `run record ${runId}${complexity ? "" : ": complexity unavailable"}`;
+    } catch {
+      complexitySource = `run record ${runId}: lookup unavailable`;
+    }
+  }
   const review = section("Code review");
-  const rounds = review.match(/Review rounds:\s*(\d+)/i)?.[1];
   const panel = [...review.matchAll(/^- Panel review R(\d+)\b/gm)].map((m) => Number(m[1]));
-  const count = rounds ?? (panel.length ? String(Math.max(...panel)) : "unknown");
-  const models = [
-    ...new Set([...section("Work log").matchAll(/^\| implement\s*\|\s*`([^`]+)`\s*\|/gm)].map((m) => m[1])),
-  ];
+  const work = section("Work log");
+  const reviews = [...work.matchAll(/^\| review\s*\|/gm)].length;
+  const count = panel.length ? String(Math.max(...panel)) : reviews ? String(reviews) : "unknown";
+  const reviewSource = panel.length ? "highest recorded panel-review ordinal" : "Work log review rows";
+  const models = [...new Set([...work.matchAll(/^\| implement\s*\|\s*`([^`]+)`\s*\|/gm)].map((m) => m[1]))];
   const intro = body.split(/^## /m)[0] ?? "";
   const human = /needs a human/i.test(intro)
     ? "true"
@@ -77,7 +86,7 @@ function production(body: string) {
   return {
     complexity: complexity ?? "medium",
     tags: ["replay", "replay-v2", `needs_human:${human}`, `review-rounds:${count}`],
-    notes: `Production metadata provenance: PR body factory report (Triage, Code review, Work log, introduction). Triage complexity: ${complexity ?? "unknown (default medium)"}; review rounds: ${count} (explicit count or highest recorded panel-review ordinal); needs_human: ${human}; observed implement models: ${models.join(", ") || "unknown"}. Routing configuration is not model usage.`,
+    notes: `Production metadata provenance: ${complexitySource}; PR body factory report (Code review, Work log, introduction). Triage complexity: ${complexity ?? "unknown (default medium)"}; review rounds: ${count} (${reviewSource}); needs_human: ${human}; observed implement models: ${models.join(", ") || "unknown"}. Routing configuration is not model usage.`,
   };
 }
 
@@ -86,6 +95,8 @@ type Dependencies = {
   gh?: GhRunner;
   casePath?: string;
   cache: (repo: string, branch: string, signal: AbortSignal) => Promise<string>;
+  /** Optional access to the run record named by the report footer; never fetch its arbitrary URL. */
+  lookupRun?: (id: string) => Promise<Pick<Run, "complexity"> | null | undefined>;
   timeoutSec?: number;
 };
 
@@ -184,7 +195,7 @@ export async function generateReplayCases(
         prompt,
         spec: null,
         source: data.url,
-        ...production(data.body),
+        ...(await replayProduction(data.body, deps.lookupRun)),
         hidden: {
           files: paths,
           command: `bun test ${paths.map((path) => `'./${path.replaceAll("'", "'\\''")}'`).join(" ")}`,

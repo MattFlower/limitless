@@ -349,11 +349,17 @@ are tags in the existing version-1 envelope. Select the printed IDs explicitly, 
 limitless eval run implement --models codex/sol-6.1,claude/opus --cases impl-013,impl-014 --follow
 ```
 
-`--cases` accepts IDs, not tags. Production metadata is best effort from the PR's factory
-report: triage complexity, recorded review rounds, needs_human outcome, and all observed
-implement models in the work log. Notes record provenance and unknown values; configured routing
-chains are not treated as observed usage. Missing complexity defaults to `medium` with an explicit
-note; a known complexity outside trivial/small/medium is excluded. No daemon database is required.
+`--cases` accepts IDs, not tags. Production metadata is best effort. Review rounds use the highest
+panel-review ordinal in Code review, falling back to the number of `review` rows in the Work log
+for single-reviewer reports. Shadow reviews are excluded. The report introduction supplies the
+needs_human outcome, and the Work log supplies all observed implement models; configured routing
+chains are not treated as observed usage. Notes record the evidence used and unknown values.
+
+PR bodies do not publish triage complexity. Programmatic callers of `generateReplayCases` may
+inject `lookupRun(id)` to read the `complexity` field of the run record named by the report's
+`Run` footer. The CLI has no run-record lookup and needs no daemon database. Without a lookup,
+footer, or available complexity, it defaults to `medium` with an explicit provenance note.
+A known complexity outside trivial/small/medium is excluded.
 
 Generator validation does not run model evaluations or bypass runner preparation, gates, audit,
 or contamination checks. Public repositories retain replay solutions in their history, and a
