@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -72,7 +73,7 @@ import {
   runProcess,
   sh,
 } from "../src/util/proc.ts";
-import { pairWorker, runWorker } from "../src/workers/client.ts";
+import { pairWorker, runWorker as runWorkerClient } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
 import { publicationFields } from "../src/workers/publication.ts";
 import { agentPathMask } from "../src/workers/reporting.ts";
@@ -87,6 +88,19 @@ import { waitClock } from "./wait-clock.ts";
 let home: string, cfg: Config, store: Store, workers: WorkerStore;
 let listener: Awaited<ReturnType<typeof startWorkerListener>>;
 let restoreConfig: string | undefined;
+const capabilityRunner: NonNullable<Parameters<typeof runWorkerClient>[4]>["capabilityRunner"] = async (
+  args,
+) => ({
+  exitCode: 0,
+  stdout:
+    args[1] === "--version"
+      ? args[0] === "claude"
+        ? "2.1.3 (Claude Code)"
+        : "codex-cli 0.50.0"
+      : "logged in",
+});
+const runWorker: typeof runWorkerClient = (coordinator, cfg, release, signal, options) =>
+  runWorkerClient(coordinator, cfg, release, signal, { capabilityRunner, ...options });
 const releaseSha = "f".repeat(40);
 test("strict worker results and check events accept optional bounded skipped-test identities", () => {
   const check = { name: "tests", command: "bun test", ok: true, exitCode: 0, durationMs: 1, output: "" };
@@ -159,6 +173,11 @@ const caps = (jobs: string[] = []): Capabilities => ({
   onAC: true,
   idleSeconds: 0,
   jobs,
+  agents: {
+    claude: { version: "2.1.3 (Claude Code)", loggedIn: true },
+    codex: { version: "codex-cli 0.50.0", loggedIn: true },
+  },
+  privateStringsDigest: privateStringsDigest([]),
 });
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "workers-"));
@@ -809,7 +828,9 @@ test("heartbeats record capabilities, cancel unknown jobs and become stale after
   expect(workers.list()[0]).toMatchObject({
     state: "available",
     lastHeartbeatAt: now,
-    capabilities: caps([id]),
+    capabilities: Heartbeat.omit({ agents: true, privateStringsDigest: true })
+      .strip()
+      .parse(caps([id])),
   });
   await call("/worker/heartbeat", { ...caps([id]), freeSlots: 0 }, token);
   expect(workers.list()[0]?.state).toBe("busy");
@@ -1050,7 +1071,7 @@ test("owner API requires authentication for approval, listing and revocation and
       target: {
         modelId: "fake",
         provider: "fake",
-        harness: "fake",
+        harness: "claude",
         model: "fake",
         vendor: "fake",
         tier: 1,
@@ -4243,7 +4264,7 @@ test("a target change during installation restores before attempting the latest 
 
 test.each(["initial", "rollback"])("the worker survives a strict legacy coordinator on %s", async (kind) => {
   await listen();
-  const legacy = Heartbeat.omit({ updateWarning: true }).strict();
+  const legacy = Heartbeat.omit({ updateWarning: true, agents: true, privateStringsDigest: true }).strict();
   const target = "a".repeat(40);
   let oldProtocol = kind === "initial",
     accepted = 0,
@@ -4262,8 +4283,14 @@ test.each(["initial", "rollback"])("the worker survives a strict legacy coordina
           rejected++;
           return { ...reply, status: 400, json: () => ({ error: "Invalid heartbeat" }) };
         }
+        expect(body.agents).toBeUndefined();
+        expect(body.privateStringsDigest).toBeUndefined();
+        expect(body.updateWarning).toBeUndefined();
         accepted++;
-        return { ...reply, json: () => ({ cancelled: [] }) };
+        return {
+          ...reply,
+          json: () => ({ cancelled: [], releaseSha: kind === "initial" ? releaseSha : target }),
+        };
       }
       expect(body.updateWarning).toBeUndefined();
       return { ...reply, json: () => ({ cancelled: [], releaseSha: target }) };
@@ -4281,8 +4308,9 @@ test.each(["initial", "rollback"])("the worker survives a strict legacy coordina
   try {
     await until(() => accepted >= 4);
     expect(worker.controller.signal.aborted).toBe(false);
-    expect(rejected).toBe(kind === "rollback" ? 1 : 0);
+    expect(rejected).toBe(1);
     expect(attempts).toBe(kind === "rollback" ? 1 : 0);
+    if (kind === "initial") expect(leases).toBeGreaterThan(0);
     if (kind === "rollback") {
       expect(leases).toBe(0);
       expect(workers.list()[0]?.capabilities?.freeSlots).toBe(0);
@@ -4353,7 +4381,7 @@ const agentRequest = (overrides: Partial<AgentJobRequest> = {}): AgentJobRequest
   target: {
     modelId: "fake",
     provider: "fake",
-    harness: "fake",
+    harness: "claude",
     model: "fake",
     vendor: "fake",
     tier: 1,
@@ -5420,6 +5448,13 @@ test("worker rejects unsupported providers without invoking a harness", async ()
   await listen();
   const id = enqueueAgent();
   const worker = await loop({
+    async request(...args) {
+      const reply = await workerRequest(...args);
+      if (args[1] !== "/worker/lease") return reply;
+      const body = reply.json() as { agentJob?: { request: { target: { harness: string } } } };
+      if (body.agentJob) body.agentJob.request.target.harness = "fake";
+      return { ...reply, json: () => body };
+    },
     harnesses: {
       claude: fakeHarness(() => {
         throw new Error("unexpected harness");
@@ -5666,6 +5701,7 @@ test.each([
         home: ${JSON.stringify(remote.paths.home)}, configDir: ${JSON.stringify(cfg.paths.configDir)}, raw: {},
       }), ${JSON.stringify(releaseSha)}, new AbortController().signal, {
         heartbeatMs: 10, retryMs: 5,
+        capabilityRunner: async (args) => ({ exitCode: 0, stdout: args[1] === "--version" ? "2.1.3 (Claude Code)" : "logged in" }),
         machineState: async () => ({ onAC: true, idleSeconds: 0 }),
         confinement: {
           wrap: (cmd) => cmd,
@@ -6222,7 +6258,10 @@ test.each([
     const token = `synthetic-gh-token-${randomBytes(16).toString("hex")}`;
     registerCredential("PUBLICATION_TOKEN", token);
     if (kind.startsWith("credential")) registerCredential("PUBLICATION_SECRET", secret);
-    if (kind.startsWith("private")) writeFileSync(join(workerConfig, "private-strings.txt"), `${secret}\n`);
+    if (kind.startsWith("private")) {
+      writeFileSync(join(workerConfig, "private-strings.txt"), `${secret}\n`);
+      writeFileSync(join(cfg.paths.configDir, "private-strings.txt"), `${secret}\n`);
+    }
     const id = await queuedLocalAgent({
       timeoutMs: 20_000,
       mode: kind.startsWith("readonly")
@@ -6575,3 +6614,232 @@ test.each([
   },
   30_000,
 );
+
+test.each(["match", "differs", "absent", "unreadable"])(
+  "heartbeat stores parity without retaining the digest (%s)",
+  async (kind) => {
+    const logs: string[] = [];
+    await listen("127.0.0.1:0", (text) => logs.push(text));
+    const token = await paired();
+    const file = join(cfg.paths.configDir, "private-strings.txt");
+    writeFileSync(file, "one.example\n");
+    const digest = privateStringsDigest(loadPrivateStrings(cfg.paths.configDir));
+    if (kind === "differs") writeFileSync(file, "two.example\n");
+    if (kind === "unreadable") linkSync(file, join(home, "private-link"));
+    const account = `account=${["synthetic", "worker"].join("-")}@example.com`;
+    const agents = {
+      claude: { version: null, loggedIn: true },
+      codex: { version: null, loggedIn: true },
+    };
+    const body = {
+      ...caps(),
+      agents: {
+        claude: { version: account, loggedIn: true },
+        codex: { version: account, loggedIn: true },
+      },
+      privateStringsDigest: kind === "absent" ? undefined : digest,
+    };
+    const heartbeat = await call("/worker/heartbeat", body, token);
+    expect(heartbeat.status).toBe(200);
+    expect(JSON.stringify(heartbeat.json())).not.toContain(account);
+    const row = workers.worker("runner");
+    if (!row) throw new Error("Missing worker");
+    expect(
+      store.db
+        .query<{ name: string }, []>("PRAGMA table_info(workers)")
+        .all()
+        .map((c) => c.name),
+    ).toContain("agent_capabilities");
+    const legacy = Heartbeat.omit({ agents: true, privateStringsDigest: true }).strict();
+    expect(legacy.parse(JSON.parse(row.capabilities ?? "null"))).toEqual(legacy.strip().parse(caps()));
+    expect(workers.available(row)).toBe(true);
+    const privateStrings = kind === "match" || kind === "differs" ? kind : "unknown";
+    expect(JSON.parse(row.agent_capabilities ?? "null")).toEqual({ agents, privateStrings });
+    expect(workers.list()[0]).toMatchObject({
+      ...(kind === "unreadable" ? {} : { agents }),
+      privateStrings,
+    });
+    expect(JSON.stringify(row)).not.toContain(digest);
+    expect(JSON.stringify(workers.list())).not.toContain(digest);
+    expect(JSON.stringify(row)).not.toContain(account);
+    expect(JSON.stringify(workers.list())).not.toContain(account);
+    expect(JSON.stringify(logs)).not.toContain(account);
+    cfg.port = 0;
+    const factory = new Factory(cfg, { store, bootSha: releaseSha, models: [], providers: [] });
+    const credential = createApiToken(cfg.paths.home);
+    const api = await startHttp(factory, {}, Bun.serve, credential);
+    try {
+      const response = await fetch(`${api.url.origin}/api/workers`, {
+        headers: { authorization: `Bearer ${credential.token}` },
+      });
+      expect(response.status).toBe(200);
+      const listing = await response.text();
+      expect(listing).not.toContain(digest);
+      expect(listing).not.toContain(account);
+      if (kind === "match") {
+        const cli = await runProcess({
+          cmd: [process.execPath, "src/cli/main.ts", "workers", "ls"],
+          cwd: join(import.meta.dir, ".."),
+          env: {
+            ...process.env,
+            LIMITLESS_HOME: cfg.paths.home,
+            LIMITLESS_CONFIG_DIR: cfg.paths.configDir,
+            LIMITLESS_URL: api.url.origin,
+          },
+          timeoutMs: 10_000,
+        });
+        expect(cli.exitCode).toBe(0);
+        expect(cli.stdout.trim()).toBe(
+          "runner\tavailable\tclaude:unknown\tcodex:unknown\tprivate-strings:match",
+        );
+        expect(cli.stdout).not.toContain(account);
+        expect(cli.stderr).not.toContain(account);
+      }
+    } finally {
+      await api.stop(true);
+      credential.release();
+    }
+  },
+);
+
+test("heartbeat uses cached sanitized capabilities while a refresh is pending", async () => {
+  const file = join(cfg.paths.configDir, "private-strings.txt");
+  writeFileSync(file, "one.example\n");
+  linkSync(file, join(home, "worker-private-link"));
+  await listen();
+  const { probeAgents } = await import("../src/workers/capabilities.ts");
+  const pending = Promise.withResolvers<Awaited<ReturnType<typeof probeAgents>>>();
+  let probes = 0,
+    beats = 0;
+  const bodies: Capabilities[] = [];
+  const worker = await loop({
+    capabilityRefreshMs: 10,
+    probeAgents: async (run, signal) =>
+      ++probes === 1
+        ? probeAgents(
+            async (args, opts) => ({
+              ...(await (run ?? capabilityRunner)(args, opts)),
+              stdout: args[1] === "--version" ? "2.1.3 (Claude Code)\nuser@example.com" : "user@example.com",
+            }),
+            signal,
+          )
+        : probes === 2
+          ? pending.promise
+          : Promise.reject(new Error("user@example.com")),
+    async request(...args) {
+      if (args[1] === "/worker/heartbeat") {
+        bodies.push(structuredClone(args[2]) as Capabilities);
+        beats++;
+      }
+      return workerRequest(...args);
+    },
+  });
+  try {
+    await until(() => probes === 2 && beats >= 3);
+    expect(probes).toBe(2);
+    expect(bodies.every((body) => body.agents?.claude?.loggedIn)).toBe(true);
+    expect(JSON.stringify(bodies)).not.toContain("user@example.com");
+    expect(bodies.every((body) => body.privateStringsDigest === undefined)).toBe(true);
+    pending.resolve({
+      claude: { version: null, loggedIn: false },
+      codex: { version: null, loggedIn: false },
+    });
+    await until(() => bodies.some((body) => body.agents?.claude?.loggedIn === false));
+    const changedAt = beats;
+    await until(() => probes >= 3 && beats >= changedAt + 2);
+    expect(bodies.at(-1)?.agents?.claude?.loggedIn).toBe(false);
+  } finally {
+    pending.resolve({
+      claude: { version: null, loggedIn: false },
+      codex: { version: null, loggedIn: false },
+    });
+    await worker.stop();
+  }
+});
+
+test("a logged-out session fails before checkout, is excluded and leaves provider health unchanged", async () => {
+  await listen();
+  const id = enqueueAgent({ branch: "change/login" });
+  const factory = new Factory(cfg, {
+    store,
+    bootSha: releaseSha,
+    models: [],
+    providers: [{ id: "fake", label: "Test", harness: "claude", billing: "subscription", maxConcurrent: 2 }],
+  });
+  factory.tracker.record("fake", "unavailable");
+  const snapshot = () => {
+    const value = factory.tracker.status("fake");
+    if (!value) throw new Error("Missing provider");
+    const { updatedAt: _time, ...status } = value;
+    return status;
+  };
+  const health = store.getProviderRow("fake"),
+    status = snapshot();
+  expect(health).not.toBeNull();
+  expect(status.state).toBe("degraded");
+  let calls = 0;
+  const failures: unknown[] = [];
+  const worker = await loop({
+    probeAgents: async () => ({
+      claude: { version: "2.1.3 (Claude Code)", loggedIn: true },
+      codex: { version: null, loggedIn: false },
+    }),
+    capabilityRunner: async () => ({
+      exitCode: 0,
+      stdout: '{"loggedIn":false,"account":"user@example.com"}',
+    }),
+    harnesses: {
+      claude: fakeHarness(() => {
+        calls++;
+        return {};
+      }),
+    },
+    async request(...args) {
+      if (args[1] === agentPath(id, "failure")) failures.push(args[2]);
+      return workerRequest(...args);
+    },
+  });
+  try {
+    await until(() => failures.length > 0 && workers.agentJob(id)?.state === "queued");
+    expect(failures).toEqual([{ reason: "Worker CLI not logged in" }]);
+    expect(calls).toBe(0);
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+    expect(workers.agentJob(id)).toMatchObject({ state: "queued", excluded: '["loop-runner"]' });
+    expect(store.getProviderRow("fake")).toEqual(health);
+    expect(snapshot()).toEqual(status);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("heartbeat optional fields return only after the observed coordinator release changes", async () => {
+  await listen();
+  let rejected = 0,
+    accepted = 0,
+    modern = false,
+    resumed = false;
+  const worker = await loop({
+    async request(...args) {
+      const reply = await workerRequest(...args);
+      if (args[1] !== "/worker/heartbeat") return reply;
+      const body = args[2] as Capabilities;
+      if (!modern && body.agents) {
+        rejected++;
+        return { ...reply, status: 400 };
+      }
+      if (!modern) {
+        expect(body.agents).toBeUndefined();
+        expect(body.privateStringsDigest).toBeUndefined();
+        expect(body.updateWarning).toBeUndefined();
+        modern = ++accepted >= 3;
+      } else resumed = !!body.agents && !!body.privateStringsDigest;
+      return { ...reply, json: () => ({ cancelled: [], ...(modern ? { releaseSha } : {}) }) };
+    },
+  });
+  try {
+    await until(() => resumed);
+    expect(rejected).toBe(1);
+  } finally {
+    await worker.stop();
+  }
+});

@@ -19,7 +19,7 @@ const request: AgentJobRequest = {
   target: {
     modelId: "fake",
     provider: "fake",
-    harness: "fake",
+    harness: "claude",
     model: "fake",
     vendor: "fake",
     tier: 1,
@@ -37,6 +37,7 @@ const caps = (jobs: string[] = []): Capabilities => ({
   onAC: true,
   idleSeconds: 0,
   jobs,
+  agents: { claude: { version: null, loggedIn: true } },
 });
 let store: Store, workers: WorkerStore, now: number;
 beforeEach(() => {
@@ -444,3 +445,53 @@ test("agent deadlines retain the maximum timer bound, and queued retries expire 
   workers.sweepAgentJobs();
   expect(workers.agentJob(queued)).toMatchObject({ state: "failed", attempt: 2 });
 });
+
+test("agent matching skips older incompatible jobs and leases matching jobs oldest first", () => {
+  pair("one");
+  const codex = enqueue({ ...request, target: { ...request.target, harness: "codex" } });
+  const excluded = enqueue();
+  store.db.query("UPDATE agent_jobs SET excluded='[\"one\"]' WHERE id=?").run(excluded);
+  const first = enqueue(),
+    second = enqueue();
+  expect(workers.leaseAgentJob("one")?.id).toBe(first);
+  expect(workers.leaseAgentJob("one")?.id).toBe(second);
+  expect(workers.agentJob(codex)?.state).toBe("queued");
+  expect(workers.agentJob(excluded)?.state).toBe("queued");
+});
+
+test.each([
+  null,
+  "invalid JSON",
+  "{}",
+  '{"agents":{"claude":{"version":null,"loggedIn":"true"}}}',
+  '{"agents":{"claude":{"version":null,"loggedIn":false}}}',
+])("missing, invalid or logged-out agent capabilities fail closed (%s)", (capabilities) => {
+  pair("one");
+  const id = enqueue();
+  store.db.query("UPDATE workers SET agent_capabilities=?").run(capabilities);
+  expect(workers.leaseAgentJob("one")).toBeNull();
+  expect(workers.agentJob(id)?.state).toBe("queued");
+});
+
+test.each(["match", "differs", "unknown"] as const)(
+  "publishing requires matching private strings (%s)",
+  (parity) => {
+    pair("one");
+    const worker = workers.worker("one");
+    if (!worker) throw new Error("Missing worker");
+    workers.heartbeat(worker, caps(), parity);
+    const id = enqueue({
+      ...request,
+      commit: {
+        message: "commit",
+        authorName: "Test",
+        authorEmail: "test@example.com",
+        committerName: "Test",
+        committerEmail: "test@example.com",
+      },
+    });
+    const ordinary = enqueue();
+    expect(workers.leaseAgentJob("one")?.id).toBe(parity === "match" ? id : ordinary);
+    if (parity !== "match") expect(workers.agentJob(id)?.state).toBe("queued");
+  },
+);

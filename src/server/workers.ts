@@ -5,6 +5,7 @@ import type { Server } from "bun";
 import type { Paths } from "../config.ts";
 import { type AgentJobRequest, PairingLimitError, type WorkerStore } from "../db/workers.ts";
 import type { GateRequest } from "../gates/executor.ts";
+import { loadPrivateStrings, privateStringsDigest } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath, withRepoLock } from "../git/repos.ts";
 import { AgentEvents, AgentFailure, AgentResultReport } from "../workers/agent-protocol.ts";
@@ -99,10 +100,19 @@ export async function startWorkerListener(
       const worker = token ? workers.authenticate(token) : null;
       if (!worker) return json({ error: "Worker authentication required" }, 401);
       if (path === "/worker/heartbeat" && req.method === "POST") {
-        const capabilities = Heartbeat.parse(await readJson(req));
+        const { privateStringsDigest: digest, ...capabilities } = Heartbeat.parse(await readJson(req));
+        let parity: "match" | "differs" | "unknown" = "unknown";
+        if (digest !== undefined) {
+          try {
+            parity =
+              digest === privateStringsDigest(loadPrivateStrings(paths.configDir)) ? "match" : "differs";
+          } catch {
+            /* Unreadable private policy has unknown parity. */
+          }
+        }
         const current = workers.authenticate(token ?? "");
         if (!current) return json({ error: "Worker revoked" }, 401);
-        return json(workers.heartbeat(current, capabilities));
+        return json(workers.heartbeat(current, capabilities, parity));
       }
       if (path === "/worker/lease" && req.method === "POST") {
         const held = LeaseRequest.parse(await readJson(req)).jobs;
