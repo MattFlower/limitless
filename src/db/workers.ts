@@ -297,7 +297,7 @@ export class WorkerStore {
     return this.store.db.query<AgentJobRow, [string]>("SELECT * FROM agent_jobs WHERE id=?").get(id);
   }
   enqueueAgentJob(req: AgentJobRequest, id: string = randomUUID()) {
-    if ([req.target.backend, req.target.openai, req.target.decisions].some((t) => t?.authToken)) return null;
+    if ("backend" in req.target || "openai" in req.target || "decisions" in req.target) return null;
     let credentials = false;
     const request = JSON.stringify(req, (key, value: unknown) => {
       credentials ||= credentialInText(key) || (typeof value === "string" && credentialInText(value));

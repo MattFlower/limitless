@@ -1,6 +1,7 @@
 import { availableParallelism, loadavg } from "node:os";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import type { EngineDeps } from "./pipeline/context.ts";
+import { clearGitHubWait, finalizeRecordedCancellation } from "./pipeline/cancellation.ts";
+import type { EngineDeps, RunState } from "./pipeline/context.ts";
 import { executeRun } from "./pipeline/engine.ts";
 
 /**
@@ -27,9 +28,17 @@ export class Scheduler {
   ) {}
 
   start(): void {
+    for (const run of this.deps.store.listRuns({
+      status: ["queued", "cancelled"],
+      limit: Number.MAX_SAFE_INTEGER,
+    })) {
+      if (run.status === "queued") finalizeRecordedCancellation(this.deps.store, run.id);
+      else if (run.githubWait)
+        this.deps.store.updateRun(run.id, {}, clearGitHubWait(this.deps.store.getRunState<RunState>(run.id)));
+    }
     const interrupted = this.deps.store.listRuns({ status: ["running", "waiting_input"], limit: 1000 });
     for (const run of interrupted) {
-      const cancelled = run.error?.startsWith("cancelled by");
+      const cancelled = finalizeRecordedCancellation(this.deps.store, run.id);
       for (const stage of this.deps.store.listStages(run.id))
         if (stage.status === "running")
           this.deps.store.finishStage(stage.id, "cancelled", "Daemon interrupted stage");
@@ -41,10 +50,7 @@ export class Scheduler {
             finishedAt: Date.now(),
           });
       this.deps.store.refreshRunTotals(run.id);
-      this.deps.store.updateRun(run.id, {
-        status: cancelled ? "cancelled" : "queued",
-        finishedAt: cancelled ? Date.now() : null,
-      });
+      if (!cancelled) this.deps.store.updateRun(run.id, { status: "queued", finishedAt: null });
       this.deps.store.addEvent({
         runId: run.id,
         type: "log",
@@ -126,8 +132,10 @@ export class Scheduler {
     for (const run of this.deps.store.nextQueuedRuns(capacity)) {
       if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
+      if (finalizeRecordedCancellation(this.deps.store, run.id)) continue;
       const controller = new AbortController();
-      const done = executeRun(this.deps, run.id, controller.signal, () => this.draining, this.drainEvents)
+      const { promise, resolve } = Promise.withResolvers<unknown>();
+      const done = promise
         .catch((e) => {
           this.deps.store.updateRun(run.id, {
             status: "failed",
@@ -136,10 +144,13 @@ export class Scheduler {
           });
         })
         .finally(() => {
+          finalizeRecordedCancellation(this.deps.store, run.id);
           this.active.delete(run.id);
           if (!this.stopping) this.tick();
         });
       this.active.set(run.id, { controller, done });
+      // State subscribers can cancel or stop synchronously during executeRun's first publication.
+      resolve(executeRun(this.deps, run.id, controller.signal, () => this.draining, this.drainEvents));
     }
   }
 
@@ -152,7 +163,7 @@ export class Scheduler {
     if (active) {
       active.controller.abort();
     } else {
-      this.deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
+      finalizeRecordedCancellation(this.deps.store, runId);
     }
     this.deps.store.addEvent({ runId, type: "log", level: "warn", message: `Cancel requested by ${by}` });
     return true;

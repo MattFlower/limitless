@@ -300,3 +300,17 @@ test("signal warnings persist with invocation linkage, feed once, remain private
     memory.close();
   }
 });
+
+test("GitHub waits emit one feed item per persisted outage episode", async () => {
+  const run = await create();
+  const wait = { since: 100, nextAttemptAt: 200, reason: "GitHub unavailable" };
+  const items = twice(() =>
+    store.updateRun(run.id, { status: "queued" }, { phase: "deliver", githubWait: wait }),
+  );
+  expect(items).toMatchObject([{ kind: "run.waiting_github", runId: run.id, summary: wait.reason }]);
+  store.setRunState(run.id, { phase: "deliver", githubWait: { ...wait, nextAttemptAt: 300 } });
+  expect(allItems(store).filter((i) => i.kind === "run.waiting_github")).toHaveLength(1);
+  store.setRunState(run.id, { phase: "deliver" });
+  store.setRunState(run.id, { phase: "deliver", githubWait: { ...wait, since: 400 } });
+  expect(allItems(store).filter((i) => i.kind === "run.waiting_github")).toHaveLength(2);
+});

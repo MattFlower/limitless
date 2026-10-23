@@ -127,6 +127,7 @@ export interface Repo {
 export interface Run {
   models?: RunModels;
   flow?: "build" | "verify-change";
+  githubWait?: { since: number; nextAttemptAt: number; reason: string; deadline: number };
   id: string;
   repoId: string;
   repoSlug: string;
@@ -453,6 +454,7 @@ export type FeedKind =
   | `conflict.${"round_started" | "round_delivered"}`
   | "run.warning"
   | "run.gate_timeout_retry"
+  | "run.waiting_github"
   | `deploy.${"started" | "failed"}`
   | LandFeedKind
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
