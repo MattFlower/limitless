@@ -1,6 +1,5 @@
 import { describe, expect, spyOn } from "bun:test";
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1739,19 +1738,24 @@ test("a credential inside the model name never reaches the log header", async ()
   }
 });
 
-function codexInstallation(standalone: boolean) {
+const installationLayouts = ["Homebrew", "standalone", "codex-home", "aws", "home"] as const;
+function codexInstallation(layout: (typeof installationLayouts)[number]) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-install-")));
   const home = join(root, "home");
-  const bin = standalone
-    ? join(home, ".codex/packages/standalone/releases/test-target/bin")
-    : join(root, "opt/homebrew/Cellar/codex/test/bin");
-  const link = join(standalone ? home : root, standalone ? ".local/bin" : "opt/homebrew/bin", "codex");
+  const bin = {
+    Homebrew: join(root, "opt/homebrew/Cellar/codex/test/bin"),
+    standalone: join(home, ".codex/packages/standalone/releases/test-target/bin"),
+    "codex-home": join(home, ".codex"),
+    aws: join(home, ".aws"),
+    home,
+  }[layout];
+  const link = join(home, ".local/bin/codex");
   mkdirSync(bin, { recursive: true });
   mkdirSync(dirname(link), { recursive: true });
   mkdirSync(join(home, ".codex"), { recursive: true });
   const executable = join(bin, "codex");
-  copyFileSync("/bin/echo", executable);
-  if (standalone) {
+  writeFileSync(executable, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 });
+  if (layout === "standalone") {
     const current = join(home, ".codex/packages/standalone/current");
     symlinkSync(dirname(bin), current);
     symlinkSync(join(current, "bin/codex"), link);
@@ -1785,57 +1789,89 @@ function installationSpec(cwd: string, scratchDir: string): AgentSpec {
   };
 }
 
-// Named Codex filesystem entries are path-specific read/execute grants. Exercise those generated
-// entries directly with Seatbelt so this regression needs neither an installed CLI nor a login.
-function generatedSeatbelt(args: string[], omit: string[] = []) {
+function filesystemEntries(args: string[]): [string, string][] {
   const config = args.find((arg) => arg.startsWith("permissions=")) ?? "";
-  const entries = [...config.matchAll(/("(?:[^"\\]|\\.)*")="(read|write|none)"/g)]
-    .map((match) => ({ path: JSON.parse(match[1] ?? '""') as string, access: match[2] }))
-    .filter(({ path }) => path.startsWith("/") && !omit.includes(path))
-    .sort((a, b) => a.path.length - b.path.length);
-  return [
-    "(version 1)",
-    "(allow default)",
-    "(deny file-write*)",
-    ...entries.map(
-      ({ path, access }) =>
-        `(${access === "none" ? "deny" : "allow"} file-read* process-exec ${access === "write" ? "file-write* " : ""}(subpath ${JSON.stringify(path)}))`,
-    ),
-  ].join("\n");
+  return [...config.matchAll(/("(?:[^"\\]|\\.)*")="(read|write|none)"/g)].map((match) => [
+    JSON.parse(match[1] ?? '""') as string,
+    match[2] ?? "",
+  ]);
 }
 
-test.each([false, true])("Codex canonical installation profiles (standalone=%s)", async (standalone) => {
-  const install = codexInstallation(standalone);
+function filesystemAccess(entries: [string, string][], file: string) {
+  return entries
+    .filter(([path]) => file === path || file.startsWith(path === "/" ? path : `${path}/`))
+    .sort(([a], [b]) => b.length - a.length)[0]?.[1];
+}
+
+function installationProfile(args: string[]) {
+  return args
+    .filter((arg) => arg.startsWith("default_permissions=") || arg.startsWith("permissions="))
+    .flatMap((arg) => ["-c", arg]);
+}
+
+test.each([...installationLayouts])("Codex canonical installation profiles (%s)", async (layout) => {
+  const install = codexInstallation(layout);
   const lookup = spyOn(Bun, "which").mockReturnValue(install.link);
   try {
     const executable = new CodexReaderProbe().resolve();
     expect(executable).toBe(install.executable);
+    const deniedChild = join(install.bin, "private/token");
+    mkdirSync(dirname(deniedChild));
+    writeFileSync(deniedChild, "private-canary");
+    const deniedAlias = join(install.root, "private-alias");
+    symlinkSync(dirname(deniedChild), deniedAlias);
     await withScratch(install.cwd, async (scratchDir) => {
       await readPolicyScope.run({ home: install.home, environment: {} }, async () => {
+        const codexHome = join(install.home, ".codex");
         for (const [mode, confineReads] of [
           ["edit", false],
           ["readonly", false],
           ["readonly", true],
         ] as const) {
-          const args = buildCodexArgs(
-            {
-              ...installationSpec(install.cwd, scratchDir),
-              mode,
-              confineReads,
-              denyRead: [join(install.home, ".codex")],
-            },
-            executable,
+          const spec = {
+            ...installationSpec(install.cwd, scratchDir),
+            mode,
+            confineReads,
+            denyRead: [codexHome, join(install.home, ".aws")],
+          };
+          const entries = filesystemEntries(buildCodexArgs(spec, executable));
+          expect(entries).toContainEqual([executable, "read"]);
+          expect(entries).toContainEqual([codexHome, "none"]);
+          expect(filesystemAccess(entries, join(codexHome, "auth.json"))).toBe("none");
+          expect(new Set(entries.map(([path]) => path)).size).toBe(entries.length);
+          if (layout === "Homebrew" || layout === "standalone")
+            expect(entries).toContainEqual([install.bin, "read"]);
+          else expect(entries).not.toContainEqual([install.bin, "read"]);
+          expect(entries).not.toContainEqual([install.home, "read"]);
+          // Root-level installations must add only the file; confined readers must keep / absent.
+          const rootEntries = filesystemEntries(buildCodexArgs(spec, "/codex"));
+          expect(rootEntries).toContainEqual(["/codex", "read"]);
+          expect(rootEntries.filter(([path]) => path === "/")).toHaveLength(confineReads ? 0 : 1);
+          expect(new Set(rootEntries.map(([path]) => path)).size).toBe(rootEntries.length);
+          // Even a denied executable gets one exact-file exception, without duplicate TOML keys.
+          const deniedExecutable = filesystemEntries(
+            buildCodexArgs(
+              {
+                ...spec,
+                denyRead: [...spec.denyRead, executable],
+              },
+              executable,
+            ),
           );
-          const config = args.find((arg) => arg.startsWith("permissions=")) ?? "";
-          for (const path of [install.executable, install.bin]) {
-            expect(config).toContain(`${JSON.stringify(path)}="read"`);
-            expect(config).not.toContain(`${JSON.stringify(path)}="write"`);
-          }
-          expect(config).toContain(`${JSON.stringify(join(install.home, ".codex"))}="none"`);
-          for (const path of [install.home, join(install.home, ".codex/packages"), dirname(install.bin)]) {
-            expect(config).not.toContain(`${JSON.stringify(path)}="read"`);
-            expect(config).not.toContain(`${JSON.stringify(path)}="write"`);
-          }
+          expect(new Set(deniedExecutable.map(([path]) => path)).size).toBe(deniedExecutable.length);
+          expect(filesystemAccess(deniedExecutable, executable)).toBe("read");
+          // An ancestor of a caller-denied file must not become a directory allowance.
+          const restricted = filesystemEntries(
+            buildCodexArgs(
+              {
+                ...spec,
+                denyRead: [...spec.denyRead, join(deniedAlias, "token")],
+              },
+              executable,
+            ),
+          );
+          expect(restricted).not.toContainEqual([install.bin, "read"]);
+          expect(filesystemAccess(restricted, deniedChild)).toBe("none");
         }
       });
     });
@@ -1845,43 +1881,92 @@ test.each([false, true])("Codex canonical installation profiles (standalone=%s)"
   }
 });
 
-test.skipIf(seatbeltSkip !== null)(
-  `Codex standalone helper executes while credentials and unrelated home executables stay denied${seatbeltSkip ? ` (skipped: ${seatbeltSkip})` : ""}`,
-  async () => {
-    const install = codexInstallation(true);
-    const auth = join(install.home, ".codex/auth.json");
-    const unrelated = join(install.home, "unrelated");
-    writeFileSync(auth, "credential-canary");
-    copyFileSync("/bin/echo", unrelated);
-    try {
-      await withScratch(install.cwd, async (scratchDir) => {
-        const spec = {
+test("Codex without a probe runs the resolved executable", async () => {
+  const install = codexInstallation("standalone");
+  try {
+    await withScratch(install.cwd, async (scratchDir) => {
+      const probe = new CodexReaderProbe(() => install.executable);
+      const verify = spyOn(probe, "verify");
+      let command: string[] = [];
+      await runCodex(
+        {
           ...installationSpec(install.cwd, scratchDir),
-          mode: "readonly" as const,
-          confineReads: true,
-          denyRead: [install.home, join(install.home, ".codex")],
-        };
-        const args = buildCodexArgs(spec, realpathSync(install.link));
-        const execute = (command: string[], omit: string[] = []) =>
-          runProcess({
-            cmd: ["/usr/bin/sandbox-exec", "-p", generatedSeatbelt(args, omit), ...command],
-            cwd: install.cwd,
-            env: agentEnv(),
-            timeoutMs: 5000,
+          mode: "readonly",
+          confineReads: false,
+        },
+        async ({ cmd }) => {
+          command = cmd;
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: "fixture",
+            timedOut: false,
+            idleTimedOut: false,
+            cancelled: false,
+            signal: null,
+            truncated: false,
+            durationMs: 0,
+          };
+        },
+        probe,
+      );
+      expect(verify).not.toHaveBeenCalled();
+      expect(command[0]).toBe(install.executable);
+      expect(filesystemEntries(command)).toContainEqual([install.executable, "read"]);
+    });
+  } finally {
+    rmSync(install.root, { recursive: true, force: true });
+  }
+});
+
+const sandboxCodex = Bun.which("codex");
+const codexSandboxSkip = sandboxCodex ? null : "no codex on PATH";
+test.skipIf(seatbeltSkip !== null).skipIf(codexSandboxSkip !== null)(
+  `Codex installation helper executes while credentials and unrelated home executables stay denied${seatbeltSkip || codexSandboxSkip ? ` (skipped: ${seatbeltSkip ?? codexSandboxSkip})` : ""}`,
+  async () => {
+    if (!sandboxCodex) throw new Error("no codex on PATH");
+    for (const layout of ["standalone", "codex-home"] as const) {
+      const install = codexInstallation(layout);
+      const auth = join(install.home, ".codex/auth.json");
+      const unrelated = join(install.home, "unrelated");
+      writeFileSync(auth, "credential-canary");
+      writeFileSync(unrelated, "#!/bin/sh\necho unrelated-ok\n", { mode: 0o755 });
+      try {
+        await withScratch(install.cwd, async (scratchDir) => {
+          await readPolicyScope.run({ home: install.home, environment: {} }, async () => {
+            const spec = {
+              ...installationSpec(install.cwd, scratchDir),
+              mode: "readonly" as const,
+              confineReads: true,
+              denyRead: [install.home, join(install.home, ".codex")],
+            };
+            const profile = installationProfile(buildCodexArgs(spec, realpathSync(install.link)));
+            const execute = (command: string[], sandbox = true) =>
+              runProcess({
+                cmd: sandbox ? [sandboxCodex, "sandbox", ...profile, "--", ...command] : command,
+                cwd: install.cwd,
+                env: agentEnv({ CODEX_HOME: scratchDir }),
+                timeoutMs: 5000,
+              });
+            for (const path of [install.link, install.executable]) {
+              const outside = await execute([path, "helper-ok"], false);
+              expect(outside.exitCode).toBe(0);
+              expect(outside.stdout.trim()).toBe("helper-ok");
+              const positive = await execute([path, "helper-ok"]);
+              expect(positive.exitCode).toBe(0);
+              expect(positive.stdout.trim()).toBe("helper-ok");
+            }
+            expect((await execute(["/bin/cat", auth])).exitCode).not.toBe(0);
+            const outside = await execute([unrelated], false);
+            expect(outside.exitCode).toBe(0);
+            expect(outside.stdout.trim()).toBe("unrelated-ok");
+            expect((await execute([unrelated])).exitCode).not.toBe(0);
           });
-        const positive = await execute([install.executable, "helper-ok"]);
-        expect(positive.exitCode).toBe(0);
-        expect(positive.stdout.trim()).toBe("helper-ok");
-        expect((await execute(["/bin/cat", auth])).exitCode).not.toBe(0);
-        expect((await execute([unrelated, "unrelated-ok"])).exitCode).not.toBe(0);
-        expect((await execute([install.executable], [install.executable, install.bin])).exitCode).not.toBe(0);
-        expect(
-          (await execute(["/bin/sh", "-c", 'echo forbidden > "$1"', "sh", join(install.bin, "new")]))
-            .exitCode,
-        ).not.toBe(0);
-      });
-    } finally {
-      rmSync(install.root, { recursive: true, force: true });
+        });
+      } finally {
+        rmSync(install.root, { recursive: true, force: true });
+      }
     }
   },
+  30_000,
 );

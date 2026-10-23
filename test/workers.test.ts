@@ -6845,8 +6845,27 @@ test("heartbeat optional fields return only after the observed coordinator relea
   }
 });
 
-test.each([
-  ...workerStartupFailures.map(([label, error]) => ({ label, error, infrastructure: true })),
+const workerStartupCases: {
+  label: string;
+  error: string;
+  infrastructure: boolean;
+  numTurns?: number;
+  failedProbe?: boolean;
+  progress?: "tool_call" | "text";
+}[] = [
+  ...workerStartupFailures.flatMap(([label, error]) => [
+    { label: `${label} before startup`, error, infrastructure: true },
+    { label: `${label} after turns`, error, infrastructure: false, numTurns: 3 },
+    { label: `${label} after a tool call`, error, infrastructure: false, progress: "tool_call" as const },
+    { label: `${label} after model output`, error, infrastructure: false, progress: "text" as const },
+  ]),
+  {
+    label: "failed confinement probe",
+    error: "probe failed",
+    infrastructure: true,
+    failedProbe: true,
+    numTurns: 3,
+  },
   { label: "ordinary agent failure", error: "agent could not complete the task", infrastructure: false },
   {
     label: "unrelated EPERM",
@@ -6858,9 +6877,10 @@ test.each([
     error: "fs sandbox helper failed: invalid configuration",
     infrastructure: false,
   },
-])(
+];
+test.each(workerStartupCases)(
   "worker startup classification: $label",
-  async ({ error, infrastructure }) => {
+  async ({ error, infrastructure, numTurns = 0, failedProbe = false, progress }) => {
     await listen();
     const id = await queuedLocalAgent();
     const secret = randomBytes(24).toString("hex");
@@ -6868,7 +6888,32 @@ test.each([
     let results = 0;
     let transmitted = "";
     const worker = await loop({
-      harnesses: { claude: fakeHarness(() => ({ fault: "exit", error: `${error} ${secret}` })) },
+      harnesses: {
+        claude: async (spec) => ({
+          ...(await fakeHarness(() => ({
+            fault: "exit",
+            error: `${error} ${secret}`,
+            events:
+              progress === "tool_call"
+                ? [{ type: "tool_call", id: "read", name: "Read", input: {} }]
+                : progress === "text"
+                  ? [{ type: "text", text: "working" }]
+                  : [],
+          }))(spec)),
+          numTurns,
+          ...(failedProbe
+            ? {
+                confinement: {
+                  ok: false,
+                  path: null,
+                  version: null,
+                  reason: "probe inconclusive" as const,
+                  exitCode: null,
+                },
+              }
+            : {}),
+        }),
+      },
       async request(...args) {
         if (args[1] === agentPath(id, "result")) results++;
         if (args[1] === agentPath(id, "failure")) transmitted = (args[2] as { reason: string }).reason;
@@ -6876,11 +6921,7 @@ test.each([
       },
     });
     try {
-      await until(() =>
-        infrastructure
-          ? workers.agentJob(id)?.failure_reason !== null
-          : workers.agentJob(id)?.state === "done",
-      );
+      await until(() => !!workers.agentJob(id)?.failure_reason || workers.agentJob(id)?.state === "done");
       const job = workers.agentJob(id);
       if (infrastructure) {
         expect(job).toMatchObject({

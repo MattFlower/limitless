@@ -833,6 +833,7 @@ export async function runWorker(
         sanitize = agentPathMask([root, join(root, "checkout")]);
         await withCheckout(id, root, join(root, "repo.git"), req.parentSha, path, jobSignal, async (cwd) => {
           sanitize = agentPathMask([cwd, root ?? cwd]);
+          let sessionStarted = false;
           const spec: AgentSpec = {
             ...session,
             target: { ...req.target, harness: name },
@@ -844,6 +845,8 @@ export async function runWorker(
             logPath: join(root ?? cwd, "agent.jsonl"),
             onEvent(event) {
               if (jobSignal.aborted) return;
+              if (event.type === "tool_call" || event.type === "text" || event.type === "thinking")
+                sessionStarted = true;
               events.push(event);
               if (events.length === 200) flush();
               else flushTimer ??= setTimeout(flush, 250);
@@ -868,12 +871,15 @@ export async function runWorker(
             result.status !== "ok" &&
             result.status !== "cancelled" &&
             (result.confinement?.ok === false ||
-              /Failed to create session:[^\n]*fs sandbox helper failed[^\n]*sandbox-exec: execvp\(\)[^\n]*Operation not permitted/i.test(
-                result.error ?? "",
-              ) ||
-              /API Error: EPERM: operation not permitted, (?:mkdir|rmdir) ['"][^'"\n]*\/\.config\/anthropic\/credentials\.lock['"]/i.test(
-                result.error ?? "",
-              ))
+              (result.numTurns === 0 &&
+                !result.finalText &&
+                !sessionStarted &&
+                (/Failed to create session:[^\n]*fs sandbox helper failed[^\n]*sandbox-exec: execvp\(\)[^\n]*Operation not permitted/i.test(
+                  result.error ?? "",
+                ) ||
+                  /API Error: EPERM: operation not permitted, (?:mkdir|rmdir) ['"][^'"\n]*\/\.config\/anthropic\/credentials\.lock['"]/i.test(
+                    result.error ?? "",
+                  ))))
           )
             throw new ConfinementError(result.error ?? "Worker session confinement failed");
           assertProcessesStopped();

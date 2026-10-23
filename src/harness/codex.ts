@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
-import { ConfinementError, READ_PROBE } from "./read-policy.ts";
+import { ConfinementError, READ_PROBE, resolvedHome } from "./read-policy.ts";
 import {
   agentShellEnv,
   createScratch,
@@ -259,19 +259,22 @@ function findKey(obj: unknown, key: string): unknown {
 function readerFilesystem(spec: AgentSpec, scratch: string, executable?: string): string {
   const entries: [string, string][] = [];
   const commands = invocationCommands(scratch, spec.cwd);
+  let denied: string[];
   if (spec.confineReads) {
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
+    denied = deny;
     entries.push([":minimal", "read"]);
     for (const path of deny) entries.push([path, "none"]);
     for (const path of cwd) entries.push([path, "read"]);
     for (const path of writable) entries.push([path, "write"]);
   } else {
+    denied = validateDenyRead(spec, scratch);
     entries.push(["/", "read"]);
-    for (const path of validateDenyRead(spec, scratch)) entries.push([path, "none"]);
+    for (const path of denied) entries.push([path, "none"]);
     entries.push(...commandEntries(commands));
     entries.push([scratch, "write"]);
   }
-  entries.push(...installationEntries(executable));
+  entries.push(...installationEntries(executable, denied));
   const unique = new Map(entries);
   return [...unique].map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
 }
@@ -285,13 +288,15 @@ function commandEntries(commands?: InvocationCommands): [string, string][] {
 }
 
 // Codex's fs sandbox helper re-execs this installation, even beneath the denied CODEX_HOME.
-function installationEntries(executable?: string): [string, string][] {
-  return executable
-    ? [
-        [executable, "read"],
-        [dirname(executable), "read"],
-      ]
-    : [];
+function installationEntries(executable: string | undefined, denied: string[]): [string, string][] {
+  if (!executable) return [];
+  const directory = dirname(executable);
+  // A directory grant must not uncover credentials or widen the profile to the home or root.
+  const safeDirectory =
+    directory !== "/" &&
+    directory !== resolvedHome() &&
+    !denied.some((path) => path === directory || path.startsWith(`${directory}/`));
+  return [[executable, "read"], ...(safeDirectory ? [[directory, "read"] as [string, string]] : [])];
 }
 
 function readerProfile(spec: AgentSpec, scratch: string, executable?: string): string[] {
@@ -312,15 +317,17 @@ export function editorProfile(spec: AgentSpec, executable?: string): string[] {
     denyRead = [],
     commands,
   } = writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead);
-  const entries = [
+  const entries: [string, string][] = [
     ["/", "read"],
-    ...write.map((p) => [p, "write"]),
-    ...protect.map((p) => [p, "read"]),
-    ...denyRead.map((p) => [p, "none"]),
+    ...write.map((p): [string, string] => [p, "write"]),
+    ...protect.map((p): [string, string] => [p, "read"]),
+    ...denyRead.map((p): [string, string] => [p, "none"]),
     ...commandEntries(commands),
-    ...installationEntries(executable),
+    ...installationEntries(executable, denyRead),
   ];
-  const filesystem = entries.map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
+  const filesystem = [...new Map(entries)]
+    .map(([path, access]) => `${JSON.stringify(path)}="${access}"`)
+    .join(",");
   return [
     "-c",
     'default_permissions="limitless-editor"',
@@ -898,7 +905,7 @@ export async function runCodex(
       executable = readerProbe.resolve();
     } catch {}
   const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec, executable);
-  if (confinement?.path) args[0] = confinement.path;
+  if (executable) args[0] = executable;
   const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
 
   const loop = new LoopDetector(spec.maxToolCalls);

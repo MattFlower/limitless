@@ -1924,7 +1924,7 @@ test("CLI sandboxes run directly when outer confinement refuses; Claude editors 
       const result = await runCodex({ ...spec, mode }, fake.runner, fake.probe);
       expect(result.status).toBe("ok");
       expect(fake.execs()).toHaveLength(1);
-      expect(fake.execs()[0]?.[0]).toBe(mode === "edit" ? CODEX : "codex");
+      expect(fake.execs()[0]?.[0]).toBe(CODEX);
     }
     const calls: string[][] = [];
     const runner = async (opts: ProcOptions) => {
