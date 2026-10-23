@@ -14,6 +14,7 @@ import { NewRun } from "./pages/NewRun.tsx";
 import { Providers } from "./pages/Providers.tsx";
 import { RunDetail } from "./pages/RunDetail.tsx";
 import { Setup } from "./pages/Setup.tsx";
+import { Workers } from "./pages/Workers.tsx";
 import { live } from "./store.ts";
 
 const Shell: Component<RouteSectionProps> = (props) => (
@@ -45,6 +46,7 @@ render(
       <Route path="/setup" component={Setup} />
       <Route path="/models" component={Models} />
       <Route path="/providers" component={Providers} />
+      <Route path="/workers" component={Workers} />
       <Route path="/chat" component={Chat} />
     </Router>
   ),

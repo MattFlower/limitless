@@ -270,6 +270,7 @@ Coordinator restarts, including deploys, cancel open agent jobs. If a worker pus
 seconds before cancellation, the run ends NeedsHuman because adopting unreported commits requires
 re-attachment support. Before rolling back past S5 after a crash, cancel runs that were in a
 worker implement round: older releases can lease leftover jobs without the release parity check.
+The signed-in `/workers` page shows capabilities, current agent jobs and recent runs that used workers.
 Bonjour discovery, power/idle selection and Linux workers are not supported.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default

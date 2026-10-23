@@ -17,9 +17,15 @@ import type {
   StreamMessage,
 } from "../src/core/types.ts";
 import type { ProviderWorkload, Stats } from "../src/db/stats.ts";
+import type { WorkerRun, WorkerStore } from "../src/db/workers.ts";
 import type { ModelDef, Policy } from "../src/router/catalog.ts";
 
 export type { StreamMessage };
+export type Worker = Omit<ReturnType<WorkerStore["list"]>[number], "agentJobs"> & {
+  agentJobs?: { id: string; attempt: number; runId: string }[];
+};
+export const getWorkers = () => request<Worker[]>("/api/workers");
+export const getWorkerRuns = () => request<WorkerRun[]>("/api/workers/runs");
 
 class ApiError extends Error {
   constructor(

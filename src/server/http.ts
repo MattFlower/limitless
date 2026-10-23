@@ -306,6 +306,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   };
   const routes: Record<string, unknown> = {
     "/api/workers": handle(() => json(factory.workers.list())),
+    "/api/workers/runs": {
+      GET: handle((req) => json(factory.workers.runs(Number(new URL(req.url).searchParams.get("limit"))))),
+    },
     "/api/workers/approve": {
       POST: handle(async (req) => {
         const input = await body<{ code: string }>(req);
