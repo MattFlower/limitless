@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildConfig, buildSha, checkAssets } from "../scripts/build-binary.ts";
+import { buildConfig, buildSha, checkAssets, validateMetafile } from "../scripts/build-binary.ts";
 import { BUILD_DEFINES } from "../src/release.ts";
 import { sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
@@ -116,7 +116,7 @@ test("build root must be the Git top-level directory", async () => {
 
 test("binary config seals autoloading and embeds only explicit identity", () => {
   const identity = { version: "3.2.1", sha: "d".repeat(40) };
-  const config = buildConfig(identity, dir);
+  const config = buildConfig(identity, dir, dir);
   expect(config.outdir).toBe(dir);
   expect(config.entrypoints).toHaveLength(1);
   const entry = config.entrypoints?.[0];
@@ -133,7 +133,9 @@ test("binary config seals autoloading and embeds only explicit identity", () => 
       "src/db/migrations",
       "routing/policy.json",
       "integrations/codex/.agents/skills/limitless/SKILL.md",
-    ].map((path) => join(import.meta.dir, "..", path)),
+    ]
+      .map((path) => join(import.meta.dir, "..", path))
+      .concat(dir),
     autoloadDotenv: false,
     autoloadBunfig: false,
     autoloadTsconfig: false,
@@ -146,6 +148,7 @@ test("binary config seals autoloading and embeds only explicit identity", () => 
   expect(config.define).toEqual({
     [BUILD_DEFINES.version]: JSON.stringify(identity.version),
     [BUILD_DEFINES.sha]: JSON.stringify(identity.sha),
+    [BUILD_DEFINES.packaged]: "true",
   });
 });
 
@@ -156,8 +159,8 @@ test("the binary embeds the three runtime resources from the checkout, unchanged
     join(checkout, "routing/policy.json"),
     join(checkout, "integrations/codex/.agents/skills/limitless/SKILL.md"),
   ];
-  const config = buildConfig({ version: "1.0.0", sha: "a".repeat(40) }, dir);
-  expect(typeof config.compile === "object" && config.compile.assets).toEqual(expected);
+  const config = buildConfig({ version: "1.0.0", sha: "a".repeat(40) }, dir, dir);
+  expect(typeof config.compile === "object" && config.compile.assets).toEqual([...expected, dir]);
   for (const asset of expected) expect(existsSync(asset)).toBe(true);
   expect(config.loader).toBeUndefined();
   expect(config.plugins).toBeUndefined();
@@ -175,4 +178,17 @@ test("asset validation refuses missing resources and shared basenames", () => {
     "share the basename policy.json",
   );
   expect(checkAssets([join(dir, "a", "policy.json")])).toEqual([join(dir, "a", "policy.json")]);
+});
+
+test.each(["node_modules/@babel/core/lib/index.js", "/build/node_modules/babel-preset-solid/index.js"])(
+  "binary metafile rejects %s",
+  (input) => {
+    expect(() => validateMetafile({ inputs: { [input]: {} } })).toThrow("Babel dependency");
+  },
+);
+
+test("binary metafile accepts dependencies outside Babel", () => {
+  expect(() =>
+    validateMetafile({ inputs: { "node_modules/solid-js/index.js": {}, "src/cli/main.ts": {} } }),
+  ).not.toThrow();
 });

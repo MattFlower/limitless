@@ -1,11 +1,9 @@
+import { uiBuildOptions } from "../src/server/ui-build.ts";
 import solidPlugin from "./solid-plugin.ts";
 
 const result = await Bun.build({
-  entrypoints: ["./ui/index.html"],
+  ...uiBuildOptions(solidPlugin),
   outdir: "./dist",
-  target: "browser",
-  minify: true,
-  plugins: [solidPlugin],
 });
 if (!result.success) {
   for (const log of result.logs) console.error(log);
