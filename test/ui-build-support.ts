@@ -1,4 +1,4 @@
-import { afterAll } from "bun:test";
+import { afterAll, expect, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,17 @@ export function uiBuildFixture() {
     root = mkdtempSync(join(tmpdir(), "limitless-ui-test-"));
     const { directory } = await stageUi(root);
     const info: Release = { kind: "packaged", root, version: "test", sha: "a".repeat(40), bun: Bun.version };
-    return { source: await buildUi(), packaged: await buildUi(info), directory, info };
+    const source = await buildUi();
+    const builder = spyOn(Bun, "build").mockImplementation(() => {
+      throw new Error("Packaged UI must not compile from source");
+    });
+    try {
+      const packaged = await buildUi(info);
+      expect(builder).not.toHaveBeenCalled();
+      return { source, packaged, directory, info };
+    } finally {
+      builder.mockRestore();
+    }
   }
 
   afterAll(() => {
