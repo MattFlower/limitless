@@ -8,9 +8,9 @@ import type { AgentJobRequest, AgentJobRow } from "../src/db/workers.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../src/gates/private.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { headSha } from "../src/git/repos.ts";
-import { fakeHarness } from "../src/harness/fake.ts";
+import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import type { AgentExecutor } from "../src/pipeline/agent-executor.ts";
+import type { AgentCall, AgentExecutor } from "../src/pipeline/agent-executor.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
 import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
@@ -67,29 +67,45 @@ function boot(
   options: {
     executor?: AgentExecutor;
     review?: (s: AgentSpec) => Promise<void>;
+    reviewReply?: (s: AgentSpec) => Promise<FakeReply>;
     faults?: FaultPlan;
     deferStart?: boolean;
+    localImplement?: boolean;
+    freeProviders?: boolean;
   } = {},
 ) {
   let locals = 0;
   const startSpy = options.deferStart
     ? spyOn(Factory.prototype, "start").mockImplementation(() => {})
     : undefined;
-  const f = start(() => ({}), false, false, {
+  const f = start(() => ({}), false, options.freeProviders, {
     bootSha: release,
-    providers: providers.map((p) => ({ ...p, harness: "claude" })),
+    providers: [
+      ...providers,
+      ...(options.freeProviders
+        ? [{ id: "delta", label: "Delta", billing: "free" as const, maxConcurrent: 2 }]
+        : []),
+    ].map((p) => ({ ...p, harness: "claude" })),
     harnesses: {
       claude: fakeHarness(async (s) => {
         if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-        if (roleOf(s) === "review") {
+        if (roleOf(s) === "review" || s.prompt.startsWith("You are a code-review verifier")) {
           await options.review?.(s);
-          return { structured: approve };
+          return (await options.reviewReply?.(s)) ?? { structured: approve };
         }
         locals++;
         return { files: { "farewell.txt": "local goodbye\n" } };
       }),
     },
-    agentExecutor: options.executor,
+    agentExecutor:
+      options.executor ??
+      (options.localImplement
+        ? {
+            kind: "review-worker",
+            run: (call, local) =>
+              call.role === "implement" ? local() : lanAgentExecutor(f.workers, f.cfg).run(call, local),
+          }
+        : undefined),
     faults: options.faults,
   });
   startSpy?.mockRestore();
@@ -1308,5 +1324,297 @@ test("publication resume checks HEAD, cleanliness, expected SHA and the private 
     expect(instance.locals()).toBe(0);
   } finally {
     await complete();
+  }
+});
+
+async function reviewWorker(f: Factory, handler: (s: AgentSpec) => Promise<FakeReply>) {
+  const listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+  if (!listener) throw new Error("Missing listener");
+  const remote = loadConfig({ home: join(home, "review-worker"), configDir: join(home, "cfg"), raw: {} });
+  const controller = new AbortController();
+  await pairWorker(listener.url.origin, join(remote.paths.home, "worker"), "reviewer", (text) =>
+    f.workers.approve(text.split(": ")[1] ?? ""),
+  );
+  const task = runWorker(listener.url.origin, remote, release, controller.signal, {
+    confinement: fakeConfinement,
+    heartbeatMs: 10,
+    retryMs: 5,
+    capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
+    machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+    tokenLookup: async () => {
+      throw new Error("Review must not acquire publication credentials");
+    },
+    harnesses: { claude: fakeHarness(handler) },
+  });
+  return async () => {
+    controller.abort();
+    await task;
+    await listener.stop();
+  };
+}
+
+// Compare artifact structure while allowing run-specific model, duration and SHA values.
+function structure(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(structure);
+  if (value && typeof value === "object")
+    return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, structure(v)]));
+  return value === null ? null : typeof value;
+}
+
+test.each(["single", "panel", "panel pinned"] as const)(
+  "real worker reviews readonly and delivers: %s",
+  async (scenario) => {
+    const mode = scenario === "single" ? "single" : "panel";
+    const pinned = scenario === "panel pinned";
+    const bare = await githubFixture();
+    let localReviews = 0;
+    const review = async (s: AgentSpec): Promise<FakeReply> => {
+      if (s.prompt.startsWith("You are a code-review verifier"))
+        return {
+          structured: {
+            results: [
+              {
+                id: "C1",
+                verdict: "REFUTED",
+                severity: "low",
+                category: "correctness",
+                evidence: "farewell.txt:1 contains a valid farewell",
+                trigger: "Reading the farewell",
+              },
+            ],
+          },
+        };
+      return {
+        structured:
+          mode === "single" || s.target.modelId === "alpha/m" || s.prompt.includes("# Lens: coordinator")
+            ? approve
+            : {
+                ...approve,
+                findings: [
+                  {
+                    severity: "minor",
+                    security: false,
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Check farewell",
+                    detail: "The farewell may be too terse",
+                    suggestion: "Check it",
+                    failure_scenario: "Reading the farewell",
+                    category: "correctness",
+                    confidence: 0.9,
+                    introduced_by_diff: true,
+                  },
+                ],
+              },
+      };
+    };
+    let f: Factory;
+    let checked = 0;
+    const reviewCalls: AgentCall[] = [];
+    const refs = async () => (await sh(["git", "show-ref"], { cwd: bare })).stdout;
+    const executor: AgentExecutor = {
+      kind: "test",
+      async run(call, local) {
+        if (call.role === "implement") return local();
+        if (call.role === "review") reviewCalls.push(call);
+        if (call.role !== "review" || !f.cfg.workers.agents.includes("review"))
+          return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+        if (call.spec.prompt.includes("# Lens: coordinator"))
+          return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+        const before = await refs();
+        const head = await headSha(call.worktree);
+        const status = (await worktreeGit(["git", "status", "--porcelain"], { cwd: call.worktree })).stdout;
+        expect(before).not.toContain(`refs/heads/${call.checkout?.branch}`);
+        expect(call.checkout).toMatchObject({
+          parentSha: head,
+          baseSha: f.store.getRun(call.runId)?.baseSha,
+        });
+        expect(f.tracker.status(call.spec.target.provider)?.inFlight).toBeGreaterThan(0);
+        const result = await lanAgentExecutor(f.workers, f.cfg).run(call, local);
+        expect(await headSha(call.worktree)).toBe(head);
+        expect((await worktreeGit(["git", "status", "--porcelain"], { cwd: call.worktree })).stdout).toBe(
+          status,
+        );
+        expect(await refs()).toBe(before);
+        checked++;
+        return result;
+      },
+    };
+    const instance = boot({
+      executor,
+      freeProviders: mode === "panel",
+      reviewReply: async (s) => {
+        localReviews++;
+        return review(s);
+      },
+    });
+    f = instance.f;
+    f.cfg.workers.agents = ["implement", "review"];
+    if (mode === "panel")
+      f.deps.reviewSystem = {
+        name: "panel",
+        mode: "panel",
+        finders: [
+          { target: "alpha/m", prompt: "standard" },
+          { target: "beta/m", prompt: "adversarial" },
+          {
+            prompt: "standard",
+            local: true,
+            lens: { name: "coordinator", focus: "Check the farewell locally." },
+          },
+        ],
+        verifier: {},
+        implementerReport: "include",
+      };
+    registerGithub(f, bare);
+    const sessions: AgentSpec[] = [];
+    const stop = await reviewWorker(f, async (s) => {
+      sessions.push(s);
+      expect(s.mode).toBe("readonly");
+      expect(s.cwd).not.toBe(f.store.getRunState<RunState>(jobs(f)[0]?.run_id ?? "")?.worktreePath);
+      // A misbehaving harness cannot change the coordinator or publish its writes.
+      return { ...(await review(s)), files: { "worker-only.txt": "discard me\n" } };
+    });
+    try {
+      const runOptions = {
+        repo: "test/repo",
+        prompt: "Add farewell",
+        profile: "quick" as const,
+        ...(pinned ? { models: { review: ["beta/m", "alpha/m"] } } : {}),
+      };
+      const run = await f.createRun(runOptions);
+      const status = await waitFor(f, run.id, ["succeeded", "needs_human"]);
+      expect(f.store.getRun(run.id)?.error).toBeNull();
+      expect(status).toBe("succeeded");
+      const rows = jobs(f);
+      expect(rows).toHaveLength(mode === "single" ? 1 : 3);
+      expect(checked).toBe(rows.length);
+      expect(sessions).toHaveLength(rows.length);
+      expect(localReviews).toBe(mode === "panel" ? 1 : 0);
+      expect(instance.locals()).toBe(1);
+      const state = f.store.getRunState<RunState>(run.id);
+      const localCalls = reviewCalls.filter((call) => call.spec.prompt.includes("# Lens: coordinator"));
+      expect(localCalls).toHaveLength(mode === "panel" ? 1 : 0);
+      for (const call of localCalls) {
+        expect(call.checkout).toBeUndefined();
+        expect(call.spec.target).toMatchObject({
+          harness: "claude",
+          billing: pinned ? "subscription" : "free",
+        });
+        for (const field of ["backend", "openai", "decisions"])
+          expect(call.spec.target).not.toHaveProperty(field);
+        expect(rows.some((row) => row.invocation_id === call.invocationId)).toBe(false);
+      }
+      const workerCalls = reviewCalls.filter((call) => !localCalls.includes(call));
+      expect(rows.map((row) => row.invocation_id).sort()).toEqual(
+        workerCalls.map((call) => call.invocationId).sort(),
+      );
+      if (mode === "panel") {
+        expect(workerCalls.filter((call) => roleOf(call.spec) === "review")).toHaveLength(2);
+        expect(
+          workerCalls.filter((call) => call.spec.prompt.startsWith("You are a code-review verifier")),
+        ).toHaveLength(1);
+      }
+      for (const row of rows) {
+        expect(request(row)).toMatchObject({ role: "review", mode: "readonly" });
+        expect(request(row)).not.toHaveProperty("commit");
+        expect(row).toMatchObject({ state: "done", result_sha: row.parent_sha });
+        expect(state?.reviewHistory?.at(-1)?.sha).toBe(row.parent_sha);
+      }
+      expect(state?.agentJob).toBeUndefined();
+      expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("pr create");
+      const artifact = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "null");
+      f.cfg.workers.agents = [];
+      const local = await f.createRun(runOptions);
+      expect(await waitFor(f, local.id, ["succeeded", "needs_human"])).toBe("succeeded");
+      expect(jobs(f)).toHaveLength(rows.length);
+      expect(structure(artifact)).toEqual(
+        structure(JSON.parse(f.store.getArtifact(local.id, "review-1.json") ?? "null")),
+      );
+      if (mode === "panel") expect(artifact.panel.verdicts).not.toHaveLength(0);
+    } finally {
+      await stop();
+    }
+  },
+  30_000,
+);
+
+test("review worker failures fall back without affecting provider health", async () => {
+  const bare = await githubFixture();
+  let f: Factory;
+  let localReviews = 0;
+  let checked = false;
+  const executor: AgentExecutor = {
+    kind: "test",
+    async run(call, local) {
+      if (call.role !== "review") return local();
+      const provider = call.spec.target.provider;
+      f.tracker.record(provider, "unavailable");
+      const health = f.store.getProviderRow(provider);
+      const result = await lanAgentExecutor(f.workers, f.cfg).run(call, async () => {
+        expect(f.store.getProviderRow(provider)).toEqual(health);
+        checked = true;
+        return local();
+      });
+      expect(f.store.getProviderRow(provider)).toEqual(health);
+      return result;
+    },
+  };
+  ({ f } = boot({
+    executor,
+    review: async () => {
+      localReviews++;
+    },
+  }));
+  f.cfg.workers.agents = ["review"];
+  registerGithub(f, bare);
+  const finish = simulated(f, async (job) => {
+    f.workers.failAgentJob(job.id, "Disconnected");
+    f.workers.failAgentJob(job.id, "Disconnected");
+  });
+  try {
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+    expect(checked).toBe(true);
+    expect(localReviews).toBe(1);
+    expect(jobs(f)).toHaveLength(1);
+  } finally {
+    await finish();
+  }
+});
+
+test("shutdown cancels review and resume runs review again", async () => {
+  const bare = await githubFixture();
+  let { f } = boot({ localImplement: true });
+  f.cfg.workers.agents = ["review"];
+  registerGithub(f, bare);
+  const queued = Promise.withResolvers<void>();
+  const finish = simulated(f, async () => {
+    queued.resolve();
+  });
+  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+  await queued.promise;
+  const old = jobs(f)[0];
+  if (!old) throw new Error("Missing review job");
+  expect(request(old).role).toBe("review");
+  await f.stop();
+  await finish();
+  expect(f.workers.agentJob(old.id)?.state).toBe("cancelled");
+  expect(f.store.getRunState<RunState>(run.id)?.agentJob).toBeUndefined();
+  f.store.close();
+  const resumed = boot({ localImplement: true, deferStart: true });
+  f = resumed.f;
+  f.cfg.workers.agents = ["review"];
+  const stop = await reviewWorker(f, async () => ({ structured: approve }));
+  try {
+    f.start();
+    expect(await waitFor(f, run.id, ["succeeded", "needs_human"])).toBe("succeeded");
+    const rows = jobs(f);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.state)).toEqual(["cancelled", "done"]);
+    expect(rows[1]?.parent_sha).toBe(old.parent_sha);
+    expect(resumed.locals()).toBe(0);
+  } finally {
+    await stop();
   }
 });

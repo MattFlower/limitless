@@ -807,6 +807,14 @@ export async function runWorker(
         void posts.catch(() => agentJobs.get(id)?.controller.abort());
       };
       try {
+        if (
+          (request.role === "review" || request.mode === "readonly") &&
+          (request.mode !== "readonly" ||
+            Object.keys(publicationFields).some(
+              (key) => request[key as keyof typeof publicationFields] !== undefined,
+            ))
+        )
+          throw new Error("Readonly jobs carry no publication fields");
         const publication = z.object(publicationFields).safeParse(request);
         if (!publication.success) throw new Error("Invalid agent publication metadata");
         const req = {

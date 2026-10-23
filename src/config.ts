@@ -386,7 +386,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   if (!Array.isArray(agents) || !agents.every((r) => typeof r === "string" && roles.includes(r)))
     throw new Error("workers.agents must be an array of known role names");
   for (const role of new Set(agents))
-    if (role !== "implement") console.warn(`workers.agents: ${role} stays local in this release`);
+    if (role !== "implement" && role !== "review")
+      console.warn(`workers.agents: ${role} stays local in this release`);
   if (typeof agentSlots !== "number" || !Number.isSafeInteger(agentSlots) || agentSlots <= 0)
     throw new Error("workers.agent_slots must be a positive integer");
   if (listen !== undefined) {

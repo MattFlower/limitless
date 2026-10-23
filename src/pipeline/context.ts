@@ -228,6 +228,7 @@ export const invokeGuard = new AsyncLocalStorage<{
 
 export interface InvokeOptions {
   publication?: AgentPublicationHooks;
+  checkout?: { parentSha: string; baseSha: string; branch: string };
   role: Role;
   stage: Stage;
   prompt: string;
@@ -895,6 +896,7 @@ export class RunContext {
               denyRead: opts.denyRead,
               dispatch,
               publication: opts.publication,
+              checkout: opts.checkout,
               round: opts.stage.round,
               agentJob: this.state.agentJob,
             },
