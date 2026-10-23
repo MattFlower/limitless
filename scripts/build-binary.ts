@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { version } from "../package.json";
@@ -7,7 +8,18 @@ import { sh } from "../src/util/proc.ts";
 const root = resolve(import.meta.dir, "..");
 
 export async function buildSha(cwd = root): Promise<string> {
-  const status = await sh(["git", "status", "--porcelain", "--untracked-files=all"], { cwd });
+  if ("GIT_DIR" in process.env || "GIT_WORK_TREE" in process.env)
+    throw new Error("Cannot build Limitless with GIT_DIR or GIT_WORK_TREE overrides");
+  const worktree = await sh(["git", "config", "--get-all", "core.worktree"], { cwd, allowFail: true });
+  if (worktree.exitCode === 0) throw new Error("Cannot build Limitless with core.worktree configured");
+  if (worktree.exitCode !== 1) throw new Error("Cannot inspect build core.worktree configuration");
+  const top = (await sh(["git", "rev-parse", "--show-toplevel"], { cwd })).stdout.trim();
+  if (realpathSync(top) !== realpathSync(cwd))
+    throw new Error("Cannot build Limitless: Git checkout root does not match build root");
+  const status = await sh(
+    ["git", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
+    { cwd },
+  );
   if (status.stdout.trim()) throw new Error("Cannot build Limitless from a dirty tree");
   const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Cannot resolve build HEAD SHA");
@@ -27,7 +39,7 @@ export function buildConfig(identity: { version: string; sha: string }, outdir: 
       autoloadTsconfig: false,
       autoloadPackageJson: false,
     },
-    minify: { keepNames: true },
+    minify: { whitespace: true, syntax: true, identifiers: true, keepNames: true },
     sourcemap: "linked",
     env: "disable",
     metafile: true,

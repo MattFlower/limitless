@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildConfig, buildSha } from "../scripts/build-binary.ts";
@@ -15,9 +15,21 @@ const seed = seeded(async (cwd) => {
   await sh(["git", "commit", "-m", "seed"], { cwd });
   return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
 });
+const submoduleSeed = seeded(async (cwd) => {
+  await seed(cwd);
+  const source = mkdtempSync(join(tmpdir(), "limitless-submodule-"));
+  try {
+    await seed(source);
+    await sh(["git", "-c", "protocol.file.allow=always", "submodule", "add", source, "sub"], { cwd });
+    await sh(["git", "commit", "-am", "submodule"], { cwd });
+    await sh(["git", "config", "diff.ignoreSubmodules", "all"], { cwd });
+  } finally {
+    rmSync(source, { recursive: true, force: true });
+  }
+});
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "limitless-build-"));
+  dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-build-")));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -50,6 +62,44 @@ test("a checkout without HEAD refuses", async () => {
   await expect(buildSha(empty)).rejects.toThrow();
 });
 
+test("modified committed submodules refuse despite hidden submodule diffs", async () => {
+  await submoduleSeed(dir);
+  await buildSha(dir);
+  writeFileSync(join(dir, "sub", "tracked"), "changed\n");
+  await expect(buildSha(dir)).rejects.toThrow("dirty tree");
+});
+
+test("core.worktree cannot redirect a dirty checkout to a clean copy", async () => {
+  const dirty = join(dir, "dirty");
+  const clean = join(dir, "clean");
+  await seed(dirty);
+  await seed(clean);
+  writeFileSync(join(dirty, "tracked"), "changed\n");
+  await sh(["git", "config", "core.worktree", clean], { cwd: dirty });
+  await expect(buildSha(dirty)).rejects.toThrow("core.worktree");
+});
+
+test.each(["GIT_DIR", "GIT_WORK_TREE"])("%s overrides refuse even when empty", async (name) => {
+  await seed(dir);
+  const original = process.env[name];
+  try {
+    for (const value of [dir, ""]) {
+      process.env[name] = value;
+      await expect(buildSha(dir)).rejects.toThrow("GIT_DIR or GIT_WORK_TREE");
+    }
+  } finally {
+    if (original === undefined) delete process.env[name];
+    else process.env[name] = original;
+  }
+});
+
+test("build root must be the Git top-level directory", async () => {
+  await seed(dir);
+  const nested = join(dir, "ignored");
+  mkdirSync(nested);
+  await expect(buildSha(nested)).rejects.toThrow("checkout root");
+});
+
 test("binary config seals autoloading and embeds only explicit identity", () => {
   const identity = { version: "3.2.1", sha: "d".repeat(40) };
   const config = buildConfig(identity, dir);
@@ -72,7 +122,7 @@ test("binary config seals autoloading and embeds only explicit identity", () => 
   });
   expect(config.env).toBe("disable");
   expect(config.metafile).toBe(true);
-  expect(config.minify).toMatchObject({ keepNames: true });
+  expect(config.minify).toEqual({ whitespace: true, syntax: true, identifiers: true, keepNames: true });
   expect(config.sourcemap).toBeTruthy();
   expect(config.define).toEqual({
     [BUILD_DEFINES.version]: JSON.stringify(identity.version),

@@ -23,6 +23,7 @@ export function resolveRelease({
   build?: BuildIdentity;
   bunVersion: string;
 }): Release {
+  if (!standalone) return { kind: "source", version, root: resolve(import.meta.dir, ".."), bun: bunVersion };
   if (build?.version !== undefined || build?.sha !== undefined) {
     if (typeof build.version !== "string" || !build.version.trim())
       throw new Error("Invalid Limitless build identity: empty version");
@@ -30,16 +31,17 @@ export function resolveRelease({
       throw new Error("Invalid Limitless build identity: SHA must be 40 lowercase hex characters");
     return { kind: "packaged", version: build.version, sha: build.sha, bun: bunVersion };
   }
-  if (standalone) throw new Error("Missing Limitless build identity in standalone executable");
-  return { kind: "source", version, root: resolve(import.meta.dir, ".."), bun: bunVersion };
+  throw new Error("Missing Limitless build identity in standalone executable");
 }
 
 export const release = resolveRelease({
   standalone: Bun.isStandaloneExecutable,
-  build: {
-    version: typeof LIMITLESS_BUILD_VERSION !== "undefined" ? LIMITLESS_BUILD_VERSION : undefined,
-    sha: typeof LIMITLESS_BUILD_SHA !== "undefined" ? LIMITLESS_BUILD_SHA : undefined,
-  },
+  build: Bun.isStandaloneExecutable
+    ? {
+        version: typeof LIMITLESS_BUILD_VERSION !== "undefined" ? LIMITLESS_BUILD_VERSION : undefined,
+        sha: typeof LIMITLESS_BUILD_SHA !== "undefined" ? LIMITLESS_BUILD_SHA : undefined,
+      }
+    : undefined,
   bunVersion: Bun.version,
 });
 

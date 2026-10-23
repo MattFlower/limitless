@@ -15,8 +15,8 @@ test("source identity uses the package version and checkout root", () => {
   });
 });
 
-test.each([false, true])("valid build defines select packaged (standalone=%s)", (standalone) => {
-  expect(resolveRelease({ standalone, build: { version: "2.0.0", sha }, bunVersion })).toEqual({
+test("valid build defines select packaged only in standalone mode", () => {
+  expect(resolveRelease({ standalone: true, build: { version: "2.0.0", sha }, bunVersion })).toEqual({
     kind: "packaged",
     version: "2.0.0",
     sha,
@@ -29,6 +29,7 @@ test("standalone requires build identity", () => {
 });
 
 test.each([
+  {},
   { version: "1", sha: "A".repeat(40) },
   { version: "1", sha: "abc" },
   { version: "1", sha: "" },
@@ -37,10 +38,26 @@ test.each([
   { version: "1" },
   { sha },
 ])("malformed or partial identity refuses: %j", (build) => {
-  for (const standalone of [false, true])
-    expect(() => resolveRelease({ standalone, build, bunVersion })).toThrow(
-      "Invalid Limitless build identity",
-    );
+  expect(() => resolveRelease({ standalone: true, build, bunVersion })).toThrow("Limitless build identity");
+  expect(resolveRelease({ standalone: false, build, bunVersion }).kind).toBe("source");
+});
+
+test.each([undefined, { version: "2.0.0", sha }])("source ignores supplied identity: %j", (build) => {
+  expect(resolveRelease({ standalone: false, build, bunVersion })).toEqual(
+    resolveRelease({ standalone: false, bunVersion }),
+  );
+});
+
+test("source never accesses build identity properties", () => {
+  const build = {
+    get version(): string {
+      throw new Error("version accessed");
+    },
+    get sha(): string {
+      throw new Error("SHA accessed");
+    },
+  };
+  expect(resolveRelease({ standalone: false, build, bunVersion }).kind).toBe("source");
 });
 
 test("packaged boot SHA never invokes git", async () => {
