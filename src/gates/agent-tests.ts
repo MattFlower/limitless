@@ -5,7 +5,7 @@ export type TestLane = "gate" | "small";
 export const AGENT_TEST_CAP_MS = { gate: 45 * 60_000, small: 15 * 60_000 } as const;
 export interface TestWait {
   kind: "agent-test";
-  phase: "wait" | "acquired" | "capped";
+  phase: "wait" | "acquired" | "capped" | "refused";
   command: string;
   lane: TestLane;
   waitMs?: number;
@@ -38,6 +38,7 @@ export class AgentTestSession {
   private readonly leases = new Map<string, Lease>();
   private readonly lanes = new Map<TestLane, Lease>();
   private readonly waits = new Map<string, number>();
+  private readonly refusals = new Set<string>();
   private closed = false;
   private readonly now;
   private readonly timer: NonNullable<SessionOptions["timer"]>;
@@ -111,6 +112,18 @@ export class AgentTestSession {
 
   async request(body: Record<string, unknown>) {
     if (this.closed || body.token !== this.token) throw new Error("invalid agent-test capability");
+    if (typeof body.refused === "string" && body.lane === "gate" && typeof body.name === "string") {
+      if (!this.refusals.has(body.refused)) {
+        this.refusals.add(body.refused);
+        this.event({
+          kind: "agent-test",
+          phase: "refused",
+          command: redactCredentials(body.name),
+          lane: "gate",
+        });
+      }
+      return { id: "refused", acquired: false };
+    }
     if (body.reuse !== undefined) {
       if (typeof body.reuse !== "string" || (body.lane !== "small" && body.lane !== "gate"))
         throw new Error("invalid nested agent-test lease");
@@ -240,6 +253,7 @@ export class AgentTestSession {
     }
     this.leases.clear();
     this.waits.clear();
+    this.refusals.clear();
   }
 }
 

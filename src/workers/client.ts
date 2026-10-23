@@ -171,6 +171,7 @@ const AgentRequest = z.object({
   privateSession: z.boolean().optional(),
   confineReads: z.boolean().optional(),
   slottedCommands: z.array(z.array(z.string())).optional(),
+  agentFullSuite: z.enum(["slot", "refuse"]).optional(),
   branch: z.string().optional(),
 });
 const Lease = z.object({
@@ -874,6 +875,10 @@ export async function runWorker(
                   return harness(spec);
                 },
                 req.confineReads ? [] : (req.slottedCommands ?? []),
+                undefined,
+                undefined,
+                undefined,
+                { role: req.role, agentFullSuite: req.agentFullSuite },
               ),
             ),
           );

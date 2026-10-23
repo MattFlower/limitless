@@ -19,6 +19,7 @@ import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
+import { agentTestCommand, type WrapperConfig } from "../src/cli/agent-test.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
@@ -73,6 +74,7 @@ import {
   runProcess,
   sh,
 } from "../src/util/proc.ts";
+import { AgentEvents } from "../src/workers/agent-protocol.ts";
 import { pairWorker, runWorker as runWorkerClient } from "../src/workers/client.ts";
 import { type Capabilities, CheckEvent, Heartbeat, pairingCode, Result } from "../src/workers/protocol.ts";
 import { publicationFields } from "../src/workers/publication.ts";
@@ -4654,6 +4656,7 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
     privateSession: true,
     confineReads: true,
     slottedCommands: [["bun", "test"]],
+    agentFullSuite: "refuse",
     branch: "change/agent",
     baseSha: releaseSha,
     commit: publicationCommit,
@@ -5561,7 +5564,12 @@ test("worker shutdown clears the fence and a late heartbeat cannot rearm it", as
 
 test("readonly worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
   await listen();
-  const id = await queuedLocalAgent({ mode: "readonly", slottedCommands: [["bun", "test"]] });
+  const id = await queuedLocalAgent({
+    mode: "readonly",
+    role: "verify",
+    agentFullSuite: "refuse",
+    slottedCommands: [["bun", "test"]],
+  });
   let cwd = "",
     scratch = "";
   let forms: string[] = [];
@@ -5584,6 +5592,7 @@ test("readonly worker agent runs at its parent, hides paths, uses local slots an
         const wrappers = spec.commandPath?.split(":")[0] ?? "";
         const config = JSON.parse(readFileSync(join(wrappers, "config.json"), "utf8"));
         expect(config).not.toHaveProperty("port");
+        expect(config).toMatchObject({ role: "verify", agentFullSuite: "refuse" });
         const lease = await agentTestLease({ token: config.token, name: "bun test", lane: "gate" });
         expect(lease.acquired).toBe(true);
         await agentTestLease({ token: config.token, id: lease.id, release: true });
@@ -5621,6 +5630,49 @@ test("readonly worker agent runs at its parent, hides paths, uses local slots an
     expect(existsSync(scratch)).toBe(false);
     expect(readdirSync(worker.remote.paths.work)).toEqual([]);
     expect(workerCleanupRecords(worker.remote)).toEqual([]);
+  } finally {
+    await worker.stop();
+  }
+}, 30_000);
+
+test("worker implement full-suite refusal is forwarded once with a redacted command", async () => {
+  await listen();
+  const secret = `credential-${crypto.randomUUID()}`;
+  registerCredential("WORKER_REFUSAL_TEST", secret);
+  const id = await queuedLocalAgent({
+    role: "implement",
+    agentFullSuite: "refuse",
+    slottedCommands: [["bun", "test"]],
+  });
+  const worker = await loop({
+    harnesses: {
+      claude: fakeHarness(async (spec) => {
+        const wrapper = spec.commandPath?.split(":")[0] ?? "";
+        const config: WrapperConfig = JSON.parse(readFileSync(join(wrapper, "config.json"), "utf8"));
+        expect(config).toMatchObject({ role: "implement", agentFullSuite: "refuse" });
+        expect(
+          await agentTestCommand(config, ["bun", "test", "-t", secret], async (body) => {
+            await agentTestLease(body);
+            return agentTestLease(body);
+          }),
+        ).not.toBe(0);
+        return {};
+      }),
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.state === "done");
+    const events = batches(id).flatMap((row) => JSON.parse(row.events));
+    const refusals = events.filter((event) => event.text?.startsWith("agent-test refused:"));
+    expect(refusals).toEqual([
+      { type: "status", text: "agent-test refused: full suite: bun test -t [redacted]" },
+    ]);
+    expect(AgentEvents.safeParse({ seq: 0, events: refusals }).success).toBe(true);
+    expect(
+      AgentEvents.safeParse({ seq: 0, events: [{ ...refusals[0], data: { command: "bun test" } }] }).success,
+    ).toBe(false);
+    expect(JSON.parse(workers.agentJob(id)?.result ?? "null")).toMatchObject({ status: "ok" });
+    expect(JSON.stringify(events)).not.toContain(secret);
   } finally {
     await worker.stop();
   }
