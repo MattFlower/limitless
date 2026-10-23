@@ -450,7 +450,7 @@ for (const failure of ["throws", "empty", "ownerId", "ownerPid", "ownerBirth"] a
           row.invocation,
         );
       process.kill(owner.pid, "SIGKILL");
-      await waitFor(() => recoveryProcessStopped(owner.pid));
+      await waitFor(() => processBirthSync(owner.pid) === null);
       await recoverBoth();
       expectProcessStopped(row.pid);
       expect(store.listProcessDiscoveries()).toEqual([]);

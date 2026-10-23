@@ -180,8 +180,10 @@ export async function recoverProcessCleanups(
     // A persisted job marker can be scanned even when its boot identity was unavailable.
     const sameBoot = (row: ProcessCleanup | ProcessDiscovery) =>
       ownership ? !boot || !row.boot || row.boot === boot : row.boot === boot;
-    for (const row of discoveries)
-      if (sameBoot(row) && preserveProcessOwner(row)) invocations.delete(row.invocation);
+    // Workers explicitly recover a finished job's ownership, even while their process lives.
+    if (!ownership)
+      for (const row of discoveries)
+        if (sameBoot(row) && preserveProcessOwner(row)) invocations.delete(row.invocation);
     records = records.filter((row) => invocations.has(row.invocation));
     discoveries = discoveries.filter((row) => invocations.has(row.invocation));
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
