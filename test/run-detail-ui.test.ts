@@ -6,6 +6,7 @@ import { renderToString } from "solid-js/web";
 import type { RunModels } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { MODELS } from "../src/router/catalog.ts";
+import { formatDateTime } from "../ui/lib/format.ts";
 import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
 import { buildSetupUi, settle } from "./setup-ui-support.ts";
 
@@ -101,6 +102,47 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
     picker.dispose();
     store.close();
     globalThis.fetch = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Run Detail shows the GitHub wait only for queued runs with an outage episode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-github-wait-ui-"));
+  const store = new Store(":memory:");
+  const repo = store.upsertRepo({
+    slug: "owner/repo",
+    kind: "github",
+    url: "unused",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "Wait" });
+  const detail = store.getRunDetail(run.id);
+  if (!detail) throw new Error("missing detail");
+  const page = await buildNeedsYouUi(dir);
+  const since = Date.UTC(2026, 0, 1, 12);
+  const githubWait = {
+    since,
+    nextAttemptAt: since + 300_000,
+    deadline: since + 21_600_000,
+    reason: "unavailable",
+  };
+  try {
+    page.mount({ ...detail, run: { ...run, status: "queued", githubWait } });
+    const html = renderToString(() => page.render());
+    expect(html).toContain("waiting for GitHub since");
+    expect(html).toContain("next try");
+    expect(html).toContain("gives up");
+    for (const time of [githubWait.since, githubWait.nextAttemptAt, githubWait.deadline])
+      expect(html).toContain(formatDateTime(time));
+    page.mount(detail);
+    expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
+    page.mount({ ...detail, run: { ...run, status: "running", githubWait } });
+    expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
+  } finally {
+    page.dispose();
+    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

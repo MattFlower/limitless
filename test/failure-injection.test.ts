@@ -23,6 +23,7 @@ import {
   createPullRequest,
   GitHubUnavailableError,
   githubRetry,
+  githubWait,
   isTransient,
   mergePullRequest,
   pushBranch,
@@ -69,6 +70,7 @@ const waits = testWaits();
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
 githubRetry.baseDelayMs = 10;
+const normalGithubWait = { ...githubWait };
 
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -170,6 +172,7 @@ beforeEach(async () => {
   factories = [];
 });
 afterEach(async () => {
+  Object.assign(githubWait, normalGithubWait);
   for (const f of factories) {
     await f.stop();
     f.store.close();
@@ -1272,15 +1275,19 @@ test("startup finalizes abandoned running rows before retrying the stage", async
 
 // `cancel` records its reason on an active run and leaves the cancelled status to the engine; a
 // crash between the two leaves exactly this state behind.
-for (const status of ["running", "waiting_input"] as const)
-  test(`a cancel recorded before a crash stays cancelled on restart (${status})`, async () => {
+for (const [status, phase] of [
+  ["running", "triage"],
+  ["waiting_input", "clarify"],
+  ["running", "deliver"],
+] as const)
+  test(`a cancel recorded before a crash stays cancelled on restart (${phase})`, async () => {
     const waiting = status === "waiting_input";
     const f = factory();
     const r = await f.createRun({ repo: source, prompt: "Change" });
     // Past prepare, so a run that resumed instead would really rerun its stage (test/AGENTS.md).
-    f.store.setRunState(r.id, {
+    const state = {
       flow: "build",
-      phase: waiting ? "clarify" : "triage",
+      phase,
       worktreePath: source,
       previewConfig: null,
       slottedCommands: [],
@@ -1290,9 +1297,17 @@ for (const status of ["running", "waiting_input"] as const)
       triedImplementers: [],
       feedback: null,
       toolCommands: [],
-    } satisfies RunState);
+      ...(phase === "deliver"
+        ? {
+            githubWait: { since: Date.now() - 1000, nextAttemptAt: Date.now() + 60_000, reason: "outage" },
+            publishingSha: "verified-head",
+            publishedSha: "published-head",
+          }
+        : {}),
+    } satisfies RunState;
+    f.store.setRunState(r.id, state);
     if (waiting) f.store.askQuestion(r.id, "Which file?");
-    const stage = f.store.startStage(r.id, waiting ? "clarify" : "triage");
+    const stage = f.store.startStage(r.id, phase);
     const inv = waiting
       ? null
       : f.store.createInvocation({
@@ -1314,6 +1329,8 @@ for (const status of ["running", "waiting_input"] as const)
     expect(after?.status).toBe("cancelled");
     expect(after?.error).toBe("cancelled by tester");
     expect(after?.finishedAt).toBeNumber();
+    expect(after?.githubWait).toBeUndefined();
+    expect(next.store.getRunState<RunState>(r.id)).toEqual({ ...state, githubWait: undefined });
     expect(next.scheduler.activeRunIds).toEqual([]);
     expect(next.store.getStage(stage.id)?.status).toBe("cancelled");
     if (inv) expect(next.store.getInvocation(inv.id)?.status).toBe("cancelled");
@@ -2685,6 +2702,7 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
 for (const failures of [2, 3]) {
   const timeout = failures === 3 ? 60_000 : undefined;
   const checkDelivery = async () => {
+    githubWait.maxMs = 0;
     const pr = join(root, "pr");
     const restore = fakeGh(pr);
     try {
@@ -2753,6 +2771,7 @@ async function deliveryFaultFixture() {
       expect(f.store.listStages(r.id).some((s) => s.name === "deliver" && s.status === "succeeded")).toBe(
         draft,
       );
+      expect(state?.githubWait).toBeUndefined();
       expect(state?.pendingRebaseSha).toBeUndefined();
       expect(state?.worktreePath).toBe(before.worktreePath);
       expect(existsSync(before.worktreePath)).toBe(true);
@@ -2777,11 +2796,383 @@ async function deliveryFaultFixture() {
   }
 }
 
+test("GitHub outage: cancellation during parking stays terminal across restart", async () => {
+  githubWait.intervalMs = 60_000;
+  githubWait.maxMs = 600_000;
+  const { f, r, pr, restore } = await deliveryFaultFixture();
+  let cancelled = false;
+  let activeAtCancel = false;
+  let nextAttemptAt = 0;
+  const unsubscribe = f.store.subscribe((msg) => {
+    if (cancelled || msg.kind !== "run" || msg.run.id !== r.id) return;
+    if (msg.run.status !== "queued" || !msg.run.githubWait) return;
+    cancelled = true;
+    nextAttemptAt = msg.run.githubWait.nextAttemptAt;
+    activeAtCancel = f.scheduler.activeRunIds.includes(r.id);
+    f.scheduler.cancel(r.id, "parking subscriber");
+  });
+  try {
+    writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr create", err: bad502 })));
+    f.scheduler.start();
+    await waits.until(() => cancelled && !f.scheduler.activeRunIds.includes(r.id), {
+      timeoutMs: 25_000,
+      subscribe: (wake) => f.store.subscribe(wake),
+    });
+    expect(cancelled).toBe(true);
+    expect(activeAtCancel).toBe(true);
+    expect(f.store.getRun(r.id)).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by parking subscriber",
+      finishedAt: expect.any(Number),
+      githubWait: undefined,
+    });
+    expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+    expect(ghCalls(pr, "pr create")).toHaveLength(3);
+    const calls = ghCalls(pr, "");
+    const stages = f.store.listStages(r.id);
+    const invocations = f.store.listInvocations(r.id);
+    const clock = spyOn(Date, "now").mockReturnValue(nextAttemptAt + 1);
+    try {
+      f.scheduler.tick();
+      const next = await reopen(f);
+      next.scheduler.tick();
+      expect(next.scheduler.activeRunIds).toEqual([]);
+      expect(next.store.getRun(r.id)).toMatchObject({
+        status: "cancelled",
+        error: "cancelled by parking subscriber",
+        githubWait: undefined,
+      });
+      expect(next.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+      expect(next.store.listStages(r.id)).toEqual(stages);
+      expect(next.store.listInvocations(r.id)).toEqual(invocations);
+      expect(ghCalls(pr, "")).toEqual(calls);
+    } finally {
+      clock.mockRestore();
+    }
+  } finally {
+    unsubscribe();
+    await restore();
+  }
+});
+
+test("GitHub outage: cancellation on the first running publication aborts the admitted attempt", async () => {
+  const { f, r, before, pr, refs, restore } = await deliveryFaultFixture();
+  const state: RunState = {
+    ...before,
+    githubWait: { since: Date.now() - 1000, nextAttemptAt: Date.now() - 1, reason: "outage" },
+  };
+  f.store.updateRun(r.id, { status: "queued" }, state);
+  let cancelled = false;
+  let activeAtCancel = false;
+  const unsubscribe = f.store.subscribe((msg) => {
+    if (cancelled || msg.kind !== "run" || msg.run.id !== r.id || msg.run.status !== "running") return;
+    cancelled = true;
+    activeAtCancel = f.scheduler.activeRunIds.includes(r.id);
+    f.scheduler.cancel(r.id, "starting subscriber");
+  });
+  try {
+    const remote = await refs();
+    writeFileSync(`${pr}.calls`, "");
+    const calls = ghCalls(pr, "");
+    const stages = f.store.listStages(r.id);
+    const invocations = f.store.listInvocations(r.id);
+    f.scheduler.start();
+    await settled(f, r.id);
+    expect(cancelled).toBe(true);
+    expect(activeAtCancel).toBe(true);
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    const after = f.store.getRun(r.id);
+    expect(after).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by starting subscriber",
+      finishedAt: expect.any(Number),
+      githubWait: undefined,
+    });
+    expect(f.store.getRunState<RunState>(r.id)).toEqual({ ...state, githubWait: undefined });
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(f.store.getRun(r.id)).toEqual(after);
+    expect(f.store.listStages(r.id)).toEqual(stages);
+    expect(f.store.listInvocations(r.id)).toEqual(invocations);
+    expect(ghCalls(pr, "")).toEqual(calls);
+    expect(await refs()).toBe(remote);
+  } finally {
+    unsubscribe();
+    await restore();
+  }
+});
+
+test("GitHub outage: startup reconciles future queued cancellations and stale cancelled waits", async () => {
+  const { f, r, before, pr, restore } = await deliveryFaultFixture();
+  let current = f;
+  let modelCalls = 0;
+  try {
+    const repo = f.store.getRepo(r.repoId);
+    if (!repo) throw new Error("missing repo");
+    const state: RunState = {
+      ...before,
+      githubWait: { since: Date.now() - 1000, nextAttemptAt: Date.now() + 86_400_000, reason: "outage" },
+      publishingSha: before.lastVerifiedSha,
+      publishedSha: before.lastVerifiedSha,
+    };
+    const finishedAt = Date.now() - 10_000;
+    const rows = (
+      [
+        ["queued", "cancelled by queued tester", null],
+        ["queued", "cancelled by completed tester", finishedAt],
+        ["cancelled", "cancelled by terminal tester", finishedAt],
+        ["cancelled", null, finishedAt],
+      ] as const
+    ).map(([status, error, finishedAt], index) => {
+      const run = index === 0 ? r : f.store.createRun(repo, { repo: repo.slug, prompt: "Change" });
+      f.store.updateRun(run.id, { status, error, finishedAt }, state);
+      return {
+        id: run.id,
+        error,
+        finishedAt,
+        stages: f.store.listStages(run.id),
+        invocations: f.store.listInvocations(run.id),
+      };
+    });
+    writeFileSync(`${pr}.calls`, "");
+    const calls = ghCalls(pr, "");
+    const recovered = [];
+    for (let restart = 0; restart < 2; restart++) {
+      await current.stop();
+      current.store.close();
+      factories = factories.filter((v) => v !== current);
+      current = factory(undefined, (s) => {
+        modelCalls++;
+        return answer(s);
+      });
+      current.deps.gh = f.deps.gh;
+      current.scheduler.drain();
+      current.scheduler.start();
+      expect(current.scheduler.activeRunIds).toEqual([]);
+      for (const row of rows) {
+        const after = current.store.getRun(row.id);
+        expect(after).toMatchObject({
+          status: "cancelled",
+          error: row.error,
+          finishedAt: row.finishedAt ?? expect.any(Number),
+          githubWait: undefined,
+        });
+        expect(current.store.getRunState<RunState>(row.id)).toEqual({ ...state, githubWait: undefined });
+        expect(current.store.listStages(row.id)).toEqual(row.stages);
+        expect(current.store.listInvocations(row.id)).toEqual(row.invocations);
+      }
+      recovered.push(rows.map((row) => current.store.getRun(row.id)));
+      expect(modelCalls).toBe(0);
+      expect(ghCalls(pr, "")).toEqual(calls);
+    }
+    expect(recovered[1]).toEqual(recovered[0]);
+  } finally {
+    await restore();
+  }
+});
+
+test("GitHub outage: a due queued cancellation is finalized before execution", async () => {
+  const { f, r, before, pr, restore } = await deliveryFaultFixture();
+  const state: RunState = {
+    ...before,
+    githubWait: { since: Date.now() - 1000, nextAttemptAt: Date.now() - 1, reason: "outage" },
+  };
+  try {
+    f.store.updateRun(r.id, { status: "queued", error: "cancelled by tester" }, state);
+    writeFileSync(`${pr}.calls`, "");
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    const stages = f.store.listStages(r.id);
+    const invocations = f.store.listInvocations(r.id);
+    const calls = ghCalls(pr, "");
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(f.store.getRun(r.id)).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by tester",
+      finishedAt: expect.any(Number),
+      githubWait: undefined,
+    });
+    expect(f.store.getRunState<RunState>(r.id)).toEqual({ ...state, githubWait: undefined });
+    expect(f.store.listStages(r.id)).toEqual(stages);
+    expect(f.store.listInvocations(r.id)).toEqual(invocations);
+    expect(ghCalls(pr, "")).toEqual(calls);
+  } finally {
+    await restore();
+  }
+});
+
+test.each([
+  "parks, then delivers",
+  "restart mid-wait",
+  "restart during a resumed attempt",
+  "cancel while parked",
+  "deadline",
+])("GitHub outage: %s", async (scenario) => {
+  githubWait.intervalMs = 60_000;
+  githubWait.maxMs = 600_000;
+  const { f, r, before, remote, pr, restore } = await deliveryFaultFixture();
+  const pushes: string[][] = [];
+  const realSh = proc.sh;
+  const command = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+    if (cmd.includes("push")) pushes.push(cmd);
+    return realSh(cmd, opts);
+  });
+  const fail = () =>
+    writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr create", err: bad502 })));
+  const signal = new AbortController().signal;
+  let current = f;
+  try {
+    fail();
+    expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+    const parked = f.store.getRun(r.id);
+    const wait = f.store.getRunState<RunState>(r.id)?.githubWait;
+    if (!wait) throw new Error("missing GitHub wait");
+    expect(parked).toMatchObject({
+      status: "queued",
+      stage: null,
+      error: null,
+      githubWait: { ...wait, deadline: wait.since + githubWait.maxMs },
+    });
+    expect(wait.reason).toContain("GitHub unavailable");
+    expect(wait.nextAttemptAt).toBeGreaterThan(wait.since);
+    expect(f.store.getRunState<RunState>(r.id)?.needsHumanReason).toBeUndefined();
+    expect(f.store.parkedRunIds()).toEqual([]);
+    expect(ghCalls(pr, "pr create")).toHaveLength(3);
+    expect(ghCalls(pr, "pr create").some((c) => c.includes("--draft"))).toBe(false);
+    expect(
+      f.store
+        .listEvents(r.id)
+        .some(
+          (e) =>
+            e.level === "warn" &&
+            e.message?.includes("delivery retries at") &&
+            e.message.includes("gives up at"),
+        ),
+    ).toBe(true);
+    // Filtering must precede LIMIT, so this older parked run cannot starve another run.
+    const repo = f.store.getRepo(r.repoId);
+    if (!repo) throw new Error("missing repo");
+    const other = f.store.createRun(repo, { repo: repo.slug, prompt: "Other" });
+    f.store.db.query("UPDATE runs SET created_at = ? WHERE id = ?").run(r.createdAt + 1, other.id);
+    expect(f.store.nextQueuedRuns(1, wait.nextAttemptAt - 1).map((r) => r.id)).toEqual([other.id]);
+    expect(f.store.nextQueuedRuns(1, wait.nextAttemptAt).map((r) => r.id)).toEqual([r.id]);
+    f.scheduler.cancel(other.id, "test");
+    const calls = ghCalls(pr, "").length;
+    if (scenario === "cancel while parked") {
+      expect(f.scheduler.cancel(r.id, "test")).toBe(true);
+      current = await reopen(f);
+      current.scheduler.tick();
+      expect(current.store.getRun(r.id)).toMatchObject({ status: "cancelled", githubWait: undefined });
+      expect(ghCalls(pr, "")).toHaveLength(calls);
+      return;
+    }
+    if (scenario === "restart during a resumed attempt") {
+      f.deps.faults = { "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pushed" } };
+      fail();
+      expect(await executeRun(f.deps, r.id, signal)).toBe("running");
+      expect(f.store.getRun(r.id)?.githubWait?.since).toBe(wait.since);
+    }
+    if (scenario.startsWith("restart")) {
+      const beforeRestart = ghCalls(pr, "").length;
+      current = await reopen(f);
+      current.scheduler.tick();
+      expect(current.scheduler.activeRunIds).toEqual([]);
+      expect(current.store.getRunState<RunState>(r.id)?.githubWait).toEqual(wait);
+      expect(ghCalls(pr, "")).toHaveLength(beforeRestart);
+    }
+    if (scenario === "restart during a resumed attempt") {
+      expect(await executeRun(current.deps, r.id, signal)).toBe("queued");
+      expect(current.store.getRun(r.id)?.githubWait?.since).toBe(wait.since);
+    }
+    const state = current.store.getRunState<RunState>(r.id);
+    if (!state?.githubWait) throw new Error("missing saved wait");
+    if (scenario === "deadline") {
+      state.githubWait.since = Date.now() - githubWait.maxMs - 1;
+      current.store.setRunState(r.id, state);
+      fail();
+      expect(await executeRun(current.deps, r.id, signal)).toBe("needs_human");
+      expect(ghCalls(pr, "pr create")).toHaveLength(7);
+      expect(ghCalls(pr, "pr create").at(-1)).toContain("--draft");
+      expect(current.store.getRun(r.id)?.error).toContain("waited");
+      expect(current.store.getRunState<RunState>(r.id)?.needsHumanReason).toContain("waited");
+    } else {
+      writeFileSync(`${pr}.fail`, "[]");
+      if (scenario.startsWith("restart")) {
+        state.githubWait.nextAttemptAt = Date.now() - 1;
+        current.store.setRunState(r.id, state);
+        current.scheduler.tick();
+        await settled(current, r.id);
+      } else expect(await executeRun(current.deps, r.id, signal)).toBe("succeeded");
+      expect(current.store.getRun(r.id)?.status).toBe("succeeded");
+      expect(ghCalls(pr, "pr create")).toHaveLength(scenario === "restart during a resumed attempt" ? 7 : 4);
+      expect(ghCalls(pr, "pr create").some((c) => c.includes("--draft"))).toBe(false);
+      expect(pushes).toHaveLength(1);
+    }
+    const branch = current.store.getRun(r.id)?.branch;
+    expect((await sh(["git", "rev-parse", `refs/heads/${branch}`], { cwd: remote })).stdout.trim()).toBe(
+      before.lastVerifiedSha,
+    );
+    expect(current.store.getRun(r.id)?.githubWait).toBeUndefined();
+    expect(current.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+  } finally {
+    command.mockRestore();
+    await restore();
+  }
+});
+
+test.each(["cause", "cancel recorded during failure"])("GitHub outage: %s", async (scenario) => {
+  const { f, r, pr, restore } = await deliveryFaultFixture();
+  f.deps.gh = async () => {
+    if (scenario === "cancel recorded during failure")
+      f.store.updateRun(r.id, { error: "cancelled by test" });
+    throw new Error("delivery unavailable", { cause: new GitHubUnavailableError("GitHub unavailable") });
+  };
+  try {
+    expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe(
+      scenario === "cause" ? "queued" : "cancelled",
+    );
+    expect(f.store.getRun(r.id)?.githubWait !== undefined).toBe(scenario === "cause");
+    expect(existsSync(`${pr}.calls`)).toBe(false);
+  } finally {
+    await restore();
+  }
+});
+
+test("GitHub outage in publication check parks instead of reporting a private-string block", async () => {
+  const { f, r, pr, restore } = await deliveryFaultFixture();
+  const realSh = proc.sh;
+  let attempts = 0;
+  const command = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+    if (cmd.includes("ls-remote")) {
+      attempts++;
+      throw new CommandError(
+        "Could not resolve host: example.invalid",
+        128,
+        "",
+        "Could not resolve host: example.invalid",
+        false,
+      );
+    }
+    return realSh(cmd, opts);
+  });
+  try {
+    expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("queued");
+    expect(attempts).toBe(githubRetry.attempts);
+    expect(f.store.getRun(r.id)?.githubWait?.reason).toContain("Could not resolve host");
+    expect(f.store.getRun(r.id)?.githubWait?.reason).not.toContain("Private-string check blocked");
+    expect(ghCalls(pr, "pr create")).toEqual([]);
+  } finally {
+    command.mockRestore();
+    await restore();
+  }
+});
+
 test.each(["permanent PR-create failure", "PR-create timeout", "unparsable PR-create response"])(
   "delivery persists needs_human after %s through fallback",
   async (fault) => {
     const { before, remote, pr, restore, finish } = await deliveryFaultFixture();
     const timeout = fault === "PR-create timeout";
+    if (timeout) githubWait.maxMs = 0;
     const reason = timeout
       ? "gh pr create timed out"
       : fault === "permanent PR-create failure"
@@ -2833,6 +3224,7 @@ test.each([
   ["corrupt bare cache", "failed to unpack tree object HEAD", false],
 ] as const)("delivery persists needs_human after %s", async (fault, reason, draft) => {
   const { f, r, before, remote, pr, restore, refs, finish, cache } = await deliveryFaultFixture();
+  if (fault === "exhausted network fetch failure") githubWait.maxMs = 0;
   const branch = f.store.getRun(r.id)?.branch;
   if (!branch) throw new Error("missing delivery branch");
   const realGit = Bun.which("git");
@@ -2922,6 +3314,7 @@ test("PR create retries a lagging lookup after 'already exists', up to twice", a
 });
 
 test("a fallback after the budget is spent still records a PR that was created", async () => {
+  githubWait.maxMs = 0;
   const pr = join(root, "pr");
   const restore = fakeGh(pr);
   const budgetMs = githubRetry.budgetMs;
