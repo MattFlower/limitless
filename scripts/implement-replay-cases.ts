@@ -236,13 +236,12 @@ export async function generateReplayCases(
       }
       const root = mkdtempSync(join(tmpdir(), "implement-replay-"));
       try {
-        const candidate = join(root, "base");
-        const { prepared, cleanup } = await prepareImplementCase(item, candidate, signal, (base, snapshot) =>
+        const checkout = (cwd: string, base: string, snapshot: boolean) =>
           createEvalWorktreeFromCache(
             repository,
             base,
             base,
-            candidate,
+            cwd,
             signal,
             {
               paths: ["evals/implement"],
@@ -255,15 +254,21 @@ export async function generateReplayCases(
               ],
             },
             snapshot,
-          ),
+          );
+        const candidate = join(root, "candidate");
+        const { prepared, cleanup } = await prepareImplementCase(item, candidate, signal, (base, snapshot) =>
+          checkout(candidate, base, snapshot),
         ).catch((error: Error) => {
           throw new Error(`excluded: runner preparation: ${error.message}`);
         });
         try {
           for (const revision of ["base", "head"] as const) {
             const cwd = join(root, revision);
+            let cleanupBase: (() => Promise<void>) | undefined;
             try {
-              if (revision === "head")
+              // Preparation preserves ignored setup outputs; validation needs a fresh snapshot.
+              if (revision === "base") cleanupBase = await checkout(cwd, item.base, true);
+              else
                 await withRepoLock(repository, () => addDetachedWorktree(repository, item.head, cwd, signal));
               row[revision] = await withCommandScratch(cwd, async () => {
                 const gates = prepared.gates;
@@ -305,6 +310,7 @@ export async function generateReplayCases(
               row[revision] = "not-run";
               row.reason += `${revision}: error: ${(error as Error).message}; `;
             }
+            await cleanupBase?.();
             if (revision === "head") {
               await withRepoLock(repository, () =>
                 cacheGit(["git", "worktree", "remove", "--force", cwd], {

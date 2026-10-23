@@ -93,6 +93,7 @@ const kinds = [
   "snapshot-failure",
   "load-error",
   "contaminated",
+  "fresh-setup",
 ];
 const seed = seeded(async (root) => {
   const source = join(root, "source");
@@ -102,15 +103,17 @@ const seed = seeded(async (root) => {
   const commits: Record<string, { base: string; head: string }> = {};
   mkdirSync(join(source, "evals/implement"), { recursive: true });
   writeFileSync(join(source, "evals/implement/cases.json"), '{"labels":"fixture history"}');
+  writeFileSync(join(source, ".gitignore"), "setup-output/\n");
   for (const kind of kinds) {
     rmSync(join(source, "test"), { recursive: true, force: true });
     mkdirSync(join(source, "test"));
     writeFileSync(join(source, "answer.ts"), `export const answer = ${kind === "base-pass" ? 42 : 0};\n`);
     writeFileSync(
       join(source, ".limitless.toml"),
-      `[gates]\nsetup = ["${kind === "setup-failure" ? "false" : "printf ready > ready"}"]\n${kind === "snapshot-failure" ? 'checks = [{ name = "reads-evals", run = "test -f evals/implement/cases.json" }]\n' : ""}`,
+      `[gates]\nsetup = ["${kind === "setup-failure" ? "false" : kind === "fresh-setup" ? "mkdir setup-output && printf ready > ready" : "printf ready > ready"}"]\n${kind === "snapshot-failure" ? 'checks = [{ name = "reads-evals", run = "test -f evals/implement/cases.json" }]\n' : ""}`,
     );
     if (kind === "load-error") rmSync(join(source, "answer.ts"));
+    rmSync(join(source, "leaked.ts"), { force: true });
     if (kind === "contaminated") writeFileSync(join(source, "leaked.ts"), testSource(42));
     writeFileSync(join(source, changed), testSource(0));
     writeFileSync(
@@ -313,6 +316,23 @@ test("squash replay preserves request, all hidden bytes, production evidence and
       expect(readFileSync(join(dirname(f.casePath), "hidden/impl-01000", path))).toEqual(
         Buffer.from(testSource(42)),
       );
+    await f.clean();
+  } finally {
+    f.close();
+  }
+});
+
+test("setup that creates an ignored directory runs in fresh preparation, base and head checkouts", async () => {
+  const f = await fixture();
+  try {
+    const rows = await f.run([10]);
+    expect(rows[0]).toMatchObject({
+      base: "fail",
+      head: "pass",
+      baseFailure: "assertion-failure",
+      reason: "accepted",
+    });
+    expect(f.read().cases[1]).toMatchObject({ ...f.commits["fresh-setup"], snapshot: true });
     await f.clean();
   } finally {
     f.close();

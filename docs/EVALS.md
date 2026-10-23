@@ -342,8 +342,9 @@ while the dataset retains the original squash commit and first parent as provena
 failures exclude the case with the runner's reason, including remaining label contamination or a
 baseline check that fails after removing `evals/`.
 
-After preparation succeeds, hidden tests run independently on the prepared base snapshot and the
-actual reference head, using setup and gate configuration selected from base. The hidden command
+After preparation succeeds, hidden tests run independently on a fresh base snapshot and the
+actual reference head, using setup and gate configuration selected from base. Each validation
+checkout runs setup once, without reusing preparation's ignored outputs. The hidden command
 must complete with a nonzero exit at base and zero at head. The table distinguishes base assertion
 failures from test load errors (such as `Cannot find module`); both qualify. Load-error cases also
 receive the `base-load-error` tag. A base pass, head failure, setup failure, timeout, launch failure
