@@ -155,6 +155,7 @@ export class LandQueue {
   private readonly waiting = new Map<number, { controller: AbortController; work: Promise<void> }>();
   private readonly repump = new Set<string>();
   private conflictStartup?: { controller: AbortController; work: Promise<void> };
+  private recoveryTimer?: { id: unknown };
   private readonly owner = randomUUID();
 
   constructor(private readonly deps: LandDeps) {}
@@ -169,7 +170,7 @@ export class LandQueue {
     return this.deps.clock?.now ?? Date.now;
   }
 
-  /** Resume unowned or expired claims, then wait for new requests. */
+  /** Resume unowned or expired claims, including claims left fresh by a crash. */
   start(): void {
     this.stopped = false;
     if (!this.conflictStartup) {
@@ -186,11 +187,29 @@ export class LandQueue {
       if (entry.state === "waiting_approval") this.watchApproval(entry);
       else this.pump(entry.repo);
     }
+    this.scheduleRecovery();
+  }
+
+  private scheduleRecovery(): void {
+    if (this.stopped || this.recoveryTimer) return;
+    const timer = { id: undefined as unknown };
+    const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
+    this.recoveryTimer = timer;
+    timer.id = set(() => {
+      if (this.stopped || this.recoveryTimer !== timer) return;
+      this.recoveryTimer = undefined;
+      for (const repo of new Set(this.store.listLandEntries({ active: true }).map((e) => e.repo)))
+        this.pump(repo);
+      this.scheduleRecovery();
+    }, CLAIM_STALE_MS);
   }
 
   /** Abort in-flight git, gates and `gh` calls; entries keep their state for the next start. */
   async stop(): Promise<void> {
     this.stopped = true;
+    const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
+    if (this.recoveryTimer) clear(this.recoveryTimer.id);
+    this.recoveryTimer = undefined;
     this.conflictStartup?.controller.abort();
     for (const wait of this.waiting.values()) wait.controller.abort();
     for (const controller of this.inFlight.values()) controller.abort();

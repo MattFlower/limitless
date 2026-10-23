@@ -14,6 +14,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
 import { redactGateStreams } from "../gates/output.ts";
+import { type Release, release } from "../release.ts";
 import { sh } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import {
@@ -120,8 +121,8 @@ function plist(
 `;
 }
 
-export function mtplxPlist(): string {
-  return plist(MTPLX_LABEL, [
+export function mtplxPlist(workingDirectory = appDir): string {
+  const args = [
     join(home, ".mtplx", "bin", "mtplx"),
     "serve",
     "--model",
@@ -135,7 +136,8 @@ export function mtplxPlist(): string {
     "--batching-preset",
     "agent",
     "--yes",
-  ]);
+  ];
+  return plist(MTPLX_LABEL, args, {}, workingDirectory);
 }
 
 async function launchctl(args: string[], allowFail = true) {
@@ -156,11 +158,28 @@ function samePath(a: unknown, b: string): boolean {
 type Migration = Record<"label" | "path" | "target" | "phase" | "backup", string> & {
   old: { label: string; path: string };
 };
-type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]>;
+type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]> & {
+  release?: Release;
+  execPath?: string;
+};
+
+export function stableExecutable(execPath = process.execPath): string {
+  const cellar = execPath.match(/^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/([^/]+)$/);
+  if (!cellar) return execPath;
+  const stable = `${cellar[1]}/opt/${cellar[2]}/bin/${cellar[3]}`;
+  try {
+    if (realpathSync(stable) === realpathSync(execPath)) return stable;
+  } catch {
+    // Missing or inaccessible targets cannot establish a stable launch path.
+  }
+  throw new Error(`Cannot use stable executable ${stable}: it must resolve to ${execPath}`);
+}
 export async function installedUnits(opts: ServiceOptions = {}) {
   const dir = opts.agentsDir ?? agentsDir;
-  const release = opts.releaseDir ?? appDir;
-  const entry = join(release, "src", "cli", "main.ts");
+  const packaged = (opts.release ?? release).kind === "packaged";
+  const executablePath = packaged ? stableExecutable(opts.execPath) : "";
+  const workingDirectory = packaged ? join(home, ".limitless") : (opts.releaseDir ?? appDir);
+  const entry = join(opts.releaseDir ?? appDir, "src", "cli", "main.ts");
   const units = [] as { label: string; path: string; kind: string }[];
   const run = opts.command ?? sh;
   const options = { cwd: home, allowFail: true };
@@ -176,8 +195,13 @@ export async function installedUnits(opts: ServiceOptions = {}) {
     const is = (at: number, ...parts: string[]) =>
       parts.every((part, i) => (part.startsWith("/") ? samePath(args[at + i], part) : args[at + i] === part));
     let kind = "";
-    if (executable === "bun" && is(1, entry, "serve")) kind = "daemon";
-    else if (samePath(data.WorkingDirectory, release)) {
+    if (
+      packaged
+        ? args.length === 2 && args[0] === executablePath && args[1] === "serve"
+        : executable === "bun" && is(1, entry, "serve")
+    )
+      kind = "daemon";
+    else if (samePath(data.WorkingDirectory, workingDirectory)) {
       if (is(0, join(home, ".mtplx", "bin", "mtplx"), "serve")) kind = "mtplx";
       if (executable === "cloudflared" && is(1, "tunnel", "--config", config, "run")) kind = "tunnel";
     }
@@ -243,19 +267,27 @@ async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
 }
 
 export function installationUnits(
-  opts: { mtplx?: boolean } = {},
+  opts: { mtplx?: boolean; release?: Release; execPath?: string } = {},
   tunnel: string | null = null,
 ): [string, string][] {
-  const units: [string, string][] = [
-    [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
-  ];
+  const packaged = (opts.release ?? release).kind === "packaged";
+  const workingDirectory = packaged ? join(home, ".limitless") : appDir;
+  const args = packaged
+    ? [stableExecutable(opts.execPath), "serve"]
+    : [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"];
+  const units: [string, string][] = [[LABEL, plist(LABEL, args, {}, workingDirectory)]];
   if (opts.mtplx === true) {
-    units.push([MTPLX_LABEL, mtplxPlist()]);
+    units.push([MTPLX_LABEL, mtplxPlist(workingDirectory)]);
   }
   if (tunnel) {
     units.push([
       TUNNEL_LABEL,
-      plist(TUNNEL_LABEL, ["/opt/homebrew/bin/cloudflared", "tunnel", "--config", tunnel, "run"]),
+      plist(
+        TUNNEL_LABEL,
+        ["/opt/homebrew/bin/cloudflared", "tunnel", "--config", tunnel, "run"],
+        {},
+        workingDirectory,
+      ),
     ]);
   }
   return units;
@@ -266,6 +298,8 @@ export async function install(
   opts: { tunnel?: boolean; mtplx?: boolean; publicUrl?: string | null } & ServiceOptions = {},
   control?: { run: typeof sh; race: <T>(work: Promise<T>) => Promise<T>; recover?: boolean },
 ): Promise<void> {
+  const info = opts.release ?? release;
+  if (info.kind === "packaged") opts = { ...opts, execPath: stableExecutable(opts.execPath) };
   // Reuse deploy's lock and signal scope for installation and journal recovery.
   if (!control)
     return deploy(port, undefined, false, {
@@ -340,17 +374,23 @@ export async function install(
     return;
   }
   mkdirSync(logDir, { recursive: true });
-  mkdirSync(agentsDir, { recursive: true });
-  await ensureRelease(appDir, command);
-  await command(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
-  const previous = await installedUnits({ command });
-  const target = (await command(["git", "rev-parse", "HEAD"], { cwd: appDir })).stdout.trim();
+  const agents = opts.agentsDir ?? agentsDir;
+  mkdirSync(agents, { recursive: true });
+  if (info.kind === "source") {
+    await ensureRelease(appDir, command);
+    await command(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
+  }
+  const previous = await installedUnits({ ...opts, command });
+  const target =
+    info.kind === "packaged"
+      ? info.sha
+      : (await command(["git", "rev-parse", "HEAD"], { cwd: appDir })).stdout.trim();
   // The public tunnel is opt-in: only once webhook authentication is in place.
   const tunnel = opts.tunnel ? tunnelConfig(port, opts.publicUrl ?? null) : null;
   if (opts.tunnel && !tunnel) console.warn("skipping tunnel: no cloudflared credentials or no public_url");
   const units = installationUnits(opts, tunnel);
   for (const [label, content] of units) {
-    const path = join(agentsDir, `${label}.plist`);
+    const path = join(agents, `${label}.plist`);
     const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     if (existsSync(path) && !samePath(old?.path, path)) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
@@ -365,7 +405,7 @@ export async function install(
     try {
       if (old && label === LABEL && (await isLoaded(old.label))) {
         drainAttempted = true;
-        await race(requestAdmin(client, clock, "drain"));
+        await requestDrain(client, clock, race);
         await race(waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log));
       }
       if (state) save(Object.assign(state, { phase: "stopping" }));
@@ -504,6 +544,127 @@ async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOp
   if (smoke) await gate(SMOKE, 900_000);
 }
 
+async function kickstart(opts: ServiceOptions, label?: string): Promise<unknown> {
+  if (opts.restart) return opts.restart();
+  label ??= (await installedUnits(opts)).find((unit) => unit.kind === "daemon")?.label;
+  if (!label) throw new Error("no installed daemon agent; run limitless service install");
+  return (opts.command ?? sh)(["launchctl", "kickstart", "-k", `gui/${uid}/${label}`], { cwd: home });
+}
+
+function resumeFailure(port: number, error: unknown): string {
+  const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
+  const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
+  return `resume scheduler: ${String(error)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`;
+}
+
+async function requestDrain(
+  client: DeployClient,
+  clock: DeployClock,
+  race: <T>(work: Promise<T>) => Promise<T>,
+): Promise<void> {
+  const request = requestAdmin(client, clock, "drain");
+  try {
+    await race(request);
+  } catch (error) {
+    // Cleanup must not resume ahead of an in-flight drain; its request timeout still bounds this wait.
+    await request.catch(() => {});
+    throw error;
+  }
+}
+
+export async function restart(port: number, opts: ServiceOptions = {}): Promise<void> {
+  const client = opts.client ?? localDeployClient(port),
+    clock = opts.clock ?? deployClock;
+  const log = opts.log ?? console.log;
+  const maxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
+  const { run, race, interruption, release } = serviceControl(opts, "restart");
+  try {
+    const agent = (await installedUnits({ ...opts, command: run })).find((unit) => unit.kind === "daemon");
+    if (!agent) throw new Error("no installed daemon agent; run limitless service install");
+    const running = validateHealth(await race(bounded(clock, (signal) => client.health(signal))));
+    if (running.sha === "unknown") throw new Error("cannot restart: daemon boot SHA is unknown");
+    const before = { ...running, observedAt: clock.now() };
+    log(`daemon before: ${running.sha}`);
+    let restartAttempted = false;
+    try {
+      if (!running.draining) await requestDrain(client, clock, race);
+      await race(waitForDrain(client, clock, maxWaitMs, opts.now === true, log));
+      if (interruption()) throw interruption();
+      log("restarting daemon via launchd");
+      restartAttempted = true;
+      await race(kickstart({ ...opts, command: run }, agent.label));
+      const replacement = await race(waitForHealthy(client, clock, running.sha, log, before));
+      log(`daemon after: ${replacement.sha}; new boot healthy`);
+    } catch (error) {
+      if (!restartAttempted || !interruption()) {
+        const draining =
+          !restartAttempted ||
+          (await bounded(clock, (signal) => client.health(signal)).then(
+            (state) => state.draining,
+            () => false,
+          ));
+        if (draining) {
+          try {
+            await requestAdmin(client, clock, "resume");
+          } catch (resume) {
+            log(resumeFailure(port, resume));
+          }
+        }
+      }
+      if (restartAttempted && !interruption()) await status(port, opts);
+      throw error;
+    }
+  } finally {
+    release();
+  }
+}
+
+function serviceControl(opts: ServiceOptions, operation: "deploy" | "restart") {
+  const command = opts.command ?? sh;
+  const log = opts.log ?? console.log;
+  const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
+  let interrupted: Error | null = null;
+  const commandAbort = new AbortController();
+  let rejectSignal = (_error: Error) => {};
+  const signal = new Promise<never>((_, reject) => {
+    rejectSignal = reject;
+  });
+  void signal.catch(() => {});
+  const onSignal = (name: string) => {
+    if (interrupted) {
+      (opts.exit ?? process.exit)(name === "SIGINT" ? 130 : 143);
+      return;
+    }
+    interrupted = new Error(`${operation} interrupted by ${name}`);
+    log(operation === "deploy" ? "interrupted, rolling back..." : "interrupted, stopping restart...");
+    commandAbort.abort();
+    rejectSignal(interrupted);
+  };
+  const onInt = () => onSignal("SIGINT");
+  const onTerm = () => onSignal("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  const race = <T>(work: Promise<T>): Promise<T> => Promise.race([work, signal]);
+  const run: typeof sh = async (args, options) => {
+    if (interrupted) throw interrupted;
+    const result = await command(args, { ...options, signal: commandAbort.signal });
+    if (interrupted) throw interrupted;
+    return result;
+  };
+  return {
+    run,
+    race,
+    interruption: () => interrupted,
+    signal: commandAbort.signal,
+    release: () => {
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+      unlock();
+    },
+  };
+}
+
 /**
  * Deploy a ref to the release checkout: gate on the checks, restart, health-check, and roll
  * back to the previous commit if the new version does not come up.
@@ -534,44 +695,10 @@ export async function deploy(
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
   const client = opts.client ?? localDeployClient(port);
   const clock = opts.clock ?? deployClock;
-  const restart =
-    opts.restart ??
-    (async () => {
-      const agent = (await installedUnits(opts)).find((unit) => unit.kind === "daemon");
-      if (!agent) throw new Error("no installed daemon agent; run limitless service install");
-      return command(["launchctl", "kickstart", "-k", `gui/${uid}/${agent.label}`], { cwd: home });
-    });
+  const restart = () => kickstart(opts);
   const log = opts.log ?? console.log;
-  const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
-  let interrupted: Error | null = null;
-  const commandAbort = new AbortController();
-  const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal: commandAbort.signal };
-  let rejectSignal = (_error: Error) => {};
-  const signal = new Promise<never>((_, reject) => {
-    rejectSignal = reject;
-  });
-  void signal.catch(() => {});
-  const onSignal = (name: string) => {
-    if (interrupted) {
-      (opts.exit ?? process.exit)(name === "SIGINT" ? 130 : 143);
-      return;
-    }
-    interrupted = new Error(`deploy interrupted by ${name}`);
-    log("interrupted, rolling back...");
-    commandAbort.abort();
-    rejectSignal(interrupted);
-  };
-  const onInt = () => onSignal("SIGINT");
-  const onTerm = () => onSignal("SIGTERM");
-  process.on("SIGINT", onInt);
-  process.on("SIGTERM", onTerm);
-  const race = <T>(work: Promise<T>): Promise<T> => Promise.race([work, signal]);
-  const run: typeof sh = async (args, options) => {
-    if (interrupted) throw interrupted;
-    const result = await command(args, { ...options, signal: commandAbort.signal });
-    if (interrupted) throw interrupted;
-    return result;
-  };
+  const { run, race, interruption, signal, release } = serviceControl(opts, "deploy");
+  const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal };
   let previous = "";
   let drainAttempted = false;
   let restartAttempted = false;
@@ -619,7 +746,7 @@ export async function deploy(
     drainAttempted = true;
     try {
       if (running.draining) log(`daemon ${previous} is already draining; continuing deployment`);
-      else await race(requestAdmin(client, clock, "drain"));
+      else await requestDrain(client, clock, race);
       await race(waitForDrain(client, clock, maxWaitMs, opts.now === true, log));
     } catch (error) {
       if (!(error instanceof DrainUnsupportedError)) throw error;
@@ -631,14 +758,14 @@ export async function deploy(
         );
       log("--now: the running daemon has no drain endpoint; restarting without draining");
     }
-    if (interrupted) throw interrupted;
+    if (interruption()) throw interruption();
     restartAttempted = true;
     await race(restart());
     const replacement = await race(waitForHealthy(client, clock, target, log));
     log(`daemon after: ${replacement.sha}`);
     log(`deployed ${previous.slice(0, 8)} → ${target.slice(0, 8)}`);
   } catch (error) {
-    if (interrupted && restartAttempted) throw interrupted;
+    if (interruption() && restartAttempted) throw interruption();
     if (!previous) throw error;
     const cleanupErrors: string[] = [];
     const cleanup = async (name: string, action: () => Promise<unknown>) => {
@@ -657,11 +784,7 @@ export async function deploy(
       try {
         await requestAdmin(client, clock, "resume");
       } catch (resume) {
-        const tokenPath = join(process.env.LIMITLESS_HOME ?? join(home, ".limitless"), "api-token");
-        const quotedPath = `'${tokenPath.replace(/'/g, `'"'"'`)}'`;
-        cleanupErrors.push(
-          `resume scheduler: ${String(resume)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`,
-        );
+        cleanupErrors.push(resumeFailure(port, resume));
       }
     }
     throw new Error(
@@ -670,19 +793,32 @@ export async function deploy(
       { cause: error },
     );
   } finally {
-    process.off("SIGINT", onInt);
-    process.off("SIGTERM", onTerm);
-    unlock();
+    release();
   }
 }
 
-export async function status(port: number): Promise<void> {
-  for (const { label } of await installedUnits())
-    console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
-  if (existsSync(join(appDir, ".git"))) {
-    // This release repository is written only by the user/deployer, never by an agent.
-    const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
-    console.log(`release: ${head}`);
+export async function status(port: number, opts: ServiceOptions = {}): Promise<void> {
+  const command = opts.command ?? sh,
+    log = opts.log ?? console.log;
+  const dir = opts.releaseDir ?? appDir;
+  for (const { label } of await installedUnits(opts)) {
+    const result = await command(["launchctl", "print", `gui/${uid}/${label}`], {
+      cwd: home,
+      allowFail: true,
+    });
+    log(`${label}: ${result.exitCode === 0 ? "loaded" : "not loaded"}`);
   }
-  console.log(`health: ${(await health(port, 2000)) ? "ok" : "unreachable"}`);
+  if (existsSync(join(dir, ".git"))) {
+    // This release repository is written only by the user/deployer, never by an agent.
+    const head = (await command(["git", "log", "-1", "--format=%h %s"], { cwd: dir })).stdout.trim();
+    log(`release: ${head}`);
+  }
+  const client = opts.client;
+  const healthy = client
+    ? await bounded(opts.clock ?? deployClock, (signal) => client.health(signal), 2000).then(
+        () => true,
+        () => false,
+      )
+    : await health(port, 2000);
+  log(`health: ${healthy ? "ok" : "unreachable"}`);
 }

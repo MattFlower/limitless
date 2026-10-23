@@ -1553,7 +1553,7 @@ test.each([
     const before = claimSnapshot(entry);
     if (response === "error") pending.reject(new CommandError("lookup denied", 1, "", "denied", false));
     else pending.resolve(JSON.stringify({ url: url(1), state: "OPEN", isDraft: false, headRefOid: head }));
-    await waitWithoutClock(() => clock.pending === 0);
+    await waitWithoutClock(() => clock.pending === 1);
     expect(claimSnapshot(entry)).toEqual(before);
     expect(attempts).toBe(2);
     expect(gates.requests).toHaveLength(0);
@@ -1957,6 +1957,110 @@ test("a repository claim is durable: a second claim finds nothing", async () => 
   expect(store.claimLandEntry(SLUG, 30_000, "test-owner")?.id).toBe(entry.id);
 });
 
+function crashedLandClaim() {
+  const pr = delivered(1, "pr-1");
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: "a".repeat(40),
+  });
+  expect(store.claimLandEntry(SLUG, 30_000, "crashed-owner", clock.now() - 5000)?.id).toBe(entry.id);
+  return entry;
+}
+
+test("recovery wakeup resumes a crashed owner's checking entry after its claim expires", async () => {
+  const entry = crashedLandClaim();
+  let reads = 0;
+  const git = spyOn(repos, "ensureCache");
+  const q = queue({
+    start: false,
+    client: async () => {
+      throw new Error("unexpected CI read");
+    },
+    gh: async (_args, signal) => {
+      reads++;
+      // Hold resumed processing at its first dependency, and let shutdown abort it.
+      return new Promise<string>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  try {
+    q.start();
+    await clock.flush();
+    await clock.advance(25_000);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", attempts: 1 });
+    expect(reads).toBe(0);
+    await clock.advance(5000);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", attempts: 2 });
+    expect(store.ownsLandClaim(entry.id, "crashed-owner")).toBe(false);
+    expect(reads).toBe(1);
+    await clock.advance(30_000);
+    expect(store.getLandEntry(entry.id)?.attempts).toBe(2);
+    expect(reads).toBe(1);
+    expect(git).not.toHaveBeenCalled();
+    await q.stop();
+    expect(clock.pending).toBe(0);
+  } finally {
+    await q.stop();
+    git.mockRestore();
+  }
+});
+
+test.each([false, true])(
+  "idle recovery is bounded and stops without external work, foreign claim=%s",
+  async (foreign) => {
+    const entry = foreign ? crashedLandClaim() : undefined;
+    const calls: string[] = [];
+    const git = spyOn(proc, "sh");
+    const cache = spyOn(repos, "ensureCache");
+    const claim = spyOn(store, "claimLandEntry");
+    const q = queue({
+      start: false,
+      gh: async () => {
+        calls.push("gh");
+        throw new Error("unexpected gh call");
+      },
+      client: async () => {
+        calls.push("CI");
+        return null;
+      },
+    });
+    try {
+      q.start();
+      q.start();
+      await clock.flush();
+      expect(clock.pending).toBe(1);
+      for (let i = 0; i < 3; i++) {
+        await clock.advance(29_999);
+        if (entry) expect(store.heartbeatLandClaim(entry.id, "crashed-owner", clock.now())).toBe(true);
+        await clock.advance(1);
+        expect(clock.pending).toBe(1);
+        if (entry) expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", attempts: 1 });
+      }
+      expect(claim.mock.calls).toHaveLength(foreign ? 5 : 0); // two starts and three recovery pumps
+      await q.stop();
+      expect(clock.pending).toBe(0);
+      const claims = claim.mock.calls.length;
+      await clock.advance(90_000);
+      expect(claim).toHaveBeenCalledTimes(claims);
+      expect(calls).toEqual([]);
+      expect(github.rest()).toEqual([]);
+      expect(git).not.toHaveBeenCalled();
+      expect(cache).not.toHaveBeenCalled();
+      expect(ghCalls("pr ")).toEqual([]);
+    } finally {
+      await q.stop();
+      claim.mockRestore();
+      git.mockRestore();
+      cache.mockRestore();
+    }
+  },
+);
+
 test("two queues on one database never run two checks for the same repository", async () => {
   gateSlots.setLimit(2);
   const first = delivered(1, "pr-1");
@@ -2073,7 +2177,7 @@ test.each(["merged", "failed", "exception"] as const)(
       });
       const before = snapshot();
       release.resolve();
-      await waitWithoutClock(() => clock.pending === 0, 15_000);
+      await waitWithoutClock(() => clock.pending === 1, 15_000);
       await q.stop();
       expect(snapshot()).toEqual(before);
       expect(boundary).toHaveBeenCalledTimes(1);
@@ -2131,7 +2235,7 @@ test("a resumed land cannot merge after losing its claim during a CI read", asyn
     });
     const before = snapshot();
     response.resolve(view);
-    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await waitWithoutClock(() => clock.pending === 1, 15_000);
     await q.stop();
     expect(snapshot()).toEqual(before);
     expect(ghCalls("pr merge")).toEqual([]);
@@ -2182,7 +2286,7 @@ test.each(["preparation", "completion"] as const)(
       const before = snapshot();
       const pushed = await remoteHead("pr-1");
       release.resolve();
-      await waitWithoutClock(() => clock.pending === 0, 15_000);
+      await waitWithoutClock(() => clock.pending === 1, 15_000);
       await q.stop();
       expect(snapshot()).toEqual(before);
       expect(await remoteHead("pr-1")).toBe(pushed);
@@ -2574,7 +2678,7 @@ test.each(["pushed", "unrelated"])(
     });
     observe(1, pinned, "FAILURE", ["network"]);
     await waitWithoutClock(
-      () => reads === 1 && (clock.pending > 1 || store.getLandEntry(entry.id)?.state === "blocked"),
+      () => reads === 1 && (clock.pending > 2 || store.getLandEntry(entry.id)?.state === "blocked"),
     );
     expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
     expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
@@ -3428,7 +3532,7 @@ test("a reclaim during push retry backoff prevents the next push and all publica
     const before = claimSnapshot(entry);
     const now = clock.now();
     release?.();
-    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await waitWithoutClock(() => clock.pending === 1, 15_000);
     expect(pushes).toBe(1);
     expect(ghCalls("pr merge")).toEqual([]);
     expect(claimSnapshot(entry)).toEqual(before);
@@ -3513,7 +3617,7 @@ test("a reclaim during the pre-merge lookup prevents every merge command", async
     expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
     const before = claimSnapshot(entry);
     rmSync(join(root, "gh.hold-view"));
-    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await waitWithoutClock(() => clock.pending === 1, 15_000);
     expect(claimSnapshot(entry)).toEqual(before);
     expect(ghCalls("pr merge")).toEqual([]);
   } finally {
@@ -3546,7 +3650,7 @@ test("pushExistingBranch checks the claim after its internal remote lookup and a
   const q = queue();
   try {
     await q.request({ target: pr.run.id });
-    await waitWithoutClock(() => !!before && clock.pending === 0, 15_000);
+    await waitWithoutClock(() => !!before && clock.pending === 1, 15_000);
     if (!entry || !before) throw new Error("guard never reached");
     expect(claimSnapshot(entry)).toEqual(before);
     expect(signal?.aborted).toBe(true);
@@ -3582,7 +3686,7 @@ test.each([201, 422])("a reclaim during a pending rerun POST leaves no writes (%
     const before = claimSnapshot(reclaimed);
     const calls = github.rest().length;
     response.resolve(respond(status, {}));
-    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await waitWithoutClock(() => clock.pending === 1, 15_000);
     expect(claimSnapshot(reclaimed)).toEqual(before);
     expect(github.rest()).toHaveLength(calls);
     expect(ghCalls("pr merge")).toEqual([]);
@@ -3618,7 +3722,7 @@ test("a heartbeat aborts after the replacement owner blocks the entry", async ()
     expect(signal?.aborted).toBe(true);
     expect(claimSnapshot(entry)).toEqual(before);
     release.resolve();
-    await waitWithoutClock(() => clock.pending === 0, 15_000);
+    await waitWithoutClock(() => clock.pending === 1, 15_000);
   } finally {
     release.resolve();
     await q.stop();
