@@ -96,6 +96,8 @@ export interface RunState {
   slottedCommands?: SlottedCommands;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
+  /** Effective review mode, pinned before the run's first review invocation. */
+  reviewMode?: "single" | "panel";
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
   gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };

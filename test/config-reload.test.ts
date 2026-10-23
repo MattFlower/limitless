@@ -1,6 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { loadConfig } from "../src/config.ts";
+import { reloadedConfig } from "../src/config-reload.ts";
 import { executeGate, type GateRequest } from "../src/gates/executor.ts";
 import type { GateRun } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
@@ -13,7 +15,9 @@ import { productionReviewSystem } from "../src/pipeline/review-system.ts";
 import { reloadFixture } from "./config-reload-support.ts";
 
 test("mixed reloads apply only live keys, compare against active overrides, and record names only", () => {
-  const f = reloadFixture('[server]\nport = 7400\n[review]\nimplementer_report = "include"\n');
+  const f = reloadFixture(
+    '[server]\nport = 7400\n[limits]\n[workers]\n[review]\nimplementer_report = "include"\n',
+  );
   const initialSecrets = f.factory.cfg.secrets;
   const sentinel = crypto.randomUUID();
   writeFileSync(join(f.configDir, "secrets.env"), `OPENROUTER_API_KEY=${sentinel}\n`);
@@ -53,18 +57,90 @@ test("mixed reloads apply only live keys, compare against active overrides, and 
   expect(Object.keys(items[0]?.data ?? {}).sort()).toEqual(["applied", "restartRequired"]);
   expect(JSON.stringify({ result, items })).not.toContain(sentinel);
   expect(JSON.stringify({ result, items })).not.toContain("7500");
-  f.write("[server]\nport = 7400\n");
+  f.write("[server]\nport = 7400\n[limits]\n[workers]\n[review]\n");
   expect(f.factory.reloadConfig()).toEqual({
     applied: result.applied,
     restartRequired: [],
     unchanged: ["server.port"],
   });
   expect(f.factory.cfg.reviewImplementerReport).toBe("include");
-  expect(f.factory.cfg.raw.review).toBeUndefined();
+  expect(f.factory.cfg.raw.review).toEqual({});
   expect(f.factory.cfg.workers.agents).toEqual([]);
-  expect(f.factory.reloadConfig()).toEqual({ applied: [], restartRequired: [], unchanged: ["server.port"] });
+  expect(f.factory.reloadConfig()).toEqual({
+    applied: [],
+    restartRequired: [],
+    unchanged: ["limits", "review", "server.port", "workers"],
+  });
   expect(f.factory.store.readFeed().items).toHaveLength(4);
 });
+
+const liveSections = [
+  {
+    section: "workers",
+    text: '[workers]\nlisten = "127.0.0.1:7501"\nagents = ["implement"]\nrepos = ["test/repo"]\n',
+  },
+  { section: "limits", text: "[limits]\nmax_concurrent_runs = 7\nmax_concurrent_gates = 5\n" },
+  {
+    section: "review",
+    text: '[review]\nmode = "panel"\nimplementer_report = "omit"\ntrusted_reviewers = ["reviewer"]\n',
+  },
+] as const;
+
+for (const { section, text } of liveSections) {
+  test.each(["scalar", "array", "removed", "added"])(
+    `${section} shape change (%s) stays inactive`,
+    (shape) => {
+      const f = reloadFixture(shape === "added" ? "" : text);
+      const current = f.factory.cfg;
+      f.write(shape === "added" ? text : "");
+      const next = loadConfig({ home: f.home, configDir: f.configDir });
+      // Startup rejects non-tables for workers/review; exercise the merge boundary independently.
+      if (shape === "scalar" || shape === "array") next.raw[section] = shape === "scalar" ? 42 : [];
+      let active = current;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { cfg, result } = reloadedConfig(active, next);
+        expect(cfg).toEqual(current);
+        expect(result.restartRequired).toContain(section);
+        expect(result.applied.some((key) => key === section || key.startsWith(`${section}.`))).toBe(false);
+        active = cfg;
+      }
+    },
+  );
+}
+
+test.each([
+  ...liveSections.map(({ text, section }) => ({ text, section, next: "" })),
+  { text: liveSections[1].text, section: "limits", next: "limits = 42\n" },
+  { text: "", section: "limits", next: liveSections[1].text },
+])(
+  "factory keeps $section values and executors when its section changes shape",
+  ({ text, section, next }) => {
+    const f = reloadFixture(text);
+    const before = f.factory.cfg;
+    const agent = f.factory.deps.agentExecutor;
+    const gate = f.factory.deps.gateExecutor;
+    const schedulerLimit = spyOn(f.factory.scheduler, "setLimit");
+    f.write(next);
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = f.factory.reloadConfig();
+        expect(result).toMatchObject({ applied: [], restartRequired: [section] });
+        expect(f.factory.cfg).toEqual(before);
+        expect(f.factory.deps.cfg).toEqual(before);
+        expect(f.factory.deps.agentExecutor).toBe(agent);
+        expect(f.factory.deps.gateExecutor).toBe(gate);
+        expect(gateSlots.limit).toBe(before.maxConcurrentGates);
+        expect(schedulerLimit).toHaveBeenLastCalledWith(before.maxConcurrentRuns);
+        expect(f.factory.store.readFeed().items.at(-1)?.data).toEqual({
+          applied: [],
+          restartRequired: [section],
+        });
+      }
+    } finally {
+      schedulerLimit.mockRestore();
+    }
+  },
+);
 
 test("invalid TOML and semantic validation leave config, executors, limits and comparison unchanged", () => {
   const f = reloadFixture('[workers]\nlisten = "127.0.0.1:7501"\nagents = ["implement"]\n');
@@ -116,7 +192,7 @@ test("empty non-live tables are reported without changing the active raw configu
 });
 
 test("review roster validation uses the active catalog and does not partially reload", () => {
-  const f = reloadFixture();
+  const f = reloadFixture("[limits]\n[review]\n");
   f.write(
     '[limits]\nmax_concurrent_gates = 8\n[review]\nmode = "panel"\nrosters.quick = [{target = "missing/model", prompt = "standard"}]\n',
   );

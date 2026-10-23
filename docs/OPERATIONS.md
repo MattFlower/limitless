@@ -47,10 +47,14 @@ The live keys are `workers.agents`, `workers.repos`, every supported `[review]` 
 `limits.max_concurrent_runs` / `limits.max_concurrent_gates`. Enabling worker agents requires
 an already active `workers.listen`; listener settings and `gates.executor` still need a restart.
 New calls use the updated worker eligibility. Calls already running keep their executor,
-and each running stage keeps its starting review settings; later stages use the new settings.
+and a land check in progress keeps its starting gate executor through retries.
+Each running stage keeps its starting review settings. A run's review mode is fixed at its first
+review and kept across reloads and restarts; other `[review]` keys apply to later stages.
 Existing review safety rules still apply: runs prepared without base review lenses stay single,
 and a shadow panel without saved base lenses is skipped.
 Lowering a limit lets existing work finish and holds further admissions until capacity is available.
+Live sections must be tables in both the active and edited configuration. Adding, removing, or
+replacing a live section with a non-table needs a restart; none of that section is applied live.
 
 Reload first re-reads and validates both `config.toml` and `secrets.env` using the daemon's
 configuration directory. A validation failure returns HTTP 400 with a redacted error and leaves

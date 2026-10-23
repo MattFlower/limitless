@@ -238,10 +238,14 @@ export class Factory {
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, (s) =>
       console.warn(redactCredentials(s)),
     );
-    const agent =
-      this.opts.agentExecutor ??
-      (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined);
-    const gate = this.opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos);
+    const workersChanged = result.applied.some((key) => key.startsWith("workers."));
+    const agent = workersChanged
+      ? (this.opts.agentExecutor ??
+        (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined))
+      : this.deps.agentExecutor;
+    const gate = workersChanged
+      ? (this.opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos))
+      : this.deps.gateExecutor;
     this.cfg = cfg;
     this.deps.cfg = shadowOk ? cfg : { ...cfg, reviewShadow: "off" };
     this.deps.agentExecutor = agent;

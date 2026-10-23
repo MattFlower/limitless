@@ -1434,8 +1434,15 @@ async function oneRound(
     diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
   const resolution = ctx.state.conflictRound === round;
   const reviewSettings = () => {
+    const reviewMode =
+      ctx.state.reviewMode ??
+      (ctx.state.lastReview?.mode === "panel" ||
+      ctx.state.reviewHistory?.some((entry) => entry.panelReview !== undefined || entry.scope !== undefined)
+        ? "panel"
+        : ctx.deps.cfg.reviewMode);
     const system =
-      ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
+      ctx.deps.reviewSystem ??
+      configuredReviewSystem({ ...ctx.deps.cfg, reviewMode }, profile(ctx), ctx.state.reviewLenses);
     // A gate-failed round reviews nothing; replays retain the same panel number.
     const panelReview =
       system.mode === "panel" && !resolution
@@ -1774,6 +1781,10 @@ async function oneRound(
     "review",
     async (stage) => {
       ({ system, panelReview, panelRules } = reviewSettings());
+      if (ctx.state.reviewMode === undefined) {
+        ctx.state.reviewMode = system.mode;
+        await ctx.save();
+      }
       const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
       const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
       const scope: ReviewScope | undefined =

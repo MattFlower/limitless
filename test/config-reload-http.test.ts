@@ -6,7 +6,7 @@ import { reloadFixture } from "./config-reload-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 test("config reload uses admin authentication, loopback and mutation protections", async () => {
-  const f = reloadFixture("[server]\nrequire_api_token = true\n");
+  const f = reloadFixture("[server]\nrequire_api_token = true\n[limits]\n");
   const token = "a".repeat(64);
   const routes = createHttpRoutes(f.factory, { apiToken: token });
   const route = routes["/api/admin/config/reload"] as { POST: Route; GET?: Route };

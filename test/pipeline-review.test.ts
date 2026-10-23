@@ -40,6 +40,8 @@ const { start } = pipelineSetup({
 
 describe("pipeline (fake agents, real git + gates)", () => {
   test("a reload during implementation updates the later review in the same run", async () => {
+    mkdirSync(join(home, "cfg"));
+    writeFileSync(join(home, "cfg", "config.toml"), "[review]\n");
     const reviews: string[] = [];
     const f = start((s) => {
       const role = roleOf(s);
