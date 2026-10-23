@@ -377,13 +377,14 @@ async function main(): Promise<void> {
               setupWarning?: string;
               agents?: Partial<Record<"claude" | "codex", Cli>>;
               privateStrings?: string;
+              agentJobs?: { id: string }[];
             }[]
           >("/api/workers");
         const cli = (c?: Cli) =>
           c?.loggedIn ? (c.version ?? "unknown") : c?.version ? "logged out" : "missing";
         for (const w of rows)
           console.log(
-            `${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}${w.setupWarning ? `\t${w.setupWarning}` : ""}\tclaude:${cli(w.agents?.claude)}\tcodex:${cli(w.agents?.codex)}\tprivate-strings:${w.privateStrings ?? "unknown"}`,
+            `${w.name}\t${w.state}${w.code ? `\t${w.code}` : ""}${w.setupWarning ? `\t${w.setupWarning}` : ""}\tclaude:${cli(w.agents?.claude)}\tcodex:${cli(w.agents?.codex)}\tprivate-strings:${w.privateStrings ?? "unknown"}\tagent-jobs:${w.agentJobs?.length ?? 0}`,
           );
         return;
       }

@@ -347,10 +347,12 @@ export const VerifySchema = z.object({
     z.object({
       id: z.string(),
       status: z.enum(["met", "unmet", "unclear", "blocked"]),
+      // A default, not optional: OpenAI strict mode requires every property, and an optional one made
+      // every Codex verifier request fail with a 400.
       blockedReason: z
         .enum(["sandbox", "environment"])
         .nullable()
-        .optional()
+        .default(null)
         .describe(
           "For blocked checks: sandbox restrictions or another environmental failure; null otherwise",
         ),

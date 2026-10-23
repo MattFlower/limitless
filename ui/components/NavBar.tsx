@@ -60,6 +60,7 @@ const LINKS: { href: string; label: string }[] = [
   { href: "/setup", label: "Setup" },
   { href: "/models", label: "Models" },
   { href: "/providers", label: "Providers" },
+  { href: "/workers", label: "Workers" },
   { href: "/land", label: "Land" },
   { href: "/evals", label: "Evals" },
   { href: "/chat", label: "Chat" },
