@@ -365,10 +365,17 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "unflagged",
     "cancel slot",
     "cancel retry",
-  ])("post-merge gate timeout: %s", async (scenario) => {
+    "slow pass",
+    "slow twice",
+    "slow changed file",
+    "slow confinement",
+    "slow targeted fresh",
+  ])("post-merge gate re-check: %s", async (scenario) => {
+    const slow = scenario.startsWith("slow");
+    const targeted = scenario === "slow targeted fresh";
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      '[gates]\nsetup = ["fake-setup"]\nchecks = [{ name = "test", run = "fake-test", timeoutSec = 37 }, { name = "lint", run = "fake-lint" }]\n',
+      `[gates]\n${targeted ? 'retry_files = "fake-targeted {files}"\n' : ""}setup = ["fake-setup"]\nchecks = [{ name = "test", run = "fake-test", timeoutSec = 37 }, { name = "lint", run = "fake-lint" }]\n`,
     );
     await sh(
       ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "post-merge timeout fixture"],
@@ -391,6 +398,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     registerGithub(f, bare);
+    if (targeted && f.deps.gateExecutor) f.deps.gateExecutor.freshCheckoutFor = () => true;
     const clock = waitClock();
     const scheduled = [deferred<void>(), deferred<void>()];
     const queued = deferred<void>();
@@ -401,6 +409,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     let held: Promise<() => void> | undefined;
     let release: (() => void) | undefined;
     let attempts = 0;
+    let testAttempts = 0;
+    let runId = "";
+    const retryPurposes: string[] = [];
     let waits = 0;
     let mergedHead = "";
     const commands: string[] = [];
@@ -430,8 +441,37 @@ describe("pipeline (fake agents, real git + gates)", () => {
           }
         }
       }
+      if (postMerge && (command === "fake-test" || command.startsWith("fake-targeted"))) {
+        if (command === "fake-test") testAttempts++;
+        if (slow && (testAttempts > 1 || command.startsWith("fake-targeted"))) {
+          expect(readFileSync(join(cwd, "slow-build-output"), "utf8")).toBe("built\n");
+          retryPurposes.push(f.store.getRunState<RunState>(runId)?.gateExecution?.purpose ?? "missing");
+          if (scenario === "slow pass") {
+            queued.resolve();
+            await finishRetry.promise;
+            expect(acquired).toBe(false);
+          }
+        }
+        if (slow && testAttempts === 1 && command === "fake-test") {
+          writeFileSync(join(cwd, "slow-build-output"), "built\n");
+          if (targeted) {
+            const report = opts.env?.LIMITLESS_GATE_REPORT;
+            if (!report) throw new Error("Missing JUnit report path");
+            writeFileSync(
+              report,
+              '<testsuites tests="1" failures="1" errors="0" skipped="0"><testsuite tests="1" failures="1" errors="0" skipped="0"><testcase file="farewell.txt" name="failure" time="1"><failure>failed</failure></testcase></testsuite></testsuites>',
+            );
+          }
+          if (scenario === "slow pass")
+            held = gateSlots.acquire(new AbortController().signal).then((free) => {
+              acquired = true;
+              return free;
+            });
+        }
+      }
       const timeout =
         postMerge &&
+        !slow &&
         ((command === "fake-test" &&
           (attempts === 1 || scenario === "twice" || scenario === "cancel retry") &&
           !["failure", "setup", "unflagged"].includes(scenario)) ||
@@ -439,7 +479,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const fail =
         postMerge &&
         ((command === "fake-test" &&
-          (scenario === "failure" ||
+          ((slow && (testAttempts === 1 || scenario === "slow twice")) ||
+            scenario === "failure" ||
             scenario === "unflagged" ||
             (scenario === "retry failure" && attempts === 2))) ||
           (command === "fake-lint" && scenario === "mixed") ||
@@ -468,7 +509,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         opts.signal?.throwIfAborted();
       }
       const stderr =
-        timeout && scenario === "confinement" ? ["sandbox_apply:", "Operation not permitted"].join(" ") : "";
+        (timeout && scenario === "confinement") ||
+        (scenario === "slow confinement" && postMerge && command === "fake-test" && testAttempts === 2)
+          ? ["sandbox_apply:", "Operation not permitted"].join(" ")
+          : "";
       opts.onRawChunk?.(stderr, "stderr");
       return {
         exitCode: timeout ? null : fail ? 1 : 0,
@@ -477,24 +521,43 @@ describe("pipeline (fake agents, real git + gates)", () => {
         timedOut: timeout,
         idleTimedOut: false,
         truncated: false,
-        stdout: timeout || fail ? "[timed out] from nested tool" : "passed",
+        stdout:
+          fail && scenario === "slow changed file"
+            ? "farewell.txt:12: failure"
+            : timeout || fail
+              ? "[timed out] from nested tool"
+              : "passed",
         stderr,
-        durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
+        durationMs:
+          command === "fake-test" &&
+          (!postMerge || slow || (scenario === "retry failure" && testAttempts === 2))
+            ? postMerge
+              ? 400_000
+              : 100_000
+            : timeout
+              ? (opts.timeoutMs ?? 900_000)
+              : 1,
       };
     });
     try {
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-      if (!["failure", "unflagged"].includes(scenario)) {
+      runId = run.id;
+      if (!slow && !["failure", "unflagged"].includes(scenario)) {
         await scheduled[0]?.promise;
         await clock.advance(900_000);
       }
-      if (scenario === "slot" || scenario === "cancel slot") {
+      if (scenario === "slow pass") await queued.promise;
+      if (scenario === "slot" || scenario === "cancel slot" || scenario === "slow pass") {
         expect(await Promise.race([queued.promise.then(() => "retry"), held?.then(() => "competitor")])).toBe(
           "retry",
         );
         expect(acquired).toBe(false);
-        expect(attempts).toBe(2);
-        expect(commands).toEqual(["fake-setup", "fake-test", "fake-lint", "fake-setup"]);
+        expect(attempts).toBe(slow ? 1 : 2);
+        expect(commands).toEqual(
+          slow
+            ? ["fake-setup", "fake-test", "fake-lint", "fake-test"]
+            : ["fake-setup", "fake-test", "fake-lint", "fake-setup"],
+        );
         if (scenario === "cancel slot") f.cancelRun(run.id);
         finishRetry.resolve();
         release = await held;
@@ -515,7 +578,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
         "retry setup",
         "cancel retry",
       ].includes(scenario);
-      expect(attempts).toBe(retries ? 2 : 1);
+      expect(attempts).toBe(targeted ? 3 : retries ? 2 : 1);
+      if (slow || scenario === "retry failure") expect(testAttempts).toBe(2);
+      if (slow)
+        expect(retryPurposes).toEqual(
+          targeted ? ["regression-retry-targeted", "regression-retry"] : ["regression-retry"],
+        );
       expect(clock.pending).toBe(0);
       if (scenario.startsWith("cancel")) {
         expect(status).toBe("cancelled");
@@ -532,18 +600,61 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (scenario !== "retry setup")
           expect(evidence[0]?.firstAttempt).toMatchObject({ timedOut: true, exitCode: null });
       }
-      if (scenario === "slot") {
+      if (slow) {
+        const recovered = !["slow twice", "slow confinement"].includes(scenario);
+        expect(evidence[0]).toMatchObject({
+          verdict: recovered ? "flaky" : scenario === "slow confinement" ? "confinement_error" : "regressed",
+          blocking: !recovered,
+          firstAttempt: { ok: false, durationMs: 400_000 },
+          result: { ok: recovered, firstAttempt: { ok: false, durationMs: 400_000 } },
+        });
+        if (targeted) {
+          expect(evidence[0]?.result.targetedRetry).toMatchObject({
+            ok: true,
+            command: "fake-targeted './farewell.txt'",
+          });
+          expect(commands).toEqual([
+            "fake-setup",
+            "fake-test",
+            "fake-lint",
+            "fake-setup",
+            "fake-targeted './farewell.txt'",
+            "fake-setup",
+            "fake-test",
+          ]);
+        }
+        const warnings = f.store
+          .listEvents(run.id)
+          .filter((e) => e.type === "gate" && e.message.includes("post-merge re-check"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings).toMatchObject([
+          {
+            level: "warn",
+            message: `test post-merge re-check: ran 4.0x its pre-merge time (400s vs 100s): ${recovered ? "pass (flaky, not blocking)" : "FAIL again"}`,
+          },
+        ]);
+      }
+      if (scenario === "slot" || (slow && !["slow twice", "slow confinement"].includes(scenario))) {
         expect(status).toBe("succeeded");
         expect(stage?.status).toBe("succeeded");
-        expect(state?.lastGates?.[0]?.firstAttempt?.timedOut).toBe(true);
-        expect(commands).toEqual([
-          "fake-setup",
-          "fake-test",
-          "fake-lint",
-          "fake-setup",
-          "fake-test",
-          "fake-lint",
-        ]);
+        if (slow) {
+          expect(state?.lastGates?.[0]).toMatchObject({
+            verdict: "flaky",
+            blocking: false,
+            firstAttempt: { ok: false },
+          });
+          expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `test`");
+        } else {
+          expect(state?.lastGates?.[0]?.firstAttempt?.timedOut).toBe(true);
+          expect(commands).toEqual([
+            "fake-setup",
+            "fake-test",
+            "fake-lint",
+            "fake-setup",
+            "fake-test",
+            "fake-lint",
+          ]);
+        }
         expect(f.store.getRun(run.id)).toMatchObject({ baseSha: baseTip, headSha: mergedHead });
       } else {
         expect(status).toBe("needs_human");
