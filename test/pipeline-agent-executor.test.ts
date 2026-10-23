@@ -8,7 +8,7 @@ import { agentTestLease } from "../src/gates/agent-tests.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentResult, AgentSpec } from "../src/harness/types.ts";
 import type { AgentCall, AgentExecutor } from "../src/pipeline/agent-executor.ts";
-import { type EngineDeps, type InvokeOptions, RunContext } from "../src/pipeline/context.ts";
+import { type EngineDeps, type InvokeOptions, NeedsHumanError, RunContext } from "../src/pipeline/context.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
@@ -85,6 +85,40 @@ const remoteResult: AgentResult = {
   error: null,
   quota: { windows: { short: { utilization: 0.2, resetsAt: null } }, exhaustedUntil: null },
 };
+
+test("NeedsHuman finalizes the invocation after releasing its slot without observing health", async () => {
+  const reason = new NeedsHumanError("Run branch moved during a failed worker attempt");
+  const f = fixture({
+    kind: "lan",
+    async run() {
+      throw reason;
+    },
+  });
+  f.tracker.record("alpha", "unavailable");
+  expect(f.tracker.status("alpha")?.state).toBe("degraded");
+  const record = spyOn(f.tracker, "record");
+  const windows = spyOn(f.tracker, "observeWindows");
+  const confinement = spyOn(f.tracker, "observeConfinement");
+  const publication = {
+    async prepare() {
+      return null;
+    },
+    async adopt() {},
+    async remoteSha() {
+      return null;
+    },
+  };
+  await expect(f.invoke({ publication })).rejects.toBe(reason);
+  expect(f.calls).toHaveLength(0);
+  expect(f.store.listInvocations(f.run.id)).toMatchObject([
+    { status: "error", error: reason.message, finishedAt: expect.any(Number) },
+  ]);
+  expect(record).not.toHaveBeenCalled();
+  expect(windows).not.toHaveBeenCalled();
+  expect(confinement).not.toHaveBeenCalled();
+  expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+  expect(f.tracker.status("alpha")?.state).toBe("degraded");
+});
 
 test.each([
   ["ordinary", {}, false],

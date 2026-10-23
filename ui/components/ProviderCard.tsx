@@ -5,15 +5,10 @@ import type { ProviderStatus } from "../../src/core/types.ts";
 import type { ProviderWorkload, WorkloadTotals } from "../../src/db/stats.ts";
 import { setProviderEnabled, setProviderFast } from "../api.ts";
 import { compactNumber, duration, money, pct, resetsIn } from "../lib/format.ts";
+import { gaugeClass } from "../lib/gauge.ts";
 import { now } from "../lib/ticker.ts";
 import { windowLabel } from "../lib/window-label.ts";
 import { ProviderStatePill } from "./StatusPill.tsx";
-
-function gaugeClass(util: number): string {
-  if (util >= 0.9) return "crit";
-  if (util >= 0.7) return "warn";
-  return "";
-}
 
 function openRouterDetails(provider: ProviderStatus): string {
   const estimate = provider.spendUsd ?? 0;

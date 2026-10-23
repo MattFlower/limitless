@@ -296,7 +296,7 @@ export class WorkerStore {
     return this.store.db.query<AgentJobRow, [string]>("SELECT * FROM agent_jobs WHERE id=?").get(id);
   }
   enqueueAgentJob(req: AgentJobRequest) {
-    if ([req.target.backend, req.target.openai, req.target.decisions].some((t) => t?.authToken)) return null;
+    if ("backend" in req.target || "openai" in req.target || "decisions" in req.target) return null;
     let credentials = false;
     const request = JSON.stringify(req, (key, value: unknown) => {
       credentials ||= credentialInText(key) || (typeof value === "string" && credentialInText(value));
@@ -362,6 +362,16 @@ export class WorkerStore {
         "SELECT NULL AS attempt,seq,events,created_at FROM agent_job_events WHERE job_id=? UNION ALL SELECT attempt,seq,events,created_at FROM agent_job_attempt_events WHERE job_id=? ORDER BY attempt,seq",
       )
       .all(id, id);
+  }
+  agentJobEventsAfter(id: string, cursor = { attempt: -1, seq: -1 }) {
+    return this.store.db
+      .query<
+        { attempt: number; seq: number; events: string; created_at: number },
+        [string, string, number, number, number]
+      >(
+        "SELECT * FROM (SELECT -1 AS attempt,seq,events,created_at FROM agent_job_events WHERE job_id=? UNION ALL SELECT attempt,seq,events,created_at FROM agent_job_attempt_events WHERE job_id=?) WHERE attempt>? OR (attempt=? AND seq>?) ORDER BY attempt,seq",
+      )
+      .all(id, id, cursor.attempt, cursor.attempt, cursor.seq);
   }
   failAgentJob(id: string, reason: string) {
     this.store.db

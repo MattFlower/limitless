@@ -4361,6 +4361,27 @@ const agentRequest = (overrides: Partial<AgentJobRequest> = {}): AgentJobRequest
   },
   ...overrides,
 });
+
+test.each(["backend", "openai", "decisions"] as const)(
+  "agent targets with %s stay local regardless of contents",
+  (field) => {
+    for (const value of [{ baseUrl: "http://localhost:8080", authToken: "" }, undefined]) {
+      const req = agentRequest();
+      req.target[field] = value;
+      expect(workers.enqueueAgentJob(req)).toBeNull();
+      expect(store.db.query("SELECT * FROM agent_jobs").all()).toEqual([]);
+    }
+  },
+);
+
+test.each(["claude", "codex"] as const)("plain %s CLI agent targets still enqueue", (harness) => {
+  const req = agentRequest();
+  req.target.harness = harness;
+  const id = workers.enqueueAgentJob(req);
+  expect(id).not.toBeNull();
+  expect(workers.agentJob(id ?? "")?.request).toBe(JSON.stringify(req));
+});
+
 function enqueueAgent(overrides: Partial<AgentJobRequest> = {}) {
   const id = workers.enqueueAgentJob(agentRequest(overrides));
   if (!id) throw new Error("Agent request refused");

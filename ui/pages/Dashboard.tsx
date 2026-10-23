@@ -1,12 +1,15 @@
 import type { Component } from "solid-js";
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack } from "solid-js";
 import type { Stats } from "../../src/db/stats.ts";
 import { getStats } from "../api.ts";
 import { CostCell } from "../components/CostCell.tsx";
 import { CostChart } from "../components/CostChart.tsx";
 import { FilterChips, matchesRunFilter, type RunFilter } from "../components/FilterChips.tsx";
 import { KpiStrip } from "../components/KpiStrip.tsx";
+import { PipelineMap } from "../components/PipelineMap.tsx";
 import { RunsTable } from "../components/RunsTable.tsx";
+import { padDays } from "../lib/days.ts";
+import { openNeedsYou } from "../lib/needs-you.ts";
 import { ensureLiveStore, live, subscribeLiveUpdates } from "../store.ts";
 
 const STATS_REFRESH_MS = 30_000;
@@ -59,6 +62,18 @@ export const Dashboard: Component = () => {
     const f = statusFilter();
     return f ? runs().filter((r) => matchesRunFilter(r.status, f, attention()?.has(r.id))) : runs();
   });
+  // Re-pad only when the stats or the calendar day change, not on every clock tick, so the chart's
+  // bars (and a focused bar's tooltip) are not rebuilt each second.
+  const today = createMemo(() => new Date(now()).toDateString());
+  const chartDays = createMemo(() => {
+    today();
+    const s = stats();
+    return s ? padDays(s.days, 14, untrack(now)) : [];
+  });
+  const delivered = createMemo(() => {
+    const totals = stats()?.totals;
+    return totals ? { succeeded: totals.succeeded, runs: totals.runs } : undefined;
+  });
   const alerts = createMemo(() =>
     Object.values(live.alerts).filter((a) => a.resetsAt === null || a.resetsAt > now()),
   );
@@ -66,7 +81,19 @@ export const Dashboard: Component = () => {
   return (
     <div class="page stack">
       <div class="page-header">
-        <h1 class="page-title">Mission control</h1>
+        <div>
+          <h1 class="page-title">Mission control</h1>
+          <Show when={stats()}>
+            {(s) => (
+              <p class="page-subtitle">
+                {s().totals.runs} {s().totals.runs === 1 ? "run" : "runs"} in the last 14 days ·{" "}
+                {openNeedsYou(s()) === 0
+                  ? "nothing needs you right now"
+                  : `${openNeedsYou(s())} ${openNeedsYou(s()) === 1 ? "needs" : "need"} you`}
+              </p>
+            )}
+          </Show>
+        </div>
       </div>
 
       <For each={alerts()}>
@@ -88,19 +115,21 @@ export const Dashboard: Component = () => {
         )}
       </For>
 
+      <PipelineMap runs={runs()} delivered={delivered()} />
+
       <Show when={stats()} fallback={<div class="centered-hint">loading stats…</div>}>
         {(s) => <KpiStrip totals={s().totals} />}
       </Show>
 
       <div class="grid-2">
         <div class="card card-pad">
-          <div class="section-label">Cost per day (14d)</div>
+          <h2 class="card-title">Cost per day · 14d</h2>
           <Show when={stats()} fallback={<div class="centered-hint">loading…</div>}>
-            {(s) => <CostChart days={s().days} />}
+            <CostChart days={chartDays()} />
           </Show>
         </div>
         <div class="card card-pad">
-          <div class="section-label">By model (14d)</div>
+          <h2 class="card-title">By model · 14d</h2>
           <Show when={stats()} fallback={<div class="centered-hint">loading…</div>}>
             {(s) => (
               <table class="table">
@@ -138,10 +167,8 @@ export const Dashboard: Component = () => {
       </div>
 
       <div>
-        <div class="page-header" style={{ "margin-bottom": "10px" }}>
-          <div class="section-label" style={{ "margin-bottom": 0 }}>
-            Runs
-          </div>
+        <div class="page-header runs-header">
+          <h2 class="section-title">Runs</h2>
           <FilterChips active={statusFilter()} onChange={setStatusFilter} />
         </div>
         <div class="card">
