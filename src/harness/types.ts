@@ -67,6 +67,8 @@ export interface AgentSpec {
    * not home directories, other temporary directories or `denyRead`.
    */
   confineReads?: boolean;
+  /** Opt a Claude reader into local port binding (macOS); ignored by other harnesses. */
+  allowLocalBinding?: boolean;
   timeoutMs: number;
   idleTimeoutMs: number;
   /** Invocation-owned clock excluding live slotted-command time; never used for overall deadlines. */
