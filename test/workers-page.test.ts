@@ -82,13 +82,30 @@ test("Workers renders capabilities and jobs, refreshes with newest responses and
     };
     const root = f.node();
     const respond = (index: number, value: unknown) => f.requests[index]?.resolve(Response.json(value));
+    const unavailable = (index: number) =>
+      f.requests[index]?.resolve(Response.json({ error: "not found" }, { status: 404 }));
+    const refresh = () => {
+      const index = f.requests.length;
+      f.focus();
+      expect(f.requests.slice(index).map((r) => r.path)).toEqual(["/api/workers", "/api/workers/runs"]);
+      return index;
+    };
     dispose = f.render(() => f.Workers(), root);
     expect(f.requests.map((r) => r.path)).toEqual(["/api/workers", "/api/workers/runs"]);
+    respond(0, [{ name: "initial worker", state: "available" }]);
+    await flush();
+    expect(text(root)).toContain("initial worker"); // History is still pending.
+    expect(text(root)).toContain("loading…");
+    unavailable(1);
+    await flush();
+    expect(text(root)).toContain("initial worker");
+    expect(text(root)).toContain("Run history unavailable");
+    expect(text(root)).not.toContain("loading…");
     f.advanceTimers(9999);
     expect(f.requests).toHaveLength(2);
     f.advanceTimers(1);
     expect(f.requests).toHaveLength(4);
-    respond(2, [
+    const workerRows = [
       {
         name: "runner",
         state: "available",
@@ -103,9 +120,20 @@ test("Workers renders capabilities and jobs, refreshes with newest responses and
         agentJobs: [{ id: "job-one", attempt: 2, runId: "active" }],
       },
       { name: "pending", state: "pending", code: "PAIRING", privateStrings: "unknown" },
-    ]);
-    respond(3, [{ runId: "completed", title: "Finished run" }]);
+    ];
+    respond(2, workerRows);
+    unavailable(3);
     await flush();
+    expect(text(root)).toContain("runner");
+    expect(text(root)).toContain("Run history unavailable");
+    const recovery = refresh();
+    respond(recovery, [...workerRows, { name: "focus worker", state: "available" }]);
+    await flush();
+    expect(text(root)).toContain("focus worker");
+    expect(text(root)).toContain("Run history unavailable");
+    respond(recovery + 1, [{ runId: "completed", title: "Finished run" }]);
+    await flush();
+    expect(text(root)).not.toContain("Run history unavailable");
     for (const value of [
       "runner",
       "available",
@@ -132,40 +160,82 @@ test("Workers renders capabilities and jobs, refreshes with newest responses and
         .filter((n) => n.tag === "a")
         .map((n) => n.props.href),
     ).toEqual(["/runs/active", "/runs/completed"]);
-    respond(0, []);
-    respond(1, []);
-    await flush();
-    expect(text(root)).toContain("runner");
-    expect(text(root)).toContain("Finished run");
-    f.focus(); // Request generation 3 will fail after generation 4 succeeds.
-    f.focus();
-    respond(6, [{ name: "legacy", state: "offline" }]);
-    respond(7, []);
+    const staleSuccess = refresh();
+    const latestSuccess = refresh();
+    respond(latestSuccess, [{ name: "legacy", state: "offline" }]);
+    respond(latestSuccess + 1, [{ runId: "latest", title: "Latest run" }]);
     await flush();
     expect(text(root)).toContain("legacy");
     expect(text(root)).toContain("unavailable");
-    f.requests[4]?.reject(new Error("stale failure"));
-    respond(5, []);
+    respond(staleSuccess, []);
+    respond(staleSuccess + 1, []);
     await flush();
-    expect(text(root)).not.toContain("stale failure");
-    f.focus();
-    respond(8, []);
-    respond(9, []);
+    expect(text(root)).toContain("legacy");
+    expect(text(root)).toContain("Latest run");
+
+    const staleFailure = refresh();
+    const empty = refresh();
+    respond(empty, []);
+    respond(empty + 1, []);
     await flush();
     expect(text(root)).toContain("No paired workers");
-    f.focus();
+    f.requests[staleFailure]?.reject(new Error("stale workers failure"));
+    f.requests[staleFailure + 1]?.reject(new Error("stale history failure"));
+    await flush();
+    expect(text(root)).not.toContain("stale");
+    expect(text(root)).not.toContain("Run history unavailable");
+
+    const staleRecovery = refresh();
+    const failure = refresh();
+    f.requests[failure]?.reject(new Error("Workers request failed"));
+    unavailable(failure + 1);
+    await flush();
+    expect(text(root)).toContain("Workers request failed");
+    expect(text(root)).toContain("Run history unavailable");
+    respond(staleRecovery, [{ name: "stale worker", state: "available" }]);
+    respond(staleRecovery + 1, [{ runId: "stale", title: "Stale run" }]);
+    await flush();
+    expect(text(root)).not.toContain("stale worker");
+    expect(text(root)).not.toContain("Stale run");
+    expect(text(root)).toContain("Workers request failed");
+    expect(text(root)).toContain("Run history unavailable");
+
+    const independent = refresh();
+    respond(independent + 1, [{ runId: "recovered", title: "Recovered history" }]);
+    await flush();
+    expect(text(root)).toContain("Recovered history"); // Workers is still pending.
+    expect(nodes(root).some((n) => n.tag === "a" && n.props.href === "/runs/recovered")).toBe(true);
+    expect(text(root)).not.toContain("Run history unavailable");
+    f.requests[independent]?.reject(new Error("Workers still unavailable"));
+    await flush();
+    expect(text(root)).toContain("Workers still unavailable");
+    expect(text(root)).toContain("Recovered history");
+    const hideHistory = refresh();
+    respond(hideHistory, [{ name: "returned worker", state: "available" }]);
+    unavailable(hideHistory + 1);
+    await flush();
+    expect(text(root)).toContain("returned worker");
+    expect(text(root)).not.toContain("Workers still unavailable");
+    expect(text(root)).not.toContain("Recovered history");
+    expect(text(root)).toContain("Run history unavailable");
+
+    const disposedSuccess = refresh();
+    const disposedFailure = refresh();
     dispose();
     expect(f.timerCount()).toBe(0);
     expect(f.focusListeners()).toBe(0);
-    respond(10, [{ name: "disposed" }]);
-    respond(11, []);
+    respond(disposedSuccess, [{ name: "disposed worker" }]);
+    respond(disposedSuccess + 1, [{ runId: "disposed", title: "Disposed history" }]);
+    f.requests[disposedFailure]?.reject(new Error("disposed workers failure"));
+    f.requests[disposedFailure + 1]?.reject(new Error("disposed history failure"));
     await flush();
     expect(text(root)).not.toContain("disposed");
+    expect(text(root)).not.toContain("Disposed history");
     f.advanceTimers(10_000);
     f.focus();
-    expect(f.requests).toHaveLength(12);
+    expect(f.requests).toHaveLength(disposedFailure + 2);
     const pending = f.getWorkers();
-    f.requests[12]?.resolve(new Response("unauthorized", { status: 401 }));
+    f.requests[disposedFailure + 2]?.resolve(new Response("unauthorized", { status: 401 }));
     await expect(pending).rejects.toThrow("unauthorized");
     expect(f.redirects).toEqual(["/login?next=%2Fworkers"]);
     const nav = f.node();
@@ -173,7 +243,7 @@ test("Workers renders capabilities and jobs, refreshes with newest responses and
     expect(
       nodes(nav).some((n) => n.tag === "a" && n.props.href === "/workers" && text(n) === "Workers"),
     ).toBe(true);
-    respond(13, { session: null });
+    respond(disposedFailure + 3, { session: null });
     await flush();
   } finally {
     dispose();

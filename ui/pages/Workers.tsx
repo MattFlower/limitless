@@ -4,27 +4,46 @@ import { getWorkerRuns, getWorkers, type Worker } from "../api.ts";
 
 export const Workers: Component = () => {
   const [workers, setWorkers] = createSignal<Worker[]>();
-  const [runs, setRuns] = createSignal<WorkerRun[]>([]);
+  const [runs, setRuns] = createSignal<WorkerRun[]>();
   const [error, setError] = createSignal("");
-  let generation = 0;
-  const load = async () => {
-    const request = ++generation;
+  const [runsUnavailable, setRunsUnavailable] = createSignal(false);
+  let workersGeneration = 0;
+  let runsGeneration = 0;
+  const loadWorkers = async () => {
+    const request = ++workersGeneration;
     try {
-      const [workers, runs] = await Promise.all([getWorkers(), getWorkerRuns()]);
-      if (request !== generation) return;
-      setWorkers(workers);
-      setRuns(runs);
+      const result = await getWorkers();
+      if (request !== workersGeneration) return;
+      setWorkers(result);
       setError("");
     } catch (err) {
-      if (request === generation) setError(err instanceof Error ? err.message : String(err));
+      if (request === workersGeneration) setError(err instanceof Error ? err.message : String(err));
     }
+  };
+  const loadRuns = async () => {
+    const request = ++runsGeneration;
+    try {
+      const result = await getWorkerRuns();
+      if (request !== runsGeneration) return;
+      setRuns(result);
+      setRunsUnavailable(false);
+    } catch {
+      if (request !== runsGeneration) return;
+      setRuns(undefined);
+      setRunsUnavailable(true);
+    }
+  };
+  const load = () => {
+    void loadWorkers();
+    void loadRuns();
   };
   onMount(() => {
     void load();
     const timer = setInterval(load, 10_000);
     window.addEventListener("focus", load);
     onCleanup(() => {
-      generation++;
+      workersGeneration++;
+      runsGeneration++;
       clearInterval(timer);
       window.removeEventListener("focus", load);
     });
@@ -35,7 +54,7 @@ export const Workers: Component = () => {
       <Show when={error()}>
         <div class="text-danger">{error()}</div>
       </Show>
-      <Show when={workers()} fallback={<div>loading…</div>}>
+      <Show when={workers()} fallback={<Show when={!error()}>loading…</Show>}>
         <Show when={workers()?.length === 0}>
           <div>No paired workers</div>
         </Show>
@@ -80,7 +99,12 @@ export const Workers: Component = () => {
         </For>
       </Show>
       <h2 class="section-label">Runs that used workers</h2>
-      <For each={runs()}>{(run) => <a href={`/runs/${run.runId}`}>{run.title || run.runId}</a>}</For>
+      <Show when={runsUnavailable()}>
+        <div class="text-danger">Run history unavailable</div>
+      </Show>
+      <Show when={runs()} fallback={<Show when={!runsUnavailable()}>loading…</Show>}>
+        <For each={runs()}>{(run) => <a href={`/runs/${run.runId}`}>{run.title || run.runId}</a>}</For>
+      </Show>
     </div>
   );
 };
