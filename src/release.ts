@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { version } from "../package.json";
 
 export const BUILD_DEFINES = {
@@ -11,7 +12,7 @@ declare const LIMITLESS_BUILD_SHA: string;
 type BuildIdentity = { version?: string; sha?: string };
 export type Release = { version: string; bun: string } & (
   | { kind: "source"; root: string }
-  | { kind: "packaged"; sha: string }
+  | { kind: "packaged"; sha: string; root?: string }
 );
 
 export function resolveRelease({
@@ -50,4 +51,19 @@ export async function resolveReleaseBootSha(
   info: Release = release,
 ): Promise<string | undefined> {
   return info.kind === "packaged" ? info.sha : resolveGit(info.root);
+}
+
+// Bun embeds each `--asset` under its basename at the bundle root (`/$bunfs/root`), which every bundled
+// module, including this one, sees as `import.meta.dir`. `root` on a packaged release only exists for tests.
+export function resourcePath(relative: string, info: Release = release): string {
+  return info.kind === "source"
+    ? join(info.root, relative)
+    : join(info.root ?? import.meta.dir, basename(relative));
+}
+
+export function policyOverlayPath(info: Release = release): string {
+  const path = resourcePath("routing/policy.json", info);
+  if (info.kind === "packaged" && !existsSync(path))
+    throw new Error(`Packaged Limitless is missing its embedded routing overlay: ${path}`);
+  return path;
 }

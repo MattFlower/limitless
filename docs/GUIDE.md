@@ -277,6 +277,7 @@ unreachable for one lease period after the restart is retried on another worker.
 pushed without an accepted report ends the run NeedsHuman. Before manually rolling back past S5a,
 cancel runs that were in a worker implement round: older releases can lease leftover jobs without
 the release parity check.
+The signed-in `/workers` page shows capabilities, current agent jobs and recent runs that used workers.
 Bonjour discovery, power/idle selection and Linux workers are not supported.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default

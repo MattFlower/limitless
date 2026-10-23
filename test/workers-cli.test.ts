@@ -19,6 +19,7 @@ test("workers ls appends CLI versions, login state and private-strings parity", 
             codex: { version: "codex-cli 0.50.0", loggedIn: false },
           },
           privateStrings: "match",
+          agentJobs: [{ id: "one" }, { id: "two" }],
         },
         { name: "legacy", state: "available" },
         {
@@ -26,6 +27,7 @@ test("workers ls appends CLI versions, login state and private-strings parity", 
           state: "available",
           agents: { claude: { version: null, loggedIn: true }, codex: { version: null, loggedIn: false } },
           privateStrings: "unknown",
+          agentJobs: [],
         },
         {
           name: "unknown-codex-version",
@@ -49,10 +51,10 @@ test("workers ls appends CLI versions, login state and private-strings parity", 
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim().split("\n")).toEqual([
-      "ready\tavailable\tclaude:2.1.3 (Claude Code)\tcodex:logged out\tprivate-strings:match",
-      "legacy\tavailable\tclaude:missing\tcodex:missing\tprivate-strings:unknown",
-      "unknown-version\tavailable\tclaude:unknown\tcodex:missing\tprivate-strings:unknown",
-      "unknown-codex-version\tavailable\tclaude:missing\tcodex:unknown\tprivate-strings:match",
+      "ready\tavailable\tclaude:2.1.3 (Claude Code)\tcodex:logged out\tprivate-strings:match\tagent-jobs:2",
+      "legacy\tavailable\tclaude:missing\tcodex:missing\tprivate-strings:unknown\tagent-jobs:0",
+      "unknown-version\tavailable\tclaude:unknown\tcodex:missing\tprivate-strings:unknown\tagent-jobs:0",
+      "unknown-codex-version\tavailable\tclaude:missing\tcodex:unknown\tprivate-strings:match\tagent-jobs:0",
     ]);
   } finally {
     server.stop(true);
