@@ -9,6 +9,7 @@ import { KpiStrip } from "../components/KpiStrip.tsx";
 import { PipelineMap } from "../components/PipelineMap.tsx";
 import { RunsTable } from "../components/RunsTable.tsx";
 import { padDays } from "../lib/days.ts";
+import { openNeedsYou } from "../lib/needs-you.ts";
 import { ensureLiveStore, live, subscribeLiveUpdates } from "../store.ts";
 
 const STATS_REFRESH_MS = 30_000;
@@ -86,9 +87,9 @@ export const Dashboard: Component = () => {
             {(s) => (
               <p class="page-subtitle">
                 {s().totals.runs} {s().totals.runs === 1 ? "run" : "runs"} in the last 14 days ·{" "}
-                {s().totals.openNeedsHuman === 0
+                {openNeedsYou(s()) === 0
                   ? "nothing needs you right now"
-                  : `${s().totals.openNeedsHuman} ${s().totals.openNeedsHuman === 1 ? "needs" : "need"} you`}
+                  : `${openNeedsYou(s())} ${openNeedsYou(s()) === 1 ? "needs" : "need"} you`}
               </p>
             )}
           </Show>

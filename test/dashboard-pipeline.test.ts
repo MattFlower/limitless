@@ -1,9 +1,19 @@
 import { expect, test } from "bun:test";
 import type { Run, RunStatus, StageName } from "../src/core/types.ts";
-import type { DayStats } from "../src/db/stats.ts";
+import type { DayStats, Stats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { padDays } from "../ui/lib/days.ts";
+import { openNeedsYou } from "../ui/lib/needs-you.ts";
 import { pipelineCounts } from "../ui/lib/pipeline.ts";
+
+test("the needs-you count covers every open item, not only the last 14 days", () => {
+  const totals = { openNeedsHuman: 1 } as Stats["totals"];
+  // Three runs need the owner; only one of them was created inside the stats window.
+  expect(openNeedsYou({ totals, needsYouRunIds: ["old-a", "old-b", "recent"] })).toBe(3);
+  expect(openNeedsYou({ totals: { ...totals, openNeedsHuman: 0 }, needsYouRunIds: ["old-a"] })).toBe(1);
+  // An older daemon sends no ids, so the windowed count is all there is.
+  expect(openNeedsYou({ totals })).toBe(1);
+});
 
 function runs(cases: [RunStatus, StageName | null][]): Run[] {
   const store = new Store(":memory:");
