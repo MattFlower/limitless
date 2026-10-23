@@ -62,7 +62,7 @@ export interface Config {
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
   baselineCache: boolean;
   gateExecutor: "local" | "lan";
-  workers: { listen?: string; repos: string[]; agentSlots: number };
+  workers: { listen?: string; repos: string[]; agentSlots: number; agents: Role[] };
   /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
   baselineEnv: string[];
   maxRounds: number; // implement ⇄ feedback rounds before escalation
@@ -381,6 +381,12 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   if (!workers || typeof workers !== "object" || Array.isArray(workers))
     throw new Error("workers must be a table");
   const { listen, repos: workerRepos = [], agent_slots: agentSlots = 2 } = workers as Record<string, unknown>;
+  const configuredAgents = (workers as Record<string, unknown>).agents;
+  const agents = configuredAgents === undefined ? [] : configuredAgents;
+  if (!Array.isArray(agents) || !agents.every((r) => typeof r === "string" && roles.includes(r)))
+    throw new Error("workers.agents must be an array of known role names");
+  for (const role of new Set(agents))
+    if (role !== "implement") console.warn(`workers.agents: ${role} stays local in this release`);
   if (typeof agentSlots !== "number" || !Number.isSafeInteger(agentSlots) || agentSlots <= 0)
     throw new Error("workers.agent_slots must be a positive integer");
   if (listen !== undefined) {
@@ -465,7 +471,12 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
     gateExecutor: gates.executor === "lan" ? "lan" : "local",
-    workers: { listen: listen as string | undefined, repos: workerRepos, agentSlots },
+    workers: {
+      listen: listen as string | undefined,
+      repos: workerRepos,
+      agentSlots,
+      agents: agents as Role[],
+    },
     baselineEnv,
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
