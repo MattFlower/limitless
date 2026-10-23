@@ -262,8 +262,11 @@ Opted-in implement rounds publish a commit that the coordinator fetches and veri
 gates, audit, review and delivery. Merge and resolution rounds, review rounds, existing-branch
 delivery, verify-change runs and local repositories stay local. Each worker needs `gh auth login`
 and the same entries in `private-strings.txt` as the coordinator; order and comments do not matter.
-A mismatch fails the job before the session starts and the round runs locally. With no worker
-available, a round waits up to two pickup periods before running locally.
+Workers report their CLI login states and versions; agent jobs go only to workers logged in to
+the target CLI, and publishing jobs also require matching private strings. `limitless workers ls`
+shows both CLI capabilities and private-strings parity. A mismatch is also checked before the session
+starts; if found then, the job fails and the round runs locally. With no worker available, a round
+waits up to two pickup periods before running locally.
 Coordinator restarts, including deploys, re-attach to worker implement jobs. A worker that stays
 unreachable for one lease period after the restart is retried on another worker. Only a commit
 pushed without an accepted report ends the run NeedsHuman. Before manually rolling back past S5a,

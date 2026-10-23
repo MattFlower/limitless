@@ -7,6 +7,7 @@ import { githubDoctor } from "../integrations/github-poller.ts";
 import { installIntegrations, repositoryRoot, sessionStartInstructions } from "../integrations/install.ts";
 import { resolveCatalog } from "../router/config-catalog.ts";
 import { redactCredentials, sh } from "../util/proc.ts";
+import { loggedIn as cliLoggedIn, loginArgs } from "../workers/capabilities.ts";
 import { apiTokenHeaders } from "./api-token.ts";
 import { patchSetupConfig } from "./setup-config.ts";
 export type Check = { id: string; status: "ok" | "warn" | "fail"; message: string; fix?: string };
@@ -104,11 +105,10 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
       "GitHub owner unset; Dependabot runs, issue-label triggers and /limitless comment triggers disabled",
     );
   const cli = await Promise.all([run("claude", "--version"), run("codex", "--version")]);
-  for (const [index, name] of ["claude", "codex"].entries()) {
+  for (const [index, name] of (["claude", "codex"] as const).entries()) {
     const present = cli[index]?.exitCode === 0;
-    const args = name === "claude" ? ["auth", "status"] : ["login", "status"];
-    const login = present ? await run(name, ...args) : null;
-    const loggedIn = login?.exitCode === 0 && !/"loggedIn"\s*:\s*false/.test(login.stdout);
+    const login = present ? await run(name, ...loginArgs[name]) : null;
+    const loggedIn = cliLoggedIn(login);
     const missing = !present && cli.some((c) => c.exitCode === 0) ? "warn" : "fail";
     add(name, loggedIn ? "ok" : missing, loggedIn ? "installed and logged in" : "CLI missing or logged out");
   }

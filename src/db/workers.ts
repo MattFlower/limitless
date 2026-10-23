@@ -8,6 +8,7 @@ import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { redactCredentialData, registerCredential } from "../util/proc.ts";
 import {
+  AgentCapabilities,
   type Capabilities,
   Claim,
   Heartbeat,
@@ -30,6 +31,7 @@ export interface WorkerRow {
   pairing_expires_at: number;
   last_heartbeat_at: number | null;
   capabilities: string | null;
+  agent_capabilities: string | null;
   setup_warning: string | null;
 }
 export interface JobRow {
@@ -200,6 +202,13 @@ export class WorkerStore {
       (agent || c.freeSlots > 0)
     );
   }
+  private agentCapabilities(w: WorkerRow) {
+    try {
+      return AgentCapabilities.parse(JSON.parse(w.agent_capabilities ?? "null"));
+    } catch {
+      return { privateStrings: "unknown" as const, agents: undefined };
+    }
+  }
   list() {
     return this.store.db
       .query<WorkerRow, [number]>(
@@ -208,12 +217,14 @@ export class WorkerStore {
       .all(this.now())
       .map((w) => {
         const c: Capabilities | null = w.capabilities ? JSON.parse(w.capabilities) : null;
-        return this.sanitize({
+        const { agents, privateStrings } = this.agentCapabilities(w);
+        const result = this.sanitize({
           name: w.name,
           fingerprint: w.fingerprint,
           code: w.state === "pending" ? w.pairing_code : undefined,
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
+          agents,
           setupWarning: c?.updateWarning ?? w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
@@ -229,15 +240,20 @@ export class WorkerStore {
                     ? "busy"
                     : "offline",
         });
+        return { ...result, privateStrings };
       });
   }
-  heartbeat(w: WorkerRow, c: Capabilities) {
+  heartbeat(w: WorkerRow, c: Capabilities, privateStrings: "match" | "differs" | "unknown" = "unknown") {
+    const { agents, privateStringsDigest: _digest, ...legacy } = c;
+    c = legacy;
     this.sweep();
     this.sweepAgentJobs();
     if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
     this.store.db
-      .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
-      .run(this.now(), JSON.stringify(c), w.name);
+      .query(
+        "UPDATE workers SET last_heartbeat_at=?,capabilities=?,agent_capabilities=? WHERE name=? AND state='approved'",
+      )
+      .run(this.now(), JSON.stringify(c), JSON.stringify({ agents, privateStrings }), w.name);
     const cancelled: string[] = [];
     for (const id of c.jobs) {
       const gate = this.job(id);
@@ -318,6 +334,8 @@ export class WorkerStore {
         this.sweepAgentJobs();
         const w = this.worker(name);
         if (!w || !this.available(w, true)) return null;
+        const { agents, privateStrings } = this.agentCapabilities(w);
+        if (!agents) return null;
         const held =
           this.store.db
             .query<{ n: number }, [string]>(
@@ -326,10 +344,15 @@ export class WorkerStore {
             .get(name)?.n ?? 0;
         if (held >= this.agentSlots) return null;
         const j = this.store.db
-          .query<AgentJobRow, [string]>(
-            "SELECT * FROM agent_jobs WHERE state='queued' AND NOT EXISTS (SELECT 1 FROM json_each(excluded) WHERE value=?) ORDER BY created_at, rowid LIMIT 1",
+          .query<AgentJobRow, [string, number, number, string]>(
+            "SELECT * FROM agent_jobs WHERE state='queued' AND NOT EXISTS (SELECT 1 FROM json_each(excluded) WHERE value=?) AND ((json_extract(request,'$.target.harness')='claude' AND ?=1) OR (json_extract(request,'$.target.harness')='codex' AND ?=1)) AND (json_extract(request,'$.commit') IS NULL OR ?='match') ORDER BY created_at, rowid LIMIT 1",
           )
-          .get(name);
+          .get(
+            name,
+            Number(agents.claude?.loggedIn === true),
+            Number(agents.codex?.loggedIn === true),
+            privateStrings,
+          );
         if (!j) return null;
         const req: AgentJobRequest = JSON.parse(j.request);
         const now = this.now(),

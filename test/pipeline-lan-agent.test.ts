@@ -5,6 +5,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Stage, StageName } from "../src/core/types.ts";
 import type { AgentJobRequest, AgentJobRow } from "../src/db/workers.ts";
+import { loadPrivateStrings, privateStringsDigest } from "../src/gates/private.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { headSha } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
@@ -217,6 +218,7 @@ test("real worker rounds publish, adopt, relay events and deliver over an advanc
     task = runWorker(listener.url.origin, remote, release, controller.signal, {
       confinement: fakeConfinement,
       heartbeatMs: 10,
+      capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
       retryMs: 5,
       tokenLookup: async () => "fixture-worker-token",
       machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -534,18 +536,23 @@ function approveSimulated(f: Factory) {
   f.workers.approve(pending.code);
   const worker = f.workers.worker("simulated");
   if (!worker) throw new Error("Missing worker");
-  f.workers.heartbeat(worker, {
-    releaseSha: release,
-    bunVersion: Bun.version,
-    os: "darwin",
-    osVersion: "test",
-    cpuCount: 4,
-    ramBytes: 1024,
-    freeSlots: 1,
-    onAC: true,
-    idleSeconds: 0,
-    jobs: [],
-  });
+  f.workers.heartbeat(
+    worker,
+    {
+      releaseSha: release,
+      bunVersion: Bun.version,
+      os: "darwin",
+      osVersion: "test",
+      cpuCount: 4,
+      ramBytes: 1024,
+      freeSlots: 1,
+      onAC: true,
+      idleSeconds: 0,
+      jobs: [],
+      agents: { claude: { version: null, loggedIn: true } },
+    },
+    "match",
+  );
   return worker;
 }
 
@@ -797,6 +804,8 @@ test("unreadable private strings on restart cancel the reconciled lease before r
     onAC: true,
     idleSeconds: 0,
     jobs: [] as string[],
+    agents: { claude: { version: null, loggedIn: true } },
+    privateStringsDigest: privateStringsDigest(loadPrivateStrings(f.cfg.paths.configDir)),
   };
   await call("/worker/heartbeat", capabilities);
   const leased = Promise.withResolvers<string>();
