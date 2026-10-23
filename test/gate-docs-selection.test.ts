@@ -2,6 +2,7 @@ import { expect } from "bun:test";
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { globToRegex } from "../src/gates/audit.ts";
 import { gatesHash } from "../src/gates/cache.ts";
 import { detectGates, readDocs } from "../src/gates/detect.ts";
 import { docsOnlyGates } from "../src/gates/docs.ts";
@@ -12,9 +13,9 @@ import { seeded } from "./seeded.ts";
 
 const toml = `[gates]
 docs = ["docs/**", "*.md"]
-retry_files = "targeted {files}"
+retry_files = "bun test {files}"
 setup = ["setup"]
-checks = [{name="lint",run="lint"}, {name="test",run="full $LIMITLESS_GATE_REPORT",timeoutSec=37}, {name="typecheck",run="types"}]
+checks = [{name="lint",run="lint"}, {name="test",run="bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",timeoutSec=37}, {name="typecheck",run="types"}]
 `;
 const seed = seeded(async (cwd) => {
   mkdirSync(join(cwd, "docs"));
@@ -110,8 +111,8 @@ test.each([
           timeoutSec: 37,
           run:
             scenario === "deletion"
-              ? "targeted './test/a.test.ts'"
-              : "targeted './test/a.test.ts' './test/path.spec.ts' './test/space '\\'' quote.test.ts'",
+              ? "bun test './test/a.test.ts'"
+              : "bun test './test/a.test.ts' './test/path.spec.ts' './test/space '\\'' quote.test.ts'",
         });
       } else
         expect(compareGates(null, run)[1]).toMatchObject({
@@ -151,7 +152,7 @@ test("docs config validates and leaves legacy baseline hashes unchanged", () => 
         checks: cfg.checks,
         source: ".limitless.toml",
         protectedPaths: [],
-        retryFiles: "targeted {files}",
+        retryFiles: "bun test {files}",
       }),
     );
     const warnings: string[] = [];
@@ -160,6 +161,94 @@ test("docs config validates and leaves legacy baseline hashes unchanged", () => 
     }
     expect(warnings).toHaveLength(3);
     expect(warnings.every((w) => w.includes("Invalid [gates].docs"))).toBe(true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["docs/**/guide.md", "docs/guide.md", true],
+  ["docs/**/guide.md", "docs/a/b/guide.md", true],
+  ["docs/**/guide.md", "docs/notguide.md", false],
+  ["docs/**/guide.md", "docsx/guide.md", false],
+  ["*.md", "README.md", true],
+  ["*.md", "docs/x.md", false],
+  ["docs/**", "docs/a/b/c.md", true],
+  ["docs/**", "docsx/a.md", false],
+  ["test/fixtures/**", "test/fixtures/a/b.ts", true],
+  ["test/AGENTS.md", "test/AGENTS.md", true],
+  ["test/AGENTS.md", "test/AGENTSxmd", false],
+  ["test/AGENTS.md", "test/AGENTS.md\n", false],
+  ["docs/**", "docs/a\nb.md", true],
+  ["a?b", "a/b", false],
+  ["a?b", "axb", true],
+  ["**/guide.md", "guide.md", true],
+  ["**", "a/b.ts", true],
+  ["a**b", "a/x/b", false],
+  ["a.+^{}$()|[]\\.md", "a.+^{}$()|[]\\.md", true],
+] as const)("glob %s matches %s: %s", (pattern, path, matches) => {
+  expect(globToRegex(pattern).test(path)).toBe(matches);
+});
+
+test("docs glob boundaries and unknown runners keep the configured checks", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "docs-runner-"));
+  try {
+    await seed(cwd);
+    const base = await commitDoc(cwd, "docs/notguide.md", "base");
+    const head = await commitDoc(cwd, "docs/notguide.md", "edited");
+    const cfg = detectGates(cwd);
+    const boundary = await docsOnlyGates(cwd, { ...cfg, docs: ["docs/**/guide.md"] }, base, head);
+    expect(boundary.selection.mode).toBe("full");
+    expect(boundary.gates.checks).toEqual(cfg.checks);
+    for (const [run, retryFiles] of [
+      ["npm test $LIMITLESS_GATE_REPORT", "bun test {files}"],
+      ["bun test $LIMITLESS_GATE_REPORT", "npx vitest run {files}"],
+      ["bun testing $LIMITLESS_GATE_REPORT", "bun test {files}"],
+      ["env CI=1 bun test $LIMITLESS_GATE_REPORT", "bun test {files}"],
+      ["bun test $LIMITLESS_GATE_REPORT", "bun testx {files}"],
+    ] as const) {
+      const config = { ...cfg, checks: [{ name: "test", run }], retryFiles };
+      const docs = await docsOnlyGates(cwd, config, base, head);
+      expect(docs.selection).toMatchObject({ mode: "full", files: [] });
+      expect(docs.selection.reason).toContain("unrecognized test runner");
+      expect(docs.selection.reason).toContain(run);
+      expect(docs.selection.reason).toContain(retryFiles);
+      expect(docs.gates).toBe(config);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+async function commitDoc(cwd: string, path: string, text: string) {
+  writeFileSync(join(cwd, path), text);
+  return commit(cwd);
+}
+
+test("Bun underscore test names and all supported extensions are targeted", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "docs-bun-tests-"));
+  try {
+    await seed(cwd);
+    const files = ["doc_test.ts", "x_spec.mts"];
+    for (const suffix of [".test", "_test", ".spec", "_spec"])
+      for (const ext of ["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"])
+        files.push(`test/doc${suffix}.${ext}`);
+    for (const file of files) writeFileSync(join(cwd, file), "docs/names.md");
+    writeFileSync(join(cwd, "test/excluded.test.mjsx"), "docs/names.md");
+    const base = await commitDoc(cwd, "docs/names.md", "base");
+    const head = await commitDoc(cwd, "docs/names.md", "edited");
+    const cfg = detectGates(cwd);
+    const docs = await docsOnlyGates(cwd, cfg, base, head);
+    expect(docs.selection.mode).toBe("targeted");
+    expect(docs.selection.files).toEqual(files.sort());
+    expect(docs.gates.checks[1]?.run).toBe(`bun test ${files.map((p) => `'./${p}'`).join(" ")}`);
+    // With just the two underscore names, neither can be mistaken for no references.
+    for (const file of files.filter((p) => p.startsWith("test/"))) rmSync(join(cwd, file));
+    const fewer = await commit(cwd);
+    const changed = await commitDoc(cwd, "docs/names.md", "edited again");
+    const selected = await docsOnlyGates(cwd, cfg, fewer, changed);
+    expect(selected.selection.files).toEqual(["doc_test.ts", "x_spec.mts"]);
+    expect(selected.gates.checks[1]?.run).toBe("bun test './doc_test.ts' './x_spec.mts'");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

@@ -2558,16 +2558,21 @@ test("adding a file under a protected path warns; editing one blocks", () => {
       files: [
         { status: "A", path: "test/fixtures/new.json" },
         { status: "M", path: "test/fixtures/old.json" },
+        { status: "M", path: "test/fixtures/a/b.ts" },
+        { status: "M", path: "docs/notguide.md" },
+        { status: "M", path: "docs/a/guide.md" },
       ],
       stat: "",
       added: 0,
       removed: 0,
     },
-    { taskClass: "feature", protectedPaths: ["test/fixtures/**"] },
+    { taskClass: "feature", protectedPaths: ["test/fixtures/**", "docs/**/guide.md"] },
   );
   expect(f.map((x) => `${x.file}:${x.severity}`)).toEqual([
     "test/fixtures/new.json:warn",
     "test/fixtures/old.json:block",
+    "test/fixtures/a/b.ts:block",
+    "docs/a/guide.md:block",
   ]);
 });
 

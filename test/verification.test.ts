@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
-import { compareGates } from "../src/gates/run.ts";
+import { compareGates, type GateComparison } from "../src/gates/run.ts";
 import {
+  formatGateFeedback,
   formatVerifyFeedback,
   holdoutPrompt,
   holdoutRedactor,
   redactHoldoutText,
+  reviewPrompt,
   verifyPrompt,
 } from "../src/pipeline/prompts.ts";
 import {
@@ -1149,6 +1151,62 @@ test.each(["H-1", "h-1", " H-1 "])(
       ])
         expect(output).not.toContain(secret);
       expect(output).toContain("unknown-");
+    }
+  },
+);
+
+test.each(["targeted_pass", "targeted_failure", "flaky", "not_run"] as const)(
+  "prompts describe limited docs evidence: %s",
+  (verdict) => {
+    const skipped = verdict === "not_run";
+    const reason = skipped
+      ? "docs-only change; no test reads the changed files"
+      : "docs-only change; test source references a changed path or basename";
+    const check: GateComparison = {
+      name: "test",
+      verdict,
+      blocking: verdict === "targeted_failure",
+      result: {
+        name: "test",
+        command: "bun test './doc_test.ts'",
+        ok: verdict === "targeted_pass" || verdict === "flaky",
+        exitCode: skipped ? null : 0,
+        durationMs: 1,
+        output: "",
+        docsOnly: {
+          mode: skipped ? "skipped" : "targeted",
+          files: skipped ? [] : ["doc_test.ts"],
+          changedPaths: ["docs/guide.md"],
+          reason,
+        },
+      },
+    };
+    const prompts = [
+      verifyPrompt({ prompt: "update docs", spec, holdout, baseSha: "abc", checks: [check] }),
+      reviewPrompt({
+        prompt: "update docs",
+        spec,
+        baseSha: "abc",
+        stat: "",
+        gates: [check],
+        audit: [],
+        implementerReport: "",
+      }),
+    ];
+    for (const prompt of prompts) {
+      expect(prompt).toContain(reason);
+      expect(prompt).not.toContain("`bun test './doc_test.ts'`: pass");
+      if (skipped) expect(prompt).toContain("not run");
+      else {
+        expect(prompt).toContain(verdict === "targeted_failure" ? "targeted failure" : "targeted pass");
+        expect(prompt).toContain("1 test file");
+        expect(prompt).toContain("full suite didn't run");
+      }
+    }
+    if (check.blocking) {
+      expect(formatGateFeedback([check])).toContain("FAILS in the targeted test files");
+      check.result.timedOut = true;
+      expect(formatGateFeedback([check])).toContain("timed out in the targeted test files");
     }
   },
 );

@@ -464,7 +464,7 @@ function fakeLandGates(
   return { executor, requests };
 }
 
-test.each(["targeted", "skipped", "mixed"])("land docs-only selection: %s", async (mode) => {
+test.each(["targeted", "skipped", "mixed", "failure"])("land docs-only selection: %s", async (mode) => {
   mkdirSync(join(seed, "test"));
   writeFileSync(join(seed, "test/a.test.ts"), mode === "skipped" ? "unrelated" : "README.md");
   writeFileSync(join(seed, "test/b.test.ts"), "unrelated");
@@ -472,8 +472,8 @@ test.each(["targeted", "skipped", "mixed"])("land docs-only selection: %s", asyn
     join(seed, ".limitless.toml"),
     `[gates]
 docs = ["*.md"]
-retry_files = "fake-targeted {files}"
-checks = [{name="lint",run="fake-lint"}, {name="test",run="fake-full $LIMITLESS_GATE_REPORT"}]
+retry_files = "bun test {files}"
+checks = [{name="lint",run="fake-lint"}, {name="test",run="bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"}]
 `,
   );
   await sh(["git", "add", "."], { cwd: seed });
@@ -484,44 +484,44 @@ checks = [{name="lint",run="fake-lint"}, {name="test",run="fake-full $LIMITLESS_
   if (mode === "mixed") head = await pushBranch("pr-1", "source.ts", "export {};\n");
   observe(1, head);
   approve(1, head);
-  const commands: string[] = [];
-  const realProcess = proc.runProcess;
-  const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
-    if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
-    opts.onStdoutLine?.(opts.cmd[4] ?? "");
-    commands.push(opts.cmd.at(-1) ?? "");
-    return {
-      exitCode: 0,
-      signal: null,
-      cancelled: false,
-      timedOut: false,
-      idleTimedOut: false,
-      truncated: false,
-      stdout: "passed",
-      stderr: "",
-      durationMs: 1,
-    };
-  });
-  const q = queue();
+  const fake = fakeLandGates((req) =>
+    retryRun(req, mode === "failure" ? { test: { ok: false, exitCode: 1 } } : {}),
+  );
+  const q = queue({ gateExecutor: fake.executor });
   try {
     const entry = await q.request({ target: pr.run.id });
-    await waitFor(() => store.getLandEntry(entry.id)?.state === "landed");
-    expect(commands).toEqual([
+    await waitFor(() => store.getLandEntry(entry.id)?.state === (mode === "failure" ? "blocked" : "landed"));
+    expect(fake.requests.flatMap((r) => r.gates.checks.map((c) => c.run))).toEqual([
       "fake-lint",
       ...(mode === "skipped"
         ? []
-        : [mode === "targeted" ? "fake-targeted './test/a.test.ts'" : "fake-full $LIMITLESS_GATE_REPORT"]),
+        : [
+            mode !== "mixed"
+              ? "bun test './test/a.test.ts'"
+              : "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+          ]),
     ]);
     const log = readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8");
-    expect(log).toContain(`"mode":"${mode === "mixed" ? "full" : mode}"`);
-    if (mode === "targeted") expect(log).toContain("test/a.test.ts");
+    expect(log).toContain(`"mode":"${mode === "mixed" ? "full" : mode === "failure" ? "targeted" : mode}"`);
+    if (mode === "targeted") {
+      const message =
+        "test: targeted pass (test/a.test.ts; docs-only change; test source references a changed path or basename";
+      expect(log).toContain(message);
+      expect(store.listEvents(pr.run.id).some((e) => e.type === "gate" && e.message.includes(message))).toBe(
+        true,
+      );
+    }
+    if (mode === "failure") {
+      expect(store.getLandEntry(entry.id)?.reason).toContain("test failed");
+      expect(log).not.toContain("targeted pass");
+      expect(ghCalls("pr merge")).toEqual([]);
+    }
     if (mode === "skipped") expect(log).toContain("docs-only change; no test reads the changed files");
     expect(
       store.listEvents(pr.run.id).some((e) => e.type === "gate" && e.message.includes("Gate selection:")),
     ).toBe(true);
   } finally {
     await q.stop();
-    processSpy.mockRestore();
   }
 });
 

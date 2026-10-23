@@ -51,6 +51,8 @@ export interface GateRun {
 
 export type GateVerdict =
   | "pass"
+  | "targeted_pass"
+  | "targeted_failure"
   | "fixed"
   | "regressed"
   | "still_failing"
@@ -401,6 +403,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     const baselineConfinementError = confinementFailed(before);
     let verdict: GateVerdict;
     if (confinementFailed(r)) verdict = "confinement_error";
+    else if (r.docsOnly?.mode === "targeted") verdict = r.ok ? "targeted_pass" : "targeted_failure";
     // A skipped reference provides no evidence that a later failure already existed.
     else if (!before || before.docsOnly?.mode === "skipped" || baselineConfinementError)
       verdict = r.ok ? "new_pass" : "new_failure";
@@ -414,6 +417,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
       blocking:
         verdict === "confinement_error" ||
         !!r.timedOut ||
+        verdict === "targeted_failure" ||
         verdict === "regressed" ||
         verdict === "new_failure",
       result: r,
@@ -471,7 +475,12 @@ export async function retryRegressions(
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const selected = cmp.flatMap((c) => {
-    if (c.verdict !== "regressed" || c.result.timedOut || confinementFailed(c.result) || !select(c))
+    if (
+      (c.verdict !== "regressed" && c.verdict !== "targeted_failure") ||
+      c.result.timedOut ||
+      confinementFailed(c.result) ||
+      !select(c)
+    )
       return [];
     const check = findGateCounterpart(c, cmp, cfg.checks);
     return check?.run === c.result.command ? [{ check, original: c.result }] : [];
@@ -484,7 +493,7 @@ export async function retryRegressions(
     const confinementError = confinementFailed(retry);
     return {
       ...c,
-      verdict: confinementError ? "confinement_error" : retry.ok ? "flaky" : "regressed",
+      verdict: confinementError ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
       blocking: confinementError || !retry.ok,
       result: { ...retry, ...(c.result.docsOnly ? { docsOnly: c.result.docsOnly } : {}) },
       firstAttempt: c.result,

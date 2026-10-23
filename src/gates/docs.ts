@@ -35,7 +35,11 @@ export async function docsOnlyGates(cwd: string, cfg: GateConfig, base: string, 
       selection.changedPaths.length &&
       selection.changedPaths.every((p) => patterns.some((r) => r.test(p)))
     ) {
-      const isTest = (p: string) => /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(p);
+      if (![check.run, cfg.retryFiles].every((command) => /^bun test(?:\s|$)/.test(command.trim()))) {
+        selection.reason = `docs-only change; unrecognized test runner: ${check.run}; retry_files: ${cfg.retryFiles}`;
+        return { gates, selection, annotate: (run: GateRun) => run };
+      }
+      const isTest = (p: string) => /[._](?:test|spec)\.(?:[jt]sx?|[cm][jt]s)$/.test(basename(p));
       const tracked = (await git(["ls-tree", "-r", "--name-only", "-z", head])).stdout
         .split("\0")
         .filter(isTest);

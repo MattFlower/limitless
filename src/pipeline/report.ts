@@ -2,7 +2,7 @@ import { repoSettings } from "../config.ts";
 import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
-import { redactGateData } from "../gates/output.ts";
+import { docsGateSummary, redactGateData } from "../gates/output.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { activity } from "../util/stall.ts";
 import type { RunContext, RunState } from "./context.ts";
@@ -288,7 +288,10 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
         state.lastGates.map((g) => {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky" || g.verdict === "not_run";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
-          const row = [g.name, `${icon} ${g.result.timedOut ? "timed out" : g.verdict.replace("_", " ")}`];
+          const row = [
+            g.name,
+            `${icon} ${docsGateSummary(g) ?? (g.result.timedOut ? "timed out" : g.verdict.replaceAll("_", " "))}`,
+          ];
           const command = clipCell(g.result.command);
           return commands
             ? [

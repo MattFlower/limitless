@@ -864,6 +864,14 @@ export class LandQueue {
           return !result.ok || result.timedOut || confinementFailed(result);
         });
         if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
+        for (const check of run.checks) {
+          if (check.docsOnly?.mode !== "targeted") continue;
+          const message = redactGateOutput(
+            `${check.name}: targeted pass (${check.docsOnly.files.join(", ")}; ${check.docsOnly.reason}; full suite didn't run)`,
+          );
+          appendFileSync(log, `${message}\n`);
+          if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "info", message });
+        }
         if (retries.size) {
           const reason = redactGateOutput(
             `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,

@@ -75,8 +75,8 @@ test.each(["targeted", "skipped"] as const)("docs-only %s cannot substitute for 
     files: mode === "targeted" ? ["test/loopback.test.ts"] : [],
     reason: "docs-only change",
   };
+  check.verdict = mode === "targeted" ? "targeted_pass" : "not_run";
   if (mode === "skipped") {
-    check.verdict = "not_run";
     check.result.ok = false;
   }
   const fullSpec = {
@@ -89,6 +89,23 @@ test.each(["targeted", "skipped"] as const)("docs-only %s cannot substitute for 
   expect(result?.evidence).toStartWith("Factory gate substitution unavailable: docs-only");
   expect(result?.evidence).toContain(mode === "skipped" ? "skip" : "targeting");
 });
+
+test.each(["targeted_pass", "targeted_failure"] as const)(
+  "%s refuses full-suite evidence without a docs annotation",
+  (verdict) => {
+    const evidence = gates();
+    const check = evidence.checks[0];
+    if (!check) throw new Error("missing test check");
+    check.verdict = verdict;
+    const fullSpec = {
+      ...spec,
+      acceptance_criteria: [{ id: "AC-1", criterion: "tests pass", how_to_verify: "bun test" }],
+    };
+    const result = resolve(blocked, evidence, fullSpec).criteria[0];
+    expect(result?.status).toBe("blocked");
+    expect(result?.evidence).toContain("targeted test check; full suite did not run");
+  },
+);
 
 test("the model cannot supply gate provenance; model judgments and prose pass through unchanged", () => {
   const model = {

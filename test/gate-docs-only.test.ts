@@ -18,6 +18,7 @@ const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup(fixt
 
 test.each([
   "targeted",
+  "failing baseline",
   "retry",
   "timeout",
   "skipped",
@@ -38,9 +39,9 @@ test.each([
   writeFileSync(join(cwd, "test/b.test.ts"), "unrelated");
   const config = `[gates]
 ${["untrusted", "unconfigured"].includes(scenario) ? "" : scenario === "invalid" ? 'docs = "docs/**"' : 'docs = ["docs/**"]'}
-retry_files = "fake-targeted {files}"
+retry_files = "bun test {files}"
 setup = ["fake-setup"]
-checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {name="test",run="fake-full $LIMITLESS_GATE_REPORT"}]
+checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {name="test",run="bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"}]
 `;
   writeFileSync(join(cwd, ".limitless.toml"), config);
   await sh(["git", "add", "."], { cwd });
@@ -79,10 +80,13 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
     if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
     opts.onStdoutLine?.(opts.cmd[4] ?? "");
     commands.push(opts.cmd.at(-1) ?? "");
-    const targeted = opts.cmd.at(-1)?.startsWith("fake-targeted") ?? false;
+    const targeted = opts.cmd.at(-1)?.startsWith("bun test './") ?? false;
     if (targeted) targetedAttempts++;
     const firstFailure = targeted && targetedAttempts === 1 && ["retry", "timeout"].includes(scenario);
-    const failed = firstFailure || (targeted && scenario === "post-merge failure");
+    const failed =
+      firstFailure ||
+      (targeted && scenario === "post-merge failure") ||
+      (scenario === "failing baseline" && opts.cmd.at(-1)?.includes("$LIMITLESS_GATE_REPORT"));
     return {
       exitCode: failed ? (scenario === "timeout" ? null : 1) : 0,
       signal: null,
@@ -110,21 +114,32 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
       : initiallySkipped
         ? "skipped"
         : "targeted";
-    // The first four commands are the unchanged prepare baseline.
-    expect(commands.slice(0, 4)).toEqual([
+    // The baseline always runs the full command, including its existing retry on failure.
+    const baselineCommands = scenario === "failing baseline" ? 5 : 4;
+    expect(commands.slice(0, baselineCommands)).toEqual([
       "fake-setup",
       "fake-lint",
       "fake-types",
-      "fake-full $LIMITLESS_GATE_REPORT",
+      "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+      ...(scenario === "failing baseline" ? ["bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"] : []),
     ]);
-    expect(commands.slice(4, 7)).toEqual(["fake-setup", "fake-lint", "fake-types"]);
+    expect(commands.slice(baselineCommands, baselineCommands + 3)).toEqual([
+      "fake-setup",
+      "fake-lint",
+      "fake-types",
+    ]);
     const expectedTest =
       mode === "targeted"
-        ? ["fake-targeted './test/a.test.ts'"]
+        ? ["bun test './test/a.test.ts'"]
         : mode === "full"
-          ? ["fake-full $LIMITLESS_GATE_REPORT"]
+          ? ["bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"]
           : [];
-    expect(commands.slice(7, postMerge ? 7 + expectedTest.length : undefined)).toEqual([
+    expect(
+      commands.slice(
+        baselineCommands + 3,
+        postMerge ? baselineCommands + 3 + expectedTest.length : undefined,
+      ),
+    ).toEqual([
       ...expectedTest,
       ...(scenario === "retry"
         ? expectedTest
@@ -135,6 +150,14 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
     const artifact = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]") as GateComparison[];
     const testCheck = artifact.find((c) => c.name === "test");
     if (scenario === "retry") expect(testCheck?.verdict).toBe("flaky");
+    if (["targeted", "failing baseline"].includes(scenario)) {
+      expect(testCheck?.verdict).toBe("targeted_pass");
+      const report = f.store.getArtifact(run.id, "report.md") ?? "";
+      expect(report).toContain("✅ targeted pass (1 test file");
+      expect(report).toContain(testCheck?.result.docsOnly?.reason ?? "missing reason");
+      expect(report).not.toContain("✅ fixed");
+      expect(report).not.toMatch(/\| test \| ✅ pass/);
+    }
     if (scenario === "timeout") expect(testCheck?.firstAttempt?.timedOut).toBe(true);
     if (mode !== "full") {
       expect(testCheck?.result.docsOnly).toMatchObject({
@@ -159,7 +182,10 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
         blocking: false,
         result: { output: "docs-only change; no test reads the changed files" },
       });
-      if (!postMerge) expect(f.store.getArtifact(run.id, "report.md")).toContain("⚠️ not run");
+      if (!postMerge)
+        expect(f.store.getArtifact(run.id, "report.md")).toContain(
+          "⚠️ not run (docs-only change; no test reads the changed files)",
+        );
     }
     const state = f.store.getRunState<RunState>(run.id);
     if (postMerge) {
@@ -172,11 +198,11 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
         "fake-setup",
         "fake-lint",
         "fake-types",
-        ...(mergedMode === "targeted" ? ["fake-targeted './test/a.test.ts'"] : []),
+        ...(mergedMode === "targeted" ? ["bun test './test/a.test.ts'"] : []),
       ]);
       if (scenario === "post-merge failure") {
         expect(rebase.find((c) => c.name === "test")).toMatchObject({
-          verdict: "new_failure",
+          verdict: "targeted_failure",
           blocking: true,
           result: { ok: false },
         });
