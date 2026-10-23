@@ -2,13 +2,36 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BaselineCacheKey } from "../db/store.ts";
+import { sh } from "../util/proc.ts";
 import type { GateConfig } from "./detect.ts";
 import { redactGateOutput } from "./output.ts";
 import type { GateResult, GateRun } from "./run.ts";
 
 /** Bump whenever how gates execute changes (environment, retries, result shape): old entries then miss. */
-export const GATE_ENV_VERSION = 3;
+export const GATE_ENV_VERSION = 4;
 export const BASELINE_CACHE_TTL_MS = 7 * 86_400_000;
+
+/** Probe only factory-owned directories: a checkout can contain untrusted Bun configuration. */
+export async function gateBunVersion(
+  cwd: string,
+  env: Record<string, string>,
+  signal: AbortSignal,
+): Promise<string> {
+  try {
+    const result = await sh(["bun", "--version"], { cwd, env, signal, timeoutMs: 2_000, allowFail: true });
+    const version = result.stdout.trim();
+    return result.exitCode === 0 &&
+      !result.timedOut &&
+      /^[0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+        version,
+      )
+      ? version
+      : "none";
+  } catch {
+    signal.throwIfAborted();
+    return "none";
+  }
+}
 
 const LOCKFILES = [
   "bun.lock",

@@ -24,7 +24,8 @@ const requestedScenario = process.argv[2] ?? "migration";
 const sequential = requestedScenario.startsWith("sequence");
 let scenario = sequential ? "bootstrap" : requestedScenario;
 const kind = process.argv[3] ?? "daemon";
-const agents = join(home, "Library", "LaunchAgents");
+const packaged = requestedScenario.startsWith("packaged-");
+const agents = packaged ? join(home, "isolated-agents") : join(home, "Library", "LaunchAgents");
 const realApp = join(home, "app & release");
 const alias = join(home, "alias");
 mkdirSync(join(realApp, "src", "cli"), { recursive: true });
@@ -60,6 +61,13 @@ function parse(content: string) {
     Label: value("Label"),
     LimitlessService: value("LimitlessService"),
     WorkingDirectory: value("WorkingDirectory"),
+    EnvironmentVariables: Object.fromEntries(
+      [
+        ...(content.match(/<key>EnvironmentVariables<\/key>\s*<dict>(.*?)<\/dict>/s)?.[1] ?? "").matchAll(
+          /<key>(.*?)<\/key><string>(.*?)<\/string>/gs,
+        ),
+      ].map((match) => [match[1], decode(match[2] ?? "")]),
+    ),
     ProgramArguments: [
       ...(content.match(/<array>(.*?)<\/array>/s)?.[1] ?? "").matchAll(/<string>(.*?)<\/string>/gs),
     ].map((match) => decode(match[1] ?? "")),
@@ -95,7 +103,7 @@ const marker = ["marked", "contradictory"].includes(scenario)
   ? `<key>LimitlessService</key><string>${scenario === "contradictory" ? (kind === "daemon" ? "tunnel" : "daemon") : kind}</string>`
   : "";
 const old = `<plist><dict>${marker}<key>Label</key><string>${oldLabel}</string><key>WorkingDirectory</key><string>${xmlEscape(plistApp)}</string><key>ProgramArguments</key><array>${args.map((a) => `<string>${xmlEscape(a)}</string>`).join("")}</array></dict></plist>`;
-if (scenario !== "fresh" && !scenario.startsWith("recover")) {
+if (!packaged && scenario !== "fresh" && !scenario.startsWith("recover")) {
   writeFileSync(oldPath, old);
   if (scenario !== "unloaded") loaded.add(oldLabel);
 }
@@ -154,7 +162,9 @@ async function compete() {
   contenderCalls = calls.slice(before);
   lockHeld = existsSync(lock) && readFileSync(lock, "utf8").trim() === String(process.pid);
 }
+const commands: string[][] = [];
 const command: typeof sh = async (argv) => {
+  commands.push([...argv]);
   const ok = (stdout = "", exitCode = 0, stderr = "") => ({ stdout, exitCode, stderr });
   if (argv[0] === "plutil") {
     const content = readFileSync(argv.at(-1) ?? "", "utf8");
@@ -198,6 +208,13 @@ const command: typeof sh = async (argv) => {
     const unitOld = unitKind === kind ? oldLabel : `arbitrary.installed.${unitKind}`;
     const unitOldPath = join(agents, `${unitKind}-original.plist`);
     calls.push(`bootstrap ${data.Label}`);
+    if (packaged && data.Label === neutral) {
+      packagedHealthReads = 0;
+      if (failBootstrap) {
+        failBootstrap = false;
+        return ok("", 1, "replacement bootstrap failed");
+      }
+    }
     if (data.Label === neutral && scenario === "phase-update") mkdirSync(`${journal}.tmp`);
     if (data.Label === neutral && scenario.startsWith("signal")) {
       if (existsSync(oldPath)) throw new Error("signal must follow old plist removal");
@@ -246,22 +263,41 @@ const command: typeof sh = async (argv) => {
   }
   throw new Error(`unexpected launchctl: ${argv.join(" ")}`);
 };
+let packagedHealthReads = 0;
+let failBootstrap = false;
+let failHealth = false;
 const client: DeployClient = {
   async admin(action) {
     calls.push(action);
     if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
-    draining = action === "drain";
     if (action === "drain" && (scenario.endsWith("signal-drain") || scenario === "signal-journal")) {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
+      const interrupted = new Promise<void>((resolve) => {
+        const finish = () => {
+          process.off("SIGINT", finish);
+          process.off("SIGTERM", finish);
+          resolve();
+        };
+        process.once("SIGINT", finish);
+        process.once("SIGTERM", finish);
+      });
       console.log("READY");
-      await new Promise(() => {});
+      await interrupted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      calls.push("drain applied");
     }
+    draining = action === "drain";
     if (action === "drain" && ["drain", "resume-failure"].includes(scenario)) throw new Error("drain failed");
     if (action === "drain" && scenario === "unsupported")
       throw new DrainUnsupportedError("no drain endpoint");
     return { draining, active: [] };
   },
   async health() {
+    if (packaged) {
+      const sha = !draining && (failHealth || packagedHealthReads++ === 0) ? "b".repeat(40) : "a".repeat(40);
+      calls.push(`health ${draining ? "draining" : sha}`);
+      return { ok: true, uptimeMs: 1, sha, draining, active: [] };
+    }
     calls.push(`health ${draining ? "draining" : "fresh"}`);
     if (scenario === "deploy-install") await compete();
     if (draining && scenario === "drain-health") throw new Error("drain health failed");
@@ -298,8 +334,61 @@ let error = "";
 let firstError = "";
 let tunnelJournal = "";
 let daemonOld = "";
+let firstCalls: string[] = [];
+let discovered: string[] = [];
+let original = "";
+let stable = "";
+let executable = "";
 try {
-  if (scenario === "deploy-install" || (scenario.startsWith("recover") && scenario.endsWith("deploy")))
+  if (packaged) {
+    const prefix = join(home, "brew");
+    const version = join(prefix, "Cellar", "limitless", "1.0");
+    executable = join(version, "bin", "limitless");
+    stable = join(prefix, "opt", "limitless", "bin", "limitless");
+    mkdirSync(join(version, "bin"), { recursive: true });
+    writeFileSync(executable, "binary");
+    mkdirSync(join(prefix, "opt"), { recursive: true });
+    symlinkSync(version, join(prefix, "opt", "limitless"));
+    const options = {
+      command,
+      client,
+      clock,
+      agentsDir: agents,
+      release: { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version },
+      execPath: executable,
+      mtplx: true,
+      tunnel: true,
+      publicUrl: "https://hooks.example.test",
+    };
+    process.env.BUN_BE_BUN = "1";
+    process.env.BUN_OPTIONS = "--preload=caller-option";
+    process.env.SERVICE_CALLER_VARIABLE = "caller-value";
+    const path = join(agents, "dev.limitless.daemon.plist");
+    if (scenario === "packaged-source") {
+      original =
+        service.installationUnits({
+          release: { kind: "source", root: app, version: "1.0", bun: Bun.version },
+        })[0]?.[1] ?? "";
+      writeFileSync(path, original);
+      loaded.add(neutral);
+    } else {
+      await service.install(0, options);
+      firstCalls = calls.splice(0);
+      original = readFileSync(path, "utf8").replace("<integer>10</integer>", "<integer>11</integer>");
+      if (scenario !== "packaged-fresh") writeFileSync(path, original);
+    }
+    if (scenario !== "packaged-fresh") {
+      if (scenario === "packaged-invalid") unlinkSync(join(prefix, "opt", "limitless"));
+      if (scenario === "packaged-extra") {
+        original = original.replace("</array>", "<string>--extra</string></array>");
+        writeFileSync(path, original);
+      }
+      failBootstrap = scenario === "packaged-bootstrap";
+      failHealth = scenario === "packaged-health";
+      await service.install(0, options);
+      discovered = (await service.installedUnits(options)).map((unit) => unit.kind);
+    }
+  } else if (scenario === "deploy-install" || (scenario.startsWith("recover") && scenario.endsWith("deploy")))
     await service.deploy(0, undefined, false, {
       command,
       client,
@@ -346,6 +435,17 @@ writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
 console.log(
   JSON.stringify({
     error,
+    firstCalls,
+    discovered,
+    original,
+    stable,
+    executable,
+    commands,
+    parsedUnits: Object.fromEntries(
+      readdirSync(agents)
+        .filter((name) => name.startsWith("dev.limitless."))
+        .map((name) => [name, parse(readFileSync(join(agents, name), "utf8"))]),
+    ),
     backupBeforeStop,
     contenderError,
     contenderCalls,

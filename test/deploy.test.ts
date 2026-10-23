@@ -1292,6 +1292,35 @@ test("signals during drain wait restore the daemon checkout and resume", async (
   }
 });
 
+test("interrupted deploy waits for an in-flight drain before resuming", async () => {
+  const f = setup();
+  const entered = Promise.withResolvers<void>();
+  const apply = Promise.withResolvers<void>();
+  const admin = f.client.admin;
+  f.client.admin = async (action, signal) => {
+    if (action === "drain") {
+      entered.resolve();
+      await apply.promise;
+    }
+    return admin(action, signal);
+  };
+  const result = deploy(7400, "feature", false, f.opts).catch((error: unknown) => error);
+  await entered.promise;
+  process.emit("SIGINT");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const resumedEarly = f.calls.includes("resume");
+  const lockHeld = existsSync(f.opts.lockPath);
+  apply.resolve();
+  expect(String(await result)).toContain("deploy interrupted by SIGINT");
+  expect(resumedEarly).toBe(false);
+  expect(lockHeld).toBe(true);
+  expect(f.calls.filter((call) => call === "drain" || call === "resume")).toEqual(["drain", "resume"]);
+  expect((await f.client.health(new AbortController().signal)).draining).toBe(false);
+  expect(f.calls).not.toContain("restart");
+  expect(f.selected()).toBe("previous");
+  expect(existsSync(f.opts.lockPath)).toBe(false);
+});
+
 test("a second signal exits immediately during rollback", async () => {
   const f = setup();
   const exits: number[] = [];
