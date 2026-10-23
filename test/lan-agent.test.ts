@@ -78,6 +78,7 @@ function fixture() {
     private: false,
     denyRead: undefined,
     slottedCommands: [],
+    agentFullSuite: "refuse",
     dispatch() {},
     spec: {
       cwd: root,
@@ -278,6 +279,10 @@ test("events use an attempt cursor and adoption precedes the result", async () =
   const running = f.run();
   await f.enqueued;
   const id = f.job();
+  expect(JSON.parse(f.workers.agentJob(id)?.request ?? "{}")).toMatchObject({
+    role: "implement",
+    agentFullSuite: "refuse",
+  });
   f.store.db
     .query("INSERT INTO agent_job_events (job_id,seq,events,created_at) VALUES (?,0,?,0)")
     .run(id, JSON.stringify([{ type: "text", text: "legacy" }]));

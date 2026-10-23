@@ -145,6 +145,7 @@ test.each([
     ["bun", "test"],
     ["cargo", "test"],
   ];
+  f.context.state.agentFullSuite = "refuse";
   const denyRead = [join(f.root, "private-source")];
   const outcome = await f.invoke({ ...options, denyRead });
   expect(received).toHaveLength(1);
@@ -154,6 +155,7 @@ test.each([
     invocationId: outcome.invocation.id,
     repoSlug: "fixture/repo",
     role: "implement",
+    agentFullSuite: "refuse",
     worktree: f.cwd,
     slottedCommands:
       "confineReads" in options

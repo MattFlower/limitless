@@ -1,8 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { installationUnits } from "../src/cli/service.ts";
+import { installationUnits, stableExecutable } from "../src/cli/service.ts";
 
 test("installation selects only explicitly requested rollback and tunnel agents", () => {
   for (const mtplx of [undefined, false, true])
@@ -67,6 +75,20 @@ afterEach(() => {
 });
 
 type MigrationResult = {
+  firstCalls: string[];
+  discovered: string[];
+  original: string;
+  stable: string;
+  executable: string;
+  commands: string[][];
+  parsedUnits: Record<
+    string,
+    {
+      ProgramArguments: string[];
+      WorkingDirectory: string;
+      EnvironmentVariables: Record<string, string>;
+    }
+  >;
   error: string;
   backupBeforeStop: boolean;
   contenderError: string;
@@ -107,6 +129,137 @@ async function migration(
   ]);
   expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
   return { result: JSON.parse(stdout.trim().split("\n").at(-1) ?? "") as MigrationResult, stdout };
+}
+
+test("packaged stable executable maps a Cellar file to its matching opt symlink", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "limitless-homebrew-"));
+  migrationDirs.push(prefix);
+  const version = join(prefix, "Cellar", "limitless", "1.0");
+  const executable = join(version, "bin", "limitless");
+  mkdirSync(join(version, "bin"), { recursive: true });
+  writeFileSync(executable, "binary");
+  mkdirSync(join(prefix, "opt"));
+  symlinkSync(version, join(prefix, "opt", "limitless"));
+  expect(stableExecutable(executable)).toBe(join(prefix, "opt", "limitless", "bin", "limitless"));
+});
+
+for (const target of ["missing", "wrong-version", "missing-executable"]) {
+  test(`packaged stable executable refuses ${target} with both paths`, () => {
+    const prefix = mkdtempSync(join(tmpdir(), "limitless-homebrew-"));
+    migrationDirs.push(prefix);
+    const executable = join(prefix, "Cellar", "limitless", "1.0", "bin", "limitless");
+    const other = join(prefix, "Cellar", "limitless", "2.0");
+    const stable = join(prefix, "opt", "limitless", "bin", "limitless");
+    mkdirSync(join(executable, ".."), { recursive: true });
+    if (target !== "missing-executable") writeFileSync(executable, "binary");
+    mkdirSync(join(other, "bin"), { recursive: true });
+    writeFileSync(join(other, "bin", "limitless"), "other binary");
+    mkdirSync(join(prefix, "opt"));
+    if (target !== "missing") symlinkSync(other, join(prefix, "opt", "limitless"));
+    expect(() => stableExecutable(executable)).toThrow(stable);
+    expect(() => stableExecutable(executable)).toThrow(executable);
+  });
+}
+
+test("packaged stable executable preserves a local bin path", () => {
+  const home = mkdtempSync(join(tmpdir(), "limitless-local-bin-"));
+  migrationDirs.push(home);
+  const executable = join(home, ".local", "bin", "limitless");
+  mkdirSync(join(executable, ".."), { recursive: true });
+  writeFileSync(executable, "binary");
+  expect(stableExecutable(executable)).toBe(executable);
+});
+
+test("packaged fresh install uses stable arguments, data home, explicit environment and build SHA", async () => {
+  const { result: r } = await migration("packaged-fresh");
+  expect(r.error).toBe("");
+  const daemon = r.parsedUnits["dev.limitless.daemon.plist"];
+  expect(daemon?.ProgramArguments).toEqual([r.stable, "serve"]);
+  expect(Object.keys(r.parsedUnits).sort()).toEqual([
+    "dev.limitless.daemon.plist",
+    "dev.limitless.mtplx.plist",
+    "dev.limitless.tunnel.plist",
+  ]);
+  const dir = migrationDirs.at(-1) ?? "";
+  for (const unit of Object.values(r.parsedUnits)) {
+    expect(unit.WorkingDirectory).toBe(join(dir, ".limitless"));
+    expect(unit.EnvironmentVariables).toEqual({
+      PATH: [
+        join(dir, ".local", "bin"),
+        "/opt/homebrew/bin",
+        join(dir, ".bun", "bin"),
+        join(dir, ".mtplx", "bin"),
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+      ].join(":"),
+      LANG: "C.UTF-8",
+      NODE_ENV: "production",
+    });
+  }
+  expect(
+    r.commands.filter((args) => args[0] === "git" || (args[0] === "bun" && args[1] === "install")),
+  ).toEqual([]);
+  expect(r.firstCalls).toContain(`health ${"b".repeat(40)}`);
+  expect(r.firstCalls.at(-3)).toBe(`health ${"a".repeat(40)}`);
+  expect(r.firstCalls.indexOf(`health ${"b".repeat(40)}`)).toBeLessThan(
+    r.firstCalls.indexOf(`health ${"a".repeat(40)}`),
+  );
+  expect(r.lock).toBe(false);
+});
+
+test("packaged reinstall discovers its own daemon and auxiliary units and drains before replacement", async () => {
+  const { result: r } = await migration("packaged-reinstall");
+  expect(r.error).toBe("");
+  expect(r.discovered.sort()).toEqual(["daemon", "mtplx", "tunnel"]);
+  expect(r.calls).toEqual([
+    "drain",
+    "health draining",
+    "bootout dev.limitless.daemon",
+    "bootstrap dev.limitless.daemon",
+    `health ${"b".repeat(40)}`,
+    `health ${"a".repeat(40)}`,
+    "bootout dev.limitless.mtplx",
+    "bootstrap dev.limitless.mtplx",
+    "bootout dev.limitless.tunnel",
+    "bootstrap dev.limitless.tunnel",
+  ]);
+  expect(r.journals).toEqual([]);
+  expect(r.lock).toBe(false);
+});
+
+for (const failure of ["bootstrap", "health"]) {
+  test(`packaged reinstall restores original plist and loaded agent after ${failure} failure`, async () => {
+    const { result: r } = await migration(`packaged-${failure}`);
+    expect(r.error).toContain(
+      failure === "bootstrap" ? "replacement bootstrap failed" : `expected ${"a".repeat(40)}`,
+    );
+    expect(r.calls[0]).toBe("drain");
+    expect(r.calls.at(-1)).toBe("bootstrap dev.limitless.daemon");
+    expect(r.files["dev.limitless.daemon.plist"]).toBe(r.original);
+    expect(r.loaded).toContain("dev.limitless.daemon");
+    expect(r.backup).toBe(r.original);
+    expect(r.phase).toBe("restored");
+    expect(r.lock).toBe(false);
+  });
+}
+
+for (const scenario of ["source", "extra", "invalid"]) {
+  test(`packaged install preserves a loaded ${scenario} unit without draining or stopping`, async () => {
+    const { result: r } = await migration(`packaged-${scenario}`);
+    expect(r.error).toContain(scenario === "invalid" ? "stable executable" : "unrelated agent");
+    if (scenario === "invalid") {
+      expect(r.error).toContain(r.stable);
+      expect(r.error).toContain(r.executable);
+    }
+    expect(r.calls).toEqual([]);
+    expect(r.files["dev.limitless.daemon.plist"]).toBe(r.original);
+    expect(r.loaded).toContain("dev.limitless.daemon");
+    expect(r.journals).toEqual([]);
+    expect(r.lock).toBe(false);
+  });
 }
 
 test("migration drains current work, waits for unload, then replaces and checks health", async () => {
@@ -472,7 +625,16 @@ for (const [scenario, signal] of [
   ["marked-signal-drain", "SIGKILL"],
 ] as const) {
   test(`${signal} during ${scenario} leaves the running agent alone and its rollback data intact`, async () => {
-    const { dir, original } = await interrupted(scenario, signal, false, "prepared");
+    const { dir, original, output } = await interrupted(scenario, signal, false, "prepared");
+    if (signal !== "SIGKILL") {
+      const stopped = JSON.parse(output.trim().split("\n").at(-1) ?? "") as MigrationResult;
+      expect(stopped.draining).toBe(false);
+      expect(stopped.calls.filter((call) => ["drain applied", "resume"].includes(call))).toEqual([
+        "drain applied",
+        "resume",
+      ]);
+      expect(stopped.calls.some((call) => call.startsWith("boot"))).toBe(false);
+    }
     const { result: r } = await migration("recover-deploy", "daemon", dir);
     expect(r.error).toBe("");
     expect(r.calls.filter((call) => call.startsWith("boot"))).toEqual([]);

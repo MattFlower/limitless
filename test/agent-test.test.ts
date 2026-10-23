@@ -33,7 +33,7 @@ import { AgentTestSession, agentTestLease, type TestWait } from "../src/gates/ag
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { agentShellEnv, removeScratch, SCRATCH_NAME } from "../src/harness/scratch.ts";
 import { withSlottedCommands } from "../src/harness/slotted.ts";
-import { readSlottedCommands } from "../src/harness/slotted-config.ts";
+import { readAgentFullSuite, readSlottedCommands } from "../src/harness/slotted-config.ts";
 import { agentEnv, sh } from "../src/util/proc.ts";
 
 import { waitClock } from "./wait-clock.ts";
@@ -54,9 +54,13 @@ function fixture() {
   const fake = join(real, "bun");
   writeFileSync(fake, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_MARKER"\nexit 3\n', { mode: 0o755 });
   const path = process.env.PATH,
+    previousLease = process.env.LIMITLESS_AGENT_TEST_LEASE,
     previousMarker = process.env.TEST_MARKER;
+  delete process.env.LIMITLESS_AGENT_TEST_LEASE;
   cleanup.push(() => {
     process.env.PATH = path;
+    if (previousLease === undefined) delete process.env.LIMITLESS_AGENT_TEST_LEASE;
+    else process.env.LIMITLESS_AGENT_TEST_LEASE = previousLease;
     if (previousMarker === undefined) delete process.env.TEST_MARKER;
     else process.env.TEST_MARKER = previousMarker;
   });
@@ -89,7 +93,12 @@ function offlineClient(config: WrapperConfig, detail = "offline") {
   );
 }
 
-test("matched command waits, passes exit code and releases its lease", async () => {
+test.each([
+  { role: "verify", agentFullSuite: "refuse" },
+  { role: "implement" },
+  { role: "implement", agentFullSuite: "slot" },
+  { agentFullSuite: "refuse" },
+] as const)("matched command waits, passes exit code and releases its lease (%j)", async (policy) => {
   const f = fixture(),
     queued = Promise.withResolvers<void>(),
     acquire = Promise.withResolvers<void>();
@@ -106,7 +115,7 @@ test("matched command waits, passes exit code and releases its lease", async () 
     await acquire.promise;
     return { id: "lease", acquired: true };
   };
-  const work = agentTestCommand(f.config, ["bun", "test"], client);
+  const work = agentTestCommand({ ...f.config, ...policy }, ["bun", "test"], client);
   await queued.promise;
   expect(existsSync(f.marker)).toBe(false);
   acquire.resolve();
@@ -114,6 +123,117 @@ test("matched command waits, passes exit code and releases its lease", async () 
   expect(readFileSync(f.marker, "utf8")).toBe("test\n");
   expect(requests[0]).toMatchObject({ name: "bun test", lane: "gate", token: "test-token" });
   expect(requests.at(-1)).toMatchObject({ id: "lease", release: true });
+});
+
+test.each([{ args: ["test"] }, { args: ["test", "-t", "name"] }, { args: ["test", "--parallel=4"] }])(
+  "implement full suite is refused before slot registration (%j)",
+  async ({ args }) => {
+    const f = fixture();
+    process.env.LIMITLESS_AGENT_TEST_LEASE = "parent";
+    const events: TestWait[] = [];
+    const session = new AgentTestSession((event) => events.push(event));
+    const held = await gateSlots.acquire(new AbortController().signal);
+    const registration = spyOn(gateSlots, "lease");
+    const stderr = spyOn(console, "error").mockImplementation(() => {});
+    const requests: Record<string, unknown>[] = [];
+    try {
+      const code = await agentTestCommand(
+        { ...f.config, role: "implement", agentFullSuite: "refuse", token: session.token },
+        ["bun", ...args],
+        async (body) => {
+          requests.push(body);
+          if (!body.refused) throw new LeaseRejected("unexpected slot request");
+          await agentTestLease(body);
+          // A transport fallback may deliver the same refusal notification again.
+          return agentTestLease(body);
+        },
+      );
+      expect(code).not.toBe(0);
+      expect(stderr.mock.calls.flat().join()).toContain(
+        "factory's gates run the full suite after this round",
+      );
+      expect(stderr.mock.calls.flat().join()).toContain("bun test test/<file>.test.ts");
+      expect(existsSync(f.marker)).toBe(false);
+      expect(registration).not.toHaveBeenCalled();
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ refused: expect.any(String) });
+      expect(events).toEqual([
+        { kind: "agent-test", phase: "refused", command: ["bun", ...args].join(" "), lane: "gate" },
+      ]);
+    } finally {
+      held();
+      session.close();
+      registration.mockRestore();
+      stderr.mockRestore();
+    }
+  },
+);
+
+test("installed background refusal skips the gate slot; affected files still use the small lane", async () => {
+  const f = fixture(),
+    scratch = join(f.root, SCRATCH_NAME),
+    tests = join(f.root, "test");
+  mkdirSync(scratch);
+  mkdirSync(tests);
+  writeFileSync(join(tests, "x.test.ts"), "");
+  const events: TestWait[] = [];
+  const held = await gateSlots.acquire(new AbortController().signal);
+  const gate = spyOn(gateSlots, "lease"),
+    small = spyOn(agentTestSlots, "lease");
+  try {
+    await withSlottedCommands(
+      f.config.commands,
+      f.root,
+      scratch,
+      undefined,
+      (event) => events.push(event),
+      async (path) => {
+        const result = await sh(["/bin/sh", "-c", 'bun test & child=$!; wait "$child"'], {
+          cwd: f.root,
+          env: { PATH: path ?? "", TEST_MARKER: f.marker },
+          allowFail: true,
+          timeoutMs: 5000,
+        });
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain("bun test test/<file>.test.ts");
+        expect(existsSync(f.marker)).toBe(false);
+        expect(gate).not.toHaveBeenCalled();
+        expect(events).toHaveLength(1);
+        const targeted = await sh(["bun", "test", "test/x.test.ts"], {
+          cwd: f.root,
+          env: { PATH: path ?? "", TEST_MARKER: f.marker },
+          allowFail: true,
+          timeoutMs: 5000,
+        });
+        expect(targeted.exitCode).toBe(3);
+        expect(readFileSync(f.marker, "utf8")).toBe("test test/x.test.ts\n");
+        expect(small).toHaveBeenCalledTimes(1);
+        expect(events).toHaveLength(1);
+        expect(gate).not.toHaveBeenCalled();
+      },
+      undefined,
+      { role: "implement", agentFullSuite: "refuse" },
+    );
+  } finally {
+    held();
+    gate.mockRestore();
+    small.mockRestore();
+  }
+});
+
+test("full-suite policy defaults to slot and warns for invalid values", () => {
+  const warnings: string[] = [];
+  for (const contents of [null, "[limits]", '[limits]\nagent_full_suite = "slot"'])
+    expect(readAgentFullSuite(contents, (warning) => warnings.push(warning))).toBe("slot");
+  expect(
+    readAgentFullSuite('[limits]\nagent_full_suite = "refuse"', (warning) => warnings.push(warning)),
+  ).toBe("refuse");
+  expect(warnings).toEqual([]);
+  for (const value of ['"invalid"', "42", "false", "[]"])
+    expect(
+      readAgentFullSuite(`[limits]\nagent_full_suite = ${value}`, (warning) => warnings.push(warning)),
+    ).toBe("slot");
+  expect(warnings).toHaveLength(4);
 });
 
 test("unslotted argv executes immediately without requesting a lease", async () => {
@@ -124,7 +244,13 @@ test("unslotted argv executes immediately without requesting a lease", async () 
     throw new Error("must not request");
   };
   for (const args of [["install"], ["run", "lint"], ["testing"]])
-    expect(await agentTestCommand(f.config, ["bun", ...args], client)).toBe(3);
+    expect(
+      await agentTestCommand(
+        { ...f.config, role: "implement", agentFullSuite: "refuse" },
+        ["bun", ...args],
+        client,
+      ),
+    ).toBe(3);
   expect(requests).toBe(0);
   expect(readFileSync(f.marker, "utf8")).toBe("install\nrun lint\ntesting\n");
 });
