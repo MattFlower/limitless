@@ -784,7 +784,12 @@ export async function runWorker(
         if (job) job.reported = false;
       }
     };
-    const runAgent = async (id: string, request: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
+    const runAgent = async (
+      id: string,
+      request: z.infer<typeof AgentRequest>,
+      jobSignal: AbortSignal,
+      deadline: number,
+    ) => {
       const path = `/worker/agent-jobs/${id}`;
       let root: string | undefined;
       let sanitize = agentPathMask([]);
@@ -882,7 +887,14 @@ export async function runWorker(
             }),
           );
           assertProcessesStopped();
-          return () => call(`${path}/result`, report, jobSignal);
+          return () =>
+            call(
+              `${path}/result`,
+              report,
+              sha === req.parentSha
+                ? jobSignal
+                : AbortSignal.any([combined, AbortSignal.timeout(Math.max(0, deadline - Date.now()))]),
+            );
         });
       } catch (error) {
         if (!jobSignal.aborted)
@@ -972,7 +984,12 @@ export async function runWorker(
               () => controller.abort(),
               Math.min(remainingMs ?? request.timeoutMs + 360_000, 2_147_483_647),
             );
-            const task = runAgent(id, request, AbortSignal.any([combined, controller.signal])).finally(() => {
+            const task = runAgent(
+              id,
+              request,
+              AbortSignal.any([combined, controller.signal]),
+              Date.now() + Math.min(remainingMs ?? request.timeoutMs + 360_000, 2_147_483_647),
+            ).finally(() => {
               clearTimeout(timer);
               agentJobs.delete(id);
             });

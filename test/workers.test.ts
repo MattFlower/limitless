@@ -4393,9 +4393,13 @@ const agentRequest = (overrides: Partial<AgentJobRequest> = {}): AgentJobRequest
 test.each(["backend", "openai", "decisions"] as const)(
   "agent targets with %s stay local regardless of contents",
   (field) => {
-    for (const value of [{ baseUrl: "http://localhost:8080", authToken: "" }, undefined]) {
+    for (const value of [
+      { baseUrl: "http://localhost:8080", authToken: "" },
+      { baseUrl: "http://localhost:8080" },
+      undefined,
+    ]) {
       const req = agentRequest();
-      req.target[field] = value;
+      Object.assign(req.target, { [field]: value });
       expect(workers.enqueueAgentJob(req)).toBeNull();
       expect(store.db.query("SELECT * FROM agent_jobs").all()).toEqual([]);
     }
@@ -4408,6 +4412,16 @@ test.each(["claude", "codex"] as const)("plain %s CLI agent targets still enqueu
   const id = workers.enqueueAgentJob(req);
   expect(id).not.toBeNull();
   expect(workers.agentJob(id ?? "")?.request).toBe(JSON.stringify(req));
+});
+
+test("agent enqueue preserves the durable coordinator job id", () => {
+  const req = agentRequest();
+  const id = "durable-agent-job";
+  expect(workers.enqueueAgentJob(req, id)).toBe(id);
+  expect(workers.agentJob(id)).toMatchObject({ id, state: "queued", request: JSON.stringify(req) });
+  req.target.backend = { baseUrl: "http://localhost:8080", authToken: "" };
+  expect(workers.enqueueAgentJob(req, "refused-agent-job")).toBeNull();
+  expect(workers.agentJob("refused-agent-job")).toBeNull();
 });
 
 function enqueueAgent(overrides: Partial<AgentJobRequest> = {}) {

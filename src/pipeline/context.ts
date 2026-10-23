@@ -99,6 +99,8 @@ export interface RunState {
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
   gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
+  /** the worker implement job of this round; cleared in the implementation-ready save */
+  agentJob?: { round: number; id: string };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
@@ -894,6 +896,7 @@ export class RunContext {
               dispatch,
               publication: opts.publication,
               round: opts.stage.round,
+              agentJob: this.state.agentJob,
             },
             local,
           );
