@@ -319,6 +319,48 @@ untracked hidden files, commits and artifacts while preserving ignored dependenc
 outputs. Passing and final rounds need no restoration. Hidden output is never included in
 recovery feedback.
 
+## Replays
+
+Generate harder implement cases from selected merged factory PRs:
+
+```sh
+bun scripts/implement-replay-cases.ts --repo owner/name --pr 123,456
+```
+
+The generator uses `gh` and the repository cache. Run it on a host where the existing
+gate confinement backend is available; missing confinement excludes a case. It extracts the
+published quoted `## Request` without rewriting it, pins the default branch's squash commit
+and its first parent, and copies every added or modified `test/**/*.test.ts` from that commit
+(including renamed destinations). Deleted tests and support files are excluded. Hidden tests
+overwrite the candidate's versions at grading, as with other implement cases.
+
+Each proposed case gets independent detached worktrees at base and head. Both run setup
+selected from the base revision before receiving the hidden files. The hidden command must
+complete with a nonzero exit at base and zero at head. A base pass, head failure, setup failure,
+timeout, launch failure or other operational error excludes the case. The printed table shows
+both outcomes and exclusion or duplicate reasons. One excluded PR does not stop the others.
+
+Accepted cases append to `evals/implement/cases.json`, with hidden bytes under
+`evals/implement/hidden/<case-id>/<repository-relative-path>`. IDs continue above the highest
+existing `impl-NNN`; repeated repository/PR identities are skipped. `replay` and `replay-v2`
+are tags in the existing version-1 envelope. Select the printed IDs explicitly, for example:
+
+```sh
+limitless eval run implement --models codex/sol-6.1,claude/opus --cases impl-013,impl-014 --follow
+```
+
+`--cases` accepts IDs, not tags. Production metadata is best effort from the PR's factory
+report: triage complexity, recorded review rounds, needs_human outcome, and all observed
+implement models in the work log. Notes record provenance and unknown values; configured routing
+chains are not treated as observed usage. Missing complexity defaults to `medium` with an explicit
+note; a known complexity outside trivial/small/medium is excluded. No daemon database is required.
+
+Generator validation does not run model evaluations or bypass runner preparation, gates, audit,
+or contamination checks. Public repositories retain replay solutions in their history, and a
+candidate with network access could look upstream even though trials pin base history. Public
+solutions may also be present in training data. Treat absolute pass rates as upper bounds when
+comparing candidates; see the [dataset caveats](../evals/implement/README.md#caveats).
+
 ## Policy generation and review
 
 `limitless eval policy` reads persisted evidence and effective settings through the daemon API;

@@ -61,7 +61,7 @@ export async function prepareImplement(item: ImplementCase, cwd: string, signal:
 }
 
 /** Reject symlink components, including the final file, before any hidden bytes are written. */
-function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
+export function injectHiddenFiles(cwd: string, files: ReturnType<typeof hiddenContents>) {
   if (lstatSync(cwd).isSymbolicLink()) throw new Error("hidden destination repository symlink");
   const root = realpathSync(cwd);
   for (const file of files) {
@@ -267,7 +267,7 @@ export async function gradeImplement(
       ...after.checks,
     ].some((g) => g.output.startsWith("[timed out]"));
     if (gateTimeout) evidence.reason = "timeout";
-    inject(checkout, files);
+    injectHiddenFiles(checkout, files);
     const grading = checkout;
     // Confined to the grading checkout and its own scratch HOME/TMPDIR; never the candidate's.
     const hidden = await runConfined({
