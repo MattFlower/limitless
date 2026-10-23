@@ -247,6 +247,9 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
           autoAllowBashIfSandboxed: true,
           allowUnsandboxedCommands: spec.mode === "edit",
           excludedCommands: [],
+          ...(spec.mode === "readonly" && spec.allowLocalBinding
+            ? { network: { allowLocalBinding: true } }
+            : {}),
           filesystem,
         },
         disableAllHooks: true,
