@@ -16,7 +16,7 @@ import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree, withRepoLock } from "../git/repos.ts";
 import { runClaude } from "../harness/claude.ts";
 import { runCodex } from "../harness/codex.ts";
-import { readPolicyScope } from "../harness/read-policy.ts";
+import { ConfinementError, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
@@ -864,6 +864,18 @@ export async function runWorker(
           flush();
           await posts;
           jobSignal.throwIfAborted();
+          if (
+            false && result.status !== "ok" &&
+            result.status !== "cancelled" &&
+            (result.confinement?.ok === false ||
+              /Failed to create session:[^\n]*fs sandbox helper failed[^\n]*sandbox-exec: execvp\(\)[^\n]*Operation not permitted/i.test(
+                result.error ?? "",
+              ) ||
+              /API Error: EPERM: operation not permitted, (?:mkdir|rmdir) ['"][^'"\n]*\/\.config\/anthropic\/credentials\.lock['"]/i.test(
+                result.error ?? "",
+              ))
+          )
+            throw new ConfinementError(result.error ?? "Worker session confinement failed");
           assertProcessesStopped();
           const sha = await publishAgentChanges(
             cwd,

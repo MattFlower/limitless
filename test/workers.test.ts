@@ -84,6 +84,7 @@ import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
+import { workerStartupFailures } from "./worker-startup-support.ts";
 
 let home: string, cfg: Config, store: Store, workers: WorkerStore;
 let listener: Awaited<ReturnType<typeof startWorkerListener>>;
@@ -6843,3 +6844,71 @@ test("heartbeat optional fields return only after the observed coordinator relea
     await worker.stop();
   }
 });
+
+test.each([
+  ...workerStartupFailures.map(([label, error]) => ({ label, error, infrastructure: true })),
+  { label: "ordinary agent failure", error: "agent could not complete the task", infrastructure: false },
+  {
+    label: "unrelated EPERM",
+    error: "API Error: EPERM: operation not permitted, mkdir '/workspace/credentials.lock'",
+    infrastructure: false,
+  },
+  {
+    label: "unrelated helper failure",
+    error: "fs sandbox helper failed: invalid configuration",
+    infrastructure: false,
+  },
+])(
+  "worker startup classification: $label",
+  async ({ error, infrastructure }) => {
+    await listen();
+    const id = await queuedLocalAgent();
+    const secret = randomBytes(24).toString("hex");
+    registerCredential("WORKER_STARTUP_TEST", secret);
+    let results = 0;
+    let transmitted = "";
+    const worker = await loop({
+      harnesses: { claude: fakeHarness(() => ({ fault: "exit", error: `${error} ${secret}` })) },
+      async request(...args) {
+        if (args[1] === agentPath(id, "result")) results++;
+        if (args[1] === agentPath(id, "failure")) transmitted = (args[2] as { reason: string }).reason;
+        return workerRequest(...args);
+      },
+    });
+    try {
+      await until(() =>
+        infrastructure
+          ? workers.agentJob(id)?.failure_reason !== null
+          : workers.agentJob(id)?.state === "done",
+      );
+      const job = workers.agentJob(id);
+      if (infrastructure) {
+        expect(job).toMatchObject({
+          state: "queued",
+          result: null,
+          result_sha: null,
+          excluded: '["loop-runner"]',
+        });
+        expect(transmitted).toBe(`${error} [redacted]`);
+        expect(job?.failure_reason).toBeTruthy();
+        expect(job?.failure_reason).not.toContain(secret);
+        expect(results).toBe(0);
+        const token = await paired("retry");
+        await call("/worker/heartbeat", caps(), token);
+        expect(workers.leaseAgentJob("loop-runner")).toBeNull();
+        expect(workers.leaseAgentJob("retry")?.id).toBe(id);
+      } else {
+        expect(results).toBe(1);
+        expect(JSON.parse(job?.result ?? "null")).toMatchObject({
+          status: "error",
+          error: "[withheld: private text]",
+        });
+        expect(job?.excluded).toBe("[]");
+      }
+      expect(worker.controller.signal.aborted).toBe(false);
+    } finally {
+      await worker.stop();
+    }
+  },
+  30_000,
+);

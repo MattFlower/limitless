@@ -1,11 +1,13 @@
-import { describe, expect } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,7 +15,7 @@ import { delimiter, dirname, join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
-  type CodexReaderProbe,
+  CodexReaderProbe,
   CodexStreamParser,
   parseRateLimits,
   runCodex,
@@ -32,8 +34,8 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
-import { runProcess } from "../src/util/proc.ts";
-import { fakeConfinement } from "./confinement.ts";
+import { agentEnv, runProcess } from "../src/util/proc.ts";
+import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 
@@ -310,6 +312,7 @@ const swapCommand = (cmd: string[], replacement: string[]) =>
 // A confined Codex editor runs only on a CLI whose sandbox was verified; this stub stands in for that probe.
 const verifiedCodex: typeof runClaude = (spec, runner) =>
   runCodex(spec, runner, {
+    resolve: () => "codex",
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
 
@@ -1735,3 +1738,150 @@ test("a credential inside the model name never reaches the log header", async ()
     fixture.close();
   }
 });
+
+function codexInstallation(standalone: boolean) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "codex-install-")));
+  const home = join(root, "home");
+  const bin = standalone
+    ? join(home, ".codex/packages/standalone/releases/test-target/bin")
+    : join(root, "opt/homebrew/Cellar/codex/test/bin");
+  const link = join(standalone ? home : root, standalone ? ".local/bin" : "opt/homebrew/bin", "codex");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(dirname(link), { recursive: true });
+  mkdirSync(join(home, ".codex"), { recursive: true });
+  const executable = join(bin, "codex");
+  copyFileSync("/bin/echo", executable);
+  if (standalone) {
+    const current = join(home, ".codex/packages/standalone/current");
+    symlinkSync(dirname(bin), current);
+    symlinkSync(join(current, "bin/codex"), link);
+  } else symlinkSync(executable, link);
+  const cwd = join(root, "checkout");
+  mkdirSync(cwd);
+  return { root, home, bin, executable, link, cwd };
+}
+
+function installationSpec(cwd: string, scratchDir: string): AgentSpec {
+  return {
+    cwd,
+    scratchDir,
+    prompt: "fixture",
+    mode: "edit",
+    target: {
+      modelId: "codex/test",
+      provider: "codex",
+      harness: "codex",
+      model: "test",
+      vendor: "openai",
+      tier: 4,
+      billing: "subscription",
+    },
+    signal: new AbortController().signal,
+    onEvent() {},
+    logPath: join(scratchDir, "log"),
+    timeoutMs: 1000,
+    idleTimeoutMs: 1000,
+    maxToolCalls: 1,
+  };
+}
+
+// Named Codex filesystem entries are path-specific read/execute grants. Exercise those generated
+// entries directly with Seatbelt so this regression needs neither an installed CLI nor a login.
+function generatedSeatbelt(args: string[], omit: string[] = []) {
+  const config = args.find((arg) => arg.startsWith("permissions=")) ?? "";
+  const entries = [...config.matchAll(/("(?:[^"\\]|\\.)*")="(read|write|none)"/g)]
+    .map((match) => ({ path: JSON.parse(match[1] ?? '""') as string, access: match[2] }))
+    .filter(({ path }) => path.startsWith("/") && !omit.includes(path))
+    .sort((a, b) => a.path.length - b.path.length);
+  return [
+    "(version 1)",
+    "(allow default)",
+    "(deny file-write*)",
+    ...entries.map(
+      ({ path, access }) =>
+        `(${access === "none" ? "deny" : "allow"} file-read* process-exec ${access === "write" ? "file-write* " : ""}(subpath ${JSON.stringify(path)}))`,
+    ),
+  ].join("\n");
+}
+
+test.each([false, true])("Codex canonical installation profiles (standalone=%s)", async (standalone) => {
+  const install = codexInstallation(standalone);
+  const lookup = spyOn(Bun, "which").mockReturnValue(install.link);
+  try {
+    const executable = new CodexReaderProbe().resolve();
+    expect(executable).toBe(install.executable);
+    await withScratch(install.cwd, async (scratchDir) => {
+      await readPolicyScope.run({ home: install.home, environment: {} }, async () => {
+        for (const [mode, confineReads] of [
+          ["edit", false],
+          ["readonly", false],
+          ["readonly", true],
+        ] as const) {
+          const args = buildCodexArgs(
+            {
+              ...installationSpec(install.cwd, scratchDir),
+              mode,
+              confineReads,
+              denyRead: [join(install.home, ".codex")],
+            },
+            executable,
+          );
+          const config = args.find((arg) => arg.startsWith("permissions=")) ?? "";
+          for (const path of [install.executable, install.bin]) {
+            expect(config).toContain(`${JSON.stringify(path)}="read"`);
+            expect(config).not.toContain(`${JSON.stringify(path)}="write"`);
+          }
+          expect(config).toContain(`${JSON.stringify(join(install.home, ".codex"))}="none"`);
+          for (const path of [install.home, join(install.home, ".codex/packages"), dirname(install.bin)]) {
+            expect(config).not.toContain(`${JSON.stringify(path)}="read"`);
+            expect(config).not.toContain(`${JSON.stringify(path)}="write"`);
+          }
+        }
+      });
+    });
+  } finally {
+    lookup.mockRestore();
+    rmSync(install.root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `Codex standalone helper executes while credentials and unrelated home executables stay denied${seatbeltSkip ? ` (skipped: ${seatbeltSkip})` : ""}`,
+  async () => {
+    const install = codexInstallation(true);
+    const auth = join(install.home, ".codex/auth.json");
+    const unrelated = join(install.home, "unrelated");
+    writeFileSync(auth, "credential-canary");
+    copyFileSync("/bin/echo", unrelated);
+    try {
+      await withScratch(install.cwd, async (scratchDir) => {
+        const spec = {
+          ...installationSpec(install.cwd, scratchDir),
+          mode: "readonly" as const,
+          confineReads: true,
+          denyRead: [install.home, join(install.home, ".codex")],
+        };
+        const args = buildCodexArgs(spec, realpathSync(install.link));
+        const execute = (command: string[], omit: string[] = []) =>
+          runProcess({
+            cmd: ["/usr/bin/sandbox-exec", "-p", generatedSeatbelt(args, omit), ...command],
+            cwd: install.cwd,
+            env: agentEnv(),
+            timeoutMs: 5000,
+          });
+        const positive = await execute([install.executable, "helper-ok"]);
+        expect(positive.exitCode).toBe(0);
+        expect(positive.stdout.trim()).toBe("helper-ok");
+        expect((await execute(["/bin/cat", auth])).exitCode).not.toBe(0);
+        expect((await execute([unrelated, "unrelated-ok"])).exitCode).not.toBe(0);
+        expect((await execute([install.executable], [install.executable, install.bin])).exitCode).not.toBe(0);
+        expect(
+          (await execute(["/bin/sh", "-c", 'echo forbidden > "$1"', "sh", join(install.bin, "new")]))
+            .exitCode,
+        ).not.toBe(0);
+      });
+    } finally {
+      rmSync(install.root, { recursive: true, force: true });
+    }
+  },
+);
