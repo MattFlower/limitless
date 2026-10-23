@@ -2,11 +2,26 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { validateMetafile } from "../scripts/build-binary.ts";
+import { BUILD_DEFINES } from "../src/release.ts";
 import { buildUi } from "../src/server/ui.ts";
 import { UI_RESOURCE } from "../src/server/ui-build.ts";
 import { uiBuildFixture } from "./ui-build-support.ts";
 
 const uiMaps = uiBuildFixture();
+
+test("release define removes the source UI compiler from the bundle", async () => {
+  const result = await Bun.build({
+    entrypoints: [join(import.meta.dir, "../src/server/ui.ts")],
+    target: "bun",
+    metafile: true,
+    define: { [BUILD_DEFINES.packaged]: "true" },
+  });
+  expect(result.success).toBe(true);
+  const { metafile } = result;
+  if (!metafile) throw new Error("Missing bundle metafile");
+  expect(() => validateMetafile(metafile)).not.toThrow();
+});
 
 test("shared UI options emit root-relative script and stylesheet URLs", async () => {
   const { directory } = await uiMaps();

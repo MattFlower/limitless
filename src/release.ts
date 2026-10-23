@@ -11,8 +11,11 @@ declare const LIMITLESS_BUILD_VERSION: string;
 declare const LIMITLESS_BUILD_SHA: string;
 declare const LIMITLESS_BUILD_PACKAGED: boolean;
 
-// This compile-time guard lets release builds discard source-only build dependencies.
-export const SOURCE_BUILD = typeof LIMITLESS_BUILD_PACKAGED === "undefined" || !LIMITLESS_BUILD_PACKAGED;
+// Keep the define beside the import: Bun does not fold guards imported from another module.
+export async function sourceUiPlugin() {
+  if (typeof LIMITLESS_BUILD_PACKAGED === "undefined" || !LIMITLESS_BUILD_PACKAGED)
+    return (await import("../scripts/solid-plugin.ts")).default;
+}
 
 type BuildIdentity = { version?: string; sha?: string };
 export type Release = { version: string; bun: string } & (
