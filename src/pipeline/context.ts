@@ -29,7 +29,7 @@ import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { selectHarness } from "../harness/select.ts";
-import type { SlottedCommands } from "../harness/slotted-config.ts";
+import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { GhRunner } from "../integrations/github.ts";
@@ -60,6 +60,8 @@ export interface EngineDeps {
   store: Store;
   /** Limitless build (git SHA), part of the baseline cache key; unknown disables the cache. */
   buildSha?: string;
+  /** Coordinator runtime override for baseline cache tests; defaults to Bun.version. */
+  bunVersion?: string;
   router: Router;
   tracker: ProviderTracker;
   harnesses: Record<string, Harness>;
@@ -94,6 +96,7 @@ export interface RunState {
   gatesConfig?: GateConfig;
   previewConfig?: PreviewConfig | null;
   slottedCommands?: SlottedCommands;
+  agentFullSuite?: AgentFullSuite;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
   /** Effective review mode, pinned before the run's first review invocation. */
@@ -913,6 +916,7 @@ export class RunContext {
                   data,
                 }),
               dispatch,
+              { role: opts.role, agentFullSuite: this.state.agentFullSuite },
             );
           result = await agentExecutor.run(
             {
@@ -923,6 +927,7 @@ export class RunContext {
               worktree: spec.cwd,
               spec,
               slottedCommands,
+              agentFullSuite: this.state.agentFullSuite,
               shadow: Boolean(shadow),
               private: Boolean(opts.privateOutput || opts.redactHoldout || opts.privateSession),
               denyRead: opts.denyRead,

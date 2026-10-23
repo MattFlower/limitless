@@ -3,7 +3,7 @@ import type { Role } from "../core/types.ts";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateRun } from "../gates/run.ts";
-import type { SlottedCommands } from "../harness/slotted-config.ts";
+import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { redactCredentialData, registerCredential } from "../util/proc.ts";
@@ -84,6 +84,7 @@ export interface AgentJobRequest
   role?: Role;
   branch?: string;
   slottedCommands?: SlottedCommands;
+  agentFullSuite?: AgentFullSuite;
   commit?: {
     message: string;
     authorName: string;

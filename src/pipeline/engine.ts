@@ -9,6 +9,7 @@ import {
   BASELINE_CACHE_TTL_MS,
   baselineCacheKey,
   cacheableBaseline,
+  gateBunVersion,
   gateEnvDigest,
   lockfileHash,
   singleFlight,
@@ -76,7 +77,7 @@ import {
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
-import { readSlottedCommands } from "../harness/slotted-config.ts";
+import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -266,15 +267,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       );
       await ctx.save();
     }
-    if (ctx.state.phase !== "prepare" && ctx.state.slottedCommands === undefined) {
+    if (
+      ctx.state.phase !== "prepare" &&
+      (ctx.state.slottedCommands === undefined || ctx.state.agentFullSuite === undefined)
+    ) {
       const trustedSha =
         reviewRound(ctx)?.owner.baseSha ?? ctx.state.verification?.baseSha ?? ctx.run.baseSha;
       if (!trustedSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base slotted commands: missing base SHA or worktree");
-      ctx.state.slottedCommands = readSlottedCommands(
-        await readFileAt(ctx.state.worktreePath, trustedSha, ".limitless.toml"),
-        (message) => ctx.log(message, "warn"),
-      );
+      const contents = await readFileAt(ctx.state.worktreePath, trustedSha, ".limitless.toml");
+      ctx.state.slottedCommands ??= readSlottedCommands(contents, (message) => ctx.log(message, "warn"));
+      ctx.state.agentFullSuite ??= readAgentFullSuite(contents, (message) => ctx.log(message, "warn"));
       await ctx.save();
     }
     if (ctx.state.phase === "prepare") await prepare(ctx);
@@ -602,6 +605,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     try {
       const repoConfig = await readFileAt(wt.path, trustedSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
+      ctx.state.agentFullSuite = readAgentFullSuite(repoConfig, (message) => ctx.log(message, "warn"));
       ctx.state.slottedCommands = readSlottedCommands(repoConfig, (message) => ctx.log(message, "warn"));
       // Review lenses come from the base commit, never from the change under review.
       if (ctx.deps.cfg.reviewMode === "panel")
@@ -660,18 +664,26 @@ async function prepare(ctx: RunContext): Promise<void> {
       // Without a known build the gate environment can't be keyed: never read or write the cache.
       else if (!buildSha) ctx.state.baseline = await runBaseline();
       else {
+        const executor =
+          cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local";
+        const env = gateEnv();
+        const bunVersion =
+          executor === "lan"
+            ? (ctx.deps.bunVersion ?? Bun.version)
+            : await gateBunVersion(ctx.runDir, env, ctx.signal);
+        ctx.checkCancelled();
         // Keyed by the commit actually checked out, so verify-change caches its PR base.
         const key = baselineCacheKey({
-          executor: cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local",
+          executor,
           repoId: ctx.repo.id,
           baseSha: await headSha(wt.path),
           gates,
           lockfileHash: lockfileHash(wt.path),
-          bunVersion: Bun.version,
+          bunVersion,
           platform: process.platform,
           arch: process.arch,
           buildSha,
-          envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
+          envDigest: gateEnvDigest(env, cfg.baselineEnv),
         });
         // A bypass still runs the baseline and refreshes the entry if it passes.
         const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;

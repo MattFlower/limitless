@@ -64,6 +64,7 @@ function fixture(limit = 2, concurrency = 3) {
       worktreePath: root,
       previewConfig: null,
       slottedCommands: [],
+      agentFullSuite: "slot",
       answers: [],
       round: 0,
       roundsOnImplementer: 0,

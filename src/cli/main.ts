@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+// WebAuthn's bundled dependencies need the polyfill before the daemon's dynamic imports initialize.
+import "reflect-metadata";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { validateAllow } from "../core/allow.ts";
