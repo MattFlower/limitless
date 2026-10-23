@@ -259,8 +259,9 @@ on the worker. Leases renew with
 heartbeats and expire after sixty seconds. Infrastructure failures retry once on another worker,
 then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
 restarts re-attach only to baseline, initial and rebase LAN gate jobs for the same stage, round and
-SHA. The coordinator must return before the gate-job sweep fails the job for an expired lease or
-stale heartbeat (about thirty seconds since the last heartbeat, with no restart grace). Land checks
+SHA. After a coordinator restart, the gate-job sweep gives each leased or queued job one window of
+grace for worker freshness, pickup and lease, measured from when the worker listener is back, and
+then fails it as before. Land checks
 have no durable gate handle and run again after a restart; a graceful land-queue stop cancels its
 LAN gate jobs. Cancelling a run tells its worker to stop. Changes to restart recovery are tracked
 in [#784](https://github.com/MattFlower/limitless/issues/784).
