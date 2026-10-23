@@ -1,11 +1,12 @@
 import type { Run, StageName } from "../../src/core/types.ts";
 
 /** Stages in the order the engine runs them; optional ones run only for some profiles or requests. */
-export const PIPELINE: readonly { stage: StageName; optional?: true }[] = [
+const STATIONS = [
   { stage: "prepare" },
   { stage: "triage" },
   { stage: "clarify", optional: true },
   { stage: "spec" },
+  { stage: "plan", optional: true },
   { stage: "holdout", optional: true },
   { stage: "implement" },
   { stage: "gates" },
@@ -14,7 +15,11 @@ export const PIPELINE: readonly { stage: StageName; optional?: true }[] = [
   { stage: "preview", optional: true },
   { stage: "verify" },
   { stage: "deliver" },
-];
+] as const satisfies readonly { stage: StageName; optional?: true }[];
+
+// A new StageName must get a station before this assignment can typecheck.
+export const PIPELINE: readonly { stage: StageName; optional?: true }[] &
+  (Exclude<StageName, (typeof STATIONS)[number]["stage"]> extends never ? unknown : never) = STATIONS;
 
 export interface PipelineCounts {
   queued: number;

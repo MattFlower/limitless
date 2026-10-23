@@ -1,6 +1,14 @@
+import { createSignal } from "solid-js";
 import { createStore } from "solid-js/store";
 import { createRenderer } from "solid-js/universal";
-import type { AuthSession, ProviderStatus, QuotaAlert, Run, StreamMessage } from "../src/core/types.ts";
+import type {
+  AuthSession,
+  HealthResponse,
+  ProviderStatus,
+  QuotaAlert,
+  Run,
+  StreamMessage,
+} from "../src/core/types.ts";
 import type { ProviderWorkload, Stats } from "../src/db/stats.ts";
 
 // Solid's universal renderer exercises mounted reactive components without a browser or DOM dependency.
@@ -56,8 +64,11 @@ export const {
 const [providers, setProviders] = createStore<Record<string, ProviderStatus>>(Object.create(null));
 const [alerts, setAlerts] = createStore<Record<string, QuotaAlert>>({});
 const [runs, setRuns] = createStore<Record<string, Run>>({});
-export const live = { providers, alerts, runs, connected: () => true };
-export { setAlerts, setProviders, setRuns };
+const [gateSlots, setGateSlots] = createSignal<HealthResponse["gateSlots"]>();
+export const [now, setNow] = createSignal(Date.now());
+export const [location, setLocation] = createStore({ pathname: "/" });
+export const live = { providers, alerts, runs, gateSlots, connected: () => true };
+export { setAlerts, setGateSlots, setProviders, setRuns };
 export let liveStarts = 0;
 export function ensureLiveStore() {
   liveStarts++;

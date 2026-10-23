@@ -1,7 +1,8 @@
 import { A } from "@solidjs/router";
 import { type Component, createMemo, For, Index, Show } from "solid-js";
 import { pct } from "../lib/format.ts";
-import { gaugeClass } from "../lib/gauge.ts";
+import { gaugeClass, quotaWindowFresh } from "../lib/gauge.ts";
+import { now } from "../lib/ticker.ts";
 import { windowLabel } from "../lib/window-label.ts";
 import { live } from "../store.ts";
 
@@ -11,10 +12,12 @@ export const SidebarStatus: Component = () => {
     Object.values(live.providers)
       .filter((p) => p.enabled)
       .flatMap((p) => {
-        const busiest = Object.entries(p.windows).reduce<[string, number] | null>(
-          (top, [key, w]) => (top === null || w.utilization > top[1] ? [key, w.utilization] : top),
-          null,
-        );
+        const busiest = Object.entries(p.windows)
+          .filter(([, w]) => quotaWindowFresh(w, now()))
+          .reduce<[string, number] | null>(
+            (top, [key, w]) => (top === null || w.utilization > top[1] ? [key, w.utilization] : top),
+            null,
+          );
         return busiest
           ? [{ id: p.id, label: p.label, window: windowLabel(busiest[0]), used: busiest[1] }]
           : [];
