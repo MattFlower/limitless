@@ -14,6 +14,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
 import { redactGateStreams } from "../gates/output.ts";
+import { type Release, release } from "../release.ts";
 import { sh } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import {
@@ -120,8 +121,8 @@ function plist(
 `;
 }
 
-export function mtplxPlist(): string {
-  return plist(MTPLX_LABEL, [
+export function mtplxPlist(workingDirectory = appDir): string {
+  const args = [
     join(home, ".mtplx", "bin", "mtplx"),
     "serve",
     "--model",
@@ -135,7 +136,8 @@ export function mtplxPlist(): string {
     "--batching-preset",
     "agent",
     "--yes",
-  ]);
+  ];
+  return plist(MTPLX_LABEL, args, {}, workingDirectory);
 }
 
 async function launchctl(args: string[], allowFail = true) {
@@ -156,11 +158,28 @@ function samePath(a: unknown, b: string): boolean {
 type Migration = Record<"label" | "path" | "target" | "phase" | "backup", string> & {
   old: { label: string; path: string };
 };
-type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]>;
+type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]> & {
+  release?: Release;
+  execPath?: string;
+};
+
+export function stableExecutable(execPath = process.execPath): string {
+  const cellar = execPath.match(/^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/([^/]+)$/);
+  if (!cellar) return execPath;
+  const stable = `${cellar[1]}/opt/${cellar[2]}/bin/${cellar[3]}`;
+  try {
+    if (realpathSync(stable) === realpathSync(execPath)) return stable;
+  } catch {
+    // Missing or inaccessible targets cannot establish a stable launch path.
+  }
+  throw new Error(`Cannot use stable executable ${stable}: it must resolve to ${execPath}`);
+}
 export async function installedUnits(opts: ServiceOptions = {}) {
   const dir = opts.agentsDir ?? agentsDir;
-  const release = opts.releaseDir ?? appDir;
-  const entry = join(release, "src", "cli", "main.ts");
+  const packaged = (opts.release ?? release).kind === "packaged";
+  const executablePath = packaged ? stableExecutable(opts.execPath) : "";
+  const workingDirectory = packaged ? join(home, ".limitless") : (opts.releaseDir ?? appDir);
+  const entry = join(opts.releaseDir ?? appDir, "src", "cli", "main.ts");
   const units = [] as { label: string; path: string; kind: string }[];
   const run = opts.command ?? sh;
   const options = { cwd: home, allowFail: true };
@@ -176,8 +195,13 @@ export async function installedUnits(opts: ServiceOptions = {}) {
     const is = (at: number, ...parts: string[]) =>
       parts.every((part, i) => (part.startsWith("/") ? samePath(args[at + i], part) : args[at + i] === part));
     let kind = "";
-    if (executable === "bun" && is(1, entry, "serve")) kind = "daemon";
-    else if (samePath(data.WorkingDirectory, release)) {
+    if (
+      packaged
+        ? args.length === 2 && args[0] === executablePath && args[1] === "serve"
+        : executable === "bun" && is(1, entry, "serve")
+    )
+      kind = "daemon";
+    else if (samePath(data.WorkingDirectory, workingDirectory)) {
       if (is(0, join(home, ".mtplx", "bin", "mtplx"), "serve")) kind = "mtplx";
       if (executable === "cloudflared" && is(1, "tunnel", "--config", config, "run")) kind = "tunnel";
     }
@@ -243,19 +267,27 @@ async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
 }
 
 export function installationUnits(
-  opts: { mtplx?: boolean } = {},
+  opts: { mtplx?: boolean; release?: Release; execPath?: string } = {},
   tunnel: string | null = null,
 ): [string, string][] {
-  const units: [string, string][] = [
-    [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
-  ];
+  const packaged = (opts.release ?? release).kind === "packaged";
+  const workingDirectory = packaged ? join(home, ".limitless") : appDir;
+  const args = packaged
+    ? [stableExecutable(opts.execPath), "serve"]
+    : [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"];
+  const units: [string, string][] = [[LABEL, plist(LABEL, args, {}, workingDirectory)]];
   if (opts.mtplx === true) {
-    units.push([MTPLX_LABEL, mtplxPlist()]);
+    units.push([MTPLX_LABEL, mtplxPlist(workingDirectory)]);
   }
   if (tunnel) {
     units.push([
       TUNNEL_LABEL,
-      plist(TUNNEL_LABEL, ["/opt/homebrew/bin/cloudflared", "tunnel", "--config", tunnel, "run"]),
+      plist(
+        TUNNEL_LABEL,
+        ["/opt/homebrew/bin/cloudflared", "tunnel", "--config", tunnel, "run"],
+        {},
+        workingDirectory,
+      ),
     ]);
   }
   return units;
@@ -266,6 +298,8 @@ export async function install(
   opts: { tunnel?: boolean; mtplx?: boolean; publicUrl?: string | null } & ServiceOptions = {},
   control?: { run: typeof sh; race: <T>(work: Promise<T>) => Promise<T>; recover?: boolean },
 ): Promise<void> {
+  const info = opts.release ?? release;
+  if (info.kind === "packaged") opts = { ...opts, execPath: stableExecutable(opts.execPath) };
   // Reuse deploy's lock and signal scope for installation and journal recovery.
   if (!control)
     return deploy(port, undefined, false, {
@@ -340,17 +374,23 @@ export async function install(
     return;
   }
   mkdirSync(logDir, { recursive: true });
-  mkdirSync(agentsDir, { recursive: true });
-  await ensureRelease(appDir, command);
-  await command(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
-  const previous = await installedUnits({ command });
-  const target = (await command(["git", "rev-parse", "HEAD"], { cwd: appDir })).stdout.trim();
+  const agents = opts.agentsDir ?? agentsDir;
+  mkdirSync(agents, { recursive: true });
+  if (info.kind === "source") {
+    await ensureRelease(appDir, command);
+    await command(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
+  }
+  const previous = await installedUnits({ ...opts, command });
+  const target =
+    info.kind === "packaged"
+      ? info.sha
+      : (await command(["git", "rev-parse", "HEAD"], { cwd: appDir })).stdout.trim();
   // The public tunnel is opt-in: only once webhook authentication is in place.
   const tunnel = opts.tunnel ? tunnelConfig(port, opts.publicUrl ?? null) : null;
   if (opts.tunnel && !tunnel) console.warn("skipping tunnel: no cloudflared credentials or no public_url");
   const units = installationUnits(opts, tunnel);
   for (const [label, content] of units) {
-    const path = join(agentsDir, `${label}.plist`);
+    const path = join(agents, `${label}.plist`);
     const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     if (existsSync(path) && !samePath(old?.path, path)) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
