@@ -325,7 +325,10 @@ test.each([
     expect(JSON.parse(job?.result ?? "null")).toEqual(run);
     const warning = workers.list()[0]?.setupWarning;
     expect(workers.list()[0]?.state).toBe("available");
-    expect(warning).toContain("Worker runner setup failed");
+    expect(warning).toBe(
+      "Worker setup failed: [withheld: private text]; LAN gates falling back to local execution",
+    );
+    expect(JSON.stringify(store.listEvents(req.runId ?? ""))).not.toContain("runner");
     expect(warning).toContain("[withheld: private text]");
     expect(warning).toContain("falling back to local execution");
     expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toBe(warning);
@@ -383,7 +386,8 @@ test("successful worker setup clears a confirmed warning and preserves fallback 
   expect(workers.list()[0]?.setupWarning).toBeUndefined();
   expect(workers.complete(first.id, { setupOk: true, setup: [], checks: [] }, true)).toBe(true);
   const warning = workers.list()[0]?.setupWarning;
-  expect(warning).toContain("Worker runner setup failed");
+  expect(warning).toBe(`Worker setup failed: test -f tracked; LAN gates falling back to local execution`);
+  expect(JSON.stringify(store.listEvents(req.runId ?? ""))).not.toContain("runner");
   const events = workers.job(first.id)?.events;
   const runEvents = store.listEvents(req.runId ?? "");
   const command = "test -f another-setup";
@@ -481,7 +485,7 @@ test.each(["shutdown", "cancel", "stored cancel"])(
       await started.promise;
       expect(workers.job(handle.id)?.state).toBe("failed");
       expect(workers.list()[0]?.setupWarning).toBeUndefined();
-      expect(workers.job(handle.id)?.events).toContain("Worker runner setup failed: test -f tracked");
+      expect(workers.job(handle.id)?.events).toContain("Worker setup failed: test -f tracked");
       expect(workers.lease("runner")).toBeNull();
       expect(executor.attach(handle, new AbortController().signal)).toBe(execution);
       if (mode === "stored cancel") workers.cancel(handle.id);
@@ -510,9 +514,9 @@ test.each(["shutdown", "cancel", "stored cancel"])(
         expect(run.setupOk).toBe(true);
         expect(localStarts).toBe(2);
         expect(workers.job(handle.id)?.state).toBe("done");
-        expect(workers.list()[0]?.setupWarning).toContain("Worker runner setup failed");
+        expect(workers.list()[0]?.setupWarning).toContain("Worker setup failed");
         const events: { type: string; text?: string }[] = JSON.parse(workers.job(handle.id)?.events ?? "[]");
-        expect(events.filter((e) => e.text?.includes("Worker runner setup failed"))).toHaveLength(1);
+        expect(events.filter((e) => e.text?.includes("Worker setup failed"))).toHaveLength(1);
       } else {
         const resumed = gateExecutorFor("lan", workers, [req.repo]).attach(
           handle,
@@ -4394,9 +4398,13 @@ const agentRequest = (overrides: Partial<AgentJobRequest> = {}): AgentJobRequest
 test.each(["backend", "openai", "decisions"] as const)(
   "agent targets with %s stay local regardless of contents",
   (field) => {
-    for (const value of [{ baseUrl: "http://localhost:8080", authToken: "" }, undefined]) {
+    for (const value of [
+      { baseUrl: "http://localhost:8080", authToken: "" },
+      { baseUrl: "http://localhost:8080" },
+      undefined,
+    ]) {
       const req = agentRequest();
-      req.target[field] = value;
+      Object.assign(req.target, { [field]: value });
       expect(workers.enqueueAgentJob(req)).toBeNull();
       expect(store.db.query("SELECT * FROM agent_jobs").all()).toEqual([]);
     }
@@ -4409,6 +4417,16 @@ test.each(["claude", "codex"] as const)("plain %s CLI agent targets still enqueu
   const id = workers.enqueueAgentJob(req);
   expect(id).not.toBeNull();
   expect(workers.agentJob(id ?? "")?.request).toBe(JSON.stringify(req));
+});
+
+test("agent enqueue preserves the durable coordinator job id", () => {
+  const req = agentRequest();
+  const id = "durable-agent-job";
+  expect(workers.enqueueAgentJob(req, id)).toBe(id);
+  expect(workers.agentJob(id)).toMatchObject({ id, state: "queued", request: JSON.stringify(req) });
+  req.target.backend = { baseUrl: "http://localhost:8080", authToken: "" };
+  expect(workers.enqueueAgentJob(req, "refused-agent-job")).toBeNull();
+  expect(workers.agentJob("refused-agent-job")).toBeNull();
 });
 
 function enqueueAgent(overrides: Partial<AgentJobRequest> = {}) {
@@ -4428,7 +4446,7 @@ const agentResult = (parentSha = releaseSha) => ({
   error: null,
   quota: null,
   parentSha,
-  sha: "a".repeat(40),
+  sha: parentSha,
   branch: "change/example",
 });
 const agentPath = (id: string, action: string) => `/worker/agent-jobs/${id}/${action}`;
@@ -4761,9 +4779,20 @@ test("agent reports validate result metadata and persist changed and unchanged c
   const token = await paired();
   await call("/worker/heartbeat", caps(), token);
   for (const unchanged of [false, true]) {
-    const id = enqueueAgent();
+    const id = enqueueAgent(
+      unchanged
+        ? {}
+        : {
+            commit: publicationCommit,
+            branch: "change/example",
+            privateStringsDigest: privateStringsDigest([]),
+          },
+    );
     workers.leaseAgentJob("runner");
-    const result = agentResult();
+    const result = {
+      ...agentResult(),
+      ...(unchanged ? {} : { privateStringsDigest: privateStringsDigest([]) }),
+    };
     for (const bad of [
       { parentSha: "b".repeat(40) },
       ...["short", "g".repeat(40), "a".repeat(41), "a".repeat(63)].map((sha) => ({ sha })),
@@ -4777,6 +4806,12 @@ test("agent reports validate result metadata and persist changed and unchanged c
       { confinement: { ok: false, path: null, version: null, reason: "unknown", exitCode: null } },
     ]) {
       expect((await call(agentPath(id, "result"), { ...result, ...bad }, token)).status).toBe(400);
+      expect(workers.agentJob(id)).toMatchObject({ state: "leased", result: null, result_sha: null });
+    }
+    if (unchanged) {
+      expect((await call(agentPath(id, "result"), { ...result, sha: "a".repeat(40) }, token)).status).toBe(
+        400,
+      );
       expect(workers.agentJob(id)).toMatchObject({ state: "leased", result: null, result_sha: null });
     }
     const report = {
@@ -5690,11 +5725,13 @@ test.each([
         };
         return runProcess({
           cmd: [process.execPath, '-e',
-            "require('node:fs').writeFileSync(" + ${JSON.stringify(JSON.stringify(ready))} + ", JSON.stringify({" +
+            // Written aside and renamed, so the test never parses a partly written file.
+            "const fs = require('node:fs'); fs.writeFileSync(" + ${JSON.stringify(JSON.stringify(`${ready}.tmp`))} + ", JSON.stringify({" +
             "pid: process.pid, invocation: process.env.LIMITLESS_INVOCATION, ownership: process.env[" +
             JSON.stringify('LIMITLESS_INVOCATION_' + scope.ownershipMarker.replaceAll('-', '_')) + "]," +
             "cwd: " + JSON.stringify(cwd) + ", scratch: " + JSON.stringify(invocationScratch.getStore()) +
-            "})); setInterval(() => {}, 1000);"],
+            "})); fs.renameSync(" + ${JSON.stringify(JSON.stringify(`${ready}.tmp`))} + ", " + ${JSON.stringify(JSON.stringify(ready))} + ");" +
+            " setInterval(() => {}, 1000);"],
           cwd, env: {},
         });
       };
@@ -6270,7 +6307,7 @@ test.each([
         : kind === "session committed dirty"
           ? "edit"
           : undefined,
-      ...(!kind.includes("legacy")
+      ...(!kind.includes("legacy") && kind !== "readonly"
         ? {
             privateStringsDigest:
               kind === "missing digest"
@@ -6691,7 +6728,7 @@ test.each(["match", "differs", "absent", "unreadable"])(
         });
         expect(cli.exitCode).toBe(0);
         expect(cli.stdout.trim()).toBe(
-          "runner\tavailable\tclaude:unknown\tcodex:unknown\tprivate-strings:match",
+          "runner\tavailable\tclaude:unknown\tcodex:unknown\tprivate-strings:match\tagent-jobs:0",
         );
         expect(cli.stdout).not.toContain(account);
         expect(cli.stderr).not.toContain(account);
@@ -6840,6 +6877,45 @@ test("heartbeat optional fields return only after the observed coordinator relea
   try {
     await until(() => resumed);
     expect(rejected).toBe(1);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test.each([
+  { role: "review", mode: "edit" },
+  ...["review", "implement"].flatMap((role) => [
+    { role, mode: "readonly", commit: publicationCommit },
+    { role, mode: "readonly", repoUrl: "https://github.com/test/repo.git" },
+    { role, mode: "readonly", expectedRemoteSha: null },
+    { role, mode: "readonly", expectedRemoteSha: releaseSha },
+    { role, mode: "readonly", privateStringsDigest: privateStringsDigest([]) },
+    { role, mode: "readonly", discreet: false },
+    { role, mode: "readonly", uiUrl: "https://example.com" },
+  ]),
+])("worker refuses readonly publication before fetching: %j", async (fields) => {
+  await listen();
+  const id = enqueueAgent({
+    ...fields,
+    role: fields.role as AgentJobRequest["role"],
+    mode: fields.mode as AgentJobRequest["mode"],
+  });
+  let bundles = 0;
+  const harness = spyOn({ run: fakeHarness(() => ({})) }, "run");
+  const worker = await loop({
+    capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
+    harnesses: { claude: harness },
+    request: async (...args) => {
+      if (args[1].endsWith("/bundle")) bundles++;
+      return workerRequest(...args);
+    },
+  });
+  try {
+    await until(() => workers.agentJob(id)?.failure_reason !== null);
+    expect(workers.agentJob(id)?.failure_reason).toBe("Readonly jobs carry no publication fields");
+    expect(bundles).toBe(0);
+    expect(harness).not.toHaveBeenCalled();
+    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
   } finally {
     await worker.stop();
   }

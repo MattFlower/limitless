@@ -74,6 +74,7 @@ export async function startWorkerListener(
   if (!listen) return undefined;
   const tls = await certificate(join(paths.home, "worker-tls"));
   workers.pairingKey = tls.key;
+  workers.resumedAt = workers.now();
   const limits = new Map<string, { at: number; count: number }>();
   const closing = new AbortController();
   const fetch = async (req: Request, server: Server<undefined>): Promise<Response> => {
@@ -246,6 +247,8 @@ export async function startWorkerListener(
           const result = AgentResultReport.parse(body);
           if (result.parentSha !== job.parent_sha) return json({ error: "Result parent SHA mismatch" }, 400);
           const request: AgentJobRequest = JSON.parse(job.request);
+          if (!request.commit && result.sha !== job.parent_sha)
+            return json({ error: "Readonly result SHA mismatch" }, 400);
           if (
             request.commit &&
             (result.branch !== request.branch ||

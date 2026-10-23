@@ -213,7 +213,7 @@ discovers an owner.
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
 | `[repos."<owner>/<name>"] branch_prefix` | `"change/"` | In discreet mode, branches use `<branch_prefix><title-slug>` with `-2` through `-5`, then one random suffix for collisions (six probes maximum). Must form a valid branch when followed by `x`. Ignored unless `discreet = true`. |
 | `[workers] agent_slots` | `2` | Positive integer cap on leased agent sessions per worker, independent of gate slots. Older releases ignore this key. |
-| `[workers] agents` | `[]` | Role names opted into worker sessions. Only `implement` dispatches in this release; other known roles warn and stay local. Requires `listen`, independently of `[gates] executor`. Older releases ignore this key. |
+| `[workers] agents` | `[]` | Role names opted into worker sessions. `implement` and `review` dispatch in this release; other known roles warn and stay local. Requires `listen`, independently of `[gates] executor`. Older releases ignore this key. |
 | `[workers] repos` | `[]` | Repositories allowed to send gate code and agent sessions to paired workers, for example `["owner/name"]`. Gates also require `[gates] executor = "lan"`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
@@ -259,17 +259,25 @@ heartbeats and expire after sixty seconds. Infrastructure failures retry once on
 then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
 restarts re-attach to gate jobs, while cancelling a run tells its worker to stop.
 Opted-in implement rounds publish a commit that the coordinator fetches and verifies before running
-gates, audit, review and delivery. Merge and resolution rounds, review rounds, existing-branch
-delivery, verify-change runs and local repositories stay local. Each worker needs `gh auth login`
-and the same entries in `private-strings.txt` as the coordinator; order and comments do not matter.
+gates, audit, review and delivery. Implement sessions for merge and resolution rounds, PR review
+rounds, existing-branch delivery, verify-change runs and local repositories stay local. Publishing
+workers need `gh auth login` and the same entries in `private-strings.txt` as the coordinator; order
+and comments do not matter.
+Review sessions run readonly on workers from a bundle at the reviewed commit and never publish.
+Concurrent panel finders beyond the workers' agent slots wait up to two pickup periods before
+running locally.
+
 Workers report their CLI login states and versions; agent jobs go only to workers logged in to
 the target CLI, and publishing jobs also require matching private strings. `limitless workers ls`
 shows both CLI capabilities and private-strings parity. A mismatch is also checked before the session
-starts. With no worker available, a round waits up to two pickup periods before running locally.
-Coordinator restarts, including deploys, cancel open agent jobs. If a worker pushed in the last
-seconds before cancellation, the run ends NeedsHuman because adopting unreported commits requires
-re-attachment support. Before rolling back past S5 after a crash, cancel runs that were in a
-worker implement round: older releases can lease leftover jobs without the release parity check.
+starts; if found then, the job fails and the round runs locally. With no worker available, a round
+waits up to two pickup periods before running locally.
+Coordinator restarts, including deploys, re-attach to worker implement jobs. A worker that stays
+unreachable for one lease period after the restart is retried on another worker. Only a commit
+pushed without an accepted report ends the run NeedsHuman. Before manually rolling back past S5a,
+cancel runs that were in a worker implement round: older releases can lease leftover jobs without
+the release parity check.
+The signed-in `/workers` page shows capabilities, current agent jobs and recent runs that used workers.
 Bonjour discovery, power/idle selection and Linux workers are not supported.
 
 Per-repository settings go in a `.limitless.toml` committed to the target repository's default

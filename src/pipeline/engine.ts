@@ -71,6 +71,7 @@ import {
   remoteBranchSha,
   removeWorktree,
   resetTo,
+  verifyWorkerCommit,
   withGitHubRetry,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
@@ -1171,6 +1172,22 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
   const remoteSha = () => remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch(() => undefined);
   return {
     remoteSha,
+    async started(id) {
+      ctx.state.agentJob = { round, id };
+      await ctx.save("agent-job-started");
+    },
+    async resume(request) {
+      try {
+        return (
+          (await headSha(cwd)) === request.parentSha &&
+          (await clean()) &&
+          request.expectedRemoteSha === (ctx.state.publishedSha ?? null) &&
+          request.privateStringsDigest === privateStringsDigest(privateEntries(ctx, cwd))
+        );
+      } catch (error) {
+        throw new NeedsHumanError(`Cannot reconcile worker job: ${redactCredentials(String(error))}`);
+      }
+    },
     async prepare() {
       const parentSha = await headSha(cwd);
       if (!(await clean())) return null;
@@ -1179,7 +1196,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
       if (remote !== (ctx.state.publishedSha ?? null)) {
         if (remote !== parentSha)
           throw new NeedsHumanError(
-            `Run branch ${branch} is at ${remote}, expected ${ctx.state.publishedSha ?? "no branch"}; another push moved it or a worker commit was not adopted (re-attach is S6)`,
+            `Run branch ${branch} is at ${remote}, expected ${ctx.state.publishedSha ?? "no branch"}; another push moved it or a worker commit was pushed without an accepted report`,
           );
         ctx.state.publishedSha = parentSha;
         await ctx.save();
@@ -1224,7 +1241,13 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
             throw new Error("Coordinator HEAD or worktree changed during worker session");
           return;
         }
-        await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+        if ((await headSha(cwd)) === sha) {
+          await verifyWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+          if ((await headSha(cwd)) !== sha || !(await clean()))
+            throw new Error("Coordinator HEAD or worktree changed during worker adoption");
+        } else {
+          await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+        }
       } catch (error) {
         throw new NeedsHumanError(
           `Cannot adopt worker commit ${sha} for round ${round}: ${redactCredentials((error as Error).message)}`,
@@ -1347,6 +1370,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
         if (result.status !== "ok") ctx.log(`Implementer ended with ${result.status}`, "warn");
         ctx.state.implementationReadyRound = round;
+        delete ctx.state.agentJob;
         await ctx.save("implementation-ready");
       }
       ctx.checkCancelled();
@@ -1813,6 +1837,10 @@ async function oneRound(
           ...request,
           ...(deadline ? { deadline } : {}),
           shadow: invokeGuard.getStore(),
+          checkout:
+            ctx.repo.kind === "github" && ctx.run.branch && constraints.billing !== "free_only"
+              ? { parentSha: reviewedSha, baseSha, branch: ctx.run.branch }
+              : undefined,
           requireStructured: true,
         });
         if (!ctx.parallelChecks || invokeGuard.getStore())

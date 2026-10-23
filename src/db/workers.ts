@@ -21,6 +21,14 @@ import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
 export class PairingLimitError extends Error {}
+export interface WorkerRun {
+  runId: string;
+  title: string;
+  agentJobs: number;
+  gateJobs: number;
+  workers: string[];
+  lastAt: number;
+}
 export interface WorkerRow {
   name: string;
   fingerprint: string;
@@ -97,6 +105,7 @@ export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_orde
 
 /** All worker transitions are synchronous SQLite transactions; no observation crosses an await. */
 export class WorkerStore {
+  resumedAt?: number | null;
   pairingKey?: string;
   readonly times: WorkerTiming;
   constructor(
@@ -224,6 +233,11 @@ export class WorkerStore {
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
           agents,
+          agentJobs: this.store.db
+            .query<{ id: string; attempt: number; runId: string }, [string]>(
+              "SELECT id,attempt,run_id AS runId FROM agent_jobs WHERE state='leased' AND worker=? ORDER BY id",
+            )
+            .all(w.name),
           setupWarning: c?.updateWarning ?? w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
@@ -241,6 +255,24 @@ export class WorkerStore {
         });
         return { ...result, privateStrings };
       });
+  }
+  runs(limit = 50): WorkerRun[] {
+    limit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50;
+    const rows = this.store.db
+      .query<Omit<WorkerRun, "workers"> & { workers: string }, [number]>(`
+        SELECT r.id AS runId,r.title,sum(j.agent) AS agentJobs,sum(j.gate) AS gateJobs,
+          json_group_array(DISTINCT j.worker) AS workers,max(j.updated_at) AS lastAt
+        FROM (
+          SELECT run_id,worker,updated_at,1 AS agent,0 AS gate FROM agent_jobs
+            WHERE state='done' AND worker IS NOT NULL
+          UNION ALL
+          SELECT run_id,worker,updated_at,0 AS agent,1 AS gate FROM gate_jobs
+            WHERE state='done' AND worker IS NOT NULL AND setup_fallback=0
+        ) j JOIN runs r ON r.id=j.run_id
+        GROUP BY r.id ORDER BY lastAt DESC,r.id LIMIT ?
+      `)
+      .all(limit);
+    return this.sanitize(rows.map((r) => ({ ...r, workers: (JSON.parse(r.workers) as string[]).sort() })));
   }
   heartbeat(w: WorkerRow, c: Capabilities, privateStrings: "match" | "differs" | "unknown" = "unknown") {
     const { agents, privateStringsDigest: _digest, ...legacy } = c;
@@ -311,7 +343,7 @@ export class WorkerStore {
   agentJob(id: string) {
     return this.store.db.query<AgentJobRow, [string]>("SELECT * FROM agent_jobs WHERE id=?").get(id);
   }
-  enqueueAgentJob(req: AgentJobRequest) {
+  enqueueAgentJob(req: AgentJobRequest, id: string = randomUUID()) {
     if ("backend" in req.target || "openai" in req.target || "decisions" in req.target) return null;
     let credentials = false;
     const request = JSON.stringify(req, (key, value: unknown) => {
@@ -319,8 +351,7 @@ export class WorkerStore {
       return value;
     });
     if (credentials || credentialInText(request)) return null;
-    const id = randomUUID(),
-      now = this.now();
+    const now = this.now();
     this.store.db
       .query(
         "INSERT INTO agent_jobs (id,run_id,invocation_id,request,parent_sha,state,created_at,updated_at) VALUES (?,?,?,?,?,'queued',?,?)",
@@ -425,14 +456,26 @@ export class WorkerStore {
         for (const j of this.store.db
           .query<AgentJobRow, []>("SELECT * FROM agent_jobs WHERE state IN ('queued','leased')")
           .all()) {
-          if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
+          if (
+            j.state === "queued" &&
+            now - Math.max(j.updated_at, this.resumedAt ?? Number.NEGATIVE_INFINITY) >= this.times.pickup
+          )
             this.failAgentJob(j.id, "No worker picked up job");
           else if (j.state === "leased") {
             const w = j.worker ? this.worker(j.worker) : null;
             if (w?.state !== "approved") this.failAgentJob(j.id, "Worker disconnected or revoked");
             else if ((j.attempt_deadline_at ?? 0) <= now) this.failAgentJob(j.id, "Attempt deadline expired");
-            else if ((j.lease_expires_at ?? 0) <= now) this.failAgentJob(j.id, "Lease expired");
-            else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh)
+            else if (
+              Math.max(
+                j.lease_expires_at ?? 0,
+                (this.resumedAt ?? Number.NEGATIVE_INFINITY) + this.times.lease,
+              ) <= now
+            )
+              this.failAgentJob(j.id, "Lease expired");
+            else if (
+              now - Math.max(w.last_heartbeat_at ?? 0, this.resumedAt ?? Number.NEGATIVE_INFINITY) >
+              this.times.fresh
+            )
               this.failAgentJob(j.id, "Worker disconnected");
           }
         }
@@ -455,10 +498,12 @@ export class WorkerStore {
       )
       .run(this.now(), id);
   }
-  cancelOpenAgentJobs() {
+  cancelOpenAgentJobs(keep: ReadonlySet<string>) {
     this.store.db
-      .query("UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE state IN ('queued','leased')")
-      .run(this.now());
+      .query(
+        "UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE state IN ('queued','leased') AND id NOT IN (SELECT value FROM json_each(?))",
+      )
+      .run(this.now(), JSON.stringify([...keep]));
   }
   cancelRunAgentJobs(runId: string) {
     this.store.db
@@ -565,7 +610,7 @@ export class WorkerStore {
       const j = this.job(id);
       if (j?.state !== "done" || !j.worker || j.setup_fallback) return false;
       const text = this.sanitize(
-        `Worker ${j.worker} setup failed: ${command}; LAN gates falling back to local execution`,
+        `Worker setup failed: ${command}; LAN gates falling back to local execution`,
       );
       // Historical worker completions can retain infrastructure failure reasons; mark fallback separately.
       this.store.db
