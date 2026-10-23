@@ -220,7 +220,7 @@ async function follow(runId: string, after = 0, diagnosticsAfter?: number): Prom
 
 async function serve(): Promise<void> {
   const { resolveBootSha } = await import("./boot-sha.ts");
-  const { resolveReleaseBootSha } = await import("../release.ts");
+  const { policyOverlayPath, resolveReleaseBootSha } = await import("../release.ts");
   const { loadConfig } = await import("../config.ts");
   const { Factory } = await import("../app.ts");
   const { startDaemon } = await import("./daemon.ts");
@@ -230,11 +230,9 @@ async function serve(): Promise<void> {
   sweepClassificationScratch();
   const orphans = sweepOrphanedSnapshots();
   if (orphans.length) console.log(`Removed ${orphans.length} holdout snapshot(s) left by a stopped daemon`);
+  const policyPath = policyOverlayPath();
   const bootSha = await resolveReleaseBootSha(resolveBootSha);
-  const factory = new Factory(cfg, {
-    bootSha,
-    policyPath: join(import.meta.dir, "../../routing/policy.json"),
-  });
+  const factory = new Factory(cfg, { bootSha, policyPath });
   const ui = await (await import("../server/ui.ts")).buildUi();
   const { integrations, server } = await startDaemon(factory, ui);
   let autoDeploy: import("../land/auto-deploy.ts").AutoDeploy | undefined;
