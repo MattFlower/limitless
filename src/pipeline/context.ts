@@ -82,6 +82,7 @@ export interface RunState {
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
   phase: Phase;
+  githubWait?: { since: number; nextAttemptAt: number; reason: string };
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
@@ -98,6 +99,8 @@ export interface RunState {
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
   gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
+  /** the worker implement job of this round; cleared in the implementation-ready save */
+  agentJob?: { round: number; id: string };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
@@ -424,6 +427,7 @@ export class RunContext {
   }
 
   async save(checkpoint?: string): Promise<void> {
+    if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
       await this.faults.hit(
@@ -892,6 +896,7 @@ export class RunContext {
               dispatch,
               publication: opts.publication,
               round: opts.stage.round,
+              agentJob: this.state.agentJob,
             },
             local,
           );

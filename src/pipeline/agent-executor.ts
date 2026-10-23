@@ -23,6 +23,8 @@ export type AgentPublication = Required<
   Pick<AgentJobRequest, "uiUrl">;
 
 export interface AgentPublicationHooks {
+  started(id: string): Promise<void>;
+  resume(request: AgentPublication): Promise<boolean>;
   prepare(): Promise<AgentPublication | null>;
   adopt(sha: string, request: AgentPublication): Promise<void>;
   remoteSha(): Promise<string | null | undefined>;
@@ -42,6 +44,7 @@ export interface AgentCall {
   dispatch: () => void;
   publication?: AgentPublicationHooks;
   round?: number;
+  agentJob?: { round: number; id: string };
 }
 
 export interface AgentExecutor {

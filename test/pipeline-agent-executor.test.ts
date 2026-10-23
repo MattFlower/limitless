@@ -100,6 +100,10 @@ test("NeedsHuman finalizes the invocation after releasing its slot without obser
   const windows = spyOn(f.tracker, "observeWindows");
   const confinement = spyOn(f.tracker, "observeConfinement");
   const publication = {
+    async started() {},
+    async resume() {
+      return true;
+    },
     async prepare() {
       return null;
     },

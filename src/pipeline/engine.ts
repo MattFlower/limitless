@@ -57,7 +57,9 @@ import {
   findPullRequest,
   formatTopLevel,
   type GitHubBudget,
+  GitHubUnavailableError,
   githubRetry,
+  githubWait,
   headSha,
   isAncestor,
   mergeBase,
@@ -69,6 +71,7 @@ import {
   remoteBranchSha,
   removeWorktree,
   resetTo,
+  verifyWorkerCommit,
   withGitHubRetry,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
@@ -88,6 +91,7 @@ import {
 } from "../util/proc.ts";
 import { publicationFields } from "../workers/publication.ts";
 import type { AgentPublication, AgentPublicationHooks } from "./agent-executor.ts";
+import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -178,6 +182,7 @@ export async function executeRun(
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
+  if (finalizeRecordedCancellation(deps.store, runId)) return "cancelled";
   const repo = deps.store.getRepo(run.repoId);
   if (!repo) {
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
@@ -213,6 +218,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
+  if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
   ctx.run = deps.store.updateRun(
     runId,
     {
@@ -323,11 +329,18 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         !reason &&
         !deps.store.getRun(runId)?.error?.startsWith("cancelled by");
       const status = shutdown ? "queued" : "cancelled";
-      deps.store.updateRun(runId, {
-        status,
-        finishedAt: shutdown ? null : Date.now(),
-        ...(reason ? { error: redactGateOutput(reason) } : {}),
-      });
+      // An interrupted save can leave in-memory state ahead of its durable checkpoint.
+      const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
+      if (!shutdown) clearGitHubWait(ctx.state);
+      deps.store.updateRun(
+        runId,
+        {
+          status,
+          finishedAt: shutdown ? null : Date.now(),
+          ...(reason ? { error: redactGateOutput(reason) } : {}),
+        },
+        state ?? undefined,
+      );
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;
     };
@@ -342,6 +355,38 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     const terminationBlocked =
       !!processScope.getStore()?.terminationError ||
       ctx.state.needsHumanReason?.startsWith(ProcessTerminationError.prefix);
+    const unavailable = githubUnavailable(e);
+    const now = Date.now();
+    const since = ctx.state.githubWait?.since ?? now;
+    if (
+      unavailable &&
+      ctx.state.phase === "deliver" &&
+      ctx.repo.kind === "github" &&
+      !ctx.run.deliveryBranch &&
+      !reviewRound(ctx) &&
+      !ctx.state.verification &&
+      !terminationBlocked &&
+      githubWait.maxMs > 0 &&
+      now < since + githubWait.maxMs
+    ) {
+      if (deps.store.getRun(runId)?.error?.startsWith("cancelled by")) return cancelled();
+      const reason = redactCredentials((e as Error).message).slice(0, 300);
+      ctx.state.githubWait = { since, nextAttemptAt: now + githubWait.intervalMs, reason };
+      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.log(
+        `GitHub unavailable; delivery retries at ${new Date(ctx.state.githubWait.nextAttemptAt).toISOString()}, gives up at ${new Date(since + githubWait.maxMs).toISOString()}: ${reason}`,
+        "warn",
+      );
+      return "queued";
+    }
+    const waited =
+      unavailable && ctx.state.githubWait
+        ? `; waited ${Math.floor((now - since) / 60_000)} minutes for GitHub`
+        : "";
+    if (ctx.state.githubWait) {
+      ctx.state.githubWait = undefined;
+      deps.store.setRunState(runId, ctx.state);
+    }
     const verifiedFailure =
       verifiedSha &&
       ctx.repo.kind === "github" &&
@@ -355,7 +400,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       !!verifiedFailure ||
       resolvingReview ||
       terminationBlocked;
-    let message = redactGateOutput((e as Error).message);
+    let message = redactGateOutput((e as Error).message) + waited;
     if (resolvingReview) {
       message = redactGateOutput(
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
@@ -1127,6 +1172,22 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
   const remoteSha = () => remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch(() => undefined);
   return {
     remoteSha,
+    async started(id) {
+      ctx.state.agentJob = { round, id };
+      await ctx.save("agent-job-started");
+    },
+    async resume(request) {
+      try {
+        return (
+          (await headSha(cwd)) === request.parentSha &&
+          (await clean()) &&
+          request.expectedRemoteSha === (ctx.state.publishedSha ?? null) &&
+          request.privateStringsDigest === privateStringsDigest(privateEntries(ctx, cwd))
+        );
+      } catch (error) {
+        throw new NeedsHumanError(`Cannot reconcile worker job: ${redactCredentials(String(error))}`);
+      }
+    },
     async prepare() {
       const parentSha = await headSha(cwd);
       if (!(await clean())) return null;
@@ -1135,7 +1196,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
       if (remote !== (ctx.state.publishedSha ?? null)) {
         if (remote !== parentSha)
           throw new NeedsHumanError(
-            `Run branch ${branch} is at ${remote}, expected ${ctx.state.publishedSha ?? "no branch"}; another push moved it or a worker commit was not adopted (re-attach is S6)`,
+            `Run branch ${branch} is at ${remote}, expected ${ctx.state.publishedSha ?? "no branch"}; another push moved it or a worker commit was pushed without an accepted report`,
           );
         ctx.state.publishedSha = parentSha;
         await ctx.save();
@@ -1180,7 +1241,13 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
             throw new Error("Coordinator HEAD or worktree changed during worker session");
           return;
         }
-        await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+        if ((await headSha(cwd)) === sha) {
+          await verifyWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+          if ((await headSha(cwd)) !== sha || !(await clean()))
+            throw new Error("Coordinator HEAD or worktree changed during worker adoption");
+        } else {
+          await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
+        }
       } catch (error) {
         throw new NeedsHumanError(
           `Cannot adopt worker commit ${sha} for round ${round}: ${redactCredentials((error as Error).message)}`,
@@ -1303,6 +1370,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
         if (result.status !== "ok") ctx.log(`Implementer ended with ${result.status}`, "warn");
         ctx.state.implementationReadyRound = round;
+        delete ctx.state.agentJob;
         await ctx.save("implementation-ready");
       }
       ctx.checkCancelled();
@@ -2338,6 +2406,13 @@ function publicationText(ctx: RunContext, text: string): string {
   );
 }
 
+function githubUnavailable(error: unknown): boolean {
+  return (
+    error instanceof GitHubUnavailableError ||
+    (error instanceof Error && error.cause instanceof GitHubUnavailableError)
+  );
+}
+
 /** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
@@ -2390,6 +2465,13 @@ async function checkPublication(
     const hit = findings.find((f) => f.rule === "private-string");
     if (hit) throw new PrivateError(hit.detail);
   } catch (error) {
+    if (
+      githubUnavailable(error) ||
+      error instanceof CancelledError ||
+      ctx.signal.aborted ||
+      (error instanceof Error && error.name === "AbortError")
+    )
+      throw error;
     const reason =
       error instanceof PrivateError || error instanceof DiscreetError
         ? error.message
@@ -2878,15 +2960,20 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.checkCancelled();
     ctx.state.publishingSha = head;
     await ctx.save("delivery-publishing");
-    await pushBranch(
-      ctx.repo,
-      cwd,
-      ctx.run.branch as string,
-      head,
-      ctx.signal,
-      budget,
-      ctx.state.publishedSha ?? null,
-    );
+    if (
+      !ctx.state.githubWait ||
+      ctx.state.publishedSha !== head ||
+      (await remoteBranchSha(ctx.repo, cwd, ctx.run.branch as string, ctx.signal, budget)) !== head
+    )
+      await pushBranch(
+        ctx.repo,
+        cwd,
+        ctx.run.branch as string,
+        head,
+        ctx.signal,
+        budget,
+        ctx.state.publishedSha ?? null,
+      );
     ctx.state.publishedSha = head;
     ctx.state.publishingSha = undefined;
     await ctx.save("delivery-pushed");
@@ -2985,6 +3072,7 @@ async function mergeForDelivery(
       `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`,
     );
     ctx.state.phase = "loop";
+    ctx.state.githubWait = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }

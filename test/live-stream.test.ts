@@ -1,5 +1,11 @@
 import { expect, jest, test } from "bun:test";
-import { MAX_RUN_IDS, type QuotaAlert, type Run, type StreamMessage } from "../src/core/types.ts";
+import {
+  MAX_RUN_IDS,
+  type QuotaAlert,
+  type Run,
+  type RunStatus,
+  type StreamMessage,
+} from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { openGlobalStream } from "../ui/api.ts";
@@ -37,10 +43,13 @@ function runStates(prompt: string): { failed: Run; resolved: Run } {
 function liveDeps(
   listRuns: (opts?: { ids?: string[] }) => Promise<Run[]>,
   getAlerts: () => Promise<QuotaAlert[]> = async () => [],
+  // The open-runs query, kept apart so the tests above count only the recent-window and by-id reads.
+  listOpen: (status: RunStatus[]) => Promise<Run[]> = async () => [],
 ) {
   const stream = { push: (_msg: StreamMessage) => {}, connected: (_connected: boolean) => {} };
   const deps = {
-    listRuns,
+    listRuns: (opts?: { ids?: string[]; status?: RunStatus[] }) =>
+      opts?.status ? listOpen(opts.status) : listRuns(opts),
     getProviders: async () => [],
     getAlerts,
     getHealth: async () => ({ ok: true, uptimeMs: 1, sha: "test", active: [], draining: false }),
@@ -82,6 +91,35 @@ test("the first open fetches once, and a burst of reconnects catches up with one
   expect(fetches).toBe(2);
   expect(live.connected()).toBe(true);
   expect(live.runs[failed.id]?.status).toBe("resolved");
+});
+
+test("open runs older than the 200-run window are loaded and caught up too", async () => {
+  const { failed } = runStates("Waiting on a dependency");
+  const waiting: Run = { ...failed, id: "old-waiting", status: "waiting", createdAt: 1 };
+  const clock = waitClock();
+  const asked: RunStatus[][] = [];
+  let open = [waiting];
+  const { stream, deps } = liveDeps(
+    async () => [],
+    undefined,
+    async (status) => {
+      asked.push(status);
+      return open;
+    },
+  );
+  const { ensureLiveStore, live } = await freshStore("open");
+  ensureLiveStore(deps, timers(clock));
+  await clock.flush();
+  expect(asked).toEqual([["queued", "waiting", "running", "waiting_input"]]);
+  expect(live.runs[waiting.id]?.status).toBe("waiting");
+
+  // It starts while the stream is down; the catch-up's open query brings the new state.
+  stream.connected(true);
+  stream.connected(false);
+  open = [{ ...waiting, status: "running", stage: "implement" }];
+  stream.connected(true);
+  await clock.advance(250);
+  expect(live.runs[waiting.id]?.status).toBe("running");
 });
 
 test("after a gap, runs (including cached ones outside the window) and alerts catch up from REST", async () => {

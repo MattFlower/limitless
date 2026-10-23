@@ -8,6 +8,7 @@ import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { redactCredentialData, registerCredential } from "../util/proc.ts";
 import {
+  AgentCapabilities,
   type Capabilities,
   Claim,
   Heartbeat,
@@ -30,6 +31,7 @@ export interface WorkerRow {
   pairing_expires_at: number;
   last_heartbeat_at: number | null;
   capabilities: string | null;
+  agent_capabilities: string | null;
   setup_warning: string | null;
 }
 export interface JobRow {
@@ -95,6 +97,7 @@ export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_orde
 
 /** All worker transitions are synchronous SQLite transactions; no observation crosses an await. */
 export class WorkerStore {
+  resumedAt?: number | null;
   pairingKey?: string;
   readonly times: WorkerTiming;
   constructor(
@@ -199,6 +202,13 @@ export class WorkerStore {
       (agent || c.freeSlots > 0)
     );
   }
+  private agentCapabilities(w: WorkerRow) {
+    try {
+      return AgentCapabilities.parse(JSON.parse(w.agent_capabilities ?? "null"));
+    } catch {
+      return { privateStrings: "unknown" as const, agents: undefined };
+    }
+  }
   list() {
     return this.store.db
       .query<WorkerRow, [number]>(
@@ -207,12 +217,14 @@ export class WorkerStore {
       .all(this.now())
       .map((w) => {
         const c: Capabilities | null = w.capabilities ? JSON.parse(w.capabilities) : null;
-        return this.sanitize({
+        const { agents, privateStrings } = this.agentCapabilities(w);
+        const result = this.sanitize({
           name: w.name,
           fingerprint: w.fingerprint,
           code: w.state === "pending" ? w.pairing_code : undefined,
           lastHeartbeatAt: w.last_heartbeat_at,
           capabilities: c,
+          agents,
           setupWarning: c?.updateWarning ?? w.setup_warning ?? undefined,
           state:
             w.state !== "approved"
@@ -228,15 +240,20 @@ export class WorkerStore {
                     ? "busy"
                     : "offline",
         });
+        return { ...result, privateStrings };
       });
   }
-  heartbeat(w: WorkerRow, c: Capabilities) {
+  heartbeat(w: WorkerRow, c: Capabilities, privateStrings: "match" | "differs" | "unknown" = "unknown") {
+    const { agents, privateStringsDigest: _digest, ...legacy } = c;
+    c = legacy;
     this.sweep();
     this.sweepAgentJobs();
     if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
     this.store.db
-      .query("UPDATE workers SET last_heartbeat_at=?,capabilities=? WHERE name=? AND state='approved'")
-      .run(this.now(), JSON.stringify(c), w.name);
+      .query(
+        "UPDATE workers SET last_heartbeat_at=?,capabilities=?,agent_capabilities=? WHERE name=? AND state='approved'",
+      )
+      .run(this.now(), JSON.stringify(c), JSON.stringify({ agents, privateStrings }), w.name);
     const cancelled: string[] = [];
     for (const id of c.jobs) {
       const gate = this.job(id);
@@ -295,7 +312,7 @@ export class WorkerStore {
   agentJob(id: string) {
     return this.store.db.query<AgentJobRow, [string]>("SELECT * FROM agent_jobs WHERE id=?").get(id);
   }
-  enqueueAgentJob(req: AgentJobRequest) {
+  enqueueAgentJob(req: AgentJobRequest, id: string = randomUUID()) {
     if ("backend" in req.target || "openai" in req.target || "decisions" in req.target) return null;
     let credentials = false;
     const request = JSON.stringify(req, (key, value: unknown) => {
@@ -303,8 +320,7 @@ export class WorkerStore {
       return value;
     });
     if (credentials || credentialInText(request)) return null;
-    const id = randomUUID(),
-      now = this.now();
+    const now = this.now();
     this.store.db
       .query(
         "INSERT INTO agent_jobs (id,run_id,invocation_id,request,parent_sha,state,created_at,updated_at) VALUES (?,?,?,?,?,'queued',?,?)",
@@ -318,6 +334,8 @@ export class WorkerStore {
         this.sweepAgentJobs();
         const w = this.worker(name);
         if (!w || !this.available(w, true)) return null;
+        const { agents, privateStrings } = this.agentCapabilities(w);
+        if (!agents) return null;
         const held =
           this.store.db
             .query<{ n: number }, [string]>(
@@ -326,10 +344,15 @@ export class WorkerStore {
             .get(name)?.n ?? 0;
         if (held >= this.agentSlots) return null;
         const j = this.store.db
-          .query<AgentJobRow, [string]>(
-            "SELECT * FROM agent_jobs WHERE state='queued' AND NOT EXISTS (SELECT 1 FROM json_each(excluded) WHERE value=?) ORDER BY created_at, rowid LIMIT 1",
+          .query<AgentJobRow, [string, number, number, string]>(
+            "SELECT * FROM agent_jobs WHERE state='queued' AND NOT EXISTS (SELECT 1 FROM json_each(excluded) WHERE value=?) AND ((json_extract(request,'$.target.harness')='claude' AND ?=1) OR (json_extract(request,'$.target.harness')='codex' AND ?=1)) AND (json_extract(request,'$.commit') IS NULL OR ?='match') ORDER BY created_at, rowid LIMIT 1",
           )
-          .get(name);
+          .get(
+            name,
+            Number(agents.claude?.loggedIn === true),
+            Number(agents.codex?.loggedIn === true),
+            privateStrings,
+          );
         if (!j) return null;
         const req: AgentJobRequest = JSON.parse(j.request);
         const now = this.now(),
@@ -402,14 +425,26 @@ export class WorkerStore {
         for (const j of this.store.db
           .query<AgentJobRow, []>("SELECT * FROM agent_jobs WHERE state IN ('queued','leased')")
           .all()) {
-          if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
+          if (
+            j.state === "queued" &&
+            now - Math.max(j.updated_at, this.resumedAt ?? Number.NEGATIVE_INFINITY) >= this.times.pickup
+          )
             this.failAgentJob(j.id, "No worker picked up job");
           else if (j.state === "leased") {
             const w = j.worker ? this.worker(j.worker) : null;
             if (w?.state !== "approved") this.failAgentJob(j.id, "Worker disconnected or revoked");
             else if ((j.attempt_deadline_at ?? 0) <= now) this.failAgentJob(j.id, "Attempt deadline expired");
-            else if ((j.lease_expires_at ?? 0) <= now) this.failAgentJob(j.id, "Lease expired");
-            else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh)
+            else if (
+              Math.max(
+                j.lease_expires_at ?? 0,
+                (this.resumedAt ?? Number.NEGATIVE_INFINITY) + this.times.lease,
+              ) <= now
+            )
+              this.failAgentJob(j.id, "Lease expired");
+            else if (
+              now - Math.max(w.last_heartbeat_at ?? 0, this.resumedAt ?? Number.NEGATIVE_INFINITY) >
+              this.times.fresh
+            )
               this.failAgentJob(j.id, "Worker disconnected");
           }
         }
@@ -432,10 +467,12 @@ export class WorkerStore {
       )
       .run(this.now(), id);
   }
-  cancelOpenAgentJobs() {
+  cancelOpenAgentJobs(keep: ReadonlySet<string>) {
     this.store.db
-      .query("UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE state IN ('queued','leased')")
-      .run(this.now());
+      .query(
+        "UPDATE agent_jobs SET state='cancelled',updated_at=? WHERE state IN ('queued','leased') AND id NOT IN (SELECT value FROM json_each(?))",
+      )
+      .run(this.now(), JSON.stringify([...keep]));
   }
   cancelRunAgentJobs(runId: string) {
     this.store.db

@@ -44,6 +44,7 @@ const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
 /** Retry policy for GitHub and remote git (tests shorten it). */
 export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 };
+export { githubWait } from "./github-wait.ts";
 /**
  * In-memory GitHub time shared by every call in one delivery attempt. It only drains while a
  * remote command or a backoff pause runs, so local work in between never eats into it. It bounds
@@ -589,8 +590,8 @@ export async function commitAll(
   return headSha(cwd);
 }
 
-/** Adopt only the exact, coordinator-authored shape published on the worker branch. */
-export async function adoptWorkerCommit(
+/** Fetch and verify the exact, coordinator-authored worker commit. */
+export async function verifyWorkerCommit(
   paths: Paths,
   repo: Repo,
   cwd: string,
@@ -633,6 +634,22 @@ export async function adoptWorkerCommit(
       throw new Error("Worker commit identity mismatch");
   }
   if (text.slice(split + 2) !== commit.message) throw new Error("Worker commit message mismatch");
+}
+
+/** Adopt only the exact, coordinator-authored shape published on the worker branch. */
+export async function adoptWorkerCommit(
+  paths: Paths,
+  repo: Repo,
+  cwd: string,
+  {
+    branch,
+    parentSha,
+    sha,
+    commit,
+  }: { branch: string; parentSha: string; sha: string; commit: NonNullable<AgentJobRequest["commit"]> },
+  signal?: AbortSignal,
+): Promise<void> {
+  await verifyWorkerCommit(paths, repo, cwd, { branch, parentSha, sha, commit }, signal);
   if ((await headSha(cwd)) !== parentSha) throw new Error("Worker adoption HEAD is not parentSha");
   if (
     (await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd, signal })).stdout !==

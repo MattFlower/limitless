@@ -37,6 +37,7 @@ import {
   sh,
 } from "../util/proc.ts";
 import { AgentResultReport } from "./agent-protocol.ts";
+import { type CapabilityRunner, checkLogin, probeAgents } from "./capabilities.ts";
 import { type Capabilities, pairingCode, timing } from "./protocol.ts";
 import { publicationFields, publishAgentChanges } from "./publication.ts";
 import { agentPathMask } from "./reporting.ts";
@@ -217,6 +218,9 @@ export async function runWorker(
   releaseSha: string,
   signal: AbortSignal,
   options: {
+    capabilityRunner?: CapabilityRunner;
+    probeAgents?: typeof probeAgents;
+    capabilityRefreshMs?: number;
     confinement?: ConfinementBackend;
     harnesses?: Partial<Record<"claude" | "codex", Harness>>;
     tokenLookup?: Parameters<typeof publishAgentChanges>[4];
@@ -478,11 +482,17 @@ export async function runWorker(
     let update: UpdateEpisode | undefined,
       updateWarning: string | undefined,
       supportsUpdates = false,
+      optionalFields = true,
+      observedRelease: string | undefined,
+      releaseObserved = false,
       updating = false,
       restorationFailed = false;
     const now = options.updateRetry?.now ?? Date.now;
     const updateBlocked = () => update !== undefined || updating || restorationFailed;
     const observeRelease = (target: string | undefined) => {
+      if (releaseObserved && target !== observedRelease) optionalFields = true;
+      releaseObserved = true;
+      observedRelease = target;
       supportsUpdates = target !== undefined;
       if (target === undefined || target === update?.target) return;
       update?.controller.abort();
@@ -526,6 +536,19 @@ export async function runWorker(
         delay = Math.min(delay * 2, 10_000);
       }
     };
+    let agents = await (options.probeAgents ?? probeAgents)(options.capabilityRunner, combined);
+    const refresh = setInterval(() => {
+      if (refreshing) return;
+      refreshing = (options.probeAgents ?? probeAgents)(options.capabilityRunner, combined)
+        .then((result) => {
+          agents = result;
+        })
+        .catch(() => {})
+        .finally(() => {
+          refreshing = undefined;
+        });
+    }, options.capabilityRefreshMs ?? 300_000);
+    let refreshing: Promise<void> | undefined;
     const heartbeat = async () => {
       // Retained cleanup must not delay lease renewal for unrelated active jobs.
       void recover().catch(unresolved);
@@ -541,19 +564,27 @@ export async function runWorker(
         freeSlots: updateBlocked()
           ? 0
           : Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
-        ...(supportsUpdates && updateWarning ? { updateWarning } : {}),
+        ...(optionalFields ? { agents, ...(supportsUpdates && updateWarning ? { updateWarning } : {}) } : {}),
         ...state,
         jobs: heldJobs(),
       };
+      if (optionalFields) {
+        try {
+          body.privateStringsDigest = privateStringsDigest(loadPrivateStrings(cfg.paths.configDir));
+        } catch {
+          /* Omit unreadable private policy. */
+        }
+      }
       let response: Awaited<ReturnType<typeof call>>;
       try {
         response = await call("/worker/heartbeat", body);
       } catch (error) {
         // A running coordinator can roll back to the previous strict schema.
-        if (!(error instanceof CoordinatorRefusal) || error.status !== 400 || !body.updateWarning)
-          throw error;
-        supportsUpdates = false;
+        if (!(error instanceof CoordinatorRefusal) || error.status !== 400 || !optionalFields) throw error;
+        optionalFields = false;
         delete body.updateWarning;
+        delete body.agents;
+        delete body.privateStringsDigest;
         response = await call("/worker/heartbeat", body);
       }
       const reply = z
@@ -753,7 +784,12 @@ export async function runWorker(
         if (job) job.reported = false;
       }
     };
-    const runAgent = async (id: string, request: z.infer<typeof AgentRequest>, jobSignal: AbortSignal) => {
+    const runAgent = async (
+      id: string,
+      request: z.infer<typeof AgentRequest>,
+      jobSignal: AbortSignal,
+      deadline: number,
+    ) => {
       const path = `/worker/agent-jobs/${id}`;
       let root: string | undefined;
       let sanitize = agentPathMask([]);
@@ -795,6 +831,8 @@ export async function runWorker(
             : undefined;
         if (!harness || (name !== "claude" && name !== "codex"))
           throw new Error("provider unavailable on worker");
+        if (!(await checkLogin(name, options.capabilityRunner, jobSignal)))
+          throw new Error("Worker CLI not logged in");
         if (!req.branch || !isBranchName(req.branch)) throw new Error("Missing or invalid agent branch");
         root = mkdtempSync(join(cfg.paths.work, "worker-agent-"));
         sanitize = agentPathMask([root, join(root, "checkout")]);
@@ -849,7 +887,14 @@ export async function runWorker(
             }),
           );
           assertProcessesStopped();
-          return () => call(`${path}/result`, report, jobSignal);
+          return () =>
+            call(
+              `${path}/result`,
+              report,
+              sha === req.parentSha
+                ? jobSignal
+                : AbortSignal.any([combined, AbortSignal.timeout(Math.max(0, deadline - Date.now()))]),
+            );
         });
       } catch (error) {
         if (!jobSignal.aborted)
@@ -939,7 +984,12 @@ export async function runWorker(
               () => controller.abort(),
               Math.min(remainingMs ?? request.timeoutMs + 360_000, 2_147_483_647),
             );
-            const task = runAgent(id, request, AbortSignal.any([combined, controller.signal])).finally(() => {
+            const task = runAgent(
+              id,
+              request,
+              AbortSignal.any([combined, controller.signal]),
+              Date.now() + Math.min(remainingMs ?? request.timeoutMs + 360_000, 2_147_483_647),
+            ).finally(() => {
               clearTimeout(timer);
               agentJobs.delete(id);
             });
@@ -967,10 +1017,12 @@ export async function runWorker(
       if (!signal.aborted) throw error;
     } finally {
       stop.abort();
+      clearInterval(refresh);
       fenceTimer.clear(fence);
       for (const [, job] of allJobs()) job.controller.abort();
       await Promise.allSettled([
         ...(beats ? [beats] : []),
+        ...(refreshing ? [refreshing] : []),
         ...allJobs().map(([, j]) => j.task),
         ...(recovery ? [recovery] : []),
       ]);

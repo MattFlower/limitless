@@ -53,6 +53,7 @@ import {
 } from "../core/types.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
+import { githubWait } from "../git/github-wait.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
 import type { RunState } from "../pipeline/context.ts";
@@ -204,6 +205,14 @@ const toRepo = (r: Row): Repo => ({
   createdAt: r.created_at as number,
 });
 
+const runStateFields = (state: unknown): Pick<Run, "flow" | "githubWait"> => {
+  const { flow, githubWait: wait } = parse<Pick<RunState, "flow" | "githubWait">>(state, {});
+  return {
+    flow: flow ?? "build",
+    githubWait: wait ? { ...wait, deadline: wait.since + githubWait.maxMs } : undefined,
+  };
+};
+
 const toRun = (r: Row): Run => ({
   id: r.id as string,
   repoId: r.repo_id as string,
@@ -214,7 +223,7 @@ const toRun = (r: Row): Run => ({
   source: r.source as Run["source"],
   githubWebhookVerified: r.github_webhook_verified === 1,
   sourceRef: parse(r.source_ref, null),
-  flow: parse<{ flow?: Run["flow"] }>(r.state_json, {}).flow ?? "build",
+  ...runStateFields(r.state_json),
   requestedBy: (r.requested_by as string) ?? null,
   profile: r.profile as Run["profile"],
   resolvedProfile: (r.resolved_profile as Run["resolvedProfile"]) ?? null,
@@ -1792,13 +1801,13 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** Oldest-first queue of runs waiting to start. */
-  nextQueuedRuns(limit: number): Run[] {
+  nextQueuedRuns(limit: number, now = Date.now()): Run[] {
     return (
       this.db
         .query(
-          `${RUN_SELECT} WHERE runs.status = 'queued' ORDER BY runs.priority DESC, runs.created_at ASC LIMIT ?`,
+          `${RUN_SELECT} WHERE runs.status = 'queued' AND coalesce(json_extract(runs.state_json, '$.githubWait.nextAttemptAt'), 0) <= ? ORDER BY runs.priority DESC, runs.created_at ASC LIMIT ?`,
         )
-        .all(limit) as Row[]
+        .all(now, limit) as Row[]
     ).map(toRun);
   }
 
