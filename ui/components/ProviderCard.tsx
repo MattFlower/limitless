@@ -5,7 +5,7 @@ import type { ProviderStatus } from "../../src/core/types.ts";
 import type { ProviderWorkload, WorkloadTotals } from "../../src/db/stats.ts";
 import { setProviderEnabled, setProviderFast } from "../api.ts";
 import { compactNumber, duration, money, pct, resetsIn } from "../lib/format.ts";
-import { gaugeClass } from "../lib/gauge.ts";
+import { gaugeClass, quotaWindowFresh } from "../lib/gauge.ts";
 import { now } from "../lib/ticker.ts";
 import { windowLabel } from "../lib/window-label.ts";
 import { ProviderStatePill } from "./StatusPill.tsx";
@@ -169,7 +169,7 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
             <Gauge
               label={windowLabel(name)}
               value={pct(w.utilization)}
-              utilization={w.utilization}
+              utilization={quotaWindowFresh(w, now()) ? w.utilization : undefined}
               details={`${w.resetsAt === null ? "" : `${resetsIn(w.resetsAt, now())} · `}${observationAge(w.observedAt, now()).replace(/^as of /, "updated ")}`}
             />
           )}

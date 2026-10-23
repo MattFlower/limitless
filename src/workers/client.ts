@@ -16,7 +16,7 @@ import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree, withRepoLock } from "../git/repos.ts";
 import { runClaude } from "../harness/claude.ts";
 import { runCodex } from "../harness/codex.ts";
-import { readPolicyScope } from "../harness/read-policy.ts";
+import { ConfinementError, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
@@ -807,6 +807,14 @@ export async function runWorker(
         void posts.catch(() => agentJobs.get(id)?.controller.abort());
       };
       try {
+        if (
+          (request.role === "review" || request.mode === "readonly") &&
+          (request.mode !== "readonly" ||
+            Object.keys(publicationFields).some(
+              (key) => request[key as keyof typeof publicationFields] !== undefined,
+            ))
+        )
+          throw new Error("Readonly jobs carry no publication fields");
         const publication = z.object(publicationFields).safeParse(request);
         if (!publication.success) throw new Error("Invalid agent publication metadata");
         const req = {
@@ -838,6 +846,7 @@ export async function runWorker(
         sanitize = agentPathMask([root, join(root, "checkout")]);
         await withCheckout(id, root, join(root, "repo.git"), req.parentSha, path, jobSignal, async (cwd) => {
           sanitize = agentPathMask([cwd, root ?? cwd]);
+          let sessionStarted = false;
           const spec: AgentSpec = {
             ...session,
             target: { ...req.target, harness: name },
@@ -849,6 +858,8 @@ export async function runWorker(
             logPath: join(root ?? cwd, "agent.jsonl"),
             onEvent(event) {
               if (jobSignal.aborted) return;
+              if (event.type === "tool_call" || event.type === "text" || event.type === "thinking")
+                sessionStarted = true;
               events.push(event);
               if (events.length === 200) flush();
               else flushTimer ??= setTimeout(flush, 250);
@@ -869,6 +880,21 @@ export async function runWorker(
           flush();
           await posts;
           jobSignal.throwIfAborted();
+          if (
+            result.status !== "ok" &&
+            result.status !== "cancelled" &&
+            (result.confinement?.ok === false ||
+              (result.numTurns === 0 &&
+                !result.finalText &&
+                !sessionStarted &&
+                (/Failed to create session:[^\n]*fs sandbox helper failed[^\n]*sandbox-exec: execvp\(\)[^\n]*Operation not permitted/i.test(
+                  result.error ?? "",
+                ) ||
+                  /API Error: EPERM: operation not permitted, (?:mkdir|rmdir) ['"][^'"\n]*\/\.config\/anthropic\/credentials\.lock['"]/i.test(
+                    result.error ?? "",
+                  ))))
+          )
+            throw new ConfinementError(result.error ?? "Worker session confinement failed");
           assertProcessesStopped();
           const sha = await publishAgentChanges(
             cwd,

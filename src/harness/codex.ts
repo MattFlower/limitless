@@ -14,11 +14,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
-import { READ_PROBE } from "./read-policy.ts";
+import { ConfinementError, READ_PROBE, resolvedHome } from "./read-policy.ts";
 import {
   agentShellEnv,
   createScratch,
@@ -256,21 +256,25 @@ function findKey(obj: unknown, key: string): unknown {
  * denied explicitly (`:minimal` includes /tmp, where other invocations' scratch lives), then cwd
  * and scratch are granted inside them.
  */
-function readerFilesystem(spec: AgentSpec, scratch: string): string {
+function readerFilesystem(spec: AgentSpec, scratch: string, executable?: string): string {
   const entries: [string, string][] = [];
   const commands = invocationCommands(scratch, spec.cwd);
+  let denied: string[];
   if (spec.confineReads) {
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
+    denied = deny;
     entries.push([":minimal", "read"]);
     for (const path of deny) entries.push([path, "none"]);
     for (const path of cwd) entries.push([path, "read"]);
     for (const path of writable) entries.push([path, "write"]);
   } else {
+    denied = validateDenyRead(spec, scratch);
     entries.push(["/", "read"]);
-    for (const path of validateDenyRead(spec, scratch)) entries.push([path, "none"]);
+    for (const path of denied) entries.push([path, "none"]);
     entries.push(...commandEntries(commands));
     entries.push([scratch, "write"]);
   }
+  entries.push(...installationEntries(executable, denied));
   const unique = new Map(entries);
   return [...unique].map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
 }
@@ -283,17 +287,29 @@ function commandEntries(commands?: InvocationCommands): [string, string][] {
   ];
 }
 
-function readerProfile(spec: AgentSpec, scratch: string): string[] {
+// Codex's fs sandbox helper re-execs this installation, even beneath the denied CODEX_HOME.
+function installationEntries(executable: string | undefined, denied: string[]): [string, string][] {
+  if (!executable) return [];
+  const directory = dirname(executable);
+  // A directory grant must not uncover credentials or widen the profile to the home or root.
+  const safeDirectory =
+    directory !== "/" &&
+    directory !== resolvedHome() &&
+    !denied.some((path) => path === directory || path.startsWith(`${directory}/`));
+  return [[executable, "read"], ...(safeDirectory ? [[directory, "read"] as [string, string]] : [])];
+}
+
+function readerProfile(spec: AgentSpec, scratch: string, executable?: string): string[] {
   return [
     "-c",
     'default_permissions="limitless-reader"',
     "-c",
-    `permissions={limitless-reader={filesystem={${readerFilesystem(spec, scratch)}},network={enabled=false}}}`,
+    `permissions={limitless-reader={filesystem={${readerFilesystem(spec, scratch, executable)}},network={enabled=false}}}`,
   ];
 }
 
 /** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
-export function editorProfile(spec: AgentSpec): string[] {
+export function editorProfile(spec: AgentSpec, executable?: string): string[] {
   // Codex exposes only a network on/off switch; the API token guards the daemon port.
   const {
     write,
@@ -301,14 +317,17 @@ export function editorProfile(spec: AgentSpec): string[] {
     denyRead = [],
     commands,
   } = writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead);
-  const entries = [
+  const entries: [string, string][] = [
     ["/", "read"],
-    ...write.map((p) => [p, "write"]),
-    ...protect.map((p) => [p, "read"]),
-    ...denyRead.map((p) => [p, "none"]),
+    ...write.map((p): [string, string] => [p, "write"]),
+    ...protect.map((p): [string, string] => [p, "read"]),
+    ...denyRead.map((p): [string, string] => [p, "none"]),
     ...commandEntries(commands),
+    ...installationEntries(executable, denyRead),
   ];
-  const filesystem = entries.map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
+  const filesystem = [...new Map(entries)]
+    .map(([path, access]) => `${JSON.stringify(path)}="${access}"`)
+    .join(",");
   return [
     "-c",
     'default_permissions="limitless-editor"',
@@ -464,7 +483,10 @@ export class CodexReaderProbe {
   private readonly remove: (dir: string) => void;
 
   constructor(
-    private readonly which: (cmd: string) => string | null = (cmd) => Bun.which(cmd),
+    private readonly which: (cmd: string) => string | null = (cmd) => {
+      const path = Bun.which(cmd);
+      return path ? realpathSync(path) : null;
+    },
     options: ReaderProbeOptions = {},
   ) {
     this.roots = options.canaryRoots ?? canaryRoots;
@@ -472,6 +494,14 @@ export class CodexReaderProbe {
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? abortableSleep;
     this.remove = options.remove ?? ((dir) => rmSync(dir, { recursive: true, force: true }));
+  }
+
+  resolve(): string {
+    try {
+      const path = this.which("codex");
+      if (path) return path;
+    } catch {}
+    throw new ConfinementError("Cannot resolve Codex executable");
   }
 
   /**
@@ -486,7 +516,12 @@ export class CodexReaderProbe {
       ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
       : spellings(spec.denyRead ?? []),
   ): Promise<ConfinementProbe> {
-    const path = this.which("codex");
+    let path: string | null;
+    try {
+      path = this.resolve();
+    } catch {
+      path = null;
+    }
     if (!path) return { ok: false, path: null, version: null, reason: START_FAILED, exitCode: null };
     const lookup = await codexVersion(path, spec, run);
     const unverified = { ok: false, path, version: lookup.version, reason: INCONCLUSIVE, exitCode: null };
@@ -645,10 +680,10 @@ async function sandboxProbe(
         path: join(dir, `written-${randomUUID()}`),
         token: "",
       }));
-      profile = editorProfile(spec);
+      profile = editorProfile(spec, path);
     } else {
       positives = [canary(spec.cwd)];
-      profile = readerProfile(spec, scratch);
+      profile = readerProfile(spec, scratch, path);
     }
   } catch {
     return result(INCONCLUSIVE, null);
@@ -728,7 +763,7 @@ async function sandboxProbe(
   return editing ? result(null, last) : result(INCONCLUSIVE, null);
 }
 
-export function buildCodexArgs(spec: AgentSpec): string[] {
+export function buildCodexArgs(spec: AgentSpec, executable?: string): string[] {
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
     throw new Error("Reading invocations cannot grant additional directories");
@@ -779,7 +814,9 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
     args.push(
       "--strict-config",
       "--ignore-rules",
-      ...(spec.mode === "readonly" ? readerProfile(spec, validateScratch(spec)) : editorProfile(spec)),
+      ...(spec.mode === "readonly"
+        ? readerProfile(spec, validateScratch(spec), executable)
+        : editorProfile(spec, executable)),
       "-c",
       "orchestrator.mcp.enabled=false",
       "--disable",
@@ -821,7 +858,6 @@ export async function runCodex(
     : confined
       ? spellings(spec.denyRead ?? [])
       : [];
-  const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec);
   let confinement: ConfinementProbe | undefined;
   if (confined) {
     confinement = await readerProbe.verify(spec, processRunner, deny);
@@ -861,8 +897,15 @@ export async function runCodex(
         confinement,
       };
     }
-    args[0] = confinement.path;
   }
+  // Unverified profiles grant the installation only when it resolves; verified ones use the probed path.
+  let executable = confinement?.path ?? undefined;
+  if (!executable && !spec.noTools)
+    try {
+      executable = readerProbe.resolve();
+    } catch {}
+  const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec, executable);
+  if (executable) args[0] = executable;
   const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
 
   const loop = new LoopDetector(spec.maxToolCalls);

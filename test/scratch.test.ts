@@ -495,7 +495,10 @@ function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {
         codexHome,
         homeEmpty: !!codexHome && readdirSync(codexHome).length === 0,
         built: profileArgs(
-          buildCodexArgs({ ...specFor(opts.cwd, writeGrant(opts.cmd)), confineReads: true }),
+          buildCodexArgs(
+            { ...specFor(opts.cwd, writeGrant(opts.cmd)), confineReads: true },
+            cli.path ?? undefined,
+          ),
         ),
       });
       await Bun.sleep(1);
@@ -582,7 +585,7 @@ test("an enforcing CLI runs exec only after a readable cwd and a denial in every
     }
     expect(positive.codexHome).not.toBe(process.env.CODEX_HOME);
     expect(positive.codexHome).not.toBe(join(homedir(), ".codex"));
-    expect(profileArgs(fake.calls.at(-1))).toEqual(profileArgs(buildCodexArgs(spec)));
+    expect(profileArgs(fake.calls.at(-1))).toEqual(profileArgs(buildCodexArgs(spec, CODEX)));
     expect(fake.execs[0]?.env.CODEX_HOME).toBe(process.env.CODEX_HOME);
     // Probe-owned files are gone; the roots and the caller's files are not.
     for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
@@ -1921,7 +1924,7 @@ test("CLI sandboxes run directly when outer confinement refuses; Claude editors 
       const result = await runCodex({ ...spec, mode }, fake.runner, fake.probe);
       expect(result.status).toBe("ok");
       expect(fake.execs()).toHaveLength(1);
-      expect(fake.execs()[0]?.[0]).toBe(mode === "edit" ? CODEX : "codex");
+      expect(fake.execs()[0]?.[0]).toBe(CODEX);
     }
     const calls: string[][] = [];
     const runner = async (opts: ProcOptions) => {

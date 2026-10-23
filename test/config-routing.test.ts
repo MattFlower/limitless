@@ -32,17 +32,18 @@ test("workers agents opt in independently of gates and known unsupported roles w
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   let factory: Factory | undefined;
   try {
-    writeFileSync(fixture.file, '[workers]\nlisten = "127.0.0.1:7443"\nagents = ["implement"]\n');
+    writeFileSync(fixture.file, '[workers]\nlisten = "127.0.0.1:7443"\nagents = ["implement", "review"]\n');
     const cfg = fixture.load();
-    expect(cfg.workers.agents).toEqual(["implement"]);
+    expect(cfg.workers.agents).toEqual(["implement", "review"]);
+    expect(warn).not.toHaveBeenCalled();
     factory = new Factory(cfg, { bootSha: "f".repeat(40) });
     expect(factory.deps.agentExecutor?.kind).toBe("lan");
     expect(cfg.gateExecutor).toBe("local");
-    writeFileSync(fixture.file, '[workers]\nagents = ["review", "review"]\n');
+    writeFileSync(fixture.file, '[workers]\nagents = ["verify", "verify"]\n');
     warn.mockClear();
-    expect(fixture.load().workers.agents).toEqual(["review", "review"]);
+    expect(fixture.load().workers.agents).toEqual(["verify", "verify"]);
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0]?.[0]).toContain("review stays local in this release");
+    expect(warn.mock.calls[0]?.[0]).toContain("verify stays local in this release");
   } finally {
     await factory?.stop();
     factory?.store.close();
