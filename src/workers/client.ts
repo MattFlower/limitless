@@ -858,7 +858,9 @@ export async function runWorker(
             call(
               `${path}/result`,
               report,
-              sha === req.parentSha ? jobSignal : AbortSignal.timeout(Math.max(0, deadline - Date.now())),
+              sha === req.parentSha
+                ? jobSignal
+                : AbortSignal.any([combined, AbortSignal.timeout(Math.max(0, deadline - Date.now()))]),
             );
         });
       } catch (error) {

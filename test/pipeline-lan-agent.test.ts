@@ -771,7 +771,215 @@ test("delivery conflict resolution remains local after a worker publication", as
   }
 });
 
-test.each(["running", "pushed", "fenced"])(
+test("unreadable private strings on restart cancel the reconciled lease before refusing its result", async () => {
+  const bare = await githubFixture();
+  let { f } = boot();
+  registerGithub(f, bare);
+  let listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+  if (!listener) throw new Error("Missing listener");
+  const pending = f.workers.pair("worker", listener.tls.fingerprint, listener.url.origin);
+  f.workers.approve(pending.code);
+  const claim = f.workers.claim(pending.secret);
+  if (!("token" in claim)) throw new Error("Missing worker token");
+  const token = claim.token;
+  const call = (path: string, body: unknown) => {
+    if (!listener) throw new Error("Missing listener");
+    return workerRequest(listener.url.origin, path, body, { token, pin: listener.tls.fingerprint });
+  };
+  const capabilities = {
+    releaseSha: release,
+    bunVersion: Bun.version,
+    os: "darwin",
+    osVersion: "test",
+    cpuCount: 4,
+    ramBytes: 1024,
+    freeSlots: 1,
+    onAC: true,
+    idleSeconds: 0,
+    jobs: [] as string[],
+  };
+  await call("/worker/heartbeat", capabilities);
+  const leased = Promise.withResolvers<string>();
+  const finish = simulated(f, async (job) => {
+    await call("/worker/lease", {});
+    expect(f.workers.agentJob(job.id)?.state).toBe("leased");
+    leased.resolve(job.id);
+  });
+  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+  const id = await leased.promise;
+  await f.stop();
+  await finish();
+  await listener.stop();
+  f.store.close();
+  let provider = "";
+  let health: ReturnType<Factory["store"]["getProviderRow"]> = null;
+  let reconciliationError: unknown;
+  let propagatedError: unknown;
+  let stateBeforeError: string | undefined;
+  let dispatches = 0;
+  const executor: AgentExecutor = {
+    kind: "test",
+    async run(call, local) {
+      const publication = call.publication;
+      if (call.role === "implement" && publication) {
+        provider = call.spec.target.provider;
+        f.tracker.record(provider, "unavailable");
+        health = f.store.getProviderRow(provider);
+        const dispatch = spyOn(call, "dispatch");
+        call.publication = {
+          ...publication,
+          async resume(request) {
+            writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), Buffer.from([0xff]));
+            try {
+              return await publication.resume(request);
+            } catch (error) {
+              reconciliationError = error;
+              throw error;
+            } finally {
+              writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "");
+            }
+          },
+        };
+        try {
+          return await lanAgentExecutor(f.workers, f.cfg).run(call, local);
+        } catch (error) {
+          propagatedError = error;
+          stateBeforeError = f.workers.agentJob(id)?.state;
+          dispatches = dispatch.mock.calls.length;
+          throw error;
+        }
+      }
+      return local();
+    },
+  };
+  const resumed = boot({ executor, deferStart: true });
+  f = resumed.f;
+  listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+  try {
+    f.start();
+    expect(await waitFor(f, run.id, ["needs_human", "succeeded"])).toBe("needs_human");
+    expect(reconciliationError).toBeInstanceOf(Error);
+    expect(propagatedError).toBe(reconciliationError);
+    expect(stateBeforeError).toBe("cancelled");
+    expect(dispatches).toBe(0);
+    expect(f.store.getRun(run.id)?.error).toContain(
+      "Cannot reconcile worker job: Error: Cannot read private-strings.txt; publication blocked",
+    );
+    expect(health).not.toBeNull();
+    expect(f.store.getProviderRow(provider)).toEqual(health);
+    expect(jobs(f)).toHaveLength(1);
+    expect(resumed.locals()).toBe(0);
+    expect((await call("/worker/heartbeat", { ...capabilities, jobs: [id] })).json()).toMatchObject({
+      cancelled: [id],
+    });
+    const job = f.workers.agentJob(id);
+    if (!job) throw new Error("Missing job");
+    const req = request(job);
+    const result = await fakeHarness(() => ({}))({
+      cwd: home,
+      target: req.target,
+      mode: "edit",
+      prompt: "",
+      timeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      maxToolCalls: 10,
+      logPath: "",
+      signal: new AbortController().signal,
+      onEvent() {},
+    });
+    expect(
+      (
+        await call(`/worker/agent-jobs/${id}/result`, {
+          ...result,
+          parentSha: req.parentSha,
+          sha: req.parentSha,
+          branch: req.branch,
+          privateStringsDigest: req.privateStringsDigest,
+        })
+      ).status,
+    ).toBe(409);
+    expect(f.workers.agentJob(id)).toMatchObject({ state: "cancelled", result: null, result_sha: null });
+  } finally {
+    await listener?.stop();
+  }
+});
+
+test.each(["request", "retry wait"])(
+  "worker shutdown aborts late reporting during %s",
+  async (phase) => {
+    const bare = await githubFixture();
+    const { f } = boot();
+    registerGithub(f, bare);
+    const listener = await startWorkerListener(f.workers, f.cfg.paths, "127.0.0.1:0", () => {});
+    if (!listener) throw new Error("Missing listener");
+    const remote = loadConfig({ home: join(home, "remote"), configDir: join(home, "cfg"), raw: {} });
+    const controller = new AbortController();
+    const reporting = Promise.withResolvers<AbortSignal>();
+    const releaseRequest = Promise.withResolvers<void>();
+    let reports = 0;
+    let offline = false;
+    let task: Promise<void> | undefined;
+    try {
+      await pairWorker(listener.url.origin, join(remote.paths.home, "worker"), "worker", (text) =>
+        f.workers.approve(text.split(": ")[1] ?? ""),
+      );
+      task = runWorker(listener.url.origin, remote, release, controller.signal, {
+        confinement: fakeConfinement,
+        heartbeatMs: 10,
+        retryMs: phase === "request" ? 1 : 60_000,
+        tokenLookup: async () => "fixture-worker-token",
+        machineState: async () => ({ onAC: true, idleSeconds: 0 }),
+        harnesses: { claude: fakeHarness(() => ({ files: { "farewell.txt": "goodbye\n" } })) },
+        request: async (...args) => {
+          const [, path, body, options] = args;
+          if (path.endsWith("/result")) {
+            offline = true;
+            reports++;
+            const signal = options?.signal;
+            if (!signal) throw new Error("Missing reporting signal");
+            const job = jobs(f)[0];
+            if (!job) throw new Error("Missing job");
+            expect((body as { sha: string }).sha).not.toBe(job.parent_sha);
+            if (phase === "request" && reports === 1) throw new Error("Coordinator offline");
+            reporting.resolve(signal);
+            if (phase === "request") {
+              await Promise.race([
+                releaseRequest.promise,
+                new Promise<void>((resolve) =>
+                  signal.addEventListener("abort", () => resolve(), { once: true }),
+                ),
+              ]);
+              signal.throwIfAborted();
+              return { status: 409, data: Buffer.alloc(0), fingerprint: "", json: () => ({}) };
+            }
+            throw new Error("Coordinator offline");
+          }
+          if (offline) throw new Error("Coordinator offline");
+          return workerRequest(...args);
+        },
+      });
+      await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const reportSignal = await reporting.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const job = jobs(f)[0];
+      expect(job?.attempt_deadline_at).toBeGreaterThan(Date.now() + 60_000);
+      expect(reportSignal.aborted).toBe(false);
+      controller.abort();
+      expect(reportSignal.aborted).toBe(true);
+      await task;
+      expect(reports).toBe(phase === "request" ? 2 : 1);
+      expect(jobs(f)[0]).toMatchObject({ state: "leased", result: null, result_sha: null });
+    } finally {
+      controller.abort();
+      releaseRequest.resolve();
+      await task;
+      await listener.stop();
+    }
+  },
+  10_000,
+);
+
+test.each(["running", "pushed", "fenced", "job-cancelled"])(
   "real worker survives restart while %s",
   async (scenario) => {
     const bare = await githubFixture();
@@ -789,6 +997,8 @@ test.each(["running", "pushed", "fenced"])(
     let offline = false,
       sessions = 0;
     let fence: (() => void) | undefined;
+    let jobSignal: AbortSignal | undefined;
+    let cancelJob: string | undefined;
     const controller = new AbortController();
     let task: Promise<void> | undefined;
     try {
@@ -811,6 +1021,13 @@ test.each(["running", "pushed", "fenced"])(
         request: async (_url, path, body, options) => {
           if (offline) {
             if (path.endsWith("/result")) published.resolve((body as { sha: string }).sha);
+            if (path === "/worker/heartbeat" && cancelJob)
+              return {
+                status: 200,
+                data: Buffer.alloc(0),
+                fingerprint: "",
+                json: () => ({ cancelled: [cancelJob] }),
+              };
             throw new Error("Coordinator offline");
           }
           if (!listener) throw new Error("Missing listener");
@@ -825,7 +1042,8 @@ test.each(["running", "pushed", "fenced"])(
         },
         machineState: async () => ({ onAC: true, idleSeconds: 0 }),
         harnesses: {
-          claude: fakeHarness(async () => {
+          claude: fakeHarness(async (spec) => {
+            jobSignal = spec.signal;
             sessions++;
             if (scenario === "running") {
               entered.resolve();
@@ -851,6 +1069,15 @@ test.each(["running", "pushed", "fenced"])(
         if (scenario === "fenced") {
           if (!fence) throw new Error("Missing fence");
           fence();
+        }
+        if (scenario === "job-cancelled") {
+          if (!jobSignal) throw new Error("Missing job signal");
+          const cancelled = Promise.withResolvers<void>();
+          jobSignal.addEventListener("abort", () => cancelled.resolve(), { once: true });
+          cancelJob = id;
+          await cancelled.promise;
+          cancelJob = undefined;
+          expect(jobSignal.aborted).toBe(true);
         }
       }
       f.store.db.query("UPDATE workers SET last_heartbeat_at=last_heartbeat_at-90000").run();

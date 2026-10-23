@@ -4365,9 +4365,13 @@ const agentRequest = (overrides: Partial<AgentJobRequest> = {}): AgentJobRequest
 test.each(["backend", "openai", "decisions"] as const)(
   "agent targets with %s stay local regardless of contents",
   (field) => {
-    for (const value of [{ baseUrl: "http://localhost:8080", authToken: "" }, undefined]) {
+    for (const value of [
+      { baseUrl: "http://localhost:8080", authToken: "" },
+      { baseUrl: "http://localhost:8080" },
+      undefined,
+    ]) {
       const req = agentRequest();
-      req.target[field] = value;
+      Object.assign(req.target, { [field]: value });
       expect(workers.enqueueAgentJob(req)).toBeNull();
       expect(store.db.query("SELECT * FROM agent_jobs").all()).toEqual([]);
     }

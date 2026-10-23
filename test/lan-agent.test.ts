@@ -524,6 +524,49 @@ test.each(["queued", "finished during resume", "already done", "owner cancellati
   },
 );
 
+test.each(["queued", "leased", "done", "failed", "cancelled", "missing"])(
+  "reconciliation exception rechecks the job before cancelling: %s",
+  async (state) => {
+    const f = fixture();
+    const { id } = await detach(f);
+    const hooks = f.call.publication;
+    if (!hooks) throw new Error("Missing publication");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const error = new Error("Reconciliation failed");
+    hooks.resume = async () => {
+      entered.resolve();
+      await release.promise;
+      throw error;
+    };
+    f.store.db.query("UPDATE agent_jobs SET state='leased' WHERE id=?").run(id);
+    const dispatch = spyOn(f.call, "dispatch");
+    const cancel = spyOn(f.workers, "cancelAgentJob");
+    const running = f.run().catch((error: unknown) => error);
+    await entered.promise;
+    if (state === "done") f.complete(id, await f.report());
+    else if (state === "missing") f.store.db.query("DELETE FROM agent_jobs WHERE id=?").run(id);
+    else f.store.db.query("UPDATE agent_jobs SET state=? WHERE id=?").run(state, id);
+    release.resolve();
+    const result = await running;
+    if (state === "done") {
+      expect(result).toMatchObject({ finalText: "remote" });
+      expect(f.workers.agentJob(id)?.state).toBe("done");
+      expect(f.counts().adopted).toBe(1);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } else {
+      expect(result).toBe(error);
+      expect(f.workers.agentJob(id)?.state).toBe(
+        state === "missing" ? undefined : state === "failed" ? "failed" : "cancelled",
+      );
+      expect(f.counts().adopted).toBe(0);
+      expect(dispatch).not.toHaveBeenCalled();
+    }
+    expect(cancel).toHaveBeenCalledTimes(state === "queued" || state === "leased" ? 1 : 0);
+    expect(f.counts()).toMatchObject({ prepared: 1, jobs: state === "missing" ? 0 : 1, locals: 0 });
+  },
+);
+
 test("done job for another target is adopted before a new dispatch", async () => {
   const f = fixture();
   const { id } = await detach(f);

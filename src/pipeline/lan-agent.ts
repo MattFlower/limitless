@@ -74,8 +74,10 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
         try {
           resume = open(job.state) && matches(request) && (await publication.resume(request));
         } catch (error) {
+          job = workers.agentJob(id);
           if (spec.signal.aborted) return cancelled(id);
-          if (workers.agentJob(id)?.state === "done") continue;
+          if (job?.state === "done") continue;
+          if (job && open(job.state)) workers.cancelAgentJob(id);
           throw error;
         }
         job = workers.agentJob(id);
