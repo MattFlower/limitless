@@ -231,7 +231,7 @@ export interface InvokeOptions {
   checkout?: { parentSha: string; baseSha: string; branch: string };
   role: Role;
   stage: Stage;
-  prompt: string;
+  prompt: string | ((allowLocalBinding: boolean) => string);
   mode: "edit" | "readonly";
   complexity: Complexity;
   constraints?: RouteConstraints;
@@ -258,6 +258,7 @@ export interface InvokeOptions {
   denyRead?: string[];
   /** Tools read only the cwd and scratch (see AgentSpec.confineReads). */
   confineReads?: boolean;
+  allowLocalBinding?: boolean;
   noTools?: boolean;
   /** Typed questions for decision models; a decline falls through to the next candidate. */
   decisionTask?: DecisionTask;
@@ -711,6 +712,8 @@ export class RunContext {
         throw new NoCapacityError(stopped);
       }
       const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
+      const allowLocalBinding =
+        !!opts.allowLocalBinding && opts.mode === "readonly" && !noTools && harnessName === "claude";
       const harness = harnesses[harnessName];
       if (!harness) {
         release();
@@ -794,7 +797,9 @@ export class RunContext {
         const spec: AgentSpec = {
           fast: invocation.fast,
           cwd: opts.cwd ?? shadow?.cwd ?? this.state.worktreePath ?? this.runDir,
-          prompt: redactGateOutput(opts.prompt),
+          prompt: redactGateOutput(
+            typeof opts.prompt === "function" ? opts.prompt(allowLocalBinding) : opts.prompt,
+          ),
           systemAppend: redactGateOutput([opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n")),
           target,
           mode: opts.mode,
@@ -806,6 +811,7 @@ export class RunContext {
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
           ...(opts.denyRead ? { denyRead: opts.denyRead } : {}),
           ...(opts.confineReads ? { confineReads: true } : {}),
+          ...(opts.allowLocalBinding ? { allowLocalBinding: true } : {}),
           noTools,
           privateSession: opts.privateOutput || opts.privateSession,
           // The private log sits in the shared temporary directory while a parallel implementer

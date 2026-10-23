@@ -82,6 +82,7 @@ export async function prepareCase(
   signal: AbortSignal,
   implementerReportMode: "include" | "omit" = "include",
   decisionConfidence = DEFAULT_DECISION_CONFIDENCE,
+  allowLocalBinding = false,
 ) {
   if ("prompt" in item) {
     const input = { repoSlug: item.repo, prompt: item.prompt, tree };
@@ -137,6 +138,7 @@ export async function prepareCase(
   return {
     prompt: verifyPrompt({
       ...item.input,
+      allowLocalBinding,
       holdout: item.input.holdout ?? { scenarios: [] },
       baseSha: item.base,
     }),
