@@ -162,19 +162,60 @@ test("restart refuses without an installed daemon agent", async () => {
 test("interrupted restart before kickstart resumes scheduling and releases signal handlers", async () => {
   const f = setup();
   const listeners = process.listenerCount("SIGINT");
+  const entered = Promise.withResolvers<void>();
+  let expire = () => {};
+  f.clock.timeout = (fn) => {
+    expire = fn;
+    return () => {};
+  };
   const admin = f.client.admin;
   f.client.admin = async (action, signal) => {
     const state = await admin(action, signal);
     if (action === "drain") {
       process.emit("SIGINT");
+      entered.resolve();
       return new Promise(() => {});
     }
     return state;
   };
-  await expect(restart(7400, f.opts)).rejects.toThrow("restart interrupted by SIGINT");
+  const result = restart(7400, f.opts).catch((error: unknown) => error);
+  await entered.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const resumedEarly = f.calls.includes("resume");
+  expire();
+  expect(String(await result)).toContain("restart interrupted by SIGINT");
+  expect(resumedEarly).toBe(false);
   expect(f.calls).toContain("resume");
   expect(f.calls).not.toContain(kickstart);
   expect(process.listenerCount("SIGINT")).toBe(listeners);
+  expect(existsSync(f.opts.lockPath)).toBe(false);
+});
+
+test("interrupted restart waits for an in-flight drain before resuming", async () => {
+  const f = setup();
+  const entered = Promise.withResolvers<void>();
+  const apply = Promise.withResolvers<void>();
+  const admin = f.client.admin;
+  f.client.admin = async (action, signal) => {
+    if (action === "drain") {
+      entered.resolve();
+      await apply.promise;
+    }
+    return admin(action, signal);
+  };
+  const result = restart(7400, f.opts).catch((error: unknown) => error);
+  await entered.promise;
+  process.emit("SIGINT");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const resumedEarly = f.calls.includes("resume");
+  const lockHeld = existsSync(f.opts.lockPath);
+  apply.resolve();
+  expect(String(await result)).toContain("restart interrupted by SIGINT");
+  expect(resumedEarly).toBe(false);
+  expect(lockHeld).toBe(true);
+  expect(f.calls.filter((call) => call === "drain" || call === "resume")).toEqual(["drain", "resume"]);
+  expect((await f.client.health(new AbortController().signal)).draining).toBe(false);
+  expect(f.calls).not.toContain(kickstart);
   expect(existsSync(f.opts.lockPath)).toBe(false);
 });
 

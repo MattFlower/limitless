@@ -365,7 +365,7 @@ export async function install(
     try {
       if (old && label === LABEL && (await isLoaded(old.label))) {
         drainAttempted = true;
-        await race(requestAdmin(client, clock, "drain"));
+        await requestDrain(client, clock, race);
         await race(waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log));
       }
       if (state) save(Object.assign(state, { phase: "stopping" }));
@@ -517,6 +517,21 @@ function resumeFailure(port: number, error: unknown): string {
   return `resume scheduler: ${String(error)}; daemon is left DRAINING and its scheduler will not start new runs until resumed\nRecover with: curl -s -X POST -H "content-type: application/json" -d "{}" -H "Authorization: Bearer $(cat -- ${quotedPath})" http://127.0.0.1:${port}/api/admin/resume`;
 }
 
+async function requestDrain(
+  client: DeployClient,
+  clock: DeployClock,
+  race: <T>(work: Promise<T>) => Promise<T>,
+): Promise<void> {
+  const request = requestAdmin(client, clock, "drain");
+  try {
+    await race(request);
+  } catch (error) {
+    // Cleanup must not resume ahead of an in-flight drain; its request timeout still bounds this wait.
+    await request.catch(() => {});
+    throw error;
+  }
+}
+
 export async function restart(port: number, opts: ServiceOptions = {}): Promise<void> {
   const client = opts.client ?? localDeployClient(port),
     clock = opts.clock ?? deployClock;
@@ -533,7 +548,7 @@ export async function restart(port: number, opts: ServiceOptions = {}): Promise<
     log(`daemon before: ${running.sha}`);
     let restartAttempted = false;
     try {
-      if (!running.draining) await race(requestAdmin(client, clock, "drain"));
+      if (!running.draining) await requestDrain(client, clock, race);
       await race(waitForDrain(client, clock, maxWaitMs, opts.now === true, log));
       if (interruption()) throw interruption();
       log("restarting daemon via launchd");
@@ -691,7 +706,7 @@ export async function deploy(
     drainAttempted = true;
     try {
       if (running.draining) log(`daemon ${previous} is already draining; continuing deployment`);
-      else await race(requestAdmin(client, clock, "drain"));
+      else await requestDrain(client, clock, race);
       await race(waitForDrain(client, clock, maxWaitMs, opts.now === true, log));
     } catch (error) {
       if (!(error instanceof DrainUnsupportedError)) throw error;
