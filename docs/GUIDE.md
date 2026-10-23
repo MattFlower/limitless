@@ -258,7 +258,12 @@ heartbeat. Opted-in gates run from git bundles at the requested commit, without 
 on the worker. Leases renew with
 heartbeats and expire after sixty seconds. Infrastructure failures retry once on another worker,
 then fall back locally; a correctly reported failing check remains a gate failure. Coordinator
-restarts re-attach to gate jobs, while cancelling a run tells its worker to stop.
+restarts re-attach only to baseline, initial and rebase LAN gate jobs for the same stage, round and
+SHA. The coordinator must return before the gate-job sweep fails the job for an expired lease or
+stale heartbeat (about thirty seconds since the last heartbeat, with no restart grace). Land checks
+have no durable gate handle and run again after a restart; a graceful land-queue stop cancels its
+LAN gate jobs. Cancelling a run tells its worker to stop. Changes to restart recovery are tracked
+in [#784](https://github.com/MattFlower/limitless/issues/784).
 Opted-in implement rounds publish a commit that the coordinator fetches and verifies before running
 gates, audit, review and delivery. Implement sessions for merge and resolution rounds, PR review
 rounds, existing-branch delivery, verify-change runs and local repositories stay local. Publishing
