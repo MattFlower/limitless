@@ -1685,8 +1685,11 @@ test.each(workerStartupFailures)(
         { state: "failed", result: null, result_sha: null, excluded: '["worker"]' },
       ]);
       expect(jobs(f)[0]?.failure_reason).toBeTruthy();
-      const state = f.store.getRunState<RunState>(run.id);
-      expect(readFileSync(join(state?.worktreePath ?? "", "farewell.txt"), "utf8")).toBe("local goodbye\n");
+      // Read the delivered branch: the run's worktree can be cleaned up once the run has finished.
+      const delivered = f.store.getRun(run.id);
+      expect(
+        (await sh(["git", "show", `refs/heads/${delivered?.branch}:farewell.txt`], { cwd: bare })).stdout,
+      ).toBe("local goodbye\n");
       expect(f.store.listStages(run.id).filter((stage) => stage.name === "implement")).toMatchObject([
         { status: "succeeded", summary: expect.not.stringContaining("no changes") },
       ]);

@@ -1921,7 +1921,7 @@ test("Codex without a probe runs the resolved executable", async () => {
 
 const sandboxCodex = Bun.which("codex");
 const codexSandboxSkip = sandboxCodex ? null : "no codex on PATH";
-test.skipIf(seatbeltSkip !== null).skipIf(codexSandboxSkip !== null)(
+test.skipIf(seatbeltSkip !== null || codexSandboxSkip !== null)(
   `Codex installation helper executes while credentials and unrelated home executables stay denied${seatbeltSkip || codexSandboxSkip ? ` (skipped: ${seatbeltSkip ?? codexSandboxSkip})` : ""}`,
   async () => {
     if (!sandboxCodex) throw new Error("no codex on PATH");
