@@ -1,7 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { availableParallelism } from "node:os";
-import { redactCredentials } from "../util/proc.ts";
+import { processBirthSync, redactCredentials } from "../util/proc.ts";
 
 export const GATE_LEASE_EXPIRY_MS = 30_000;
 export type GatePriority = "ship" | "finish" | "start";
@@ -133,6 +133,9 @@ export class Semaphore {
 type Timer = (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
 interface Options {
   owner?: string;
+  pid?: number;
+  /** null confirms absence; undefined or an exception means inspection is unavailable. */
+  inspect?: (pid: number) => string | null | undefined;
   now?: () => number;
   timer?: Timer;
   clear?: typeof clearTimeout;
@@ -145,7 +148,11 @@ interface Slot {
   holder: string;
   state: "waiting" | "held";
   lease_until: number | null;
+  owner_pid: number | null;
+  owner_birth: string | null;
 }
+
+const processOwner = crypto.randomUUID();
 
 /** SQLite owns admission; timers only renew ownership and observe other processes. */
 export class DatabaseSlotPool extends Semaphore {
@@ -156,8 +163,15 @@ export class DatabaseSlotPool extends Semaphore {
   private readonly pending = new Map<string, () => void>();
   private readonly touches = new Map<string, (done: boolean) => boolean | undefined>();
   private readonly leaseTimers = new Map<string, () => void>();
-  private tick?: ReturnType<typeof setTimeout>;
-  private renewed: number;
+  private pollTick?: ReturnType<typeof setTimeout>;
+  private renewTick?: ReturnType<typeof setTimeout>;
+  private closed = false;
+  private readonly pid;
+  private readonly birth;
+  private readonly inspect;
+  private readonly pollMs;
+  private readonly renewMs;
+  private readonly inspectionWarnings = new Set<string>();
 
   constructor(
     private readonly db: Database,
@@ -166,45 +180,73 @@ export class DatabaseSlotPool extends Semaphore {
     options: Options = {},
   ) {
     super(defaultLimit);
-    this.owner = options.owner ?? crypto.randomUUID();
+    this.owner = options.owner ?? processOwner;
     this.now = options.now ?? Date.now;
     this.timer = options.timer ?? setTimeout;
     this.clear = options.clear ?? clearTimeout;
-    this.renewed = this.now();
+    this.pid = options.pid ?? process.pid;
+    this.inspect = options.inspect ?? processBirthSync;
+    const birth = this.inspect(this.pid);
+    if (!birth) throw new Error("Slot owner process identity is unavailable");
+    this.birth = birth;
+    this.pollMs = Math.max(1, Math.min(250, options.pollMs ?? 250));
+    this.renewMs = options.renewMs ?? 10_000;
     this.write(
       "INSERT OR IGNORE INTO slot_pools (pool, capacity) VALUES (?, ?)",
       pool,
       Math.max(1, Math.floor(defaultLimit)),
     );
-    const pulse = () => {
-      try {
-        const renew = this.now() - this.renewed >= (options.renewMs ?? 10_000);
-        this.refresh(() => {
-          if (renew)
-            this.write(
-              "UPDATE slot_requests SET renewed_at = ? WHERE pool = ? AND owner = ?",
-              this.now(),
-              pool,
-              this.owner,
-            );
-        });
-        if (renew) this.renewed = this.now();
-      } catch (error) {
-        console.warn(redactCredentials(`Slot pool renewal/poll failed: ${String(error)}`));
-      } finally {
-        this.tick = this.timer(pulse, Math.min(250, options.pollMs ?? 250));
-        this.tick.unref?.();
-      }
+  }
+
+  private schedule() {
+    if (this.closed) return;
+    const owned =
+      this.rows("SELECT id FROM slot_requests WHERE pool = ? AND owner = ? LIMIT 1", this.pool, this.owner)
+        .length > 0;
+    const arm = (renew: boolean) => {
+      const tick = this.timer(
+        () => {
+          if (renew) this.renewTick = undefined;
+          else this.pollTick = undefined;
+          try {
+            this.refresh(() => {
+              if (renew)
+                this.write(
+                  "UPDATE slot_requests SET renewed_at = ? WHERE pool = ? AND owner = ?",
+                  this.now(),
+                  this.pool,
+                  this.owner,
+                );
+            });
+          } catch (error) {
+            console.warn(redactCredentials(`Slot pool renewal/poll failed: ${String(error)}`));
+          } finally {
+            this.schedule();
+          }
+        },
+        renew ? this.renewMs : this.pollMs,
+      );
+      tick.unref?.();
+      return tick;
     };
-    this.tick = this.timer(pulse, Math.min(250, options.pollMs ?? 250));
-    this.tick.unref?.();
+    if (!this.pending.size && this.pollTick !== undefined) {
+      this.clear(this.pollTick);
+      this.pollTick = undefined;
+    } else if (this.pending.size && this.pollTick === undefined) this.pollTick = arm(false);
+    if (!owned && this.renewTick !== undefined) {
+      this.clear(this.renewTick);
+      this.renewTick = undefined;
+    } else if (owned && this.renewTick === undefined) this.renewTick = arm(true);
   }
 
   /** Stop renewal without discarding external leases during graceful shutdown. */
   close() {
-    if (this.tick !== undefined) this.clear(this.tick);
+    this.closed = true;
+    if (this.pollTick !== undefined) this.clear(this.pollTick);
+    if (this.renewTick !== undefined) this.clear(this.renewTick);
     for (const cancel of this.leaseTimers.values()) cancel();
     this.leaseTimers.clear();
+    this.touches.clear();
   }
 
   override get limit(): number {
@@ -250,13 +292,36 @@ export class DatabaseSlotPool extends Semaphore {
   private refresh(change = () => {}) {
     this.db
       .transaction(() => {
-        this.write(
-          `DELETE FROM slot_requests WHERE pool = ? AND
-          (renewed_at <= ? OR lease_until <= ?)`,
+        this.write("DELETE FROM slot_requests WHERE pool = ? AND lease_until <= ?", this.pool, this.now());
+        for (const row of this.rows(
+          "SELECT DISTINCT owner, owner_pid, owner_birth FROM slot_requests WHERE pool = ? AND lease_until IS NULL",
           this.pool,
-          this.now() - GATE_LEASE_EXPIRY_MS,
-          this.now(),
-        );
+        )) {
+          try {
+            // Older requests cannot be attributed safely; timestamps do not prove death.
+            if (row.owner_pid === null || !row.owner_birth)
+              throw new Error("missing recorded process identity");
+            const birth = this.inspect(row.owner_pid);
+            if (birth === undefined || birth === "") throw new Error("process identity is unavailable");
+            if (birth !== row.owner_birth)
+              this.write(
+                "DELETE FROM slot_requests WHERE pool = ? AND owner = ? AND owner_pid = ? AND owner_birth = ? AND lease_until IS NULL",
+                this.pool,
+                row.owner,
+                row.owner_pid,
+                row.owner_birth,
+              );
+            this.inspectionWarnings.delete(row.owner);
+          } catch (error) {
+            if (!this.inspectionWarnings.has(row.owner))
+              console.warn(
+                redactCredentials(
+                  `Slot owner ${row.owner} inspection failed; preserving reservations: ${String(error)}`,
+                ),
+              );
+            this.inspectionWarnings.add(row.owner);
+          }
+        }
         change();
         const rows = this.rows(
           `SELECT * FROM slot_requests WHERE pool = ?
@@ -273,6 +338,7 @@ export class DatabaseSlotPool extends Semaphore {
       })
       .immediate();
     for (const wake of [...this.pending.values()]) wake();
+    this.schedule();
   }
 
   private remove(id: string) {
@@ -303,8 +369,8 @@ export class DatabaseSlotPool extends Semaphore {
     this.refresh(() =>
       this.write(
         `INSERT INTO slot_requests
-      (id, pool, owner, holder, priority, state, requested_at, renewed_at, lease_until, held_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT coalesce(max(held_order), 0) + 1 FROM slot_requests))`,
+      (id, pool, owner, holder, priority, state, requested_at, renewed_at, lease_until, owner_pid, owner_birth, held_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT coalesce(max(held_order), 0) + 1 FROM slot_requests))`,
         id,
         this.pool,
         this.owner,
@@ -314,13 +380,15 @@ export class DatabaseSlotPool extends Semaphore {
         this.now(),
         this.now(),
         leaseUntil,
+        this.pid,
+        this.birth,
       ),
     );
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
-      this.remove(id);
+      if (leaseUntil === null) this.remove(id);
     };
     try {
       if (this.row(id)?.state !== "held") {
@@ -329,6 +397,7 @@ export class DatabaseSlotPool extends Semaphore {
         await new Promise<void>((resolve, reject) => {
           const done = (error?: unknown) => {
             this.pending.delete(id);
+            this.schedule();
             signal.removeEventListener("abort", abort);
             if (error !== undefined) reject(error);
             else resolve();
@@ -340,11 +409,13 @@ export class DatabaseSlotPool extends Semaphore {
           const wake = () => {
             const row = this.row(id);
             if (!row) done(new Error("Slot expired"));
+            else if (row.owner !== this.owner) done(new Error("Slot ownership transferred"));
             else if (row.state === "held") done();
           };
           this.pending.set(id, wake);
           signal.addEventListener("abort", abort, { once: true });
           wake();
+          this.schedule();
         });
       }
       signal.throwIfAborted();
@@ -366,7 +437,7 @@ export class DatabaseSlotPool extends Semaphore {
   ): Promise<string> {
     const id = crypto.randomUUID(),
       controller = new AbortController();
-    this.armLease(id, timer, clear, () => controller.abort());
+    const touch = this.armLease(id, timer, clear, () => controller.abort());
     let acquired = false;
     void this.reserve(
       id,
@@ -378,13 +449,13 @@ export class DatabaseSlotPool extends Semaphore {
       priority,
     ).then(
       () => {
-        if (controller.signal.aborted) this.touches.get(id)?.(true);
+        if (controller.signal.aborted) touch(true);
         else {
           acquired = true;
           observe?.onAcquired();
         }
       },
-      () => this.touches.get(id)?.(true),
+      () => touch(true),
     );
     await Promise.resolve();
     if (immediate && !acquired) this.heartbeat(id, true);
@@ -395,6 +466,7 @@ export class DatabaseSlotPool extends Semaphore {
     this.leaseTimers.get(id)?.();
     let expiry: ReturnType<typeof setTimeout>;
     const touch = (done: boolean) => {
+      if (this.touches.get(id) !== touch) return undefined;
       clear(expiry);
       const row = this.row(id);
       if (done || !row || row.owner !== this.owner) {
@@ -403,6 +475,7 @@ export class DatabaseSlotPool extends Semaphore {
         this.touches.delete(id);
         this.leaseTimers.delete(id);
         abort();
+        this.schedule();
         return row?.state === "held";
       }
       expiry = timer(expire, GATE_LEASE_EXPIRY_MS);
@@ -410,7 +483,14 @@ export class DatabaseSlotPool extends Semaphore {
       return row.state === "held";
     };
     const expire = () => {
+      if (this.touches.get(id) !== touch) return;
       try {
+        const row = this.row(id);
+        if (row?.owner === this.owner && row.lease_until !== null && row.lease_until > this.now()) {
+          expiry = timer(expire, row.lease_until - this.now());
+          expiry.unref?.();
+          return;
+        }
         touch(true);
       } catch (error) {
         console.warn(redactCredentials(`Slot lease expiry failed: ${String(error)}`));
@@ -422,6 +502,7 @@ export class DatabaseSlotPool extends Semaphore {
     this.leaseTimers.set(id, () => clear(expiry));
     expiry = timer(expire, GATE_LEASE_EXPIRY_MS);
     expiry.unref?.();
+    return touch;
   }
 
   override heartbeat(id: string, release = false): boolean | undefined {
@@ -429,15 +510,17 @@ export class DatabaseSlotPool extends Semaphore {
       adopt = false;
     this.refresh(() => {
       const row = this.row(id);
-      if (!row || row.lease_until === null || (row.owner !== this.owner && row.state !== "held")) return;
+      if (!row || row.lease_until === null) return;
       held = row.state === "held";
       adopt = !this.touches.has(id) || row.owner !== this.owner;
       if (release) this.write("DELETE FROM slot_requests WHERE pool = ? AND id = ?", this.pool, id);
       else
         this.write(
-          `UPDATE slot_requests SET owner = ?, renewed_at = ?, lease_until = ?
+          `UPDATE slot_requests SET owner = ?, owner_pid = ?, owner_birth = ?, renewed_at = ?, lease_until = ?
         WHERE pool = ? AND id = ?`,
           this.owner,
+          this.pid,
+          this.birth,
           this.now(),
           this.now() + GATE_LEASE_EXPIRY_MS,
           this.pool,
