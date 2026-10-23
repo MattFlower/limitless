@@ -577,9 +577,10 @@ export class WorkerStore {
   }
   sweep() {
     const now = this.now();
+    const resumedAt = this.resumedAt ?? Number.NEGATIVE_INFINITY;
     for (const j of this.jobs("state IN ('queued','leased')")) {
       if (j.state === "queued" && this.keepLocal(j)) continue;
-      if (j.state === "queued" && now - j.updated_at >= this.times.pickup)
+      if (j.state === "queued" && now - Math.max(j.updated_at, resumedAt) >= this.times.pickup)
         this.fail(j.id, "No worker picked up job");
       else if (j.state === "leased") {
         // Older leases acquire a deadline once, using their persisted last renewal.
@@ -593,8 +594,10 @@ export class WorkerStore {
         const w = j.worker ? this.worker(j.worker) : null;
         if (w?.state !== "approved") this.fail(j.id, "Worker disconnected or revoked");
         else if (deadline <= now) this.fail(j.id, "Attempt deadline expired");
-        else if ((j.lease_expires_at ?? 0) <= now) this.fail(j.id, "Lease expired");
-        else if (now - (w.last_heartbeat_at ?? 0) > this.times.fresh) this.fail(j.id, "Worker disconnected");
+        else if (Math.max(j.lease_expires_at ?? 0, resumedAt + this.times.lease) <= now)
+          this.fail(j.id, "Lease expired");
+        else if (now - Math.max(w.last_heartbeat_at ?? 0, resumedAt) > this.times.fresh)
+          this.fail(j.id, "Worker disconnected");
       }
     }
   }

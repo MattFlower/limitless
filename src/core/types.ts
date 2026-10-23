@@ -562,6 +562,7 @@ export interface DrainState {
 }
 
 export interface HealthResponse extends DrainState {
+  startedAt?: number;
   loadPerCore?: number;
   admissionHeld?: boolean;
   eventLoopLagMaxMs?: number;
