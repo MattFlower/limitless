@@ -1,9 +1,12 @@
-import { existsSync, realpathSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { version } from "../package.json";
 import { BUILD_DEFINES } from "../src/release.ts";
+import { UI_RESOURCE, uiBuildOptions } from "../src/server/ui-build.ts";
 import { sh } from "../src/util/proc.ts";
+import solidPlugin from "./solid-plugin.ts";
 
 const root = resolve(import.meta.dir, "..");
 
@@ -55,7 +58,29 @@ export async function buildSha(cwd = root): Promise<string> {
   return sha;
 }
 
-export function buildConfig(identity: { version: string; sha: string }, outdir: string): Bun.BuildConfig {
+export async function stageUi(stagingRoot: string) {
+  const directory = join(stagingRoot, UI_RESOURCE);
+  rmSync(directory, { recursive: true, force: true });
+  mkdirSync(directory, { recursive: true });
+  const result = await Bun.build({ ...uiBuildOptions(solidPlugin), outdir: directory });
+  if (!result.success) throw new AggregateError(result.logs, "UI build failed");
+  return { directory, outputs: result.outputs };
+}
+
+export function validateMetafile(metafile: { inputs: Record<string, unknown> }): void {
+  if (
+    Object.keys(metafile.inputs).some((path) =>
+      /(?:^|\/)node_modules\/(?:@babel\/|babel-preset-solid\/)/.test(path),
+    )
+  )
+    throw new Error("Cannot build Limitless: Babel dependency in binary metafile");
+}
+
+export function buildConfig(
+  identity: { version: string; sha: string },
+  outdir: string,
+  uiDirectory: string,
+): Bun.BuildConfig {
   return {
     entrypoints: [resolve(root, "src/cli/main.ts")],
     outdir,
@@ -63,7 +88,7 @@ export function buildConfig(identity: { version: string; sha: string }, outdir: 
     format: "esm",
     compile: {
       outfile: resolve(outdir, "limitless"),
-      assets: checkAssets(EMBEDDED_RESOURCES.map((path) => resolve(root, path))),
+      assets: checkAssets([...EMBEDDED_RESOURCES.map((path) => resolve(root, path)), uiDirectory]),
       autoloadDotenv: false,
       autoloadBunfig: false,
       autoloadTsconfig: false,
@@ -76,6 +101,7 @@ export function buildConfig(identity: { version: string; sha: string }, outdir: 
     define: {
       [BUILD_DEFINES.version]: JSON.stringify(identity.version),
       [BUILD_DEFINES.sha]: JSON.stringify(identity.sha),
+      [BUILD_DEFINES.packaged]: "true",
     },
   };
 }
@@ -83,9 +109,23 @@ export function buildConfig(identity: { version: string; sha: string }, outdir: 
 async function main(): Promise<void> {
   const { values } = parseArgs({ args: Bun.argv.slice(2), options: { outdir: { type: "string" } } });
   if (!values.outdir) throw new Error("Usage: bun scripts/build-binary.ts --outdir <dir>");
-  const result = await Bun.build(buildConfig({ version, sha: await buildSha() }, values.outdir));
-  if (!result.success) throw new AggregateError(result.logs, "Binary build failed");
-  await Bun.write(resolve(values.outdir, "metafile.json"), JSON.stringify(result.metafile));
+  const identity = { version, sha: await buildSha() };
+  const stagingRoot = mkdtempSync(join(tmpdir(), "limitless-build-ui-"));
+  try {
+    const { directory } = await stageUi(stagingRoot);
+    const result = await Bun.build(buildConfig(identity, values.outdir, directory));
+    if (!result.success) throw new AggregateError(result.logs, "Binary build failed");
+    try {
+      if (!result.metafile) throw new Error("Binary build returned no metafile");
+      validateMetafile(result.metafile);
+    } catch (error) {
+      rmSync(resolve(values.outdir, "limitless"), { force: true });
+      throw error;
+    }
+    await Bun.write(resolve(values.outdir, "metafile.json"), JSON.stringify(result.metafile));
+  } finally {
+    rmSync(stagingRoot, { recursive: true, force: true });
+  }
 }
 
 if (import.meta.main)

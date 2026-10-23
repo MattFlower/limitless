@@ -1731,7 +1731,7 @@ async function oneRound(
   }
 
   const concurrent = profile(ctx) !== "quick" && ctx.state.flow !== "verify-change" && !resolution;
-  // --- review (a different vendor than the implementer)
+  // --- review
   if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
   const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
@@ -1785,6 +1785,17 @@ async function oneRound(
     ctx,
     "review",
     async (stage) => {
+      const sameVendorAllowed =
+        system.mode === "single" &&
+        ctx.state.flow !== "verify-change" &&
+        ctx.deps.cfg.reviewAvoidImplementerVendor === false;
+      ctx.log(
+        system.mode === "panel"
+          ? "review: panel finder family rules"
+          : sameVendorAllowed
+            ? "review: same-vendor allowed by config"
+            : "review: avoiding implementer's vendor",
+      );
       // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
@@ -1855,7 +1866,11 @@ async function oneRound(
             const finder = system.finders[index];
             const vendor = ctx.state.implementer?.vendor;
             const constraints: RouteConstraints = {
-              ...(finder?.family === "implementer" ? { preferVendor: vendor } : { avoidVendor: vendor }),
+              ...(finder?.family === "implementer"
+                ? { preferVendor: vendor }
+                : !shadow && sameVendorAllowed && system.mode === "single"
+                  ? {}
+                  : { avoidVendor: vendor }),
               ...(finder?.local ? { billing: "free_only" as const } : {}),
             };
             // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
@@ -1935,7 +1950,8 @@ async function oneRound(
         ).values(),
       ];
       const sameVendor = target.vendor === ctx.state.implementer?.vendor;
-      if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
+      if (sameVendor && !sameVendorAllowed)
+        ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
       ctx.state.lastReview = { ...r, modelId: target.modelId };
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();

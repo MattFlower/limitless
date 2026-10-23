@@ -324,10 +324,12 @@ prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, 
 audit), `chat_messages`, `settings`, `land_entries` (the approved-PR queue). The frozen legacy
 migrations and timestamped SQL files are applied at startup.
 
-On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
-current stage (the worktree is preserved; Claude sessions can be resumed). Land entries left in
-flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps waiting on the recorded
-commit, and `merging` first asks GitHub whether the PR already merged.
+On startup, runs left `running` by a crash/restart are re-queued and start their interrupted stage
+over. The worktree retains a killed session's uncommitted edits, but the engine does not resume
+model sessions; confined Claude editors disable session persistence and refuse resume requests.
+Land entries left in flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps
+waiting on the recorded commit, and `merging` first asks GitHub whether the PR already merged.
+Changes to restart recovery are tracked in [#784](https://github.com/MattFlower/limitless/issues/784).
 
 ### Landing (the land queue)
 
