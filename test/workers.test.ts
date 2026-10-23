@@ -5707,11 +5707,13 @@ test.each([
         };
         return runProcess({
           cmd: [process.execPath, '-e',
-            "require('node:fs').writeFileSync(" + ${JSON.stringify(JSON.stringify(ready))} + ", JSON.stringify({" +
+            // Written aside and renamed, so the test never parses a partly written file.
+            "const fs = require('node:fs'); fs.writeFileSync(" + ${JSON.stringify(JSON.stringify(`${ready}.tmp`))} + ", JSON.stringify({" +
             "pid: process.pid, invocation: process.env.LIMITLESS_INVOCATION, ownership: process.env[" +
             JSON.stringify('LIMITLESS_INVOCATION_' + scope.ownershipMarker.replaceAll('-', '_')) + "]," +
             "cwd: " + JSON.stringify(cwd) + ", scratch: " + JSON.stringify(invocationScratch.getStore()) +
-            "})); setInterval(() => {}, 1000);"],
+            "})); fs.renameSync(" + ${JSON.stringify(JSON.stringify(`${ready}.tmp`))} + ", " + ${JSON.stringify(JSON.stringify(ready))} + ");" +
+            " setInterval(() => {}, 1000);"],
           cwd, env: {},
         });
       };
