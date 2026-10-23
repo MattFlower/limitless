@@ -806,6 +806,10 @@ for (const failure of ["discovery", "birth", "recording", "boot"] as const) {
           : failure === "birth"
             ? processBirthInspection.run({ read: fail }, invoke)
             : invoke();
+      // Spawn-time evidence can fail before the child gets to print its PID.
+      const child = scope.children.keys().next().value;
+      if (child?.pid === undefined) throw new Error("Missing spawned child");
+      member = child.pid;
       await expect(pending).rejects.toThrow(`injected ${failure} failure`);
       await expect(pending).rejects.toBeInstanceOf(ProcessTerminationError);
       const deadline = performance.now() + 5000;
@@ -815,6 +819,8 @@ for (const failure of ["discovery", "birth", "recording", "boot"] as const) {
       recorder?.mockRestore();
       for (const child of scope.children.keys()) {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        if (child.exitCode === null && child.signalCode === null)
+          await new Promise<void>((resolve) => child.once("exit", () => resolve()));
       }
       store.close();
       rmSync(directory, { recursive: true, force: true });

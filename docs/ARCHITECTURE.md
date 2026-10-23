@@ -338,7 +338,8 @@ the run's recorded review approval, or an explicit `--sha` that must be the PR's
 the approved SHA — plus a base merge the factory itself made — may land. One entry lands at a time
 per repository, oldest first, and the claim that gives a repository to one queue is a store
 transaction (`claimLandEntry`, one running land per repository), so a restart resumes and two queues
-cannot check the same repository at once.
+cannot check the same repository at once. The queue re-pumps active repositories once per claim
+staleness window, so an entry left claimed by a crashed process resumes once its claim goes stale.
 
 Each entry checks out the approved head from the bare cache, merges the base in when it has moved,
 runs the repository's checks (from the base commit's `.limitless.toml`) in one gate slot with the
