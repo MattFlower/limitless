@@ -1432,27 +1432,27 @@ async function oneRound(
   const privateStrings = () => privateEntries(ctx, cwd);
   const changeDiff = () =>
     diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
-  const system =
-    ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
-  // Panel reviews are numbered apart from implementation rounds (a gate-failed round reviews nothing,
-  // a replayed round keeps its number); a conflict-resolution review is outside the count.
-  const panelReview =
-    system.mode === "panel" && !resolution
-      ? Math.max(
-          0,
-          ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
-        ) + 1
-      : undefined;
-  // What decides a panel review's blocking findings; a conflict-resolution review follows R2's rules.
-  const panelRules: PanelReview | undefined =
-    resolution && system.mode === "panel" ? "resolution" : panelReview;
-  // Checked before implementing: work no review can see is not worth paying for. The worktree keeps
-  // the head the last review saw, which the draft delivers.
-  if (panelReview && panelReview > PANEL_REVIEWS)
-    throw new NeedsHumanError(
-      `Panel review limit reached (R${PANEL_REVIEWS}); not implementing again. Last feedback:\n${ctx.state.feedback ?? ""}`,
-    );
+  const reviewSettings = () => {
+    const system =
+      ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
+    // A gate-failed round reviews nothing; replays retain the same panel number.
+    const panelReview =
+      system.mode === "panel" && !resolution
+        ? Math.max(
+            0,
+            ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
+          ) + 1
+        : undefined;
+    if (panelReview && panelReview > PANEL_REVIEWS)
+      throw new NeedsHumanError(
+        `Panel review limit reached (R${PANEL_REVIEWS}); not implementing again. Last feedback:\n${ctx.state.feedback ?? ""}`,
+      );
+    const panelRules: PanelReview | undefined =
+      resolution && system.mode === "panel" ? "resolution" : panelReview;
+    return { system, panelReview, panelRules };
+  };
+  let { system, panelReview, panelRules } = reviewSettings();
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
@@ -1740,22 +1740,10 @@ async function oneRound(
   const reviewedSha = await headSha(cwd);
   // R2 and R3 review only the fixes since the previous review. A conflict-resolution review, like a
   // single one, sees the change against the new base, so upstream-only files never appear.
-  const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
-  const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
-  const scope: ReviewScope | undefined =
-    system.mode !== "panel"
-      ? undefined
-      : fixSha
-        ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
-        : {
-            kind: resolution ? "resolution" : "full",
-            range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
-          };
   const previousReview = priorReview
     ? {
         sha: priorReview.sha,
         findings: priorReview.blocking,
-        ...(fixSha ? { resolved: resolvedPriorFindings(findingsReviews) } : {}),
       }
     : undefined;
   const reviewText = (text: string) => redactPrivate(redactGateOutput(text), privateStrings());
@@ -1785,6 +1773,18 @@ async function oneRound(
     ctx,
     "review",
     async (stage) => {
+      ({ system, panelReview, panelRules } = reviewSettings());
+      const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
+      const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
+      const scope: ReviewScope | undefined =
+        system.mode !== "panel"
+          ? undefined
+          : fixSha
+            ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
+            : {
+                kind: resolution ? "resolution" : "full",
+                range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
+              };
       const sameVendorAllowed =
         system.mode === "single" &&
         ctx.state.flow !== "verify-change" &&
@@ -1822,7 +1822,10 @@ async function oneRound(
           externalChange: ctx.state.flow === "verify-change",
           dependencyUpdate:
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
-          previous: previousReview,
+          previous: previousReview && {
+            ...previousReview,
+            ...(fixSha ? { resolved: resolvedPriorFindings(findingsReviews) } : {}),
+          },
           headSha: reviewedSha,
           resolution,
           firstParentPatch: firstParentDiff?.[0],

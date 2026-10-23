@@ -759,6 +759,19 @@ export class Store {
     this.publishFeed();
   }
 
+  configReloaded(applied: string[], restartRequired: string[]): void {
+    this.db.query("INSERT INTO feed_add VALUES ('config.reloaded', NULL, NULL, ?, ?, ?, ?)").run(
+      "Configuration reloaded",
+      "Configuration reloaded",
+      json({
+        applied: applied.map(redactCredentials),
+        restartRequired: restartRequired.map(redactCredentials),
+      }),
+      crypto.randomUUID(),
+    );
+    this.publishFeed();
+  }
+
   readFeed(opts: Partial<FeedQuery> = {}): FeedPage {
     validateFeedQuery(opts);
     const newest = this.feedIssued();

@@ -460,6 +460,7 @@ export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"
   | "daemon.started"
+  | "config.reloaded"
   | `review.${"round_started" | "round_delivered" | "approved"}`
   | GitHubFeedKind;
 export type LandFeedKind = "land.queued" | "land.waiting_approval" | "land.landed" | "land.blocked";

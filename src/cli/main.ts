@@ -21,6 +21,7 @@ const USAGE = `limitless — personal software factory
 Usage:
   limitless version [--json]              Print release identity (--version also supported)
   limitless serve                         Start the daemon (API, UI, scheduler)
+  limitless config reload                 Apply live config keys; report changes requiring restart
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
@@ -366,6 +367,10 @@ async function main(): Promise<void> {
     return;
   }
   switch (cmd) {
+    case "config": {
+      const { configCommand } = await import("./config.ts");
+      return configCommand(rest, { api, print: console.log });
+    }
     case "workers": {
       if (rest[0] === "ls") {
         const rows =
