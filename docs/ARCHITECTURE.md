@@ -305,8 +305,9 @@ detection, per-invocation budget, process-group kill on cancel.
   caches verdicts by CLI identity/version, profile kind and deny set. On macOS, `~/Library/Keychains`
   is denied. Claude editors exempt keychain paths only in the outer profile for login through
   `security`; native Read, Grep and Glob tools retain all keychain denies. Overlapping credential or
-  explicit denies take precedence. The follow-up to #834 will supply their login from the daemon
-  before denying outer-profile Keychain access. Claude's file-backed CLI login remains readable (#369).
+  explicit denies take precedence. With a configured `CLAUDE_CODE_OAUTH_TOKEN`, daemon-local
+  subscription sessions receive it and editors retain the outer-profile Keychain denies. LAN
+  workers keep their own logins and exemption. Claude's file-backed CLI login remains readable (#369).
   HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
   and a private copy of Cargo configuration preserve installed toolchain discovery and read
   access; writes to real HOME remain denied.
