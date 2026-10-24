@@ -16,6 +16,7 @@ export function attributedJUnitCounts(
   checkout: string,
   canonicalFile: (file: string) => string | undefined,
   onTestcase?: (node: Bun.XML.Node, file?: string, describes?: (string | undefined)[]) => void,
+  onInvalid?: (reason: string) => void,
 ): AttributedTestCounts | undefined {
   const canonicalCheckout = realpathSync(checkout);
   const reportFiles = new Map<string, Set<string>>();
@@ -93,14 +94,19 @@ export function attributedJUnitCounts(
     for (const key of Object.keys(counts) as (keyof AttributedTestCounts)[]) {
       const value = node.attributes[key];
       if (value !== undefined && (!/^\d+$/.test(value) || Number(value) !== counts[key]))
-        throw new Error("Unmatched JUnit counter");
+        throw new Error(
+          /^\d+$/.test(value) && Number(value) > counts[key] && (key === "errors" || key === "failures")
+            ? `${Number(value) - counts[key]} unattributed ${key.slice(0, -1)}${Number(value) - counts[key] === 1 ? "" : "s"}`
+            : "Unmatched JUnit counter",
+        );
     }
     return counts;
   };
   try {
     const counts = visit(root);
     return onTestcase || counts.failures + counts.errors > 0 ? counts : undefined;
-  } catch {
+  } catch (error) {
+    onInvalid?.(error instanceof Error ? error.message : "Invalid JUnit evidence");
     return undefined;
   }
 }
@@ -143,5 +149,13 @@ export class RunnerFailureEvidence {
       (this.counts.get("skip") ?? 0) + (this.counts.get("todo") ?? 0) === counts.skipped &&
       this.counts.get("tests") === counts.tests
     );
+  }
+
+  reason(counts?: AttributedTestCounts): string | undefined {
+    if (this.agrees(counts)) return undefined;
+    const errors = this.counts.get("error");
+    if (errors) return `${errors} unattributed error${errors === 1 ? "" : "s"}`;
+    if (this.invalid) return "runner reported an error, bail, or invalid/duplicate summary";
+    return counts ? "runner summary missing or inconsistent with JUnit" : undefined;
   }
 }
