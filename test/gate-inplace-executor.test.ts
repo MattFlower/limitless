@@ -682,6 +682,44 @@ test.each(["confirmed", "failed"])(
   },
 );
 
+test("cancelling shared scratch waits for the stopped first attempt and its running retry", async () => {
+  const { f, context, req } = await setup();
+  const runId = context().run.id;
+  const scratch = createScratch(req.cwd);
+  const request = { ...req, runId, scratch };
+  const first = f.workers.enqueue(request, randomUUID(), true);
+  const retry = f.workers.enqueue(request, randomUUID(), true);
+  // Model the retained jobs after detaching from a stage's retry.
+  f.store.db.query("UPDATE gate_jobs SET state='done',stopped=1 WHERE id=?").run(first);
+  f.store.db.query("UPDATE gate_jobs SET state='leased',stopped=0 WHERE id=?").run(retry);
+  const releaseRetry = Promise.withResolvers<void>();
+  const originalWait = f.workers.waitStopped.bind(f.workers);
+  const stopped = spyOn(f.workers, "waitStopped").mockImplementation(async (id) => {
+    if (id === retry) await releaseRetry.promise;
+    await originalWait(id);
+  });
+  try {
+    expect(f.cancelRun(runId)).toBe(true);
+    expect(stopped.mock.calls).toEqual([[first], [retry]]);
+    // Drain the completed attempt's promise chain, including any premature scratch removal.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.workers.job(first)).toMatchObject({ state: "done", stopped: 1 });
+    expect(f.workers.job(retry)).toMatchObject({ state: "cancelled", stopped: 0 });
+    expect(existsSync(scratch)).toBe(true);
+
+    f.store.db.query("UPDATE gate_jobs SET stopped=1 WHERE id=?").run(retry);
+    releaseRetry.resolve();
+    await wait(() => !existsSync(scratch), { timeoutMs: 10_000 });
+  } finally {
+    f.store.db.query("UPDATE gate_jobs SET stopped=1 WHERE id=?").run(retry);
+    releaseRetry.resolve();
+    await Promise.all(stopped.mock.results.map(({ value }) => value));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    stopped.mockRestore();
+    removeScratch(scratch);
+  }
+});
+
 test.each(["sha", "missing", "release", "environment"])(
   "resume rejects a %s mismatch instead of waiting on the old handle",
   async (kind) => {

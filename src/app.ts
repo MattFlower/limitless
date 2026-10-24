@@ -391,18 +391,20 @@ export class Factory {
   cancelRun(id: string, by = "user"): boolean {
     const cancelled = this.scheduler.cancel(id, by);
     if (cancelled) {
+      // A detached in-place stage's scratch outlives the daemon's scope, and its first attempt and
+      // retries share it: remove each scratch only once every job using it has stopped.
+      const users = new Map<string, string[]>();
       for (const job of this.workers.jobs("run_id=?", id)) {
         this.workers.cancel(job.id);
-        // A detached in-place job's scratch outlives the daemon's scope; remove it once its processes stop.
         const scratch = job.in_place ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
-        if (scratch)
-          void this.workers
-            .waitStopped(job.id)
-            .then(() => removeScratch(scratch))
-            .catch((error: unknown) =>
-              console.warn(redactCredentials(`Kept in-place gate scratch: ${String(error)}`)),
-            );
+        if (scratch) users.set(scratch, [...(users.get(scratch) ?? []), job.id]);
       }
+      for (const [scratch, jobs] of users)
+        void Promise.all(jobs.map((job) => this.workers.waitStopped(job)))
+          .then(() => removeScratch(scratch))
+          .catch((error: unknown) =>
+            console.warn(redactCredentials(`Kept in-place gate scratch: ${String(error)}`)),
+          );
       this.workers.cancelRunAgentJobs(id);
     }
     return cancelled;
