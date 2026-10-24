@@ -6,7 +6,12 @@ import type { GateRun } from "../gates/run.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
-import { processBirthSync, redactCredentialData, registerCredential } from "../util/proc.ts";
+import {
+  processBirthSync,
+  recoverProcessCleanups,
+  redactCredentialData,
+  registerCredential,
+} from "../util/proc.ts";
 import {
   AgentCapabilities,
   type Capabilities,
@@ -360,9 +365,22 @@ export class WorkerStore {
   async waitStopped(id: string, signal?: AbortSignal) {
     while (this.job(id)?.stopped === 0) {
       signal?.throwIfAborted();
-      const worker = this.job(id)?.worker;
-      if (!worker || !this.executor(worker, false))
-        throw new Error("In-place gate stop is unconfirmed; process recovery required");
+      const job = this.job(id);
+      const worker = job?.worker;
+      if (!worker || !this.executor(worker, false)) {
+        if (!job) return;
+        const { cwd } = JSON.parse(job.request) as GateRequest;
+        const records = () => [
+          ...this.store.listProcessDiscoveries(undefined, cwd),
+          ...this.store.listProcessCleanups(undefined, cwd),
+        ];
+        await recoverProcessCleanups(this.store, records());
+        if (records().length) throw new Error("In-place gate stop is unconfirmed; process recovery required");
+        this.store.db
+          .query("UPDATE gate_jobs SET stopped=1 WHERE id=? AND worker IS ? AND stopped=0")
+          .run(id, worker ?? null);
+        continue;
+      }
       await Bun.sleep(this.times.tick);
     }
   }

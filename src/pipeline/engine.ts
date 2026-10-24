@@ -106,7 +106,7 @@ import {
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
-import { runGateExecution } from "./gate-execution.ts";
+import { resumeGateExecution, runGateExecution } from "./gate-execution.ts";
 import {
   checkDiscreetCommits,
   DiscreetError,
@@ -582,11 +582,14 @@ async function prepare(ctx: RunContext): Promise<void> {
         : wt.baseSha);
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
     const verification = ctx.state.verification;
+    const env = gateEnv();
+    const resuming =
+      (await resumeGateExecution(ctx, "prepare", "baseline", wt.path, env))?.kind === "inplace";
     if (verification) {
       ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
-      if (ctx.state.gateExecution?.handle.kind !== "inplace") await resetTo(wt.path, verification.baseSha);
+      if (!resuming) await resetTo(wt.path, verification.baseSha);
     }
-    if (ctx.state.gateExecution?.handle.kind !== "inplace") await discardChanges(wt.path);
+    if (!resuming) await discardChanges(wt.path);
     // A round's gate, audit and review settings come from its original run's base commit: an
     // earlier round's edits to the PR must never weaken the next round's checks.
     const trustedSha = review ? review.owner.baseSha : (verification?.baseSha ?? baseSha);
@@ -637,7 +640,6 @@ async function prepare(ctx: RunContext): Promise<void> {
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const baselineSha = await headSha(wt.path);
-      const env = gateEnv();
       const runBaseline = gateSlotScope(
         commandScope(wt.path, async (): Promise<GateRun> => {
           const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait }, env);
@@ -1527,10 +1529,11 @@ async function oneRound(
           let testScripts: Record<string, string> = {};
           let baseTimeout = false;
           try {
-            if (ctx.state.gateExecution?.handle.kind !== "inplace")
+            const env = gateEnv();
+            if ((await resumeGateExecution(ctx, "gates", "initial", cwd, env))?.kind !== "inplace")
               await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
             testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
-            let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events);
+            let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events, env);
             ctx.checkCancelled();
             baseTimeout = after.checks.some(
               (r) =>
@@ -1548,8 +1551,7 @@ async function oneRound(
               );
               // The re-run starts from the committed tree too, not from what the first attempt left behind.
               localSetupReady = false;
-              if (ctx.state.gateExecution?.handle.kind !== "inplace")
-                await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+              await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
               after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
               ctx.checkCancelled();
               after = {
@@ -3121,6 +3123,8 @@ async function mergeForDelivery(
   }
   const before = ctx.state.preRebaseHead;
   if (!before) throw new Error("Missing pre-merge HEAD");
+  const env = gateEnv();
+  const resuming = (await resumeGateExecution(ctx, "gates", "rebase", cwd, env))?.kind === "inplace";
   const conflicts = await prepareMerge(cwd, before, fetched);
   if (conflicts.length) {
     ctx.state.conflictFiles = conflicts;
@@ -3139,7 +3143,7 @@ async function mergeForDelivery(
   if ((await headSha(cwd)) === before)
     await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
   await validateMerge(cwd, before, fetched);
-  await checkoutCommitted(cwd);
+  if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
@@ -3157,6 +3161,7 @@ async function mergeForDelivery(
           cwd,
           assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
           gateEvents(ctx),
+          env,
         );
         ctx.checkCancelled();
         if (timeoutOnly(after)) {

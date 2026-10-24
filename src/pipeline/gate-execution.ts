@@ -5,24 +5,24 @@ import { cancelGateExecution, executeGate, gateShutdown } from "../gates/executo
 import { lanExecutor } from "../gates/lan.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
 import { gateEnv } from "../gates/run.ts";
-import { headSha } from "../git/repos.ts";
+import { checkoutCommitted, headSha } from "../git/repos.ts";
 import type { RunContext } from "./context.ts";
 
-/** Resume only a stage's first execution; later attempts depend on its setup. */
-export async function runGateExecution(
+/** Validate before preserving a surviving gate's worktree or doing destructive Git operations. */
+export async function resumeGateExecution(
   ctx: RunContext,
   stage: StageName,
   purpose: string,
   cwd: string,
-  gates: GateConfig,
-  hooks: GateHooks = {},
   env = gateEnv(),
-): Promise<GateRun> {
+  sha?: string,
+) {
   ctx.checkCancelled();
+  const pending = ctx.state.gateExecution;
+  if (!pending) return undefined;
   const executor = ctx.deps.gateExecutor;
   const round = ctx.state.round;
-  const sha = await headSha(cwd);
-  const pending = ctx.state.gateExecution;
+  sha ??= await headSha(cwd);
   const stored =
     pending?.stage === stage &&
     pending.round === round &&
@@ -41,7 +41,27 @@ export async function runGateExecution(
     );
     ctx.state.gateExecution = undefined;
     await ctx.save();
+    if (pending.handle.kind === "inplace")
+      await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
   }
+  return stored;
+}
+
+/** Resume only a stage's first execution; later attempts depend on its setup. */
+export async function runGateExecution(
+  ctx: RunContext,
+  stage: StageName,
+  purpose: string,
+  cwd: string,
+  gates: GateConfig,
+  hooks: GateHooks = {},
+  env = gateEnv(),
+): Promise<GateRun> {
+  ctx.checkCancelled();
+  const sha = await headSha(cwd);
+  const stored = await resumeGateExecution(ctx, stage, purpose, cwd, env, sha);
+  const executor = ctx.deps.gateExecutor;
+  const round = ctx.state.round;
   let settled = false;
   try {
     const result = await executeGate(
