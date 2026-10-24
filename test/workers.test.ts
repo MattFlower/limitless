@@ -7156,60 +7156,159 @@ test("heartbeat uses cached sanitized capabilities while a refresh is pending", 
   }
 });
 
-test("a logged-out session fails before checkout, is excluded and leaves provider health unchanged", async () => {
-  await listen();
-  const id = enqueueAgent({ branch: "change/login" });
-  const factory = new Factory(cfg, {
-    store,
-    bootSha: releaseSha,
-    models: [],
-    providers: [{ id: "fake", label: "Test", harness: "claude", billing: "subscription", maxConcurrent: 2 }],
-  });
-  factory.tracker.record("fake", "unavailable");
-  const snapshot = () => {
-    const value = factory.tracker.status("fake");
-    if (!value) throw new Error("Missing provider");
-    const { updatedAt: _time, ...status } = value;
-    return status;
-  };
-  const health = store.getProviderRow("fake"),
-    status = snapshot();
-  expect(health).not.toBeNull();
-  expect(status.state).toBe("degraded");
-  let calls = 0;
-  const failures: unknown[] = [];
-  const worker = await loop({
-    probeAgents: async () => ({
-      claude: { version: "2.1.3 (Claude Code)", loggedIn: true },
-      codex: { version: null, loggedIn: false },
-    }),
-    capabilityRunner: async () => ({
-      exitCode: 0,
-      stdout: '{"loggedIn":false,"account":"user@example.com"}',
-    }),
-    harnesses: {
-      claude: fakeHarness(() => {
-        calls++;
-        return {};
+test.each([
+  { configured: true, statusFailed: false },
+  { configured: true, statusFailed: true },
+  { configured: false, statusFailed: false },
+])(
+  "worker-local authentication covers startup, refreshed capabilities and jobs: %j",
+  async ({ configured, statusFailed }) => {
+    await listen();
+    const token = `worker-probe-${crypto.randomUUID()}`;
+    const priorToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (configured)
+      writeFileSync(join(cfg.paths.configDir, "secrets.env"), `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+    const bodies: Capabilities[] = [];
+    const transmitted: unknown[] = [];
+    const diagnostics: string[] = [];
+    const checks: string[][] = [];
+    let versions = 0,
+      harnessCalls = 0;
+    const worker = await loop({
+      capabilityRefreshMs: 10,
+      capabilityRunner: async (args, options) => {
+        if (args[1] === "--version") {
+          expect(args).toHaveLength(2);
+          if (args[0] !== "claude") return { exitCode: 1, stdout: "not installed" };
+          return { exitCode: 0, stdout: `2.1.${++versions === 1 ? 3 : 4} (Claude Code)` };
+        }
+        checks.push(args);
+        const supplied = options.env?.CLAUDE_CODE_OAUTH_TOKEN;
+        expect(supplied).toBe(configured ? token : undefined);
+        expect(args).toEqual(["claude", "auth", "status"]);
+        const authenticated = !statusFailed && (!configured || supplied === token);
+        return {
+          exitCode: authenticated ? 0 : 1,
+          stdout: authenticated ? '{"loggedIn":true}' : `Status failed: ${token}`,
+        };
+      },
+      harnesses: {
+        claude: fakeHarness((spec) => {
+          harnessCalls++;
+          expect(spec.claudeSubscriptionToken).toBe(configured ? token : undefined);
+          return {};
+        }),
+      },
+      log: (text) => diagnostics.push(text),
+      async request(...args) {
+        transmitted.push(structuredClone(args[2]));
+        if (args[1] === "/worker/heartbeat") bodies.push(structuredClone(args[2]) as Capabilities);
+        return workerRequest(...args);
+      },
+    });
+    try {
+      await until(() => bodies.some((body) => body.agents?.claude?.version === "2.1.4 (Claude Code)"));
+      expect(bodies[0]?.agents?.claude).toEqual({ version: "2.1.3 (Claude Code)", loggedIn: !statusFailed });
+      expect(bodies.at(-1)?.agents?.claude?.loggedIn).toBe(!statusFailed);
+      expect(checks.length).toBeGreaterThanOrEqual(2);
+      if (!statusFailed) {
+        const priorChecks = checks.length;
+        const id = await queuedLocalAgent();
+        await until(() => workers.agentJob(id)?.state === "done" || !!workers.agentJob(id)?.failure_reason);
+        expect(workers.agentJob(id)?.state).toBe("done");
+        expect(checks.length).toBeGreaterThan(priorChecks);
+      }
+      for (const args of checks) expect(args).toEqual(["claude", "auth", "status"]);
+      expect(harnessCalls).toBe(statusFailed ? 0 : 1);
+      expect(JSON.stringify({ transmitted, diagnostics })).not.toContain(token);
+    } finally {
+      await worker.stop();
+      if (priorToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      else process.env.CLAUDE_CODE_OAUTH_TOKEN = priorToken;
+    }
+  },
+);
+
+test.each([false, true])(
+  "a logged-out session fails before checkout, is excluded and leaves provider health unchanged, token=%s",
+  async (configured) => {
+    await listen();
+    const token = `worker-rejected-${crypto.randomUUID()}`;
+    const priorToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (configured)
+      writeFileSync(join(cfg.paths.configDir, "secrets.env"), `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+    const id = enqueueAgent({ branch: "change/login" });
+    const factory = new Factory(cfg, {
+      store,
+      bootSha: releaseSha,
+      models: [],
+      providers: [
+        { id: "fake", label: "Test", harness: "claude", billing: "subscription", maxConcurrent: 2 },
+      ],
+    });
+    factory.tracker.record("fake", "unavailable");
+    const snapshot = () => {
+      const value = factory.tracker.status("fake");
+      if (!value) throw new Error("Missing provider");
+      const { updatedAt: _time, ...status } = value;
+      return status;
+    };
+    const health = store.getProviderRow("fake"),
+      status = snapshot();
+    expect(health).not.toBeNull();
+    expect(status.state).toBe("degraded");
+    let calls = 0;
+    const loginTokens: (string | undefined)[] = [];
+    const failures: unknown[] = [];
+    const transmitted: unknown[] = [];
+    const worker = await loop({
+      probeAgents: async () => ({
+        claude: { version: "2.1.3 (Claude Code)", loggedIn: true },
+        codex: { version: null, loggedIn: false },
       }),
-    },
-    async request(...args) {
-      if (args[1] === agentPath(id, "failure")) failures.push(args[2]);
-      return workerRequest(...args);
-    },
-  });
-  try {
-    await until(() => failures.length > 0 && workers.agentJob(id)?.state === "queued");
-    expect(failures).toEqual([{ reason: "Worker CLI not logged in" }]);
-    expect(calls).toBe(0);
-    expect(readdirSync(worker.remote.paths.work)).toEqual([]);
-    expect(workers.agentJob(id)).toMatchObject({ state: "queued", excluded: '["loop-runner"]' });
-    expect(store.getProviderRow("fake")).toEqual(health);
-    expect(snapshot()).toEqual(status);
-  } finally {
-    await worker.stop();
-  }
-});
+      capabilityRunner: async (args, options) => {
+        const supplied = options.env?.CLAUDE_CODE_OAUTH_TOKEN;
+        loginTokens.push(supplied);
+        expect(args).toEqual(["claude", "auth", "status"]);
+        return configured
+          ? supplied
+            ? { exitCode: 1, stdout: "", stderr: `Status failed: ${token}` }
+            : { exitCode: 0, stdout: "stored login works" }
+          : { exitCode: 0, stdout: '{"loggedIn":false,"account":"user@example.com"}' };
+      },
+      harnesses: {
+        claude: fakeHarness(() => {
+          calls++;
+          return {};
+        }),
+      },
+      async request(...args) {
+        transmitted.push(structuredClone(args[2]));
+        if (args[1] === agentPath(id, "failure")) failures.push(args[2]);
+        return workerRequest(...args);
+      },
+    });
+    try {
+      await until(() => calls > 0 || (failures.length > 0 && workers.agentJob(id)?.state === "queued"));
+      expect(failures).toEqual([
+        { reason: configured ? "Status failed: [redacted]" : "Worker CLI not logged in" },
+      ]);
+      expect(JSON.stringify(transmitted)).not.toContain(token);
+      expect(loginTokens).toEqual([configured ? token : undefined]);
+      expect(calls).toBe(0);
+      expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+      expect(workers.agentJob(id)).toMatchObject({ state: "queued", excluded: '["loop-runner"]' });
+      expect(store.getProviderRow("fake")).toEqual(health);
+      expect(snapshot()).toEqual(status);
+    } finally {
+      await worker.stop();
+      if (priorToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      else process.env.CLAUDE_CODE_OAUTH_TOKEN = priorToken;
+    }
+  },
+);
 
 test("heartbeat optional fields return only after the observed coordinator release changes", async () => {
   await listen();

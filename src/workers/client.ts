@@ -538,10 +538,10 @@ export async function runWorker(
         delay = Math.min(delay * 2, 10_000);
       }
     };
-    let agents = await (options.probeAgents ?? probeAgents)(options.capabilityRunner, combined);
+    let agents = await (options.probeAgents ?? probeAgents)(options.capabilityRunner, combined, cfg.secrets);
     const refresh = setInterval(() => {
       if (refreshing) return;
-      refreshing = (options.probeAgents ?? probeAgents)(options.capabilityRunner, combined)
+      refreshing = (options.probeAgents ?? probeAgents)(options.capabilityRunner, combined, cfg.secrets)
         .then((result) => {
           agents = result;
         })
@@ -843,7 +843,7 @@ export async function runWorker(
         if (!localHarness || (name !== "claude" && name !== "codex"))
           throw new Error("provider unavailable on worker");
         const harness = withSubscriptionAuth(name, localHarness, cfg.secrets);
-        if (!(await checkLogin(name, options.capabilityRunner, jobSignal)))
+        if (!(await checkLogin(name, options.capabilityRunner, jobSignal, cfg.secrets)))
           throw new Error("Worker CLI not logged in");
         if (!req.branch || !isBranchName(req.branch)) throw new Error("Missing or invalid agent branch");
         root = mkdtempSync(join(cfg.paths.work, "worker-agent-"));
