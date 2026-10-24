@@ -104,10 +104,13 @@ export function hiddenDarwinProcessMember(
   if (darwinDescendant(pid, parents, members)) return true;
   // Hidden descendants of proven members are ours. Otherwise cwd can identify only
   // orphans (ppid 1) born during this invocation, never a live non-member's children.
-  // Residuals: a detached platform tool that leaves the worktree and writes by absolute
-  // path, or a hidden process whose parent is still alive but not a member, is unrecognized.
-  // On Linux, a descendant that replaces its environment is not recognised unless
-  // already claimed; discovery there relies only on environment markers.
+  // Measured on macOS with `bun scripts/probe-process-recovery.ts` (#740): setsid,
+  // leaving the roots, SIP-hidden /bin/sleep and orphaning each alone remain discoverable.
+  // Combining all four escapes discovery; a null-leader hidden orphan outside the roots
+  // is also missed even in the original session/group. Independent-session and caller-
+  // session controls were excluded. Linux env -i remains unmeasured here and marker-only.
+  // Two empty scans prove quiescence only within these rules' coverage (ARCHITECTURE §6).
+  // A hidden process with a live but unproven parent is also unrecognized.
   if (parents.get(pid) !== 1) return false;
   const born = readBorn();
   if (typeof born !== "number") {
