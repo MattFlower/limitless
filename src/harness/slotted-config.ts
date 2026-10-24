@@ -1,12 +1,13 @@
 export type SlottedCommands = string[][];
-export type AgentFullSuite = "slot" | "refuse";
+export type AgentFullSuite = "slot" | "refuse" | "gate";
 
 export function readAgentFullSuite(contents: string | null, warn: (message: string) => void): AgentFullSuite {
   try {
     const raw =
       contents === null ? {} : (Bun.TOML.parse(contents) as { limits?: { agent_full_suite?: unknown } });
     const value = raw.limits?.agent_full_suite;
-    if (value === undefined || value === "slot" || value === "refuse") return value ?? "slot";
+    if (value === undefined || value === "slot" || value === "refuse" || value === "gate")
+      return value ?? "slot";
   } catch {}
   warn("Invalid [limits].agent_full_suite; using slot");
   return "slot";

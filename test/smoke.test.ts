@@ -1454,6 +1454,10 @@ wait
       { mode: 0o755 },
     );
     writeFileSync(join(dir, "codex"), readFileSync(join(dir, "claude")), { mode: 0o755 });
+    if (mode === "probe") {
+      mkdirSync(join(dir, "work"));
+      mkdirSync(join(dir, "scratch"));
+    }
     const entry = join(dir, "runner.ts");
     writeFileSync(
       entry,
@@ -1463,10 +1467,11 @@ import { expectProcessStopped } from ${JSON.stringify(join(import.meta.dir, "pro
 import { sh, runProcess } from ${JSON.stringify(join(process.cwd(), "src/util/proc.ts"))};
 import { readFileSync, appendFileSync } from 'node:fs';
 import { CodexReaderProbe } from ${JSON.stringify(join(process.cwd(), "src/harness/codex.ts"))};
+import { readPolicyScope } from ${JSON.stringify(join(process.cwd(), "src/harness/read-policy.ts"))};
 const kill = process.kill.bind(process);
 process.kill = (pid, signal) => { appendFileSync('${dir}/signals', pid + ' ' + signal + ' ' + Date.now() + '\\n'); return kill(pid, signal); };
 const run = async (signal) => {
-  if (${mode === "probe"}) { await new CodexReaderProbe().verify({cwd: '${dir}', signal}, runProcess); return {status: 'pass'}; }
+  if (${mode === "probe"}) { await readPolicyScope.run({home: '${dir}', environment: {}}, () => new CodexReaderProbe().verify({cwd: '${dir}/work', scratchDir: '${dir}/scratch', mode: 'readonly', signal}, runProcess)); return {status: 'pass'}; }
   const previous = ${timed} ? readFileSync('${dir}/pids', 'utf8').trim().split(/\\s+/).map(Number).filter(Boolean) : [];
   for (const pid of previous) expectProcessStopped(pid);
   if (${mode === "idle-timeout"}) { const r = await runProcess({cmd: ['claude'], cwd: '${dir}', env: process.env, signal, idleTimeoutMs: 250}); return {status: r.idleTimedOut ? 'pass' : 'fail'}; }

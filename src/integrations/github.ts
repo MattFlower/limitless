@@ -3,18 +3,22 @@ import type { Factory } from "../app.ts";
 import { parseAllow } from "../core/allow.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
+import { IssueClaimed } from "../db/store.ts";
 import { inAnyCidr } from "../util/cidr.ts";
-import { redactCredentialData, redactCredentials, sh } from "../util/proc.ts";
+import { redactCredentialData, redactCredentials } from "../util/proc.ts";
+import { githubSh } from "./github-identity.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
 export type GhRunner = (
   args: string[],
   signal?: AbortSignal,
   stdin?: string,
+  repo?: string,
 ) => Promise<string> | Promise<void>;
 
-export const runGh: GhRunner = async (args, signal, stdin) => {
-  return (await sh(["gh", ...args], { cwd: process.cwd(), timeoutMs: 30_000, signal, stdin })).stdout;
+export const runGh: GhRunner = async (args, signal, stdin, repo) => {
+  return (await githubSh(["gh", ...args], { cwd: process.cwd(), timeoutMs: 30_000, signal, stdin }, repo))
+    .stdout;
 };
 
 const object = (value: unknown): Record<string, unknown> | null =>
@@ -75,6 +79,22 @@ export function unquoteGitHub(
 
 type Mapped = { request?: CreateRunRequest; note: string; error?: boolean };
 
+export function issueRunRequest(
+  issue: { repo: string; number: number; title: string; body: string; author: string },
+  owner: string | null,
+): CreateRunRequest {
+  const { repo, number, title, body, author } = issue;
+  return {
+    repo,
+    source: "github",
+    title,
+    requestedBy: author,
+    sourceRef: { kind: "issue", repo, number },
+    allow: author.toLowerCase() === owner?.toLowerCase() ? parseAllow(`${title}\n${body}`) : [],
+    prompt: `${GITHUB_PREFACES.issue}\n\n${quoted({ title, body })}`,
+  };
+}
+
 export function mapGitHubEvent(event: string, payload: unknown, owner: string | null): Mapped {
   const p = object(payload);
   const repo = object(p?.repository);
@@ -97,14 +117,10 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
       return { note: "malformed issue", error: true };
     return {
       note: "owner issue labeled",
-      request: {
-        ...base,
-        title,
-        requestedBy: owner,
-        sourceRef: { kind: "issue", repo: fullName, number: id },
-        allow: parseAllow(`${title}\n${string(issue?.body) ?? ""}`), // Owner-authored issue.
-        prompt: `${GITHUB_PREFACES.issue}\n\n${quoted({ title, body: issue?.body ?? "" })}`,
-      },
+      request: issueRunRequest(
+        { repo: fullName, number: id, title, body: string(issue?.body) ?? "", author: owner },
+        owner,
+      ),
     };
   }
   if (event === "issue_comment" && action === "created") {
@@ -279,7 +295,11 @@ export function githubWebhook(
       factory.store.finishInbox(id, "run_created", mapped.note, run.id);
       return Response.json({ runId: run.id }, { status: 201 });
     } catch (error) {
-      const note = error instanceof Error ? error.message : String(error);
+      const note = redactCredentials(error instanceof Error ? error.message : String(error));
+      if (error instanceof IssueClaimed) {
+        factory.store.finishInbox(id, "ignored", note);
+        return new Response(note, { status: 200 });
+      }
       factory.store.finishInbox(id, "error", note);
       return new Response("delivery processing failed", { status: 500 });
     }

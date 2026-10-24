@@ -356,11 +356,19 @@ export async function runConfined(
     const roots = observed(writeRoots(opts.cwd, scratch, true));
     const cargo = join(scratch, "cargo");
     if (!scope.initialized) {
-      mkdirSync(cargo);
-      for (const name of ["config", "config.toml"]) {
-        const source = join(opts.env.CARGO_HOME ?? join(home, ".cargo"), name);
-        if (existsSync(source)) copyFileSync(source, join(cargo, name));
+      let created = false;
+      try {
+        mkdirSync(cargo);
+        created = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
+      // Another job/process may have initialized shared scratch. Never copy into candidate paths.
+      if (created)
+        for (const name of ["config", "config.toml"]) {
+          const source = join(opts.env.CARGO_HOME ?? join(home, ".cargo"), name);
+          if (existsSync(source)) copyFileSync(source, join(cargo, name));
+        }
       scope.initialized = true; // Never perform trusted copies into scratch after candidate code runs.
     }
     return runSandboxed(

@@ -131,6 +131,37 @@ async function migration(
   return { result: JSON.parse(stdout.trim().split("\n").at(-1) ?? "") as MigrationResult, stdout };
 }
 
+for (const mode of ["source", "packaged"]) {
+  for (const kind of ["daemon", "mtplx", "tunnel"]) {
+    test(`${mode} ${kind} discovery rejects a mismatched Program`, async () => {
+      const { result: r } = await migration(`${mode}-program-mismatch`, kind);
+      expect(r.error).toBe("");
+      expect(r.discovered).toEqual([]);
+      expect(r.files[`${kind}-original.plist`]).toBe(r.original);
+      expect(r.loaded).toContain(`arbitrary.installed.${kind}`);
+      expect(r.calls).toEqual([]);
+    });
+  }
+  for (const program of ["absent", "equal", "symlink", "invalid", "unresolvable"]) {
+    test(`${mode} daemon discovery handles ${program} Program`, async () => {
+      const { result: r } = await migration(`${mode}-program-${program}`);
+      expect(r.error).toBe("");
+      expect(r.discovered).toEqual(["invalid", "unresolvable"].includes(program) ? [] : ["daemon"]);
+    });
+  }
+  test(`${mode} install refuses a mismatched Program at the destination without side effects`, async () => {
+    const { result: r } = await migration(`${mode}-program-collision`);
+    expect(r.error).toContain("unrelated agent:");
+    expect(r.discovered).toEqual([]);
+    expect(r.files["dev.limitless.daemon.plist"]).toBe(r.original);
+    expect(r.loaded.sort()).toEqual(["arbitrary.installed.daemon", "other.program"]);
+    expect(r.calls).toEqual([]);
+    expect(r.draining).toBe(false);
+    expect(r.journals).toEqual([]);
+    expect(r.lock).toBe(false);
+  });
+}
+
 test("packaged stable executable maps a Cellar file to its matching opt symlink", () => {
   const prefix = mkdtempSync(join(tmpdir(), "limitless-homebrew-"));
   migrationDirs.push(prefix);

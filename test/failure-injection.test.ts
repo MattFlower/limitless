@@ -31,6 +31,7 @@ import {
 } from "../src/git/repos.ts";
 import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -924,7 +925,7 @@ test("codex 0.154.0, which denies home and TMPDIR but allows /tmp, diverts confi
   });
   const { run: r, invoke } = await confinedHoldout(f);
   const privateFiles = privateReadPaths().filter(existsSync);
-  const outcome = await invoke(true);
+  const outcome = await readPolicyScope.run(f.deps.cfg.readPolicy, () => invoke(true));
   expect(outcome.target.provider).toBe("b");
   expect(commands.map((cmd) => cmd[1])).not.toContain("exec");
   // Home and TMPDIR were denied; the /tmp canary is the one that leaked.

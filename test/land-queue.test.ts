@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -17,6 +18,7 @@ import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import type { GateExecutor, GateRequest } from "../src/gates/executor.ts";
 import { parseJUnit } from "../src/gates/junit.ts";
+import { redactGateData } from "../src/gates/output.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
@@ -25,6 +27,7 @@ import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
+import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type GitHubClient, normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
@@ -33,6 +36,8 @@ import { markReport, reportStructure, reportText } from "../src/pipeline/report-
 import { createHttpRoutes } from "../src/server/http.ts";
 import * as proc from "../src/util/proc.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
+import { GateRunSchema } from "../src/workers/protocol.ts";
+import { validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
@@ -108,6 +113,7 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const q of queues) await q.stop().catch(() => undefined);
   queues.length = 0;
+  configureGitHubIdentity(null);
   gateSlots.setLimit(slots);
   observerRoots.clear();
   process.env.PATH = originalPath;
@@ -391,6 +397,7 @@ async function retryLandFixture(
   retryFiles: unknown = "base-retry {files}",
   checkName = "test",
   setup = "prepare",
+  command = "full-test",
 ) {
   writeFileSync(
     join(seed, retryFile),
@@ -400,7 +407,7 @@ async function retryLandFixture(
     join(seed, ".limitless.toml"),
     `[gates]
 setup = [${JSON.stringify(setup)}]
-checks = [{ name = ${JSON.stringify(checkName)}, run = "full-test", timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
+checks = [{ name = ${JSON.stringify(checkName)}, run = ${JSON.stringify(command)}, timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
 ${retryFiles === null ? "" : `retry_files = ${JSON.stringify(retryFiles)}`}
 `,
   );
@@ -757,6 +764,11 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
       reason: `test failed (${completed?.logPath})`,
     });
     expect(log).toContain("retry setup failed");
+    const diagnostic = `Land ${entry.id} test: no targeted retry: retry setup failed`;
+    expect(log).toContain(diagnostic);
+    expect(store.listEvents(pr.run.id)).toContainEqual(
+      expect.objectContaining({ type: "gate", message: diagnostic }),
+    );
     expect(log).not.toContain(`\n$ '${process.execPath}' test`);
     expect(ghCalls("pr merge")).toEqual([]);
   } else {
@@ -817,6 +829,7 @@ const ineligibleRetries: { label: string; result?: Partial<GateResult>; template
   { label: "no files", result: { failedFiles: undefined } },
   { label: "empty files", result: { failedFiles: [] } },
   { label: "null exit", result: { exitCode: null } },
+  { label: "missing exit", result: { exitCode: undefined } },
   { label: "zero exit", result: { exitCode: 0 } },
   { label: "timeout", result: { timedOut: true } },
   { label: "confinement", result: { confinementError: true } },
@@ -828,13 +841,25 @@ const ineligibleRetries: { label: string; result?: Partial<GateResult>; template
   { label: "malformed template", template: "base-retry" },
   { label: "duplicate placeholder", template: "base-retry {files} {files}" },
   { label: "invalid files", result: { failedFiles: ["../escape.ts"] } },
+  { label: "unmatched command", result: { command: "different-command" } },
 ];
 test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $label", async (row) => {
+  const credential = "synthetic-skip-diagnostic-secret";
+  const colored = "synthetic-skip-\u001b[31mdiagnostic-secret\u001b[0m";
+  registerCredential("SKIP_DIAGNOSTIC_SECRET", credential);
   const { pr, head } = await retryLandFixture(row.template);
   const fake = fakeLandGates((req) =>
     row.label === "setup"
       ? { setupOk: false, setup: [gateResult("setup", "prepare", testFailure)], checks: [] }
-      : retryRun(req, { test: { ...testFailure, ...row.result } }),
+      : retryRun(req, {
+          test: {
+            ...testFailure,
+            ...row.result,
+            ...(row.label === "incomplete evidence"
+              ? { failureAttributionReason: `1 unattributed error: ${colored}` }
+              : {}),
+          },
+        }),
   );
   const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
   await settle();
@@ -845,8 +870,109 @@ test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $
     reason: `${row.label === "setup" ? "setup" : "test"} failed (${blocked?.logPath})`,
   });
   expect(fake.requests).toHaveLength(1);
+  const expected =
+    row.label === "setup"
+      ? "setup failures are not retried"
+      : row.label.includes("evidence")
+        ? "failure attribution incomplete"
+        : row.label.includes("confinement")
+          ? "confinement failure"
+          : row.label.includes("template") || row.label === "duplicate placeholder"
+            ? "unusable retry_files configuration"
+            : row.label === "null exit" || row.label === "missing exit"
+              ? "missing exit status"
+              : row.label === "zero exit"
+                ? "no nonzero exit status"
+                : row.label === "timeout"
+                  ? "gate process timed out"
+                  : row.label === "invalid files"
+                    ? "invalid retry files"
+                    : row.label === "unmatched command"
+                      ? "check does not match base configuration"
+                      : "absent retry files";
+  const message = `Land ${entry.id} ${row.label === "setup" ? "setup" : "test"}: no targeted retry: ${expected}`;
+  expect(readFileSync(blocked?.logPath ?? "", "utf8")).toContain(message);
+  expect(store.listEvents(pr.run.id).some((e) => e.type === "gate" && e.message.includes(message))).toBe(
+    true,
+  );
+  if (row.label === "incomplete evidence") {
+    const diagnostics =
+      readFileSync(blocked?.logPath ?? "", "utf8") + JSON.stringify(store.listEvents(pr.run.id));
+    expect(diagnostics).toContain("1 unattributed error: [redacted]");
+    expect(diagnostics).not.toContain(credential);
+    expect(diagnostics).not.toContain("\\u001b");
+  }
   expect(await remoteHead("pr-1")).toBe(head);
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a completed attributed test timeout with a redacted command lands after one targeted retry", async () => {
+  const credential = "synthetic-land-command-secret";
+  registerCredential("LAND_COMMAND_SECRET", credential);
+  const command = `full-test # ${credential}`;
+  const { pr, head } = await retryLandFixture("base-retry {files}", "test", "prepare", command);
+  const realProcess = proc.runProcess;
+  const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+    if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+    opts.onStdoutLine?.(opts.cmd[4] ?? "");
+    const failed = opts.cmd.at(-1) === command;
+    const output = failed
+      ? "(fail) slow test [62000ms]\n  ^ this test timed out after 60000ms.\n0 pass\n1 fail\nRan 1 test across 1 file."
+      : "passed";
+    if (failed) {
+      const report = opts.env?.LIMITLESS_GATE_REPORT;
+      if (!report) throw new Error("Missing report path");
+      writeFileSync(
+        report,
+        `<testsuites tests="1" failures="1"><testsuite file="${retryFile}" time="62"><testcase><failure type="TimeoutError" message="test timed out"/></testcase></testsuite></testsuites>`,
+      );
+    }
+    for (const line of output.split("\n")) opts.onStdoutLine?.(line);
+    return {
+      exitCode: failed ? 1 : 0,
+      signal: null,
+      cancelled: false,
+      timedOut: false,
+      idleTimedOut: false,
+      truncated: false,
+      stdout: output,
+      stderr: "",
+      durationMs: failed ? 954000 : 1,
+    };
+  });
+  const fake = fakeLandGates(async (req, attempt, signal) => {
+    if (attempt > 1) return retryRun(req);
+    const run = GateRunSchema.parse(redactGateData(await runLocalGates(req.cwd, req.gates, signal)));
+    expect(validRun(req, run)).toBe(true);
+    expect(run.checks[0]).toMatchObject({
+      command: "full-test # [redacted]",
+      exitCode: 1,
+      failureAttributionComplete: true,
+      failedFileTimes: { [retryFile]: 62 },
+    });
+    return run;
+  });
+  try {
+    const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+    await settle();
+    const landed = store.getLandEntry(entry.id);
+    expect(landed).toMatchObject({
+      state: "landed",
+      reason: `flaky: test (${retryFile}); merged ${head.slice(0, 12)}`,
+    });
+    expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
+      [command, "full-other", "lint"],
+      [retryCommand],
+    ]);
+    expect(fake.requests[1]?.skipGateSlot).toBe(false);
+    const log = readFileSync(landed?.logPath ?? "", "utf8");
+    expect(log).toContain("this test timed out after 60000ms");
+    expect(log).toContain(`# targeted retry\n\n$ prepare\npassed\n\n$ ${retryCommand}`);
+    expect(log).not.toContain(credential);
+    expect(ghCalls("pr merge")).toHaveLength(1);
+  } finally {
+    processSpy.mockRestore();
+  }
 });
 
 test.each(["root error", "unhandled error"])(
@@ -857,10 +983,10 @@ test.each(["root error", "unhandled error"])(
       if (attempt > 1) return retryRun(req); // A passing partial retry must never authorize this land.
       const xml =
         kind === "root error"
-          ? '<testsuites errors="1"><testsuite file="README.md" failures="1" errors="0"/></testsuites>'
+          ? '<testsuites errors="1"><testsuite file="README.md" failures="1" errors="0"><testcase><failure/></testcase></testsuite></testsuites>'
           : '<testsuites failures="1"><testsuite file="README.md" failures="1"><testcase><failure/></testcase></testsuite></testsuites>';
       const evidence = new RunnerFailureEvidence();
-      const output = `${kind === "unhandled error" ? "# Unhandled error between tests\n" : ""}0 pass\n1 fail`;
+      const output = `${kind === "unhandled error" ? "# Unhandled error between tests\n1 error\n" : ""}${"noise\n".repeat(2000)}0 pass\n1 fail\nRan 1 test across 1 file.`;
       for (const line of output.split("\n")) evidence.observe(line);
       const junit = parseJUnit(xml, req.cwd);
       expect(junit?.failedFiles).toEqual(["README.md"]);
@@ -868,8 +994,10 @@ test.each(["root error", "unhandled error"])(
         test: {
           ...testFailure,
           ...junit,
-          output,
+          output: output.slice(-6000),
           failureAttributionComplete: evidence.agrees(junit?.attributedCounts),
+          failureAttributionReason:
+            evidence.reason(junit?.attributedCounts) ?? junit?.failureAttributionReason,
         },
       });
     });
@@ -882,6 +1010,13 @@ test.each(["root error", "unhandled error"])(
       pushedSha: null,
     });
     expect(fake.requests).toHaveLength(1);
+    const message = `Land ${entry.id} test: no targeted retry: failure attribution incomplete: 1 unattributed error`;
+    const log = readFileSync(blocked?.logPath ?? "", "utf8");
+    expect(log).not.toContain("1 error");
+    expect(log).toContain(message);
+    expect(store.listEvents(pr.run.id)).toContainEqual(
+      expect.objectContaining({ type: "gate", level: "warn", message }),
+    );
     expect(await remoteHead("pr-1")).toBe(head);
     expect(ghCalls("pr merge")).toEqual([]);
   },
@@ -957,7 +1092,9 @@ test.each(["stop", "cancel"])("a %s during a targeted retry cannot authorize lan
     }
     expect(await remoteHead("pr-1")).toBe(head);
     expect(ghCalls("pr merge")).toEqual([]);
-    expect(store.listEvents(pr.run.id).filter((e) => e.level === "warn")).toEqual([]);
+    expect(store.listEvents(pr.run.id).filter((e) => e.level === "warn")).toMatchObject(
+      action === "stop" ? [{ message: `Land ${entry.id} test: no targeted retry: absent retry files` }] : [],
+    );
   } finally {
     response.resolve({ setupOk: true, setup: [], checks: [] });
     await q.stop();
@@ -1128,7 +1265,9 @@ test.each([
     const round = roundRun(pr.run.id, url(1), head);
     const repo = store.getRepo(pr.run.repoId);
     if (!repo) throw new Error("missing repository");
-    const other = store.createRun(repo, { repo: SLUG, prompt: "other request\nCloses #42" });
+    // Persist an overlapping claim as an older release could, before transactional claiming.
+    const other = store.createRun(repo, { repo: SLUG, prompt: "other request" });
+    store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("other request\nCloses #42", other.id);
     const finishedAt = 123;
     store.updateRun(other.id, { status: "needs_human", prUrl: url(2) });
     const second = roundRun(pr.run.id, url(1), head);
@@ -5231,4 +5370,45 @@ test("an old watcher cannot release a new wait with the same wall-clock marker",
   reviewObservation(head);
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+});
+
+test("App approvals use the cached bot login, count the owner and reject the factory", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const key = join(root, "app.pem");
+  writeFileSync(key, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  const requests: string[] = [];
+  configureGitHubIdentity(
+    { appId: 123, installationId: 456, privateKeyPath: key, repos: [SLUG] },
+    {
+      fetch: async (url) => {
+        requests.push(url);
+        if (url.endsWith("/app")) return Response.json({ slug: "factory" });
+        if (url.endsWith("/access_tokens"))
+          return Response.json({
+            token: "test-installation-token",
+            expires_at: new Date(Date.now() + 3600_000).toISOString(),
+          });
+        throw new Error(`Unexpected App request ${url}`);
+      },
+    },
+  );
+  github.responses.set("user", () => respond(200, { login: "owner" }));
+  const head = await pushBranch("one", "one.txt", "one\n");
+  const pr = delivered(1, "one");
+  approve(1, head);
+  reviewObservation(head, "APPROVED", "owner");
+  const q = queue({ requiresApproval: approvalPolicy() });
+  const entry = await q.request({ target: pr.run.id });
+  await waitFor(() => ["landed", "waiting_approval"].includes(store.getLandEntry(entry.id)?.state ?? ""));
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  await q.stop();
+  const nextHead = await pushBranch("two", "two.txt", "two\n", 2);
+  const next = delivered(2, "two");
+  approve(2, nextHead);
+  reviewObservation(nextHead, "APPROVED", "factory[bot]", nextHead, 2);
+  const waiting = await queue({ requiresApproval: approvalPolicy() }).request({ target: next.run.id });
+  await waitFor(() => store.getLandEntry(waiting.id)?.state === "waiting_approval");
+  expect(github.calls.filter((c) => c.path === "user")).toEqual([]);
+  expect(requests.filter((url) => url.endsWith("/app"))).toHaveLength(1);
+  expect(requests.filter((url) => url.endsWith("/access_tokens"))).toHaveLength(1);
 });

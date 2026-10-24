@@ -202,12 +202,17 @@ discovers an owner.
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
 | `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
+| `[github.queue] repos` | `[]` (queue disabled) | Poll approved issues in these owner/name repositories. Enable only after Q0's token isolation probe; see [issue contract](ISSUES.md). Restart required for queue settings. |
+| `[github.queue] trusted` | Configured GitHub owner, or `[]` | Logins trusted to author, edit and approve queued issues; case-insensitive. Empty disables polling. |
+| `[github.queue] max_issue_runs` | `1` | Positive integer cap on active issue-sourced runs; priority 0 may exceed it by one, within the overall run limit. |
+| `[github.queue] poll_seconds` | `180` | Positive polling interval, minimum 15 seconds; low GraphQL budget defers until reset. |
 | `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
 | `[github] merge` | `"auto"` when absent; init chooses `"pr"` | Default for newly registered GitHub repos: `"auto"`, `"pr"`, or `"none"`. Existing repo rows stay unchanged; repository `.limitless.toml` policy still wins. |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
+| `[executor] enabled` | `false` | Opt run gates with `[gates] executor = "local"` into the foreground `limitless executor` process when it is alive on the same release. Requires a daemon restart; older releases ignore this key. Land checks remain in the daemon. An unacknowledged stop after an executor crash currently requires process recovery before another gate can start. |
 | `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
@@ -217,7 +222,7 @@ discovers an owner.
 | `[workers] repos` | `[]` | Repositories allowed to send gate code and agent sessions to paired workers, for example `["owner/name"]`. Gates also require `[gates] executor = "lan"`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
-| `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
+| `[sandbox] deny_read` | `[]` | Additional credential paths denied to tool-enabled readers, editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`, plus `Library/Keychains` on macOS (Claude editors have the outer-profile exception below). |
 | `[sandbox] toolchain_paths` | `[]` | Additional gate-readable toolchain roots, from this factory configuration only. Only build subpaths of the Bun, Cargo and Rustup homes are included by default (using the factory's `BUN_INSTALL`, `CARGO_HOME` and `RUSTUP_HOME` when set); Cargo registry credentials stay denied. A root overlapping a denied credential path prevents launch. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] avoid_implementer_vendor` | `true` | `false` lets production single reviews follow the review routing chain regardless of the implementer's vendor. Panel finders, shadows, verification, verify-change and follow-up re-checks keep their vendor rules. Older releases refuse to start with this key set because `[review]` keys are validated strictly; remove it before rolling back past this release. |
@@ -234,14 +239,19 @@ Unknown repository settings are ignored with a warning naming the repository and
 Gates deny home reads except their checkout, scratch, recorded Git directories and approved
 toolchains; system paths remain readable. Exact ancestor manifest names and `node_modules`
 metadata remain readable for toolchain discovery, without directory listing access. Each factory
-retains its frozen configuration and credential-location environment snapshot. Editors and gates
-also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`,
+retains its frozen configuration and credential-location environment snapshot. Tool-enabled readers,
+editors and gates also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`,
 `LIMITLESS_CONFIG_DIR`, the AWS credential/config variables, `DOCKER_CONFIG`, `GNUPGHOME`,
-`KUBECONFIG`, `NETRC`, npm userconfig variables and Cargo's credential files. Editors deny the
-credential stores above, but Claude's
-own CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
-macOS Keychain access through `security`, network egress and the loopback API (#484) remain separate
-gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
+`KUBECONFIG`, `NETRC`, npm userconfig variables and Cargo's credential files. Readers retain broad
+reads outside the credential stores above unless explicitly confined.
+Codex verifies readers’ effective denies before launch and refuses unverified profiles. Claude's
+own file-backed CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
+On macOS, `~/Library/Keychains` is denied. Claude editors exempt keychain paths only in the outer
+profile so `security` can read their login; native Read, Grep and Glob tools still deny both path
+spellings. Overlapping credential or explicit denies take precedence over that exemption.
+The follow-up to #834 will supply that login from the daemon before denying outer-profile Keychain access.
+Network egress and the loopback API (#484) remain separate gaps. Older releases ignore these optional
+sandbox settings and do not enforce these read rules.
 
 To pair a macOS worker, run `limitless worker pair --coordinator https://<host>:7443`
 on that machine, then compare all 16 characters of its printed code with `limitless workers ls`
@@ -343,6 +353,13 @@ agent tests. Flags such as `--coverage` alone still count as full suites. Small 
 never wait behind a full suite. Health reports this lane as `agentTestSlots` next to
 `gateSlots`; timeline events carry `kind: "agent-test"`, command, lane and queued wait ms.
 Gates, baselines, land checks and deploys keep their existing leases and PATH.
+
+`[limits] agent_full_suite` defaults to `"slot"`; `"refuse"` refuses implementers' full-suite
+requests. With `"gate"`, local implementers request the trusted `test` gate on a private snapshot
+instead. Its output returns to the session, and the round's gates reuse that factory execution
+only for the exact same tree, gate configuration and environment. Other checks still run.
+Without a local gate executor or a `test` check, requests are refused; worker implementers
+also use `"refuse"`. Reader roles keep normal slotting.
 
 Wrappers use loopback HTTP, with a scratch Unix socket fallback, without expanding
 sandbox permissions. Each invocation's wrappers and lease capability live in a private
@@ -492,6 +509,38 @@ replies with a proposal ID; mention it again with `confirm <id>`, or with `edit 
 change the proposal. Quota alerts are posted to the channel.
 
 ### GitHub
+
+By default, factory GitHub API calls use the owner's `gh` login. To give selected repositories
+an independent factory identity, create and install a GitHub App on those repositories. Give it
+repository permissions: **actions, contents, issues, pull requests and workflows read/write**;
+**checks, statuses and metadata read**. Disable its webhook; the App needs no webhook. The
+existing repository webhook below continues to handle triggers.
+
+Save the App's private key in the config directory and run `chmod 0600` on the key file. Configure
+its App ID, installation ID, key file path and repository list in `config.toml`:
+
+```toml
+[github.app]
+app_id = 123456
+installation_id = 789012
+private_key_path = "github-app.pem" # relative to the config directory, or an absolute file path
+repos = ["<owner>/<repo>"]
+```
+
+All four keys are required when the table is present. The key must be a readable regular file
+with no group or other permissions (0600, or owner-read-only 0400); startup refuses other modes.
+The key comes only from that file, never from an environment variable. Repositories are matched
+case-insensitively. Startup refuses a listed repository with discreet mode enabled, because the
+App's `[bot]` author is a factory mark.
+
+For listed repositories, PRs, comments, issues and merges appear as `<slug>[bot]`. The owner's own
+approval can then satisfy the other-reviewer approval gate. Every other repository continues to
+use the owner's login. An App authentication failure stops the GitHub call; it never switches to
+the owner. Pushes and fetches stay over SSH. `limitless doctor` reports the App slug, the
+installation's repositories and whether token exchange works, and fails for any configured
+repository the installation does not cover. Tokens stay in memory and are withheld from agents
+and gates. These settings require a daemon restart when changed. Older releases ignore these
+keys because the `[github]` table isn't checked for unknown keys.
 
 Create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
 `application/json` and the `GITHUB_WEBHOOK_SECRET`, and select the **Issues**, **Issue comments**

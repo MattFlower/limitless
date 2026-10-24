@@ -18,16 +18,22 @@ import { dirname, join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
-import { ConfinementError, READ_PROBE, resolvedHome } from "./read-policy.ts";
+import {
+  ConfinementError,
+  homeReadPolicy,
+  policySpellings,
+  READ_PROBE,
+  resolvedHome,
+} from "./read-policy.ts";
 import {
   agentShellEnv,
   createScratch,
   type InvocationCommands,
   invocationCommands,
+  privateReadRoots,
   readConfinement,
   scratchEnv,
   scratchParent,
-  spellings,
   validateDenyRead,
   validateScratch,
   writeRoots,
@@ -259,16 +265,17 @@ function findKey(obj: unknown, key: string): unknown {
 function readerFilesystem(spec: AgentSpec, scratch: string, executable?: string): string {
   const entries: [string, string][] = [];
   const commands = invocationCommands(scratch, spec.cwd);
+  const credentials = homeReadPolicy([spec.cwd, scratch], false, validateDenyRead(spec, scratch)).denyRead;
   let denied: string[];
   if (spec.confineReads) {
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
-    denied = deny;
+    denied = [...new Set([...deny, ...credentials])];
     entries.push([":minimal", "read"]);
-    for (const path of deny) entries.push([path, "none"]);
+    for (const path of denied) entries.push([path, "none"]);
     for (const path of cwd) entries.push([path, "read"]);
     for (const path of writable) entries.push([path, "write"]);
   } else {
-    denied = validateDenyRead(spec, scratch);
+    denied = credentials;
     entries.push(["/", "read"]);
     for (const path of denied) entries.push([path, "none"]);
     entries.push(...commandEntries(commands));
@@ -468,8 +475,8 @@ function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T |
 
 /**
  * Older Codex CLIs accept the reader profile but don't fully enforce it (0.154.0 denies home and TMPDIR
- * yet allows /tmp), so before confined runs on a CLI path and version, `codex sandbox` with
- * the production profile must read a canary in its cwd and be denied one in every private root.
+ * yet allows /tmp), so before tool-enabled runs on a CLI path and version, `codex sandbox` with
+ * the production profile must prove allowed access and applicable private-root and credential denies.
  * Only definitive verdicts are cached; anything else fails closed and is retried after a backoff.
  */
 export class CodexReaderProbe {
@@ -514,7 +521,7 @@ export class CodexReaderProbe {
     run: typeof runProcess,
     deny: string[] = spec.mode === "edit"
       ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
-      : spellings(spec.denyRead ?? []),
+      : homeReadPolicy([spec.cwd, validateScratch(spec)], false, spec.denyRead).denyRead,
   ): Promise<ConfinementProbe> {
     let path: string | null;
     try {
@@ -528,7 +535,7 @@ export class CodexReaderProbe {
     if (spec.signal.aborted) return unverified;
     if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
     // The list is encoded separately so a denied path can never stand in for the CLI path or version.
-    const key = `${spec.mode}\0${path}\0${lookup.version}\0${JSON.stringify([...deny, ...privateReadPaths()].sort())}`;
+    const key = `${spec.mode}\0${!!spec.confineReads}\0${path}\0${lookup.version}\0${JSON.stringify([...deny, ...privateReadPaths()].sort())}`;
     for (;;) {
       const verdict = this.verdicts.get(key);
       if (verdict) return verdict;
@@ -655,16 +662,25 @@ async function sandboxProbe(
     const probeCwd = temp(tmp, "limitless-probe-");
     const scratchDir = createScratch(probeCwd);
     owned.push(scratchParent(scratchDir));
-    spec = editing
-      ? { ...template, cwd: probeCwd, scratchDir, confineReads: false }
-      : { ...template, cwd: probeCwd, scratchDir, confineReads: true };
+    spec = { ...template, cwd: probeCwd, scratchDir };
     const scratch = validateScratch(spec);
     // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
     codexHome = temp(tmp, "limitless-probe-home-");
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
-    negatives = roots(deny.filter((p) => !privateReadPaths().includes(p))).map((root) =>
-      canary(temp(root, "limitless-canary-")),
-    );
+    const credentials = homeReadPolicy([]).denyRead;
+    const credentialRoot = (p: string) => credentials.some((c) => p === c || p.startsWith(`${c}/`));
+    negatives =
+      editing || spec.confineReads
+        ? roots(deny.filter((p) => !credentialRoot(p))).map((root) => {
+            if (credentialRoot(realpathSync(root))) throw new Error("unsafe canary location");
+            return canary(temp(root, "limitless-canary-"));
+          })
+        : [canary(temp(tmp, "limitless-canary-"))];
+    if (!editing && !spec.confineReads)
+      spec = {
+        ...spec,
+        denyRead: [...(spec.denyRead ?? []), ...negatives.map((file) => dirname(file.path))],
+      };
     const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
     if (!negatives.length || negatives.some((file) => granted(file.path))) return result(INCONCLUSIVE, null);
     if (editing) {
@@ -704,9 +720,18 @@ async function sandboxProbe(
     });
   let last: number | null = null;
   const probeReads = async () => {
+    // Confined readers already probe private roots; their grants cannot overlap credential stores.
+    const covered = template.confineReads ? privateReadRoots() : [];
     const deniedFiles = editing
       ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
-      : privateReadPaths();
+      : [
+          ...new Set([
+            ...privateReadPaths(),
+            ...(template.denyRead ?? []).filter(
+              (p) => !covered.some((root) => p === root || p.startsWith(`${root}/`)),
+            ),
+          ]),
+        ];
     for (const file of deniedFiles.filter(existsSync)) {
       const proc = await run({
         cmd: [path, "sandbox", ...profile, "--", "/bin/sh", "-c", READ_PROBE, "sh", file],
@@ -850,16 +875,16 @@ export async function runCodex(
   spec = protectCredentials(spec);
   const t = spec.target;
   const editing = spec.mode === "edit" && !spec.noTools;
-  const confined = editing || (spec.confineReads && spec.mode === "readonly" && !spec.noTools);
+  const needsProbe = !spec.noTools;
   // One snapshot of the denied paths keys the verdict, drives the probe and builds the exec
   // profile; resolving it again is a no-op unless a symlink was retargeted meanwhile.
   const deny = editing
     ? (writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead).denyRead ?? [])
-    : confined
-      ? spellings(spec.denyRead ?? [])
+    : needsProbe
+      ? homeReadPolicy([spec.cwd, validateScratch(spec)], false, spec.denyRead).denyRead
       : [];
   let confinement: ConfinementProbe | undefined;
-  if (confined) {
+  if (needsProbe) {
     confinement = await readerProbe.verify(spec, processRunner, deny);
     if (spec.signal.aborted)
       return {
@@ -875,7 +900,7 @@ export async function runCodex(
         quota: null,
       };
     // The profile would now deny paths the verdict never covered: fail closed, nothing is cached.
-    const moved = spellings(deny).length !== deny.length;
+    const moved = policySpellings(deny, true).length !== deny.length;
     if (moved) confinement = { ...confinement, ok: false, reason: INCONCLUSIVE, exitCode: null };
     if (!confinement.ok || !confinement.path) {
       const exit = confinement.exitCode === null ? "" : `, exit ${confinement.exitCode}`;
@@ -904,7 +929,7 @@ export async function runCodex(
     try {
       executable = readerProbe.resolve();
     } catch {}
-  const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec, executable);
+  const args = buildCodexArgs(needsProbe ? { ...spec, denyRead: deny } : spec, executable);
   if (executable) args[0] = executable;
   const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
 

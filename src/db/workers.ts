@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import type { Role } from "../core/types.ts";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
@@ -6,7 +7,14 @@ import type { GateRun } from "../gates/run.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
-import { redactCredentialData, registerCredential } from "../util/proc.ts";
+import {
+  ProcessTerminationError,
+  processBirthSync,
+  processScope,
+  recoverProcessCleanups,
+  redactCredentialData,
+  registerCredential,
+} from "../util/proc.ts";
 import {
   AgentCapabilities,
   type Capabilities,
@@ -21,6 +29,13 @@ import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
 export class PairingLimitError extends Error {}
+export function canonicalGateCwd(cwd: string): string {
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return cwd;
+  }
+}
 export interface WorkerRun {
   runId: string;
   title: string;
@@ -43,6 +58,8 @@ export interface WorkerRow {
   setup_warning: string | null;
 }
 export interface JobRow {
+  in_place: number;
+  stopped: number;
   id: string;
   run_id: string | null;
   request: string;
@@ -84,7 +101,7 @@ export interface AgentJobRequest
   role?: Role;
   branch?: string;
   slottedCommands?: SlottedCommands;
-  agentFullSuite?: AgentFullSuite;
+  agentFullSuite?: Exclude<AgentFullSuite, "gate">;
   commit?: {
     message: string;
     authorName: string;
@@ -98,7 +115,8 @@ export interface AgentJobRequest
   discreet?: boolean;
   uiUrl?: string;
 }
-export interface AgentJobRow extends Omit<JobRow, "setup_fallback" | "setup_order" | "events"> {
+export interface AgentJobRow
+  extends Omit<JobRow, "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped"> {
   invocation_id: number;
   parent_sha: string;
   result_sha: string | null;
@@ -307,15 +325,14 @@ export class WorkerStore {
   job(id: string) {
     return this.store.db.query<JobRow, [string]>("SELECT * FROM gate_jobs WHERE id=?").get(id);
   }
-  enqueue(req: GateRequest) {
-    const id = randomUUID(),
-      now = this.now();
+  enqueue(req: GateRequest, id: string = randomUUID(), inplace = false) {
+    const now = this.now();
     this.store.db
       .query(
-        "INSERT INTO gate_jobs (id,run_id,request,state,created_at,updated_at) VALUES (?,?,?,'queued',?,?)",
+        "INSERT INTO gate_jobs (id,run_id,request,state,created_at,updated_at,in_place) VALUES (?,?,?,'queued',?,?,?)",
       )
-      .run(id, req.runId ?? null, JSON.stringify(req), now, now);
-    this.keepLocal(this.job(id));
+      .run(id, req.runId ?? null, JSON.stringify(req), now, now, Number(inplace));
+    if (!inplace) this.keepLocal(this.job(id));
     return id;
   }
   lease(name: string, sweep = true) {
@@ -326,7 +343,7 @@ export class WorkerStore {
       const c: Capabilities = JSON.parse(w.capabilities ?? "{}");
       const unreported = this.jobs("state='leased' AND worker=?", name).filter((j) => !c.jobs.includes(j.id));
       if (unreported.length >= c.freeSlots) return null;
-      const j = this.jobs("state='queued'").find(
+      const j = this.jobs("state='queued' AND in_place=0").find(
         (job) => !(JSON.parse(job.excluded) as string[]).includes(name),
       );
       if (!j) return null;
@@ -340,6 +357,71 @@ export class WorkerStore {
         this.store.db.query("UPDATE workers SET setup_order=setup_order+1 WHERE name=?").run(name);
       return changed.changes === 1 ? this.job(j.id) : null;
     })();
+  }
+  executor(id?: string, sameRelease = true) {
+    if (sameRelease && !this.releaseSha) return undefined;
+    return this.store.db
+      .query<{ id: string; pid: number; birth: string; release_sha: string }, []>("SELECT * FROM executors")
+      .all()
+      .find((e) => {
+        if ((id && e.id !== id) || (sameRelease && e.release_sha !== this.releaseSha)) return false;
+        try {
+          return processBirthSync(e.pid) === e.birth;
+        } catch {
+          return false;
+        }
+      });
+  }
+  async waitStopped(id: string, signal?: AbortSignal) {
+    const unconfirmed = () => {
+      const error = new ProcessTerminationError(
+        `${ProcessTerminationError.prefix}: in-place job ${id}; process recovery required`,
+      );
+      const scope = processScope.getStore();
+      if (scope) scope.terminationError = error;
+      throw error;
+    };
+    while (this.job(id)?.stopped === 0) {
+      signal?.throwIfAborted();
+      const job = this.job(id);
+      const worker = job?.worker;
+      if (!worker || !this.executor(worker, false)) {
+        if (!job) return;
+        const cwd = canonicalGateCwd((JSON.parse(job.request) as GateRequest).cwd);
+        const records = () => [
+          ...this.store.listProcessDiscoveries(undefined, cwd),
+          ...this.store.listProcessCleanups(undefined, cwd),
+        ];
+        await recoverProcessCleanups(this.store, records());
+        if (records().length) unconfirmed();
+        this.store.db
+          .query("UPDATE gate_jobs SET stopped=1 WHERE id=? AND worker IS ? AND stopped=0")
+          .run(id, worker ?? null);
+        continue;
+      }
+      if (this.now() >= (job?.lease_expires_at ?? job?.updated_at ?? 0) + 2 * this.times.lease) unconfirmed();
+      await Bun.sleep(this.times.tick);
+    }
+  }
+  leaseInplace(owner: string) {
+    if (this.store.getSetting("executor.daemonRelease", "") !== this.releaseSha || !this.executor(owner))
+      return null;
+    const j = this.jobs("state='queued' AND in_place=1").find(
+      (j) => (JSON.parse(j.request) as GateRequest).releaseSha === this.releaseSha,
+    );
+    if (!j) return null; // Idle polling must not open a write transaction.
+    return this.store.db
+      .transaction(() => {
+        if (this.store.getSetting("executor.daemonRelease", "") !== this.releaseSha) return null;
+        const deadline = this.now() + attemptBudget(JSON.parse(j.request));
+        const changed = this.store.db
+          .query(
+            "UPDATE gate_jobs SET state='leased',worker=?,stopped=0,lease_expires_at=?,attempt_deadline_at=?,updated_at=? WHERE id=? AND state='queued'",
+          )
+          .run(owner, this.now() + this.times.lease, deadline, this.now(), j.id);
+        return changed.changes === 1 ? this.job(j.id) : null;
+      })
+      .immediate();
   }
   agentJob(id: string) {
     return this.store.db.query<AgentJobRow, [string]>("SELECT * FROM agent_jobs WHERE id=?").get(id);
@@ -525,7 +607,7 @@ export class WorkerStore {
     return ids.filter((id) => !owned.has(id));
   }
   private keepLocal(j: JobRow | null) {
-    if (j?.state !== "queued" || !credentialBearing(JSON.parse(j.request))) return false;
+    if (j?.state !== "queued" || j.in_place || !credentialBearing(JSON.parse(j.request))) return false;
     this.event(j.id, {
       type: "status",
       text: "LAN gates executing locally: executable inputs contain a registered credential",
@@ -560,6 +642,15 @@ export class WorkerStore {
     const j = this.job(id);
     if (!j || !["queued", "leased"].includes(j.state)) return;
     reason = this.sanitize(reason);
+    if (j.in_place) {
+      this.event(id, { type: "status", text: `In-place executor failure: ${reason}` });
+      this.store.db
+        .query(
+          "UPDATE gate_jobs SET state='failed',failure_reason=?,updated_at=? WHERE id=? AND state IN ('queued','leased')",
+        )
+        .run(reason, this.now(), id);
+      return;
+    }
     this.event(id, { type: "status", text: `LAN infrastructure failure: ${reason}` });
     const excluded: string[] = JSON.parse(j.excluded);
     if (j.worker) excluded.push(j.worker);
@@ -592,6 +683,14 @@ export class WorkerStore {
               "UPDATE gate_jobs SET attempt_deadline_at=?,lease_expires_at=min(lease_expires_at,?) WHERE id=?",
             )
             .run(deadline, deadline, j.id);
+        if (j.in_place) {
+          if (!j.worker || !this.executor(j.worker))
+            this.fail(j.id, "Executor unavailable or release changed");
+          else if (deadline <= now) this.fail(j.id, "Attempt deadline expired");
+          else if (Math.max(j.lease_expires_at ?? 0, resumedAt + this.times.lease) <= now)
+            this.fail(j.id, "Lease expired");
+          continue;
+        }
         const w = j.worker ? this.worker(j.worker) : null;
         if (w?.state !== "approved") this.fail(j.id, "Worker disconnected or revoked");
         else if (deadline <= now) this.fail(j.id, "Attempt deadline expired");
@@ -636,7 +735,7 @@ export class WorkerStore {
           )
           .run(JSON.stringify(this.sanitize(run)), local, this.now(), id, local ? "failed" : "leased")
           .changes === 1;
-      if (changed && j?.worker && run.setupOk && (!local || j.setup_fallback)) {
+      if (changed && !j?.in_place && j?.worker && run.setupOk && (!local || j.setup_fallback)) {
         // Retain the order after recovery too: an older pending fallback must not re-flag it.
         this.store.db
           .query(

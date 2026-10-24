@@ -44,6 +44,7 @@ import {
   rebaseOnto,
   removeWorktree,
   resetTo,
+  snapshotTree,
   squashTitle,
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
@@ -1155,7 +1156,13 @@ test("rebuilding a linked worktree index defeats forged stat data, skip-worktree
   expect((await git(work, "status", "--porcelain")).stdout).toBe("");
   expect((await git(work, "show", ":sample.test.ts")).stdout).toBe(original);
   const seedIndex = readFileSync(join(seed, ".git/index"));
+  const sessionIndex = readFileSync(indexPath);
+  const sessionHead = await headSha(work);
+  const snapshot = await snapshotTree(work);
+  expect(await headSha(work)).toBe(sessionHead);
+  expect(readFileSync(indexPath)).toEqual(sessionIndex);
   expect(await commitAll(work, "factory rebuild")).not.toBeNull();
+  expect((await git(work, "rev-parse", "HEAD^{tree}")).stdout.trim()).toBe(snapshot);
   expect(readFileSync(join(seed, ".git/index"))).toEqual(seedIndex);
   await audited(["sample.test.ts", "flag.test.ts", "assume.test.ts"]);
   expect(await commitAll(work, "no changes")).toBeNull();

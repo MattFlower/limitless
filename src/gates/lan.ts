@@ -1,17 +1,21 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { WorkerStore } from "../db/workers.ts";
+import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { canonicalGateCwd, type WorkerStore } from "../db/workers.ts";
+import { checkoutCommitted } from "../git/repos.ts";
 import {
   type Execution,
   type ExecutionEvent,
   type GateExecutor,
   type GateRequest,
+  gateProvenance,
   gateShutdown,
   localExecutor,
 } from "./executor.ts";
 import type { GateRun } from "./run.ts";
 import { bindGateSlotScope, releaseGateSlotScope } from "./slots.ts";
 
-export function lanExecutor(workers: WorkerStore, repos: readonly string[]): GateExecutor {
+export function lanExecutor(workers: WorkerStore, repos: readonly string[], inplace = false): GateExecutor {
   const local = localExecutor();
   const live = new Map<string, Execution<GateRun>>();
   const starts = new Map<
@@ -19,24 +23,64 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
     { signal: AbortSignal; context: ReturnType<typeof AsyncLocalStorage.snapshot> }
   >();
   return {
-    kind: "lan",
-    freshCheckoutFor: (repo) => repos.includes(repo),
-    discard(handle) {
+    kind: inplace ? "inplace" : "lan",
+    canResume: inplace
+      ? (h, env, daemonPort) => {
+          const j = workers.job(h.id);
+          const req = j ? (JSON.parse(j.request) as GateRequest) : undefined;
+          return (
+            !!j?.in_place &&
+            !!workers.releaseSha &&
+            req?.releaseSha === workers.releaseSha &&
+            (!env || isDeepStrictEqual(req?.env, env)) &&
+            (daemonPort === undefined || req?.daemonPort === daemonPort) &&
+            (j.state === "done" ||
+              (j.state === "queued"
+                ? !!workers.executor()
+                : j.state === "leased" &&
+                  !!j.worker &&
+                  !!workers.executor(j.worker) &&
+                  (j.lease_expires_at ?? 0) > workers.now()))
+          );
+        }
+      : undefined,
+    freshCheckoutFor: (repo) => !inplace && repos.includes(repo),
+    async discard(handle) {
       workers.cancel(handle.id);
-      void live.get(handle.id)?.cancel();
+      await live.get(handle.id)?.cancel();
       starts.delete(handle.id);
+      if (inplace) await workers.waitStopped(handle.id);
     },
     async start(req, signal) {
       signal.throwIfAborted();
-      if (!repos.includes(req.repo)) return local.start(req, signal);
+      if (inplace) {
+        const cwd = canonicalGateCwd(req.cwd);
+        for (const j of workers.jobs("in_place=1 AND (state IN ('queued','leased') OR stopped=0)")) {
+          if (canonicalGateCwd((JSON.parse(j.request) as GateRequest).cwd) !== cwd) continue;
+          workers.cancel(j.id);
+          await workers.waitStopped(j.id, signal);
+        }
+        if (!workers.executor()) {
+          if (req.runId)
+            workers.store.addEvent({
+              runId: req.runId,
+              type: "gate",
+              level: "warn",
+              message: "In-place executor unavailable on this release; running gates in-process",
+            });
+          return local.start(req, signal);
+        }
+      } else if (!repos.includes(req.repo)) return local.start(req, signal);
       await releaseGateSlotScope();
       signal.throwIfAborted();
-      const id = workers.enqueue(req);
+      const id = inplace ? randomUUID() : workers.enqueue({ ...req, env: undefined });
       starts.set(id, { signal, context: AsyncLocalStorage.snapshot() });
-      return { kind: "lan", id, startedAt: workers.now() };
+      return { kind: inplace ? "inplace" : "lan", id, startedAt: workers.now() };
     },
     attach(handle, signal, req, hooks) {
       if (handle.kind === "local") return local.attach(handle, signal, req, hooks);
+      if (inplace && starts.has(handle.id) && req && !workers.job(handle.id))
+        workers.enqueue(req, handle.id, true);
       const initial = workers.job(handle.id);
       if (!initial) throw new Error("Unknown LAN gate job");
       const released =
@@ -60,8 +104,9 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
       const cancel = async (reason = signal.reason) => {
         if (!gateShutdown(AbortSignal.abort(reason))) workers.cancel(handle.id);
         controller.abort();
+        if (inplace && !gateShutdown(AbortSignal.abort(reason))) await workers.waitStopped(handle.id);
       };
-      const abort = () => void cancel();
+      const abort = () => void cancel().catch(() => {});
       signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted) abort();
       const result = (async (): Promise<GateRun> => {
@@ -79,12 +124,22 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
           if (job.state === "done" && job.result) {
             const run = JSON.parse(job.result) as GateRun;
             const failed = run.setup.find((r) => !r.ok);
-            if (!run.setupOk && failed && workers.fallbackSetup(handle.id, failed.command)) continue;
+            if (!inplace && !run.setupOk && failed && workers.fallbackSetup(handle.id, failed.command))
+              continue;
+            if (inplace && run.setupOk) hooks?.onLocalSetup?.();
             return run;
           }
           if (job.state === "failed") {
+            if (inplace) await workers.waitStopped(handle.id, controller.signal);
             const request = JSON.parse(job.request) as GateRequest;
-            workers.event(handle.id, { type: "status", text: "LAN gates falling back to local execution" });
+            if (inplace) {
+              await checkoutCommitted(request.cwd, undefined, Boolean(request.implementerIssue));
+              request.gates = { ...request.gates, setup: request.fallbackSetup ?? request.gates.setup };
+            }
+            workers.event(handle.id, {
+              type: "status",
+              text: `${inplace ? "In-place" : "LAN"} gates falling back to local execution`,
+            });
             const fallback = bindGateSlotScope(async () => {
               const h = await local.start(request, controller.signal);
               const execution = local.attach(h, controller.signal, undefined, hooks);
@@ -96,6 +151,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[]): Gat
                 }
               })();
               const [run] = await Promise.all([execution.result, stream]);
+              Object.assign(run, await gateProvenance(request.cwd, controller.signal));
               controller.signal.throwIfAborted();
               if (!workers.complete(handle.id, run, true)) throw new Error("LAN gate job cancelled");
               return workers.sanitize(run);

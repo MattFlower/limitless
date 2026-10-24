@@ -20,6 +20,7 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  reused?: { executionId: string; treeHash: string; createdAt: number };
   name: string;
   command: string;
   ok: boolean;
@@ -37,6 +38,8 @@ export interface GateResult {
   failedFileTimes?: FailedTestFiles["failedFileTimes"];
   /** Affirmative whole-stream and JUnit evidence, required only for targeted-only retries. */
   failureAttributionComplete?: boolean;
+  /** Whole-stream/report diagnostic, independent of the retained output tail. */
+  failureAttributionReason?: string;
   targetedRetry?: GateResult;
   docsOnly?: DocsSelection;
 }
@@ -44,6 +47,8 @@ export interface GateResult {
 export interface GateRun {
   /** Actual baseline checkout commit; absent in legacy records. */
   sha?: string;
+  /** Post-execution committed tree, reported with sha by LAN execution or its local fallback. */
+  treeHash?: string;
   setupOk: boolean;
   setup: GateResult[];
   checks: GateResult[];
@@ -74,10 +79,13 @@ export interface GateComparison {
 }
 
 export interface GateHooks {
+  env?: Record<string, string>;
   priority?: GatePriority;
   holder?: string;
   /** Only bounded targeted retries may bypass the full-suite queue. */
   skipGateSlot?: boolean;
+  /** Recreate prerequisites if an in-place retry falls back after cleaning its worktree. */
+  fallbackSetup?: string[];
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
   /** Evidence from this process, never from a remote result or cache. */
   onLocalSetup?: () => void;
@@ -102,7 +110,12 @@ export const gateEnv = (): Record<string, string> =>
   });
 
 /** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
-async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
+async function runOne(
+  cmd: GateCommand,
+  cwd: string,
+  signal: AbortSignal,
+  env = gateEnv(),
+): Promise<GateResult> {
   const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
@@ -119,7 +132,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const res = await runConfined({
     command: cmd.run,
     cwd,
-    env: { ...gateEnv(), LIMITLESS_GATE_REPORT: report },
+    env: { ...env, LIMITLESS_GATE_REPORT: report },
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
     redactOutput: true,
@@ -134,7 +147,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
-  const { attributedCounts, ...failedFiles } = readJUnit(report, cwd) ?? {};
+  const { attributedCounts, failureAttributionReason, ...failedFiles } = readJUnit(report, cwd) ?? {};
   return {
     name: cmd.name,
     command: cmd.run,
@@ -144,6 +157,12 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
     ...failedFiles,
     failureAttributionComplete: evidence.agrees(attributedCounts),
+    failureAttributionReason:
+      redactGateOutput(
+        [...new Set([failureAttributionReason, evidence.reason(attributedCounts)].filter(Boolean))].join(
+          "; ",
+        ),
+      ) || undefined,
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
@@ -172,7 +191,7 @@ export async function runLocalGates(
     hooks.priority,
   );
   try {
-    const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
+    const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult, hooks.env));
     if (result.setupOk && !signal.aborted) hooks.onLocalSetup?.();
     return result;
   } finally {
@@ -199,10 +218,16 @@ async function runAll(
   cfg: GateConfig,
   signal: AbortSignal,
   onResult: GateHooks["onResult"],
+  env?: Record<string, string>,
 ): Promise<GateRun> {
   const setup: GateResult[] = [];
   for (const [i, run] of cfg.setup.entries()) {
-    const r = await runOne({ name: `setup${cfg.setup.length > 1 ? `-${i + 1}` : ""}`, run }, cwd, signal);
+    const r = await runOne(
+      { name: `setup${cfg.setup.length > 1 ? `-${i + 1}` : ""}`, run },
+      cwd,
+      signal,
+      env,
+    );
     setup.push(r);
     onResult?.(r, "setup");
     if (!r.ok) return { setupOk: false, setup, checks: [] };
@@ -210,7 +235,7 @@ async function runAll(
   const checks: GateResult[] = [];
   for (const c of cfg.checks) {
     if (signal.aborted) break;
-    const r = await runOne(c, cwd, signal);
+    const r = await runOne(c, cwd, signal, env);
     checks.push(r);
     onResult?.(r, "check");
   }
@@ -248,6 +273,20 @@ export interface GateRetryOptions {
 export const UNSLOTTED_RETRY_MAX_FILES = 5;
 export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
 
+/** Share the targeted-only decision with land diagnostics; legacy evidence stays ineligible. */
+export function targetedRetrySkipReason(r: GateResult, cfg: GateConfig, cwd: string): string | undefined {
+  if (confinementFailed(r)) return "confinement failure";
+  if (r.timedOut) return "gate process timed out";
+  if (r.exitCode == null) return "missing exit status";
+  if (r.exitCode === 0) return "no nonzero exit status";
+  if (r.failureAttributionComplete !== true)
+    return `failure attribution incomplete: ${r.failureAttributionReason ?? "missing or inconsistent whole-stream/JUnit evidence"}`;
+  if (cfg.retryFiles?.split("{files}").length !== 2) return "unusable retry_files configuration";
+  if (!r.failedFiles?.length) return "absent retry files";
+  if (!validRetryFiles(r.failedFiles, cwd)) return "invalid retry files";
+  return undefined;
+}
+
 function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
   const failed = run.setup.find((r) => !r.ok);
   return {
@@ -268,6 +307,7 @@ export async function retryFailures(
   runner?: GateRunner,
   targetedOnly = false,
   freshCheckout = false,
+  onSkip?: (original: GateResult, reason: string) => void,
 ): Promise<Map<GateResult, GateResult>> {
   const results = new Map<GateResult, GateResult>();
   const targets = new Map<GateResult, GateResult>();
@@ -275,16 +315,11 @@ export async function retryFailures(
   for (const entry of failures) {
     if (signal.aborted) break;
     const { check, original } = entry;
-    if (
-      targetedOnly &&
-      (original.ok ||
-        original.failureAttributionComplete !== true ||
-        original.exitCode === null ||
-        original.exitCode === 0 ||
-        original.timedOut ||
-        confinementFailed(original))
-    )
+    const skip = targetedOnly ? targetedRetrySkipReason(original, cfg, cwd) : undefined;
+    if (targetedOnly && (original.ok || skip)) {
+      if (skip) onSkip?.(original, skip);
       continue;
+    }
     const files = original.failedFiles;
     if (cfg.retryFiles?.split("{files}").length === 2 && files && validRetryFiles(files, cwd)) {
       const times = files.map((file) => original.failedFileTimes?.[file]);
@@ -306,6 +341,7 @@ export async function retryFailures(
         { targeted: true, skipGateSlot },
       );
       if (!retried.setupOk) {
+        onSkip?.(original, "retry setup failed");
         results.set(original, retrySetupFailure(original, retried));
         continue;
       }
@@ -476,6 +512,7 @@ export async function retryRegressions(
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const selected = cmp.flatMap((c) => {
     if (
+      c.result.reused ||
       (c.verdict !== "regressed" && c.verdict !== "targeted_failure") ||
       c.result.timedOut ||
       confinementFailed(c.result) ||

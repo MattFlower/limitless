@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { WorkerStore } from "../db/workers.ts";
+import { worktreeGit } from "../git/command.ts";
 import type { GateConfig } from "./detect.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData } from "./output.ts";
@@ -14,10 +15,10 @@ import {
 import { bindGateSlotScope, type GatePriority } from "./slots.ts";
 
 export interface Executor<Req, Res> {
-  readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
+  readonly kind: "local" | "github-actions" | "lan" | "inplace" | "claude-cloud";
   start(req: Req, signal: AbortSignal): Promise<ExecutionHandle>;
   attach(handle: ExecutionHandle, signal: AbortSignal, req?: Req, hooks?: GateHooks): Execution<Res>;
-  discard?(handle: ExecutionHandle): void;
+  discard?(handle: ExecutionHandle): void | Promise<void>;
 }
 export interface ExecutionHandle {
   kind: Executor<unknown, unknown>["kind"];
@@ -34,6 +35,12 @@ export type ExecutionEvent =
   | { type: "status"; text: string }
   | { type: "check"; phase: "setup" | "check"; result: GateResult };
 export interface GateRequest {
+  env?: Record<string, string>;
+  releaseSha?: string;
+  daemonPort?: number;
+  scratch?: string;
+  implementerIssue?: boolean;
+  fallbackSetup?: string[];
   runId?: string;
   priority?: GatePriority;
   repo: string;
@@ -45,9 +52,23 @@ export interface GateRequest {
   skipGateSlot?: boolean;
 }
 export type GateExecutor = Executor<GateRequest, GateRun> & {
+  canResume?: (handle: ExecutionHandle, env?: Record<string, string>, daemonPort?: number) => boolean;
   freshCheckoutFor?: (repo: string) => boolean;
 };
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
+
+/** Inspect the checkout that executed the gate; an echoed request SHA is not provenance. */
+export async function gateProvenance(cwd: string, signal: AbortSignal) {
+  try {
+    const result = await worktreeGit(["git", "rev-parse", "HEAD", "HEAD^{tree}"], { cwd, signal });
+    const [sha, treeHash] = result.stdout.trim().split("\n");
+    const hash = /^(?:[a-f\d]{40}|[a-f\d]{64})$/;
+    if (sha && treeHash && hash.test(sha) && hash.test(treeHash)) return { sha, treeHash };
+  } catch {
+    // A completed gate still returns its result when Git inspection is unavailable.
+  }
+  return undefined;
+}
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
 export const gateShutdown = (signal: AbortSignal): boolean =>
@@ -61,17 +82,18 @@ export async function cancelGateExecution(handle: ExecutionHandle, executor?: Ga
   if (execution) {
     await execution.cancel();
     await execution.result.catch(() => {});
-  } else if (executor?.kind === handle.kind) executor.discard?.(handle);
+  } else if (executor?.kind === handle.kind) await executor.discard?.(handle);
 }
 
 export function gateExecutorFor(
   kind: "local" | "lan",
   workers?: WorkerStore,
   repos: readonly string[] = [],
+  inplace = false,
 ): GateExecutor {
   switch (kind) {
     case "local":
-      return localExecutor();
+      return inplace && workers ? lanExecutor(workers, [], true) : localExecutor();
     case "lan":
       if (!workers) throw new Error("LAN executor requires a worker store");
       return lanExecutor(workers, repos);
@@ -138,6 +160,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
           holder: slotHooks.holder,
           skipGateSlot: req.skipGateSlot,
           priority: req.priority,
+          env: req.env,
           onLocalSetup: slotHooks.onLocalSetup,
           onResult(r, phase) {
             results.push({ type: "check", phase, result: r });

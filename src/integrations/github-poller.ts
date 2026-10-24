@@ -5,6 +5,7 @@ import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 import { ciDecision } from "./ci-classifier.ts";
 import type { GhRunner } from "./github.ts";
+import { githubIdentity, githubRepo } from "./github-identity.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
 import { githubToken } from "./github-token.ts";
 
@@ -16,11 +17,17 @@ export type GitHubResponse = {
   rerunRetryAt?: number;
 };
 /** One authenticated API call: POST when `body` is given, else GET (logs return text). */
-export type GitHubClient = (path: string, body?: unknown, signal?: AbortSignal) => Promise<GitHubResponse>;
+export type GitHubClient = (
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+  repo?: string,
+) => Promise<GitHubResponse>;
 
-/** Uses the gh CLI's OAuth token (read per request, so refreshes apply), so no webhook or App is needed. */
-export const ghClient: GitHubClient = async (path, body, signal) => {
-  const token = await githubToken(signal);
+/** Repository identity; owner OAuth tokens are read per request so gh login refreshes apply. */
+export const ghClient: GitHubClient = async (path, body, signal, repo) => {
+  const identity = await githubIdentity(repo ?? githubRepo([path]));
+  const token = identity.kind === "app" ? identity.token : await githubToken(signal);
   const res = await fetch(`https://api.github.com/${path}`, {
     headers: {
       authorization: `bearer ${token}`,
@@ -342,7 +349,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   /** Null during a rate-limit (or access-block) cooldown, which every request honours. */
   const call = async (repo: string, path: string, body?: unknown): Promise<GitHubResponse | null> => {
     if (stopped || now() < cooldownUntil || now() < (blocks.get(repo)?.until ?? 0)) return null;
-    const res = await client(path, body, abort.signal);
+    const res = await client(path, body, abort.signal, repo);
     if (stopped) return null;
     const until = limitedUntil(res, now());
     const access = until === null && accessProblem(res, repo);

@@ -118,15 +118,16 @@ const command = (cmd: string[], roots: WriteRoots, bwrap: string) => [
 ];
 
 /** bwrap for the filesystem and PID namespace, Landlock for the daemon port, abstract sockets and signals. */
-export function linuxForPort(
-  port: number,
-  bwrap = BWRAP,
-  platform: string = process.platform,
-): ConfinementBackend {
+export const linuxBackend: ConfinementBackend = {
+  verify: (roots, opts, run) => verifyLinux(roots, opts, run),
+  wrap: (cmd, roots) => command(cmd, roots, BWRAP),
+};
+
+export function linuxForPort(port: number): ConfinementBackend {
   const rootsForPort = (roots: WriteRoots) => ({ ...roots, daemonPort: port || undefined });
   return {
-    verify: (roots, opts, run) => verifyLinux(rootsForPort(roots), opts, run, bwrap, platform),
-    wrap: (cmd, roots) => command(cmd, rootsForPort(roots), bwrap),
+    verify: (roots, opts, run) => linuxBackend.verify(rootsForPort(roots), opts, run),
+    wrap: (cmd, roots) => linuxBackend.wrap(cmd, rootsForPort(roots)),
   };
 }
 

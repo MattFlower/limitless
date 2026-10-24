@@ -75,6 +75,68 @@ test("comments once at creation and terminal status with cost and PR link", asyn
   stop();
 });
 
+test.each([
+  ["queue", undefined, 0],
+  ["queue without config", undefined, 0],
+  ["ordinary", undefined, 2],
+  ["ordinary", [], 2],
+  ["queue disabled", undefined, 2],
+] as const)("issue lifecycle comments for %s runs with trust %j", async (kind, trusted, expected) => {
+  const cfg = loadConfig({
+    home: join(dir, "data"),
+    configDir: join(dir, "cfg"),
+    raw: {
+      owners: { github: "owner" },
+      github:
+        kind === "queue disabled" || kind === "queue without config"
+          ? {}
+          : { queue: { repos: ["owner/repo"], trusted } },
+    },
+  });
+  const calls: string[][] = [];
+  const stop = startGitHubNotifier(
+    store,
+    async (args) => {
+      calls.push(args);
+    },
+    () => {},
+    async () => null,
+    cfg.paths.configDir,
+    [],
+    cfg,
+  );
+  try {
+    const repo = store.upsertRepo({
+      slug: "owner/repo",
+      kind: "github",
+      url: null,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "fix",
+      source: "github",
+      sourceRef: {
+        kind: "issue",
+        repo: repo.slug,
+        number: 12,
+        ...(kind === "queue" || kind === "queue without config" ? { via: "queue" } : {}),
+      },
+    });
+    expect(run.githubWebhookVerified).toBe(false);
+    store.updateRun(run.id, { status: "failed" });
+    expect(calls).toHaveLength(expected);
+    if (expected) {
+      expect(calls[0]?.at(-1)).toBe(`Limitless run created: ${run.id}`);
+      expect(calls[1]?.at(-1)).toContain("**failed**");
+    }
+  } finally {
+    await stop();
+  }
+});
+
 test("PR verification runs skip the creation comment", async () => {
   const calls: string[][] = [];
   const stop = startGitHubNotifier(store, async (args) => {
@@ -377,7 +439,9 @@ test("a merge observed by GitHub supersedes needs_human runs closing the same is
   const run = store.getRun(id);
   const repo = run && store.getRepo(run.repoId);
   if (!repo) throw new Error("missing repo");
-  const older = store.createRun(repo, { repo: repo.slug, prompt: "First try. Closes #12" });
+  // Older releases could persist overlapping claims; reconciliation must still resolve them.
+  const older = store.createRun(repo, { repo: repo.slug, prompt: "First try." });
+  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("First try. Closes #12", older.id);
   store.updateRun(older.id, { status: "needs_human", finishedAt: 1 });
   await reconcileMergedRuns(store, async (url) =>
     url === prUrl ? { url, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: null } : null,
@@ -1692,3 +1756,19 @@ test.each(["issue", "pull_request"] as const)(
     expect(calls).toHaveLength(0);
   },
 );
+
+test("an App bot merge resolves the run with its actual merger login", async () => {
+  const id = needsHuman();
+  await reconcileMergedRuns(store, async () => ({
+    url: prUrl,
+    state: "MERGED",
+    mergedAt: "2026-09-27T20:00:00Z",
+    mergedBy: { login: "factory[bot]" },
+  }));
+  expect(store.getRun(id)).toMatchObject({
+    status: "resolved",
+    merged: true,
+    mergedBy: "factory[bot]",
+    resolution: { kind: "merged", by: "github" },
+  });
+});
