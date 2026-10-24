@@ -74,6 +74,18 @@ those protections. New empty-commit and race identity controls demonstrate the r
 The implementation exceeds the approximate 150-line source budget (about 220 net source lines,
 including the manual landing entry point and the additional eval transfer discovered in the audit).
 
+## Linux
+
+On Linux, `bwrapGit` gives the same guarantees as the Seatbelt profile. Git runs in bubblewrap with
+new user, PID, IPC and network namespaces, a read-only root and private `/run` and `/tmp`, and
+read-write binds for exactly the write roots above. Inside that, `setpriv` applies a Landlock
+`execute` rule that allows git, its `--exec-path` helpers and git's ELF interpreter (the kernel
+checks execute access on the loader too). Aliases that shell out, `core.fsmonitor`, credential
+helpers and every other program are refused, and transports fail without a network. A launch
+failure (stderr starting with `bwrap: ` or `setpriv: `) is a `ConfinementError`, never a git
+result. It needs `/usr/bin/bwrap` and util-linux 2.40 or later; see
+[OPERATIONS](OPERATIONS.md#linux-confinement).
+
 ## Checks run in the worker
 
 The initial affected-suite run completed with 727 passes, 50 platform skips and one failure: the

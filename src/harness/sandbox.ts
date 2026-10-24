@@ -19,6 +19,7 @@ import {
   resolvedHome,
   specificReadDenies,
 } from "./read-policy.ts";
+import { linuxForPort } from "./sandbox-linux.ts";
 import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
@@ -103,6 +104,10 @@ export function seatbeltForPort(port: number): ConfinementBackend {
     wrap: (cmd, roots) => seatbeltBackend.wrap(cmd, rootsForPort(roots)),
   };
 }
+
+/** The factory's backend for this platform; anything but Linux gets Seatbelt, which refuses off macOS. */
+export const platformConfinement = (port: number, platform: string = process.platform): ConfinementBackend =>
+  platform === "linux" ? linuxForPort(port) : seatbeltForPort(port);
 
 /** Seatbelt verifies the effective profile every launch; Codex capability probes cache by CLI/version. */
 export async function verifySeatbelt(

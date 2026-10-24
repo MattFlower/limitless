@@ -220,6 +220,30 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
   (`~/.config/limitless/qwen38-limitless.jinja`) so agent harnesses may send system messages
   mid-conversation.
 
+## Linux confinement
+
+Gates, land checks and Git on Linux run under bubblewrap and Landlock instead of Seatbelt
+(`src/harness/sandbox-linux.ts`, `src/harness/landlock.ts`, `bwrapGit`). The coordinator itself
+stays on macOS; this is for Linux workers (#832). Host requirements:
+
+- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid) and `/usr/bin/setpriv` from util-linux 2.40
+  or later.
+- Unprivileged user namespaces. On Ubuntu 23.10 and later, `kernel.apparmor_restrict_unprivileged_userns=1`
+  needs an AppArmor profile that grants bwrap `userns`. Leave the sysctl on and add the profile
+  rather than disabling the restriction. **This path is untested:** the host that built this had no
+  AppArmor. The launcher sets `no_new_privs` before it executes bwrap, which may affect AppArmor
+  profile transitions.
+- Linux 6.12 or later (Landlock ABI 6), for scoped abstract sockets and signals.
+
+Every launch is preflighted. A missing binary, unusable namespaces or an older Landlock refuse with
+a `ConfinementError` that names the reason; nothing falls back to an unconfined run. Inside the
+sandbox, `/run` (including `$XDG_RUNTIME_DIR`, the D-Bus session bus, ssh-agent, gpg-agent, keyring
+and systemd user manager sockets), `/tmp` and `/var/tmp` are private tmpfs mounts. `/tmp` stays
+writable because Codex's own bubblewrap keeps a registry there; writes to it never reach the host.
+The daemon port is refused on every address (Landlock rules are per port), and other egress is
+allowed as on macOS. Launching costs about 5 ms for bwrap and about 70 ms for the 65,535 Landlock
+port rules a daemon port needs.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

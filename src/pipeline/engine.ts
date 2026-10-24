@@ -78,7 +78,7 @@ import {
   withGitHubRetry,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
-import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { commandScope, confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
@@ -204,7 +204,7 @@ export async function executeRun(
       checkout: () => ctx.state.worktreePath,
     },
     () =>
-      confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
+      confinementScope.run(deps.confinement ?? platformConfinement(deps.cfg.port), () =>
         readPolicyScope.run(deps.cfg.readPolicy, () =>
           worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
         ),

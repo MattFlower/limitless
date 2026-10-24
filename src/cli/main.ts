@@ -290,6 +290,10 @@ async function main(): Promise<void> {
     process.exitCode = await (await import("./agent-test.ts")).agentTestEntry(Bun.argv.slice(3));
     return;
   }
+  if (Bun.argv[2] === "__landlock") {
+    process.exitCode = await (await import("../harness/landlock.ts")).landlockEntry(Bun.argv.slice(3));
+    return;
+  }
   if (Bun.argv[2] === "gate-slot") {
     process.exitCode = await (await import("./gate-slot.ts")).gateSlotCommand(Bun.argv.slice(3));
     return;
