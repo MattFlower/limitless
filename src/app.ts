@@ -11,7 +11,7 @@ import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { summarize } from "./evals/stats.ts";
-import { gateExecutorFor } from "./gates/executor.ts";
+import { type GateRequest, gateExecutorFor } from "./gates/executor.ts";
 import { gateSlots } from "./gates/slots.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
@@ -20,6 +20,7 @@ import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import { seatbeltForPort } from "./harness/sandbox.ts";
+import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
@@ -181,7 +182,9 @@ export class Factory {
       agentExecutor:
         opts.agentExecutor ??
         (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined),
-      gateExecutor: opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos),
+      gateExecutor:
+        opts.gateExecutor ??
+        gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos, cfg.executorEnabled),
       confinement: opts.confinement ?? seatbeltForPort(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
@@ -225,7 +228,7 @@ export class Factory {
       client: getGitHubPr,
       confinement: this.deps.confinement,
       get gateExecutor() {
-        return factory.deps.gateExecutor;
+        return factory.deps.gateExecutor?.kind === "inplace" ? undefined : factory.deps.gateExecutor;
       },
       ...opts.land,
     });
@@ -244,7 +247,8 @@ export class Factory {
         (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined))
       : this.deps.agentExecutor;
     const gate = workersChanged
-      ? (this.opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos))
+      ? (this.opts.gateExecutor ??
+        gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos, cfg.executorEnabled))
       : this.deps.gateExecutor;
     this.cfg = cfg;
     this.deps.cfg = shadowOk ? cfg : { ...cfg, reviewShadow: "off" };
@@ -387,7 +391,20 @@ export class Factory {
   cancelRun(id: string, by = "user"): boolean {
     const cancelled = this.scheduler.cancel(id, by);
     if (cancelled) {
-      for (const job of this.workers.jobs("run_id=?", id)) this.workers.cancel(job.id);
+      // A detached in-place stage's scratch outlives the daemon's scope, and its first attempt and
+      // retries share it: remove each scratch only once every job using it has stopped.
+      const users = new Map<string, string[]>();
+      for (const job of this.workers.jobs("run_id=?", id)) {
+        this.workers.cancel(job.id);
+        const scratch = job.in_place ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
+        if (scratch) users.set(scratch, [...(users.get(scratch) ?? []), job.id]);
+      }
+      for (const [scratch, jobs] of users)
+        void Promise.all(jobs.map((job) => this.workers.waitStopped(job)))
+          .then(() => removeScratch(scratch))
+          .catch((error: unknown) =>
+            console.warn(redactCredentials(`Kept in-place gate scratch: ${String(error)}`)),
+          );
       this.workers.cancelRunAgentJobs(id);
     }
     return cancelled;

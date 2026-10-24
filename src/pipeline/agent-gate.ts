@@ -151,6 +151,8 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
   const signal = AbortSignal.any([ctx.signal, sessionSignal]);
   const config = ctx.state.gatesConfig;
   if (!config?.checks.some((c) => c.name === "test")) throw new Error("No test gate configured");
+  // Agent sessions stay off the in-place executor (E3): its jobs need a release, environment and port.
+  const executor = ctx.deps.gateExecutor?.kind === "inplace" ? undefined : ctx.deps.gateExecutor;
   return withScratch(cwd, async (scratch) => {
     const tree = await snapshotTree(cwd, signal);
     const checkout = join(scratch, "checkout");
@@ -189,7 +191,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
             },
             signal,
             { holder: ctx.run.id },
-            ctx.deps.gateExecutor,
+            executor,
             undefined,
             async (handle) => {
               executionId ||= handle.id;
@@ -229,7 +231,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
           signal,
           undefined,
           run,
-          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+          executor?.freshCheckoutFor?.(ctx.repo.slug),
         );
         signal.throwIfAborted();
         const comparison = comparisons.find((c) => c.name === "test");

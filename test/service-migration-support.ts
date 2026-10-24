@@ -25,6 +25,7 @@ const sequential = requestedScenario.startsWith("sequence");
 let scenario = sequential ? "bootstrap" : requestedScenario;
 const kind = process.argv[3] ?? "daemon";
 const packaged = requestedScenario.startsWith("packaged-");
+const programCase = requestedScenario.split("-program-")[1];
 const agents = packaged ? join(home, "isolated-agents") : join(home, "Library", "LaunchAgents");
 const realApp = join(home, "app & release");
 const alias = join(home, "alias");
@@ -59,6 +60,7 @@ function parse(content: string) {
   };
   return {
     Label: value("Label"),
+    Program: value("Program") ?? (content.includes("<key>Program</key><false/>") ? false : undefined),
     LimitlessService: value("LimitlessService"),
     WorkingDirectory: value("WorkingDirectory"),
     EnvironmentVariables: Object.fromEntries(
@@ -103,7 +105,7 @@ const marker = ["marked", "contradictory"].includes(scenario)
   ? `<key>LimitlessService</key><string>${scenario === "contradictory" ? (kind === "daemon" ? "tunnel" : "daemon") : kind}</string>`
   : "";
 const old = `<plist><dict>${marker}<key>Label</key><string>${oldLabel}</string><key>WorkingDirectory</key><string>${xmlEscape(plistApp)}</string><key>ProgramArguments</key><array>${args.map((a) => `<string>${xmlEscape(a)}</string>`).join("")}</array></dict></plist>`;
-if (!packaged && scenario !== "fresh" && !scenario.startsWith("recover")) {
+if (!packaged && !programCase && scenario !== "fresh" && !scenario.startsWith("recover")) {
   writeFileSync(oldPath, old);
   if (scenario !== "unloaded") loaded.add(oldLabel);
 }
@@ -340,7 +342,51 @@ let original = "";
 let stable = "";
 let executable = "";
 try {
-  if (packaged) {
+  if (programCase) {
+    executable = join(home, "bin", kind === "tunnel" ? "cloudflared" : packaged ? "limitless" : "bun");
+    mkdirSync(join(executable, ".."), { recursive: true });
+    writeFileSync(executable, "executable");
+    const unitArgs = packaged && kind === "daemon" ? [executable, "serve"] : [...args];
+    if (kind !== "mtplx") unitArgs[0] = executable;
+    const first = unitArgs[0];
+    if (!first) throw new Error("missing executable argument");
+    const alias = join(home, "program-alias");
+    symlinkSync(first, alias);
+    const other = join(home, "other-executable");
+    writeFileSync(other, "unrelated executable");
+    const program =
+      programCase === "absent"
+        ? ""
+        : programCase === "invalid"
+          ? "<key>Program</key><false/>"
+          : `<key>Program</key><string>${xmlEscape(
+              programCase === "equal"
+                ? first
+                : programCase === "symlink"
+                  ? alias
+                  : programCase === "unresolvable"
+                    ? join(home, "missing-executable")
+                    : other,
+            )}</string>`;
+    const directory = packaged ? join(home, ".limitless") : app;
+    mkdirSync(directory, { recursive: true });
+    original = `<plist><dict><key>Label</key><string>${oldLabel}</string>${program}<key>WorkingDirectory</key><string>${xmlEscape(directory)}</string><key>ProgramArguments</key><array>${unitArgs.map((arg) => `<string>${xmlEscape(arg)}</string>`).join("")}</array></dict></plist>`;
+    const path = join(agents, programCase === "collision" ? `${neutral}.plist` : `${kind}-original.plist`);
+    writeFileSync(path, original);
+    loaded.add(oldLabel);
+    const options = {
+      command,
+      client,
+      clock,
+      agentsDir: agents,
+      execPath: executable,
+      release: packaged
+        ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
+        : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
+    };
+    discovered = (await service.installedUnits(options)).map((unit) => unit.kind);
+    if (programCase === "collision") await service.install(0, options);
+  } else if (packaged) {
     const prefix = join(home, "brew");
     const version = join(prefix, "Cellar", "limitless", "1.0");
     executable = join(version, "bin", "limitless");

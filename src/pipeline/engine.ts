@@ -78,7 +78,7 @@ import {
   withGitHubRetry,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
-import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
@@ -109,7 +109,7 @@ import {
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
-import { runGateExecution } from "./gate-execution.ts";
+import { gateCommandScope, resumeGateExecution, runGateExecution } from "./gate-execution.ts";
 import {
   checkDiscreetCommits,
   DiscreetError,
@@ -504,7 +504,10 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 // ---------------------------------------------------------------------------
 // prepare: repo cache, worktree, gate detection, baseline
 
-function gateEvents(ctx: RunContext, label?: string): Required<Omit<GateHooks, "onLocalSetup">> {
+function gateEvents(
+  ctx: RunContext,
+  label?: string,
+): Required<Omit<GateHooks, "onLocalSetup" | "env" | "fallbackSetup">> {
   return {
     priority: "finish",
     skipGateSlot: false,
@@ -585,11 +588,14 @@ async function prepare(ctx: RunContext): Promise<void> {
         : wt.baseSha);
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
     const verification = ctx.state.verification;
+    const env = gateEnv();
+    const resuming =
+      (await resumeGateExecution(ctx, "prepare", "baseline", wt.path, env))?.kind === "inplace";
     if (verification) {
       ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
-      await resetTo(wt.path, verification.baseSha);
+      if (!resuming) await resetTo(wt.path, verification.baseSha);
     }
-    await discardChanges(wt.path);
+    if (!resuming) await discardChanges(wt.path);
     // A round's gate, audit and review settings come from its original run's base commit: an
     // earlier round's edits to the PR must never weaken the next round's checks.
     const trustedSha = review ? review.owner.baseSha : (verification?.baseSha ?? baseSha);
@@ -620,7 +626,12 @@ async function prepare(ctx: RunContext): Promise<void> {
         } catch (error) {
           ctx.state.shadowLenses = { error: String((error as Error).message).slice(0, 500) };
         }
-      gates = trusted ? trusted.gates : detectGates(wt.path);
+      gates =
+        ctx.state.gateExecution?.handle.kind === "inplace" && ctx.state.gatesConfig
+          ? ctx.state.gatesConfig
+          : trusted
+            ? trusted.gates
+            : detectGates(wt.path);
       gates.retryFiles = readRetryFiles(repoConfig, (message) => ctx.log(message, "warn"));
       gates.docs = readDocs(repoConfig, (message) => ctx.log(message, "warn"));
       ctx.state.gatesConfig = gates;
@@ -637,8 +648,8 @@ async function prepare(ctx: RunContext): Promise<void> {
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const baselineSha = await headSha(wt.path);
       const runBaseline = gateSlotScope(
-        commandScope(wt.path, async (): Promise<GateRun> => {
-          const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
+        gateCommandScope(ctx, "prepare", "baseline", wt.path, async (): Promise<GateRun> => {
+          const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait }, env);
           ctx.checkCancelled();
           // Retry before resetting, so a check sees the same build output as its first attempt.
           const retried = await retryBaselineFailures(
@@ -654,7 +665,8 @@ async function prepare(ctx: RunContext): Promise<void> {
                 options?.targeted ? "baseline-retry-targeted" : "baseline-retry",
                 wt.path,
                 retry,
-                { onWait, skipGateSlot: options?.skipGateSlot },
+                { onWait, skipGateSlot: options?.skipGateSlot, fallbackSetup: gates.setup },
+                env,
               ),
             ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
           );
@@ -670,7 +682,6 @@ async function prepare(ctx: RunContext): Promise<void> {
       else {
         const executor =
           cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local";
-        const env = gateEnv();
         const bunVersion =
           executor === "lan"
             ? (ctx.deps.bunVersion ?? Bun.version)
@@ -715,8 +726,10 @@ async function prepare(ctx: RunContext): Promise<void> {
           : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
       }
     } finally {
-      if (verification) await resetTo(wt.path, verification.headSha);
-      else await discardChanges(wt.path);
+      if (ctx.state.gateExecution?.handle.kind !== "inplace") {
+        if (verification) await resetTo(wt.path, verification.headSha);
+        else await discardChanges(wt.path);
+      }
     }
     const baseline = redactGateData(ctx.state.baseline);
     if (baseline) {
@@ -1511,7 +1524,7 @@ async function oneRound(
     "gates",
     (stage) =>
       gateSlotScope(
-        commandScope(cwd, async () => {
+        gateCommandScope(ctx, "gates", "initial", cwd, async () => {
           const events = {
             ...gateEvents(ctx),
             onLocalSetup: () => {
@@ -1523,7 +1536,9 @@ async function oneRound(
           let testScripts: Record<string, string> = {};
           let baseTimeout = false;
           try {
-            await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+            const env = gateEnv();
+            if ((await resumeGateExecution(ctx, "gates", "initial", cwd, env))?.kind !== "inplace")
+              await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
             const docs = await docsOnlyGates(cwd, gates, baseSha, checkedSha);
             ctx.event({
               runId: ctx.run.id,
@@ -1539,7 +1554,7 @@ async function oneRound(
               : docs.gates;
             const execute = (purpose: string) =>
               !reused || activeGates.setup.length || activeGates.checks.length
-                ? runGateExecution(ctx, "gates", purpose, cwd, activeGates, events)
+                ? runGateExecution(ctx, "gates", purpose, cwd, activeGates, events, env)
                 : Promise.resolve({ setupOk: true, setup: [], checks: [] } as GateRun);
             const insertReused = (run: GateRun): GateRun =>
               reused && run.setupOk
@@ -1620,6 +1635,7 @@ async function oneRound(
                     {
                       onWait: events.onWait,
                       skipGateSlot: options?.skipGateSlot,
+                      fallbackSetup: docs.gates.setup,
                       onLocalSetup:
                         retry.setup.length === gates.setup.length ? events.onLocalSetup : undefined,
                     },
@@ -1634,11 +1650,12 @@ async function oneRound(
             );
           } finally {
             // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-            await discardChanges(cwd).catch((error: unknown) => {
-              if (ctx.state.implementerIssue && error instanceof CommandError)
-                throw new WorktreeCleanError(error.message, { cause: error });
-              throw error;
-            });
+            if (ctx.state.gateExecution?.handle.kind !== "inplace")
+              await discardChanges(cwd).catch((error: unknown) => {
+                if (ctx.state.implementerIssue && error instanceof CommandError)
+                  throw new WorktreeCleanError(error.message, { cause: error });
+                throw error;
+              });
           }
           for (const c of cmp.filter((c) => c.firstAttempt)) {
             ctx.event({
@@ -3156,6 +3173,8 @@ async function mergeForDelivery(
   }
   const before = ctx.state.preRebaseHead;
   if (!before) throw new Error("Missing pre-merge HEAD");
+  const env = gateEnv();
+  const resuming = (await resumeGateExecution(ctx, "gates", "rebase", cwd, env))?.kind === "inplace";
   const conflicts = await prepareMerge(cwd, before, fetched);
   if (conflicts.length) {
     ctx.state.conflictFiles = conflicts;
@@ -3174,12 +3193,14 @@ async function mergeForDelivery(
   if ((await headSha(cwd)) === before)
     await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
   await validateMerge(cwd, before, fetched);
-  await checkoutCommitted(cwd);
+  if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
+  const postMergeScope = <T>(fn: () => Promise<T>) =>
+    gateSlotScope(gateCommandScope(ctx, "gates", "rebase", cwd, fn));
   try {
     await ctx.stage(
       "gates",
-      gateSlotScope(async () => {
+      postMergeScope(async () => {
         const docs = await docsOnlyGates(
           cwd,
           assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
@@ -3198,7 +3219,7 @@ async function mergeForDelivery(
           ![...run.setup, ...run.checks].some(confinementFailed) &&
           run.checks.some((r) => r.timedOut) &&
           run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
-        let after = await runGateExecution(ctx, "gates", "rebase", cwd, docs.gates, gateEvents(ctx));
+        let after = await runGateExecution(ctx, "gates", "rebase", cwd, docs.gates, gateEvents(ctx), env);
         ctx.checkCancelled();
         if (timeoutOnly(after)) {
           const first = after;
@@ -3240,7 +3261,7 @@ async function mergeForDelivery(
               options?.targeted ? "regression-retry-targeted" : "regression-retry",
               cwd,
               retry,
-              { ...events, skipGateSlot: options?.skipGateSlot },
+              { ...events, skipGateSlot: options?.skipGateSlot, fallbackSetup: docs.gates.setup },
             ),
           ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
           (c) => isSlowRegression(c, initial, reference?.checks ?? []),
