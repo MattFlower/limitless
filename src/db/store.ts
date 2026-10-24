@@ -329,6 +329,19 @@ export interface BaselineCacheKey {
 export const closedIssues = (prompt: string) =>
   new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
 
+export const ISSUE_CLAIM_STATUSES: RunStatus[] = [
+  "queued",
+  "waiting",
+  "running",
+  "waiting_input",
+  "needs_human",
+];
+export class IssueClaimed extends Error {
+  constructor(repo: string, number: number, run: Run) {
+    super(`Issue ${repo}#${number} is claimed by run ${run.id}`);
+  }
+}
+
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
 
 export interface RunPatch {
@@ -1144,10 +1157,65 @@ export class Store {
   // ---- runs ----------------------------------------------------------------
 
   // Provenance is an internal argument, never taken from the public request object.
-  createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
+  createRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    verifiedGitHubWebhook = false,
+    admission?: () => string | null,
+  ): Run {
     if (req.sourceRef?.kind === "review-round")
       throw new Error("review rounds are created only by a review verdict");
-    return this.insertRun(repo, req, verifiedGitHubWebhook);
+    return this.transaction(() => {
+      const refusal = admission?.();
+      if (refusal) throw new Error(`Run admission refused: ${refusal}`);
+      const claims: { repo: string; number: number }[] = [];
+      if (req.sourceRef?.kind === "issue") {
+        const { repo, number } = req.sourceRef;
+        if (
+          typeof repo !== "string" ||
+          typeof number !== "number" ||
+          !Number.isSafeInteger(number) ||
+          number <= 0
+        )
+          throw new Error("issue sourceRef requires a repository and positive issue number");
+        claims.push({ repo, number });
+      } else if (req.source !== "github")
+        claims.push(...[...closedIssues(req.prompt)].map((number) => ({ repo: repo.slug, number })));
+      for (const claim of claims) {
+        const run = this.issueClaim(claim.repo, claim.number);
+        if (run) throw new IssueClaimed(claim.repo, claim.number, run);
+      }
+      return this.insertRun(repo, req, verifiedGitHubWebhook);
+    });
+  }
+
+  issueClaim(repo: string, number: number): Run | null {
+    const same = (slug: unknown) => typeof slug === "string" && slug.toLowerCase() === repo.toLowerCase();
+    const candidates = this.db
+      .query(`${RUN_SELECT}
+      WHERE runs.status IN (${ISSUE_CLAIM_STATUSES.map(() => "?").join(",")}) AND (
+        (json_extract(runs.source_ref, '$.kind') = 'issue' AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
+          AND json_extract(runs.source_ref, '$.number') = ?)
+        OR (lower(repos.slug) = lower(?) AND runs.prompt LIKE '%closes%'))`)
+      .all(...ISSUE_CLAIM_STATUSES, repo, number, repo) as Row[];
+    return (
+      candidates
+        .map(toRun)
+        .find((run) =>
+          run.sourceRef?.kind === "issue"
+            ? same(run.sourceRef.repo) && run.sourceRef.number === number
+            : run.source !== "github" && same(run.repoSlug) && closedIssues(run.prompt).has(number),
+        ) ?? null
+    );
+  }
+
+  latestIssueRun(repo: string, number: number): Run | null {
+    const row = this.db
+      .query(`${RUN_SELECT} WHERE json_extract(runs.source_ref, '$.kind') = 'issue'
+      AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
+      AND json_extract(runs.source_ref, '$.number') = ? ORDER BY runs.created_at DESC, runs.rowid DESC LIMIT 1`)
+      .get(repo, number) as Row | null;
+    return row ? toRun(row) : null;
   }
 
   /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */
