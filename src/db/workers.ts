@@ -139,7 +139,7 @@ export class WorkerStore {
   sanitize<T>(data: T): T {
     return privateOutputData(
       redactGateData(data),
-      loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]"),
+      loadOutputPrivacy({ withholdRedacted: false }) ?? (() => "[withheld: private policy unavailable]"),
     );
   }
   pair(name: string, fingerprint: string, coordinator: string) {

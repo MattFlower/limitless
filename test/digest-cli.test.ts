@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { digestCommand } from "../src/cli/digest.ts";
 import type { FeedItem, FeedPage, LandEntry, RunDetail } from "../src/core/types.ts";
+import { WorkerStore } from "../src/db/workers.ts";
 import { parseFeedParams } from "../src/feed.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
@@ -496,7 +497,11 @@ test("digest redacts protected titles and registered credentials through a real 
     registerCredential("DIGEST_TEST_CREDENTIAL", "digest-test-secret-value");
     openPr(f, 'Private Prospect "feature"');
     const question = f.run("choose a name");
-    f.store.askQuestion(question.id, 'Use digest-test-secret-value for "access"?');
+    const diagnostic = new WorkerStore(f.store, undefined).sanitize(
+      "Expected: [redacted]\nReceived: digest-test-secret-value",
+    );
+    expect(diagnostic).toBe("Expected: [redacted]\nReceived: [redacted]");
+    f.store.askQuestion(question.id, diagnostic);
     const lines: string[] = [];
     await digestCommand([], {}, { api: storeApi(f, []), print: (line) => lines.push(line) });
     const text = lines.join("\n");

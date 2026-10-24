@@ -330,11 +330,9 @@ test.each([
     expect(JSON.parse(job?.result ?? "null")).toEqual(run);
     const warning = workers.list()[0]?.setupWarning;
     expect(workers.list()[0]?.state).toBe("available");
-    expect(warning).toBe(
-      "Worker setup failed: [withheld: private text]; LAN gates falling back to local execution",
-    );
+    expect(warning).toBe("Worker setup failed: : '[redacted]'; LAN gates falling back to local execution");
     expect(JSON.stringify(store.listEvents(req.runId ?? ""))).not.toContain("runner");
-    expect(warning).toContain("[withheld: private text]");
+    expect(warning).toContain("[redacted]");
     expect(warning).toContain("falling back to local execution");
     expect(new WorkerStore(store, releaseSha).list()[0]?.setupWarning).toBe(warning);
     expect(job?.events).toContain(warning ?? "missing");
@@ -1171,7 +1169,8 @@ test("a worker runs real checks from the exact bundle head and returns the local
     expect(jobs[0]).toMatchObject({ state: "done", attempt: 1, worker: "loop-runner", failure_reason: null });
     expect(jobs[0]?.result).not.toContain(secret);
     expect(jobs[0]?.events).not.toContain(secret);
-    expect(jobs[0]?.events).toContain("withheld");
+    const events = JSON.parse(jobs[0]?.events ?? "[]") as { result: { output: string } }[];
+    expect(events.at(-1)?.result.output).toBe("[redacted]");
     for (const name of ["token", "coordinator-fingerprint"])
       expect(statSync(join(worker.remote.paths.home, "worker", name)).mode & 0o777).toBe(0o600);
   } finally {
@@ -2015,9 +2014,11 @@ test("streamed and final crafted output is validated and redacted at the coordin
   const run = await confinementScope.run(fakeConfinement, () =>
     runLocalGates(req.cwd, req.gates, new AbortController().signal),
   );
-  const check = run.checks[0];
+  const check = run.checks[1];
   if (!check) throw new Error("Missing check");
-  check.output = `${credential} ${token} synthetic-private-worker-host`;
+  check.output = `Assertion failed: ${credential} ${token}; literal [redacted]`;
+  check.failures = `Expected: [redacted]\nReceived: ${credential}\n    at diagnostic.test.ts:12:3`;
+  check.failureAttributionReason = "synthetic-private-worker-host [redacted]";
   expect(
     (await call(`/worker/jobs/${id}/events`, { type: "check", phase: "check", result: check }, token)).status,
   ).toBe(200);
@@ -2025,8 +2026,30 @@ test("streamed and final crafted output is validated and redacted at the coordin
   expect(workers.job(id)?.result).not.toContain(credential);
   expect(workers.job(id)?.result).not.toContain(token);
   expect(workers.job(id)?.events).not.toContain("synthetic-private-worker-host");
-  expect(workers.job(id)?.result).toContain("withheld");
+  const stored = JSON.parse(workers.job(id)?.result ?? "null") as GateRun;
+  const events = JSON.parse(workers.job(id)?.events ?? "[]") as { result: GateRun["checks"][number] }[];
+  for (const result of [stored.checks[1], events[0]?.result]) {
+    expect(result?.output).toBe("Assertion failed: [redacted] [redacted]; literal [redacted]");
+    expect(result?.failures).toBe(
+      "Expected: [redacted]\nReceived: [redacted]\n    at diagnostic.test.ts:12:3",
+    );
+    expect(result?.failureAttributionReason).toBe("[withheld: private text]");
+  }
+  expect(workers.job(id)?.events).not.toContain(credential);
+  expect(workers.job(id)?.events).not.toContain(token);
+  expect(workers.job(id)?.result).not.toContain("synthetic-private-worker-host");
 }, 30_000);
+
+test("worker marker retention still withholds private excerpts and unreadable policy text", () => {
+  const file = join(cfg.paths.configDir, "private-strings.txt");
+  writeFileSync(file, "synthetic-private-worker-host\n");
+  const excerpt = "Expected: [redacted]\n    at diagnostic.test.ts:12:3";
+  expect(workers.sanitize(excerpt)).toBe(excerpt);
+  expect(workers.sanitize(`${excerpt}\nsynthetic-private-worker-host`)).toBe("[withheld: private text]");
+  rmSync(file);
+  mkdirSync(file);
+  expect(workers.sanitize(excerpt)).toBe("[withheld: private policy unavailable]");
+});
 
 test("cancellation is durable and is returned by both lease and heartbeat replies", async () => {
   await listen();
@@ -3922,9 +3945,7 @@ test.each(["malformed", "ancestry", "fetch", "install", "exec", "restore"])(
         expect(commands.some((args) => ["checkout", "install"].includes(args[1] ?? ""))).toBe(false);
       const warning = workers.list()[0]?.setupWarning;
       expect(transmittedWarning).toContain("Worker update failed:");
-      expect(warning).toBe(
-        ["malformed", "ancestry"].includes(failure) ? transmittedWarning : "[withheld: private text]",
-      );
+      expect(warning).toBe(transmittedWarning);
       expect(warning).not.toContain(secret);
       if (failure === "restore") expect(transmittedWarning).toContain("restoring original HEAD failed");
       await worker.stop();
@@ -5042,9 +5063,7 @@ test("agent failure validates the supplied reason and preserves sanitized retry 
     if (worker === "second") workers.leaseAgentJob(worker);
     const reason = worker === "runner" ? "Agent execution interrupted" : `Failed: ${secret}`;
     expect((await call(agentPath(id, "failure"), { reason }, token)).status).toBe(200);
-    expect(workers.agentJob(id)?.failure_reason).toBe(
-      worker === "runner" ? reason : "[withheld: private text]",
-    );
+    expect(workers.agentJob(id)?.failure_reason).toBe(worker === "runner" ? reason : "Failed: [redacted]");
   }
   expect(workers.agentJob(id)).toMatchObject({
     state: "failed",
@@ -5896,7 +5915,7 @@ test("worker sanitizes harness failures and keeps running", async () => {
     await until(() => workers.agentJob(id)?.failure_reason !== null);
     const reason = workers.agentJob(id)?.failure_reason;
     expect(transmitted).toBe(expected);
-    expect(reason).toBe("[withheld: private text]");
+    expect(reason).toBe(expected);
     expect(reason).not.toContain(cwd);
     expect(reason).not.toContain(scratch);
     expect(reason).not.toContain(secret);
@@ -6931,7 +6950,7 @@ test.each([
                             ? "Coordinator refused worker request (400)"
                             : kind === "auth failure"
                               ? "gh auth token failed: non-zero exit"
-                              : "withheld";
+                              : "push rejected [redacted] [redacted]";
           expect(job?.failure_reason).toContain(reason);
           if (kind === "credential branch") {
             expect(job?.failure_reason).toBe("Registered worker credential in publication; push blocked");
@@ -7379,7 +7398,7 @@ test.each(workerStartupCases)(
         expect(results).toBe(1);
         expect(JSON.parse(job?.result ?? "null")).toMatchObject({
           status: "error",
-          error: "[withheld: private text]",
+          error: `${error} [redacted]`,
         });
         expect(job?.excluded).toBe("[]");
       }

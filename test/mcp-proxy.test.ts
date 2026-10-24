@@ -55,7 +55,9 @@ async function changeConnections() {
             ? "/api/runs/:id/change"
             : parsed.pathname.endsWith("/review")
               ? "/api/runs/:id/review"
-              : "/api/runs/:id";
+              : parsed.pathname.endsWith("/events")
+                ? "/api/runs/:id/events"
+                : "/api/runs/:id";
       const route = routes[key];
       const handler = (
         typeof route === "function" ? route : (route as Record<string, Route>)[init?.method ?? "GET"]
@@ -3768,6 +3770,26 @@ test.each([
     await conn.close();
     if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
     else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
+  }
+});
+
+test("MCP withholds the same redacted diagnostics retained by workers on both backends", async () => {
+  const credential = "worker-mcp-diagnostic-credential";
+  registerCredential("WORKER_MCP_DIAGNOSTIC", credential);
+  const diagnostic = f.factory.workers.sanitize(`Expected: [redacted]\nReceived: ${credential}`);
+  expect(diagnostic).toBe("Expected: [redacted]\nReceived: [redacted]");
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work", title: "Gate failure" });
+  f.factory.store.updateRun(run.id, { status: "failed", error: diagnostic });
+  const connections = await changeConnections();
+  try {
+    for (const conn of [connections.direct, connections.proxy]) {
+      const detail = resultValue<{ error: string }>(
+        await conn.client.callTool({ name: "limitless_get_run", arguments: { id: run.id, full: true } }),
+      );
+      expect(detail.error).toBe("[withheld: private text]");
+    }
+  } finally {
+    await connections.close();
   }
 });
 
