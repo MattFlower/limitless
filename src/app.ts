@@ -11,7 +11,7 @@ import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { summarize } from "./evals/stats.ts";
-import { gateExecutorFor } from "./gates/executor.ts";
+import { type GateRequest, gateExecutorFor } from "./gates/executor.ts";
 import { gateSlots } from "./gates/slots.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
@@ -20,6 +20,7 @@ import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import { seatbeltForPort } from "./harness/sandbox.ts";
+import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
@@ -390,7 +391,18 @@ export class Factory {
   cancelRun(id: string, by = "user"): boolean {
     const cancelled = this.scheduler.cancel(id, by);
     if (cancelled) {
-      for (const job of this.workers.jobs("run_id=?", id)) this.workers.cancel(job.id);
+      for (const job of this.workers.jobs("run_id=?", id)) {
+        this.workers.cancel(job.id);
+        // A detached in-place job's scratch outlives the daemon's scope; remove it once its processes stop.
+        const scratch = job.in_place ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
+        if (scratch)
+          void this.workers
+            .waitStopped(job.id)
+            .then(() => removeScratch(scratch))
+            .catch((error: unknown) =>
+              console.warn(redactCredentials(`Kept in-place gate scratch: ${String(error)}`)),
+            );
+      }
       this.workers.cancelRunAgentJobs(id);
     }
     return cancelled;

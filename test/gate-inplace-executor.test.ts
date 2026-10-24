@@ -12,7 +12,7 @@ import { gateEnv } from "../src/gates/run.ts";
 import { attachSlotPools, gateSlotScope } from "../src/gates/slots.ts";
 import { headSha } from "../src/git/repos.ts";
 import { commandScope, confinementScope } from "../src/harness/sandbox.ts";
-import { createScratch } from "../src/harness/scratch.ts";
+import { createScratch, removeScratch } from "../src/harness/scratch.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { gateCommandScope, runGateExecution } from "../src/pipeline/gate-execution.ts";
 import {
@@ -603,6 +603,84 @@ test("shutdown detaches and a new context reattaches to the same job and executo
     detach();
   }
 });
+
+test.each(["confirmed", "failed"])(
+  "cancelling a detached scoped gate removes scratch only after waitStopped succeeds (%s)",
+  async (confirmation) => {
+    const failure = confirmation === "failed";
+    const { f, context, req } = await setup();
+    const controller = new AbortController();
+    req.gates = {
+      ...gates,
+      setup: ['touch "$HOME/setup-token"'],
+      checks: [{ name: "long", run: "echo $$ > gate-pid; while [ ! -f proceed ]; do sleep 0.05; done" }],
+    };
+    await withExecutor(f, async (workers) => {
+      const first = context(controller.signal);
+      const pending = gateCommandScope(first, "gates", "initial", req.cwd, () =>
+        runGateExecution(first, "gates", "initial", req.cwd, req.gates),
+      )().catch((error: unknown) => error);
+      const confirmed = Promise.withResolvers<void>();
+      const releaseWait = Promise.withResolvers<void>();
+      const originalWait = workers.waitStopped.bind(workers);
+      let scratch = "";
+      let id = "";
+      let stopped: ReturnType<typeof spyOn> | undefined;
+      const warning = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await wait(() => existsSync(join(req.cwd, "gate-pid")), { timeoutMs: 10_000 });
+        const pid = Number(readFileSync(join(req.cwd, "gate-pid"), "utf8"));
+        const handle = first.state.gateExecution?.handle;
+        expect(handle?.kind).toBe("inplace");
+        id = handle?.id ?? "";
+        scratch = (JSON.parse(workers.job(id)?.request ?? "{}") as GateRequest).scratch ?? "";
+        if (!scratch) throw new Error("missing gate scratch");
+        controller.abort(new Error("shutdown"));
+        expect(await pending).toBeInstanceOf(Error);
+        expect(workers.job(id)).toMatchObject({ state: "leased", stopped: 0 });
+        expect(recoveryProcessStopped(pid)).toBe(false);
+        expect(existsSync(join(scratch, "setup-token"))).toBe(true);
+        expect(f.store.getRun(first.run.id)?.status).toBe("queued");
+        stopped = spyOn(workers, "waitStopped").mockImplementation(async (jobId) => {
+          await originalWait(jobId);
+          confirmed.resolve();
+          await releaseWait.promise;
+          if (failure) throw new Error("fixture stop confirmation failed");
+        });
+        expect(f.cancelRun(first.run.id)).toBe(true);
+        expect(stopped.mock.calls).toEqual([[id]]);
+        await confirmed.promise;
+        expect(workers.job(id)).toMatchObject({ state: "cancelled", stopped: 1 });
+        expect(recoveryProcessStopped(pid)).toBe(true);
+        expect(existsSync(scratch)).toBe(true);
+        releaseWait.resolve();
+        if (failure) {
+          await wait(() => warning.mock.calls.length > 0, { timeoutMs: 10_000 });
+          expect(warning.mock.calls[0]?.[0]).toContain(
+            "Kept in-place gate scratch: Error: fixture stop confirmation failed",
+          );
+          expect(existsSync(scratch)).toBe(true);
+        } else {
+          await wait(() => !existsSync(scratch), { timeoutMs: 10_000 });
+          expect(warning).not.toHaveBeenCalled();
+        }
+      } finally {
+        releaseWait.resolve();
+        stopped?.mockRestore();
+        writeFileSync(join(req.cwd, "proceed"), "");
+        controller.abort(new Error("shutdown"));
+        await pending;
+        if (id) {
+          workers.cancel(id);
+          await originalWait(id);
+        }
+        // The failure case deliberately retains scratch; the test owns its final cleanup.
+        if (scratch) removeScratch(scratch);
+        warning.mockRestore();
+      }
+    });
+  },
+);
 
 test.each(["sha", "missing", "release", "environment"])(
   "resume rejects a %s mismatch instead of waiting on the old handle",
