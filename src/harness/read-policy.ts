@@ -137,9 +137,6 @@ export function resolvedHome(fs = policyFilesystem): string {
   }
 }
 
-export const keychainReadPaths = () =>
-  process.platform === "darwin" ? policySpellings([join(resolvedHome(), "Library/Keychains")], true) : [];
-
 /** One credential list for tool-enabled sessions and gates; Claude's file-backed login stays readable (#369). */
 export function homeReadPolicy(allowed: string[], gate = false, extra: string[] = [], fs = policyFilesystem) {
   const options = readPolicyScope.getStore();
@@ -148,7 +145,7 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
   const home = resolvedHome(fs);
   const expand = (p: string) => (p === "~" ? home : p.startsWith("~/") ? `${home}/${p.slice(2)}` : p);
   const cargo = expand(env.CARGO_HOME ?? join(home, ".cargo"));
-  const credentials = policySpellings(
+  const otherCredentials = policySpellings(
     [
       ...[
         ".ssh",
@@ -161,7 +158,6 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
         ".docker",
         ".gnupg",
         ".kube",
-        ...(process.platform === "darwin" ? ["Library/Keychains"] : []),
       ].map((p) => join(home, p)),
       ...[
         env.CODEX_HOME,
@@ -191,7 +187,14 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
     true,
     fs,
   );
-  const denyRead = policySpellings([...credentials, ...privateReadPaths()], true, fs);
+  const keychains = policySpellings(
+    process.platform === "darwin" ? [join(home, "Library/Keychains")] : [],
+    true,
+    fs,
+  );
+  const credentials = [...new Set([...otherCredentials, ...keychains])];
+  const otherDenies = policySpellings([...otherCredentials, ...privateReadPaths()], true, fs);
+  const denyRead = [...new Set([...otherDenies, ...keychains])];
   const required = allowed.map((p) => {
     const path = policyPath(p, false, fs);
     if (!path.available) throw new ConfinementError(`Cannot resolve read policy path ${p}`);
@@ -219,6 +222,8 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
   ];
   return {
     denyRead: gate ? [...policySpellings([options.home ?? homedir()], true, fs), ...denyRead] : denyRead,
+    // Preserve provenance before deduplication: another store's deny must beat an exemption.
+    keychainOnlyReadPaths: keychains.filter((path) => !otherDenies.includes(path)),
     ...(gate ? { allowRead } : {}),
   };
 }

@@ -47,6 +47,7 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
+import { protectPrivateFile } from "../src/util/private-reads.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -1597,6 +1598,8 @@ test("ordinary readers deny shared stores while retaining checkout, toolchain an
     if (!roots) throw new Error("missing editor launch roots");
     const outer = seatbeltProfile(roots);
     const editor = buildClaudeArgs(spec, "id");
+    const editorSettings = JSON.parse(editor[editor.indexOf("--settings") + 1] ?? "{}");
+    expect(editorSettings.sandbox.enabled).toBe(false);
     for (const path of [keychain, target]) {
       const mac = process.platform === "darwin";
       expect(homeReadPolicy([]).denyRead.includes(path)).toBe(mac);
@@ -1604,13 +1607,75 @@ test("ordinary readers deny shared stores while retaining checkout, toolchain an
       expect(codexAccess(buildCodexArgs(spec), path)).toBe(mac ? "none" : "read");
       for (const confineReads of [false, true])
         if (mac) expect(codexAccess(buildCodexArgs({ ...reader, confineReads }), path)).toBe("none");
-      expect(claudeSandboxReads(editor, path)).toBe(true);
+      if (mac) {
+        for (const rule of [`Read(/${path})`, `Read(/${path}/**)`]) {
+          expect(editorSettings.permissions.deny).toContain(rule);
+          expect(editor.slice(editor.indexOf("--disallowedTools") + 1)).toContain(rule);
+        }
+        expect(editorSettings.sandbox.filesystem.denyRead).toContain(path);
+      }
+      expect(claudeSandboxReads(editor, path)).toBe(!mac);
+      expect(roots.denyRead).not.toContain(path);
       expect(outer).not.toContain(`(subpath "${path}")`);
     }
     for (const path of homeReadPolicy([]).denyRead.filter((p) => ![keychain, target].includes(p)))
       expect(roots.denyRead).toContain(path);
   });
 });
+
+for (const source of [
+  "built-in",
+  "configured lexical",
+  "configured resolved",
+  "relocated",
+  "invocation",
+  "private",
+]) {
+  test.skipIf(process.platform !== "darwin")(
+    `Claude editor outer Keychain exemption preserves ${source} denies (requires macOS policy)`,
+    async () => {
+      const { root, spec, options } = credentialFixture();
+      const keychain = join(options.home, "Library/Keychains");
+      const target = source === "built-in" ? join(options.home, ".ssh") : join(root, "keychain-store");
+      mkdirSync(dirname(keychain));
+      if (source !== "built-in") writeFileSync(target, "stand-in");
+      symlinkSync(target, keychain);
+      const release = source === "private" ? protectPrivateFile(target) : () => {};
+      try {
+        await readPolicyScope.run(
+          {
+            ...options,
+            denyRead: [
+              ...options.denyRead,
+              ...(source === "configured lexical" ? [keychain] : []),
+              ...(source === "configured resolved" ? [target] : []),
+            ],
+            environment: source === "relocated" ? { GH_CONFIG_DIR: keychain } : {},
+          },
+          async () => {
+            const recording = recordingConfinement();
+            await confinementScope.run(recording.backend, () =>
+              runClaude({ ...spec, denyRead: source === "invocation" ? [keychain] : [] }, async (opts) => {
+                opts.onStdoutLine?.(opts.cmd[4] ?? "");
+                return procResult;
+              }),
+            );
+            const roots = recording.calls[0]?.roots;
+            if (!roots) throw new Error("missing editor launch roots");
+            expect(roots.denyRead).toContain(target);
+            expect(seatbeltProfile(roots)).toContain(`(subpath "${target}")`);
+            if (["configured lexical", "relocated", "invocation"].includes(source)) {
+              expect(roots.denyRead).toContain(keychain);
+              expect(seatbeltProfile(roots)).toContain(`(subpath "${keychain}")`);
+            }
+          },
+        );
+      } finally {
+        release();
+      }
+    },
+  );
+}
 
 test("ordinary Codex reader probes are read-only in credential stores and cached by effective profile", async () => {
   const { spec, options } = credentialFixture();

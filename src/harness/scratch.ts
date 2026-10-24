@@ -123,6 +123,8 @@ export function validateScratch(spec: AgentSpec): string {
 export interface WriteRoots {
   daemonPort?: number;
   denyRead?: string[];
+  /** Keychain spellings not independently denied by another credential or explicit policy entry. */
+  keychainOnlyReadPaths?: string[];
   allowRead?: string[];
   /** Every invocation's command capabilities are unreadable, except this invocation's own. */
   commands?: InvocationCommands;
