@@ -6,7 +6,7 @@ import { findingLines, reviewEscapeCases, validateEscapeCase } from "../scripts/
 import type { ReviewFinding } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { loadRoleCases, type ReviewCase, ReviewCaseFileSchema } from "../src/evals/cases.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
 
 setDefaultTimeout(30_000);
@@ -41,6 +41,7 @@ const seed = seeded(async (root) => {
   const fix2 = await commit("feature.ts", "fixed again\n", "2026-10-02T14:00:00Z");
   await git("checkout", "-q", "main");
   const late = await commit("late.txt", "late\n", "2026-10-04T00:00:00Z");
+  await dated("2026-10-05T00:00:00Z", "merge", "--no-ff", "-qm", "merge reviewed topic", head2);
   mkdirSync(join(root, "repos"));
   await git("clone", "-q", "--bare", work, join(root, "repos/test__repo.git"));
   return { base, head, fix, middle, head2, fix2, unrelatedFix, late };
@@ -218,6 +219,38 @@ test("write uses confirmed blocking labels only, preserves the prefix, formats, 
   expect(biome.exitCode).toBe(0);
 });
 
+test("historical main ignores topic history merged after the review", async () => {
+  row(10, { head: commits.head2, fix: commits.fix2, created: Date.parse("2026-10-02T11:00:00Z") });
+  const result = await reviewEscapeCases(options);
+  expect(result.validation[0]?.status).toBe("included");
+  expect(result.cases[0]?.base).toBe(commits.middle);
+  expect(result.cases[0]?.head).toBe(commits.head2);
+  expect(result.cases[0]?.base).not.toBe(result.cases[0]?.head);
+});
+
+test("write reserves a shared head only after accepting a confirmed round", async () => {
+  row(10);
+  row(10, { round: 2 });
+  row(10, { round: 3 });
+  json(options.confirm, { [key(10, 2)]: label() });
+  const before = read(options.cases);
+  const result = await reviewEscapeCases({ ...options, write: true });
+  expect(result.validation.map((v) => v.status)).toEqual(["excluded", "included", "duplicate"]);
+  expect(result.cases).toHaveLength(1);
+  expect(result.cases[0]?.source).toBe(
+    `pr #10 review round-2 @ ${commits.head.slice(0, 7)} fixed in ${commits.fix.slice(0, 7)}`,
+  );
+  expect(result.cases[0]?.defects[0]?.severity).toBe("major");
+  expect(read(options.cases).cases).toEqual([...before.cases, ...result.cases]);
+  const bytes = readFileSync(options.cases, "utf8");
+  expect((await reviewEscapeCases({ ...options, write: true })).validation.map((v) => v.status)).toEqual([
+    "duplicate",
+    "duplicate",
+    "duplicate",
+  ]);
+  expect(readFileSync(options.cases, "utf8")).toBe(bytes);
+});
+
 test("parity splits and fixed adjudications parse without changing existing splits", async () => {
   row(10);
   row(11, { head: commits.head2, fix: commits.fix2 });
@@ -268,7 +301,7 @@ test.each(["missing", "evals", "unrelated", "null fix", "unknown fix", "unknown 
   },
 );
 
-test("validation rejects a nonancestor base and drops only missing defects", async () => {
+test("validation rejects empty diffs and nonancestor bases and drops only missing defects", async () => {
   row(10, {
     findings: [
       { ...defect, file: "./feature.ts" },
@@ -280,6 +313,10 @@ test("validation rejects a nonancestor base and drops only missing defects", asy
   expect(result.validation[0]?.reason).toContain("missing at head");
   const item = result.cases[0];
   if (!item) throw new Error("missing candidate");
+  await expect(
+    validateEscapeCase(join(options.repos, "test__repo.git"), { ...item, base: item.head }, commits.fix),
+  ).rejects.toThrow("empty diff");
+  expect((await worktrees()).stdout.match(/^worktree /gm)).toHaveLength(1);
   await expect(
     validateEscapeCase(join(options.repos, "test__repo.git"), { ...item, base: commits.late }, commits.fix),
   ).rejects.toThrow("base is not an ancestor");
@@ -301,12 +338,12 @@ test("deduplicates existing and earlier proposed repo/head pairs", async () => {
   ]);
 });
 
-async function cli(args: string[] = []) {
+async function cli(args: string[] = [], preload = join(import.meta.dir, "git-preload.ts")) {
   return sh(
     [
       "bun",
       "--preload",
-      join(import.meta.dir, "git-preload.ts"),
+      preload,
       "scripts/review-escape-cases.ts",
       "--db",
       options.db,
@@ -321,6 +358,51 @@ async function cli(args: string[] = []) {
     { cwd: process.cwd(), allowFail: true },
   );
 }
+
+test.each(["returned validation", "CLI table"])(
+  "%s redacts credentials and private strings in invalid PR URLs",
+  async (boundary) => {
+    const credential = `synthetic-${crypto.randomUUID()}`;
+    const privateString = `private-${crypto.randomUUID()}`;
+    writeFileSync(
+      join(process.env.LIMITLESS_CONFIG_DIR ?? root, "private-strings.txt"),
+      `${privateString}\n`,
+    );
+    row(10);
+    store.db
+      .query("UPDATE review_rounds SET pr_url = ?")
+      .run(`https://github.com/test/repo/pull/10?${credential}/${privateString}`);
+    const before = readFileSync(options.cases, "utf8");
+    let output: string;
+    if (boundary === "returned validation") {
+      registerCredential("escape-output-test", credential);
+      const result = await reviewEscapeCases({ ...options, write: true });
+      expect(result.cases).toEqual([]);
+      expect(result.validation[0]).toMatchObject({
+        round: 1,
+        status: "excluded",
+        reason: "invalid GitHub PR URL",
+      });
+      output = JSON.stringify(result.validation);
+    } else {
+      const preload = join(root, "credential-preload.ts");
+      writeFileSync(
+        preload,
+        `import ${JSON.stringify(join(import.meta.dir, "git-preload.ts"))};\n` +
+          `import { registerCredential } from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};\n` +
+          `registerCredential("escape-output-test", ${JSON.stringify(credential)});\n`,
+      );
+      const result = await cli(["--write", "--confirm", options.confirm], preload);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("invalid GitHub PR URL");
+      output = result.stdout + result.stderr;
+    }
+    expect(output).toContain("[redacted]");
+    expect(output).not.toContain(credential);
+    expect(output).not.toContain(privateString);
+    expect(readFileSync(options.cases, "utf8")).toBe(before);
+  },
+);
 test("CLI prints candidates and validation, honours since, and ignores CI/conflict rows", async () => {
   row(10);
   row(11, { head: commits.head2, fix: commits.fix2, created: Date.parse("2026-10-02T11:00:00Z") });

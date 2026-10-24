@@ -105,6 +105,7 @@ export async function validateEscapeCase(cache: string, item: ReviewCase, fix: s
       throw new Error("base commit does not exist");
     });
     await git("cat-file", "-e", `${item.head}^{commit}`);
+    if (item.base === item.head) throw new Error("empty diff: base equals head");
     await git("merge-base", "--is-ancestor", item.base, item.head).catch(() => {
       throw new Error("base is not an ancestor of head");
     });
@@ -199,7 +200,6 @@ export async function reviewEscapeCases(options: EscapeOptions) {
         result.reason = "repo/head already has a case";
         continue;
       }
-      seen.add(`${repo}@${row.head}`);
       const findings = z.array(finding).parse(JSON.parse(row.findings));
       const evidence = (originals: Finding[]) =>
         `Defects demonstrated by a reproduction in the orchestrator's review round and fixed by the factory in ${row.fix}. Original findings:\n${originals.map(findingText).join("\n\n")}`;
@@ -237,7 +237,14 @@ export async function reviewEscapeCases(options: EscapeOptions) {
       if (observed.exitCode !== 0 && observed.exitCode !== 1)
         throw new Error("cannot inspect default-branch ref");
       const ref = observed.exitCode === 0 ? remote : `refs/heads/${row.branch}`;
-      const atRound = await git("rev-list", "-1", `--before=${Math.floor(row.created / 1000)}`, ref, "--");
+      const atRound = await git(
+        "rev-list",
+        "--first-parent",
+        "-1",
+        `--before=${Math.floor(row.created / 1000)}`,
+        ref,
+        "--",
+      );
       if (!atRound) throw new Error("no default-branch commit before round");
       const base = await git("merge-base", row.head, atRound);
       const item: ReviewCase = {
@@ -283,6 +290,7 @@ export async function reviewEscapeCases(options: EscapeOptions) {
         continue;
       }
       cases.push(item);
+      seen.add(`${repo}@${row.head}`);
       next++;
       result.status = "included";
     } catch (error) {
@@ -324,8 +332,10 @@ export async function reviewEscapeCases(options: EscapeOptions) {
     cases,
     validation: validation.map((r) => ({
       ...r,
-      pr: redactPrivate(r.pr, privateStrings),
-      head: redactPrivate(r.head, privateStrings),
+      pr: redactPrivate(redactCredentials(r.pr), privateStrings),
+      head: redactPrivate(redactCredentials(r.head), privateStrings),
+      status: redactPrivate(redactCredentials(r.status), privateStrings),
+      reason: redactPrivate(redactCredentials(r.reason), privateStrings),
     })),
   };
 }
