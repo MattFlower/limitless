@@ -6,7 +6,7 @@ import type { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { reloadedConfig } from "../src/config-reload.ts";
 import { WorkerStore } from "../src/db/workers.ts";
-import type { ExecutionHandle, GateRequest } from "../src/gates/executor.ts";
+import type { ExecutionEvent, ExecutionHandle, GateRequest } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor } from "../src/gates/executor.ts";
 import { gateEnv } from "../src/gates/run.ts";
 import { attachSlotPools, gateSlotScope } from "../src/gates/slots.ts";
@@ -628,7 +628,20 @@ test.each(["confirmed", "failed"])(
       let stopped: ReturnType<typeof spyOn> | undefined;
       const warning = spyOn(console, "warn").mockImplementation(() => {});
       try {
-        await wait(() => existsSync(join(req.cwd, "gate-pid")), { timeoutMs: 10_000 });
+        await wait(
+          () => {
+            const job = workers.job(first.state.gateExecution?.handle.id ?? "");
+            const events: ExecutionEvent[] = JSON.parse(job?.events ?? "[]");
+            // A lease precedes execution, and shell redirection creates the PID file before writing it.
+            return (
+              job?.state === "leased" &&
+              events.some((e) => e.type === "check" && e.phase === "setup" && e.result.ok) &&
+              existsSync(join(req.cwd, "gate-pid")) &&
+              /^[1-9]\d*\n$/.test(readFileSync(join(req.cwd, "gate-pid"), "utf8"))
+            );
+          },
+          { timeoutMs: 10_000 },
+        );
         const pid = Number(readFileSync(join(req.cwd, "gate-pid"), "utf8"));
         const handle = first.state.gateExecution?.handle;
         expect(handle?.kind).toBe("inplace");
