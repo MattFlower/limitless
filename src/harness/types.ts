@@ -42,6 +42,8 @@ export type AgentEvent =
   | { type: "warning"; id: string; text: string };
 
 export interface AgentSpec {
+  /** Supplied only at the daemon's local Claude launch boundary, never to LAN workers. */
+  claudeSubscriptionToken?: string;
   fast?: boolean;
   cwd: string;
   /** Disposable write root owned by the invocation lifecycle, outside cwd. */
