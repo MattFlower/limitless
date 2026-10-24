@@ -12,6 +12,8 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
+import { Factory } from "../src/app.ts";
+import { Store } from "../src/db/store.ts";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -39,9 +41,10 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
-import { agentEnv, runProcess } from "../src/util/proc.ts";
+import { agentEnv, type ProcOptions, runProcess } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
+import { providerFixture } from "./provider-config-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 
 const fixture = (name: string) =>
@@ -320,6 +323,140 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
     resolve: () => "codex",
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
+
+test.each(["accepted", "stream rejection", "stderr rejection"])(
+  "factory Claude subscription authentication: %s",
+  async (outcome) => {
+    const rejected = outcome !== "accepted";
+    const token = `subscription-${crypto.randomUUID()}`;
+    const keys = [
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CONFIG_DIR",
+    ];
+    const previous = keys.map((key) => process.env[key]);
+    const config = providerFixture([], `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+    const store = new Store(":memory:");
+    let factory: Factory | undefined;
+    try {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      const cfg = config.load();
+      for (const key of keys.slice(0, 3)) process.env[key] = `inherited-${crypto.randomUUID()}`;
+      const userConfig = join(config.root, "claude-config");
+      mkdirSync(userConfig);
+      process.env.CLAUDE_CONFIG_DIR = userConfig;
+      for (const path of [userConfig, join(config.work, ".claude")]) {
+        mkdirSync(path, { recursive: true });
+        for (const name of ["settings.json", "settings.local.json"])
+          writeFileSync(join(path, name), JSON.stringify({ apiKeyHelper: "exit 99" }));
+      }
+      let launches = 0;
+      const launch = async (opts: ProcOptions) => {
+        launches++;
+        // Editors receive a startup wrapper from runSandboxed, followed by the actual Claude args.
+        if (opts.cmd[4]?.startsWith("limitless-started-")) opts.onStdoutLine?.(opts.cmd[4]);
+        const settingsIndex = opts.cmd.indexOf("--settings");
+        const settings = JSON.parse(settingsIndex < 0 ? "{}" : (opts.cmd[settingsIndex + 1] ?? "{}"));
+        const backend = opts.env?.ANTHROPIC_BASE_URL !== undefined;
+        expect(opts.env?.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+        if (backend) {
+          expect(opts.env?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+          expect(opts.env?.ANTHROPIC_BASE_URL).toBe("https://example.invalid");
+          expect(readFileSync(JSON.parse(settings.apiKeyHelper.slice(4)), "utf8")).toBe("backend-key");
+        } else {
+          expect(opts.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
+          expect(opts.env?.ANTHROPIC_API_KEY).toBeUndefined();
+          expect(settings.apiKeyHelper).toBeUndefined();
+          expect(opts.cmd[opts.cmd.indexOf("--setting-sources") + 1]).toBe("");
+        }
+        const diagnostic = `subscription authentication rejected ${token}`;
+        if (rejected) opts.onStderrLine?.(diagnostic);
+        if (outcome !== "stderr rejection")
+          opts.onStdoutLine?.(
+            JSON.stringify({ type: "result", is_error: rejected, result: rejected ? diagnostic : "done" }),
+          );
+        return {
+          exitCode: rejected ? 1 : 0,
+          signal: null,
+          truncated: false,
+          durationMs: 1,
+          stdout: "",
+          stderr: rejected ? diagnostic : "",
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false,
+        };
+      };
+      factory = new Factory(cfg, { store, harnesses: { claude: (spec) => runClaude(spec, launch) } });
+      const harness = factory.deps.harnesses.claude;
+      if (!harness) throw new Error("missing Claude harness");
+      expect(agentEnv({ CLAUDE_CODE_OAUTH_TOKEN: token, OTHER: token }).OTHER).toBeUndefined();
+      await confinedEdit(config.work, async (scratchDir) => {
+        const cases = rejected
+          ? [{ mode: "edit" as const, noTools: false, backend: false }]
+          : [
+              { mode: "edit" as const, noTools: false, backend: false },
+              { mode: "readonly" as const, noTools: false, backend: false },
+              { mode: "edit" as const, noTools: true, backend: false },
+              { mode: "readonly" as const, noTools: true, backend: false },
+              { mode: "edit" as const, noTools: true, backend: true },
+            ];
+        for (const [index, scenario] of cases.entries()) {
+          const events: AgentEvent[] = [];
+          const logPath = join(scratchDir, `auth-${index}.log`);
+          const result = await harness({
+            cwd: config.work,
+            scratchDir,
+            prompt: "test",
+            mode: scenario.mode,
+            noTools: scenario.noTools,
+            target: {
+              modelId: "claude/test",
+              model: "test",
+              provider: "claude",
+              harness: "claude",
+              vendor: "anthropic",
+              billing: "subscription",
+              tier: 4,
+              ...(scenario.backend
+                ? { backend: { baseUrl: "https://example.invalid", authToken: "backend-key" } }
+                : {}),
+            },
+            timeoutMs: 10_000,
+            idleTimeoutMs: 10_000,
+            maxToolCalls: 10,
+            signal: new AbortController().signal,
+            logPath,
+            onEvent: (event) => events.push(event),
+          });
+          expect(result.status).toBe(rejected ? "error" : "ok");
+          if (rejected) {
+            expect(result.error).toBe("subscription authentication rejected [redacted]");
+            for (const output of [
+              JSON.stringify(result),
+              JSON.stringify(events),
+              readFileSync(logPath, "utf8"),
+            ]) {
+              expect(output).not.toContain(token);
+              expect(output).toContain("subscription authentication rejected [redacted]");
+            }
+          }
+        }
+        expect(launches).toBe(cases.length);
+      });
+    } finally {
+      for (const [index, key] of keys.entries()) {
+        const value = previous[index];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await factory?.stop();
+      store.close();
+      config.close();
+    }
+  },
+);
 
 // Holds every launch before the trusted startup shell; the optional hook runs just before the spawn.
 // A chatty hold emits diagnostics without reporting agent progress.
