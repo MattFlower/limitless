@@ -23,9 +23,13 @@ export class Scheduler {
 
   constructor(
     private readonly deps: EngineDeps,
-    private readonly maxConcurrent: number,
+    private maxConcurrent: number,
     private readonly options: { maxLoadPerCore?: number; loadSource?: () => number } = {},
   ) {}
+
+  setLimit(limit: number): void {
+    this.maxConcurrent = limit;
+  }
 
   start(): void {
     for (const run of this.deps.store.listRuns({

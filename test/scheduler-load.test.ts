@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -35,7 +35,7 @@ function fixture(limit = 2, concurrency = 3) {
   const factory = new Factory(cfg, {
     store: new Store(":memory:"),
     loadSource: () => load,
-    providers: providers.slice(0, 1),
+    providers: providers.slice(0, 1).map((provider) => ({ ...provider, maxConcurrent: 4 })),
     models: models.slice(0, 1),
     policy,
     harnesses: {
@@ -88,8 +88,54 @@ function fixture(limit = 2, concurrency = 3) {
       load = value;
     },
     release: () => release.resolve(),
+    reload: (concurrency: number) => {
+      mkdirSync(cfg.paths.configDir, { recursive: true });
+      writeFileSync(
+        join(cfg.paths.configDir, "config.toml"),
+        `[limits]\nmax_load_per_core = ${limit}\nmax_concurrent_runs = ${concurrency}\n`,
+      );
+      factory.reloadConfig();
+      factory.scheduler.tick();
+    },
   };
 }
+
+test("reload raises and lowers admission without interrupting active runs", async () => {
+  const f = fixture(2, 1);
+  const queued = [f.enqueue(), f.enqueue(), f.enqueue(), f.enqueue()] as const;
+  f.scheduler.tick();
+  await waits.until(() => f.calls.length === 1, { timeoutMs: 2000 });
+  expect(f.scheduler.activeRunIds).toEqual([queued[0]]);
+  f.reload(3);
+  await waits.until(() => f.calls.length === 3, { timeoutMs: 2000 });
+  expect(f.scheduler.activeRunIds).toEqual(queued.slice(0, 3));
+  f.reload(1);
+  expect(f.scheduler.activeRunIds).toHaveLength(3);
+  expect(f.calls.every((call) => !call.signal.aborted)).toBe(true);
+  for (const id of queued.slice(1, 3)) f.scheduler.cancel(id);
+  await waits.until(() => f.scheduler.activeRunIds.length === 1, { timeoutMs: 2000 });
+  expect(f.factory.store.getRun(queued[3] ?? "")?.status).toBe("queued");
+  f.release();
+  await waits.until(() => f.calls.length === 4, { timeoutMs: 2000 });
+  expect(f.scheduler.activeRunIds).toEqual([queued[3]]);
+});
+
+test("reload preserves drain and load holds when concurrency increases", async () => {
+  const f = fixture(2, 1);
+  f.enqueue();
+  f.scheduler.tick();
+  await waits.until(() => f.calls.length === 1, { timeoutMs: 2000 });
+  f.enqueue();
+  f.scheduler.drain();
+  f.reload(3);
+  expect(f.scheduler.activeRunIds).toHaveLength(1);
+  f.setLoad(3);
+  f.scheduler.resume();
+  f.scheduler.tick();
+  expect(f.scheduler.activeRunIds).toHaveLength(1);
+  expect(f.scheduler.admissionHeld).toBe(true);
+  expect(f.calls[0]?.signal.aborted).toBe(false);
+});
 
 test.each([
   [2, 3, true],
