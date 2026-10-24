@@ -145,8 +145,13 @@ export function bwrapArgs(
   const masked = [...hidden, ...outer];
   // Ancestors already behind a mask, a private tmpfs or another invocation's hidden command root show
   // nothing the host creates there later.
+  // Each absent deny's first missing name, which its shadow leaves out.
+  const excluded = absent.map(({ dir, name }) => join(dir, name));
   const shadowed = [...new Set(absent.map(({ dir }) => dir))]
     .filter((dir) => ![...masked, ...commandRoots].some((m) => within(m, dir)))
+    // A directory a later lookup found inside an entry another shadow leaves out is already hidden by
+    // that shadow's tmpfs; shadowing it too would bind its contents back.
+    .filter((dir) => !excluded.some((entry) => within(entry, dir)))
     .sort((a, b) => a.length - b.length);
   if (shadowed.includes("/"))
     throw new ConfinementError("Cannot confine a denied path whose only existing ancestor is /");
@@ -154,7 +159,7 @@ export function bwrapArgs(
   // absent one counts from the first name that was missing, so its future ancestor stays out too.
   const unbound = new Set([
     ...denied.flatMap(({ path, real }) => (real ? [real, entryOf(path)] : [])),
-    ...absent.map(({ dir, name }) => join(dir, name)),
+    ...excluded,
   ]);
   const mask = (path: string) =>
     statSync(path).isDirectory() ? ["--ro-bind", sources.dir, path] : ["--ro-bind", sources.file, path];

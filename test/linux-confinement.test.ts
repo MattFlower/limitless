@@ -363,6 +363,41 @@ test("a denied path the host creates while the mounts are built is never bound b
   expect(at("--ro-bind-try", join(home, ".ssh"), join(home, ".ssh"))).toBe(-1);
 });
 
+test("review: a later nested shadow cannot restore an earlier excluded missing subtree", () => {
+  const home = join(root, "home");
+  mkdirSync(home);
+  const config = join(home, ".config");
+  const hosts = join(config, "gh/hosts.yml");
+  const sources = { dir: join(root, "mask-dir"), file: join(root, "mask-file") };
+  const realpath = fs.realpathSync;
+  let created = false;
+  const spy = spyOn(fs, "realpathSync").mockImplementation(((path: string, options: never) => {
+    const value = realpath(path, options);
+    // The first absent deny records home/.config as its first missing component;
+    // the next deny now observes .config as an existing ancestor.
+    if (path === home && !created) {
+      created = true;
+      mkdirSync(dirname(hosts), { recursive: true });
+      writeFileSync(hosts, "secret");
+    }
+    return value;
+  }) as typeof fs.realpathSync);
+  let args: string[] = [];
+  try {
+    args = bwrapArgs({ write: [], protect: [], denyRead: [hosts, join(config, "missing")] }, sources, []);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(created).toBe(true);
+  const at = (...seq: string[]) => args.findIndex((_, n) => seq.every((v, k) => args[n + k] === v));
+  expect(at("--tmpfs", home)).toBeGreaterThan(0);
+  expect(at("--ro-bind-try", config, config)).toBe(-1);
+  // Home's tmpfs already hides .config, so no second shadow is mounted over it.
+  expect(at("--tmpfs", config)).toBe(-1);
+  expect(at("--ro-bind", sources.file, hosts)).toBe(-1);
+  expect(at("--ro-bind-try", join(config, "gh"), join(config, "gh"))).toBe(-1);
+});
+
 test("the Linux launch keeps the payload's environment and cwd off the unconfined launcher and bwrap", () => {
   const { work, roots } = layout();
   const secret = `secret-${crypto.randomUUID()}`;
