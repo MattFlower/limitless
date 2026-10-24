@@ -260,6 +260,8 @@ export interface InvokeOptions {
   redactHoldout?: boolean;
   /** Run in this directory instead of the worktree (e.g. a base-commit snapshot). */
   cwd?: string;
+  /** Trusted gate setup for a detached LAN reader checkout. */
+  readerSetup?: string[];
   /** Paths a tool-enabled reader must not read (see AgentSpec.denyRead). */
   denyRead?: string[];
   /** Tools read only the cwd and scratch (see AgentSpec.confineReads). */
@@ -935,6 +937,7 @@ export class RunContext {
               slottedCommands,
               agentFullSuite: this.state.agentFullSuite,
               shadow: Boolean(shadow),
+              readerSetup: opts.readerSetup,
               private: Boolean(opts.privateOutput || opts.redactHoldout || opts.privateSession),
               denyRead: opts.denyRead,
               dispatch,

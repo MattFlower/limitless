@@ -1,6 +1,9 @@
 import type { Invocation, Role, Run } from "../core/types.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
 import type { FactoryGateHandler, TestWait } from "../gates/agent-tests.ts";
+import { redactGateOutput } from "../gates/output.ts";
+import { runLocalGates } from "../gates/run.ts";
+import { discardChanges } from "../git/repos.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { withSlottedCommands } from "../harness/slotted.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
@@ -39,6 +42,7 @@ export interface AgentCall {
   spec: AgentSpec;
   slottedCommands: SlottedCommands;
   agentFullSuite?: AgentFullSuite;
+  readerSetup?: string[];
   shadow: boolean;
   private: boolean;
   denyRead: AgentSpec["denyRead"];
@@ -58,6 +62,22 @@ export const localAgentExecutor: AgentExecutor = {
   kind: "local",
   run: (_call, local) => local(),
 };
+
+/** Factory-owned setup: readers retain write access only to their invocation scratch. */
+export async function prepareReaderCheckout(cwd: string, setup: string[], signal: AbortSignal) {
+  if (!setup.length) return;
+  const result = await runLocalGates(
+    cwd,
+    { setup, checks: [], source: ".limitless.toml", protectedPaths: [] },
+    signal,
+  );
+  signal.throwIfAborted();
+  if (!result.setupOk) {
+    const failed = result.setup.find((r) => !r.ok);
+    throw new Error(redactGateOutput(`Reader setup failed: $ ${failed?.command}\n${failed?.output}`));
+  }
+  await discardChanges(cwd);
+}
 
 /** One lifecycle for tool-enabled sessions, on the coordinator or a worker. */
 export function runToolAgent(

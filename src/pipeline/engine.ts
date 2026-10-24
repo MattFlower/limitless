@@ -94,7 +94,11 @@ import {
   redactCredentials,
 } from "../util/proc.ts";
 import { publicationFields } from "../workers/publication.ts";
-import type { AgentPublication, AgentPublicationHooks } from "./agent-executor.ts";
+import {
+  type AgentPublication,
+  type AgentPublicationHooks,
+  prepareReaderCheckout,
+} from "./agent-executor.ts";
 import { reusableAgentGate } from "./agent-gate.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
@@ -1829,6 +1833,14 @@ async function oneRound(
   }
 
   const concurrent = profile(ctx) !== "quick" && ctx.state.flow !== "verify-change" && !resolution;
+  // Cached/resumed or remote gates are not evidence of an install in the reader's worktree.
+  // A matching preview already prepares this checkout before the concurrent readers start.
+  const previewWillSetup =
+    concurrent && ctx.state.previewConfig && needsPreview(ctx.state.previewConfig, diff);
+  if (!localSetupReady && !previewWillSetup) {
+    await prepareReaderCheckout(cwd, gates.setup, ctx.signal);
+    localSetupReady = true;
+  }
   // --- review
   if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
@@ -1948,6 +1960,7 @@ async function oneRound(
           role: "review",
           stage,
           mode: "readonly",
+          readerSetup: gates.setup,
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
@@ -2246,8 +2259,9 @@ async function oneRound(
             ),
           );
           const met = v.criteria.filter((c) => c.status === "met").length;
+          const blocked = v.criteria.filter((c) => c.status === "blocked").length;
           return {
-            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
+            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${target.modelId})`,
             value: v,
           };
         },

@@ -248,17 +248,26 @@ test("actionable feedback excludes blocked checks and redacts holdout inputs", (
       criteria: [
         { id: "AC-1", status: "blocked", evidence: "bun test failed: EPERM", publicSummary: "" },
         { id: "H-1", status: "unmet", evidence: "secret input returned wrong result", publicSummary: "" },
+        { id: "AC-2", status: "unclear", evidence: "Output not established", publicSummary: "" },
       ],
       overall: "fail",
       notes: "",
     },
-    spec,
+    {
+      ...spec,
+      acceptance_criteria: [
+        ...spec.acceptance_criteria,
+        { id: "AC-2", criterion: "Output works", how_to_verify: "Check output" },
+      ],
+    },
     holdout,
   );
   expect(feedback).not.toContain("AC-1");
   expect(feedback).not.toContain("EPERM");
   expect(feedback).not.toContain("secret input");
   expect(feedback).toContain("H-1");
+  expect(feedback).toContain("AC-2");
+  expect(feedback).toContain("Output not established");
 });
 
 test("backstop detects observed literals absent from the authored scenario", () => {

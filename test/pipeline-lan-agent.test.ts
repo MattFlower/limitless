@@ -19,8 +19,23 @@ import { sh } from "../src/util/proc.ts";
 import { pairWorker, runWorker } from "../src/workers/client.ts";
 import { workerRequest } from "../src/workers/tls.ts";
 import { fakeConfinement } from "./confinement.ts";
-import { approve, pipelineSetup, providers, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import {
+  approve,
+  holdout,
+  pass,
+  pipelineSetup,
+  providers,
+  roleOf,
+  spec,
+  triage,
+  waitFor,
+} from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
+import {
+  dependencyPackage,
+  expectReaderDependency,
+  readerDependencyFixture,
+} from "./reader-dependencies-support.ts";
 import { workerStartupFailures } from "./worker-startup-support.ts";
 
 let home = "",
@@ -1353,6 +1368,63 @@ async function reviewWorker(f: Factory, handler: (s: AgentSpec) => Promise<FakeR
     await listener.stop();
   };
 }
+
+test("LAN review installs dependencies and acceptance verification stays local", async () => {
+  const install = await readerDependencyFixture(repoDir);
+  writeFileSync(
+    join(repoDir, ".limitless.toml"),
+    `[gates]\nsetup = [${JSON.stringify(install)}]\nchecks = []\n`,
+  );
+  await sh(["git", "add", "."], { cwd: repoDir });
+  await sh(["git", "commit", "-qm", "offline reviewer dependencies"], { cwd: repoDir });
+  const bare = await githubFixture();
+  dependencyPackage(join(home, "review-worker/node_modules/zod"), "3.0.0");
+  let verifications = 0;
+  let reviews = 0;
+  let f: Factory;
+  const handler = async (s: AgentSpec): Promise<FakeReply> => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "verify") {
+      verifications++;
+      await expectReaderDependency(s.cwd);
+      expect(f.store.getRunState<RunState>(run.id)?.worktreePath).toBe(s.cwd);
+      return { structured: pass };
+    }
+    if (role === "review") throw new Error("Review should use worker");
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  f = start(handler, false, false, {
+    bootSha: release,
+    providers: providers.map((p) => ({ ...p, harness: "claude" })),
+    harnesses: { claude: fakeHarness(handler) },
+    agentExecutor: {
+      kind: "test",
+      run: (call, local) => lanAgentExecutor(f.workers, f.cfg).run(call, local),
+    },
+  });
+  f.cfg.workers.agents = ["review", "verify"];
+  registerGithub(f, bare);
+  const stop = await reviewWorker(f, async (s) => {
+    reviews++;
+    await expectReaderDependency(s.cwd);
+    return { structured: approve };
+  });
+  const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "standard" });
+  try {
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(reviews).toBe(1);
+    expect(verifications).toBe(1);
+    expect(jobs(f)).toMatchObject([{ state: "done" }]);
+    const job = jobs(f)[0];
+    if (!job) throw new Error("Missing review job");
+    expect(request(job)).toMatchObject({ role: "review", readerSetup: [install] });
+  } finally {
+    await stop();
+  }
+}, 30_000);
 
 // Compare artifact structure while allowing run-specific model, duration and SHA values.
 function structure(value: unknown): unknown {
