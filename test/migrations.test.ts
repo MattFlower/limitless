@@ -448,7 +448,8 @@ test("process discovery migration preserves pre-change data and rollback writes 
     const before = join(directory, "before");
     cpSync(MIGRATION_DIR, before, {
       recursive: true,
-      filter: (src) => !src.endsWith("-process-discoveries.sql"),
+      filter: (src) =>
+        !src.endsWith("-process-discoveries.sql") && !src.endsWith("-process-discovery-owner.sql"),
     });
     const old = new Store(path, before);
     old.setSetting("sentinel", "unchanged");
@@ -470,6 +471,9 @@ test("process discovery migration preserves pre-change data and rollback writes 
       boot: "old-boot",
       createdAt: 1,
       discovery: { group: 42, started: 1, directories: [directory], leader: null, spawnedAt: "0" },
+      ownerId: null,
+      ownerPid: null,
+      ownerBirth: null,
     };
     current.recordProcessDiscovery(evidence);
     expect(current.getRun(original.id)?.prompt).toBe("existing");

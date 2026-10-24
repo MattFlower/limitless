@@ -478,9 +478,19 @@ export class Store {
   recordProcessDiscovery(row: ProcessDiscovery): void {
     this.db
       .query(
-        "INSERT INTO process_discoveries (invocation, run_id, directory, boot, created_at, discovery) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO process_discoveries (invocation, run_id, directory, boot, created_at, discovery, owner_id, owner_pid, owner_birth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(row.invocation, row.runId, row.directory, row.boot, row.createdAt, JSON.stringify(row.discovery));
+      .run(
+        row.invocation,
+        row.runId,
+        row.directory,
+        row.boot,
+        row.createdAt,
+        JSON.stringify(row.discovery),
+        row.ownerId ?? null,
+        row.ownerPid ?? null,
+        row.ownerBirth ?? null,
+      );
   }
 
   listProcessDiscoveries(runId?: string, directory?: string): ProcessDiscovery[] {
@@ -488,7 +498,8 @@ export class Store {
       directory === undefined ? null : directory.endsWith(sep) ? directory : `${directory}${sep}`;
     return this.db
       .query<Omit<ProcessDiscovery, "discovery"> & { discovery: string }, (string | null)[]>(
-        `SELECT invocation, run_id AS runId, directory, boot, created_at AS createdAt, discovery
+        `SELECT invocation, run_id AS runId, directory, boot, created_at AS createdAt, discovery,
+         owner_id AS ownerId, owner_pid AS ownerPid, owner_birth AS ownerBirth
          FROM process_discoveries WHERE (? IS NULL AND ? IS NULL) OR run_id = ?
          OR directory = ? OR substr(directory, 1, length(?)) = ?`,
       )

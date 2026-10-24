@@ -2033,9 +2033,23 @@ export async function createEvalWorktree(
   labels: EvalLabels = { paths: [], contents: [] },
   snapshot = false,
 ): Promise<(() => Promise<void>) & { base: string }> {
+  const cache = await evalRepositoryCache(paths, store, slug, base, head, signal);
+  return createEvalWorktreeFromCache(cache, base, head, path, signal, labels, snapshot);
+}
+
+/** The same isolated checkout and contamination checks, using an already resolved cache. */
+export async function createEvalWorktreeFromCache(
+  cache: string,
+  base: string,
+  head: string,
+  path: string,
+  signal: AbortSignal,
+  labels: EvalLabels,
+  snapshot = false,
+): Promise<(() => Promise<void>) & { base: string }> {
   const cleanup = async () => rmSync(path, { recursive: true, force: true });
   try {
-    const pins = await stageEvalRepo(paths, store, slug, base, head, path, signal, labels, snapshot);
+    const pins = await stagePinnedEvalRepo(cache, base, head, path, signal, labels, snapshot);
     const opts = { cwd: path, signal };
     await worktreeGit(
       ["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]],
@@ -2063,7 +2077,8 @@ export async function snapshotTopLevel(
   labels: EvalLabels,
 ): Promise<string> {
   try {
-    const [, head] = await stageEvalRepo(paths, store, slug, sha, sha, path, signal, labels, true);
+    const cache = await evalRepositoryCache(paths, store, slug, sha, sha, signal);
+    const [, head] = await stagePinnedEvalRepo(cache, sha, sha, path, signal, labels, true);
     // Only the factory writes this eval staging repository; no candidate has run yet.
     const tree = await sh(["git", "ls-tree", "--name-only", "-z", head], { cwd: path, signal });
     return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
@@ -2072,21 +2087,14 @@ export async function snapshotTopLevel(
   }
 }
 
-/**
- * Fill a fresh repository at `path` with the pins (or their snapshot) under refs/eval/{base,head}
- * and reject contamination; returns the commits the candidate will see.
- */
-async function stageEvalRepo(
+async function evalRepositoryCache(
   paths: Paths,
   store: Store,
   slug: string,
   base: string,
   head: string,
-  path: string,
   signal: AbortSignal,
-  labels: EvalLabels,
-  snapshot: boolean,
-): Promise<[string, string]> {
+) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || ![base, head].every((sha) => /^[a-fA-F0-9]{40}$/.test(sha)))
     throw new Error("invalid repository pin");
   const registered = store.getRepoBySlug(slug);
@@ -2103,6 +2111,19 @@ async function stageEvalRepo(
   const cache = cachePath(paths, repo);
   signal.throwIfAborted();
   if (!existsSync(cache)) await ensureCache(paths, repo, signal);
+  return cache;
+}
+
+async function stagePinnedEvalRepo(
+  cache: string,
+  base: string,
+  head: string,
+  path: string,
+  signal: AbortSignal,
+  labels: EvalLabels,
+  snapshot: boolean,
+): Promise<[string, string]> {
+  if (![base, head].every((sha) => /^[a-fA-F0-9]{40}$/.test(sha))) throw new Error("invalid repository pin");
   let pins: [string, string] = [base, head];
   await withRepoLock(cache, async () => {
     signal.throwIfAborted();
@@ -2139,7 +2160,7 @@ async function stageEvalRepo(
       );
     }
     for (const sha of [base, head])
-      if (!(await exists(sha))) throw new Error(`pinned commit ${sha} missing in ${slug}`);
+      if (!(await exists(sha))) throw new Error(`pinned commit ${sha} missing in repository cache`);
     signal.throwIfAborted();
     // A standalone repo holding only history reachable from the pins: a linked worktree
     // would share the cache's refs and objects, exposing later fixes and labeled datasets.
