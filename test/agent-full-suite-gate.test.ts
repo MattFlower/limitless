@@ -338,7 +338,7 @@ test.each([
           const repo = f.store.listRepos()[0];
           if (!repo) throw new Error("missing repo");
           const other = f.store.createRun(repo, { repo: fixture.repoDir, prompt: "other run" });
-          // Only its identity is needed; cancel before yielding to the scheduler's shared handler.
+          // Its shared handler would overwrite snapshotDir; only a foreign run identity is needed.
           f.store.updateRun(other.id, { status: "cancelled" });
           f.store.db.query("UPDATE agent_gate_executions SET run_id = ?").run(other.id);
         }
