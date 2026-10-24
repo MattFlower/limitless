@@ -16,7 +16,7 @@ import { findingEvidence } from "./review-support.ts";
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start, wait } = pipelineSetup({
+const { start, wait, githubFixture, registerGithub } = pipelineSetup({
   get home() {
     return home;
   },
@@ -370,6 +370,7 @@ test.skipIf(platform() !== "linux")("Linux wrapper", () => expect(platform()).to
 });
 
 for (const scenario of [
+  "all-blocked",
   "blocked",
   "passes",
   "retry-unmet",
@@ -379,6 +380,7 @@ for (const scenario of [
   "no-alternative",
 ] as const) {
   test(`environment verification retry: ${scenario}`, async () => {
+    const bare = scenario === "all-blocked" ? await githubFixture() : null;
     const verifierModels: string[] = [];
     const scratchPaths: string[] = [];
     const implementationPrompts: string[] = [];
@@ -420,11 +422,11 @@ for (const scenario of [
             ...pass,
             overall: "fail",
             criteria: pass.criteria.map((c) =>
-              c.id === "AC-1"
+              c.id === "AC-1" || scenario === "all-blocked"
                 ? {
                     ...c,
                     status: scenario === "initial-unclear" ? "unclear" : "blocked",
-                    blockedReason: scenario === "mixed-unclear" ? "environment" : null,
+                    blockedReason: ["mixed-unclear", "all-blocked"].includes(scenario) ? "environment" : null,
                     evidence:
                       scenario === "initial-unclear"
                         ? "Missing evidence: farewell.txt contents were not inspected"
@@ -448,10 +450,15 @@ for (const scenario of [
       implementationPrompts.push(s.prompt);
       return { files: { "farewell.txt": "goodbye\n" }, text: "implemented" };
     });
-    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile: "standard" });
+    if (bare) registerGithub(f, bare);
+    const run = await f.createRun({
+      repo: bare ? "test/repo" : repoDir,
+      prompt: "Add a farewell file",
+      profile: "standard",
+    });
     const terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     expect(terminal).toBe(
-      scenario === "blocked" || scenario === "no-alternative" ? "needs_human" : "succeeded",
+      ["blocked", "all-blocked", "no-alternative"].includes(scenario) ? "needs_human" : "succeeded",
     );
     const state = f.store.getRunState<RunState>(run.id);
     const actionable = ["retry-unmet", "initial-unmet", "initial-unclear", "mixed-unclear"].includes(
@@ -461,6 +468,30 @@ for (const scenario of [
     expect(state?.round).toBe(actionable ? 1 : 0);
     expect(state?.roundsOnImplementer).toBe(actionable ? 1 : 0);
     expect(state?.implementer?.modelId).toBe("alpha/m");
+    if (scenario === "all-blocked") {
+      expect(state?.feedback).toBeNull();
+      expect(state?.verifyResults).toHaveLength(2);
+      for (const result of state?.verifyResults ?? []) {
+        expect(result.overall).toBe("fail");
+        expect(
+          result.criteria.every(
+            (c) =>
+              c.status === "blocked" && c.blockedReason === "environment" && c.evidence.includes("EPERM"),
+          ),
+        ).toBe(true);
+      }
+      expect(f.store.listStages(run.id).filter((s) => s.name === "review")).toMatchObject([
+        { status: "succeeded" },
+      ]);
+      expect(f.store.getRun(run.id)?.prUrl).toBeTruthy();
+      expect(f.store.getArtifact(run.id, "report.md")).toContain("🚧 blocked AC-1");
+    }
+    if (scenario === "all-blocked" || scenario === "mixed-unclear") {
+      const summary = f.store.listStages(run.id).find((s) => s.name === "verify")?.summary;
+      expect(summary).toContain(
+        scenario === "all-blocked" ? "0/4 criteria met, 4 blocked" : "2/4 criteria met, 1 blocked",
+      );
+    }
     expect(new Set(scratchPaths).size).toBe(scratchPaths.length);
     for (const scratch of scratchPaths) expect(existsSync(scratch)).toBe(false);
     expect(verifierModels[0]).toBe("beta/m");
@@ -721,6 +752,12 @@ for (const [reject, status] of [
             ? verifyFeedback
             : "";
         expect(feedback).toBe(expected);
+        if (status === "blocked") {
+          expect(f.store.listStages(run.id).find((s) => s.name === "verify")?.summary).toContain(
+            "3/4 criteria met, 1 blocked",
+          );
+          expect(feedback).not.toContain("Observed incorrect output");
+        }
         expect(initialVerifies).toBe(!reject && status === "blocked" ? 2 : 1);
         const state = f.store.getRunState<RunState>(run.id);
         expect(state?.round).toBe(expected ? 1 : 0);

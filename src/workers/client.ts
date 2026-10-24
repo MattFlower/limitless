@@ -21,7 +21,7 @@ import { ConfinementError, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
-import { runToolAgent } from "../pipeline/agent-executor.ts";
+import { prepareReaderCheckout, runToolAgent } from "../pipeline/agent-executor.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import {
   agentEnv,
@@ -173,6 +173,7 @@ const AgentRequest = z.object({
   confineReads: z.boolean().optional(),
   slottedCommands: z.array(z.array(z.string())).optional(),
   agentFullSuite: z.enum(["slot", "refuse"]).optional(),
+  readerSetup: z.array(z.string()).optional(),
   branch: z.string().optional(),
 });
 const Lease = z.object({
@@ -870,8 +871,9 @@ export async function runWorker(
             },
           };
           const result = await readPolicyScope.run(cfg.readPolicy, () =>
-            confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
-              runToolAgent(
+            confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), async () => {
+              if (req.mode === "readonly") await prepareReaderCheckout(cwd, req.readerSetup ?? [], jobSignal);
+              return runToolAgent(
                 spec,
                 (spec) => {
                   sanitize = agentPathMask([cwd, ...(spec.scratchDir ? [spec.scratchDir] : []), root ?? cwd]);
@@ -882,8 +884,8 @@ export async function runWorker(
                 undefined,
                 undefined,
                 { role: req.role, agentFullSuite: req.agentFullSuite },
-              ),
-            ),
+              );
+            }),
           );
           flush();
           await posts;

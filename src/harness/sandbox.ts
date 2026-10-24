@@ -19,6 +19,7 @@ import {
   resolvedHome,
   specificReadDenies,
 } from "./read-policy.ts";
+import { linuxForPort } from "./sandbox-linux.ts";
 import { scratchEnv, type WriteRoots, withScratch, writeRoots } from "./scratch.ts";
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
@@ -88,6 +89,15 @@ const observed = (roots: WriteRoots): WriteRoots => ({ ...roots, write: [...root
 export interface ConfinementBackend {
   verify(roots: WriteRoots, opts: ProcOptions, run: typeof runProcess): Promise<void>;
   wrap(cmd: string[], roots: WriteRoots): string[];
+  /**
+   * Optional: launch the confined command from a trusted environment and cwd, so nothing the payload
+   * controls runs before confinement applies. The payload's own environment and cwd reach only the payload.
+   */
+  launch?(
+    cmd: string[],
+    roots: WriteRoots,
+    payload: { env: Record<string, string>; cwd: string },
+  ): { cmd: string[]; env: Record<string, string>; cwd: string };
 }
 export const confinementScope = new AsyncLocalStorage<ConfinementBackend>();
 export const seatbeltBackend: ConfinementBackend = {
@@ -103,6 +113,10 @@ export function seatbeltForPort(port: number): ConfinementBackend {
     wrap: (cmd, roots) => seatbeltBackend.wrap(cmd, rootsForPort(roots)),
   };
 }
+
+/** The factory's backend for this platform; anything but Linux gets Seatbelt, which refuses off macOS. */
+export const platformConfinement = (port: number, platform: string = process.platform): ConfinementBackend =>
+  platform === "linux" ? linuxForPort(port) : seatbeltForPort(port);
 
 /** Seatbelt verifies the effective profile every launch; Codex capability probes cache by CLI/version. */
 export async function verifySeatbelt(
@@ -313,7 +327,12 @@ export async function runSandboxed(
     },
     onStderrLine: (line) => forwardLine(line, opts.onStderrLine),
   };
-  const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
+  const launched = backend.launch?.(payload.cmd, roots, { env: payload.env, cwd: payload.cwd }) ?? {
+    cmd: backend.wrap(payload.cmd, roots),
+    env: payload.env,
+    cwd: payload.cwd,
+  };
+  const result = await run({ ...payload, ...launched });
   if (!started) {
     // Our cancel stopped the launch before the trusted shell ran, so the payload never did.
     if (killedByCancel(result) && !launch.failed()) return result;
@@ -329,7 +348,7 @@ export async function runSandboxed(
  * records that the cancel began it while the child still ran. An exit, a timeout, another signal,
  * a child that was already dead or a Seatbelt diagnostic is a failed launch even with a cancel.
  */
-const killedByCancel = (result: ProcResult): boolean =>
+export const killedByCancel = (result: ProcResult): boolean =>
   result.cancelled &&
   result.cancelKilled === true &&
   !result.timedOut &&

@@ -102,6 +102,7 @@ export interface AgentJobRequest
   branch?: string;
   slottedCommands?: SlottedCommands;
   agentFullSuite?: Exclude<AgentFullSuite, "gate">;
+  readerSetup?: string[];
   commit?: {
     message: string;
     authorName: string;
