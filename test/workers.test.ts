@@ -84,6 +84,14 @@ import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
+import {
+  captureSetupEnv,
+  dependencyPackage,
+  expectPrivateSetup,
+  expectReaderDependency,
+  expectReaderPermissions,
+  readerDependencyFixture,
+} from "./reader-dependencies-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
 import { workerStartupFailures } from "./worker-startup-support.ts";
@@ -5563,6 +5571,53 @@ test("worker shutdown clears the fence and a late heartbeat cannot rearm it", as
     scheduled.mockRestore();
   }
 });
+
+test.each(["claude", "codex"] as const)(
+  "readonly worker dependencies: %s",
+  async (harness) => {
+    await listen();
+    const req = await request();
+    const install = await readerDependencyFixture(req.cwd);
+    await sh(["git", "add", "."], { cwd: req.cwd });
+    await sh(["git", "commit", "-qm", "offline dependency fixture"], { cwd: req.cwd });
+    const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd: req.cwd })).stdout.trim();
+    await sh(["git", "clone", "--bare", req.cwd, join(cfg.paths.repos, "test__repo.git")], { cwd: home });
+    const ancestor = join(home, "remote/node_modules/zod");
+    dependencyPackage(ancestor, "3.0.0");
+    const before = readFileSync(join(ancestor, "index.js"), "utf8");
+    const id = enqueueAgent({
+      runId: req.runId,
+      parentSha: sha,
+      branch: "change/worker-agent",
+      role: "review",
+      mode: "readonly",
+      timeoutMs: 15_000,
+      readerSetup: [install, captureSetupEnv],
+      target: { ...agentRequest().target, harness },
+    });
+    let imports = 0;
+    const worker = await loop({
+      harnesses: {
+        [harness]: fakeHarness(async (spec) => {
+          await expectReaderDependency(spec.cwd);
+          expectPrivateSetup(spec.cwd);
+          expectReaderPermissions(spec);
+          imports++;
+          return { text: "checked dependencies" };
+        }),
+      },
+    });
+    try {
+      await until(() => workers.agentJob(id)?.state === "done");
+      expect(imports).toBe(1);
+      expect(workers.agentJob(id)?.result_sha).toBe(sha);
+      expect(readFileSync(join(ancestor, "index.js"), "utf8")).toBe(before);
+    } finally {
+      await worker.stop();
+    }
+  },
+  30_000,
+);
 
 test("readonly worker agent runs at its parent, hides paths, uses local slots and discards edits", async () => {
   await listen();
