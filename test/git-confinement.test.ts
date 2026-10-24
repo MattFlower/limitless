@@ -23,6 +23,7 @@ import {
   pushBranch,
   rebaseOnto,
 } from "../src/git/repos.ts";
+import { BWRAP } from "../src/harness/sandbox-linux.ts";
 import {
   CommandError,
   invocationScratch,
@@ -33,7 +34,7 @@ import {
   recoveryProcessStopped,
   sh,
 } from "../src/util/proc.ts";
-import { seatbeltSkip } from "./confinement.ts";
+import { bwrapSkip, seatbeltSkip } from "./confinement.ts";
 import { fakeGitConfinement } from "./git-preload.ts";
 import { seeded } from "./seeded.ts";
 
@@ -703,9 +704,14 @@ test("every git process of a factory call, auxiliary ones included, runs through
   expect(calls.filter((line) => line.endsWith(" clean -ffdxq"))).toHaveLength(2);
 });
 
-// Seatbelt can't nest, so running the child inside a sandbox makes confinement unavailable to it.
+// Seatbelt can't nest and bwrap needs user namespaces, so these wrappers make confinement unavailable.
 const unavailable =
-  seatbeltSkip === null ? ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)"] : [];
+  seatbeltSkip === null
+    ? ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)"]
+    : bwrapSkip === null
+      ? [BWRAP, "--unshare-user", "--disable-userns", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
+      : [];
+const realGitSkip = seatbeltSkip === null || bwrapSkip === null ? null : bwrapSkip;
 const launch = (code: string, dir: string) =>
   sh([...unavailable, process.execPath, "--config=/dev/null", "--no-env-file", "-e", code], {
     cwd: dir,
@@ -730,8 +736,8 @@ test("a launch without the test preload refuses worktreeGit when confinement is 
   expect(existsSync(marker)).toBe(false);
 });
 
-test.skipIf(seatbeltSkip !== null)(
-  `a launch without the test preload confines worktreeGit (${seatbeltSkip ?? "available"})`,
+test.skipIf(realGitSkip !== null)(
+  `a launch without the test preload confines worktreeGit (${realGitSkip ?? "available"})`,
   async () => {
     const marker = await nested("clean");
     const result = await sh(

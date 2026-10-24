@@ -113,6 +113,7 @@ async function withExecutor(
   const script = `
     import { runInplaceExecutor } from ${JSON.stringify(new URL("../src/gates/inplace.ts", import.meta.url).pathname)};
     import { seatbeltBackend } from ${JSON.stringify(new URL("../src/harness/sandbox.ts", import.meta.url).pathname)};
+    import { linuxBackend } from ${JSON.stringify(new URL("../src/harness/sandbox-linux.ts", import.meta.url).pathname)};
     import { appendFileSync } from 'node:fs';
     import { gitBackend } from ${JSON.stringify(new URL("../src/git/confinement.ts", import.meta.url).pathname)};
     import { processBootInspection } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).pathname)};
@@ -121,8 +122,11 @@ async function withExecutor(
     const cfg = ${JSON.stringify({ paths: f.cfg.paths, port: f.cfg.port, maxConcurrentGates: 1, readPolicy: f.cfg.readPolicy })};
     if (!${realConfinement}) {
       gitBackend.default = { wrap: async cmd => cmd };
-      seatbeltBackend.verify = async (roots) => appendFileSync(${JSON.stringify(join(fixture.home, "executor-ports"))}, String(roots.daemonPort) + '\\n');
-      seatbeltBackend.wrap = cmd => cmd;
+      for (const backend of [seatbeltBackend, linuxBackend]) {
+        backend.verify = async (roots) => appendFileSync(${JSON.stringify(join(fixture.home, "executor-ports"))}, String(roots.daemonPort) + '\\n');
+        backend.wrap = cmd => cmd;
+        backend.launch = (cmd, _roots, payload) => ({ cmd, ...payload });
+      }
     }
     await processBootInspection.run(() => "test-boot", () => runInplaceExecutor(cfg, ${JSON.stringify(sha)}, controller.signal));
   `;

@@ -20,7 +20,7 @@ import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
-import { seatbeltForPort } from "./harness/sandbox.ts";
+import { platformConfinement } from "./harness/sandbox.ts";
 import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { configureGitHubIdentity } from "./integrations/github-identity.ts";
@@ -189,7 +189,7 @@ export class Factory {
       gateExecutor:
         opts.gateExecutor ??
         gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos, cfg.executorEnabled),
-      confinement: opts.confinement ?? seatbeltForPort(cfg.port),
+      confinement: opts.confinement ?? platformConfinement(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
       store: this.store,
