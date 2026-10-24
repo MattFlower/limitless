@@ -112,6 +112,8 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
 );
 export const GateRunSchema = z
   .object({
+    trackedClean: z.boolean().optional(),
+    provenanceError: z.string().optional(),
     sha: z
       .string()
       .regex(/^(?:[a-f\d]{40}|[a-f\d]{64})$/i)

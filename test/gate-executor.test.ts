@@ -6,7 +6,7 @@ import { auditDiff } from "../src/gates/audit.ts";
 import { baselineCacheKey, cacheableBaseline } from "../src/gates/cache.ts";
 import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
-import { executeGate, gateExecutorFor, localExecutor } from "../src/gates/executor.ts";
+import { executeGate, gateExecutorFor, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import { redactGateData } from "../src/gates/output.ts";
 import {
   compareGates,
@@ -95,7 +95,10 @@ function fake(
     attach(h, _signal, rebuilt) {
       attaches.push(h);
       const req = rebuilt ?? requests.get(h.id) ?? request(fixture.repoDir);
-      const completed = onAttach(h, req);
+      const completed = onAttach(h, req).then(async (run) => ({
+        ...run,
+        ...(await gateProvenance(req.cwd, _signal, req.headSha)),
+      }));
       return {
         result: completed,
         events: {
