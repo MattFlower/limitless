@@ -24,6 +24,7 @@ export type AgentPublication = Required<
 
 export interface AgentPublicationHooks {
   started(id: string): Promise<void>;
+  retired(id: string): Promise<void>;
   resume(request: AgentPublication): Promise<boolean>;
   prepare(): Promise<AgentPublication | null>;
   adopt(sha: string, request: AgentPublication): Promise<void>;
