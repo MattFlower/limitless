@@ -1881,12 +1881,18 @@ test.each([...installationLayouts])("Codex canonical installation profiles (%s)"
   }
 });
 
-test("Codex without a probe runs the resolved executable", async () => {
+test("Codex ordinary readers run the verified executable", async () => {
   const install = codexInstallation("standalone");
   try {
     await withScratch(install.cwd, async (scratchDir) => {
       const probe = new CodexReaderProbe(() => install.executable);
-      const verify = spyOn(probe, "verify");
+      const verify = spyOn(probe, "verify").mockResolvedValue({
+        ok: true,
+        path: install.executable,
+        version: "codex-cli 0.157.1",
+        reason: null,
+        exitCode: 0,
+      });
       let command: string[] = [];
       await runCodex(
         {
@@ -1910,7 +1916,7 @@ test("Codex without a probe runs the resolved executable", async () => {
         },
         probe,
       );
-      expect(verify).not.toHaveBeenCalled();
+      expect(verify).toHaveBeenCalledTimes(1);
       expect(command[0]).toBe(install.executable);
       expect(filesystemEntries(command)).toContainEqual([install.executable, "read"]);
     });

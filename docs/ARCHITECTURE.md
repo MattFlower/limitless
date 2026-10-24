@@ -299,8 +299,12 @@ detection, per-invocation budget, process-group kill on cancel.
   inspects output and retained first attempts, so restored results without a diagnostic flag still block.
 - Gate setup, checks and pipeline retries share private scratch until completion or cancellation.
   Their home reads are denied except for the run's checkout, scratch, recorded Git directories and
-  trusted toolchain homes. Editors deny credential stores through the same read-policy module;
-  Claude's own CLI login remains readable (#369), and Keychain access is a separate gap.
+  trusted toolchain homes. Tool-enabled readers and editors deny credential stores through the same
+  read-policy module, including relocated stores and configured `sandbox.deny_read` paths. Ordinary
+  readers retain broad reads elsewhere; Codex verifies their effective denies before launch and
+  caches verdicts by CLI identity/version, profile kind and deny set. On macOS, `~/Library/Keychains`
+  is denied except for Claude editors: the follow-up to #834 will supply their login from the daemon
+  before denying Keychain access. Claude's file-backed CLI login remains readable (#369).
   HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
   and a private copy of Cargo configuration preserve installed toolchain discovery and read
   access; writes to real HOME remain denied.

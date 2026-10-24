@@ -137,7 +137,10 @@ export function resolvedHome(fs = policyFilesystem): string {
   }
 }
 
-/** One credential list for editors and gates; Claude's own login remains readable (#369). */
+export const keychainReadPaths = () =>
+  process.platform === "darwin" ? policySpellings([join(resolvedHome(), "Library/Keychains")], true) : [];
+
+/** One credential list for tool-enabled sessions and gates; Claude's file-backed login stays readable (#369). */
 export function homeReadPolicy(allowed: string[], gate = false, extra: string[] = [], fs = policyFilesystem) {
   const options = readPolicyScope.getStore();
   if (!options) throw new ConfinementError("Missing factory read policy");
@@ -158,6 +161,7 @@ export function homeReadPolicy(allowed: string[], gate = false, extra: string[] 
         ".docker",
         ".gnupg",
         ".kube",
+        ...(process.platform === "darwin" ? ["Library/Keychains"] : []),
       ].map((p) => join(home, p)),
       ...[
         env.CODEX_HOME,
