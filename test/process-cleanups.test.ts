@@ -1286,6 +1286,75 @@ test("discovery scope selection respects run IDs, checkout boundaries and missin
   ).toEqual(["shared", "sibling"]);
 });
 
+for (const recovery of ["startup", "scoped"] as const) {
+  test(`same-owner abandoned invocation recovers through ${recovery} in a fresh scope`, async () => {
+    store.close();
+    store = new Store(join(directory, "abandoned.db"));
+    const failed = scope();
+    const sentinel = join(directory, "stage-started");
+    let descendant: number | undefined;
+    try {
+      await processInspection.run(
+        async () => {
+          throw new Error("injected shutdown scan failure");
+        },
+        () =>
+          processScope.run(failed, async () => {
+            await expect(
+              runProcess({
+                cmd: [
+                  process.execPath,
+                  "-e",
+                  `const child = require('node:child_process').spawn(process.execPath,
+                    ['-e', 'console.log("ready"); setInterval(() => {}, 1000)'],
+                    { stdio: ['ignore', 'pipe', 'ignore'] });
+                  child.stdout.once('data', () => {
+                    console.log(child.pid); child.stdout.destroy(); child.unref();
+                  });`,
+                ],
+                cwd: directory,
+                env: {},
+                onStdoutLine: (line) => {
+                  descendant = Number(line);
+                },
+              }),
+            ).rejects.toThrow("injected shutdown scan failure");
+          }),
+      );
+      expect(failed.terminationError).toBeInstanceOf(ProcessTerminationError);
+      if (descendant === undefined) throw new Error("Missing descendant pid");
+      expect(recoveryProcessStopped(descendant)).toBe(false);
+      const evidence = store.listProcessDiscoveries();
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0]?.ownerPid).toBe(process.pid);
+      expect(evidence[0]?.ownerBirth).toBe(processBirthSync(process.pid));
+      expect(store.listProcessCleanups()).toEqual([]);
+      const pid = descendant;
+      await processScope.run(scope(), async () => {
+        if (recovery === "startup") await recoverProcessCleanups(store);
+        else await recoverScopedProcesses();
+        expectProcessStopped(pid);
+        expect(store.listProcessDiscoveries()).toEqual([]);
+        expect(store.listProcessCleanups()).toEqual([]);
+        expect(existsSync(sentinel)).toBe(false);
+        const result = await runProcess({
+          cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+          cwd: directory,
+          env: {},
+        });
+        expect(result.exitCode).toBe(0);
+      });
+      expect(existsSync(sentinel)).toBe(true);
+    } finally {
+      const pid = descendant;
+      if (pid !== undefined && !recoveryProcessStopped(pid)) {
+        process.kill(pid, "SIGKILL");
+        await waitFor(() => recoveryProcessStopped(pid));
+      }
+    }
+  });
+}
+
 test("live parallel discoveries survive scoped and background startup recovery", async () => {
   const controller = new AbortController();
   const current = { ...scope(), signal: controller.signal };

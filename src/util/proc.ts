@@ -183,7 +183,8 @@ export async function recoverProcessCleanups(
     // Workers explicitly recover a finished job's ownership, even while their process lives.
     if (!ownership)
       for (const row of discoveries)
-        if (sameBoot(row) && preserveProcessOwner(row)) invocations.delete(row.invocation);
+        if (sameBoot(row) && row.ownerId !== processOwner && preserveProcessOwner(row))
+          invocations.delete(row.invocation);
     records = records.filter((row) => invocations.has(row.invocation));
     discoveries = discoveries.filter((row) => invocations.has(row.invocation));
     const readBirth = processRecoveryInspection.getStore()?.birth ?? processBirth;
