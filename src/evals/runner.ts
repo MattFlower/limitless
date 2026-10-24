@@ -11,7 +11,7 @@ import {
   snapshotTopLevel,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
-import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import {
@@ -413,7 +413,7 @@ export class EvalRunner {
     this.executing.set(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
     this.resizeEvalSlots();
     try {
-      await confinementScope.run(this.deps.confinement ?? seatbeltForPort(this.deps.cfg.port), () =>
+      await confinementScope.run(this.deps.confinement ?? platformConfinement(this.deps.cfg.port), () =>
         readPolicyScope.run(this.deps.cfg.readPolicy, () =>
           this.executeRun(run, file, cases, cache, signal, predecessors),
         ),
