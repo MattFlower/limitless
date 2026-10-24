@@ -46,6 +46,33 @@ const gates = {
   protectedPaths: [],
 };
 
+async function waitForPid(path: string): Promise<number> {
+  let contents = "";
+  await wait(
+    () => {
+      contents = existsSync(path) ? readFileSync(path, "utf8") : "";
+      return /^[1-9]\d*\n$/.test(contents);
+    },
+    { timeoutMs: 10_000 },
+  );
+  return Number(contents);
+}
+
+test("waitForPid waits for a complete PID line after file creation", async () => {
+  const path = join(fixture.home, "delayed-pid");
+  writeFileSync(path, "");
+  let resolved = false;
+  const pending = waitForPid(path).then((pid) => {
+    resolved = true;
+    return pid;
+  });
+  await wait(() => existsSync(path), { timeoutMs: 10_000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(resolved).toBe(false);
+  writeFileSync(path, "123\n");
+  expect(await pending).toBe(123);
+});
+
 async function setup(enabled = true) {
   mkdirSync(join(fixture.home, "cfg"));
   writeFileSync(join(fixture.home, "cfg", "config.toml"), `[executor]\nenabled = ${enabled}\n`);
@@ -250,8 +277,7 @@ test("a canonical-path start recovers an earlier symlink job before unlocking th
   await withExecutor(f, async (workers, crash) => {
     const id = workers.enqueue(req, randomUUID(), true);
     try {
-      await wait(() => existsSync(pidFile), { timeoutMs: 10_000 });
-      const pid = Number(readFileSync(pidFile, "utf8"));
+      const pid = await waitForPid(pidFile);
       expect(recoveryProcessStopped(pid)).toBe(false);
       expect(workers.job(id)?.stopped).toBe(0);
       await crash();
@@ -340,8 +366,7 @@ test("executor crash fallback restores committed bytes after stopping the origin
     const pending = runGateExecution(context(), "gates", "initial", req.cwd, req.gates);
     const rejected = pending.catch((e) => e);
     try {
-      await wait(() => existsSync(pidFile), { timeoutMs: 10_000 });
-      pid = Number(readFileSync(pidFile, "utf8"));
+      pid = await waitForPid(pidFile);
       expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("dirty\n");
       await crash();
       expect((await pending).checks[0]?.ok).toBe(true);
@@ -387,7 +412,7 @@ test.each(["baseline", "initial"])(
     await withExecutor(f, async (workers, crash) => {
       try {
         const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
-        await wait(() => existsSync(pidFile), { timeoutMs: 10_000 });
+        const pid = await waitForPid(pidFile);
         const state = f.store.getRunState<RunContext["state"]>(run.id);
         expect(state?.gateExecution?.purpose).toBe(
           purpose === "baseline" ? "baseline-retry" : "regression-retry",
@@ -399,7 +424,6 @@ test.each(["baseline", "initial"])(
         // A healthy in-place retry reused setup; it has not rebuilt these outputs yet.
         const before = readFileSync(setups, "utf8");
         expect(before).toBe(purpose === "baseline" ? "setup\n" : "setup\nsetup\n");
-        const pid = Number(readFileSync(pidFile, "utf8"));
         await crash();
         expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
         expect(recoveryProcessStopped(pid)).toBe(true);
@@ -557,7 +581,7 @@ test("shutdown detaches and a new context reattaches to the same job and executo
       )();
       const rejected = pending.catch((error) => error);
       try {
-        await wait(() => existsSync(join(req.cwd, "gate-pid")), { timeoutMs: 10_000 });
+        await waitForPid(join(req.cwd, "gate-pid"));
         const handle = first.state.gateExecution?.handle;
         expect(handle?.kind).toBe("inplace");
         const slots = () =>
@@ -632,17 +656,15 @@ test.each(["confirmed", "failed"])(
           () => {
             const job = workers.job(first.state.gateExecution?.handle.id ?? "");
             const events: ExecutionEvent[] = JSON.parse(job?.events ?? "[]");
-            // A lease precedes execution, and shell redirection creates the PID file before writing it.
+            // A lease precedes execution; also wait for setup to finish.
             return (
               job?.state === "leased" &&
-              events.some((e) => e.type === "check" && e.phase === "setup" && e.result.ok) &&
-              existsSync(join(req.cwd, "gate-pid")) &&
-              /^[1-9]\d*\n$/.test(readFileSync(join(req.cwd, "gate-pid"), "utf8"))
+              events.some((e) => e.type === "check" && e.phase === "setup" && e.result.ok)
             );
           },
           { timeoutMs: 10_000 },
         );
-        const pid = Number(readFileSync(join(req.cwd, "gate-pid"), "utf8"));
+        const pid = await waitForPid(join(req.cwd, "gate-pid"));
         const handle = first.state.gateExecution?.handle;
         expect(handle?.kind).toBe("inplace");
         id = handle?.id ?? "";
@@ -904,9 +926,8 @@ test.each(["SHA", "daemon port"])(
       };
       const pending = runGateExecution(current, "gates", "initial", req.cwd, long).catch((e) => e);
       try {
-        await wait(() => existsSync(join(req.cwd, "previous-pid")), { timeoutMs: 10_000 });
+        const pid = await waitForPid(join(req.cwd, "previous-pid"));
         const old = current.state.gateExecution?.handle.id ?? "";
-        const pid = Number(readFileSync(join(req.cwd, "previous-pid"), "utf8"));
         controller.abort(new Error("shutdown"));
         await pending;
         if (kind === "SHA") {
@@ -956,8 +977,7 @@ test("a daemon release change stops a running job before in-process fallback", a
     const pending = runGateExecution(context(), "gates", "initial", req.cwd, long);
     const rejected = pending.catch((e) => e);
     try {
-      await wait(() => existsSync(join(req.cwd, "previous-pid")), { timeoutMs: 10_000 });
-      const pid = Number(readFileSync(join(req.cwd, "previous-pid"), "utf8"));
+      const pid = await waitForPid(join(req.cwd, "previous-pid"));
       f.store.setSetting("executor.daemonRelease", "new-release");
       expect((await pending).checks[0]?.ok).toBe(true);
       expect(recoveryProcessStopped(pid)).toBe(true);
@@ -992,8 +1012,7 @@ test.each(["during resume", "before resume"])(
       const first = context(controller.signal);
       const pending = runGateExecution(first, "gates", "initial", req.cwd, long).catch((e) => e);
       try {
-        await wait(() => existsSync(pidFile), { timeoutMs: 10_000 });
-        const pid = Number(readFileSync(pidFile, "utf8"));
+        const pid = await waitForPid(pidFile);
         const id = first.state.gateExecution?.handle.id ?? "";
         controller.abort(new Error("shutdown"));
         await pending;
