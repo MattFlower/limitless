@@ -98,6 +98,9 @@ export const redactGateDiagnostics = <T extends GateResult>(result: T): T => ({
   ...result,
   confinementError: result.confinementError ?? launchFailure(result.output),
   output: redactGateOutput(result.output),
+  ...(result.failureAttributionReason !== undefined
+    ? { failureAttributionReason: redactGateOutput(result.failureAttributionReason) }
+    : {}),
   ...(result.testCoverage ? { testCoverage: redactGateData(result.testCoverage) } : {}),
   ...(result.failures !== undefined ? { failures: redactGateOutput(result.failures) } : {}),
   ...(result.firstAttempt ? { firstAttempt: redactGateDiagnostics(result.firstAttempt) } : {}),
