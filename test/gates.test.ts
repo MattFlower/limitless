@@ -591,6 +591,52 @@ describe("runGates / compareGates", () => {
     ]);
   });
 
+  test.each([true, false])("targeted results are independent of full baseline (ok=%s)", (baseOk) => {
+    const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", baseOk)] };
+    const docsOnly = {
+      mode: "targeted" as const,
+      changedPaths: ["docs/guide.md"],
+      files: ["doc_test.ts"],
+      reason: "docs-only change; test source references a changed path or basename",
+    };
+    for (const ok of [true, false]) {
+      const after: GateRun = { setupOk: true, setup: [], checks: [{ ...r("test", ok), docsOnly }] };
+      expect(compareGates(baseline, after)[0]).toMatchObject({
+        verdict: ok ? "targeted_pass" : "targeted_failure",
+        blocking: !ok,
+      });
+      expect(compareGates(null, after)[0]?.verdict).toBe(ok ? "targeted_pass" : "targeted_failure");
+      after.checks = after.checks.map((c) => ({ ...c, confinementError: true }));
+      expect(compareGates(baseline, after)[0]).toMatchObject({
+        verdict: "confinement_error",
+        blocking: true,
+      });
+    }
+  });
+
+  test.each([true, false])("a docs-skipped baseline provides no pass/fail evidence (ok=%s)", (ok) => {
+    const baseline: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [
+        {
+          ...r("test", false),
+          docsOnly: {
+            mode: "skipped",
+            changedPaths: ["docs/guide.md"],
+            files: [],
+            reason: "docs-only change; no test reads the changed files",
+          },
+        },
+      ],
+    };
+    const after: GateRun = { setupOk: true, setup: [], checks: [r("test", ok)] };
+    expect(compareGates(baseline, after)[0]).toMatchObject({
+      verdict: ok ? "new_pass" : "new_failure",
+      blocking: !ok,
+    });
+  });
+
   test.each(["flag", "output", "firstAttempt", "targetedRetry"] as const)(
     "baseline confinement failure makes only its check unusable (%s)",
     (kind) => {
@@ -947,6 +993,7 @@ describe("gate slots and flaky retry", () => {
     duration?: number;
     referenceMs?: number;
     referenceOk?: boolean;
+    referenceName?: string;
     missing?: boolean;
     result?: Partial<GateResult>;
     firstOk?: boolean;
@@ -959,6 +1006,7 @@ describe("gate slots and flaky retry", () => {
     { name: "exactly the increase floor", duration: 80_000, referenceMs: 20_000, expected: true },
     { name: "failing counterpart", referenceOk: false, expected: false },
     { name: "missing counterpart", missing: true, expected: false },
+    { name: "unmatched counterpart", referenceName: "other", expected: false },
     { name: "zero duration counterpart", referenceMs: 0, expected: false },
     { name: "timeout", result: { timedOut: true }, expected: false },
     { name: "confinement", result: { confinementError: true }, expected: false },
@@ -973,32 +1021,34 @@ describe("gate slots and flaky retry", () => {
     { name: "other verdict", verdict: "new_failure", expected: false },
     { name: "slow regression", expected: true },
   ];
-  test.each(slowCases)("slow regression: $name", (row) => {
-    const reference: GateResult = {
-      name: "test",
-      command: "fake-test",
-      ok: row.referenceOk ?? true,
-      exitCode: 0,
-      durationMs: row.referenceMs ?? 100_000,
-      output: "passed",
-    };
-    const result: GateResult = {
-      ...reference,
-      ok: false,
-      exitCode: 1,
-      durationMs: row.duration ?? 400_000,
-      ...row.result,
-      ...(row.firstOk !== undefined ? { firstAttempt: { ...reference, ok: row.firstOk } } : {}),
-    };
-    const c: GateComparison = {
-      name: "test",
-      verdict: row.verdict ?? "regressed",
-      blocking: true,
-      result,
-      ...(row.comparisonFirst ? { firstAttempt: reference } : {}),
-    };
-    expect(isSlowRegression(c, [c], row.missing ? [] : [reference])).toBe(row.expected);
-  });
+  for (const verdict of ["regressed", "targeted_failure"] as const)
+    test.each(slowCases)(`slow ${verdict}: $name`, (row) => {
+      const reference: GateResult = {
+        name: row.referenceName ?? "test",
+        command: "fake-test",
+        ok: row.referenceOk ?? true,
+        exitCode: 0,
+        durationMs: row.referenceMs ?? 100_000,
+        output: "passed",
+      };
+      const result: GateResult = {
+        ...reference,
+        name: "test",
+        ok: false,
+        exitCode: 1,
+        durationMs: row.duration ?? 400_000,
+        ...row.result,
+        ...(row.firstOk !== undefined ? { firstAttempt: { ...reference, ok: row.firstOk } } : {}),
+      };
+      const c: GateComparison = {
+        name: "test",
+        verdict: row.verdict ?? verdict,
+        blocking: true,
+        result,
+        ...(row.comparisonFirst ? { firstAttempt: reference } : {}),
+      };
+      expect(isSlowRegression(c, [c], row.missing ? [] : [reference])).toBe(row.expected);
+    });
 
   test("fail → retry → pass is flaky and does not block", async () => {
     const { c, summary } = await retried(
@@ -1964,6 +2014,62 @@ const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal
   sandbox.confinementScope.run(fakeConfinement, () =>
     productionRetry(cmp, cwd, cfg, changed, signal, onWait),
   );
+
+test.each([true, false])("docs-targeted regression retry retains its scope (ok=%s)", async (ok) => {
+  const cwd = tempDir({ "doc_test.ts": "" });
+  const command = "bun test './doc_test.ts'";
+  const original: GateResult = {
+    name: "test",
+    command,
+    ok: false,
+    exitCode: 1,
+    durationMs: 1,
+    output: "failure",
+    failedFiles: ["doc_test.ts"],
+    docsOnly: {
+      mode: "targeted",
+      files: ["doc_test.ts"],
+      changedPaths: ["docs/guide.md"],
+      reason: "docs-only change",
+    },
+  };
+  const cfg: GateConfig = {
+    setup: [],
+    checks: [{ name: "test", run: command }],
+    retryFiles: "bun test {files}",
+    source: "detected",
+    protectedPaths: [],
+  };
+  const commands: string[] = [];
+  try {
+    const cmp = compareGates(null, { setupOk: true, setup: [], checks: [original] });
+    const retried = await productionRetry(
+      cmp,
+      cwd,
+      cfg,
+      [],
+      new AbortController().signal,
+      undefined,
+      async (gates) => {
+        commands.push(...gates.checks.map((c) => c.run));
+        return {
+          setupOk: true,
+          setup: [],
+          checks: [{ ...original, ok, exitCode: ok ? 0 : 1, docsOnly: undefined }],
+        };
+      },
+    );
+    expect(commands).toEqual(ok ? [command, command] : [command]);
+    expect(retried[0]).toMatchObject({
+      verdict: ok ? "flaky" : "targeted_failure",
+      blocking: !ok,
+      result: { docsOnly: original.docsOnly },
+      firstAttempt: original,
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test.each(["baseline", "regression"])("standalone %s retries own scratch per check", async (kind) => {
   const cwd = tempDir({});
