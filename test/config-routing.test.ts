@@ -6,7 +6,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { seatbeltBackend } from "../src/harness/sandbox.ts";
+import { platformConfinement } from "../src/harness/sandbox.ts";
 import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router/catalog.ts";
 import { exportProviders, resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
@@ -446,7 +446,10 @@ test("provider concurrency overrides reach the tracker without changing catalog 
     expect(loadConfig({ home: join(root, "data"), configDir }).secrets.OMLX_API_KEY).toBe("file-key");
     const defaults = new Factory(loadConfig({ home: join(root, "defaults"), configDir }));
     expect(defaults.deps.confinement?.wrap(["true"], { write: [root], protect: [] })).toEqual(
-      seatbeltBackend.wrap(["true"], { write: [root], protect: [], daemonPort: defaults.cfg.port }),
+      platformConfinement(defaults.cfg.port).wrap(["true"], { write: [root], protect: [] }),
+    );
+    expect(defaults.deps.confinement?.wrap(["true"], { write: [root], protect: [] }).join(" ")).toContain(
+      String(defaults.cfg.port),
     );
     expect(defaults.tracker.status("omlx")?.maxConcurrent).toBe(4);
     defaults.store.close();

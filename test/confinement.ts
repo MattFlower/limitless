@@ -1,4 +1,6 @@
+import { landlockCommand } from "../src/harness/landlock.ts";
 import type { ConfinementBackend } from "../src/harness/sandbox.ts";
+import { BWRAP } from "../src/harness/sandbox-linux.ts";
 import type { WriteRoots } from "../src/harness/scratch.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 
@@ -32,3 +34,27 @@ export const seatbeltSkip =
             env: agentEnv(),
           }),
         );
+
+/** Real bwrap needs Linux, usable user namespaces (AppArmor may restrict them) and Landlock ABI 6. */
+export const bwrapSkip =
+  process.platform !== "linux"
+    ? "requires Linux bubblewrap"
+    : (
+          await runProcess({
+            cmd: [
+              ...landlockCommand(0),
+              "--",
+              BWRAP,
+              "--unshare-user",
+              "--unshare-pid",
+              "--ro-bind",
+              "/",
+              "/",
+              "/bin/true",
+            ],
+            cwd: process.cwd(),
+            env: agentEnv(),
+          })
+        ).exitCode !== 0
+      ? "bubblewrap with user namespaces and Landlock ABI 6 unavailable"
+      : null;
