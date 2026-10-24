@@ -15,18 +15,18 @@ export interface DocsSelection {
 /** Recognize one invocation without evaluating shell content; unknown syntax keeps the full check. */
 function singleBunTest(command: string): boolean {
   if (!/^[\t ]*bun[\t ]+test(?:[\t ]|$)/.test(command)) return false;
-  const stack = [{ quote: "", depth: 0 }];
+  const stack = [{ quote: "" }];
   for (let i = 0; i < command.length; i++) {
     const frame = stack.at(-1);
     const c = command[i];
     if (!frame || c === "`" || (stack.length === 1 && /[\r\n]/.test(c ?? ""))) return false;
     if (c === "\\" && frame.quote !== "'") {
       const next = command[++i];
-      if (!next || (stack.length === 1 && /[\r\n]/.test(next))) return false;
+      if (!next || /[\r\n]/.test(next)) return false;
     } else if (c === "$" && frame.quote !== "'" && /['"{]/.test(command[i + 1] ?? "")) {
       return false;
     } else if (c === "$" && command[i + 1] === "(" && frame.quote !== "'") {
-      stack.push({ quote: "", depth: 1 });
+      stack.push({ quote: "" });
       i++;
     } else if (frame.quote) {
       if (c === frame.quote) frame.quote = "";
@@ -34,8 +34,9 @@ function singleBunTest(command: string): boolean {
     // Comments and heredocs need shell grammar beyond balanced substitutions.
     else if (c === "#" || (c === "<" && command[i + 1] === "<")) return false;
     else if (stack.length > 1) {
-      if (c === "(") frame.depth++;
-      if (c === ")" && --frame.depth === 0) stack.pop();
+      // Case patterns and bare parentheses require shell grammar, not delimiter counting.
+      if (c === "(" || (c === "c" && /^case\b/.test(command.slice(i)))) return false;
+      if (c === ")") stack.pop();
     } else if (/[;&|<>()#]/.test(c ?? "")) return false;
   }
   return stack.length === 1 && stack[0]?.quote === "";
