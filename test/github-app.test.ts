@@ -27,7 +27,8 @@ import {
 } from "../src/integrations/github-identity.ts";
 import { getGitHubPr } from "../src/integrations/github-notifier.ts";
 import { ghClient, startGitHubPoller } from "../src/integrations/github-poller.ts";
-import { privateReadPaths } from "../src/util/private-reads.ts";
+import * as privateReads from "../src/util/private-reads.ts";
+import { privateReadPaths, protectPrivateFile } from "../src/util/private-reads.ts";
 import * as proc from "../src/util/proc.ts";
 import { pollerHarness } from "./github-poller-support.ts";
 import { setupFixture } from "./setup-support.ts";
@@ -100,6 +101,7 @@ test.each(["regular", "symlink", "absent", "startup failure"])(
     const start = spyOn(factory, "start").mockImplementation(() => {});
     let daemon: Awaited<ReturnType<typeof startDaemon>> | undefined;
     const spellings = [...new Set([resolve(path), realpathSync(path)])];
+    const pendingKey = join(external, "pending.pem");
     const check = () => {
       for (const spelling of spellings) {
         expect(privateReadPaths().includes(spelling)).toBe(kind !== "absent");
@@ -110,11 +112,23 @@ test.each(["regular", "symlink", "absent", "startup failure"])(
     try {
       const pending = startDaemon(factory, {}, async () => {
         check();
-        if (kind === "startup failure") throw new Error("mount failed");
+        if (kind === "startup failure") {
+          writeFileSync(pendingKey, pem, { mode: 0o600 });
+          writeFileSync(
+            join(dir, "config.toml"),
+            `[github.app]\napp_id = 123\ninstallation_id = 456\nprivate_key_path = ${JSON.stringify(pendingKey)}\nrepos = ["O/R"]\n`,
+          );
+          factory.reloadConfig();
+          expect(privateReadPaths()).toContain(pendingKey);
+          throw new Error("mount failed");
+        }
         return { routes: {}, notes: [], stop: async () => {} };
       });
-      if (kind === "startup failure") await expect(pending).rejects.toThrow("mount failed");
-      else {
+      if (kind === "startup failure") {
+        await expect(pending).rejects.toThrow("mount failed");
+        factory.reloadConfig();
+        expect(privateReadPaths()).not.toContain(pendingKey);
+      } else {
         daemon = await pending;
         check();
       }
@@ -126,6 +140,100 @@ test.each(["regular", "symlink", "absent", "startup failure"])(
       rmSync(external, { recursive: true, force: true });
     }
     for (const spelling of spellings) expect(privateReadPaths()).not.toContain(spelling);
+    expect(privateReadPaths()).not.toContain(pendingKey);
+  },
+);
+
+test.each(["existing", "added"])(
+  "daemon retains active and pending App key protections: %s",
+  async (kind) => {
+    const external = mkdtempSync(join(tmpdir(), "github-key-reload-"));
+    const canonical = join(realpathSync(external), "keys");
+    mkdirSync(canonical);
+    const alias = join(external, "alias");
+    symlinkSync(canonical, alias);
+    const keys = ["active.pem", "pending.pem", "replacement.pem", "detached.pem"].map((name) => {
+      writeFileSync(join(canonical, name), pem, { mode: 0o600 });
+      return join(alias, name);
+    });
+    const [active = "", pending = "", replacement = "", detached = ""] = keys;
+    const write = (path: string | null) =>
+      writeFileSync(
+        join(dir, "config.toml"),
+        path
+          ? `[github.app]\napp_id = 123\ninstallation_id = 456\nprivate_key_path = ${JSON.stringify(path)}\nrepos = ["O/R"]\n`
+          : "",
+      );
+    write(kind === "existing" ? active : null);
+    const cfg = loadConfig({ home: dir, configDir: dir, readOnly: true });
+    cfg.port = 0;
+    const store = new Store(":memory:");
+    const factory = new Factory(cfg, { store, models: [], providers: [], bootSha: "f".repeat(40) });
+    const start = spyOn(factory, "start").mockImplementation(() => {});
+    let independent = () => {};
+    let daemon: Awaited<ReturnType<typeof startDaemon>> | undefined;
+    const spellings = (path: string) => [resolve(path), realpathSync(path)];
+    const check = (paths: string[], protectedPaths = true) => {
+      const policies = [false, true].map((gate) =>
+        readPolicyScope.run({ home: dir, environment: {} }, () => homeReadPolicy([], gate)),
+      );
+      for (const path of paths) {
+        expect(spellings(path)[0]).not.toBe(spellings(path)[1]);
+        for (const spelling of spellings(path)) {
+          expect(privateReadPaths().includes(spelling)).toBe(protectedPaths);
+          for (const policy of policies) expect(policy.denyRead.includes(spelling)).toBe(protectedPaths);
+        }
+      }
+    };
+    try {
+      daemon = await startDaemon(factory, {}, async () => ({ routes: {}, notes: [], stop: async () => {} }));
+      const accepted = kind === "existing" ? [active] : [];
+      for (const path of [pending, pending, replacement, null, active]) {
+        write(path);
+        const result = factory.reloadConfig();
+        if (kind === "existing" ? path !== active : path !== null)
+          expect(result.restartRequired).toContain("github.app.private_key_path");
+        else expect(result.restartRequired).toEqual([]);
+        expect(result.applied).toEqual([]);
+        expect(factory.cfg.githubApp).toBe(cfg.githubApp);
+        expect(factory.deps.cfg.githubApp).toBe(cfg.githubApp);
+        if (path) accepted.push(path);
+        check(accepted);
+      }
+      // A registration error must abort before publishing config or a reload event.
+      write(detached);
+      const before = factory.cfg;
+      const feedLength = store.readFeed().items.length;
+      const protect = spyOn(privateReads, "protectPrivateFile").mockImplementation(() => {
+        throw new Error("protection failed");
+      });
+      try {
+        expect(() => factory.reloadConfig()).toThrow("protection failed");
+        expect(factory.cfg).toBe(before);
+        expect(factory.deps.cfg.githubApp).toBe(cfg.githubApp);
+        expect(store.readFeed().items).toHaveLength(feedLength);
+        check([detached], false);
+      } finally {
+        protect.mockRestore();
+      }
+      independent = protectPrivateFile(pending);
+      await daemon.server.stop(true);
+      check([active, replacement], false);
+      check([pending]);
+      independent();
+      check([pending], false);
+      // Cleanup detaches the hook so later reloads cannot leak registrations.
+      write(detached);
+      factory.reloadConfig();
+      check([detached], false);
+    } finally {
+      await daemon?.server.stop(true);
+      independent();
+      start.mockRestore();
+      await factory.stop();
+      store.close();
+      rmSync(external, { recursive: true, force: true });
+    }
   },
 );
 

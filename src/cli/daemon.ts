@@ -30,11 +30,16 @@ async function startScopedDaemon(
 ) {
   const credential = createApiToken(factory.cfg.paths.home);
   const privateFiles: (() => void)[] = [];
+  const protectAppKey = (cfg: Factory["cfg"]) => {
+    if (cfg.githubApp) privateFiles.push(protectPrivateFile(cfg.githubApp.privateKeyPath));
+  };
   let integrations: Awaited<ReturnType<typeof mount>> | undefined;
   let server: Awaited<ReturnType<typeof startHttp>> | undefined;
   let workers: Awaited<ReturnType<typeof startWorkerListener>>;
   let detachSlots = () => {};
+  let detachReload = () => {};
   const stop = async (force?: boolean) => {
+    detachReload();
     const results = await Promise.allSettled([
       Promise.resolve().then(() => integrations?.stop()),
       Promise.resolve().then(() => server?.stop(force)),
@@ -56,7 +61,8 @@ async function startScopedDaemon(
       mkdirSync(home, { recursive: true, mode: 0o700 });
       for (const file of files) privateFiles.push(protectPrivateFile(join(home, file)));
     }
-    if (factory.cfg.githubApp) privateFiles.push(protectPrivateFile(factory.cfg.githubApp.privateKeyPath));
+    protectAppKey(factory.cfg);
+    detachReload = factory.onConfigValidated(protectAppKey);
     workers = await startWorkerListener(factory.workers, factory.cfg.paths, factory.cfg.workers.listen);
     integrations = await mount(factory);
     server = await startHttp(

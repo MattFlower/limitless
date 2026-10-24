@@ -94,6 +94,7 @@ export class Factory {
   private readonly gcTimer: NonNullable<FactoryOptions["gcTimer"]>;
   private gcInterval: ReturnType<typeof setInterval> | null = null;
   private gcInFlight: Promise<GcResult> | null = null;
+  private readonly configValidated = new Set<(cfg: Config) => void>();
 
   constructor(
     public cfg: Config,
@@ -234,8 +235,14 @@ export class Factory {
     this.concierge = new Concierge(this);
   }
 
+  onConfigValidated(listener: (cfg: Config) => void): () => void {
+    this.configValidated.add(listener);
+    return () => this.configValidated.delete(listener);
+  }
+
   reloadConfig(): ConfigReload {
     const next = loadConfig({ ...this.cfg.paths, readOnly: true });
+    for (const listener of this.configValidated) listener(next);
     const { cfg, result } = reloadedConfig(this.cfg, next);
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, (s) =>
       console.warn(redactCredentials(s)),
