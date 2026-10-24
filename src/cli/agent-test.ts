@@ -276,7 +276,9 @@ export function enterCallerDirectory(directory: string | undefined): void {
   console.warn("agent-test: could not enter the caller's directory; running from the wrapper directory");
 }
 
-if (import.meta.main) {
-  enterCallerDirectory(process.argv[2]);
-  process.exitCode = await wrapperMain(process.argv.slice(3));
+export async function agentTestEntry(args: string[]): Promise<number> {
+  enterCallerDirectory(args[0]);
+  return wrapperMain(args.slice(1));
 }
+
+if (import.meta.main) process.exitCode = await agentTestEntry(process.argv.slice(2));

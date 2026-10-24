@@ -34,6 +34,7 @@ import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { agentShellEnv, removeScratch, SCRATCH_NAME } from "../src/harness/scratch.ts";
 import { withSlottedCommands } from "../src/harness/slotted.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../src/harness/slotted-config.ts";
+import { release } from "../src/release.ts";
 import { agentEnv, sh } from "../src/util/proc.ts";
 
 import { waitClock } from "./wait-clock.ts";
@@ -497,6 +498,87 @@ test("installed wrappers catch cd/env and nested scripts, use scratch transport 
   } finally {
     for (const release of held) release();
   }
+});
+
+test("packaged wrappers forward argv and clear BUN_BE_BUN without building source", async () => {
+  const f = fixture(),
+    caller = join(f.root, "caller's directory"),
+    scratch = join(f.root, SCRATCH_NAME),
+    executable = join(f.real, "limitless ' binary"),
+    name = "command' name";
+  mkdirSync(caller);
+  mkdirSync(scratch);
+  const alias = join(f.root, "caller-link");
+  symlinkSync(caller, alias);
+  writeFileSync(executable, `#!/bin/sh\nprintf "%s\\n" "\${BUN_BE_BUN-unset}" "$@"\nexit 7\n`, {
+    mode: 0o755,
+  });
+  const build = spyOn(Bun, "build").mockImplementation(() => {
+    throw new Error("Unexpected bundle build");
+  });
+  cleanup.push(() => build.mockRestore());
+  let directory = "";
+  await withSlottedCommands(
+    [[name, "test"]],
+    f.root,
+    scratch,
+    undefined,
+    () => {},
+    async (path) => {
+      directory = path?.split(delimiter)[0] ?? "";
+      expect(existsSync(join(directory, "entry.js"))).toBe(false);
+      expect(existsSync(join(directory, "bunfig.toml"))).toBe(false);
+      const result = await sh([join(directory, name), "--parallel=4", "-t", "a b", "it's a test", ""], {
+        cwd: alias,
+        env: { ...process.env, BUN_BE_BUN: "1" },
+        allowFail: true,
+      });
+      expect(result.exitCode).toBe(7);
+      expect(result.stdout.split("\n")).toEqual([
+        "unset",
+        "__agent-test",
+        caller,
+        join(directory, "config.json"),
+        name,
+        "--parallel=4",
+        "-t",
+        "a b",
+        "it's a test",
+        "",
+        "",
+      ]);
+    },
+    undefined,
+    {},
+    { release: { kind: "packaged", version: "test", sha: "a".repeat(40), bun: Bun.version }, executable },
+  );
+  expect(build).not.toHaveBeenCalled();
+  expect(existsSync(directory)).toBe(false);
+});
+
+test("source wrapper retains its pre-packaging script and source-only files", async () => {
+  const f = fixture(),
+    scratch = join(f.root, SCRATCH_NAME);
+  mkdirSync(scratch);
+  await withSlottedCommands(
+    f.config.commands,
+    f.root,
+    scratch,
+    undefined,
+    () => {},
+    async (path) => {
+      const directory = path?.split(delimiter)[0] ?? "";
+      const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      // Captured from the source wrapper before packaged dispatch was added.
+      const expected = `#!/bin/sh\nexec ${q(process.execPath)} --no-env-file --config=${q(join(directory, "bunfig.toml"))} --cwd ${q(directory)} ${q(join(directory, "entry.js"))} "$(pwd -P)" ${q(join(directory, "config.json"))} 'bun' "$@"\n`;
+      expect(readFileSync(join(directory, "bun"), "utf8")).toBe(expected);
+      expect(readFileSync(join(directory, "entry.js"), "utf8").length).toBeGreaterThan(0);
+      expect(readFileSync(join(directory, "bunfig.toml"), "utf8")).toBe("preload = []\n");
+    },
+    undefined,
+    {},
+    { release, executable: process.execPath },
+  );
 });
 
 test("empty commands install no wrappers and pass no PATH override", async () => {
