@@ -73,6 +73,9 @@ test("resumed run refuses discovery-only recovery failure before calling its sta
     directory: repoDir,
     boot: bootIdentity(),
     createdAt: 1,
+    ownerId: null,
+    ownerPid: null,
+    ownerBirth: null,
     discovery: { group: 0, started: 0, directories: [repoDir], leader: null, spawnedAt: "0" },
   };
   f.store.recordProcessDiscovery(evidence);

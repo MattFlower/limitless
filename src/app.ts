@@ -1,7 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
-import type { Config } from "./config.ts";
+import { type Config, loadConfig } from "./config.ts";
+import { type ConfigReload, reloadedConfig } from "./config-reload.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { TERMINAL_STATUSES } from "./core/types.ts";
 import { Store } from "./db/store.ts";
@@ -94,8 +95,8 @@ export class Factory {
   private gcInFlight: Promise<GcResult> | null = null;
 
   constructor(
-    readonly cfg: Config,
-    opts: FactoryOptions = {},
+    public cfg: Config,
+    private readonly opts: FactoryOptions = {},
   ) {
     this.bootSha = opts.bootSha ?? "unknown";
     gateSlots.setLimit(cfg.maxConcurrentGates);
@@ -212,6 +213,7 @@ export class Factory {
       maxLoadPerCore: cfg.maxLoadPerCore,
       loadSource: opts.loadSource,
     });
+    const factory = this;
     this.land = new LandQueue({
       cfg,
       store: this.store,
@@ -222,10 +224,36 @@ export class Factory {
       ciReruns: cfg.githubCiReruns,
       client: getGitHubPr,
       confinement: this.deps.confinement,
-      gateExecutor: this.deps.gateExecutor,
+      get gateExecutor() {
+        return factory.deps.gateExecutor;
+      },
       ...opts.land,
     });
     this.concierge = new Concierge(this);
+  }
+
+  reloadConfig(): ConfigReload {
+    const next = loadConfig({ ...this.cfg.paths, readOnly: true });
+    const { cfg, result } = reloadedConfig(this.cfg, next);
+    const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, (s) =>
+      console.warn(redactCredentials(s)),
+    );
+    const workersChanged = result.applied.some((key) => key.startsWith("workers."));
+    const agent = workersChanged
+      ? (this.opts.agentExecutor ??
+        (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined))
+      : this.deps.agentExecutor;
+    const gate = workersChanged
+      ? (this.opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos))
+      : this.deps.gateExecutor;
+    this.cfg = cfg;
+    this.deps.cfg = shadowOk ? cfg : { ...cfg, reviewShadow: "off" };
+    this.deps.agentExecutor = agent;
+    this.deps.gateExecutor = gate;
+    gateSlots.setLimit(cfg.maxConcurrentGates);
+    this.scheduler.setLimit(cfg.maxConcurrentRuns);
+    this.store.configReloaded(result.applied, result.restartRequired);
+    return result;
   }
 
   evalPolicy(evalIds?: string[]): EvalPolicyResponse {

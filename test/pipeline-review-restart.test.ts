@@ -42,6 +42,170 @@ const { start, wait } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["single", "panel"] as const)(
+    "a legacy state without review evidence uses current %s mode",
+    async (mode) => {
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      await f.stop();
+      f.deps.cfg.reviewMode = "panel";
+      f.deps.cfg.reviewRosters.quick = [{ prompt: "standard" }];
+      f.deps.faults = { "stage:review:before": { action: "kill" } };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+      const checkpoint = f.store.getRunState<RunState>(run.id);
+      expect(checkpoint?.reviewLenses).toEqual([]);
+      expect(checkpoint?.reviewMode).toBeUndefined();
+      expect(checkpoint?.lastReview).toBeUndefined();
+      expect(checkpoint?.reviewHistory).toBeUndefined();
+      f.deps.faults = undefined;
+      f.deps.cfg = { ...f.deps.cfg, reviewMode: mode };
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state?.reviewMode).toBe(mode);
+      expect(state?.reviewHistory?.[0]?.panelReview).toBe(mode === "panel" ? 1 : undefined);
+    },
+  );
+
+  test.each([false, true])(
+    "panel mode survives reload and a cached R2 restart (legacy state: %s)",
+    async (legacy) => {
+      const verificationStarted = deferred<void>();
+      const releaseVerification = deferred<void>();
+      const reviews: string[] = [];
+      let implementations = 0;
+      let restarting = true;
+      const handler: Handler = async (s) => {
+        if (s.prompt.startsWith("You are a code-review verifier")) {
+          const cited = [
+            ...s.prompt.matchAll(/"id": "(C\d+)",\s+"file": "[^"]*",\s+"line": \d+,\s+"title": "([^"]*)"/g),
+          ];
+          return {
+            structured: {
+              results: cited.map(([, id, title]) => ({
+                id,
+                verdict: title === `R${reviews.length} bug` ? "CONFIRMED" : "REFUTED",
+                severity: "high",
+                category: "correctness",
+                evidence: "farewell.txt:1",
+                trigger: "wrong farewell",
+              })),
+            },
+          };
+        }
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") {
+          reviews.push(s.prompt);
+          const active = factory?.store.listRuns({ status: ["running"] })[0];
+          expect(active && factory?.store.getRunState<RunState>(active.id)?.reviewMode).toBe(
+            reviews.length > 3 ? "single" : "panel",
+          );
+          return {
+            structured: {
+              ...approve,
+              findings:
+                reviews.length <= 2
+                  ? [
+                      {
+                        ...findingEvidence,
+                        severity: "major",
+                        security: false,
+                        file: "farewell.txt",
+                        line: 1,
+                        title: `R${reviews.length} bug`,
+                        detail: "wrong farewell",
+                        suggestion: "fix",
+                        ...(reviews.length === 2 ? { label: "new", prior: "" } : {}),
+                      },
+                    ]
+                  : [],
+            },
+          };
+        }
+        if (role === "verify") {
+          if (restarting && implementations === 2) {
+            verificationStarted.resolve();
+            await releaseVerification.promise;
+          }
+          return { structured: pass };
+        }
+        implementations++;
+        return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+      };
+      const f = start(handler);
+      await f.stop();
+      f.deps.cfg = {
+        ...f.deps.cfg,
+        reviewMode: "panel",
+        reviewRosters: {
+          ...f.deps.cfg.reviewRosters,
+          standard: [{ prompt: "standard" }],
+        },
+      };
+      f.deps.faults = {
+        "stage:implement:before": {
+          action: "continue",
+          when: ({ round }) => round === 1,
+          onHit: () => {
+            f.deps.cfg = { ...f.deps.cfg, reviewMode: "single" };
+          },
+        },
+      };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+      const controller = new AbortController();
+      const executing = executeRun(f.deps, run.id, controller.signal);
+      try {
+        await verificationStarted.promise;
+        await wait(
+          () =>
+            f.store.getRunState<RunState>(run.id)?.completedChecks?.round === 1 &&
+            f.store.getRunState<RunState>(run.id)?.completedChecks?.values.review !== undefined,
+          { timeoutMs: 5000 },
+        );
+        controller.abort(new Error("shutdown"));
+      } finally {
+        releaseVerification.resolve();
+      }
+      expect(await executing).toBe("queued");
+      const checkpoint = f.store.getRunState<RunState>(run.id);
+      expect(checkpoint?.reviewMode).toBe("panel");
+      expect(checkpoint?.lastReview?.verdict).toBe("request_changes");
+      expect(checkpoint?.reviewHistory?.map((entry) => entry.panelReview)).toEqual([1, 2]);
+      if (legacy && checkpoint) {
+        delete checkpoint.reviewMode;
+        if (checkpoint.lastReview) delete checkpoint.lastReview.mode;
+        for (const entry of checkpoint.reviewHistory ?? []) delete entry.scope;
+        f.store.setRunState(run.id, checkpoint);
+      }
+      f.store.close();
+      restarting = false;
+      const resumed = start(handler);
+      // The restarted daemon loads single mode; panel history must still control the cached R2.
+      expect(resumed.deps.cfg.reviewMode).toBe("single");
+      resumed.deps.cfg.reviewRosters.standard = [{ prompt: "standard" }];
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(reviews).toHaveLength(3);
+      expect(reviews[1]).toContain("review R2: the fix diff only");
+      expect(reviews[2]).toContain("review R3: the fix diff only");
+      expect(resumed.store.getRunState<RunState>(run.id)).toMatchObject({ reviewMode: "panel" });
+      expect(
+        resumed.store.getRunState<RunState>(run.id)?.reviewHistory?.map((entry) => entry.panelReview),
+      ).toEqual([1, 2, 3]);
+      // New runs use the reloaded single mode, rather than inheriting the older run's mode.
+      const next = await resumed.createRun({ repo: repoDir, prompt: "Add farewell again", profile: "quick" });
+      expect(await waitFor(resumed, next.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(resumed.store.getRunState<RunState>(next.id)?.reviewMode).toBe("single");
+      expect(resumed.store.getRunState<RunState>(next.id)?.lastReview?.mode).not.toBe("panel");
+    },
+  );
+
   test("review context and follow-ups survive a factory restart", async () => {
     let reviews = 0;
     let implementsCount = 0;

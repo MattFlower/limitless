@@ -797,6 +797,7 @@ export class LandQueue {
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */
   private async checks(entry: LandEntry, cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
+    const gateExecutor = this.deps.gateExecutor;
     const log = entry.runId
       ? join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`)
       : join(this.deps.paths.home, "land", `land-${entry.id}.log`);
@@ -830,7 +831,7 @@ export class LandQueue {
           ),
       };
       await gateSlotScope(async () => {
-        const run = docs.annotate(await executeGate(request, signal, hooks, this.deps.gateExecutor));
+        const run = docs.annotate(await executeGate(request, signal, hooks, gateExecutor));
         signal.throwIfAborted();
         this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { logPath: log }));
         const selected = run.setupOk
@@ -851,11 +852,11 @@ export class LandQueue {
               { ...request, gates: retry, skipGateSlot: options?.skipGateSlot },
               signal,
               hooks,
-              this.deps.gateExecutor,
+              gateExecutor,
             );
           },
           true,
-          this.deps.gateExecutor?.freshCheckoutFor?.(entry.repo),
+          gateExecutor?.freshCheckoutFor?.(entry.repo),
         );
         signal.throwIfAborted();
         const failed = [...run.setup, ...run.checks].filter((c) => {

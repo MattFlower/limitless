@@ -316,6 +316,9 @@ function queue(
     },
     log: (message: string) => void landLog.push(message),
     ...opts,
+    get gateExecutor() {
+      return opts.gateExecutor;
+    },
     client: async (url, signal) => {
       const read = {};
       pendingPrReads.add(read);
@@ -523,6 +526,51 @@ checks = [{name="lint",run="fake-lint"}, {name="test",run="bun test --reporter-o
   } finally {
     await q.stop();
   }
+});
+
+test("a land check pins its executor through fresh-checkout retries; the next entry uses the reload", async () => {
+  const { pr } = await retryLandFixture();
+  const b = fakeLandGates((req) => retryRun(req));
+  const a = fakeLandGates((req, attempt) => {
+    current = b.executor;
+    return retryRun(req, attempt === 1 ? { test: testFailure } : {});
+  });
+  let current = a.executor;
+  const freshLookups: string[] = [];
+  a.executor.freshCheckoutFor = (repo) => {
+    freshLookups.push(repo);
+    return true;
+  };
+  b.executor.freshCheckoutFor = () => {
+    throw new Error("The first entry must use A's fresh checkout policy");
+  };
+  const q = queue({
+    get gateExecutor() {
+      return current;
+    },
+  });
+  const first = await q.request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(first.id)?.state).toBe("landed");
+  expect(a.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
+    ["full-test", "full-other", "lint"],
+    [retryCommand],
+  ]);
+  expect(a.requests[1]?.gates.setup).toEqual(["prepare"]);
+  expect(freshLookups).toEqual([SLUG]);
+  expect(b.requests).toHaveLength(0);
+
+  b.executor.freshCheckoutFor = () => true;
+  const secondPr = delivered(2, "pr-2");
+  const head = await pushBranch("pr-2", "second.txt", "second\n", 2);
+  observe(2, head);
+  approve(2, head);
+  const second = await q.request({ target: secondPr.run.id });
+  await settle();
+  expect(store.getLandEntry(second.id)?.state).toBe("landed");
+  expect(a.requests).toHaveLength(2);
+  expect(b.requests).toHaveLength(1);
+  expect(b.requests[0]?.headSha).toBe(head);
 });
 
 test.each([false, true])("targeted land retries record flakes through CI (restart: %s)", async (restart) => {
