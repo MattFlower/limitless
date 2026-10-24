@@ -286,6 +286,10 @@ async function serve(): Promise<void> {
 
 async function main(): Promise<void> {
   const { release, resolveReleaseBootSha } = await import("../release.ts");
+  if (Bun.argv[2] === "__agent-test") {
+    process.exitCode = await (await import("./agent-test.ts")).agentTestEntry(Bun.argv.slice(3));
+    return;
+  }
   if (Bun.argv[2] === "gate-slot") {
     process.exitCode = await (await import("./gate-slot.ts")).gateSlotCommand(Bun.argv.slice(3));
     return;
