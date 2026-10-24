@@ -1740,8 +1740,8 @@ for (const [outcome, reason] of [
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
       // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch,
-      // plus bundle-transfer scratch and one confined scratch per gate run (baseline and grading).
-      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 3);
+      // plus bundle-transfer scratch and command/provenance scratch for baseline and grading gates.
+      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 5);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
@@ -1807,8 +1807,8 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     f.save();
     expect((await f.run()).trials[0]?.pass).toBe(true);
     const dirs = allocated.mock.results.map((r) => String(r.value));
-    // Harness, grading checkout, bundle transfer and hidden scratch, plus both gate commands'.
-    expect(dirs).toHaveLength(6);
+    // Harness, grading checkout, bundle transfer and hidden scratch, plus both gates' command/provenance.
+    expect(dirs).toHaveLength(8);
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();

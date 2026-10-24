@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunStatus } from "../src/core/types.ts";
+import * as gitCommand from "../src/git/command.ts";
 import * as repos from "../src/git/repos.ts";
 import { NeedsHumanError, NoCapacityError, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -40,6 +41,10 @@ const { start, wait } = pipelineSetup({
 // retried pass) is unit-tested in gate-evidence.test.ts; these rows cover the engine and resume.
 for (const evidence of [
   "matching",
+  "tracked-output",
+  "untracked-output",
+  "ignored-output",
+  "inspection-failed",
   "suite",
   "different-sha",
   "resume",
@@ -57,6 +62,15 @@ for (const evidence of [
     const secret = "synthetic-verification-artifact-549";
     const gateName = evidence === "resume-redacted" ? `\x1b[31m${secret}` : "test";
     if (evidence === "resume-redacted") registerCredential("verify-artifact-test", secret);
+    const trackedOutput = evidence === "tracked-output";
+    const generated = trackedOutput
+      ? `changed-${secret}\n".txt`
+      : evidence === "ignored-output"
+        ? "cache-output"
+        : "build-output";
+    if (trackedOutput) registerCredential("changed-path-test", secret);
+    writeFileSync(join(repoDir, ".gitignore"), "cache-output\n");
+    if (trackedOutput) writeFileSync(join(repoDir, generated), "original\n");
     mkdirSync(join(repoDir, "test"));
     writeFileSync(
       join(repoDir, "test/loopback.test.ts"),
@@ -64,7 +78,9 @@ for (const evidence of [
       evidence === "resume-redacted"
         ? `import { expect, spyOn, test } from "bun:test";\ntest("passes", () => expect(1).toBe(1));\n`
         : `import { expect, spyOn, test } from "bun:test";
+import { existsSync, writeFileSync } from "node:fs";
 test("loopback server", () => {
+  ${evidence.endsWith("-output") ? `if (existsSync("farewell.txt")) writeFileSync(${JSON.stringify(generated)}, "generated");` : ""}
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });
   try { expect(server.port).toBeGreaterThan(0); } finally { server.stop(true); }
   ${evidence === "suite" ? 'console.error("x".repeat(8000));' : ""}
@@ -94,6 +110,19 @@ afterAll(async () => {
     );
     await sh(["git", "add", "."], { cwd: repoDir });
     await sh(["git", "commit", "-qm", "loopback gate fixture"], { cwd: repoDir });
+    const originalGit = gitCommand.worktreeGit;
+    const inspection =
+      evidence === "inspection-failed"
+        ? spyOn(gitCommand, "worktreeGit").mockImplementation((args, opts, retry) => {
+            if (
+              args.includes("--cached") &&
+              args.includes("--name-only") &&
+              existsSync(join(opts.cwd, "farewell.txt"))
+            )
+              throw new Error("inspection unavailable");
+            return originalGit(args, opts, retry);
+          })
+        : undefined;
     let attempts = 0;
     let initialGateSha = "";
     const loopbackSpec = {
@@ -188,15 +217,19 @@ afterAll(async () => {
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     unsubscribe();
+    inspection?.mockRestore();
     const succeeds = [
       "matching",
+      "untracked-output",
+      "ignored-output",
       "suite",
       "resume",
       "resume-redacted",
       "matching-skips",
       "resume-skips",
     ].includes(evidence);
-    expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
+    if (!trackedOutput && evidence !== "inspection-failed")
+      expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
     if (evidence === "different-sha") {
       expect(f.store.getRun(run.id)?.error).toContain("Commit changed during verification");
@@ -204,6 +237,23 @@ afterAll(async () => {
       expect(f.store.listStages(run.id).some((stage) => stage.status === "running")).toBe(false);
       expect(initialGateSha).not.toBe("");
       return;
+    }
+    if (trackedOutput || evidence === "inspection-failed") {
+      expect(state?.gateEvidence).toBeUndefined();
+      expect(state?.lastGates?.find((c) => c.name === "test")?.result.ok).toBe(true);
+      expect(state?.worktreePath).toBeDefined();
+      if (state?.worktreePath && trackedOutput)
+        expect(readFileSync(join(state.worktreePath, generated), "utf8")).toBe("original\n");
+      const diagnostics = f.store
+        .listEvents(run.id)
+        .filter((e) => e.message.startsWith("Gate evidence withheld"));
+      expect(diagnostics.length).toBeGreaterThan(0);
+      const messages = JSON.stringify(diagnostics);
+      expect(messages).toContain(trackedOutput ? "changed-[redacted]" : "provenance could not be confirmed");
+      expect(messages).not.toContain(secret);
+      if (!state?.worktreePath || !state.reviewedSha) throw new Error("missing reviewed checkout");
+      expect(await repos.headSha(state.worktreePath)).toBe(state.reviewedSha);
+      expect(terminal).toBe("needs_human");
     }
     const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
     if (evidence.includes("skips")) {
