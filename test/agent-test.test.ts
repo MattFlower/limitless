@@ -715,7 +715,7 @@ test("packaged wrappers forward argv and clear BUN_BE_BUN without building sourc
   expect(existsSync(directory)).toBe(false);
 });
 
-test("source wrapper retains its pre-packaging script and source-only files", async () => {
+test("source wrapper uses isolated Bun startup and source-only files", async () => {
   const f = fixture(),
     scratch = join(f.root, SCRATCH_NAME);
   mkdirSync(scratch);
@@ -728,8 +728,15 @@ test("source wrapper retains its pre-packaging script and source-only files", as
     async (path) => {
       const directory = path?.split(delimiter)[0] ?? "";
       const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-      // Captured from the source wrapper before packaged dispatch was added.
-      const expected = `#!/bin/sh\nexec ${q(process.execPath)} --no-env-file --config=${q(join(directory, "bunfig.toml"))} --cwd ${q(directory)} ${q(join(directory, "entry.js"))} "$(pwd -P)" ${q(join(directory, "config.json"))} 'bun' "$@"\n`;
+      const expected = `#!/bin/sh
+if [ "\${BUN_OPTIONS+x}" = x ]; then
+  export LIMITLESS_WRAPPER_BUN_OPTIONS="$BUN_OPTIONS"
+else
+  unset LIMITLESS_WRAPPER_BUN_OPTIONS
+fi
+unset BUN_OPTIONS
+exec ${q(process.execPath)} --no-env-file --config=${q(join(directory, "bunfig.toml"))} --cwd ${q(directory)} ${q(join(directory, "entry.js"))} "$(pwd -P)" ${q(join(directory, "config.json"))} 'bun' "$@"
+`;
       expect(readFileSync(join(directory, "bun"), "utf8")).toBe(expected);
       expect(readFileSync(join(directory, "entry.js"), "utf8").length).toBeGreaterThan(0);
       expect(readFileSync(join(directory, "bunfig.toml"), "utf8")).toBe("preload = []\n");
