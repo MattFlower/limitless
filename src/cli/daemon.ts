@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../app.ts";
 import { liveAgentTestCapability } from "../gates/agent-tests.ts";
+import { attachSlotPools } from "../gates/slots.ts";
 import { mountIntegrations } from "../integrations/index.ts";
 import { createApiToken } from "../server/api-token.ts";
 import { startHttp } from "../server/http.ts";
@@ -32,6 +33,7 @@ async function startScopedDaemon(
   let integrations: Awaited<ReturnType<typeof mount>> | undefined;
   let server: Awaited<ReturnType<typeof startHttp>> | undefined;
   let workers: Awaited<ReturnType<typeof startWorkerListener>>;
+  let detachSlots = () => {};
   const stop = async (force?: boolean) => {
     const results = await Promise.allSettled([
       Promise.resolve().then(() => integrations?.stop()),
@@ -39,11 +41,13 @@ async function startScopedDaemon(
       Promise.resolve().then(() => workers?.stop()),
     ]);
     credential.release();
+    detachSlots();
     for (const release of privateFiles) release();
     const failure = results.find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
   };
   try {
+    detachSlots = await attachSlotPools(factory.store.db, factory.cfg.maxConcurrentGates);
     for (const [dir, files] of [
       ["worker-tls", ["key.pem"]],
       ["worker", ["token", "key.pem", "coordinator-fingerprint"]],

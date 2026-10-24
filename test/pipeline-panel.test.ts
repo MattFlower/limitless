@@ -50,6 +50,58 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([false, true])(
+    "single review stays single after enabling panel (prepared with lenses: %s)",
+    async (preparedPanel) => {
+      const reviews: AgentSpec[] = [];
+      let implementations = 0;
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          reviews.push(s);
+          f.deps.cfg = { ...f.deps.cfg, reviewMode: "panel", reviewImplementerReport: "omit" };
+          return {
+            structured: {
+              ...approve,
+              findings:
+                reviews.length === 1
+                  ? [
+                      {
+                        ...findingEvidence,
+                        severity: "major",
+                        security: false,
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "First blocker",
+                        detail: "wrong farewell",
+                        suggestion: "fix",
+                      },
+                    ]
+                  : [],
+            },
+          };
+        }
+        implementations++;
+        if (implementations === 1)
+          f.deps.cfg = { ...f.deps.cfg, reviewMode: preparedPanel ? "single" : "panel" };
+        return { files: { "farewell.txt": `goodbye ${implementations}\n` }, text: "REVIEW_REPORT" };
+      });
+      // With saved lenses, single mode must be pinned; without them, even the first review stays single.
+      f.deps.cfg.reviewMode = preparedPanel ? "panel" : "single";
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state?.reviewLenses).toEqual(preparedPanel ? [] : undefined);
+      expect(state?.reviewMode).toBe("single");
+      expect(state?.reviewHistory?.map((entry) => entry.panelReview)).toEqual([undefined, undefined]);
+      expect(reviews).toHaveLength(2);
+      expect(reviews[0]?.prompt).toContain("REVIEW_REPORT");
+      expect(reviews[1]?.prompt).not.toContain("REVIEW_REPORT");
+      expect(f.store.getArtifact(run.id, "review-2.json")).toBeNull();
+    },
+  );
+
   test("read-only cleanup leaves the index shared by panel finders unchanged", async () => {
     const indexPath = join(repoDir, ".git", "index");
     const index = readFileSync(indexPath);

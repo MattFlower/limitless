@@ -100,6 +100,8 @@ export interface RunState {
   agentFullSuite?: AgentFullSuite;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
+  /** Effective review mode, pinned before the run's first review invocation. */
+  reviewMode?: "single" | "panel";
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
   gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
@@ -292,6 +294,8 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
+  readonly deps: EngineDeps;
+  private readonly stageConfig = new AsyncLocalStorage<Config>();
   private readonly interruption = new AbortController();
   readonly signal: AbortSignal;
   termination?: SimulatedTermination;
@@ -317,13 +321,22 @@ export class RunContext {
   }
 
   constructor(
-    readonly deps: EngineDeps,
+    private readonly liveDeps: EngineDeps,
     public run: Run,
     readonly repo: Repo,
     signal: AbortSignal,
     readonly isDraining: () => boolean = () => false,
     readonly drainEvents?: EventTarget,
   ) {
+    const deps = liveDeps;
+    const thisContext = this;
+    this.deps = new Proxy(deps, {
+      get(target, key, receiver) {
+        return key === "cfg"
+          ? (thisContext.stageConfig.getStore() ?? target.cfg)
+          : Reflect.get(target, key, receiver);
+      },
+    });
     this.signal = AbortSignal.any([signal, this.interruption.signal]);
     this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
@@ -477,6 +490,18 @@ export class RunContext {
     background = false,
     parkOnDrain = true,
   ): Promise<T> {
+    return this.stageConfig.run(this.liveDeps.cfg, () =>
+      this.runStage(name, fn, round, background, parkOnDrain),
+    );
+  }
+
+  private async runStage<T>(
+    name: StageName,
+    fn: (stage: Stage) => Promise<{ summary: string; value: T }>,
+    round: number,
+    background: boolean,
+    parkOnDrain: boolean,
+  ): Promise<T> {
     this.checkCancelled();
     const cacheable =
       !background && this.state.phase === "loop" && ["gates", "audit", "review"].includes(name);
@@ -545,6 +570,7 @@ export class RunContext {
    * quota or unavailable. Task-level failures are returned to the caller, not retried here.
    */
   async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
+    const agentExecutor = this.deps.agentExecutor ?? localAgentExecutor;
     const { router, tracker, store, harnesses } = this.deps;
     const { shadow } = opts;
     const chain = shadow ? undefined : this.run.models?.[opts.role as RunRole];
@@ -899,7 +925,7 @@ export class RunContext {
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,
             );
-          result = await (this.deps.agentExecutor ?? localAgentExecutor).run(
+          result = await agentExecutor.run(
             {
               runId: this.run.id,
               invocationId: invocation.id,

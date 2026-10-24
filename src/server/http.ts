@@ -383,6 +383,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/admin/drain": admin("drain"),
     "/api/admin/resume": admin("resume"),
+    "/api/admin/config/reload": { POST: handle(() => json(factory.reloadConfig()), true) },
     "/api/admin/profile": {
       POST: handle(async (req, server) => {
         const { seconds } = z
