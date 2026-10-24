@@ -99,6 +99,8 @@ export interface AgentResult {
   fastModeState?: string | null;
   fastModeDisabledReason?: string | null;
   status: InvocationStatus;
+  /** Structured CLI rejection before the session could run; absent in older reports. */
+  failureClass?: "authentication";
   finalText: string;
   structured: unknown;
   sessionId: string | null;

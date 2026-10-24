@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { headSha } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -597,4 +598,116 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
   const run = await factory.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
   expect(await waitFor(factory, run.id, ["succeeded", "needs_human", "failed"])).toBe("succeeded");
   expect(ids).toEqual(["beta/m", "beta/other"]);
+});
+
+test("authentication exhaustion fails implementation without consuming a round or checking unchanged code", async () => {
+  let before = "";
+  const f = start(
+    (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      return { status: "error", failureClass: "authentication", error: "authentication rejected" };
+    },
+    false,
+    false,
+    {
+      agentExecutor: {
+        kind: "capture",
+        async run(call, local) {
+          if (call.role === "implement") {
+            before ||= await headSha(call.spec.cwd);
+          }
+          return local();
+        },
+      },
+    },
+  );
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await waitFor(f, run.id, ["needs_human", "succeeded", "failed"])).toBe("needs_human");
+  expect(f.store.getRun(run.id)?.error).toContain("authentication rejected");
+  const state = f.store.getRunState<RunState>(run.id);
+  if (!state?.worktreePath) throw new Error("missing worktree");
+  expect(state).toMatchObject({ round: 0, roundsOnImplementer: 0 });
+  expect(state.implementationReadyRound).toBeUndefined();
+  expect(state.implementedRound).toBeUndefined();
+  expect(state.gateEvidence).toBeUndefined();
+  expect(before).toBe(f.store.getRun(run.id)?.baseSha ?? "missing base");
+  expect(await headSha(state.worktreePath)).toBe(before);
+  const stages = f.store.listStages(run.id);
+  expect(stages.filter((s) => s.name === "implement")).toMatchObject([
+    { round: 0, status: "failed", summary: expect.stringContaining("authentication rejected") },
+  ]);
+  expect(stages.filter((s) => ["gates", "verify", "review"].includes(s.name))).toEqual([]);
+  expect(f.store.listInvocations(run.id).filter((i) => i.role === "implement")).toMatchObject([
+    { provider: "alpha", status: "unavailable", error: "authentication rejected" },
+    { provider: "beta", status: "unavailable", error: "authentication rejected" },
+  ]);
+  expect(f.store.listEvents(run.id).some((e) => e.message.includes("implementation-ready"))).toBe(false);
+  expect(f.store.listArtifacts(run.id).some((a) => a.name.startsWith("implement-"))).toBe(false);
+});
+
+test("a resumed near-limit run completes the same round after authentication fallback", async () => {
+  const handler: Handler = (s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: pass };
+    if (s.target.provider === "alpha")
+      return { status: "error", failureClass: "authentication", error: "authentication rejected" };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  const f = start(handler, false, false, { faults: { "stage:implement:before": { action: "kill" } } });
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  const deadline = Date.now() + 10_000;
+  while (!f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "cancelled")) {
+    if (Date.now() > deadline) throw new Error("implement interruption timed out");
+    await Bun.sleep(10);
+  }
+  await f.stop();
+  const state = f.store.getRunState<RunState>(run.id);
+  if (!state?.worktreePath) throw new Error("missing state");
+  const before = await headSha(state.worktreePath);
+  const round = f.cfg.maxRounds + 1;
+  state.round = round;
+  state.roundsOnImplementer = 1;
+  state.implementer = { modelId: "alpha/m", tier: 4, vendor: "anthropic" };
+  state.triedImplementers = ["alpha/m"];
+  f.store.setRunState(run.id, state);
+  f.store.close();
+  factory = null;
+  const resumed = start(handler);
+  expect(await waitFor(resumed, run.id, ["succeeded", "needs_human", "failed"])).toBe("succeeded");
+  const after = resumed.store.getRunState<RunState>(run.id);
+  const head = resumed.store.getRun(run.id)?.headSha;
+  if (!head) throw new Error("missing implementation commit");
+  expect(after).toMatchObject({
+    round,
+    roundsOnImplementer: 1,
+    implementedRound: round,
+    implementationReadyRound: round,
+  });
+  expect(head).toBeString();
+  expect(head).not.toBe(before);
+  expect(after?.gateEvidence?.sha).toBe(head);
+  expect(after?.lastVerifiedSha).toBe(head);
+  expect(after?.gateEvidence?.changedFiles).toContain("farewell.txt");
+  const invocations = resumed.store.listInvocations(run.id);
+  expect(invocations.filter((i) => i.role === "implement").map((i) => [i.provider, i.status])).toEqual([
+    ["alpha", "unavailable"],
+    ["beta", "ok"],
+  ]);
+  const stages = resumed.store.listStages(run.id);
+  expect(stages.filter((s) => s.name === "implement" && s.status === "succeeded")).toMatchObject([{ round }]);
+  expect(
+    stages
+      .filter((s) => ["gates", "verify", "review"].includes(s.name))
+      .every((s) => s.round === round && s.status === "succeeded"),
+  ).toBe(true);
+  expect(resumed.store.listEvents(run.id).some((e) => e.message.includes("Escalating implementer"))).toBe(
+    false,
+  );
 });

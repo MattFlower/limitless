@@ -19,6 +19,13 @@ export function parseFakeStream(stream: StreamFault, emit: (event: AgentEvent) =
     ...(parser instanceof ClaudeStreamParser
       ? { fastModeState: parser.fastModeState, fastModeDisabledReason: parser.fastModeDisabledReason }
       : {}),
+    ...(parser instanceof ClaudeStreamParser && parser.authenticationFailed
+      ? ({
+          status: "unavailable",
+          failureClass: "authentication",
+          error: parser.finalText || parser.lastAssistantText,
+        } as const)
+      : {}),
     usage: parser.usage,
     sessionId: "fake-session",
     numTurns: 0,

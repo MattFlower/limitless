@@ -205,8 +205,15 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
                 id = undefined;
                 continue dispatchLoop;
               }
-              if (result.confinement?.ok !== false && result.status !== "cancelled") return result;
-              log(`Worker job ${id} attempt ${attempt} could not run the session; running locally`);
+              if (
+                result.confinement?.ok !== false &&
+                result.status !== "cancelled" &&
+                result.failureClass !== "authentication"
+              )
+                return result;
+              log(
+                `Worker ${job.worker ?? "unknown"} job ${id} attempt ${attempt} could not run the session${result.failureClass === "authentication" ? `: authentication failed (${result.error ?? "login rejected"})` : ""}; running locally`,
+              );
               return fallback(id);
             }
             reason = "Invalid worker result";

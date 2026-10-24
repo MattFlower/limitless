@@ -397,14 +397,14 @@ test("abort when enqueue rejects prevents local fallback", async () => {
   expect(f.counts()).toMatchObject({ locals: 0, jobs: 0 });
 });
 
-test.each(["confinement", "cancelled session", "failed job", "cancelled job"])(
+test.each(["authentication", "confinement", "cancelled session", "failed job", "cancelled job"])(
   "abort during async worker handling prevents local fallback: %s",
   async (reason) => {
     const f = fixture();
     if (!f.call.publication) throw new Error("Missing hooks");
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const adoption = reason === "confinement" || reason === "cancelled session";
+    const adoption = ["authentication", "confinement", "cancelled session"].includes(reason);
     const adopt = spyOn(f.call.publication, "adopt");
     if (adoption)
       adopt.mockImplementation(async () => {
@@ -435,7 +435,9 @@ test.each(["confinement", "cancelled session", "failed job", "cancelled job"])(
                 exitCode: 1,
               },
             }
-          : { ...result, status: "cancelled" },
+          : reason === "authentication"
+            ? { ...result, status: "unavailable", failureClass: "authentication", error: "login rejected" }
+            : { ...result, status: "cancelled" },
       );
     } else if (reason === "cancelled job") f.workers.cancelAgentJob(id);
     else {
@@ -725,4 +727,45 @@ test.each(["queued", "leased"])("shutdown cancels %s review jobs without a durab
   expect(f.workers.agentJob(id)?.state).toBe("cancelled");
   expect(f.counts()).toMatchObject({ locals: 0 });
   expect(f.call.agentJob).toBeUndefined();
+});
+
+test.each(["implement", "review"] as const)(
+  "worker authentication rejection runs %s locally and names the worker",
+  async (role) => {
+    const f = role === "review" ? reviewFixture() : fixture();
+    const running = f.run();
+    await f.enqueued;
+    const id = f.job();
+    f.store.db.query("UPDATE agent_jobs SET worker=? WHERE id=?").run("fixture-worker", id);
+    const report = await f.report();
+    f.complete(id, {
+      ...report,
+      ...(role === "review"
+        ? { branch: "change/review", sha: parentSha, privateStringsDigest: undefined }
+        : {}),
+      status: "unavailable",
+      failureClass: "authentication",
+      error: "Login rejected",
+    });
+    expect(await running).toMatchObject({ status: "ok", finalText: "local" });
+    expect(f.counts()).toMatchObject({ locals: 1 });
+    expect(
+      f.events.some(
+        (e) =>
+          e.type === "status" &&
+          e.text.includes("fixture-worker") &&
+          e.text.includes("authentication failed (Login rejected)") &&
+          e.text.includes("running locally"),
+      ),
+    ).toBe(true);
+  },
+);
+
+test("older worker reports mentioning authentication retain ordinary task errors", async () => {
+  const f = fixture();
+  const running = f.run();
+  await f.enqueued;
+  f.complete(f.job(), { ...(await f.report()), status: "error", error: "Test user cannot authenticate" });
+  expect(await running).toMatchObject({ status: "error", error: "Test user cannot authenticate" });
+  expect(f.counts()).toMatchObject({ locals: 0, adopted: 1 });
 });

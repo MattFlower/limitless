@@ -129,66 +129,116 @@ describe("ClaudeStreamParser", () => {
       structured_output: { ok: true },
     });
   test.each([
-    ["no result event", [init, text], "claude exited with 0 and no result"],
+    ["no result event", [init, text], "claude exited with 0 and no result", false],
     [
       "a result line cut off mid-object",
       [init, text, '{"type":"result"'],
       "claude exited with 0 and no result",
+      false,
     ],
-    ["an error result", [init, text, result(true)], "run failed"],
-    ["a successful result", [init, text, result(false)], null],
-  ])("a claude stream with %s completes only on a successful result", async (_, lines, cliError) => {
-    const ok = cliError === null;
-    const seam = parseFakeStream({ parser: "claude", lines }, () => {});
-    expect(seam.status).toBe(ok ? "ok" : "error");
-    expect(seam.error).toBe(
-      ok ? null : "malformed or truncated harness stream: missing successful completion",
-    );
-    const dir = mkdtempSync(join(tmpdir(), "limitless-claude-stream-"));
-    try {
-      const outcome = await runClaude(
-        {
-          cwd: dir,
-          prompt: "x",
-          mode: "readonly",
-          noTools: true,
-          target: {
-            modelId: "c/m",
-            provider: "claude",
-            harness: "claude",
-            model: "m",
-            vendor: "anthropic",
-            tier: 4,
-            billing: "subscription",
-          },
-          timeoutMs: 10_000,
-          idleTimeoutMs: 10_000,
-          maxToolCalls: 0,
-          signal: new AbortController().signal,
-          logPath: join(dir, "log"),
-          onEvent: () => {},
-        },
-        async (opts) => {
-          for (const line of lines) opts.onStdoutLine?.(line);
-          return {
-            exitCode: 0,
-            signal: null,
-            truncated: false,
-            durationMs: 1,
-            stdout: "",
-            stderr: "",
-            timedOut: false,
-            idleTimedOut: false,
-            cancelled: false,
-          };
-        },
+    ["an error result", [init, text, result(true)], "run failed", false],
+    ["a successful result", [init, text, result(false)], null, false],
+    [
+      "an authentication rejection",
+      fixture("claude-authentication.jsonl"),
+      "Failed to authenticate. API Error: 401 Invalid bearer token",
+      true,
+    ],
+    [
+      "a rejection with different wording",
+      fixture("claude-authentication.jsonl").map((line) =>
+        line.replaceAll("Failed to authenticate. API Error: 401 Invalid bearer token", "Login rejected"),
+      ),
+      "Login rejected",
+      true,
+    ],
+    [
+      "a structured result rejection",
+      [init, JSON.stringify({ type: "result", is_error: true, api_error_status: 401, result: "Rejected" })],
+      "Rejected",
+      true,
+    ],
+    [
+      "a structured assistant rejection",
+      [
+        init,
+        JSON.stringify({
+          type: "assistant",
+          error: "authentication_failed",
+          message: { content: [{ type: "text", text: "Rejected" }] },
+        }),
+        result(true),
+      ],
+      "run failed",
+      true,
+    ],
+    [
+      "a task error mentioning authentication",
+      [init, text, result(true).replace("run failed", "Could not authenticate the test user")],
+      "Could not authenticate the test user",
+      false,
+    ],
+  ])(
+    "a claude stream with %s completes only on a successful result",
+    async (_, lines, cliError, authentication) => {
+      const ok = cliError === null;
+      const seam = parseFakeStream({ parser: "claude", lines }, () => {});
+      expect(seam.status).toBe(authentication ? "unavailable" : ok ? "ok" : "error");
+      expect(seam.failureClass).toBe(authentication ? "authentication" : undefined);
+      expect(seam.error).toBe(
+        authentication
+          ? cliError
+          : ok
+            ? null
+            : "malformed or truncated harness stream: missing successful completion",
       );
-      expect(outcome.status).toBe(ok ? "ok" : "error");
-      expect(outcome.error).toBe(cliError);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+      const dir = mkdtempSync(join(tmpdir(), "limitless-claude-stream-"));
+      try {
+        const outcome = await runClaude(
+          {
+            cwd: dir,
+            prompt: "x",
+            mode: "readonly",
+            noTools: true,
+            target: {
+              modelId: "c/m",
+              provider: "claude",
+              harness: "claude",
+              model: "m",
+              vendor: "anthropic",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 10_000,
+            idleTimeoutMs: 10_000,
+            maxToolCalls: 0,
+            signal: new AbortController().signal,
+            logPath: join(dir, "log"),
+            onEvent: () => {},
+          },
+          async (opts) => {
+            for (const line of lines) opts.onStdoutLine?.(line);
+            return {
+              exitCode: 0,
+              signal: null,
+              truncated: false,
+              durationMs: 1,
+              stdout: "",
+              stderr: "",
+              timedOut: false,
+              idleTimedOut: false,
+              cancelled: false,
+            };
+          },
+        );
+        expect(outcome.status).toBe(authentication ? "unavailable" : ok ? "ok" : "error");
+        expect(outcome.failureClass).toBe(authentication ? "authentication" : undefined);
+        expect(outcome.error).toBe(cliError);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("CodexStreamParser", () => {

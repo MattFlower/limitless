@@ -10,6 +10,7 @@ export interface FakeReply {
   events?: AgentEvent[];
   stream?: StreamFault;
   status?: InvocationStatus;
+  failureClass?: AgentResult["failureClass"];
   sessionId?: string | null;
   costUsd?: number;
   costEquivUsd?: number;
@@ -60,6 +61,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
       });
     return baseResult({
       status: reply.status ?? "ok",
+      failureClass: reply.failureClass,
       numTurns: 1,
       sessionId: reply.sessionId === undefined ? "fake-session" : reply.sessionId,
       finalText: reply.text ?? "",

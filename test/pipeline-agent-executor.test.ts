@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { WorkerStore } from "../src/db/workers.ts";
 import { agentTestLease } from "../src/gates/agent-tests.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentResult, AgentSpec } from "../src/harness/types.ts";
 import type { AgentCall, AgentExecutor } from "../src/pipeline/agent-executor.ts";
 import { type EngineDeps, type InvokeOptions, NeedsHumanError, RunContext } from "../src/pipeline/context.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
+import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { registerCredential } from "../src/util/proc.ts";
@@ -24,6 +26,7 @@ function fixture(
   executor?: AgentExecutor,
   reply: (spec: AgentSpec) => FakeReply | Promise<FakeReply> = () => ({ text: "local result" }),
   faults?: FaultPlan,
+  catalogModels = models,
 ) {
   const root = mkdtempSync(join(tmpdir(), "agent-executor-"));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
@@ -36,7 +39,7 @@ function fixture(
     cfg,
     store,
     tracker,
-    router: new Router(tracker, policy, models),
+    router: new Router(tracker, policy, catalogModels),
     agentExecutor: executor,
     faults,
     harnesses: {
@@ -70,7 +73,7 @@ function fixture(
       cwd,
       ...options,
     });
-  return { root, cwd, run, stage, repo, context, store, tracker, calls, invoke };
+  return { root, cwd, run, stage, repo, context, store, tracker, calls, invoke, cfg };
 }
 
 const remoteResult: AgentResult = {
@@ -410,3 +413,138 @@ test.each([false, true])(
     }
   },
 );
+
+test.each(["implement", "verify", "review", "triage"] as const)(
+  "%s authentication failure skips the provider's remaining candidates",
+  async (role) => {
+    const first = models[0];
+    if (!first) throw new Error("missing model");
+    const secret = `auth-secret-${role}`;
+    registerCredential("auth-test", secret);
+    const f = fixture(
+      undefined,
+      (spec) =>
+        spec.target.provider === "alpha"
+          ? {
+              status: "unavailable",
+              failureClass: "authentication",
+              error: `authentication rejected ${secret}`,
+            }
+          : { text: "success", structured: { complete: true } },
+      undefined,
+      [...models, { ...first, id: "alpha/second", model: "alpha-2" }],
+    );
+    f.context.run.models = { [role]: ["alpha/m", "alpha/second", "beta/m"] };
+    const outcome = await f.invoke({
+      role,
+      mode: role === "implement" ? "edit" : "readonly",
+      constraints: {},
+      requireStructured: role !== "implement",
+    });
+    expect(outcome.target.provider).toBe("beta");
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m", "beta/m"]);
+    expect(f.store.listInvocations(f.run.id)).toMatchObject([
+      {
+        modelId: "alpha/m",
+        status: "unavailable",
+        error: expect.stringContaining("authentication rejected"),
+      },
+      { modelId: "beta/m", status: "ok" },
+    ]);
+    expect(f.tracker.status("alpha")).toMatchObject({
+      state: "degraded",
+      reason: expect.stringContaining("authentication rejected"),
+    });
+    expect(JSON.stringify(f.tracker.status("alpha"))).not.toContain(secret);
+    expect(JSON.stringify(f.store.listInvocations(f.run.id))).not.toContain(secret);
+    expect(f.context.state.round).toBe(0);
+    expect(f.context.state.roundsOnImplementer).toBe(0);
+  },
+);
+
+test.each([true, false])(
+  "worker authentication rejection followed by local success=%s observes only local health",
+  async (success) => {
+    const f = fixture(undefined, () =>
+      success
+        ? { text: "local success" }
+        : { status: "unavailable", failureClass: "authentication", error: "local authentication rejected" },
+    );
+    f.cfg.workers.agents = ["review"];
+    f.cfg.workers.repos = [f.repo.slug];
+    const workers = new WorkerStore(f.store, "a".repeat(40), { tick: 1 });
+    const parentSha = "b".repeat(40);
+    const enqueue = workers.enqueueAgentJob.bind(workers);
+    spyOn(workers, "enqueueAgentJob").mockImplementation((request, id) => {
+      if (!id) throw new Error("missing job id");
+      const job = enqueue(request, id);
+      f.store.db.query("UPDATE agent_jobs SET state='leased',worker='fixture-worker' WHERE id=?").run(id);
+      workers.completeAgentJob(
+        id,
+        {
+          ...remoteResult,
+          status: "unavailable",
+          failureClass: "authentication",
+          error: "remote authentication rejected",
+          parentSha,
+          sha: parentSha,
+          branch: "change/review",
+        },
+        "a".repeat(40),
+      );
+      return job;
+    });
+    const executor = lanAgentExecutor(workers, f.cfg);
+    f.context.deps.agentExecutor = {
+      kind: "lan",
+      run: (call, local) =>
+        executor.run(
+          { ...call, spec: { ...call.spec, target: { ...call.spec.target, harness: "claude" } } },
+          local,
+        ),
+    };
+    const record = spyOn(f.tracker, "record");
+    const invoked = f.invoke({
+      role: "review",
+      mode: "readonly",
+      checkout: { parentSha, baseSha: parentSha, branch: "change/review" },
+    });
+    if (success) {
+      expect((await invoked).result).toMatchObject({ status: "ok", finalText: "local success" });
+      expect(f.tracker.status("alpha")).toMatchObject({ state: "ok", reason: null });
+    } else {
+      await expect(invoked).rejects.toThrow("local authentication rejected");
+      expect(f.tracker.status("alpha")?.reason).toBe("local authentication rejected");
+    }
+    expect(f.calls).toHaveLength(1);
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(f.store.listInvocations(f.run.id)).toHaveLength(1);
+  },
+);
+
+test.each([false, true])(
+  "private authentication exhaustion retains the cause without private output (pinned=%s)",
+  async (pinned) => {
+    const f = fixture(undefined, () => ({
+      status: "error",
+      failureClass: "authentication",
+      error: "private diagnostic",
+    }));
+    if (pinned) f.context.run.models = { implement: ["alpha/m"] };
+    await expect(f.invoke({ privateOutput: true })).rejects.toThrow("authentication failed");
+    expect(f.tracker.status("alpha")?.reason).toBe("authentication failed");
+    expect(f.store.listInvocations(f.run.id)).toMatchObject([
+      { status: "unavailable", error: "authentication failed" },
+    ]);
+    expect(f.context.state.round).toBe(0);
+  },
+);
+
+test("structured authentication rejection without diagnostics retains a usable reason", async () => {
+  const f = fixture(undefined, () => ({ status: "error", failureClass: "authentication" }));
+  await expect(f.invoke()).rejects.toThrow("authentication failed");
+  expect(f.tracker.status("alpha")?.reason).toBe("authentication failed");
+  expect(f.store.listInvocations(f.run.id)).toMatchObject([
+    { status: "unavailable", error: "authentication failed" },
+  ]);
+});
