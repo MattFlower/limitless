@@ -34,6 +34,9 @@ const QUOTA_TEXT =
 
 type Json = Record<string, unknown>;
 
+const subscriptionToken = (spec: AgentSpec) =>
+  spec.target.billing === "subscription" && !spec.target.backend ? spec.claudeSubscriptionToken : undefined;
+
 function blocks(msg: unknown): Json[] {
   const content = (msg as { content?: unknown })?.content;
   return Array.isArray(content) ? (content as Json[]) : [];
@@ -181,7 +184,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     // Tools must not inherit hooks, sandbox exclusions, permissions or MCP servers from project
     // settings: arrays such as excludedCommands and permission rules merge across sources.
     "--setting-sources",
-    spec.mode === "readonly" || !spec.noTools ? "" : "project,local",
+    subscriptionToken(spec) || spec.mode === "readonly" || !spec.noTools ? "" : "project,local",
     "--permission-mode",
     "dontAsk",
   ];
@@ -303,8 +306,9 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
 
 function claudeEditorRoots(spec: AgentSpec, scratch: string) {
   const roots = writeRoots(spec.cwd, scratch, false, spec.denyRead);
-  // Follow-up to #834: supply Claude's login from the daemon before denying outer-profile Keychain
-  // access for security. Native tools keep the full list; overlapping credential denies win here.
+  if (subscriptionToken(spec)) return roots;
+  // Without daemon-supplied auth (including LAN workers), the CLI still needs its Keychain login.
+  // Native tools keep the full list; overlapping credential denies win here.
   const keychains = new Set(roots.keychainOnlyReadPaths);
   return { ...roots, denyRead: roots.denyRead?.filter((path) => !keychains.has(path)) };
 }
@@ -317,6 +321,7 @@ export async function runClaude(
   spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
   const t = spec.target;
+  const token = subscriptionToken(spec);
   const keyFile = t.backend && `${tmpdir()}/limitless-${sessionId}.key`;
   const args = buildClaudeArgs(spec, sessionId, keyFile);
   const editing = spec.mode === "edit" && !spec.noTools;
@@ -417,16 +422,21 @@ export async function runClaude(
   const proc = await runner({
     cmd: args,
     cwd: spec.cwd,
-    env: agentEnv({
-      ...envExtra,
-      ...shellEnv,
-      // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
-      // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
-      // cwd record) must land in the scratch directly: its parent is outside the boundary.
-      ...(spec.scratchDir
-        ? { CLAUDE_CODE_TMPDIR: editing ? spec.scratchDir : scratchParent(spec.scratchDir) }
-        : {}),
-    }),
+    env: {
+      ...agentEnv({
+        ...envExtra,
+        ...shellEnv,
+        // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
+        // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
+        // cwd record) must land in the scratch directly: its parent is outside the boundary.
+        ...(spec.scratchDir
+          ? { CLAUDE_CODE_TMPDIR: editing ? spec.scratchDir : scratchParent(spec.scratchDir) }
+          : {}),
+      }),
+      // This credential belongs only to subscription Claude. Generic children still strip it,
+      // including explicit overrides; add it only after agentEnv has removed API credentials.
+      ...(token ? { CLAUDE_CODE_OAUTH_TOKEN: token } : {}),
+    },
     stdin: spec.prompt,
     signal,
     timeoutMs: spec.timeoutMs,

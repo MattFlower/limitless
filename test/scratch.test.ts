@@ -1,4 +1,4 @@
-import { afterEach, expect } from "bun:test";
+import { afterEach, expect, spyOn } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -32,6 +32,7 @@ import {
   readPolicyScope,
 } from "../src/harness/read-policy.ts";
 import { ConfinementError, confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
+import * as scratchPolicy from "../src/harness/scratch.ts";
 import {
   commandDir,
   commandRoots,
@@ -1557,6 +1558,61 @@ function credentialFixture() {
   for (const dir of [fixture.cwd, fixture.scratchDir]) writeFileSync(join(dir, "canary"), "stand-in");
   return { ...fixture, files, options: { home, denyRead: [join(home, "custom-login")] } };
 }
+
+test.each([false, true])("Claude editor keychain profile with subscription token=%s", async (configured) => {
+  const { root, spec, options } = credentialFixture();
+  const keychain = join(options.home, "Library/Keychains");
+  const target = join(root, "keychain-store");
+  mkdirSync(dirname(keychain));
+  mkdirSync(target);
+  symlinkSync(target, keychain);
+  const paths = [keychain, target];
+  const original = scratchPolicy.writeRoots;
+  // Supply the macOS keychain policy on every platform, using real synthetic alias spellings.
+  const rootsSpy = spyOn(scratchPolicy, "writeRoots").mockImplementation((...args) => {
+    const roots = original(...args);
+    return {
+      ...roots,
+      denyRead: [...new Set([...(roots.denyRead ?? []), ...paths])],
+      keychainOnlyReadPaths: args[3]?.length ? [] : paths,
+    };
+  });
+  try {
+    await readPolicyScope.run({ ...options, environment: {} }, async () => {
+      for (const overlapping of [false, true]) {
+        const recording = recordingConfinement();
+        await confinementScope.run(recording.backend, () =>
+          runClaude(
+            {
+              ...spec,
+              claudeSubscriptionToken: configured ? "synthetic-subscription-token" : undefined,
+              denyRead: overlapping ? [keychain] : [],
+            },
+            async (opts) => {
+              opts.onStdoutLine?.(opts.cmd[4] ?? "");
+              const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+              for (const path of paths) {
+                expect(settings.sandbox.filesystem.denyRead).toContain(path);
+                expect(settings.permissions.deny).toContain(`Read(/${path})`);
+                expect(settings.permissions.deny).toContain(`Read(/${path}/**)`);
+              }
+              return procResult;
+            },
+          ),
+        );
+        const roots = recording.calls[0]?.roots;
+        if (!roots) throw new Error("missing editor roots");
+        for (const path of paths) {
+          expect(roots.denyRead?.includes(path)).toBe(configured || overlapping);
+          expect(seatbeltProfile(roots).includes(`(subpath "${path}")`)).toBe(configured || overlapping);
+        }
+        expect(roots.denyRead).toContain(join(options.home, ".ssh"));
+      }
+    });
+  } finally {
+    rootsSpy.mockRestore();
+  }
+});
 
 test("ordinary readers deny shared stores while retaining checkout, toolchain and system reads", async () => {
   const { root, cwd, scratchDir, spec, files, options } = credentialFixture();

@@ -258,9 +258,16 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
   const fileSecrets = parseEnvFile(join(configDir, "secrets.env"));
   const secrets: Record<string, string> = Object.assign(Object.create(null), fileSecrets);
   // Environment variables win over the secrets file (useful for tests and CI).
-  for (const key of ["DISCORD_BOT_TOKEN", "DISCORD_APP_ID", "DISCORD_GUILD_ID", "GITHUB_WEBHOOK_SECRET"]) {
+  for (const key of [
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_APP_ID",
+    "DISCORD_GUILD_ID",
+    "GITHUB_WEBHOOK_SECRET",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+  ]) {
     const v = process.env[key];
     if (v) secrets[key] = v;
+    if (key === "CLAUDE_CODE_OAUTH_TOKEN") registerCredential(key, secrets[key]);
   }
 
   for (const p of catalog.providers) {
