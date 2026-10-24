@@ -7156,19 +7156,24 @@ test("heartbeat uses cached sanitized capabilities while a refresh is pending", 
   }
 });
 
-test.each([false, true])(
-  "worker-local token authenticates startup, refreshed capabilities and jobs, rejected=%s",
-  async (rejected) => {
+test.each([
+  { configured: true, rejected: false },
+  { configured: true, rejected: true },
+  { configured: false, rejected: false },
+])(
+  "worker-local authentication covers startup, refreshed capabilities and jobs: %j",
+  async ({ configured, rejected }) => {
     await listen();
     const token = `worker-probe-${crypto.randomUUID()}`;
     const priorToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    writeFileSync(join(cfg.paths.configDir, "secrets.env"), `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+    if (configured)
+      writeFileSync(join(cfg.paths.configDir, "secrets.env"), `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
     const bodies: Capabilities[] = [];
     const transmitted: unknown[] = [];
     const diagnostics: string[] = [];
+    const checks: string[][] = [];
     let versions = 0,
-      checks = 0,
       harnessCalls = 0;
     const worker = await loop({
       capabilityRefreshMs: 10,
@@ -7176,17 +7181,21 @@ test.each([false, true])(
         if (args[0] !== "claude") return { exitCode: 1, stdout: "not installed" };
         if (args[1] === "--version")
           return { exitCode: 0, stdout: `2.1.${++versions === 1 ? 3 : 4} (Claude Code)` };
-        checks++;
-        expect(args).toEqual(["claude", "auth", "status"]);
+        checks.push(args);
         const supplied = options.env?.CLAUDE_CODE_OAUTH_TOKEN;
-        // The stored login fails for the valid-token case and succeeds for the rejected-token case.
-        const success = supplied === token ? !rejected : rejected;
-        return { exitCode: success ? 0 : 1, stdout: `Token rejected: ${token}` };
+        expect(supplied).toBe(configured ? token : undefined);
+        if (args[1] === "auth") {
+          expect(args).toEqual(["claude", "auth", "status"]);
+          if (supplied) return { exitCode: 0, stdout: '{"loggedIn":true,"authMethod":"oauth_token"}' };
+          return { exitCode: !configured || rejected ? 0 : 1, stdout: "stored login" };
+        }
+        expect(args).toContain("--print");
+        return { exitCode: supplied === token && !rejected ? 0 : 1, stdout: `Token rejected: ${token}` };
       },
       harnesses: {
         claude: fakeHarness((spec) => {
           harnessCalls++;
-          expect(spec.claudeSubscriptionToken).toBe(token);
+          expect(spec.claudeSubscriptionToken).toBe(configured ? token : undefined);
           return {};
         }),
       },
@@ -7201,7 +7210,8 @@ test.each([false, true])(
       await until(() => bodies.some((body) => body.agents?.claude?.version === "2.1.4 (Claude Code)"));
       expect(bodies[0]?.agents?.claude).toEqual({ version: "2.1.3 (Claude Code)", loggedIn: !rejected });
       expect(bodies.at(-1)?.agents?.claude?.loggedIn).toBe(!rejected);
-      expect(checks).toBeGreaterThanOrEqual(2);
+      expect(checks.length).toBeGreaterThanOrEqual(2);
+      expect(checks.every((args) => args[1] === (configured ? "--print" : "auth"))).toBe(true);
       if (!rejected) {
         const id = await queuedLocalAgent();
         await until(() => workers.agentJob(id)?.state === "done" || !!workers.agentJob(id)?.failure_reason);
@@ -7256,9 +7266,12 @@ test.each([false, true])(
         codex: { version: null, loggedIn: false },
       }),
       capabilityRunner: async (args, options) => {
-        expect(args).toEqual(["claude", "auth", "status"]);
         const supplied = options.env?.CLAUDE_CODE_OAUTH_TOKEN;
         loginTokens.push(supplied);
+        if (args[1] === "auth") {
+          expect(args).toEqual(["claude", "auth", "status"]);
+          if (supplied) return { exitCode: 0, stdout: '{"loggedIn":true,"authMethod":"oauth_token"}' };
+        } else expect(args).toContain("--print");
         return configured
           ? supplied
             ? { exitCode: 1, stdout: "", stderr: `Token rejected: ${token}` }
@@ -7278,7 +7291,7 @@ test.each([false, true])(
       },
     });
     try {
-      await until(() => failures.length > 0 && workers.agentJob(id)?.state === "queued");
+      await until(() => calls > 0 || (failures.length > 0 && workers.agentJob(id)?.state === "queued"));
       expect(failures).toEqual([
         { reason: configured ? "Token rejected: [redacted]" : "Worker CLI not logged in" },
       ]);

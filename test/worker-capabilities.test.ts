@@ -113,13 +113,45 @@ test.each([
     if (args[1] === "--version")
       return { exitCode: 0, stdout: args[0] === "claude" ? "2.1.3 (Claude Code)" : "codex-cli 0.50.0" };
     if (args[0] === "codex") return { exitCode: 0, stdout: "logged in" };
-    expect(args).toEqual(["claude", "auth", "status"]);
-    return { exitCode: accepted ? 0 : 1, stdout: accepted ? "logged in" : `Rejected ${token}` };
+    if (args[1] === "auth") {
+      expect(args).toEqual(["claude", "auth", "status"]);
+      // The real CLI accepts any nonempty token here, including a revoked one.
+      return supplied
+        ? { exitCode: 0, stdout: '{"loggedIn":true,"authMethod":"oauth_token"}' }
+        : {
+            exitCode: configured || accepted ? 0 : 1,
+            stdout: JSON.stringify({ loggedIn: configured || accepted }),
+          };
+    }
+    expect(args).toEqual([
+      "claude",
+      "--print",
+      "Reply OK.",
+      "--model",
+      "haiku",
+      "--tools",
+      "",
+      "--max-turns",
+      "1",
+      "--no-session-persistence",
+      "--setting-sources",
+      "",
+      "--strict-mcp-config",
+      "--settings",
+      '{"disableAllHooks":true}',
+    ]);
+    return {
+      exitCode: supplied === token && accepted ? 0 : 1,
+      stdout: accepted ? "OK." : `Rejected ${token}`,
+    };
   };
   const result = await probeAgents(run, undefined, secrets);
   expect(result.claude).toEqual({ version: "2.1.3 (Claude Code)", loggedIn: accepted });
   expect(result.codex.loggedIn).toBe(true);
   expect(calls).toHaveLength(4);
+  expect(calls.filter((args) => args[0] === "claude" && args[1] !== "--version")).toEqual([
+    expect.arrayContaining(configured ? ["--print", "--tools", ""] : ["auth", "status"]),
+  ]);
   expect(JSON.stringify(result)).not.toContain(token);
   if (configured) expect(redactCredentials(`Rejected ${token}`)).toBe("Rejected [redacted]");
 });
@@ -133,8 +165,11 @@ test.each(["stdout", "stderr", "throw"] as const)(
     await expect(
       checkLogin(
         "claude",
-        async (_args, options) => {
+        async (args, options) => {
           calls++;
+          if (args[1] === "auth")
+            return { exitCode: 0, stdout: '{"loggedIn":true,"authMethod":"oauth_token"}' };
+          expect(args).toContain("--print");
           expect(options.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
           if (source === "throw") throw new Error(diagnostic);
           return { exitCode: 1, stdout: "", [source]: diagnostic };

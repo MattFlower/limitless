@@ -37,8 +37,16 @@ export async function checkLogin(
   signal?: AbortSignal,
   secrets: Record<string, string> = {},
 ) {
-  const result = await command(name, loginArgs[name], run, signal, secrets);
-  if (!loggedIn(result) && subscriptionToken(name, secrets))
+  const token = subscriptionToken(name, secrets);
+  let args = loginArgs[name];
+  // auth status only checks token presence; a request must validate it with Claude.
+  if (token) {
+    args = ["--print", "Reply OK.", "--model", "haiku", "--tools", "", "--max-turns", "1"];
+    args.push("--no-session-persistence", "--setting-sources", "", "--strict-mcp-config");
+    args.push("--settings", '{"disableAllHooks":true}');
+  }
+  const result = await command(name, args, run, signal, secrets);
+  if (!loggedIn(result) && token)
     throw new Error(
       redactCredentials(result?.stderr?.trim() || result?.stdout.trim() || "Worker CLI not logged in").slice(
         0,
