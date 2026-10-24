@@ -163,7 +163,7 @@ use the file first, then the environment.
 
 | Key | Enables |
 |---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Optional Claude subscription authentication for daemon-local sessions, including sessions on the coordinator. A nonempty environment value overrides the file; an empty value leaves the file value in effect. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Optional Claude subscription authentication for local sessions on coordinators, workers and smoke checks. A nonempty environment value overrides the file; an empty value leaves the file value in effect. |
 | `OPENROUTER_API_KEY` | The `openrouter` provider. Without it, the provider shows `missing OPENROUTER_API_KEY`. |
 | `OMLX_API_KEY` | Authenticated oMLX inference and health probes |
 | `TYPESAFE_API_KEY` | The `typesafe` provider (TypeSafe decisions API key, for the Jev decision model) |
@@ -175,7 +175,10 @@ plan), then put `CLAUDE_CODE_OAUTH_TOKEN=<token>` in `secrets.env`. It lasts one
 per-token revocation; signing out everywhere revokes it. Agents in Claude sessions can read this
 token. It authenticates against the subscription, without API billing. Authentication failure
 fails the session without falling back to the keychain or an API key. Without a token, existing
-login behavior is unchanged. LAN workers do not receive this token and keep their own Claude logins.
+login behavior is unchanged. Run `claude setup-token` on each LAN worker and put its token in
+that worker's `secrets.env`; the coordinator's token is never forwarded. Workers without a token
+retain interactive-login authentication, whose short-lived access token cannot be refreshed
+persistently inside confined sessions. Older workers retain that same behavior.
 
 **Before upgrading:** installations relying on the former hardcoded GitHub owner must explicitly
 set `github = "<owner>"` under `[owners]` in `config.toml` before upgrading, or their Dependabot
@@ -258,8 +261,8 @@ On macOS, `~/Library/Keychains` is denied. With `CLAUDE_CODE_OAUTH_TOKEN` config
 Claude subscription editors also deny all keychain spellings in their outer profile. Without it,
 Claude editors exempt keychain paths only in the outer profile so `security` can read their login;
 native Read, Grep and Glob tools still deny both path spellings. Overlapping credential or explicit
-denies take precedence over that exemption. LAN workers keep this exemption and their own Claude
-logins; the coordinator token is not forwarded to them.
+denies take precedence over that exemption. Workers use their own configured token and retain
+the exemption only without one; the coordinator token is not forwarded to them.
 Network egress and the loopback API (#484) remain separate gaps. Older releases ignore these optional
 sandbox settings and do not enforce these read rules.
 

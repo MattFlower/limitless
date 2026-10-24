@@ -114,11 +114,13 @@ async function withExecutor(
     import { runInplaceExecutor } from ${JSON.stringify(new URL("../src/gates/inplace.ts", import.meta.url).pathname)};
     import { seatbeltBackend } from ${JSON.stringify(new URL("../src/harness/sandbox.ts", import.meta.url).pathname)};
     import { appendFileSync } from 'node:fs';
+    import { gitBackend } from ${JSON.stringify(new URL("../src/git/confinement.ts", import.meta.url).pathname)};
     import { processBootInspection } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).pathname)};
     const controller = new AbortController();
     process.once('SIGTERM', () => controller.abort());
     const cfg = ${JSON.stringify({ paths: f.cfg.paths, port: f.cfg.port, maxConcurrentGates: 1, readPolicy: f.cfg.readPolicy })};
     if (!${realConfinement}) {
+      gitBackend.default = { wrap: async cmd => cmd };
       seatbeltBackend.verify = async (roots) => appendFileSync(${JSON.stringify(join(fixture.home, "executor-ports"))}, String(roots.daemonPort) + '\\n');
       seatbeltBackend.wrap = cmd => cmd;
     }
@@ -1131,7 +1133,16 @@ test.each([
         attach.mockRestore();
       }
       writeFileSync(proceed, "");
-      expect(await waitFor(next, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(await waitFor(next, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        purpose === "initial" ? "needs_human" : "succeeded",
+      );
+      if (purpose === "initial") {
+        // The resumed gate passes against its edited file, so it cannot attest to the commit.
+        const completed = next.store.getRunState<RunContext["state"]>(run.id);
+        expect(completed?.lastGates?.find((check) => check.name === "build")?.result.ok).toBe(true);
+        expect(completed?.gateEvidence).toBeUndefined();
+        expect(next.store.getRun(run.id)?.error).toContain("missing or inconsistent passing round evidence");
+      }
       expect(implementations).toBe(1);
       expect(workers.job(job?.id ?? "")?.state).toBe(mismatch ? "cancelled" : "done");
       expect(readFileSync(counter, "utf8")).toBe(mismatch ? "run\nrun\n" : "run\n");

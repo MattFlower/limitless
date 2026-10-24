@@ -25,6 +25,7 @@ import {
   readRetryFiles,
 } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
+import { gateProvenance } from "../gates/executor.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
@@ -1536,6 +1537,20 @@ async function oneRound(
             },
           };
           const checkedSha = await headSha(cwd);
+          ctx.state.gateEvidence = undefined;
+          let reusable = true;
+          const confirm = (run: GateRun) => {
+            if (run.sha !== checkedSha || run.trackedClean !== true) {
+              reusable = false;
+              ctx.log(
+                redactGateOutput(
+                  `Gate evidence withheld: ${run.provenanceError ?? "execution provenance could not be confirmed for the checked commit"}`,
+                ),
+                "warn",
+              );
+            }
+            return run;
+          };
           let cmp: GateComparison[];
           let testScripts: Record<string, string> = {};
           let baseTimeout = false;
@@ -1558,8 +1573,10 @@ async function oneRound(
               : docs.gates;
             const execute = (purpose: string) =>
               !reused || activeGates.setup.length || activeGates.checks.length
-                ? runGateExecution(ctx, "gates", purpose, cwd, activeGates, events, env)
-                : Promise.resolve({ setupOk: true, setup: [], checks: [] } as GateRun);
+                ? runGateExecution(ctx, "gates", purpose, cwd, activeGates, events, env).then(confirm)
+                : gateProvenance(cwd, ctx.signal, checkedSha).then((provenance) =>
+                    confirm({ setupOk: true, setup: [], checks: [], ...provenance }),
+                  );
             const insertReused = (run: GateRun): GateRun =>
               reused && run.setupOk
                 ? {
@@ -1643,7 +1660,7 @@ async function oneRound(
                       onLocalSetup:
                         retry.setup.length === gates.setup.length ? events.onLocalSetup : undefined,
                     },
-                  ),
+                  ).then(confirm),
                 ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
               );
             ctx.checkCancelled();
@@ -1681,9 +1698,8 @@ async function oneRound(
             canonicalPaths.every((path) => path.length <= 2000 && redactGateOutput(path) === path)
               ? canonicalPaths
               : undefined;
-          // A gate may have changed HEAD itself; those results cannot attest to the checked commit.
           ctx.state.gateEvidence =
-            (await headSha(cwd)) === checkedSha
+            reusable && (await headSha(cwd)) === checkedSha
               ? {
                   stageId: stage.id,
                   sha: checkedSha,

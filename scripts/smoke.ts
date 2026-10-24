@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { worktreeGit } from "../src/git/command.ts";
+import { withSubscriptionAuth } from "../src/harness/auth.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
@@ -1068,6 +1069,7 @@ export function explicitModelChecks(
   catalog = { providers: PROVIDERS, models: MODELS },
   excludeOrigins?: readonly string[],
   check = liveCheck,
+  secrets: Record<string, string> = {},
 ): SmokeCheck[] {
   return references.split(",").map((reference) => {
     const resolved = resolveTarget(reference, (id) => catalog.models.find((m) => m.id === id));
@@ -1080,7 +1082,13 @@ export function explicitModelChecks(
     return {
       name: `${resolved.targetId} structured`,
       timeoutMs: 90_000,
-      run: (signal) => check(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
+      run: (signal) =>
+        check(
+          withSubscriptionAuth(provider.id, provider.id === "claude" ? runClaude : runCodex, secrets),
+          target,
+          "structured",
+          signal,
+        ),
     };
   });
 }
@@ -1089,6 +1097,7 @@ export function nativeChecks(
   catalog = { providers: PROVIDERS, models: MODELS },
   excludeOrigins?: readonly string[],
   check = liveCheck,
+  secrets: Record<string, string> = {},
 ): SmokeCheck[] {
   const checks: SmokeCheck[] = [];
   for (const id of ["claude", "codex"]) {
@@ -1097,7 +1106,7 @@ export function nativeChecks(
     let target: ModelTarget | undefined;
     const selectedTarget = () =>
       (target ??= targetFor(provider, cheapestModel(id, catalog.models, excludeOrigins)));
-    const harness = id === "claude" ? runClaude : runCodex;
+    const harness = withSubscriptionAuth(id, id === "claude" ? runClaude : runCodex, secrets);
     for (const kind of [
       "structured",
       "fast",
@@ -1146,14 +1155,23 @@ export async function main(print = console.log, options: RunOptions = {}): Promi
     const references = process.argv[index + 1];
     if (!references) throw new Error("--models requires model@effort references");
     return readPolicyScope.run(cfg.readPolicy, () =>
-      reportChecks(explicitModelChecks(references, catalog, excludeOrigins), print, options),
+      reportChecks(
+        explicitModelChecks(references, catalog, excludeOrigins, liveCheck, secrets),
+        print,
+        options,
+      ),
     );
   }
   const store = new Store(cfg.paths.db);
   const runtime = store.runtimeModels();
   const enabled = catalog.providers.filter((p) => store.getProviderEnabledOverride(p.id) !== false);
   store.close();
-  const checks = nativeChecks({ providers: enabled, models: catalog.models }, excludeOrigins);
+  const checks = nativeChecks(
+    { providers: enabled, models: catalog.models },
+    excludeOrigins,
+    liveCheck,
+    secrets,
+  );
   checks.push(
     ...backendChecks(
       secrets,

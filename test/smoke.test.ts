@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -35,6 +35,7 @@ import {
 } from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
 import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
+import * as claudeHarness from "../src/harness/claude.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, PROVIDERS } from "../src/router/catalog.ts";
@@ -55,6 +56,46 @@ const result: AgentResult = {
   quota: null,
 };
 const now = () => performance.now();
+
+test.each([undefined, "synthetic-smoke-subscription-token"])(
+  "native and explicit Claude smoke launch with local subscription token=%s",
+  async (token) => {
+    const launches: (string | undefined)[] = [];
+    const launch = spyOn(claudeHarness, "runClaude").mockImplementation(async (spec) => {
+      launches.push(spec.claudeSubscriptionToken);
+      return result;
+    });
+    const catalog = {
+      providers: PROVIDERS.filter((p) => p.id === "claude"),
+      models: MODELS.filter((m) => m.provider === "claude"),
+    };
+    const secrets: Record<string, string> = token ? { CLAUDE_CODE_OAUTH_TOKEN: token } : {};
+    const check: typeof liveCheck = async (harness, target, _kind, signal) => {
+      await harness({
+        target,
+        cwd: ".",
+        prompt: "test",
+        mode: "readonly",
+        timeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        maxToolCalls: 1,
+        signal: signal ?? new AbortController().signal,
+        logPath: "unused",
+        onEvent: () => {},
+      });
+      return { status: "pass" };
+    };
+    try {
+      const native = nativeChecks(catalog, undefined, check, secrets);
+      const explicit = explicitModelChecks("claude/haiku", catalog, undefined, check, secrets);
+      const rows = await runChecks([...native, ...explicit]);
+      expect(rows.every((row) => row.status === "pass")).toBe(true);
+      expect(launches).toEqual(Array.from({ length: 9 }, () => token));
+    } finally {
+      launch.mockRestore();
+    }
+  },
+);
 
 test("excluded backend smoke preserves missing-key and failed-health skips without invoking a checker", async () => {
   const providers = PROVIDERS.filter((p) => ["omlx", "openrouter", "typesafe"].includes(p.id));
