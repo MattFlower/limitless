@@ -305,8 +305,12 @@ detection, per-invocation budget, process-group kill on cancel.
   caches verdicts by CLI identity/version, profile kind and deny set. On macOS, `~/Library/Keychains`
   is denied. Claude editors exempt keychain paths only in the outer profile for login through
   `security`; native Read, Grep and Glob tools retain all keychain denies. Overlapping credential or
-  explicit denies take precedence. The follow-up to #834 will supply their login from the daemon
-  before denying outer-profile Keychain access. Claude's file-backed CLI login remains readable (#369).
+  explicit denies take precedence. With a configured `CLAUDE_CODE_OAUTH_TOKEN`, local subscription
+  sessions on coordinators, workers and smoke checks receive it, and editors retain the outer-profile
+  Keychain denies. Run `claude setup-token` on each LAN worker and put its token in that worker's
+  `secrets.env`; coordinator tokens are never forwarded. Tokenless and older workers retain
+  interactive-login behavior and the keychain exemption, including the existing limitation that
+  confined sessions cannot persist access-token refreshes. Claude's file-backed CLI login remains readable (#369).
   HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
   and a private copy of Cargo configuration preserve installed toolchain discovery and read
   access; writes to real HOME remain denied.
@@ -321,6 +325,86 @@ detection, per-invocation budget, process-group kill on cancel.
   when missing. Installations relying on the former default must set `github = "<owner>"` under
   `[owners]` in `config.toml` before upgrading, or these triggers stop.
   Untrusted issue/PR text is treated as data and quoted, never as instructions.
+
+### Process discovery coverage and recovery probes (#740)
+
+Run `bun scripts/probe-process-recovery.ts` from the checkout (Bun and `python3` required).
+The probe calls the shared production `markedProcesses` scanner used by daemon and LAN worker
+cleanup. It uses private directories under `os.tmpdir()`, a fork-PID acknowledgement and a pipe
+release handshake, then verifies kernel-reported parent, session, group, cwd, executable name
+and environment visibility before scanning. Each readiness wait is bounded to five seconds;
+targets and helpers have 45-second safety alarms. Cleanup retains creator-reported PIDs and
+birth identities, never signals a PID obtained from a scan, and confirms every target stopped.
+Unsupported platforms, failed helpers and denied inspection are reported explicitly; they are
+not successful measurements. The null-leader experiment deliberately omits captured evidence
+from discovery, representing a record persisted after failed capture without crashing a daemon.
+
+Measured on macOS arm64 in the factory's Codex filesystem confinement on 2026-10-24:
+
+| Scenario (relative to the invocation leader) | Verified state before scanning | Discovered |
+|---|---|---|
+| Leave session/group only | New session and group; marked Python child; cwd inside roots; parent alive | Yes |
+| Leave recorded cwd only | Original session/group; marked Python child; cwd outside roots; parent alive | Yes |
+| Execute platform binary only | `/bin/sleep`, environment hidden by SIP; original session/group; cwd inside; parent alive | Yes |
+| Outlive parent only | Python, marker readable; parent 1; original session/group; cwd inside | Yes |
+| All four together | `/bin/sleep`, environment hidden; parent 1; new session/group; cwd outside | **No** |
+| Null leader, hidden orphan outside roots | `/bin/sleep`, environment hidden; parent 1; original session/group; saved leader null | **No** |
+
+Three scans per scenario excluded both independently owned, live `/bin/sleep` controls outside
+the roots: one in an independent session/group, one in the caller's session/group. Every target,
+helper and control was stopped and scratch removed. Representative shared-scan times were
+0.43–2.40 ms per scan in the initial measurement; these are observations, not timing assertions.
+The script prints current measurements on each run. No Linux host was available in this run:
+Linux environment replacement and Linux before/after timings remain **unmeasured**. The Linux
+branch of the same command verifies an `env -i /bin/sleep` child retaining its invocation's
+session/group and checks both controls. Linux discovery remains unchanged and marker-only;
+no session/group rule is enabled without the requested real Linux evidence. A future rule must
+capture birth/session/group at spawn and validate that evidence, including after persistence,
+rather than trusting numeric IDs. There is no Linux scan change to benchmark here.
+
+Darwin accepts exact environment markers, descendants of proven members, validated invocation
+session/group members, and newly born hidden-environment orphans inside the recorded roots.
+UID, zombie and protected-ancestor exclusions still apply; numeric membership excludes the
+caller's session/group and requires captured leader identity. A missing or recycled leader
+cannot grant ownership without evidence. Recovery additionally revalidates saved leader
+liveness and birth on each scan, dropping numeric authority when that continuity is lost.
+Legacy null-leader records still support marker/ancestry/cwd discovery. The combined escape
+discards every available ownership signal. Two empty recovery scans establish quiescence only
+within discovery's coverage; they do not prove that every descendant ended. These measurements
+do not establish completeness for other process topologies or confinement profiles. Userland
+quota-spending CLI binaries retain readable markers; the measured SIP gap concerns platform tools.
+
+**Unimplemented macOS option: invocation-specific Seatbelt membership.** A possible design
+would give each invocation an unguessable permission fingerprint in an inherited Seatbelt
+profile. A membership query must prove that the candidate has that invocation's restriction,
+not just that it is sandboxed. For example, query a unique denied sentinel operation together
+with an allowed control, using `sandbox_check` with reporting disabled. An unrestricted process
+would pass both; an unrelated restrictive sandbox must not be confused with the invocation.
+The sentinel pair alone is not yet demonstrated to provide exclusive ownership proof: profile
+composition, self-imposed restrictions and query errors must be tested before trusting it.
+Every claimed process would still require UID, birth and pre-signal identity checks. This could
+retain a signal across `setsid`, cwd changes, exec and reparenting if inherited membership can
+actually be queried reliably.
+
+The current code uses libSystem's `sandbox_check` only to inspect its own read-allowlist profile.
+Whether another PID's invocation fingerprint can be queried reliably from the daemon and a
+confined worker, using supported APIs and without extra entitlements/root, is an unresolved
+feasibility question. Direct sandbox identity APIs, if needed, would require an API/privilege
+investigation; no reliable public invocation-ID interface is assumed here. Restart handling
+would need durable fingerprint-to-invocation and boot evidence recorded before launch, and a
+fail-closed treatment of older records without it. It would not solve old invocations retroactively.
+
+An invocation already in a factory outer Seatbelt profile could receive the fingerprint in that
+profile at creation. Codex's own sandbox and Claude readers' internal sandbox would require
+integration with their profile construction; macOS cannot nest Seatbelt, so adding an outer
+wrapper is not a general solution. Linux and unconfined invocations would retain their existing
+discovery limits. Expected cost includes profile construction/probing at launch, persisted
+evidence and restart compatibility, and at least two extra kernel permission queries per
+candidate per scan (hundreds of processes on a production Mac). No runtime overhead has been
+measured. Implementation is a separate multi-component confinement and recovery project,
+starting with an API/ownership prototype and real nested/constrained-host probes, then backend
+integration and restart tests; it is substantially beyond this issue's source budget. No such
+mechanism or confinement-policy change is implemented here.
 
 ## 7. Persistence
 

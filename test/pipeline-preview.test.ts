@@ -2,7 +2,7 @@ import { describe, expect } from "bun:test";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
-import { type GateExecutor, localExecutor } from "../src/gates/executor.ts";
+import { type GateExecutor, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import type { GateRun } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -104,7 +104,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
             })),
           };
           return {
-            result: Promise.resolve(result),
+            result: gateProvenance(request.cwd, signal, request.headSha).then((provenance) => ({
+              ...result,
+              ...provenance,
+            })),
             events: { async *[Symbol.asyncIterator]() {} },
             async cancel() {},
           };

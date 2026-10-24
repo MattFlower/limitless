@@ -163,11 +163,22 @@ use the file first, then the environment.
 
 | Key | Enables |
 |---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | Optional Claude subscription authentication for local sessions on coordinators, workers and smoke checks. A nonempty environment value overrides the file; an empty value leaves the file value in effect. |
 | `OPENROUTER_API_KEY` | The `openrouter` provider. Without it, the provider shows `missing OPENROUTER_API_KEY`. |
 | `OMLX_API_KEY` | Authenticated oMLX inference and health probes |
 | `TYPESAFE_API_KEY` | The `typesafe` provider (TypeSafe decisions API key, for the Jev decision model) |
 | `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID` | The Discord bot (also needs `[owners].discord` and `[discord].channel_id`) |
 | `GITHUB_WEBHOOK_SECRET` | `POST /webhooks/github`. Without it, the endpoint answers 503. |
+
+Create a subscription token with `claude setup-token` (requires a Pro, Max, Team or Enterprise
+plan), then put `CLAUDE_CODE_OAUTH_TOKEN=<token>` in `secrets.env`. It lasts one year and has no
+per-token revocation; signing out everywhere revokes it. Agents in Claude sessions can read this
+token. It authenticates against the subscription, without API billing. Authentication failure
+fails the session without falling back to the keychain or an API key. Without a token, existing
+login behavior is unchanged. Run `claude setup-token` on each LAN worker and put its token in
+that worker's `secrets.env`; the coordinator's token is never forwarded. Workers without a token
+retain interactive-login authentication, whose short-lived access token cannot be refreshed
+persistently inside confined sessions. Older workers retain that same behavior.
 
 **Before upgrading:** installations relying on the former hardcoded GitHub owner must explicitly
 set `github = "<owner>"` under `[owners]` in `config.toml` before upgrading, or their Dependabot
@@ -246,10 +257,12 @@ editors and gates also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_D
 reads outside the credential stores above unless explicitly confined.
 Codex verifies readers’ effective denies before launch and refuses unverified profiles. Claude's
 own file-backed CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
-On macOS, `~/Library/Keychains` is denied. Claude editors exempt keychain paths only in the outer
-profile so `security` can read their login; native Read, Grep and Glob tools still deny both path
-spellings. Overlapping credential or explicit denies take precedence over that exemption.
-The follow-up to #834 will supply that login from the daemon before denying outer-profile Keychain access.
+On macOS, `~/Library/Keychains` is denied. With `CLAUDE_CODE_OAUTH_TOKEN` configured (see above),
+Claude subscription editors also deny all keychain spellings in their outer profile. Without it,
+Claude editors exempt keychain paths only in the outer profile so `security` can read their login;
+native Read, Grep and Glob tools still deny both path spellings. Overlapping credential or explicit
+denies take precedence over that exemption. Workers use their own configured token and retain
+the exemption only without one; the coordinator token is not forwarded to them.
 Network egress and the loopback API (#484) remain separate gaps. Older releases ignore these optional
 sandbox settings and do not enforce these read rules.
 

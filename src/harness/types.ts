@@ -42,6 +42,8 @@ export type AgentEvent =
   | { type: "warning"; id: string; text: string };
 
 export interface AgentSpec {
+  /** Supplied from each machine's own configuration at launch; never sent over LAN. */
+  claudeSubscriptionToken?: string;
   fast?: boolean;
   cwd: string;
   /** Disposable write root owned by the invocation lifecycle, outside cwd. */

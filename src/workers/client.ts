@@ -14,6 +14,7 @@ import { runLocalGates } from "../gates/run.ts";
 import { gateSlots } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree, withRepoLock } from "../git/repos.ts";
+import { withSubscriptionAuth } from "../harness/auth.ts";
 import { runClaude } from "../harness/claude.ts";
 import { runCodex } from "../harness/codex.ts";
 import { ConfinementError, readPolicyScope } from "../harness/read-policy.ts";
@@ -774,7 +775,7 @@ export async function runWorker(
             await posts;
             jobSignal.throwIfAborted();
             assertProcessesStopped();
-            Object.assign(run, await gateProvenance(cwd, jobSignal));
+            Object.assign(run, await gateProvenance(cwd, jobSignal, req.headSha));
             return () =>
               call(`/worker/jobs/${id}/result`, redactGateData({ run, sha: req.headSha }), jobSignal);
           },
@@ -835,12 +836,13 @@ export async function runWorker(
           throw new Error("Worker private-strings list differs from the coordinator's; publication blocked");
         const { privateStringsDigest: digest, ...session } = req;
         const name = req.target.harness;
-        const harness =
+        const localHarness =
           name === "claude" || name === "codex"
             ? (options.harnesses ?? { claude: runClaude, codex: runCodex })[name]
             : undefined;
-        if (!harness || (name !== "claude" && name !== "codex"))
+        if (!localHarness || (name !== "claude" && name !== "codex"))
           throw new Error("provider unavailable on worker");
+        const harness = withSubscriptionAuth(name, localHarness, cfg.secrets);
         if (!(await checkLogin(name, options.capabilityRunner, jobSignal)))
           throw new Error("Worker CLI not logged in");
         if (!req.branch || !isBranchName(req.branch)) throw new Error("Missing or invalid agent branch");

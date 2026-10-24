@@ -14,8 +14,40 @@ import { validatePolicy, validateRunModels } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
+import { redactCredentials } from "../src/util/proc.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
+
+test.each([
+  ["file only", true, undefined],
+  ["environment only", undefined, "token"],
+  ["environment wins", true, "token"],
+  ["empty environment keeps file", true, ""],
+  ["absent", undefined, undefined],
+  ["empty file", false, undefined],
+  ["empty environment", undefined, ""],
+] as const)("Claude subscription token: %s", (_, fileValue, envValue) => {
+  const key = "CLAUDE_CODE_OAUTH_TOKEN";
+  const previous = process.env[key];
+  const fileToken = `file-${crypto.randomUUID()}`;
+  const envToken = envValue ? `env-${crypto.randomUUID()}` : envValue;
+  const fixture = providerFixture(
+    [],
+    fileValue === undefined ? "" : `${key}=${fileValue ? fileToken : ""}\n`,
+  );
+  try {
+    if (envToken === undefined) delete process.env[key];
+    else process.env[key] = envToken;
+    const resolved = fixture.load().secrets[key];
+    const expected = envToken || (fileValue ? fileToken : "");
+    expect(resolved ?? "").toBe(expected);
+    if (expected) expect(redactCredentials(`before ${expected} after`)).toBe("before [redacted] after");
+  } finally {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+    fixture.close();
+  }
+});
 
 test.each(['"implement"', "[1]", '["unknown"]', "true"])("workers.agents refuses %s", (value) => {
   const fixture = providerFixture();
