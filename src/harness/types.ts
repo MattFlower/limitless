@@ -42,7 +42,7 @@ export type AgentEvent =
   | { type: "warning"; id: string; text: string };
 
 export interface AgentSpec {
-  /** Supplied only at the daemon's local Claude launch boundary, never to LAN workers. */
+  /** Supplied from each machine's own configuration at launch; never sent over LAN. */
   claudeSubscriptionToken?: string;
   fast?: boolean;
   cwd: string;

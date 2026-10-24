@@ -439,7 +439,15 @@ test.each(["accepted", "stream rejection", "stderr rejection"])(
           cancelled: false,
         };
       };
-      factory = new Factory(cfg, { store, harnesses: { claude: (spec) => runClaude(spec, launch) } });
+      factory = new Factory(cfg, {
+        store,
+        harnesses: {
+          claude: (spec) => {
+            expect(spec.claudeSubscriptionToken).toBe(token);
+            return runClaude(spec, launch);
+          },
+        },
+      });
       const harness = factory.deps.harnesses.claude;
       if (!harness) throw new Error("missing Claude harness");
       expect(agentEnv({ CLAUDE_CODE_OAUTH_TOKEN: token, OTHER: token }).OTHER).toBeUndefined();

@@ -47,8 +47,11 @@ import { acquireGateSlot, gateSlotScope, gateSlots } from "../src/gates/slots.ts
 import * as gitCommand from "../src/git/command.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
+import { runClaude } from "../src/harness/claude.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { confinementScope } from "../src/harness/sandbox.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
+import { confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
+import * as scratchPolicy from "../src/harness/scratch.ts";
 import { removeScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubToken } from "../src/integrations/github-token.ts";
@@ -82,7 +85,7 @@ import { agentPathMask } from "../src/workers/reporting.ts";
 import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
-import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -5263,6 +5266,125 @@ async function queuedLocalAgent(overrides: Partial<AgentJobRequest> = {}) {
     ...overrides,
   });
 }
+
+test.each([
+  { configured: true, rejected: false, overlapping: false },
+  { configured: true, rejected: true, overlapping: false },
+  { configured: false, rejected: false, overlapping: false },
+  { configured: false, rejected: false, overlapping: true },
+])(
+  "worker Claude uses only local subscription authentication: %j",
+  async ({ configured, rejected, overlapping }) => {
+    await listen();
+    const id = await queuedLocalAgent({
+      target: { ...agentRequest().target, billing: "subscription" },
+    });
+    const coordinatorToken = `coordinator-${crypto.randomUUID()}`;
+    const localToken = `worker-${crypto.randomUUID()}`;
+    cfg.secrets.CLAUDE_CODE_OAUTH_TOKEN = coordinatorToken;
+    const configDir = join(home, "worker-config");
+    mkdirSync(configDir);
+    writeFileSync(
+      join(configDir, "secrets.env"),
+      configured ? `CLAUDE_CODE_OAUTH_TOKEN=${localToken}\n` : "",
+    );
+    const syntheticHome = join(home, "synthetic-home");
+    const keychain = join(syntheticHome, "Library/Keychains");
+    const canonical = join(home, "keychain-store");
+    mkdirSync(dirname(keychain), { recursive: true });
+    mkdirSync(canonical);
+    symlinkSync(canonical, keychain);
+    const keychains = [keychain, realpathSync(keychain)];
+    const original = scratchPolicy.writeRoots;
+    const rootsSpy = spyOn(scratchPolicy, "writeRoots").mockImplementation((...args) => {
+      const roots = original(...args);
+      return {
+        ...roots,
+        denyRead: [...new Set([...(roots.denyRead ?? []), ...keychains])],
+        keychainOnlyReadPaths: args[3]?.length ? [] : keychains,
+      };
+    });
+    const priorToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const recording = recordingConfinement();
+    const environments: (Record<string, string> | undefined)[] = [];
+    let lease = "",
+      transmitted = "";
+    let worker: Awaited<ReturnType<typeof loop>> | undefined;
+    try {
+      worker = await loop(
+        {
+          confinement: recording.backend,
+          harnesses: {
+            claude: (spec) =>
+              readPolicyScope.run({ ...cfg.readPolicy, home: syntheticHome, environment: {} }, () =>
+                runClaude({ ...spec, denyRead: overlapping ? [keychain] : [] }, async (opts) => {
+                  environments.push(opts.env);
+                  opts.onStdoutLine?.(opts.cmd[4] ?? "");
+                  const diagnostic = `Failed to authenticate. API Error: 401 rejected ${localToken}`;
+                  opts.onStdoutLine?.(
+                    JSON.stringify({
+                      type: "result",
+                      is_error: rejected,
+                      result: rejected ? diagnostic : "done",
+                    }),
+                  );
+                  return {
+                    exitCode: rejected ? 1 : 0,
+                    signal: null,
+                    truncated: false,
+                    durationMs: 1,
+                    stdout: "",
+                    stderr: rejected ? diagnostic : "",
+                    timedOut: false,
+                    idleTimedOut: false,
+                    cancelled: false,
+                  };
+                }),
+              ),
+          },
+          async request(...args) {
+            if (args[1] === agentPath(id, "result")) transmitted = JSON.stringify(args[2]);
+            const reply = await workerRequest(...args);
+            if (args[1] === "/worker/lease") {
+              const body = JSON.stringify(reply.json());
+              if (body.includes(id)) lease = body;
+            }
+            return reply;
+          },
+        },
+        "loop-runner",
+        configDir,
+      );
+      await until(() => workers.agentJob(id)?.state === "done" || !!workers.agentJob(id)?.failure_reason);
+      expect(environments).toHaveLength(1);
+      expect(environments[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe(configured ? localToken : undefined);
+      expect(environments[0]?.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(environments[0]?.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+      expect(lease).toContain(id);
+      expect(lease).not.toContain(coordinatorToken);
+      expect(lease).not.toContain("claudeSubscriptionToken");
+      const roots = recording.calls[0]?.roots;
+      if (!roots) throw new Error("missing worker editor profile");
+      for (const path of keychains) {
+        expect(roots.denyRead?.includes(path)).toBe(configured || overlapping);
+        expect(seatbeltProfile(roots).includes(`(subpath "${path}")`)).toBe(configured || overlapping);
+      }
+      expect(workers.agentJob(id)?.state).toBe("done");
+      const report = JSON.parse(transmitted);
+      expect(report.status).toBe(rejected ? "error" : "ok");
+      if (rejected) {
+        expect(report.error).toBe("Failed to authenticate. API Error: 401 rejected [redacted]");
+        expect(transmitted).not.toContain(localToken);
+      }
+    } finally {
+      await worker?.stop();
+      rootsSpy.mockRestore();
+      if (priorToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      else process.env.CLAUDE_CODE_OAUTH_TOKEN = priorToken;
+    }
+  },
+);
 
 function reportPathForms(paths: string[]) {
   return [
