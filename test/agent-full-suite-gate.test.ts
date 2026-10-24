@@ -51,6 +51,77 @@ const mutations: Record<string, string> = {
   "tree-unreadable": "git hash-object -w --stdin < greeting.txt > .git/HEAD",
 };
 
+test("agent full-suite bypasses the in-place executor and the gates stage reuses its result", async () => {
+  await configure(true);
+  const local = localExecutor();
+  const requests: GateRequest[] = [];
+  const executor: GateExecutor = {
+    ...local,
+    kind: "inplace",
+    async start(request, signal) {
+      requests.push(request);
+      return local.start(request, signal);
+    },
+  };
+  let executionId = "",
+    treeHash = "";
+  let sessionComplete = false;
+  const f = start(
+    async (agent) => {
+      const role = roleOf(agent);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      // The baseline used the configured executor; only the session must bypass it.
+      expect(requests).toHaveLength(1);
+      requests.length = 0;
+      writeFileSync(join(agent.cwd, "farewell.txt"), "goodbye\n");
+      const directory = agent.commandPath?.split(delimiter)[0];
+      if (!directory) throw new Error("missing wrapper");
+      const result = await sh([join(directory, "bun"), "test"], { cwd: agent.cwd, env: agentEnv() });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("trusted-test");
+      expect(requests).toEqual([]);
+      expect(f.store.db.query("SELECT * FROM gate_jobs WHERE in_place=1").all()).toEqual([]);
+      const records = f.store.db
+        .query<{ execution_id: string; tree_hash: string }, []>(
+          "SELECT execution_id,tree_hash FROM agent_gate_executions",
+        )
+        .all();
+      expect(records).toHaveLength(1);
+      const record = records[0];
+      if (!record) throw new Error("missing agent gate execution");
+      executionId = record.execution_id;
+      treeHash = record.tree_hash;
+      expect(executionId).not.toBe("");
+      expect(result.stdout).toContain(`Factory gate run of check test on tree ${treeHash}: pass`);
+      sessionComplete = true;
+      return { text: "implemented" };
+    },
+    false,
+    false,
+    { gateExecutor: executor },
+  );
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
+  const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+  expect(
+    status,
+    JSON.stringify({
+      error: f.store.getRun(run.id)?.error,
+      invocations: f.store.listInvocations(run.id).map((i) => i.error),
+    }),
+  ).toBe("succeeded");
+  expect(requests).toEqual([]);
+  expect(sessionComplete).toBe(true);
+  expect(f.store.db.query("SELECT * FROM gate_jobs WHERE in_place=1").all()).toEqual([]);
+  const state = f.store.getRunState<RunState>(run.id);
+  if (!state?.worktreePath) throw new Error("missing state");
+  expect((await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: state.worktreePath })).stdout.trim()).toBe(
+    treeHash,
+  );
+  const checks: GateComparison[] = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "null");
+  expect(checks.find((c) => c.name === "test")?.result.reused).toMatchObject({ executionId, treeHash });
+});
+
 test.each([
   "same",
   "only-test",

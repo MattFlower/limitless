@@ -305,9 +305,13 @@ export function readConfinement(spec: AgentSpec, scratch: string): ReadConfineme
   };
 }
 
-/** The callback must await process termination; cleanup also covers thrown errors and cancellation. */
-export async function withScratch<T>(cwd: string, run: (scratchDir: string) => Promise<T>): Promise<T> {
-  const scratchDir = createScratch(cwd);
+/** Own scratch through cancellation; durable jobs may retain it for a later daemon scope. */
+export async function withScratch<T>(
+  cwd: string,
+  run: (scratchDir: string) => Promise<T>,
+  options: { existing?: string; keep?: () => boolean } = {},
+): Promise<T> {
+  const scratchDir = options.existing ?? createScratch(cwd);
   const scope = processScope.getStore();
   scope?.scratchDirs.add(scratchDir);
   try {
@@ -317,7 +321,7 @@ export async function withScratch<T>(cwd: string, run: (scratchDir: string) => P
     if (scope && error instanceof ProcessTerminationError) scope.terminationError = error;
     throw error;
   } finally {
-    removeScratch(scratchDir);
+    if (!options.keep?.()) removeScratch(scratchDir);
     scope?.scratchDirs.delete(scratchDir);
   }
 }
