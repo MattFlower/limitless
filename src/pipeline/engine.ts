@@ -21,8 +21,10 @@ import {
   GateNameCollisionError,
   gateScriptNames,
   pickScripts,
+  readDocs,
   readRetryFiles,
 } from "../gates/detect.ts";
+import { docsOnlyGates } from "../gates/docs.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
@@ -619,6 +621,7 @@ async function prepare(ctx: RunContext): Promise<void> {
         }
       gates = trusted ? trusted.gates : detectGates(wt.path);
       gates.retryFiles = readRetryFiles(repoConfig, (message) => ctx.log(message, "warn"));
+      gates.docs = readDocs(repoConfig, (message) => ctx.log(message, "warn"));
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = trusted
         ? trusted.scripts
@@ -1444,27 +1447,34 @@ async function oneRound(
   const privateStrings = () => privateEntries(ctx, cwd);
   const changeDiff = () =>
     diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
-  const system =
-    ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
-  // Panel reviews are numbered apart from implementation rounds (a gate-failed round reviews nothing,
-  // a replayed round keeps its number); a conflict-resolution review is outside the count.
-  const panelReview =
-    system.mode === "panel" && !resolution
-      ? Math.max(
-          0,
-          ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
-        ) + 1
-      : undefined;
-  // What decides a panel review's blocking findings; a conflict-resolution review follows R2's rules.
-  const panelRules: PanelReview | undefined =
-    resolution && system.mode === "panel" ? "resolution" : panelReview;
-  // Checked before implementing: work no review can see is not worth paying for. The worktree keeps
-  // the head the last review saw, which the draft delivers.
-  if (panelReview && panelReview > PANEL_REVIEWS)
-    throw new NeedsHumanError(
-      `Panel review limit reached (R${PANEL_REVIEWS}); not implementing again. Last feedback:\n${ctx.state.feedback ?? ""}`,
-    );
+  const reviewSettings = () => {
+    const reviewMode =
+      ctx.state.reviewMode ??
+      (ctx.state.lastReview?.mode === "panel" ||
+      ctx.state.reviewHistory?.some((entry) => entry.panelReview !== undefined || entry.scope !== undefined)
+        ? "panel"
+        : ctx.deps.cfg.reviewMode);
+    const system =
+      ctx.deps.reviewSystem ??
+      configuredReviewSystem({ ...ctx.deps.cfg, reviewMode }, profile(ctx), ctx.state.reviewLenses);
+    // A gate-failed round reviews nothing; replays retain the same panel number.
+    const panelReview =
+      system.mode === "panel" && !resolution
+        ? Math.max(
+            0,
+            ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
+          ) + 1
+        : undefined;
+    if (panelReview && panelReview > PANEL_REVIEWS)
+      throw new NeedsHumanError(
+        `Panel review limit reached (R${PANEL_REVIEWS}); not implementing again. Last feedback:\n${ctx.state.feedback ?? ""}`,
+      );
+    const panelRules: PanelReview | undefined =
+      resolution && system.mode === "panel" ? "resolution" : panelReview;
+    return { system, panelReview, panelRules };
+  };
+  let { system, panelReview, panelRules } = reviewSettings();
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
@@ -1513,8 +1523,16 @@ async function oneRound(
           let baseTimeout = false;
           try {
             await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+            const docs = await docsOnlyGates(cwd, gates, baseSha, checkedSha);
+            ctx.event({
+              runId: ctx.run.id,
+              type: "gate",
+              level: "info",
+              message: `Gate selection: ${JSON.stringify(redactGateData(docs.selection))}`,
+              data: docs.selection,
+            });
             testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
-            let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events);
+            let after = await runGateExecution(ctx, "gates", "initial", cwd, docs.gates, events);
             ctx.checkCancelled();
             baseTimeout = after.checks.some(
               (r) =>
@@ -1533,7 +1551,7 @@ async function oneRound(
               // The re-run starts from the committed tree too, not from what the first attempt left behind.
               localSetupReady = false;
               await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
-              after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
+              after = await runGateExecution(ctx, "gates", "timeout", cwd, docs.gates, events);
               ctx.checkCancelled();
               after = {
                 ...after,
@@ -1544,6 +1562,7 @@ async function oneRound(
               };
             }
             const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+            after = docs.annotate(after);
             // Retry before discarding, so a check sees the same build output as its first attempt.
             cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
               ...c,
@@ -1553,7 +1572,7 @@ async function oneRound(
               cmp = await retryRegressions(
                 cmp,
                 cwd,
-                gates,
+                docs.gates,
                 changed,
                 ctx.signal,
                 events.onWait,
@@ -1752,22 +1771,10 @@ async function oneRound(
   const reviewedSha = await headSha(cwd);
   // R2 and R3 review only the fixes since the previous review. A conflict-resolution review, like a
   // single one, sees the change against the new base, so upstream-only files never appear.
-  const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
-  const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
-  const scope: ReviewScope | undefined =
-    system.mode !== "panel"
-      ? undefined
-      : fixSha
-        ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
-        : {
-            kind: resolution ? "resolution" : "full",
-            range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
-          };
   const previousReview = priorReview
     ? {
         sha: priorReview.sha,
         findings: priorReview.blocking,
-        ...(fixSha ? { resolved: resolvedPriorFindings(findingsReviews) } : {}),
       }
     : undefined;
   const reviewText = (text: string) => redactPrivate(redactGateOutput(text), privateStrings());
@@ -1797,6 +1804,22 @@ async function oneRound(
     ctx,
     "review",
     async (stage) => {
+      ({ system, panelReview, panelRules } = reviewSettings());
+      if (ctx.state.reviewMode === undefined) {
+        ctx.state.reviewMode = system.mode;
+        await ctx.save();
+      }
+      const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
+      const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
+      const scope: ReviewScope | undefined =
+        system.mode !== "panel"
+          ? undefined
+          : fixSha
+            ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
+            : {
+                kind: resolution ? "resolution" : "full",
+                range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
+              };
       const sameVendorAllowed =
         system.mode === "single" &&
         ctx.state.flow !== "verify-change" &&
@@ -1834,7 +1857,10 @@ async function oneRound(
           externalChange: ctx.state.flow === "verify-change",
           dependencyUpdate:
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
-          previous: previousReview,
+          previous: previousReview && {
+            ...previousReview,
+            ...(fixSha ? { resolved: resolvedPriorFindings(findingsReviews) } : {}),
+          },
           headSha: reviewedSha,
           resolution,
           firstParentPatch: firstParentDiff?.[0],
@@ -3120,19 +3146,25 @@ async function mergeForDelivery(
     await ctx.stage(
       "gates",
       gateSlotScope(async () => {
+        const docs = await docsOnlyGates(
+          cwd,
+          assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
+          fetched,
+          await headSha(cwd),
+        );
+        ctx.event({
+          runId: ctx.run.id,
+          type: "gate",
+          level: "info",
+          message: `Post-merge gate selection: ${JSON.stringify(redactGateData(docs.selection))}`,
+          data: docs.selection,
+        });
         const timeoutOnly = (run: GateRun) =>
           run.setupOk &&
           ![...run.setup, ...run.checks].some(confinementFailed) &&
-          run.checks.some((r) => !r.ok) &&
-          run.checks.every((r) => r.ok || r.timedOut);
-        let after = await runGateExecution(
-          ctx,
-          "gates",
-          "rebase",
-          cwd,
-          assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
-          gateEvents(ctx),
-        );
+          run.checks.some((r) => r.timedOut) &&
+          run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
+        let after = await runGateExecution(ctx, "gates", "rebase", cwd, docs.gates, gateEvents(ctx));
         ctx.checkCancelled();
         if (timeoutOnly(after)) {
           const first = after;
@@ -3142,14 +3174,7 @@ async function mergeForDelivery(
             JSON.stringify(redactGateData(first)),
           );
           await checkoutCommitted(cwd);
-          after = await runGateExecution(
-            ctx,
-            "gates",
-            "timeout",
-            cwd,
-            ctx.state.gatesConfig as GateConfig,
-            gateEvents(ctx),
-          );
+          after = await runGateExecution(ctx, "gates", "timeout", cwd, docs.gates, gateEvents(ctx));
           ctx.checkCancelled();
           after.checks = after.checks.map((r) => ({
             ...r,
@@ -3161,6 +3186,7 @@ async function mergeForDelivery(
         const reference = previous.length
           ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
           : (ctx.state.baseline ?? null);
+        after = docs.annotate(after);
         const initial = compareGates(reference, after).map((c) => ({
           ...c,
           firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
@@ -3169,7 +3195,7 @@ async function mergeForDelivery(
         const comparison = await retryRegressions(
           initial,
           cwd,
-          ctx.state.gatesConfig as GateConfig,
+          docs.gates,
           [],
           ctx.signal,
           events.onWait,
@@ -3211,7 +3237,10 @@ async function mergeForDelivery(
         const regressed =
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
-          previous.some((c) => c.result.ok && !findGateCounterpart(c, previous, comparison)?.result.ok);
+          previous.some((c) => {
+            const current = findGateCounterpart(c, previous, comparison)?.result;
+            return c.result.ok && current?.docsOnly?.mode !== "skipped" && !current?.ok;
+          });
         if (regressed)
           throw new MergeRegressedError(
             timeoutOnly(after) ? "post-merge gate timed out" : "post-merge gates regressed",

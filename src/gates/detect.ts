@@ -15,6 +15,7 @@ export interface GateConfig {
   /** Globs the implementer must not touch (audit blocks edits to them). */
   protectedPaths: string[];
   retryFiles?: string;
+  docs?: string[];
   /** Repo-level merge policy override. */
   merge?: "auto" | "pr" | "none";
 }
@@ -41,6 +42,7 @@ export function detectGates(cwd: string, warn: (message: string) => void = conso
       source: ".limitless.toml",
       protectedPaths: Array.isArray(policy.protected_paths) ? (policy.protected_paths as string[]) : [],
       retryFiles: readRetryFiles(readFileSync(tomlPath, "utf8"), warn),
+      docs: readDocs(readFileSync(tomlPath, "utf8"), warn),
     };
     if (policy.merge === "auto" || policy.merge === "pr" || policy.merge === "none") cfg.merge = policy.merge;
     return assertDistinctGateNames(cfg);
@@ -119,6 +121,19 @@ export function readRetryFiles(
   warn(
     "Invalid [gates].retry_files; expected a string with exactly one {files} placeholder; targeted retries disabled",
   );
+  return undefined;
+}
+
+/** Documentation declarations, like commands, come only from the trusted base. */
+export function readDocs(
+  contents: string | null,
+  warn: (message: string) => void = console.warn,
+): string[] | undefined {
+  if (contents === null) return undefined;
+  const value = (Bun.TOML.parse(contents) as { gates?: { docs?: unknown } }).gates?.docs;
+  if (value === undefined) return undefined;
+  if (Array.isArray(value) && value.every((v) => typeof v === "string" && v.trim())) return value;
+  warn("Invalid [gates].docs; expected an array of non-empty strings; docs-only targeting disabled");
   return undefined;
 }
 

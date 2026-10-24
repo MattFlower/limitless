@@ -15,6 +15,7 @@ export async function runGateExecution(
   hooks: GateHooks = {},
 ): Promise<GateRun> {
   ctx.checkCancelled();
+  const executor = ctx.deps.gateExecutor;
   const round = ctx.state.round;
   const sha = await headSha(cwd);
   const pending = ctx.state.gateExecution;
@@ -27,7 +28,7 @@ export async function runGateExecution(
       ? pending.handle
       : undefined;
   if (pending && !stored) {
-    await cancelGateExecution(pending.handle, ctx.deps.gateExecutor);
+    await cancelGateExecution(pending.handle, executor);
     ctx.state.gateExecution = undefined;
     await ctx.save();
   }
@@ -47,7 +48,7 @@ export async function runGateExecution(
       },
       ctx.signal,
       hooks,
-      ctx.deps.gateExecutor,
+      executor,
       stored,
       async ({ kind, id, startedAt, url }) => {
         ctx.state.gateExecution = { stage, round, purpose, sha, handle: { kind, id, startedAt, url } };

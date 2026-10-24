@@ -8,9 +8,10 @@ import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
+import { docsOnlyGates } from "../gates/docs.ts";
 import { executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { findGateCounterpart, redactGateOutput } from "../gates/output.ts";
+import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
@@ -796,6 +797,7 @@ export class LandQueue {
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */
   private async checks(entry: LandEntry, cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
+    const gateExecutor = this.deps.gateExecutor;
     const log = entry.runId
       ? join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`)
       : join(this.deps.paths.home, "land", `land-${entry.id}.log`);
@@ -806,7 +808,12 @@ export class LandQueue {
       mkdirSync(dirname(log), { recursive: true });
       writeFileSync(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
       await exportCommit(cwd, baseSha, base, signal);
-      const gates = detectGates(base);
+      const docs = await docsOnlyGates(cwd, detectGates(base), baseSha, await headSha(cwd));
+      const gates = docs.gates;
+      const selection = redactGateOutput(`Gate selection: ${JSON.stringify(redactGateData(docs.selection))}`);
+      appendFileSync(log, `${selection}\n`);
+      if (entry.runId)
+        this.store.addEvent({ runId: entry.runId, type: "gate", level: "info", message: selection });
       const request = {
         repo: entry.repo,
         cwd,
@@ -824,7 +831,7 @@ export class LandQueue {
           ),
       };
       await gateSlotScope(async () => {
-        const run = await executeGate(request, signal, hooks, this.deps.gateExecutor);
+        const run = docs.annotate(await executeGate(request, signal, hooks, gateExecutor));
         signal.throwIfAborted();
         this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { logPath: log }));
         const selected = run.setupOk
@@ -845,18 +852,27 @@ export class LandQueue {
               { ...request, gates: retry, skipGateSlot: options?.skipGateSlot },
               signal,
               hooks,
-              this.deps.gateExecutor,
+              gateExecutor,
             );
           },
           true,
-          this.deps.gateExecutor?.freshCheckoutFor?.(entry.repo),
+          gateExecutor?.freshCheckoutFor?.(entry.repo),
         );
         signal.throwIfAborted();
         const failed = [...run.setup, ...run.checks].filter((c) => {
+          if (c.docsOnly?.mode === "skipped") return false;
           const result = retries.get(c) ?? c;
           return !result.ok || result.timedOut || confinementFailed(result);
         });
         if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
+        for (const check of run.checks) {
+          if (check.docsOnly?.mode !== "targeted") continue;
+          const message = redactGateOutput(
+            `${check.name}: targeted pass (${check.docsOnly.files.join(", ")}; ${check.docsOnly.reason}; full suite didn't run)`,
+          );
+          appendFileSync(log, `${message}\n`);
+          if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "info", message });
+        }
         if (retries.size) {
           const reason = redactGateOutput(
             `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,

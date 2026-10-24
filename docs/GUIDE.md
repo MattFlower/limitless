@@ -303,6 +303,23 @@ merge = "pr"                      # auto | pr | none
 protected_paths = ["migrations/**"]
 ```
 
+`[gates] docs` optionally declares documentation globs, for example
+`docs = ["docs/**", "*.md", "test/AGENTS.md"]`. It is read from the base commit.
+When every changed path matches (including deletions and both sides of renames),
+setup, lint, typecheck and other checks run as usual. With a valid `retry_files`
+command, the single check containing `LIMITLESS_GATE_REPORT` runs only tracked
+Bun test files whose source contains a changed path or its basename as a plain substring.
+Both commands must start with `bun test`; any other runner runs the full suite.
+Recognized names are `*.test.*`, `*_test.*`, `*.spec.*` and `*_spec.*`, with extensions
+`js`, `jsx`, `ts`, `tsx`, `mjs`, `cjs`, `mts` and `cts`.
+Targeted runs are reported as `targeted pass` or `targeted failure`, never as a full-suite pass.
+No references means that check is recorded as skipped, never passed. No recognized test files, more than 50 references, or invalid selection leaves
+the full suite enabled. `*` and `?` match within one path component; `**/` matches
+zero or more whole directories, and trailing `**` matches everything below.
+A test that builds a path at runtime isn't detected. GitHub CI still runs the full suite
+and must pass before landing. Without this key, gating is unchanged; baselines always
+run the configured full checks.
+
 `[limits] slotted_commands` is opt-in and comes only from the run's trusted base commit;
 the value is saved for resume and review. Unset or `[]` leaves agent PATH unchanged.
 Invalid values warn and disable slotting: use nonempty command strings with executable

@@ -1,6 +1,25 @@
 import { activity } from "../util/stall.ts";
 import { terminalRedactor } from "../util/terminal-redaction.ts";
-import type { GateResult } from "./run.ts";
+import type { GateComparison, GateResult } from "./run.ts";
+
+/** Describe limited test evidence consistently in reports and model prompts. */
+export function docsGateSummary(check: GateComparison): string | undefined {
+  const docs = check.result.docsOnly;
+  if (docs?.mode === "skipped") return `not run (${docs.reason})`;
+  if (docs?.mode !== "targeted" && !check.verdict.startsWith("targeted_")) return undefined;
+  const verdict =
+    check.verdict === "confinement_error"
+      ? "targeted confinement error"
+      : check.result.timedOut
+        ? "targeted failure (timed out)"
+        : check.verdict === "flaky"
+          ? "targeted pass (flaky)"
+          : check.result.ok
+            ? "targeted pass"
+            : "targeted failure";
+  const files = docs?.files ?? [];
+  return `${verdict} (${files.length} test file${files.length === 1 ? "" : "s"}; ${docs?.reason ?? "targeted check"}; full suite didn't run; ${files.join(", ")})`;
+}
 
 const LAUNCH_FAILURE = "sandbox_apply: Operation not permitted";
 export const launchFailure = (output: string) => output.includes(LAUNCH_FAILURE);
