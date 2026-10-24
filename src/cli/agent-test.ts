@@ -300,6 +300,10 @@ export function enterCallerDirectory(directory: string | undefined): void {
 }
 
 export async function agentTestEntry(args: string[]): Promise<number> {
+  const options = process.env.LIMITLESS_WRAPPER_BUN_OPTIONS;
+  if (options === undefined) delete process.env.BUN_OPTIONS;
+  else process.env.BUN_OPTIONS = options;
+  delete process.env.LIMITLESS_WRAPPER_BUN_OPTIONS;
   enterCallerDirectory(args[0]);
   return wrapperMain(args.slice(1));
 }

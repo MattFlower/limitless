@@ -31,6 +31,7 @@ import {
 } from "../src/harness/sandbox.ts";
 import { withScratch, writeRoots } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
 import { parseFakeStream } from "../src/harness/stream-fault.ts";
 import {
   type AgentEvent,
@@ -2078,6 +2079,65 @@ test("Codex ordinary readers run the verified executable", async () => {
 
 const sandboxCodex = Bun.which("codex");
 const codexSandboxSkip = sandboxCodex ? null : "no codex on PATH";
+
+test.each(["relative", "absolute", "empty", "unset"] as const)(
+  "source slotted wrapper preserves BUN_OPTIONS (%s)",
+  async (kind) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "slotted-options-")));
+    const marker = join(root, "preload-marker");
+    const preload = join(root, "setup.cjs");
+    writeFileSync(
+      preload,
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran"); process.exit(93);\n`,
+    );
+    writeFileSync(
+      join(root, "slot-probe"),
+      `#!/bin/sh\nprintf "options:%s:<%s>\\ncwd:%s\\n" "\${BUN_OPTIONS+x}" "\${BUN_OPTIONS-}" "$(pwd -P)"\nexit 37\n`,
+      { mode: 0o755 },
+    );
+    const options =
+      kind === "relative"
+        ? "--preload=./setup.cjs"
+        : kind === "absolute"
+          ? `--preload=${preload}`
+          : kind === "empty"
+            ? ""
+            : undefined;
+    try {
+      await withScratch(root, (scratch) =>
+        withSlottedCommands(
+          [["slot-probe", "leased"]],
+          root,
+          scratch,
+          undefined,
+          () => {},
+          async (path) => {
+            if (!path) throw new Error("Missing wrapper PATH");
+            const env = agentEnv({ PATH: `${path.split(delimiter)[0]}${delimiter}${root}` });
+            delete env.BUN_OPTIONS;
+            if (options !== undefined) env.BUN_OPTIONS = options;
+            for (const mode of ["leased", "direct"]) {
+              const observed = await runProcess({
+                cmd: ["slot-probe", mode],
+                cwd: root,
+                env,
+                timeoutMs: 5000,
+              });
+              expect(observed.stderr).toBe("");
+              expect(observed.exitCode).toBe(37);
+              expect(observed.stdout).toBe(
+                `options:${options === undefined ? "" : "x"}:<${options ?? ""}>\ncwd:${root}\n`,
+              );
+              expect(existsSync(marker)).toBe(false);
+            }
+          },
+        ),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 function slottedInstallation(layout: "local" | "Homebrew") {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "slotted-install-")));

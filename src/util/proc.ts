@@ -269,7 +269,8 @@ export async function recoverProcessCleanups(
             }
             pending.push(row.pid);
           }
-          // With discovery context, another empty scan rules out a fork during inspection.
+          // Another empty scan checks for forks during inspection, within discovery's
+          // coverage; it cannot prove that descendants discarding every ownership signal ended.
           if (!pending.length && (!context || (!discovered && empty))) {
             store.deleteInvocationCleanups(invocation);
             return;
@@ -365,7 +366,8 @@ export function linuxCallerAncestors(
   return protectedPids;
 }
 
-async function markedProcesses(
+/** Shared discovery, also used by scripts/probe-process-recovery.ts without signalling. */
+export async function markedProcesses(
   marker: string,
   group: number,
   started: number,

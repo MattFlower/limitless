@@ -1180,6 +1180,45 @@ test("a worker runs real checks from the exact bundle head and returns the local
   }
 }, 180_000);
 
+test.each([
+  ["rewrite", "echo changed > tracked", false],
+  ["staged", "echo changed > tracked && git add tracked", false],
+  ["deleted", "rm tracked", false],
+  ["untracked", "echo generated > build-output", true],
+  ["ignored", "echo cache-output >> .git/info/exclude; echo generated > cache-output", true],
+] as const)(
+  "worker gate provenance inspects its own checkout: %s",
+  async (_kind, command, clean) => {
+    await listen();
+    const req = await request(true);
+    req.gates.setup = [];
+    req.gates.checks = [{ name: "test", run: command }];
+    const worker = await loop();
+    try {
+      const run = await executeGate(
+        req,
+        AbortSignal.timeout(30_000),
+        {},
+        gateExecutorFor("lan", workers, [req.repo]),
+      );
+      expect(run.checks[0]).toMatchObject({ ok: true, exitCode: 0 });
+      expect(run.sha).toBe(req.headSha);
+      expect(run.trackedClean).toBe(clean);
+      if (!clean) expect(run.provenanceError).toContain("tracked");
+      expect(readFileSync(join(req.cwd, "tracked"), "utf8")).toBe("gate bytes\n");
+      expect(
+        (await worktreeGit(["git", "diff", "--cached", "--name-only", req.headSha, "--"], { cwd: req.cwd }))
+          .stdout,
+      ).toBe("");
+      expect(workers.jobs("1=1")[0]?.worker).toBe("loop-runner");
+      expect(readdirSync(worker.remote.paths.work)).toEqual([]);
+    } finally {
+      await worker.stop();
+    }
+  },
+  45_000,
+);
+
 test("a real worker setup failure reruns locally once and the local setup failure blocks", async () => {
   await listen();
   const req = await request(true);
