@@ -181,6 +181,9 @@ import {
 
 const ROUNDS_PER_IMPLEMENTER = 2;
 
+// Resume the interrupted reader without publishing a draft or persisting a terminal reason.
+class ReaderSetupError extends NeedsHumanError {}
+
 /** Execute (or resume) one run to completion. Never throws. */
 export async function executeRun(
   deps: EngineDeps,
@@ -412,7 +415,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       resolvingReview ||
       terminationBlocked;
     let message = redactGateOutput((e as Error).message) + waited;
-    if (resolvingReview) {
+    if (resolvingReview && !(e instanceof ReaderSetupError)) {
       message = redactGateOutput(
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
       );
@@ -432,6 +435,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     });
     if (
       verifiedFailure &&
+      !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
       !(e instanceof GateNameCollisionError) &&
       !terminationBlocked &&
@@ -464,6 +468,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       }
     } else if (
       e instanceof NeedsHumanError &&
+      !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       ctx.state.worktreePath &&
@@ -1842,10 +1847,18 @@ async function oneRound(
   // A matching preview already prepares this checkout before the concurrent readers start.
   const previewWillSetup =
     concurrent && ctx.state.previewConfig && needsPreview(ctx.state.previewConfig, diff);
-  if (!localSetupReady && !previewWillSetup) {
-    await prepareReaderCheckout(cwd, gates.setup, ctx.signal);
-    localSetupReady = true;
-  }
+  let readerSetup: Promise<void> | undefined;
+  const prepareLocal = () =>
+    (readerSetup ??= (async () => {
+      if (localSetupReady) return;
+      try {
+        await prepareReaderCheckout(cwd, gates.setup, ctx.signal);
+        localSetupReady = true;
+      } catch (error) {
+        ctx.checkCancelled();
+        throw new ReaderSetupError(redactGateOutput((error as Error).message));
+      }
+    })());
   // --- review
   if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
@@ -1966,6 +1979,7 @@ async function oneRound(
           stage,
           mode: "readonly",
           readerSetup: gates.setup,
+          prepareLocal: invokeGuard.getStore() ? undefined : prepareLocal,
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
@@ -2193,7 +2207,7 @@ async function oneRound(
               ctx.checkCancelled();
               if (!setup.setupOk) {
                 const failed = setup.setup.find((result) => !result.ok);
-                throw new Error(
+                throw new ReaderSetupError(
                   redactGateOutput(
                     `Preview setup failed: $ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
                   ),
@@ -2211,8 +2225,25 @@ async function oneRound(
         ctx.previewUrl = preview.url;
       }
     };
+    const prepareVerification = async () => {
+      try {
+        if (!previewWillSetup) await prepareLocal();
+        await preparePreview();
+      } catch (error) {
+        // Preparation precedes both concurrent readers, but belongs to local verification.
+        if (error instanceof ReaderSetupError)
+          return ctx.stage(
+            "verify",
+            async () => {
+              throw error;
+            },
+            round,
+          );
+        throw error;
+      }
+    };
     const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
-      await preparePreview();
+      await prepareVerification();
       return ctx.stage(
         "verify",
         async (stage) => {
@@ -2280,7 +2311,7 @@ async function oneRound(
     const original = recorded?.modelOutput ?? recorded;
     let verify: Verify;
     if (concurrent) {
-      await preparePreview();
+      await prepareVerification();
       ctx.parallelChecks = true;
       let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
       try {

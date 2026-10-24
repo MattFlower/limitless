@@ -5,7 +5,9 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Stage, StageName } from "../src/core/types.ts";
 import type { AgentJobRequest, AgentJobRow } from "../src/db/workers.ts";
+import { type GateExecutor, gateProvenance } from "../src/gates/executor.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../src/gates/private.ts";
+import { runLocalGates } from "../src/gates/run.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { headSha } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
@@ -1368,6 +1370,87 @@ async function reviewWorker(f: Factory, handler: (s: AgentSpec) => Promise<FakeR
     await listener.stop();
   };
 }
+
+test.each(["worker only", "local fallback"] as const)(
+  "quick LAN review prepares dependencies on the executing host: %s",
+  async (layout) => {
+    const install = await readerDependencyFixture(repoDir);
+    const setup =
+      layout === "worker only"
+        ? `case "$PWD" in *remote-gate-*|*worker-agent-*) true ;; *) echo "toolchain is available only on the worker" >&2; exit 1 ;; esac; ${install}`
+        : install;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nsetup = [${JSON.stringify(setup)}]\nchecks = []\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "commit", "-qm", "worker toolchain"], { cwd: repoDir });
+    const bare = await githubFixture();
+    dependencyPackage(join(home, "node_modules/zod"), "3.0.0");
+    dependencyPackage(join(home, "review-worker/node_modules/zod"), "3.0.0");
+    let f: Factory;
+    let localReviews = 0;
+    let workerReviews = 0;
+    ({ f } = boot({
+      executor: {
+        kind: "test",
+        run: (call, local) =>
+          call.role === "implement" ? local() : lanAgentExecutor(f.workers, f.cfg).run(call, local),
+      },
+      review: async (s) => {
+        if (layout === "worker only") throw new Error("Review must run on worker");
+        localReviews++;
+        await expectReaderDependency(s.cwd);
+      },
+    }));
+    const remoteGates: GateExecutor = {
+      kind: "lan",
+      async start() {
+        return { kind: "lan", id: crypto.randomUUID(), startedAt: Date.now() };
+      },
+      attach(handle, signal, req) {
+        if (!req) throw new Error("Missing gate request");
+        const cwd = join(home, `remote-gate-${handle.id}`);
+        return {
+          events: { async *[Symbol.asyncIterator]() {} },
+          result: (async () => {
+            await sh(["git", "clone", "--quiet", "--no-hardlinks", req.cwd, cwd], { cwd: home, signal });
+            await sh(["git", "checkout", "--quiet", "--detach", req.headSha], { cwd, signal });
+            return {
+              ...(await runLocalGates(cwd, req.gates, signal)),
+              ...(await gateProvenance(cwd, signal, req.headSha)),
+            };
+          })(),
+          async cancel() {},
+        };
+      },
+    };
+    f.deps.gateExecutor = remoteGates;
+    f.cfg.workers.agents = ["review"];
+    registerGithub(f, bare);
+    const stop =
+      layout === "worker only"
+        ? await reviewWorker(f, async (s) => {
+            workerReviews++;
+            await expectReaderDependency(s.cwd);
+            return { structured: approve };
+          })
+        : await simulated(f, async (job) => {
+            f.workers.failAgentJob(job.id, "Disconnected");
+            f.workers.failAgentJob(job.id, "Disconnected");
+          });
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(workerReviews).toBe(layout === "worker only" ? 1 : 0);
+      expect(localReviews).toBe(layout === "local fallback" ? 1 : 0);
+      expect(jobs(f)).toHaveLength(1);
+    } finally {
+      await stop();
+    }
+  },
+  30_000,
+);
 
 test("LAN review installs dependencies and acceptance verification stays local", async () => {
   const install = await readerDependencyFixture(repoDir);

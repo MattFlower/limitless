@@ -1,5 +1,5 @@
 import { expect } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { type GateExecutor, gateExecutorFor, gateProvenance } from "../src/gates/executor.ts";
@@ -10,7 +10,7 @@ import { confinementScope } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import {
   approve,
@@ -68,11 +68,20 @@ for (const [harness, layout] of [
   ["codex", "changed-lockfile"],
   ["codex", "resumed"],
   ["codex", "shadow"],
-  ["codex", "failure"],
+  ["codex", "review failure"],
+  ["claude", "verify failure"],
 ] as const) {
   test(`reader dependencies: ${harness} ${layout}`, async () => {
     const { home, repoDir } = fixture;
     const install = await readerDependencyFixture(repoDir);
+    const failure = layout.endsWith("failure");
+    const secret = `reader-setup-${crypto.randomUUID()}`;
+    if (failure) registerCredential("reader-setup-test", secret);
+    writeFileSync(
+      join(repoDir, ".gitignore"),
+      `${readFileSync(join(repoDir, ".gitignore"), "utf8")}reader-ready\nsetup-count\nsetup-complete\n`,
+    );
+    const setup = `${failure ? `if ! test -f remote-only; then echo attempt >> setup-count; test -f reader-ready || { touch partial-setup; echo ${secret} >&2; exit 1; }; fi; ` : "echo attempt >> setup-count; "}${install} && touch setup-complete`;
     const updatedFiles: Record<string, string> = {};
     if (layout === "changed-lockfile") {
       const next = join(home, "next");
@@ -96,11 +105,12 @@ for (const [harness, layout] of [
     });
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      `[gates]\nsetup = [${JSON.stringify(layout === "failure" ? `test -f remote-only && ${install}` : install)}, ${JSON.stringify(captureSetupEnv)}]\nchecks = [{ name = "dependency", run = ${JSON.stringify(`${JSON.stringify(process.execPath)} dependency-probe.ts`)} }]\n`,
+      `[gates]\nsetup = [${JSON.stringify(setup)}, ${JSON.stringify(captureSetupEnv)}]\nchecks = [{ name = "dependency", run = ${JSON.stringify(`${JSON.stringify(process.execPath)} dependency-probe.ts`)} }]\n`,
     );
     await sh(["git", "add", "."], { cwd: repoDir });
     await sh(["git", "commit", "-qm", "offline reader dependencies"], { cwd: repoDir });
     const readers: string[] = [];
+    let implementations = 0;
     const handler = async (s: AgentSpec) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage() };
@@ -112,8 +122,14 @@ for (const [harness, layout] of [
         await expectReaderDependency(s.cwd, layout === "changed-lockfile" ? "4.1.0" : "4.0.0");
         expectPrivateSetup(s.cwd);
         expectReaderPermissions(s);
+        expect(readFileSync(join(s.cwd, "setup-complete"), "utf8")).toBe("");
+        if (layout !== "shadow")
+          expect(readFileSync(join(s.cwd, "setup-count"), "utf8")).toBe(
+            failure ? "attempt\nattempt\n" : "attempt\n",
+          );
         return { structured: role === "review" ? approve : pass };
       }
+      implementations++;
       return { files: { ...updatedFiles, "farewell.txt": "goodbye\n" } };
     };
     const f = start(handler, false, false, {
@@ -137,8 +153,12 @@ for (const [harness, layout] of [
       );
     }
     try {
-      if (layout === "resumed") await f.stop();
-      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+      if (layout === "resumed" || failure) await f.stop();
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: "Add farewell",
+        profile: layout === "review failure" ? "quick" : "standard",
+      });
       if (layout === "resumed") {
         expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
         const state = f.store.getRunState<RunState>(run.id);
@@ -146,18 +166,43 @@ for (const [harness, layout] of [
         dependencyPackage(join(state.worktreePath, "node_modules/zod"), "3.0.0");
         f.deps.faults = undefined;
         expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+      } else if (failure) {
+        expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
       } else {
-        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-          layout === "failure" ? "failed" : "succeeded",
-        );
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       }
       expect(
         f.store.getRunState<RunState>(run.id)?.lastGates?.find((gate) => gate.name === "dependency")?.result
           .output,
       ).toContain('"source":"generated by setup"');
-      if (layout === "failure") {
+      if (failure) {
         expect(readers).toEqual([]);
         expect(f.store.getRun(run.id)?.error).toContain("Reader setup failed");
+        const responsible = layout === "review failure" ? "review" : "verify";
+        expect(f.store.getRun(run.id)?.stage).toBe(responsible);
+        const stages = f.store.listStages(run.id);
+        expect(stages.filter((s) => ["gates", "audit"].includes(s.name))).toMatchObject([
+          { status: "succeeded" },
+          { status: "succeeded" },
+        ]);
+        expect(stages.find((s) => s.name === responsible)).toMatchObject({
+          status: "failed",
+          summary: expect.stringContaining("Reader setup failed"),
+        });
+        expect(JSON.stringify(f.store.getRunDetail(run.id))).not.toContain(secret);
+        expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain(secret);
+        const state = f.store.getRunState<RunState>(run.id);
+        if (!state?.worktreePath) throw new Error("Missing checkout");
+        expect(state.feedback).toBeFalsy();
+        expect(existsSync(join(state.worktreePath, "partial-setup"))).toBe(false);
+        expect(readFileSync(join(state.worktreePath, "setup-count"), "utf8")).toBe("attempt\n");
+        writeFileSync(join(state.worktreePath, "reader-ready"), "");
+        expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+        expect(readers.sort()).toEqual(responsible === "review" ? ["review"] : ["review", "verify"]);
+        expect(implementations).toBe(1);
+        expect(f.store.listStages(run.id).filter((s) => ["gates", "audit"].includes(s.name))).toEqual(
+          stages.filter((s) => ["gates", "audit"].includes(s.name)),
+        );
       } else if (layout === "shadow") {
         expect(readers.filter((role) => role !== "shadow").sort()).toEqual(["review", "verify"]);
         expect(readers).toContain("shadow");

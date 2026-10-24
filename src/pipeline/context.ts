@@ -262,6 +262,8 @@ export interface InvokeOptions {
   cwd?: string;
   /** Trusted gate setup for a detached LAN reader checkout. */
   readerSetup?: string[];
+  /** Prepare the coordinator checkout only if the executor chooses local execution. */
+  prepareLocal?: () => Promise<void>;
   /** Paths a tool-enabled reader must not read (see AgentSpec.denyRead). */
   denyRead?: string[];
   /** Tools read only the cwd and scratch (see AgentSpec.confineReads). */
@@ -909,8 +911,10 @@ export class RunContext {
         } else if (!noTools) {
           const slottedCommands = opts.confineReads ? [] : (this.state.slottedCommands ?? []);
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
-          const local = () =>
-            runToolAgent(
+          const local = async () => {
+            await opts.prepareLocal?.();
+            this.checkCancelled();
+            return runToolAgent(
               spec,
               harness,
               slottedCommands,
@@ -932,6 +936,7 @@ export class RunContext {
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,
             );
+          };
           result = await agentExecutor.run(
             {
               runId: this.run.id,

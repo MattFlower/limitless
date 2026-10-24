@@ -160,7 +160,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
       const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-        executor === "setup failure" ? "failed" : "succeeded",
+        executor === "setup failure" ? "needs_human" : "succeeded",
       );
       const preview = f.store.getRunDetail(run.id)?.stages.find((stage) => stage.name === "preview");
       expect(preview?.status).toBe(executor === "setup failure" ? "failed" : "succeeded");
@@ -186,6 +186,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (executor === "local")
         expect(events.some((event) => event.message.startsWith("setup-1: pass"))).toBe(true);
       if (executor === "setup failure") {
+        expect(f.store.listStages(run.id).find((stage) => stage.name === "verify")).toMatchObject({
+          status: "failed",
+          summary: expect.stringContaining("Preview setup failed"),
+        });
         expect(preview?.summary).toContain(`Preview setup failed: $ ${setup[0]}`);
         expect(preview?.summary).toContain("coordinator setup diagnostic");
         expect(existsSync(join(cwd, ".setup/order"))).toBe(false);

@@ -73,11 +73,11 @@ export async function prepareReaderCheckout(cwd: string, setup: string[], signal
     signal,
   );
   signal.throwIfAborted();
+  await discardChanges(cwd);
   if (!result.setupOk) {
     const failed = result.setup.find((r) => !r.ok);
     throw new Error(redactGateOutput(`Reader setup failed: $ ${failed?.command}\n${failed?.output}`));
   }
-  await discardChanges(cwd);
 }
 
 /** One lifecycle for tool-enabled sessions, on the coordinator or a worker. */
