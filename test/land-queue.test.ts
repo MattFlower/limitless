@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -26,6 +27,7 @@ import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
+import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type GitHubClient, normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
@@ -111,6 +113,7 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const q of queues) await q.stop().catch(() => undefined);
   queues.length = 0;
+  configureGitHubIdentity(null);
   gateSlots.setLimit(slots);
   observerRoots.clear();
   process.env.PATH = originalPath;
@@ -5367,4 +5370,45 @@ test("an old watcher cannot release a new wait with the same wall-clock marker",
   reviewObservation(head);
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+});
+
+test("App approvals use the cached bot login, count the owner and reject the factory", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const key = join(root, "app.pem");
+  writeFileSync(key, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  const requests: string[] = [];
+  configureGitHubIdentity(
+    { appId: 123, installationId: 456, privateKeyPath: key, repos: [SLUG] },
+    {
+      fetch: async (url) => {
+        requests.push(url);
+        if (url.endsWith("/app")) return Response.json({ slug: "factory" });
+        if (url.endsWith("/access_tokens"))
+          return Response.json({
+            token: "test-installation-token",
+            expires_at: new Date(Date.now() + 3600_000).toISOString(),
+          });
+        throw new Error(`Unexpected App request ${url}`);
+      },
+    },
+  );
+  github.responses.set("user", () => respond(200, { login: "owner" }));
+  const head = await pushBranch("one", "one.txt", "one\n");
+  const pr = delivered(1, "one");
+  approve(1, head);
+  reviewObservation(head, "APPROVED", "owner");
+  const q = queue({ requiresApproval: approvalPolicy() });
+  const entry = await q.request({ target: pr.run.id });
+  await waitFor(() => ["landed", "waiting_approval"].includes(store.getLandEntry(entry.id)?.state ?? ""));
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  await q.stop();
+  const nextHead = await pushBranch("two", "two.txt", "two\n", 2);
+  const next = delivered(2, "two");
+  approve(2, nextHead);
+  reviewObservation(nextHead, "APPROVED", "factory[bot]", nextHead, 2);
+  const waiting = await queue({ requiresApproval: approvalPolicy() }).request({ target: next.run.id });
+  await waitFor(() => store.getLandEntry(waiting.id)?.state === "waiting_approval");
+  expect(github.calls.filter((c) => c.path === "user")).toEqual([]);
+  expect(requests.filter((url) => url.endsWith("/app"))).toHaveLength(1);
+  expect(requests.filter((url) => url.endsWith("/access_tokens"))).toHaveLength(1);
 });

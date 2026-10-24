@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { z } from "zod";
 import { loadConfig, repoName } from "../config.ts";
 import type { GitHubAccessProblem } from "../core/types.ts";
+import { createGitHubIdentity } from "../integrations/github-identity.ts";
 import { githubDoctor } from "../integrations/github-poller.ts";
 import { installIntegrations, repositoryRoot, sessionStartInstructions } from "../integrations/install.ts";
 import { resolveCatalog } from "../router/config-catalog.ts";
@@ -61,7 +63,7 @@ function encoded(d: SetupDeps, value: unknown): string {
   const redact = (_: string, v: unknown) => (typeof v === "string" ? safe(d, v) : v);
   return JSON.stringify(value, redact);
 }
-export async function doctor(d: SetupDeps): Promise<Check[]> {
+export async function doctor(d: SetupDeps, checkIdentity = true): Promise<Check[]> {
   const checks: Check[] = [];
   const fixes: Record<string, string> = {
     git: "upgrade git to 2.40 or newer",
@@ -88,7 +90,7 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
   add("git", gitOk ? "ok" : "fail", "git ≥ 2.40 required");
   let ghOk = (await run("gh", "auth", "status")).exitCode === 0;
   const repo = (d.config.raw.github as { repos?: string[] } | undefined)?.repos?.[0];
-  if (ghOk && repo) {
+  if (ghOk && repo && !d.config.githubApp?.repos.includes(repo.toLowerCase())) {
     const read = await run("gh", "api", `repos/${repo}`, "-i"),
       output = `${read.stdout}\n${read.stderr}`;
     ghOk = read.exitCode === 0 && !/HTTP\/\S+\s+[45]\d\d\b/i.test(output);
@@ -98,6 +100,60 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
         : `grant repository access to ${repo}, then run gh auth refresh`;
   }
   add("gh", ghOk ? "ok" : "fail", ghOk ? "authenticated" : "not authenticated or no repo access");
+  if (checkIdentity) {
+    try {
+      const app = d.config.githubApp;
+      if (app) {
+        const identity = await createGitHubIdentity(app, { fetch: d.fetch })(app.repos[0]);
+        if (identity.kind !== "app") throw new Error("App identity unavailable");
+        const repositories: string[] = [];
+        let page = 1;
+        let more = true;
+        while (more) {
+          const res = await d.fetch(
+            `https://api.github.com/installation/repositories?per_page=100&page=${page++}`,
+            {
+              headers: { authorization: `Bearer ${identity.token}` },
+              signal: AbortSignal.timeout(30_000),
+            },
+          );
+          const body: unknown = await res.json();
+          const parsed = z
+            .object({
+              message: z.string().optional(),
+              repositories: z.array(z.object({ full_name: z.string() })).optional(),
+            })
+            .parse(body);
+          if (!res.ok)
+            throw new Error(
+              `HTTP ${res.status}: ${parsed.message ?? "cannot list installation repositories"}`,
+            );
+          if (!parsed.repositories) throw new Error("Invalid installation repositories response");
+          repositories.push(...parsed.repositories.map((r) => r.full_name));
+          more = /rel="next"/.test(res.headers.get("link") ?? "");
+        }
+        const missing = app.repos.filter((r) => !repositories.some((name) => name.toLowerCase() === r));
+        add(
+          "github-identity",
+          missing.length ? "fail" : "ok",
+          `${identity.botLogin}: token exchange ok; installation repositories: ${repositories.join(", ")}${missing.length ? `; not covered: ${missing.join(", ")}` : ""}`,
+        );
+      } else {
+        const user = await run("gh", "api", "user");
+        let login: unknown;
+        try {
+          login = JSON.parse(user.stdout).login;
+        } catch {}
+        add(
+          "github-identity",
+          user.exitCode === 0 && typeof login === "string" ? "ok" : "warn",
+          typeof login === "string" ? `owner gh login: ${login}` : "owner gh login unavailable",
+        );
+      }
+    } catch (error) {
+      add("github-identity", "fail", safe(d, String(error)));
+    }
+  }
   if (!d.config.githubOwner)
     add(
       "github-owner",
@@ -207,7 +263,7 @@ async function runSetup(
   original: string | null,
   transaction: { failedStep: string; replaced: boolean; warnings: string[] },
 ): Promise<number> {
-  const checks = await doctor(d),
+  const checks = await doctor(d, command === "doctor"),
     ok = checks.every((c) => c.status !== "fail");
   const printChecks = () => {
     for (const c of checks) d.print(`${c.status} ${c.id}: ${c.message}${c.fix ? `\n  Fix: ${c.fix}` : ""}`);

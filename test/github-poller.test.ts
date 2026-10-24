@@ -1647,6 +1647,8 @@ test("a REST statusCheckRollup array reduces to the state and failing checks", (
 
 test.each([
   ["APPROVED", "other", SHA, "factory", true],
+  ["APPROVED", "owner", SHA, "factory[bot]", true],
+  ["APPROVED", "factory[bot]", SHA, "factory[bot]", false],
   ["APPROVED", "other", "b".repeat(40), "factory", false],
   ["APPROVED", "FaCtOrY", SHA, "factory", false],
   ["DISMISSED", "other", SHA, "factory", false],
