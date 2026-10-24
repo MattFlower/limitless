@@ -1157,11 +1157,18 @@ export class Store {
   // ---- runs ----------------------------------------------------------------
 
   // Provenance is an internal argument, never taken from the public request object.
-  createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
+  createRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    verifiedGitHubWebhook = false,
+    admission?: () => string | null,
+  ): Run {
     if (req.sourceRef?.kind === "review-round")
       throw new Error("review rounds are created only by a review verdict");
     return this.transaction(() => {
-      const claims = [...closedIssues(req.prompt)].map((number) => ({ repo: repo.slug, number }));
+      const refusal = admission?.();
+      if (refusal) throw new Error(`Run admission refused: ${refusal}`);
+      const claims: { repo: string; number: number }[] = [];
       if (req.sourceRef?.kind === "issue") {
         const { repo, number } = req.sourceRef;
         if (
@@ -1172,7 +1179,8 @@ export class Store {
         )
           throw new Error("issue sourceRef requires a repository and positive issue number");
         claims.push({ repo, number });
-      }
+      } else if (req.source !== "github")
+        claims.push(...[...closedIssues(req.prompt)].map((number) => ({ repo: repo.slug, number })));
       for (const claim of claims) {
         const run = this.issueClaim(claim.repo, claim.number);
         if (run) throw new IssueClaimed(claim.repo, claim.number, run);
@@ -1193,10 +1201,10 @@ export class Store {
     return (
       candidates
         .map(toRun)
-        .find(
-          (run) =>
-            (same(run.repoSlug) && closedIssues(run.prompt).has(number)) ||
-            (run.sourceRef?.kind === "issue" && same(run.sourceRef.repo) && run.sourceRef.number === number),
+        .find((run) =>
+          run.sourceRef?.kind === "issue"
+            ? same(run.sourceRef.repo) && run.sourceRef.number === number
+            : run.source !== "github" && same(run.repoSlug) && closedIssues(run.prompt).has(number),
         ) ?? null
     );
   }

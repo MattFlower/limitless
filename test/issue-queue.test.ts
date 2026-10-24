@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
-import { ISSUE_CLAIM_STATUSES, Store } from "../src/db/store.ts";
+import { ISSUE_CLAIM_STATUSES, IssueClaimed, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
@@ -31,7 +31,15 @@ function issue(number = 1, p = 1): QueueIssue {
     blockedBy: { totalCount: 0, nodes: [] },
     closedByPullRequestsReferences: { totalCount: 0, nodes: [] },
     timelineItems: {
-      nodes: [{ label: { name: `priority:${p}` }, actor: { login: "owner" }, createdAt: at }],
+      totalCount: 1,
+      nodes: [
+        {
+          __typename: "LabeledEvent",
+          label: { name: `priority:${p}` },
+          actor: { login: "owner" },
+          createdAt: at,
+        },
+      ],
     },
   };
 }
@@ -65,6 +73,7 @@ const exclusions: [string, (i: QueueIssue) => void][] = [
     "priority application",
     (i) => {
       i.timelineItems.nodes[0] = {
+        __typename: "LabeledEvent",
         label: { name: "priority:1" },
         actor: { login: "stranger" },
         createdAt: at,
@@ -74,7 +83,7 @@ const exclusions: [string, (i: QueueIssue) => void][] = [
   [
     "priority application",
     (i) => {
-      i.timelineItems.nodes = [];
+      i.timelineItems = { totalCount: 0, nodes: [] };
     },
   ],
   [
@@ -154,6 +163,113 @@ test("closed dependencies and merged PRs allow a trusted, edited issue", () => {
   ).toEqual({ eligible: true, priority: 1 });
 });
 
+test.each([
+  ["succeeded", "CLOSED"],
+  ["succeeded", null],
+  ["resolved", null],
+  ["succeeded", "MERGED"],
+] as const)("finished %s run with closing PR %s requires re-approval", async (status, pr) => {
+  const h = harness();
+  const candidate = issue();
+  if (pr) candidate.closedByPullRequestsReferences = { totalCount: 1, nodes: [{ state: pr }] };
+  const run = await h.factory.createRun(
+    issueRunRequest({ repo: "owner/repo", number: 1, title: "Issue", body: "", author: "owner" }, "owner"),
+  );
+  const finishedAt = Date.parse(at) + 1000;
+  const latest = h.store.updateRun(run.id, { status, finishedAt });
+  const check = () => issueEligibility(candidate, ["owner"], { latest });
+  expect(check()).toEqual({
+    eligible: false,
+    reason: "priority re-approval required after the latest issue run",
+  });
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:2" },
+    actor: { login: "stranger" },
+    createdAt: new Date(finishedAt + 1).toISOString(),
+  });
+  candidate.timelineItems.totalCount++;
+  expect(check()).toEqual({
+    eligible: false,
+    reason: "priority re-approval required after the latest issue run",
+  });
+  // A different priority label may re-approve; the current label must still be trusted.
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:2" },
+    actor: { login: "owner" },
+    createdAt: new Date(finishedAt + 2).toISOString(),
+  });
+  candidate.timelineItems.totalCount++;
+  expect(check()).toEqual({ eligible: true, priority: 1 });
+  latest.finishedAt = null;
+  expect(check()).toEqual({
+    eligible: false,
+    reason: "priority re-approval required after the latest issue run",
+  });
+});
+
+test.each([
+  "Blocked by #12, #13",
+  "- Blocked by #12",
+  "Blocked by: #12",
+  "1. blocked by #12",
+  "2) Blocked by #12",
+  " \t* BLOCKED BY: #12",
+  "+ Blocked by #12",
+])("body blocker shape: %s", (body) => {
+  const candidate = { ...issue(), body };
+  const states = new Map([
+    [12, "OPEN"],
+    [13, "OPEN"],
+  ]);
+  const check = () => issueEligibility(candidate, ["owner"], { blockers: states });
+  expect(check()).toEqual({ eligible: false, reason: "open or unresolved body blocker" });
+  states.set(12, "CLOSED");
+  if (body.includes("#13"))
+    expect(check()).toEqual({ eligible: false, reason: "open or unresolved body blocker" });
+  states.set(13, "CLOSED");
+  expect(check()).toEqual({ eligible: true, priority: 1 });
+});
+
+test.each([{ login: "stranger" }, null])("untrusted title rename actor %j", (actor) => {
+  const candidate = issue();
+  candidate.timelineItems.nodes.push({
+    __typename: "RenamedTitleEvent",
+    actor,
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  expect(issueEligibility(candidate, ["owner"])).toEqual({
+    eligible: false,
+    reason: "untrusted title editor",
+  });
+  candidate.timelineItems.nodes.push({
+    __typename: "RenamedTitleEvent",
+    actor: { login: "OWNER" },
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  expect(issueEligibility(candidate, ["owner"])).toEqual({ eligible: true, priority: 1 });
+  // A later node with an older timestamp must not override the latest rename.
+  candidate.timelineItems.nodes.push({
+    __typename: "RenamedTitleEvent",
+    actor,
+    createdAt: "2025-01-01T00:00:00Z",
+  });
+  candidate.timelineItems.totalCount++;
+  expect(issueEligibility(candidate, ["owner"])).toEqual({ eligible: true, priority: 1 });
+});
+
+test("incomplete timeline cannot approve an issue", () => {
+  const candidate = issue();
+  candidate.timelineItems.totalCount = 101;
+  expect(issueEligibility(candidate, ["owner"])).toEqual({
+    eligible: false,
+    reason: "incomplete issue evidence",
+  });
+});
+
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
@@ -193,6 +309,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   const data = new Map(repos.map((r) => [r, [] as QueueIssue[]]));
   const states = new Map<number, string | null>();
   const calls: string[][] = [];
+  const delays: number[] = [];
   const logs: string[] = [];
   const requests: CreateRunRequest[] = [];
   let stop = () => {};
@@ -204,6 +321,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     data,
     states,
     calls,
+    delays,
     logs,
     requests,
     rate: { cost: 1, remaining: 5000, resetAt: new Date(clock.now() + 3600_000).toISOString() },
@@ -231,12 +349,16 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
         gh: h.gh,
         clock: {
           now: clock.now,
-          set: clock.timer.set as unknown as typeof setTimeout,
+          set: ((fn: () => void, ms: number) => {
+            delays.push(ms);
+            return clock.timer.set(fn, ms);
+          }) as unknown as typeof setTimeout,
           clear: clock.timer.clear,
         },
         log: (s) => logs.push(s),
       });
     },
+    stop: () => stop(),
     async advance(ms = 0) {
       await clock.advance(ms);
       for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
@@ -244,9 +366,9 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     runs: () => store.listRuns({ limit: 1000 }),
   };
   const create = factory.createRun.bind(factory);
-  factory.createRun = async (req, verified) => {
+  factory.createRun = async (req, ...args) => {
     requests.push(req);
-    return create(req, verified);
+    return create(req, ...args);
   };
   cleanups.push(async () => {
     stop();
@@ -275,9 +397,11 @@ test("poll selects an eligible issue using exactly the webhook builder", async (
     "owner",
   );
   if (!mapped.request) throw new Error("missing webhook request");
-  expect(h.requests).toEqual([mapped.request]);
+  expect(h.requests).toEqual([
+    { ...mapped.request, sourceRef: { ...mapped.request.sourceRef, via: "queue" } },
+  ]);
   expect(h.runs()[0]).toMatchObject({
-    sourceRef: { kind: "issue", repo: "owner/repo", number: 1 },
+    sourceRef: { kind: "issue", repo: "owner/repo", number: 1, via: "queue" },
     githubWebhookVerified: false,
   });
   expect(h.requests[0]?.allow).toEqual(["submodules"]);
@@ -302,12 +426,15 @@ test.each(["priority", "age", "multiple labels", "untrusted urgent", "number"])(
       second.labels.nodes.push({ name: "priority:5" });
       second.labels.totalCount++;
       second.timelineItems.nodes.push({
+        __typename: "LabeledEvent",
         label: { name: "priority:5" },
         actor: { login: "owner" },
         createdAt: at,
       });
+      second.timelineItems.totalCount++;
       first.labels.nodes = [{ name: "priority:2" }];
       first.timelineItems.nodes[0] = {
+        __typename: "LabeledEvent",
         label: { name: "priority:2" },
         actor: { login: "owner" },
         createdAt: at,
@@ -317,11 +444,13 @@ test.each(["priority", "age", "multiple labels", "untrusted urgent", "number"])(
       first.labels.nodes.push({ name: "priority:0" });
       first.labels.totalCount++;
       first.timelineItems.nodes.push({
+        __typename: "LabeledEvent",
         label: { name: "priority:0" },
         actor: { login: "stranger" },
         createdAt: at,
       });
     }
+    first.timelineItems.totalCount = first.timelineItems.nodes.length;
     h.data.set("owner/a", [first]);
     h.data.set("owner/b", [second]);
     h.start();
@@ -383,24 +512,30 @@ test.each(["failed", "cancelled"] as const)(
     const finishedAt = Date.parse(at) + 1000;
     h.store.updateRun(run.id, { status, finishedAt });
     i.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
       label: { name: "priority:1" },
       actor: { login: "owner" },
       createdAt: new Date(finishedAt).toISOString(),
     });
+    i.timelineItems.totalCount++;
     await h.advance(180_000);
     expect(h.runs()).toHaveLength(1);
     i.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
       label: { name: "priority:1" },
       actor: { login: "stranger" },
       createdAt: new Date(finishedAt + 1).toISOString(),
     });
+    i.timelineItems.totalCount++;
     await h.advance(180_000);
     expect(h.runs()).toHaveLength(1);
     i.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
       label: { name: "priority:1" },
       actor: { login: "OWNER" },
       createdAt: new Date(finishedAt + 2).toISOString(),
     });
+    i.timelineItems.totalCount++;
     await h.advance(180_000);
     expect(h.runs()).toHaveLength(2);
   },
@@ -427,6 +562,100 @@ test("body dependencies are resolved by read-only aliased lookups; missing issue
       (args) => args.slice(0, 3).join(" ") === "api graphql -f" && !args[3]?.includes("mutation"),
     ),
   ).toBe(true);
+});
+
+test("poll query reads title evidence and looks up all body blockers", async () => {
+  const h = harness();
+  h.data.set("owner/repo", [{ ...issue(), body: "- Blocked by: #12, #13" }]);
+  h.states.set(12, "CLOSED");
+  h.states.set(13, "CLOSED");
+  h.start();
+  await h.advance();
+  expect(h.calls).toHaveLength(2);
+  expect(h.calls[0]?.[3]).toContain("itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]");
+  expect(h.calls[0]?.[3]).toContain("{ totalCount nodes { __typename");
+  expect(h.calls[0]?.[3]).toContain("... on RenamedTitleEvent { actor { login } createdAt }");
+  expect(h.calls[1]?.[3]).toContain("i12:issue(number:12)");
+  expect(h.calls[1]?.[3]).toContain("i13:issue(number:13)");
+  expect(h.runs()).toHaveLength(1);
+});
+
+test.each(["run limit", "issue run limit", "draining", "stopped"])(
+  "admission rechecks %s after repository resolution",
+  async (mode) => {
+    const h = harness();
+    if (mode === "run limit") h.cfg.maxConcurrentRuns = 1;
+    const repo = h.store.getRepoBySlug("owner/repo");
+    if (!repo) throw new Error("missing repo");
+    const getRepo = h.store.getRepoBySlug.bind(h.store);
+    let changed = false;
+    h.store.getRepoBySlug = (slug) => {
+      h.store.getRepoBySlug = getRepo;
+      // resolveRepo returns a promise, so this changes state while createRun awaits it.
+      queueMicrotask(() => {
+        if (mode === "run limit") h.store.createRun(repo, { repo: repo.slug, prompt: "other work" });
+        else if (mode === "issue run limit")
+          h.store.updateRun(
+            h.store.createRun(
+              repo,
+              issueRunRequest(
+                { repo: repo.slug, number: 99, title: "Other issue", body: "", author: "owner" },
+                "owner",
+              ),
+            ).id,
+            { status: "needs_human" },
+          );
+        else if (mode === "draining") h.factory.scheduler.drain();
+        else h.stop();
+        changed = true;
+      });
+      return getRepo(slug);
+    };
+    const queuePublications: string[] = [];
+    const unsubscribe = h.store.subscribe((msg) => {
+      if (msg.kind === "run" && msg.run.sourceRef?.via === "queue") queuePublications.push(msg.run.id);
+    });
+    try {
+      h.data.set(repo.slug, [issue()]);
+      h.start();
+      await h.advance();
+      expect(changed).toBe(true);
+      expect(h.runs()).toHaveLength(mode.includes("limit") ? 1 : 0);
+      expect(h.runs().some((r) => r.sourceRef?.via === "queue")).toBe(false);
+      expect(queuePublications).toEqual([]);
+      expect(h.store.db.query("SELECT count(*) AS n FROM events").get()).toEqual({ n: 0 });
+      expect(h.logs.join("\n")).toContain("Run admission refused:");
+      expect(h.logs.join("\n")).toContain(mode);
+      expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
+      if (mode.includes("limit")) {
+        for (const run of h.runs()) h.store.updateRun(run.id, { status: "succeeded" });
+        await h.advance(180_000);
+        expect(h.runs().filter((r) => r.sourceRef?.via === "queue")).toHaveLength(1);
+      }
+    } finally {
+      unsubscribe();
+      h.store.getRepoBySlug = getRepo;
+    }
+  },
+);
+
+test("far-future rate reset caps every timer and queries nothing before the deadline", async () => {
+  const h = harness();
+  h.rate.remaining = 1;
+  h.rate.resetAt = new Date(h.clock.now() + 40 * 24 * 3600_000).toISOString();
+  h.start();
+  await h.advance();
+  expect(h.delays).toEqual([0, 3_600_000]);
+  await h.advance(3_600_000);
+  expect(h.calls).toHaveLength(1);
+  expect(h.delays.at(-1)).toBe(3_600_000);
+  await h.advance(39 * 24 * 3600_000 + 22 * 3600_000 + 3_000_000);
+  expect(h.calls).toHaveLength(1);
+  expect(h.delays.at(-1)).toBe(600_000);
+  h.rate.remaining = 5000;
+  await h.advance(600_000);
+  expect(h.calls).toHaveLength(2);
+  expect(h.delays.at(-1)).toBe(180_000);
 });
 
 test("low rate budget defers to reset and skips subsequent repositories; healthy polls use the normal cadence", async () => {
@@ -595,6 +824,39 @@ test.each(ISSUE_CLAIM_STATUSES)(
   },
 );
 
+test.each(["before", "after"])(
+  "quoted issue text never claims another issue started %s it, with the queue disabled",
+  async (order) => {
+    const h = harness(null);
+    const request = (number: number, body = "") =>
+      issueRunRequest({ repo: "owner/repo", number, title: "Issue", body, author: "owner" }, "owner");
+    let secondId: string | undefined;
+    if (order === "before") secondId = (await h.factory.createRun(request(2))).id;
+    const first = await h.factory.createRun(request(1, "> Closes #2"));
+    expect(h.store.issueClaim("OWNER/REPO", 1)?.id).toBe(first.id);
+    if (order === "after") {
+      expect(h.store.issueClaim("owner/repo", 2)).toBeNull();
+      secondId = (await h.factory.createRun(request(2))).id;
+    }
+    expect(h.store.issueClaim("owner/repo", 2)?.id).toBe(secondId);
+    expect(h.runs()).toHaveLength(2);
+  },
+);
+
+test("non-issue GitHub prompts never claim quoted directives on insert or lookup", async () => {
+  const h = harness(null);
+  const cli = await h.factory.createRun({ repo: "owner/repo", source: "cli", prompt: "Closes #2" });
+  await h.factory.createRun({ repo: "owner/repo", source: "github", prompt: "> Closes #2\n> Closes #3" });
+  expect(h.store.issueClaim("owner/repo", 3)).toBeNull();
+  const refused = h.factory.createRun(
+    issueRunRequest({ repo: "owner/repo", number: 2, title: "Issue", body: "", author: "owner" }, "owner"),
+  );
+  await expect(refused).rejects.toThrow(IssueClaimed);
+  await expect(refused).rejects.toThrow(cli.id);
+  const webhook = await h.factory.createRun({ repo: "owner/repo", source: "webhook", prompt: "Closes #3" });
+  expect(h.store.issueClaim("owner/repo", 3)?.id).toBe(webhook.id);
+});
+
 test.each(["failed", "cancelled", "succeeded", "resolved"] satisfies RunStatus[])(
   "terminal %s releases the claim",
   async (status) => {
@@ -664,7 +926,13 @@ test.each([
 
 test("latest application wins even when timestamps tie, and missing actors cannot approve", () => {
   const i = issue();
-  i.timelineItems.nodes.push({ label: { name: "priority:1" }, actor: null, createdAt: at });
+  i.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:1" },
+    actor: null,
+    createdAt: at,
+  });
+  i.timelineItems.totalCount++;
   expect(issueEligibility(i, ["owner"])).toMatchObject({
     eligible: false,
     reason: expect.stringContaining("priority application"),
@@ -676,7 +944,7 @@ test("a run failing during another repository lookup is rechecked before startin
   const previous = await h.factory.createRun(
     issueRunRequest({ repo: "owner/a", number: 1, title: "Issue", body: "", author: "owner" }, "owner"),
   );
-  h.store.updateRun(previous.id, { status: "succeeded" });
+  h.store.updateRun(previous.id, { status: "succeeded", finishedAt: Date.parse(at) - 1000 });
   h.data.set("owner/a", [issue()]);
   const gh = h.gh;
   const pending = Promise.withResolvers<void>();

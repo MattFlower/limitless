@@ -25,14 +25,25 @@ const issueSchema = z.object({
   subIssuesSummary: z.object({ total: z.number().int().nonnegative() }),
   blockedBy: connection(z.object({ state: z.enum(["OPEN", "CLOSED"]) })),
   closedByPullRequestsReferences: connection(z.object({ state: z.enum(["OPEN", "CLOSED", "MERGED"]) })),
-  timelineItems: z.object({
-    nodes: z.array(z.object({ label: z.object({ name: z.string() }), actor, createdAt: date })),
-  }),
+  timelineItems: connection(
+    z.discriminatedUnion("__typename", [
+      z.object({
+        __typename: z.literal("LabeledEvent"),
+        label: z.object({ name: z.string() }),
+        actor,
+        createdAt: date,
+      }),
+      z.object({ __typename: z.literal("RenamedTitleEvent"), actor, createdAt: date }),
+    ]),
+  ),
 });
 export type QueueIssue = z.infer<typeof issueSchema>;
 const priority = (s: string) => /^priority:(10|[0-9])$/.test(s);
 const blockers = (body: string) =>
-  [...body.matchAll(/^[\t ]*Blocked by #([1-9][0-9]*)[\t ]*\r?$/gim)].map((m) => Number(m[1]));
+  body
+    .split(/\r?\n/)
+    .filter((line) => /^[\t ]*(?:(?:[-*+]|\d+[.)])[\t ]+)?blocked by\b:?/i.test(line))
+    .flatMap((line) => [...line.matchAll(/#([1-9][0-9]*)\b/g)].map((m) => Number(m[1])));
 
 /** Policy only: callers supply observed dependency and local run state. Missing evidence never approves. */
 export function issueEligibility(
@@ -46,7 +57,13 @@ export function issueEligibility(
 ): { eligible: true; priority: number } | { eligible: false; reason: string } {
   const trusts = (login: string | undefined) =>
     !!login && trusted.some((s) => s.toLowerCase() === login.toLowerCase());
-  const events = issue.timelineItems.nodes.filter((e) => priority(e.label.name));
+  const events = issue.timelineItems.nodes
+    .filter((e) => e.__typename === "LabeledEvent")
+    .filter((e) => priority(e.label.name));
+  const rename = issue.timelineItems.nodes
+    .toReversed()
+    .filter((e) => e.__typename === "RenamedTitleEvent")
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
   const approved = issue.labels.nodes
     .filter((l) => priority(l.name))
     .filter((l) => {
@@ -60,6 +77,7 @@ export function issueEligibility(
   if (issue.state !== "OPEN") reason = "issue is closed";
   else if (!trusts(issue.author?.login)) reason = "untrusted author";
   else if (issue.lastEditedAt && !trusts(issue.editor?.login)) reason = "untrusted body editor";
+  else if (rename && !trusts(rename.actor?.login)) reason = "untrusted title editor";
   else if (!issue.labels.nodes.some((l) => priority(l.name))) reason = "no priority label";
   else if (!approved.length) reason = "priority application is untrusted or missing";
   else if (issue.subIssuesSummary.total) reason = "epic has sub-issues";
@@ -71,7 +89,7 @@ export function issueEligibility(
   else if (issue.closedByPullRequestsReferences.nodes.some((p) => p.state === "OPEN"))
     reason = "open closing PR";
   else if (
-    [issue.labels, issue.blockedBy, issue.closedByPullRequestsReferences].some(
+    [issue.labels, issue.blockedBy, issue.closedByPullRequestsReferences, issue.timelineItems].some(
       (c) => c.totalCount !== c.nodes.length,
     )
   )
@@ -79,13 +97,13 @@ export function issueEligibility(
   else if (context.claim) reason = `claimed by run ${context.claim.id}`;
   else if (
     context.latest &&
-    ["failed", "cancelled"].includes(context.latest.status) &&
+    !ISSUE_CLAIM_STATUSES.includes(context.latest.status) &&
     (context.latest.finishedAt === null ||
       !events.some(
         (e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > (context.latest?.finishedAt ?? Infinity),
       ))
   )
-    reason = "latest issue run failed or cancelled; priority re-approval required";
+    reason = "priority re-approval required after the latest issue run";
   return reason
     ? { eligible: false, reason }
     : { eligible: true, priority: Math.min(...approved.map((l) => Number(l.name.slice(9)))) };
@@ -95,7 +113,9 @@ const ISSUE_FIELDS = `number title body createdAt state author { login } editor 
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
   blockedBy(first:100) { totalCount nodes { state } }
   closedByPullRequestsReferences(first:100) { totalCount nodes { state } }
-  timelineItems(last:100, itemTypes:[LABELED_EVENT]) { nodes { ... on LabeledEvent { label { name } actor { login } createdAt } } }`;
+  timelineItems(last:100, itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]) { totalCount nodes { __typename
+    ... on LabeledEvent { label { name } actor { login } createdAt }
+    ... on RenamedTitleEvent { actor { login } createdAt } } }`;
 export type IssueQueueClock = {
   now: () => number;
   set: typeof setTimeout;
@@ -211,41 +231,51 @@ export function startIssueQueue(
           log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${current.reason}`));
           continue;
         }
-        const active = factory.store.listRuns({
-          status: ISSUE_CLAIM_STATUSES,
-          limit: Number.MAX_SAFE_INTEGER,
-        });
-        if (
-          active.filter((r) => r.status === "queued" || r.status === "running").length >=
-          factory.cfg.maxConcurrentRuns
-        )
-          break;
-        if (
-          active.filter((r) => r.sourceRef?.kind === "issue").length >=
-          q.maxIssueRuns + Number(priority === 0)
-        )
-          continue;
+        const admission = () => {
+          if (stopped) return "queue stopped";
+          if (factory.scheduler.draining) return "scheduler draining";
+          const active = factory.store.listRuns({
+            status: ISSUE_CLAIM_STATUSES,
+            limit: Number.MAX_SAFE_INTEGER,
+          });
+          if (
+            active.filter((r) => r.status === "queued" || r.status === "running").length >=
+            factory.cfg.maxConcurrentRuns
+          )
+            return "run limit reached";
+          if (
+            active.filter((r) => r.sourceRef?.kind === "issue").length >=
+            q.maxIssueRuns + Number(priority === 0)
+          )
+            return "issue run limit reached";
+          return null;
+        };
+        if (admission()) continue;
         try {
-          await factory.createRun(
-            issueRunRequest(
-              {
-                repo,
-                number: issue.number,
-                title: issue.title,
-                body: issue.body,
-                author: issue.author?.login ?? "",
-              },
-              factory.cfg.githubOwner,
-            ),
+          const request = issueRunRequest(
+            {
+              repo,
+              number: issue.number,
+              title: issue.title,
+              body: issue.body,
+              author: issue.author?.login ?? "",
+            },
+            factory.cfg.githubOwner,
           );
+          request.sourceRef = { ...request.sourceRef, via: "queue" };
+          await factory.createRun(request, false, undefined, true, admission);
         } catch (e) {
-          if (!stopped) log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${String(e)}`));
+          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${String(e)}`));
         }
       }
     } catch (e) {
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
-      if (!stopped) timer = set(() => void tick(), Math.max(q.pollSeconds * 1000, notBefore - now()));
+      if (!stopped)
+        timer = set(
+          () => void tick(),
+          Math.min(3_600_000, Math.max(q.pollSeconds * 1000, notBefore - now())),
+        );
     }
   };
   timer = set(() => void tick(), 0);

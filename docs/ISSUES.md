@@ -14,7 +14,10 @@ An issue with GitHub sub-issues is an epic and is never built itself. Finish eac
 with an acceptance sub-issue blocked by its other sub-issues (as in #818 and #819).
 Declare dependencies with GitHub's native **blocked by**, or one case-insensitive
 `Blocked by #123` line per dependency in the body. Body references name issues in the
-same repository. All blockers must be closed; missing or unresolved blockers prevent work.
+same repository. Other shapes on a `Blocked by` line still count: an optional colon,
+list markers (`-`, `*`, `+`, `1.`), and several references such as `Blocked by #12, #13`.
+Every issue reference on such a line is a blocker. All blockers must be closed;
+missing or unresolved blockers prevent work.
 
 ## Queue configuration
 
@@ -45,19 +48,22 @@ An issue is eligible only when:
 
 - Its author is trusted, and its body was never edited or its last editor is trusted.
   An edited body with no identifiable editor is excluded.
+- Its most recent title rename, if any, was by a trusted account. A missing rename
+  actor is excluded too.
 - At least one current priority label's most recent application was by a trusted account.
   Missing application evidence does not approve a label.
 - It has no sub-issues, every native and body blocker is closed, and no open PR closes it.
 - It has neither `limitless:in-progress` nor `limitless:failed`.
 - No active run claims it.
-- Its latest issue-sourced run did not fail or get cancelled, or a trusted account
-  applied a priority label after that run finished. Until then it is not picked again.
+- After any finished issue-sourced run (succeeded, resolved, failed or cancelled), a
+  trusted account applied a priority label strictly after that latest run's `finishedAt`.
+  Without that timestamp or fresh approval, it is not picked again.
 
 Issues across repositories sort by priority, creation time, then issue number. Each poll
 reads at most the oldest 100 open issues per repository and logs truncation. It reads the
-latest 100 label applications; priority labels outside that window lack approval evidence.
-Incomplete blocker or closing-PR connections prevent eligibility. Body dependencies use
-additional aliased issue lookups. Low remaining GraphQL budget stops further queries and
+latest 100 label applications and title renames together. An incomplete timeline makes
+the issue ineligible, as do incomplete label, blocker or closing-PR connections. Body
+dependencies use additional aliased issue lookups. Low remaining GraphQL budget stops further queries and
 waits until at least the reported reset time (threshold: max(100, ten times query cost)).
 Errors are logged with credentials redacted and polling resumes on the next tick.
 
@@ -68,13 +74,17 @@ the overall run limit. Runs in queued, waiting, running, waiting_input or needs_
 claim issues and count toward the issue limit. A completed run releases its claim.
 
 All normal start paths share one transactional claim check, including the queue, webhooks,
-CLI/HTTP, MCP, Discord, chat and retries. A claim is an issue source reference or a
-`Closes #n` directive parsed from the prompt in the run's repository. Repository identities
+CLI/HTTP, MCP, Discord, chat and retries. Issue-sourced runs claim only their source
+reference; quoted issue text never adds claims. Other runs claim `Closes #n` directives
+parsed only from non-GitHub prompts in the run's repository. Repository identities
 are case-insensitive. Duplicate starts are refused with the claiming run's id; webhook
 refusals are recorded as ignored. Review, conflict and CI rounds use their existing lineage
 insertion path. This is single-store coordination; cross-coordinator claim refs belong to Q2.
 
 Queue runs use the same quoted issue request as an owner-labelled webhook. Only owner-authored
 issues parse `Allow:` lines; polling does not confer signed-webhook provenance. Issue source
-references already produce `Closes #n` in PR bodies. The poller only reads GitHub: lifecycle
-labels and comments, App identity, and GitHub questions and approvals are later slices.
+references already produce `Closes #n` in PR bodies. The queue adds the optional, additive
+`via: "queue"` source-reference marker, ignored by older releases. Only marked issue runs
+suppress notifier lifecycle comments, even after the queue is disabled. The poller only reads
+GitHub: lifecycle labels and comments, App identity, and GitHub questions and approvals are
+later slices.
