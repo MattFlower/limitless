@@ -105,7 +105,7 @@ export const ReviewCaseSchema = z
   .strictObject({
     ...repositoryCase,
     kind: reviewKind,
-    split: z.enum(["dev", "heldout"]).optional(),
+    split: z.enum(["dev", "heldout", "escapes-dev", "escapes-heldout"]).optional(),
     labelHistory: z
       .array(
         z.strictObject({
@@ -121,7 +121,7 @@ export const ReviewCaseSchema = z
       .optional(),
     source: z.string(),
     input: z.strictObject({
-      prompt: nonempty,
+      prompt: z.string().refine((s) => s.trim().length > 0, "prompt must not be blank"),
       spec: SpecSchema.nullable(),
       implementerReport: z.string(),
       gates: z.array(GateComparisonSchema),
@@ -137,7 +137,9 @@ export const ReviewCaseSchema = z
         summary: nonempty,
         required: z.boolean(),
         foundBy: z.string(),
-        adjudication: z.enum(["pending", "confirmed"]).optional(),
+        adjudication: z
+          .union([z.enum(["pending", "confirmed"]), z.string().regex(/^fixed in [0-9a-f]{7,64}$/)])
+          .optional(),
       }),
     ),
     seedPatch: nonempty

@@ -390,3 +390,34 @@ Recorded on 2026-10-16 (checked with `date`). This follows the 2026-10-15 proced
 - **#446, first pass against the older request (record only).** The claims matched the closed #429 design: write-time redaction removed, UI access, raw invocation logs. The factory request explicitly kept write-time redaction and made the UI optional, so these weren't labels.
 
 **Use.** The 22 new clean cases join their splits. Decisions measured before this set existed keep their recorded verdicts. Results for systems built on Sol 6.1 or Opus carry the usual independence caveat, because both adjudicators are those models.
+
+## Escape-case rule — 2026-10-23
+
+Pre-registered before any escape-case results: `scripts/review-escape-cases.ts` draws
+candidates from `review_rounds` of kind `review`, using the reviewed head, the source
+run's exact request, and the merge base with the default branch as of the round.
+Conflict and CI rounds are excluded. The generator makes heuristic proposals only;
+the original `blocker` severity is not a gold label. Proposals remain outside the
+public repository, next to the database by default.
+
+An independent adjudicator may propose labels. The orchestrator checks the reproduction
+and delivered fix, then confirms each finding in a JSON object keyed by
+`<owner>/<repo>#<pr>/round-<round>/<zero-based finding index>`. Each value has
+`classification` (`defect`, `merge-main`, `docs-process`, `decision`, or `other`),
+`severity` (`blocker`, `major`, `minor`, or `nit`), `category`, and `confirmedBy`.
+Only confirmed code defects of medium severity or higher (`major` or `blocker`) are
+written by `--write --confirm <file>`; they are required defects. Merge-main requests,
+docs/process asks and answers to implementer questions do not become gold defects.
+A case with no eligible defect is omitted.
+
+Each case records a real→real `labelHistory` entry naming the confirmer and date,
+the reproduction in the orchestrator's review, the factory's delivered fix SHA,
+and the original findings text. This is the evidence for the existing adjudication
+rule, not a claim inferred from the incoming severity. Invalid pins, missing files,
+fixes that touch no defect file, snapshot-stripped `evals/` defects and private text
+are excluded with reasons. No model calls or eval runs are part of generation.
+
+Split assignment is fixed by PR-number parity: even PRs go to **escapes-dev**;
+odd PRs go to **escapes-heldout**. All rounds of a PR share its split. Existing
+cases never move into or out of a split. These splits form a new family, independent
+of the existing `dev`/`heldout` assignment and seed.

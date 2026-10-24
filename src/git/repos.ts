@@ -500,7 +500,7 @@ export async function exportCommit(
       ...(process.env as Record<string, string>),
       GIT_INDEX_FILE: join(scratch, "index"),
     };
-    await worktreeGit(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
+    await worktreeGit(["git", "read-tree", `${sha}^{tree}`], { cwd, env, signal, timeoutMs: 300_000 });
     await worktreeGit(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
       env,
@@ -509,6 +509,71 @@ export async function exportCommit(
       timeoutMs: 300_000,
     });
   });
+}
+
+/** The tree commitAll would produce, without changing HEAD, the index or working files. */
+export async function snapshotTree(cwd: string, signal?: AbortSignal): Promise<string> {
+  return withScratch(cwd, async (scratch) => {
+    const opts = { cwd, signal, env: { ...process.env, GIT_INDEX_FILE: join(scratch, "index") } };
+    await worktreeGit(["git", "read-tree", "HEAD"], opts);
+    await stageAll(opts);
+    return (await worktreeGit(["git", "write-tree"], opts)).stdout.trim();
+  });
+}
+
+/** Independent Git history/index for gate checks; no refs, index or admin paths are shared. */
+export async function exportGateSnapshot(
+  cwd: string,
+  tree: string,
+  dest: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const opts = { cwd, signal };
+  const format = await worktreeGit(["git", "rev-parse", "--show-object-format"], opts);
+  // Recognizable metadata lets hardening discover conditional hooks before init can run them.
+  for (const dir of ["objects", "refs"]) mkdirSync(join(dest, ".git", dir), { recursive: true });
+  writeFileSync(join(dest, ".git/HEAD"), "ref: refs/heads/snapshot\n");
+  await cacheGit(["git", "init", "-q", "--template=", `--object-format=${format.stdout.trim()}`], {
+    cwd: dest,
+    signal,
+  });
+  // A synthetic child of HEAD gives describe/log the same ancestry as the eventual round commit.
+  const commit = await worktreeGit(
+    [
+      "git",
+      "-c",
+      "user.name=Limitless",
+      "-c",
+      "user.email=limitless@localhost",
+      "commit-tree",
+      tree,
+      "-p",
+      "HEAD",
+    ],
+    { ...opts, stdin: "Factory gate snapshot\n" },
+  );
+  const references = await worktreeGit(["git", "for-each-ref", "--format=%(objectname) %(refname)"], opts);
+  const refs = references.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split(" "));
+  // Copy objects through Git, never config, hooks, alternates or hard links to session metadata.
+  await worktreeGit(["git", "pack-objects", "--revs", join(dest, ".git/objects/pack/snapshot")], {
+    ...opts,
+    stdin: `${commit.stdout.trim()}\n${refs.map(([sha]) => sha).join("\n")}\n`,
+    additionalWriteRoots: [dest],
+    timeoutMs: 300_000,
+  });
+  await worktreeGit(["git", "update-ref", "--no-deref", "HEAD", commit.stdout.trim()], { cwd: dest, signal });
+  if (refs.length)
+    await worktreeGit(["git", "update-ref", "--stdin"], {
+      cwd: dest,
+      signal,
+      stdin: refs.map(([sha, ref]) => `update ${ref} ${sha}\n`).join(""),
+    });
+  await exportCommit(cwd, tree, dest, signal);
+  await worktreeGit(["git", "read-tree", tree], { cwd: dest, signal });
 }
 
 /** A detached checkout of `sha` at `dest` sharing `cwd`'s repository, for readers kept off the worktree. */

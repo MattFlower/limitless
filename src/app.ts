@@ -361,6 +361,7 @@ export class Factory {
     verifiedGitHubWebhook = false,
     chat?: { conversationId: string; proposalId: string },
     validateOrigins = true,
+    admission?: () => string | null,
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
@@ -377,7 +378,7 @@ export class Factory {
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
-      : this.store.createRun(repo, req, verifiedGitHubWebhook);
+      : this.store.createRun(repo, req, verifiedGitHubWebhook, admission);
     this.store.addEvent({
       runId: run.id,
       type: "log",

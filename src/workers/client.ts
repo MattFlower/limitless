@@ -7,7 +7,7 @@ import { z } from "zod";
 import type { Config } from "../config.ts";
 import { isBranchName } from "../core/delivery.ts";
 import { Store } from "../db/store.ts";
-import type { GateRequest } from "../gates/executor.ts";
+import { type GateRequest, gateProvenance } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../gates/private.ts";
 import { runLocalGates } from "../gates/run.ts";
@@ -774,6 +774,7 @@ export async function runWorker(
             await posts;
             jobSignal.throwIfAborted();
             assertProcessesStopped();
+            Object.assign(run, await gateProvenance(cwd, jobSignal));
             return () =>
               call(`/worker/jobs/${id}/result`, redactGateData({ run, sha: req.headSha }), jobSignal);
           },

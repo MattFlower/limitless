@@ -116,6 +116,10 @@ export const GateRunSchema = z
       .string()
       .regex(/^(?:[a-f\d]{40}|[a-f\d]{64})$/i)
       .optional(),
+    treeHash: z
+      .string()
+      .regex(/^(?:[a-f\d]{40}|[a-f\d]{64})$/i)
+      .optional(),
     setupOk: z.boolean(),
     setup: z.array(Check),
     checks: z.array(Check),

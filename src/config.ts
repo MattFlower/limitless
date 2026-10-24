@@ -95,6 +95,7 @@ export interface Config {
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
   githubPollSeconds: number; // [github] poll_seconds: the normal polling interval, at least 15
   githubCiReruns: boolean; // [github] ci_reruns: retry transient CI failures once
+  githubQueue: { repos: string[]; trusted: string[]; maxIssueRuns: number; pollSeconds: number } | null;
   discordOwnerId: string | null;
   discordChannelId: string | null;
   discordNotifyAll: boolean;
@@ -367,6 +368,28 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const github = (raw.github ?? {}) as Record<string, unknown>;
+  let githubQueue: Config["githubQueue"] = null;
+  if (github.queue !== undefined) {
+    if (!github.queue || typeof github.queue !== "object" || Array.isArray(github.queue))
+      throw new Error("github.queue must be a table");
+    const q = github.queue as Record<string, unknown>;
+    const repos = q.repos ?? [];
+    const trusted = q.trusted ?? (owners.github ? [owners.github] : []);
+    const maxIssueRuns = q.max_issue_runs ?? 1;
+    const pollSeconds = q.poll_seconds ?? 180;
+    if (!Array.isArray(repos) || !repos.every((r) => typeof r === "string" && repoName.test(r)))
+      throw new Error("github.queue.repos must be an array of owner/name strings");
+    if (
+      !Array.isArray(trusted) ||
+      !trusted.every((s) => typeof s === "string" && /^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$/.test(s))
+    )
+      throw new Error("github.queue.trusted must be an array of GitHub logins");
+    if (typeof maxIssueRuns !== "number" || !Number.isSafeInteger(maxIssueRuns) || maxIssueRuns < 1)
+      throw new Error("github.queue.max_issue_runs must be a positive integer");
+    if (typeof pollSeconds !== "number" || !Number.isFinite(pollSeconds) || pollSeconds <= 0)
+      throw new Error("github.queue.poll_seconds must be positive seconds");
+    githubQueue = { repos, trusted, maxIssueRuns, pollSeconds: Math.max(15, pollSeconds) };
+  }
   const repos = github.repos;
   const valid = Array.isArray(repos) && repos.every((r) => typeof r === "string" && repoName.test(r));
   if (repos !== undefined && !valid) throw new Error("github.repos must be an array of owner/name strings");
@@ -522,6 +545,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     githubPoll: github.poll !== false,
     githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),
     githubCiReruns: github.ci_reruns !== false,
+    githubQueue,
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),
     discordNotifyAll: discord.notify_all === true,

@@ -150,7 +150,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
             privateSession,
             confineReads,
             slottedCommands: call.slottedCommands,
-            agentFullSuite: call.agentFullSuite,
+            agentFullSuite: call.agentFullSuite === "gate" ? "refuse" : call.agentFullSuite,
           };
           id = randomUUID();
           await publication?.started(id);

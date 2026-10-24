@@ -47,8 +47,9 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
+import { protectPrivateFile } from "../src/util/private-reads.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
-import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
@@ -170,6 +171,7 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
     // Other invocations' command capabilities are unreadable; this invocation's own stays readable.
     const commands = invocationCommands(scratch);
     const capabilities = [
+      ...homeReadPolicy([]).denyRead.map((p) => `${JSON.stringify(p)}="none",`),
       ...commands.root.map((p) => `${JSON.stringify(p)}="none",`),
       ...commands.own.map((p) => `${JSON.stringify(p)}="read",`),
     ].join("");
@@ -226,7 +228,9 @@ test("denyRead keeps tool-enabled readers out of a parallel worktree", () => {
     expect(codexAccess(buildCodexArgs(spec), join(implementer, "marker.txt"))).toBe("none");
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
-    expect(settings.sandbox.filesystem.denyRead).toEqual([implementer, ...commandRoots()]);
+    expect(new Set(settings.sandbox.filesystem.denyRead)).toEqual(
+      new Set([...homeReadPolicy([], false, [implementer]).denyRead, ...commandRoots()]),
+    );
     expect(claude.slice(claude.indexOf("--disallowedTools"))).toContain(`Read(/${implementer}/**)`);
     for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")]) {
       expect(() => build({ ...spec, denyRead: [root] })).toThrow("outside");
@@ -1446,9 +1450,13 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
             );
             return { ...procResult, timedOut: outcome === "timeout", cancelled: outcome === "cancelled" };
           };
-          if (outcome === "error")
-            await expect(run(spec, runner)).rejects.toThrow("injected process failure");
-          else expect((await run(spec, runner)).status).toBe(outcome === "success" ? "ok" : outcome);
+          const probed = fakeCodex();
+          const execute = () =>
+            run === runCodex
+              ? runCodex(spec, (o) => (o.cmd[1] === "exec" ? runner(o) : probed.runner(o)), probed.probe)
+              : run(spec, runner);
+          if (outcome === "error") await expect(execute()).rejects.toThrow("injected process failure");
+          else expect((await execute()).status).toBe(outcome === "success" ? "ok" : outcome);
         });
       }
       expect(paths[0]).not.toBe(paths[1]);
@@ -1549,6 +1557,172 @@ function credentialFixture() {
   for (const dir of [fixture.cwd, fixture.scratchDir]) writeFileSync(join(dir, "canary"), "stand-in");
   return { ...fixture, files, options: { home, denyRead: [join(home, "custom-login")] } };
 }
+
+test("ordinary readers deny shared stores while retaining checkout, toolchain and system reads", async () => {
+  const { root, cwd, scratchDir, spec, files, options } = credentialFixture();
+  const keychain = join(options.home, "Library/Keychains");
+  mkdirSync(dirname(keychain));
+  const target = join(root, "keychain-store");
+  mkdirSync(target);
+  symlinkSync(target, keychain);
+  await readPolicyScope.run({ ...options, environment: {} }, async () => {
+    const reader = { ...spec, mode: "readonly" as const };
+    const codex = buildCodexArgs(reader);
+    const claude = buildClaudeArgs(reader, "id");
+    const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
+    for (const file of files) {
+      expect(codexAccess(codex, file)).toBe("none");
+      expect(claudeSandboxReads(claude, file)).toBe(false);
+    }
+    for (const path of homeReadPolicy([]).denyRead) {
+      expect(codexFilesystem(codex)[path]).toBe("none");
+      expect(settings.sandbox.filesystem.denyRead).toContain(path);
+      expect(settings.permissions.deny).toContain(`Read(/${path})`);
+      expect(settings.permissions.deny).toContain(`Read(/${path}/**)`);
+    }
+    expect(codexFilesystem(codex)["/"]).toBe("read");
+    expect(codexAccess(codex, join(scratchDir, "note"))).toBe("write");
+    for (const path of [cwd, "/usr/bin", "/etc/hosts", join(options.home, ".bun/bin/bun")]) {
+      expect(codexAccess(codex, path)).toBe("read");
+      expect(claudeSandboxReads(claude, path)).toBe(true);
+    }
+    expect(claude).toContain("Read,Grep,Glob,Bash");
+    const recording = recordingConfinement();
+    await confinementScope.run(recording.backend, () =>
+      runClaude(spec, async (opts) => {
+        opts.onStdoutLine?.(opts.cmd[4] ?? "");
+        return procResult;
+      }),
+    );
+    const roots = recording.calls[0]?.roots;
+    if (!roots) throw new Error("missing editor launch roots");
+    const outer = seatbeltProfile(roots);
+    const editor = buildClaudeArgs(spec, "id");
+    const editorSettings = JSON.parse(editor[editor.indexOf("--settings") + 1] ?? "{}");
+    expect(editorSettings.sandbox.enabled).toBe(false);
+    for (const path of [keychain, target]) {
+      const mac = process.platform === "darwin";
+      expect(homeReadPolicy([]).denyRead.includes(path)).toBe(mac);
+      expect(homeReadPolicy([cwd, scratchDir], true).denyRead.includes(path)).toBe(mac);
+      expect(codexAccess(buildCodexArgs(spec), path)).toBe(mac ? "none" : "read");
+      for (const confineReads of [false, true])
+        if (mac) expect(codexAccess(buildCodexArgs({ ...reader, confineReads }), path)).toBe("none");
+      if (mac) {
+        for (const rule of [`Read(/${path})`, `Read(/${path}/**)`]) {
+          expect(editorSettings.permissions.deny).toContain(rule);
+          expect(editor.slice(editor.indexOf("--disallowedTools") + 1)).toContain(rule);
+        }
+        expect(editorSettings.sandbox.filesystem.denyRead).toContain(path);
+      }
+      expect(claudeSandboxReads(editor, path)).toBe(!mac);
+      expect(roots.denyRead).not.toContain(path);
+      expect(outer).not.toContain(`(subpath "${path}")`);
+    }
+    for (const path of homeReadPolicy([]).denyRead.filter((p) => ![keychain, target].includes(p)))
+      expect(roots.denyRead).toContain(path);
+  });
+});
+
+for (const source of [
+  "built-in",
+  "configured lexical",
+  "configured resolved",
+  "relocated",
+  "invocation",
+  "private",
+]) {
+  test.skipIf(process.platform !== "darwin")(
+    `Claude editor outer Keychain exemption preserves ${source} denies (requires macOS policy)`,
+    async () => {
+      const { root, spec, options } = credentialFixture();
+      const keychain = join(options.home, "Library/Keychains");
+      const target = source === "built-in" ? join(options.home, ".ssh") : join(root, "keychain-store");
+      mkdirSync(dirname(keychain));
+      if (source !== "built-in") writeFileSync(target, "stand-in");
+      symlinkSync(target, keychain);
+      const release = source === "private" ? protectPrivateFile(target) : () => {};
+      try {
+        await readPolicyScope.run(
+          {
+            ...options,
+            denyRead: [
+              ...options.denyRead,
+              ...(source === "configured lexical" ? [keychain] : []),
+              ...(source === "configured resolved" ? [target] : []),
+            ],
+            environment: source === "relocated" ? { GH_CONFIG_DIR: keychain } : {},
+          },
+          async () => {
+            const recording = recordingConfinement();
+            await confinementScope.run(recording.backend, () =>
+              runClaude({ ...spec, denyRead: source === "invocation" ? [keychain] : [] }, async (opts) => {
+                opts.onStdoutLine?.(opts.cmd[4] ?? "");
+                return procResult;
+              }),
+            );
+            const roots = recording.calls[0]?.roots;
+            if (!roots) throw new Error("missing editor launch roots");
+            expect(roots.denyRead).toContain(target);
+            expect(seatbeltProfile(roots)).toContain(`(subpath "${target}")`);
+            if (["configured lexical", "relocated", "invocation"].includes(source)) {
+              expect(roots.denyRead).toContain(keychain);
+              expect(seatbeltProfile(roots)).toContain(`(subpath "${keychain}")`);
+            }
+          },
+        );
+      } finally {
+        release();
+      }
+    },
+  );
+}
+
+test("ordinary Codex reader probes are read-only in credential stores and cached by effective profile", async () => {
+  const { spec, options } = credentialFixture();
+  await readPolicyScope.run({ ...options, environment: {} }, async () => {
+    const reader = { ...spec, mode: "readonly" as const };
+    const dir = join(options.home, ".ssh");
+    const file = join(options.home, ".npmrc");
+    const fake = fakeCodex((p, o) => {
+      expect(readdirSync(dir)).toEqual(["stand-in"]);
+      expect(readFileSync(file, "utf8")).toBe("stand-in");
+      return enforcing(p, o);
+    });
+    const launch = (s = reader) => runCodex(s, fake.runner, fake.probe);
+    expect((await launch()).status).toBe("ok");
+    for (const path of [dir, file]) {
+      const read = fake.sandboxReads.find((r) => r.file === path);
+      expect(read?.cmd).toContain('if [ -d "$1" ]; then ls -A "$1"; else head -c 1 "$1"; fi >/dev/null');
+      expect(codexFilesystem(read?.cmd ?? [])["/"]).toBe("read");
+    }
+    expect(readdirSync(dir)).toEqual(["stand-in"]);
+    expect(readFileSync(file, "utf8")).toBe("stand-in");
+    expect(readFileSync(join(dir, "stand-in"), "utf8")).toBe("stand-in");
+    await launch();
+    expect(fake.probes()).toBe(1);
+    await launch({ ...reader, confineReads: true });
+    expect(fake.probes()).toBe(2);
+    await launch({ ...reader, denyRead: [join(options.home, "extra")] });
+    expect(fake.probes()).toBe(3);
+    fake.cli.version = "codex-cli 0.161.0";
+    await launch();
+    expect(fake.probes()).toBe(4);
+    fake.cli.path = `${CODEX}-alternate`;
+    await launch();
+    expect(fake.probes()).toBe(5);
+    for (const [outcome, reason] of [
+      [{ exitCode: 0 }, "reader profile not enforced"],
+      [{ exitCode: 2 }, "probe inconclusive"],
+    ] as const) {
+      const broken = fakeCodex((p, o) => (p === file ? outcome : enforcing(p, o)));
+      const result = await runCodex(reader, broken.runner, broken.probe);
+      expect(result.status).toBe("unavailable");
+      expect(result.confinement?.reason).toBe(reason);
+      expect(result.error).toContain("confinement not verified");
+      expect(broken.execs).toHaveLength(0);
+    }
+  });
+});
 
 test("both editor profiles deny every credential store and configured path, preserving run reads", () => {
   const { cwd, scratchDir, spec, files, options } = credentialFixture();
@@ -1935,11 +2109,12 @@ test("CLI sandboxes run directly when outer confinement refuses; Claude editors 
   };
   await confinementScope.run(backend, async () => {
     for (const mode of ["edit", "readonly"] as const) {
-      const fake = editCodex();
+      const fake = mode === "edit" ? editCodex() : fakeCodex();
       const result = await runCodex({ ...spec, mode }, fake.runner, fake.probe);
       expect(result.status).toBe("ok");
-      expect(fake.execs()).toHaveLength(1);
-      expect(fake.execs()[0]?.[0]).toBe(CODEX);
+      const execs = typeof fake.execs === "function" ? fake.execs() : fake.execs.map((o) => o.cmd);
+      expect(execs).toHaveLength(1);
+      expect(execs[0]?.[0]).toBe(CODEX);
     }
     const calls: string[][] = [];
     const runner = async (opts: ProcOptions) => {
@@ -2144,7 +2319,7 @@ test.skipIf(process.platform !== "darwin")(
   },
 );
 
-test("relocated credential stores retain both spellings in gate and editor profiles", async () => {
+test("relocated credential stores retain both spellings in gate, editor and reader profiles", async () => {
   const { root, cwd, scratchDir, spec } = editFixture();
   await recordWorktree(cwd);
   const home = join(root, "home");
@@ -2226,7 +2401,19 @@ test("relocated credential stores retain both spellings in gate and editor profi
             expect(profile).toContain(`(subpath "${spelling}")`);
           }
       }
+      const reader = { ...spec, mode: "readonly" as const };
+      const readerCodex = buildCodexArgs(reader);
+      const readerArgs = buildClaudeArgs(reader, "id");
+      const settings = JSON.parse(readerArgs[readerArgs.indexOf("--settings") + 1] ?? "{}");
+      for (const path of homeReadPolicy([]).denyRead) {
+        expect(settings.permissions.deny).toContain(`Read(/${path})`);
+        expect(settings.permissions.deny).toContain(`Read(/${path}/**)`);
+      }
       for (const file of targets) {
+        for (const store of [alias, stores]) {
+          expect(codexAccess(readerCodex, join(store, file))).toBe("none");
+          expect(claudeSandboxReads(readerArgs, join(store, file))).toBe(false);
+        }
         expect(codexAccess(codex, join(alias, file))).toBe("none");
         expect(codexAccess(codex, join(stores, file))).toBe("none");
         expect(claudeSandboxReads(claude, join(alias, file))).toBe(false);

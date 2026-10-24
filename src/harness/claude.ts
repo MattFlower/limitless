@@ -214,10 +214,10 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       const explicit = validateDenyRead(spec, scratch);
       const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
       const commands = invocationCommands(scratch, spec.cwd);
-      const credentials = confined ? homeReadPolicy([], false, [...explicit, ...commands.root]).denyRead : [];
+      const credentials = homeReadPolicy([spec.cwd, scratch], false, explicit).denyRead;
       const denyRead = [...(confined?.deny ?? explicit), ...credentials, ...commands.root];
       // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
-      denied.push(...[...explicit, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
+      denied.push(...[...credentials, ...commands.root].flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]));
       // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
       // reader is allowed Read (which also governs Grep and Glob) only there; a bare Grep or Glob
       // allow would search anywhere. dontAsk refuses every other path.
@@ -240,6 +240,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       "--settings",
       JSON.stringify({
         ...fastSettings,
+        permissions: { deny: denied },
         sandbox: {
           // macOS cannot nest Seatbelt: editors already run entirely inside runSandboxed.
           enabled: spec.mode !== "edit",
@@ -300,6 +301,14 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
   return args;
 }
 
+function claudeEditorRoots(spec: AgentSpec, scratch: string) {
+  const roots = writeRoots(spec.cwd, scratch, false, spec.denyRead);
+  // Follow-up to #834: supply Claude's login from the daemon before denying outer-profile Keychain
+  // access for security. Native tools keep the full list; overlapping credential denies win here.
+  const keychains = new Set(roots.keychainOnlyReadPaths);
+  return { ...roots, denyRead: roots.denyRead?.filter((path) => !keychains.has(path)) };
+}
+
 export async function runClaude(
   spec: AgentSpec,
   processRunner = runProcess,
@@ -311,7 +320,7 @@ export async function runClaude(
   const keyFile = t.backend && `${tmpdir()}/limitless-${sessionId}.key`;
   const args = buildClaudeArgs(spec, sessionId, keyFile);
   const editing = spec.mode === "edit" && !spec.noTools;
-  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec), false, spec.denyRead) : null;
+  const roots = editing ? claudeEditorRoots(spec, validateScratch(spec)) : null;
   const shellEnv = agentShellEnv(spec);
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.

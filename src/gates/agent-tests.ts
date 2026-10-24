@@ -5,7 +5,7 @@ export type TestLane = "gate" | "small";
 export const AGENT_TEST_CAP_MS = { gate: 45 * 60_000, small: 15 * 60_000 } as const;
 export interface TestWait {
   kind: "agent-test";
-  phase: "wait" | "acquired" | "capped" | "refused";
+  phase: "wait" | "acquired" | "capped" | "refused" | "gate" | "gate-pass" | "gate-fail";
   command: string;
   lane: TestLane;
   waitMs?: number;
@@ -13,6 +13,7 @@ export interface TestWait {
 }
 
 interface SessionOptions {
+  factoryGate?: FactoryGateHandler;
   onWatchdog?: (active: boolean, elapsedMs: number) => void;
   now?: () => number;
   timer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -20,6 +21,7 @@ interface SessionOptions {
   slots?: Record<TestLane, Semaphore>;
   caps?: Record<TestLane, number>;
 }
+export type FactoryGateHandler = (signal: AbortSignal) => Promise<{ status: number; text: string }>;
 interface Lease {
   id?: string;
   recoveredId?: Promise<string>;
@@ -39,6 +41,13 @@ export class AgentTestSession {
   private readonly lanes = new Map<TestLane, Lease>();
   private readonly waits = new Map<string, number>();
   private readonly refusals = new Set<string>();
+  private readonly gateAbort = new AbortController();
+  private readonly gateRequests = new Map<
+    string,
+    Promise<{ id: string; acquired: boolean; factoryGate: { status: number; text: string } }>
+  >();
+  private gateTail: Promise<unknown> = Promise.resolve();
+  private gatePending = 0;
   private closed = false;
   private readonly now;
   private readonly timer: NonNullable<SessionOptions["timer"]>;
@@ -70,7 +79,7 @@ export class AgentTestSession {
     if (status !== "heartbeat" && lease.capTimer !== undefined) this.clear(lease.capTimer);
     if (lease.id) this.slots[lease.lane].heartbeat(lease.id, true);
     if (this.lanes.get(lease.lane) === lease) this.lanes.delete(lease.lane);
-    if (!this.lanes.size && this.heldAt !== undefined) {
+    if (!this.lanes.size && !this.gatePending && this.heldAt !== undefined) {
       const elapsedMs = this.now() - this.heldAt;
       this.excludedMs += elapsedMs;
       this.heldAt = undefined;
@@ -112,6 +121,64 @@ export class AgentTestSession {
 
   async request(body: Record<string, unknown>) {
     if (this.closed || body.token !== this.token) throw new Error("invalid agent-test capability");
+    if (body.gate !== undefined) {
+      if (
+        typeof body.gate !== "string" ||
+        !body.gate ||
+        body.lane !== "gate" ||
+        typeof body.name !== "string"
+      )
+        throw new Error("invalid factory gate request");
+      const known = this.gateRequests.get(body.gate);
+      if (known) return known;
+      const command = redactCredentials(body.name);
+      const handler = this.options.factoryGate;
+      if (!handler) {
+        this.event({ kind: "agent-test", phase: "refused", command, lane: "gate" });
+        throw new Error("factory gate unavailable for this session");
+      }
+      this.gatePending++;
+      if (this.heldAt === undefined) {
+        this.heldAt = this.now();
+        this.options.onWatchdog?.(true, 0);
+      }
+      const pending = this.gateTail
+        .catch(() => {})
+        .then(async () => {
+          try {
+            this.gateAbort.signal.throwIfAborted();
+            const result = await handler(this.gateAbort.signal);
+            this.gateAbort.signal.throwIfAborted();
+            this.event({
+              kind: "agent-test",
+              phase: result.status === 0 ? "gate-pass" : "gate-fail",
+              command,
+              lane: "gate",
+            });
+            return {
+              id: body.gate as string,
+              acquired: false,
+              factoryGate: { ...result, text: redactCredentials(result.text) },
+            };
+          } catch (error) {
+            this.event({ kind: "agent-test", phase: "gate-fail", command, lane: "gate" });
+            throw error;
+          }
+        })
+        .finally(() => {
+          this.gatePending--;
+          if (!this.gatePending && !this.lanes.size && this.heldAt !== undefined) {
+            const elapsedMs = this.now() - this.heldAt;
+            this.excludedMs += elapsedMs;
+            this.heldAt = undefined;
+            this.options.onWatchdog?.(false, elapsedMs);
+          }
+        });
+      this.gateRequests.set(body.gate, pending);
+      this.gateTail = pending;
+      this.event({ kind: "agent-test", phase: "gate", command, lane: "gate" });
+      return pending;
+    }
     if (typeof body.refused === "string" && body.lane === "gate" && typeof body.name === "string") {
       if (!this.refusals.has(body.refused)) {
         this.refusals.add(body.refused);
@@ -246,6 +313,7 @@ export class AgentTestSession {
 
   close() {
     this.closed = true;
+    this.gateAbort.abort();
     sessions.delete(this.token);
     for (const lease of new Set([...this.lanes.values(), ...this.leases.values()])) {
       this.end(lease, "released");
@@ -254,6 +322,10 @@ export class AgentTestSession {
     this.leases.clear();
     this.waits.clear();
     this.refusals.clear();
+  }
+
+  async settled() {
+    await this.gateTail.catch(() => {});
   }
 }
 

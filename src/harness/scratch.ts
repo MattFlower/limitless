@@ -123,6 +123,8 @@ export function validateScratch(spec: AgentSpec): string {
 export interface WriteRoots {
   daemonPort?: number;
   denyRead?: string[];
+  /** Keychain spellings not independently denied by another credential or explicit policy entry. */
+  keychainOnlyReadPaths?: string[];
   allowRead?: string[];
   /** Every invocation's command capabilities are unreadable, except this invocation's own. */
   commands?: InvocationCommands;
@@ -265,7 +267,7 @@ export function spellings(paths: string[]): string[] {
 /** `denyRead` as given and canonical (either spelling reaches it); cwd and scratch must stay readable. */
 export function validateDenyRead(spec: AgentSpec, scratch: string): string[] {
   const cwd = realpathSync(spec.cwd);
-  const paths = spellings([...(spec.denyRead ?? []), ...privateReadPaths()]);
+  const paths = policySpellings([...(spec.denyRead ?? []), ...privateReadPaths()], true);
   for (const path of paths)
     if (within(path, cwd) || within(path, scratch))
       throw new Error(`Reader cwd and scratch must be outside ${path}`);

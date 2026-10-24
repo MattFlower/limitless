@@ -291,6 +291,8 @@ export function startGitHubNotifier(
       typeof ref.number !== "number"
     )
       return;
+    // Queue issue lifecycle messages wait for Q1b's App identity.
+    if (ref.kind === "issue" && ref.via === "queue") return;
     // A resolution follows the terminal comment already posted for needs_human or failed.
     if (run.status === "resolved") return;
     if (ref.kind === "pull_request" && run.status === "cancelled" && run.error?.startsWith("superseded:"))

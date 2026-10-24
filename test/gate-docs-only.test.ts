@@ -1,12 +1,14 @@
 import { expect, spyOn } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { GateComparison } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { applyGateEvidence } from "../src/pipeline/gate-evidence.ts";
+import type { Verify } from "../src/pipeline/schemas.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
-import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { approve, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
@@ -18,6 +20,10 @@ const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup(fixt
 
 test.each([
   "targeted",
+  "snapshot-targeted",
+  "snapshot-skipped",
+  "snapshot-changed",
+  "snapshot-changed-skipped",
   "failing baseline",
   "retry",
   "timeout",
@@ -36,7 +42,13 @@ test.each([
   mkdirSync(join(cwd, "docs"));
   mkdirSync(join(cwd, "test"));
   writeFileSync(join(cwd, "docs/guide.md"), "base\n");
-  const initiallySkipped = ["skipped", "post-merge failure"].includes(scenario);
+  const snapshot = scenario.startsWith("snapshot-");
+  const initiallySkipped = [
+    "skipped",
+    "post-merge failure",
+    "snapshot-skipped",
+    "snapshot-changed-skipped",
+  ].includes(scenario);
   writeFileSync(join(cwd, "test/a.test.ts"), initiallySkipped ? "unrelated" : "guide.md");
   writeFileSync(join(cwd, "test/b.test.ts"), "unrelated");
   const config = `[gates]
@@ -44,7 +56,7 @@ ${["untrusted", "unconfigured"].includes(scenario) ? "" : scenario === "invalid"
 retry_files = "bun test {files}"
 setup = ["fake-setup"]
 checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {name="test",run="bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"}]
-`;
+${snapshot ? '[limits]\nslotted_commands = ["bun test"]\nagent_full_suite = "gate"\n' : ""}`;
   writeFileSync(join(cwd, ".limitless.toml"), config);
   await sh(["git", "add", "."], { cwd });
   await sh(["git", "commit", "-qm", "docs gate fixture"], { cwd });
@@ -65,6 +77,16 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
           scenario === "post-merge failure" ? "guide.md" : "new base\n",
         );
       return { structured: approve };
+    }
+    if (snapshot) {
+      writeFileSync(join(s.cwd, "docs/guide.md"), "updated\n");
+      const wrapper = s.commandPath?.split(delimiter)[0];
+      if (!wrapper) throw new Error("missing wrapper");
+      const result = await sh([join(wrapper, "bun"), "test"], { cwd: s.cwd });
+      expect(result.stdout).toContain("Factory gate run of check test");
+      if (scenario.startsWith("snapshot-changed"))
+        writeFileSync(join(s.cwd, "docs/guide.md"), "changed after snapshot\n");
+      return { text: "updated the guide" };
     }
     return {
       files: {
@@ -116,6 +138,64 @@ checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {n
       scenario === "post-merge failure" || retryFails ? "needs_human" : "succeeded",
     );
     expect(reviews).toBe(1);
+    if (snapshot) {
+      const artifact = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]") as GateComparison[];
+      expect(artifact.map((c) => c.name)).toEqual(["lint", "typecheck", "test"]);
+      const check = artifact.find((c) => c.name === "test");
+      const reused = !scenario.startsWith("snapshot-changed");
+      expect(commands).toEqual([
+        "fake-setup",
+        "fake-lint",
+        "fake-types",
+        "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+        "fake-setup",
+        "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+        "fake-setup",
+        "fake-lint",
+        "fake-types",
+        ...(reused || initiallySkipped ? [] : ["bun test './test/a.test.ts'"]),
+      ]);
+      expect(check?.verdict).toBe(reused ? "pass" : initiallySkipped ? "not_run" : "targeted_pass");
+      if (reused) {
+        expect(check?.result.reused?.executionId).toEqual(expect.any(String));
+        expect(check?.result.docsOnly).toBeUndefined();
+        expect(
+          f.store
+            .listEvents(run.id)
+            .some((event) =>
+              event.message.includes(`reused factory gate execution ${check?.result.reused?.executionId}`),
+            ),
+        ).toBe(true);
+        expect(
+          f.store.getRunState<RunState>(run.id)?.gateEvidence?.checks.find((c) => c.name === "test")?.result
+            .reused,
+        ).toEqual(check?.result.reused);
+      } else {
+        expect(check?.result.reused).toBeUndefined();
+        expect(check?.result.docsOnly?.mode).toBe(initiallySkipped ? "skipped" : "targeted");
+        const evidence = f.store.getRunState<RunState>(run.id)?.gateEvidence;
+        const blocked: Verify = {
+          overall: "fail",
+          notes: "",
+          criteria: [
+            { id: "AC-1", status: "blocked", blockedReason: "sandbox", evidence: "EPERM", publicSummary: "" },
+          ],
+        };
+        const result = applyGateEvidence(
+          blocked,
+          {
+            ...spec,
+            acceptance_criteria: [{ id: "AC-1", criterion: "tests pass", how_to_verify: "bun test" }],
+          },
+          { scenarios: [] },
+          evidence?.sha ?? "",
+          evidence,
+        );
+        expect(result.criteria[0]?.status).toBe("blocked");
+        expect(result.criteria[0]?.evidence).toContain("docs-only");
+      }
+      return;
+    }
     const mode = ["mixed", "unconfigured", "untrusted", "invalid"].includes(scenario)
       ? "full"
       : initiallySkipped

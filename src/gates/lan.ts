@@ -8,6 +8,7 @@ import {
   type ExecutionEvent,
   type GateExecutor,
   type GateRequest,
+  gateProvenance,
   gateShutdown,
   localExecutor,
 } from "./executor.ts";
@@ -150,6 +151,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
                 }
               })();
               const [run] = await Promise.all([execution.result, stream]);
+              Object.assign(run, await gateProvenance(request.cwd, controller.signal));
               controller.signal.throwIfAborted();
               if (!workers.complete(handle.id, run, true)) throw new Error("LAN gate job cancelled");
               return workers.sanitize(run);

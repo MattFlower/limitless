@@ -20,6 +20,7 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  reused?: { executionId: string; treeHash: string; createdAt: number };
   name: string;
   command: string;
   ok: boolean;
@@ -44,6 +45,8 @@ export interface GateResult {
 export interface GateRun {
   /** Actual baseline checkout commit; absent in legacy records. */
   sha?: string;
+  /** Post-execution committed tree, reported with sha by LAN execution or its local fallback. */
+  treeHash?: string;
   setupOk: boolean;
   setup: GateResult[];
   checks: GateResult[];
@@ -490,6 +493,7 @@ export async function retryRegressions(
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const selected = cmp.flatMap((c) => {
     if (
+      c.result.reused ||
       (c.verdict !== "regressed" && c.verdict !== "targeted_failure") ||
       c.result.timedOut ||
       confinementFailed(c.result) ||

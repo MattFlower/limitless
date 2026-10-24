@@ -4,6 +4,7 @@ import { mountDiscord } from "./discord.ts";
 import { type GhRunner, githubWebhook, runGh } from "./github.ts";
 import { type GitHubPrClient, getGitHubPr, startGitHubNotifier } from "./github-notifier.ts";
 import { type GitHubClient, observedPrs, startGitHubPoller } from "./github-poller.ts";
+import { type IssueQueueClock, startIssueQueue } from "./issue-queue.ts";
 import { mountMcp } from "./mcp-http.ts";
 
 export interface Integrations {
@@ -18,6 +19,7 @@ export interface IntegrationDeps {
   gh?: GhRunner;
   prClient?: GitHubPrClient;
   github?: GitHubClient;
+  issueClock?: IssueQueueClock;
 }
 
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
@@ -60,6 +62,9 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
         })
       : () => {};
     cleanups.push(stopPoller);
+    const queue = factory.cfg.githubQueue;
+    const issueQueueEnabled = !!queue?.repos.length && !!queue.trusted.length;
+    if (issueQueueEnabled) cleanups.push(startIssueQueue(factory, { gh: deps.gh, clock: deps.issueClock }));
     cleanups.push(() => factory.land.stop());
     // The land queue resumes whatever the last daemon left in flight, and waits for new requests.
     factory.land.start();
@@ -80,6 +85,9 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
           ? "GitHub webhooks enabled"
           : "GitHub webhooks disabled (GITHUB_WEBHOOK_SECRET is not configured)",
         factory.cfg.githubPoll ? `GitHub PR polling every ${seconds}s` : "GitHub PR polling disabled",
+        issueQueueEnabled
+          ? `Issue queue: polling ${queue.repos.length} repos every ${queue.pollSeconds}s`
+          : "Issue queue disabled",
         `Land queue: ${queued.length ? `${queued.length} pending` : "idle"}`,
       ],
       stop,
