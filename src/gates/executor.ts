@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { WorkerStore } from "../db/workers.ts";
+import { worktreeGit } from "../git/command.ts";
 import type { GateConfig } from "./detect.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData } from "./output.ts";
@@ -48,6 +49,19 @@ export type GateExecutor = Executor<GateRequest, GateRun> & {
   freshCheckoutFor?: (repo: string) => boolean;
 };
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
+
+/** Inspect the checkout that executed the gate; an echoed request SHA is not provenance. */
+export async function gateProvenance(cwd: string, signal: AbortSignal) {
+  try {
+    const result = await worktreeGit(["git", "rev-parse", "HEAD", "HEAD^{tree}"], { cwd, signal });
+    const [sha, treeHash] = result.stdout.trim().split("\n");
+    const hash = /^(?:[a-f\d]{40}|[a-f\d]{64})$/;
+    if (sha && treeHash && hash.test(sha) && hash.test(treeHash)) return { sha, treeHash };
+  } catch {
+    // A completed gate still returns its result when Git inspection is unavailable.
+  }
+  return undefined;
+}
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
 export const gateShutdown = (signal: AbortSignal): boolean =>

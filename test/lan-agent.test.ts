@@ -274,6 +274,7 @@ test("unreported push stops rather than running locally", async () => {
 
 test("events use an attempt cursor and adoption precedes the result", async () => {
   const f = fixture();
+  f.call.agentFullSuite = "gate";
   if (!f.call.publication) throw new Error("Missing publication");
   const adopt = spyOn(f.call.publication, "adopt");
   const running = f.run();

@@ -94,6 +94,7 @@ import {
 } from "../util/proc.ts";
 import { publicationFields } from "../workers/publication.ts";
 import type { AgentPublication, AgentPublicationHooks } from "./agent-executor.ts";
+import { reusableAgentGate } from "./agent-gate.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
@@ -1532,7 +1533,34 @@ async function oneRound(
               data: docs.selection,
             });
             testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
-            let after = await runGateExecution(ctx, "gates", "initial", cwd, docs.gates, events);
+            const reused = await reusableAgentGate(ctx, cwd, checkedSha);
+            const activeGates = reused
+              ? { ...docs.gates, checks: docs.gates.checks.filter((c) => c.name !== "test") }
+              : docs.gates;
+            const execute = (purpose: string) =>
+              !reused || activeGates.setup.length || activeGates.checks.length
+                ? runGateExecution(ctx, "gates", purpose, cwd, activeGates, events)
+                : Promise.resolve({ setupOk: true, setup: [], checks: [] } as GateRun);
+            const insertReused = (run: GateRun): GateRun =>
+              reused && run.setupOk
+                ? {
+                    ...run,
+                    checks: gates.checks.flatMap((c) => {
+                      const result =
+                        c.name === "test" ? reused.result : findGateCounterpart(c, gates.checks, run.checks);
+                      return result ? [result] : [];
+                    }),
+                  }
+                : run;
+            if (reused)
+              ctx.event({
+                runId: ctx.run.id,
+                type: "gate",
+                level: reused.result.ok ? "info" : "warn",
+                message: `test: reused factory gate execution ${reused.result.reused.executionId} (tree ${reused.result.reused.treeHash.slice(0, 12)})`,
+                data: reused.result,
+              });
+            let after = insertReused(await execute("initial"));
             ctx.checkCancelled();
             baseTimeout = after.checks.some(
               (r) =>
@@ -1551,23 +1579,29 @@ async function oneRound(
               // The re-run starts from the committed tree too, not from what the first attempt left behind.
               localSetupReady = false;
               await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
-              after = await runGateExecution(ctx, "gates", "timeout", cwd, docs.gates, events);
+              after = insertReused(await execute("timeout"));
               ctx.checkCancelled();
               after = {
                 ...after,
                 checks: after.checks.map((r) => ({
                   ...r,
-                  firstAttempt: findGateCounterpart(r, after.checks, first.checks),
+                  firstAttempt: r.reused
+                    ? r.firstAttempt
+                    : findGateCounterpart(r, after.checks, first.checks),
                 })),
               };
             }
             const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
-            after = docs.annotate(after);
+            if (!reused) after = docs.annotate(after);
             // Retry before discarding, so a check sees the same build output as its first attempt.
             cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
               ...c,
               firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
             }));
+            if (reused) {
+              cmp = cmp.map((c) => (c.name === "test" ? reused : c));
+              if (!cmp.some((c) => c.name === "test")) cmp.push(reused);
+            }
             if (!baseTimeout)
               cmp = await retryRegressions(
                 cmp,

@@ -84,7 +84,7 @@ export interface AgentJobRequest
   role?: Role;
   branch?: string;
   slottedCommands?: SlottedCommands;
-  agentFullSuite?: AgentFullSuite;
+  agentFullSuite?: Exclude<AgentFullSuite, "gate">;
   commit?: {
     message: string;
     authorName: string;
