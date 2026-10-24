@@ -1,7 +1,7 @@
 import { expect, spyOn } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { reloadedConfig } from "../src/config-reload.ts";
@@ -504,12 +504,19 @@ test.each([
         ? "test -f farewell.txt && ! test -f base.txt"
         : "test -f base.txt";
   const command = `if ${condition}; then test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
+  mkdirSync(join(fixture.repoDir, "test"));
+  writeFileSync(
+    join(fixture.repoDir, "test/unrelated.test.ts"),
+    'import { test } from "bun:test"; test("unrelated", () => {});\n',
+  );
   writeFileSync(
     join(fixture.repoDir, ".limitless.toml"),
-    `[gates]\nchecks = [{ name = "build", run = ${JSON.stringify(command)} }]\n`,
+    `[gates]\ndocs = ["farewell.txt"]\nretry_files = "bun test {files}"\nchecks = [{ name = "build", run = ${JSON.stringify(command)} }, { name = "test", run = "bun test --reporter=junit --reporter-outfile=$LIMITLESS_GATE_REPORT" }]\n`,
   );
-  await sh(["git", "commit", "-qam", "long baseline"], { cwd: fixture.repoDir });
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "long baseline"], { cwd: fixture.repoDir });
   const bare = purpose === "rebase" ? await githubFixture() : undefined;
+  process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
   let advanced = false;
   let implementations = 0;
   const handler = async (s: Parameters<typeof roleOf>[0]) => {
@@ -539,6 +546,9 @@ test.each([
       expect(state?.gateExecution?.purpose).toBe(purpose);
       const job = workers.job(state?.gateExecution?.handle.id ?? "");
       expect(job?.state).toBe("leased");
+      expect((JSON.parse(job?.request ?? "{}") as GateRequest).checks).toEqual(
+        purpose === "baseline" ? ["build", "test"] : ["build"],
+      );
       await f.stop();
       expect(readFileSync(counter, "utf8")).toBe("run\n");
       if (mismatch && job) {
@@ -568,7 +578,10 @@ test.each([
       expect(baseline).toMatchObject({
         setupOk: true,
         setup: [],
-        checks: [{ name: "build", ok: true, exitCode: 0 }],
+        checks: [
+          { name: "build", ok: true, exitCode: 0 },
+          { name: "test", ok: true, exitCode: 0 },
+        ],
       });
     });
   } finally {

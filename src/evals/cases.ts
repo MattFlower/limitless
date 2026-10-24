@@ -82,6 +82,8 @@ export const GateComparisonSchema = z.strictObject({
   name: nonempty,
   verdict: z.enum([
     "pass",
+    "targeted_pass",
+    "targeted_failure",
     "fixed",
     "regressed",
     "still_failing",

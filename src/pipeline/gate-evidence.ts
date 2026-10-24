@@ -110,6 +110,10 @@ function refusal(
   gates: GateEvidence,
   baseline?: GateRun | null,
 ): string | undefined {
+  if (check.result.docsOnly)
+    return `docs-only ${check.result.docsOnly.mode === "skipped" ? "skip" : "targeting"}: ${check.result.docsOnly.reason}`;
+  if (check.verdict === "targeted_pass" || check.verdict === "targeted_failure")
+    return "targeted test check; full suite did not run";
   if (
     !["pass", "fixed", "new_pass"].includes(check.verdict) ||
     check.blocking ||

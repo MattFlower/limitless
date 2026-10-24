@@ -267,13 +267,13 @@ test.each(["exit", "parsed"] as const)(
   async (mode) => {
     const { stdout, stderr } = await diagnosticSmoke(mode);
     expect(stderr).toBe("");
-    expect(stdout.trim().split("\n")).toHaveLength(8);
-    for (const name of ["version", "serve/health"]) {
+    expect(stdout.trim().split("\n")).toHaveLength(9);
+    for (const name of ["version", "slotted commands", "serve/health"]) {
       const row = stdout.split("\n").find((line) => line.startsWith(`${name}\tFAIL\t`));
       expect(row).toContain("[redacted]");
       expect(row).toContain("<tmp>/private-file");
       expect(row).toContain("<home>/runner-file");
-      if (mode === "exit" || name === "serve/health") {
+      if (mode === "exit" || name !== "version") {
         expect(row).toContain("stdout:");
         expect(row).toContain("stderr:");
       }
