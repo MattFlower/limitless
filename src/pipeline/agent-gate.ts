@@ -71,13 +71,20 @@ export async function agentGateKey(
   const gates = ctx.state.gatesConfig;
   if (!gates) return null;
   const env = gateEnv();
+  const executor =
+    ctx.deps.gateExecutor?.kind === "lan" && ctx.deps.gateExecutor.freshCheckoutFor?.(ctx.repo.slug) !== false
+      ? "lan"
+      : "local";
   const key = baselineCacheKey({
-    executor: "local",
+    executor,
     repoId: ctx.repo.id,
     baseSha: treeHash,
     gates,
     lockfileHash: lockfileHash(cwd),
-    bunVersion: await gateBunVersion(ctx.runDir, env, ctx.signal),
+    bunVersion:
+      executor === "lan"
+        ? (ctx.deps.bunVersion ?? Bun.version)
+        : await gateBunVersion(ctx.runDir, env, ctx.signal),
     platform: process.platform,
     arch: process.arch,
     buildSha: ctx.deps.buildSha,
@@ -89,13 +96,22 @@ export async function agentGateKey(
 export async function reusableAgentGate(ctx: RunContext, cwd: string, sha: string) {
   if (ctx.state.agentFullSuite !== "gate" || !ctx.state.gatesConfig?.checks.some((c) => c.name === "test"))
     return null;
-  if (ctx.deps.gateExecutor && ctx.deps.gateExecutor.kind !== "local") return null;
   try {
     const tree = (
       await worktreeGit(["git", "rev-parse", `${sha}^{tree}`], { cwd, signal: ctx.signal })
     ).stdout.trim();
     const key = await agentGateKey(ctx, cwd, tree);
-    const record = key && ctx.store.getAgentGate(key);
+    return lookupAgentGate(ctx, key);
+  } catch (error) {
+    ctx.log(redactGateOutput(`Factory gate lookup failed; running checks: ${String(error)}`), "warn");
+    return null;
+  }
+}
+
+function lookupAgentGate(ctx: RunContext, key: AgentGateKey | null) {
+  try {
+    if (!key) return null;
+    const record = ctx.store.getAgentGate(key);
     if (!record) return null;
     const comparison = comparisonSchema.parse(redactGateData(record.comparison));
     const test = ctx.state.gatesConfig?.checks.find((c) => c.name === "test");
@@ -110,13 +126,23 @@ export async function reusableAgentGate(ctx: RunContext, cwd: string, sha: strin
       ...comparison,
       result: {
         ...comparison.result,
-        reused: { executionId: record.executionId, treeHash: tree, createdAt: record.createdAt },
+        reused: { executionId: record.executionId, treeHash: key.treeHash, createdAt: record.createdAt },
       },
     };
   } catch (error) {
     ctx.log(redactGateOutput(`Factory gate lookup failed; running checks: ${String(error)}`), "warn");
     return null;
   }
+}
+
+function sessionResult(result: GateResult, tree: string) {
+  const safe = redactGateData(result);
+  return {
+    status: result.timedOut || result.exitCode === null || result.exitCode > 128 ? 1 : result.exitCode,
+    text: redactGateOutput(
+      `Factory gate run of check test on tree ${tree}: ${result.ok ? "pass" : "FAIL"} (${Math.round(result.durationMs / 1000)}s)${result.reused ? `; reused factory gate execution ${result.reused.executionId}` : ""}\n${formatGateOutput(safe)}`,
+    ),
+  };
 }
 
 /** Only factory-owned executor results enter the record; session arguments and output are unused. */
@@ -132,6 +158,12 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
     return gateSlotScope(
       commandScope(checkout, async () => {
         const key = await agentGateKey(ctx, checkout, tree);
+        const reused = lookupAgentGate(ctx, key);
+        signal.throwIfAborted();
+        if (reused) return sessionResult(reused.result, tree);
+        const head = (
+          await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: checkout, signal })
+        ).stdout.trim();
         let executionId = "";
         const gates = { ...config, checks: config.checks.filter((c) => c.name === "test") };
         const run = (retry = gates, options?: { skipGateSlot?: boolean }) =>
@@ -141,7 +173,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
               repo: ctx.repo.slug,
               cwd: checkout,
               baseSha: ctx.run.baseSha ?? "",
-              headSha: tree,
+              headSha: head,
               gates: retry,
               checks: ["test"],
               priority: "start",
@@ -181,6 +213,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
           signal,
           undefined,
           run,
+          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
         );
         signal.throwIfAborted();
         const comparison = comparisons.find((c) => c.name === "test");
@@ -193,13 +226,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
             comparison: redactGateData(comparison),
           });
         }
-        const safe = redactGateData(result);
-        return {
-          status: result.timedOut || result.exitCode === null || result.exitCode > 128 ? 1 : result.exitCode,
-          text: redactGateOutput(
-            `Factory gate run of check test on tree ${tree}: ${result.ok ? "pass" : "FAIL"} (${Math.round(result.durationMs / 1000)}s)\n${formatGateOutput(safe)}`,
-          ),
-        };
+        return sessionResult(result, tree);
       }),
     )();
   });

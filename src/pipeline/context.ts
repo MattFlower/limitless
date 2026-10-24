@@ -920,7 +920,6 @@ export class RunContext {
               { role: opts.role, agentFullSuite: this.state.agentFullSuite },
               opts.role === "implement" &&
                 this.state.agentFullSuite === "gate" &&
-                (!this.deps.gateExecutor || this.deps.gateExecutor.kind === "local") &&
                 this.state.gatesConfig?.checks.some((c) => c.name === "test")
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,

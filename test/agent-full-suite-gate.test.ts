@@ -45,9 +45,16 @@ test.each([
   "corrupt",
   "invalid",
   "lookup",
+  "run",
+  "executor",
+  "executor-route",
   "print-only",
   "no-build",
   "lan",
+  "lan-changed",
+  "lan-fallback",
+  "repeat",
+  "repeat-lan",
   "no-test",
   "timeout",
   "cancelled",
@@ -60,25 +67,38 @@ test.each([
     worktree = "",
     snapshotDir = "";
   const executor = localExecutor();
+  let executorKind: GateExecutor["kind"] =
+    scenario.includes("lan") || scenario === "executor-route" ? "lan" : "local";
+  let remote = scenario !== "executor-route";
+  const executions: string[] = [];
+  let sessionComplete = false;
   const recording: GateExecutor = {
     ...executor,
-    ...(scenario === "lan" ? { kind: "lan" as const } : {}),
+    get kind() {
+      return executorKind;
+    },
+    freshCheckoutFor: () => executorKind === "lan" && remote,
     async start(request, signal) {
       requests.push(request);
       if (worktree && request.priority === "start") {
+        const retry = snapshotDir === request.cwd;
         snapshotDir = request.cwd;
         expect(request.cwd).not.toBe(worktree);
         expect(request.checks).toEqual(["test"]);
-        expect(request.gates.setup).toEqual(scenario === "only-test" ? [] : ["echo setup"]);
+        expect(request.gates.setup).toEqual(
+          scenario === "only-test" || (retry && !(executorKind === "lan" && remote)) ? [] : ["echo setup"],
+        );
         expect(readFileSync(join(request.cwd, "farewell.txt"), "utf8")).toBe("goodbye\n");
         expect(readFileSync(join(request.cwd, "greeting.txt"), "utf8")).toBe("edited\n");
-        tree = request.headSha;
-        if (scenario === "same") {
-          const git = async (...args: string[]) =>
-            (await sh(["git", ...args], { cwd: request.cwd })).stdout.trim();
+        const git = async (...args: string[]) =>
+          (await sh(["git", ...args], { cwd: request.cwd })).stdout.trim();
+        expect(await git("cat-file", "-t", request.headSha)).toBe("commit");
+        expect(await git("rev-parse", "HEAD")).toBe(request.headSha);
+        tree = await git("rev-parse", `${request.headSha}^{tree}`);
+        if (scenario === "same" || scenario === "lan") {
           expect(await git("write-tree")).toBe(tree);
           expect(await git("rev-parse", "HEAD^{tree}")).toBe(tree);
-          expect(await git("describe", "--tags")).toMatch(/^snapshot-base-1-g/);
+          if (scenario === "same") expect(await git("describe", "--tags")).toMatch(/^snapshot-base-1-g/);
           expect(await git("ls-files", "--error-unmatch", "farewell.txt")).toBe("farewell.txt");
           expect(await git("status", "--porcelain")).toBe("");
           expect(existsSync(join(request.cwd, ".git/objects/info/alternates"))).toBe(false);
@@ -86,7 +106,9 @@ test.each([
           await sh(["git", "update-ref", "refs/heads/snapshot-only", "HEAD"], { cwd: request.cwd });
         }
       }
-      return executor.start(request, signal);
+      const handle = await executor.start(request, signal);
+      if (worktree && request.priority === "start") executions.push(handle.id);
+      return { ...handle, kind: scenario === "lan-fallback" ? "local" : executorKind };
     },
     attach(handle, signal, request, hooks) {
       const execution = executor.attach(handle, signal, request, hooks);
@@ -143,16 +165,18 @@ test.each([
       if (scenario !== "print-only") {
         const directory = agent.commandPath?.split(delimiter)[0];
         if (!directory) throw new Error("missing wrapper");
-        const result = await sh([join(directory, "bun"), "test", "--agent-chosen-arguments"], {
-          cwd: worktree,
-          env: agentEnv(),
-          allowFail: true,
-        });
-        const refused = scenario === "lan" || scenario === "no-test";
+        const request = () =>
+          sh([join(directory, "bun"), "test", "--agent-chosen-arguments"], {
+            cwd: worktree,
+            env: agentEnv(),
+            allowFail: true,
+          });
+        const result = await request();
+        const refused = scenario === "no-test";
         const failed = ["timeout", "cancelled", "confinement", "setup-fail"].includes(scenario);
         expect(result.exitCode).toBe(scenario === "setup-fail" ? 9 : refused || failed ? 1 : 0);
         if (!refused) {
-          expect(result.stdout).toContain(
+          expect(result.stdout, result.stderr).toContain(
             `Factory gate run of check test on tree ${tree}: ${failed ? "FAIL" : "pass"}`,
           );
           expect(result.stdout).toContain(scenario === "setup-fail" ? "setup failed" : "trusted-test");
@@ -161,6 +185,15 @@ test.each([
             expect(result.stdout).toContain("snapshot-base-1-g");
           }
         }
+        if (scenario.startsWith("repeat")) {
+          const stored = f.store.db.query("SELECT * FROM agent_gate_executions").all();
+          expect(stored).toHaveLength(1);
+          const repeated = await request();
+          expect(repeated.exitCode).toBe(result.exitCode);
+          expect(repeated.stdout).toContain(`reused factory gate execution ${executions[0]}`);
+          expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual(stored);
+          expect(executions).toHaveLength(1);
+        }
       } else agent.onEvent({ type: "text", text: "bun test: 100 pass, 0 fail (factory gate passed)" });
       expect(await git("rev-parse", "HEAD")).toBe(beforeHead);
       expect(await git("status", "--porcelain")).toBe(beforeStatus);
@@ -168,21 +201,69 @@ test.each([
       if (scenario === "same") expect(await git("branch", "--list", "snapshot-only")).toBe("");
       expect(readFileSync(join(worktree, "farewell.txt"), "utf8")).toBe("goodbye\n");
       expect(readFileSync(join(worktree, "greeting.txt"), "utf8")).toBe("edited\n");
-      if (scenario === "changed") writeFileSync(join(worktree, "later.txt"), "after snapshot\n");
-      if (scenario === "config" || scenario === "env")
-        f.store.db.exec(
-          `UPDATE agent_gate_executions SET ${scenario === "config" ? "gates_hash" : "env_hash"} = 'different'`,
-        );
-      if (scenario === "missing") f.store.db.exec("DELETE FROM agent_gate_executions");
-      if (scenario === "corrupt") f.store.db.exec("UPDATE agent_gate_executions SET gate_run = '{'");
-      if (scenario === "invalid")
-        f.store.db.exec(
-          `UPDATE agent_gate_executions SET gate_run = '{"name":"test","verdict":"pass","blocking":false,"result":{"ok":true}}'`,
-        );
-      if (scenario === "lookup")
-        lookup = spyOn(f.store, "getAgentGate").mockImplementation(() => {
-          throw new Error("lookup unavailable");
-        });
+      if (scenario === "changed" || scenario === "lan-changed")
+        writeFileSync(join(worktree, "later.txt"), "after snapshot\n");
+      if (scenario.startsWith("repeat")) {
+        writeFileSync(join(worktree, "later.txt"), "after snapshot\n");
+        const directory = agent.commandPath?.split(delimiter)[0];
+        if (!directory) throw new Error("missing wrapper");
+        const changed = await sh([join(directory, "bun"), "test"], { cwd: worktree, env: agentEnv() });
+        expect(changed.stdout).not.toContain("reused factory gate execution");
+        expect(executions).toHaveLength(2);
+      }
+      const invalidate = () => {
+        if (["config", "env", "run", "executor", "executor-route"].includes(scenario))
+          f.store.db
+            .query("DELETE FROM agent_gate_executions WHERE execution_id <> ?")
+            .run(executions.at(-1) ?? "");
+        if (scenario === "config" || scenario === "env")
+          f.store.db.exec(
+            `UPDATE agent_gate_executions SET ${scenario === "config" ? "gates_hash" : "env_hash"} = 'different'`,
+          );
+        if (scenario === "missing") f.store.db.exec("DELETE FROM agent_gate_executions");
+        if (scenario === "corrupt") f.store.db.exec("UPDATE agent_gate_executions SET gate_run = '{'");
+        if (scenario === "invalid")
+          f.store.db.exec(
+            `UPDATE agent_gate_executions SET gate_run = '{"name":"test","verdict":"pass","blocking":false,"result":{"ok":true}}'`,
+          );
+        if (scenario === "lookup")
+          lookup = spyOn(f.store, "getAgentGate").mockImplementation(() => {
+            throw new Error("lookup unavailable");
+          });
+        if (scenario === "executor") executorKind = executorKind === "local" ? "lan" : "local";
+        if (scenario === "executor-route") remote = !remote;
+        if (scenario === "run") {
+          const repo = f.store.listRepos()[0];
+          if (!repo) throw new Error("missing repo");
+          const other = f.store.createRun(repo, { repo: fixture.repoDir, prompt: "other run" });
+          f.store.db.query("UPDATE agent_gate_executions SET run_id = ?").run(other.id);
+        }
+      };
+      invalidate();
+      if (
+        [
+          "config",
+          "env",
+          "missing",
+          "corrupt",
+          "invalid",
+          "lookup",
+          "run",
+          "executor",
+          "executor-route",
+        ].includes(scenario)
+      ) {
+        const before = executions.length;
+        const directory = agent.commandPath?.split(delimiter)[0];
+        if (!directory) throw new Error("missing wrapper");
+        expect(
+          (await sh([join(directory, "bun"), "test"], { cwd: worktree, env: agentEnv() })).exitCode,
+        ).toBe(0);
+        expect(executions).toHaveLength(before + 1);
+        // The gates-stage lookup must independently reject the same miss.
+        invalidate();
+      }
+      sessionComplete = true;
       return { text: "implemented" };
     },
     false,
@@ -192,7 +273,8 @@ test.each([
   try {
     const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    const reuse = scenario === "same" || scenario === "only-test";
+    expect(sessionComplete, JSON.stringify(f.store.listInvocations(run.id).map((i) => i.error))).toBe(true);
+    const reuse = ["same", "only-test", "lan", "lan-fallback", "repeat", "repeat-lan"].includes(scenario);
     const finishing = requests.filter((r) => r.priority === "finish");
     expect(finishing.some((r) => r.checks?.includes("test"))).toBe(!reuse && scenario !== "no-test");
     if (scenario === "only-test") expect(finishing).toEqual([]);
@@ -203,13 +285,14 @@ test.each([
       await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: state.worktreePath })
     ).stdout.trim();
     if (reuse) expect(finalTree).toBe(tree);
-    if (scenario === "changed") expect(finalTree).not.toBe(tree);
+    if (scenario === "changed" || scenario === "lan-changed") expect(finalTree).not.toBe(tree);
     const checks: GateComparison[] = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "null");
     const testCheck = checks.find((c) => c.name === "test");
     expect(!!testCheck?.result.reused).toBe(reuse);
     const events = f.store.listEvents(run.id);
     expect(events.some((e) => e.message.includes("reused factory gate execution"))).toBe(reuse);
     if (reuse) {
+      expect(testCheck?.result.reused?.executionId).toBe(executions.at(-1));
       expect(events.some((e) => e.message.includes(testCheck?.result.reused?.executionId ?? "missing"))).toBe(
         true,
       );
@@ -220,16 +303,9 @@ test.each([
     if (["corrupt", "invalid", "lookup"].includes(scenario))
       expect(events.some((e) => e.message.includes("Factory gate lookup failed"))).toBe(true);
     if (
-      [
-        "no-build",
-        "print-only",
-        "lan",
-        "no-test",
-        "timeout",
-        "cancelled",
-        "confinement",
-        "setup-fail",
-      ].includes(scenario)
+      ["no-build", "print-only", "no-test", "timeout", "cancelled", "confinement", "setup-fail"].includes(
+        scenario,
+      )
     )
       expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
     if (snapshotDir) expect(existsSync(snapshotDir)).toBe(false);
@@ -238,7 +314,12 @@ test.each([
   }
 });
 
-test.each([false, true])("reused failure and retry classification survive (flaky=%s)", async (flaky) => {
+test.each([
+  { flaky: false, kind: "local" as const },
+  { flaky: true, kind: "local" as const },
+  { flaky: false, kind: "lan" as const },
+  { flaky: true, kind: "lan" as const },
+])("reused failure and retry classification survive (%j)", async ({ flaky, kind }) => {
   await configure();
   const configPath = join(fixture.repoDir, ".limitless.toml");
   writeFileSync(
@@ -259,12 +340,20 @@ test.each([false, true])("reused failure and retry classification survive (flaky
     roundZeroTests = 0,
     feedback = "";
   let worktree = "";
+  let executionId = "";
+  let sessionComplete = false;
   const executor: GateExecutor = {
     ...local,
-    start(req, signal) {
+    kind,
+    freshCheckoutFor: () => kind === "lan",
+    async start(req, signal) {
       if (worktree && req.priority === "finish" && sessions === 1 && req.checks?.includes("test"))
         roundZeroTests++;
-      return local.start(req, signal);
+      if (worktree && req.priority === "start" && kind === "lan")
+        expect(req.gates.setup).toEqual(['touch "$HOME/setup-marker"']);
+      const handle = await local.start(req, signal);
+      if (worktree && req.priority === "start") executionId ||= handle.id;
+      return { ...handle, kind };
     },
     attach(handle, signal, req, hooks) {
       const execution = local.attach(handle, signal, req, hooks);
@@ -313,6 +402,19 @@ test.each([false, true])("reused failure and retry classification survive (flaky
       expect(result.exitCode).toBe(flaky ? 0 : 3);
       expect(result.stdout).not.toContain(secret);
       expect(result.stdout).toContain(flaky ? "pass on retry" : "failure excerpt [redacted]");
+      const stored = f.store.db.query("SELECT * FROM agent_gate_executions").all();
+      expect(stored).toHaveLength(1);
+      const repeated = await sh([join(wrapper, "bun"), "test"], {
+        cwd: worktree,
+        env: agentEnv(),
+        allowFail: true,
+      });
+      expect(repeated.exitCode).toBe(result.exitCode);
+      expect(repeated.stdout).toContain(`reused factory gate execution ${executionId}`);
+      expect(repeated.stdout.replace(/; reused factory gate execution [^\n]+/, "")).toBe(result.stdout);
+      expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual(stored);
+      expect(calls).toBe(flaky ? 3 : 2);
+      sessionComplete = true;
       return { text: "implementation complete" };
     },
     false,
@@ -321,6 +423,7 @@ test.each([false, true])("reused failure and retry classification survive (flaky
   );
   const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(sessionComplete).toBe(true);
   const checks: GateComparison[] = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "null");
   const testCheck = checks.find((c) => c.name === "test");
   expect(testCheck).toMatchObject({
@@ -328,7 +431,7 @@ test.each([false, true])("reused failure and retry classification survive (flaky
     blocking: !flaky,
     result: {
       ok: flaky,
-      reused: { executionId: expect.any(String) },
+      reused: { executionId },
       firstAttempt: { ok: false },
       targetedRetry: { ok: flaky, command: "echo retry './sample.test.ts'" },
     },
