@@ -782,7 +782,8 @@ test("fixed-seed review split groups whole PRs and reproduces the pre-registered
   const recorded = new Map<number, "dev" | "heldout">();
   for (const item of file.cases.slice(53, M52_END)) {
     const pr = Number(/^pr #(\d+)/.exec(item.source)?.[1]);
-    if (!item.split || !pr) throw new Error(`missing split or PR: ${item.id}`);
+    if ((item.split !== "dev" && item.split !== "heldout") || !pr)
+      throw new Error(`missing original split or PR: ${item.id}`);
     const previous = recorded.get(pr);
     if (previous !== undefined) expect(item.split).toBe(previous);
     recorded.set(pr, item.split);
@@ -863,7 +864,7 @@ test("pending review helper prints selected defects and CLI errors without netwo
 
 test("the 2026-10-16 fresh clean set matches its LABELS.md table, splits and labels", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
-  const fresh = file.cases.slice(M52_END);
+  const fresh = file.cases.slice(M52_END, M52_END + 25);
   expect(fresh.map((item) => item.id)).toEqual(
     Array.from({ length: 25 }, (_, index) => `review-${String(index + 109).padStart(3, "0")}`),
   );

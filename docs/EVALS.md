@@ -439,3 +439,28 @@ metrics and per-case/per-repetition trials. Its matrix uses the same generator u
 settings, including catalog models absent from DEFAULT_POLICY. It labels eligible, ineligible,
 insufficient evidence and no result, exposes reasons, and links results to source runs. Run detail
 comparisons are within that run; matrix comparisons use selected evidence across runs.
+
+## Escape cases
+
+Review escapes come from the factory database's `review_rounds` table (kind `review`).
+Generate candidates without model calls or network access:
+
+```sh
+bun scripts/review-escape-cases.ts --db <database> --since 2026-10-01
+bun scripts/review-escape-cases.ts --db <database> --confirm <confirmations.json> --write
+```
+
+The first command prints candidates and validation results, leaving `cases.json`
+unchanged, and writes `review-escape-proposals.json` next to the database, outside
+the public repository. `--repos`, `--cases` and `--proposals` override the cache,
+dataset and proposal paths. The cache defaults to `<database directory>/repos`.
+An adjudicator proposes classifications and severity; the orchestrator checks the
+reproduction and fix and records confirmations in a separate JSON file, using the
+finding keys and fields documented in [LABELS.md](../evals/review/LABELS.md#escape-case-rule--2026-10-23).
+`--write` appends only confirmed medium-or-higher code defects, recording the original
+findings and delivered fix as evidence. Invalid or private cases are excluded;
+re-running deduplicates by repository and reviewed head.
+
+Even PR numbers use `escapes-dev`; odd PR numbers use `escapes-heldout`. This rule
+is pre-registered before results, and existing cases keep their splits. Production
+data generation and label confirmation happen separately from shipping the generator.
