@@ -497,6 +497,38 @@ change the proposal. Quota alerts are posted to the channel.
 
 ### GitHub
 
+By default, factory GitHub API calls use the owner's `gh` login. To give selected repositories
+an independent factory identity, create and install a GitHub App on those repositories. Give it
+repository permissions: **actions, contents, issues, pull requests and workflows read/write**;
+**checks, statuses and metadata read**. Disable its webhook; the App needs no webhook. The
+existing repository webhook below continues to handle triggers.
+
+Save the App's private key in the config directory and run `chmod 0600` on the key file. Configure
+its App ID, installation ID, key file path and repository list in `config.toml`:
+
+```toml
+[github.app]
+app_id = 123456
+installation_id = 789012
+private_key_path = "github-app.pem" # relative to the config directory, or an absolute file path
+repos = ["<owner>/<repo>"]
+```
+
+All four keys are required when the table is present. The key must be a readable regular file
+with no group or other permissions (0600, or owner-read-only 0400); startup refuses other modes.
+The key comes only from that file, never from an environment variable. Repositories are matched
+case-insensitively. Startup refuses a listed repository with discreet mode enabled, because the
+App's `[bot]` author is a factory mark.
+
+For listed repositories, PRs, comments, issues and merges appear as `<slug>[bot]`. The owner's own
+approval can then satisfy the other-reviewer approval gate. Every other repository continues to
+use the owner's login. An App authentication failure stops the GitHub call; it never switches to
+the owner. Pushes and fetches stay over SSH. `limitless doctor` reports the App slug, the
+installation's repositories and whether token exchange works, and fails for any configured
+repository the installation does not cover. Tokens stay in memory and are withheld from agents
+and gates. These settings require a daemon restart when changed. Older releases ignore these
+keys because the `[github]` table isn't checked for unknown keys.
+
 Create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
 `application/json` and the `GITHUB_WEBHOOK_SECRET`, and select the **Issues**, **Issue comments**
 and **Pull requests** events. See [the webhook tunnel](#webhook-tunnel) for exposing the endpoint.

@@ -2759,7 +2759,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       await reconcilePublication(ctx, cwd, budget);
     const runner = ctx.deps.gh ?? runGh;
     const gh: GhRunner = (args, signal, stdin) =>
-      withGitHubRetry(async () => (await runner(args, signal, stdin)) ?? "", { budget, signal });
+      withGitHubRetry(async () => (await runner(args, signal, stdin, ctx.repo.slug)) ?? "", {
+        budget,
+        signal,
+      });
     if (
       success &&
       ctx.repo.kind === "github" &&

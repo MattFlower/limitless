@@ -21,6 +21,7 @@ import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import { seatbeltForPort } from "./harness/sandbox.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
+import { configureGitHubIdentity } from "./integrations/github-identity.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
 import type { EngineDeps, RunState } from "./pipeline/context.ts";
@@ -98,6 +99,7 @@ export class Factory {
     public cfg: Config,
     private readonly opts: FactoryOptions = {},
   ) {
+    configureGitHubIdentity(cfg.githubApp);
     this.bootSha = opts.bootSha ?? "unknown";
     gateSlots.setLimit(cfg.maxConcurrentGates);
     const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);

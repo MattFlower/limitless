@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { isBranchName } from "./core/delivery.ts";
 import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
@@ -89,6 +89,7 @@ export interface Config {
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   landRequiresApproval: ReadonlySet<string>; // operator repository slugs, lower case
+  githubApp: { appId: number; installationId: number; privateKeyPath: string; repos: string[] } | null;
   githubOwner: string | null; // allowlisted GitHub login for triggers
   githubMerge?: "auto" | "pr" | "none";
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
@@ -367,6 +368,46 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const github = (raw.github ?? {}) as Record<string, unknown>;
+  let githubApp: Config["githubApp"] = null;
+  if (github.app !== undefined) {
+    if (!github.app || typeof github.app !== "object" || Array.isArray(github.app))
+      throw new Error("github.app must be a table");
+    const a = github.app as Record<string, unknown>;
+    const id = (key: string) => {
+      const value = a[key];
+      const n = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+      if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0)
+        throw new Error(`github.app.${key} must be a positive integer`);
+      return n;
+    };
+    const appId = id("app_id"),
+      installationId = id("installation_id");
+    if (typeof a.private_key_path !== "string" || !a.private_key_path.trim())
+      throw new Error("github.app.private_key_path must be a file path");
+    const privateKeyPath = resolve(configDir, a.private_key_path);
+    let key: ReturnType<typeof statSync>;
+    try {
+      key = statSync(privateKeyPath);
+    } catch {
+      throw new Error(`github.app.private_key_path ${privateKeyPath} must be a readable regular file`);
+    }
+    if (!key.isFile() || (key.mode & 0o077) !== 0 || !(key.mode & 0o400))
+      throw new Error(
+        `github.app.private_key_path ${privateKeyPath} must be a regular file mode 0600 (is 0${(key.mode & 0o777).toString(8)})`,
+      );
+    if (
+      !Array.isArray(a.repos) ||
+      !a.repos.length ||
+      !a.repos.every((r) => typeof r === "string" && repoName.test(r))
+    )
+      throw new Error("github.app.repos must be a non-empty array of owner/name strings");
+    for (const repo of a.repos)
+      if (parsedRepos?.[repo.toLowerCase()]?.discreet)
+        throw new Error(
+          `github.app.repos ${repo}: discreet mode refuses the App's [bot] author, a factory mark`,
+        );
+    githubApp = { appId, installationId, privateKeyPath, repos: a.repos.map((r) => r.toLowerCase()) };
+  }
   let githubQueue: Config["githubQueue"] = null;
   if (github.queue !== undefined) {
     if (!github.queue || typeof github.queue !== "object" || Array.isArray(github.queue))
@@ -544,6 +585,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),
     githubCiReruns: github.ci_reruns !== false,
     githubQueue,
+    githubApp,
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),
     discordNotifyAll: discord.notify_all === true,

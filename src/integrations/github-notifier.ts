@@ -4,8 +4,8 @@ import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
-import { sh } from "../util/proc.ts";
 import { type GhRunner, runGh } from "./github.ts";
+import { githubSh } from "./github-identity.ts";
 import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
 
 export interface GitHubPrState {
@@ -47,7 +47,7 @@ const passes = new WeakMap<
 type GhPrView = GitHubPrView & { statusCheckRollup?: Context[] | null };
 
 export const getGitHubPr = async (url: string, signal?: AbortSignal): Promise<GitHubPrView> => {
-  const { stdout } = await sh(
+  const { stdout } = await githubSh(
     ["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy,headRefOid,statusCheckRollup"],
     { cwd: process.cwd(), timeoutMs: 30_000, signal },
   );

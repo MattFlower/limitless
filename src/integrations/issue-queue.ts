@@ -146,6 +146,8 @@ export function startIssueQueue(
         `query=query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { ${fields} } rateLimit { cost remaining resetAt } }`,
       ],
       abort.signal,
+      undefined,
+      repo,
     );
     const response = z
       .object({

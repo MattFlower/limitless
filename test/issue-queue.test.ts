@@ -327,7 +327,9 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     rate: { cost: 1, remaining: 5000, resetAt: new Date(clock.now() + 3600_000).toISOString() },
     response: undefined as unknown,
     hold: undefined as Promise<void> | undefined,
-    async gh(args: string[]) {
+    scopes: [] as (string | undefined)[],
+    async gh(args: string[], _signal?: AbortSignal, _stdin?: string, repo?: string) {
+      h.scopes.push(repo);
       calls.push(args);
       if (h.hold) await h.hold;
       if (h.response !== undefined) return JSON.stringify(h.response);
@@ -1069,4 +1071,27 @@ test("a claim won after eligibility is refused without crashing the poll cycle",
   expect(h.runs()).toHaveLength(1);
   expect(h.logs.join("\n")).toContain(claimingId);
   expect(h.clock.pending).toBe(1);
+});
+
+test("App bot issues and priority labels never inherit the owner's trust", () => {
+  const candidate = issue();
+  candidate.author = { login: "factory[bot]" };
+  expect(issueEligibility(candidate, ["owner"])).toEqual({ eligible: false, reason: "untrusted author" });
+  candidate.author = { login: "owner" };
+  const label = candidate.timelineItems.nodes[0];
+  if (!label) throw new Error("missing priority event");
+  label.actor = { login: "factory[bot]" };
+  expect(issueEligibility(candidate, ["owner"])).toEqual({
+    eligible: false,
+    reason: "priority application is untrusted or missing",
+  });
+});
+
+test("issue queue scopes both list and dependency GraphQL calls to the repository", async () => {
+  const h = harness();
+  h.data.set("owner/repo", [{ ...issue(), body: "Blocked by #9" }]);
+  h.states.set(9, "CLOSED");
+  h.start();
+  await h.advance();
+  expect(h.scopes).toEqual(["owner/repo", "owner/repo"]);
 });

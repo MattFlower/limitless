@@ -38,6 +38,7 @@ import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
+import { githubIdentity } from "../integrations/github-identity.ts";
 import {
   ciRunsSchema,
   type GitHubPrView,
@@ -602,9 +603,14 @@ export class LandQueue {
 
   /** Fresh direct evidence at claim and immediately before merge; saved evidence only while parked. */
   private async approvalEvidence(entry: LandEntry, signal: AbortSignal, saved = false) {
-    const client = this.deps.github ?? ghClient;
+    const client: GitHubClient = (path, body, signal) =>
+      (this.deps.github ?? ghClient)(path, body, signal, entry.repo);
     try {
-      const identity = await client("user", undefined, signal);
+      const factory = await githubIdentity(entry.repo);
+      const identity =
+        factory.kind === "app"
+          ? { status: 200, body: { login: factory.botLogin } }
+          : await client("user", undefined, signal);
       const parsed = z.object({ login: z.string().trim().min(1) }).safeParse(identity.body);
       const login = identity.status === 200 && parsed.success ? parsed.data.login : null;
       if (saved) {
@@ -1020,7 +1026,7 @@ export class LandQueue {
             this.store,
             pr,
             snap,
-            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal),
+            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal, entry.repo),
             this.deps.ciReruns !== false && !rerun,
             current,
             current,
