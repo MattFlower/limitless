@@ -39,6 +39,29 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("a reload during implementation updates the later review in the same run", async () => {
+    mkdirSync(join(home, "cfg"));
+    writeFileSync(join(home, "cfg", "config.toml"), "[review]\n");
+    const reviews: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        reviews.push(s.prompt);
+        return { structured: approve };
+      }
+      mkdirSync(f.cfg.paths.configDir, { recursive: true });
+      writeFileSync(join(f.cfg.paths.configDir, "config.toml"), '[review]\nimplementer_report = "omit"\n');
+      expect(f.reloadConfig().applied).toEqual(["review.implementer_report"]);
+      return { files: { "farewell.txt": "goodbye\n" }, text: "RELOAD_REPORT_SENTINEL" };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).not.toContain("RELOAD_REPORT_SENTINEL");
+    expect(f.store.getRunState<RunState>(run.id)?.implementerReport).toContain("RELOAD_REPORT_SENTINEL");
+  });
+
   test("an MCP consumer named Dependabot keeps policy routing and ordinary review input", async () => {
     const reviews: string[] = [];
     const f = start(
