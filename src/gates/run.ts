@@ -38,6 +38,8 @@ export interface GateResult {
   failedFileTimes?: FailedTestFiles["failedFileTimes"];
   /** Affirmative whole-stream and JUnit evidence, required only for targeted-only retries. */
   failureAttributionComplete?: boolean;
+  /** Whole-stream/report diagnostic, independent of the retained output tail. */
+  failureAttributionReason?: string;
   targetedRetry?: GateResult;
   docsOnly?: DocsSelection;
 }
@@ -148,7 +150,7 @@ async function runOne(
   const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
   const failures = ok ? undefined : excerpts.result();
-  const { attributedCounts, ...failedFiles } = readJUnit(report, cwd) ?? {};
+  const { attributedCounts, failureAttributionReason, ...failedFiles } = readJUnit(report, cwd) ?? {};
   return {
     name: cmd.name,
     command: cmd.run,
@@ -158,6 +160,12 @@ async function runOne(
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
     ...failedFiles,
     failureAttributionComplete: evidence.agrees(attributedCounts),
+    failureAttributionReason:
+      redactGateOutput(
+        [...new Set([failureAttributionReason, evidence.reason(attributedCounts)].filter(Boolean))].join(
+          "; ",
+        ),
+      ) || undefined,
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
@@ -268,6 +276,20 @@ export interface GateRetryOptions {
 export const UNSLOTTED_RETRY_MAX_FILES = 5;
 export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
 
+/** Share the targeted-only decision with land diagnostics; legacy evidence stays ineligible. */
+export function targetedRetrySkipReason(r: GateResult, cfg: GateConfig, cwd: string): string | undefined {
+  if (confinementFailed(r)) return "confinement failure";
+  if (r.timedOut) return "gate process timed out";
+  if (r.exitCode == null) return "missing exit status";
+  if (r.exitCode === 0) return "no nonzero exit status";
+  if (r.failureAttributionComplete !== true)
+    return `failure attribution incomplete: ${r.failureAttributionReason ?? "missing or inconsistent whole-stream/JUnit evidence"}`;
+  if (cfg.retryFiles?.split("{files}").length !== 2) return "unusable retry_files configuration";
+  if (!r.failedFiles?.length) return "absent retry files";
+  if (!validRetryFiles(r.failedFiles, cwd)) return "invalid retry files";
+  return undefined;
+}
+
 function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
   const failed = run.setup.find((r) => !r.ok);
   return {
@@ -288,6 +310,7 @@ export async function retryFailures(
   runner?: GateRunner,
   targetedOnly = false,
   freshCheckout = false,
+  onSkip?: (original: GateResult, reason: string) => void,
 ): Promise<Map<GateResult, GateResult>> {
   const results = new Map<GateResult, GateResult>();
   const targets = new Map<GateResult, GateResult>();
@@ -295,16 +318,11 @@ export async function retryFailures(
   for (const entry of failures) {
     if (signal.aborted) break;
     const { check, original } = entry;
-    if (
-      targetedOnly &&
-      (original.ok ||
-        original.failureAttributionComplete !== true ||
-        original.exitCode === null ||
-        original.exitCode === 0 ||
-        original.timedOut ||
-        confinementFailed(original))
-    )
+    const skip = targetedOnly ? targetedRetrySkipReason(original, cfg, cwd) : undefined;
+    if (targetedOnly && (original.ok || skip)) {
+      if (skip) onSkip?.(original, skip);
       continue;
+    }
     const files = original.failedFiles;
     if (cfg.retryFiles?.split("{files}").length === 2 && files && validRetryFiles(files, cwd)) {
       const times = files.map((file) => original.failedFileTimes?.[file]);
@@ -326,6 +344,7 @@ export async function retryFailures(
         { targeted: true, skipGateSlot },
       );
       if (!retried.setupOk) {
+        onSkip?.(original, "retry setup failed");
         results.set(original, retrySetupFailure(original, retried));
         continue;
       }

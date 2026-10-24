@@ -38,6 +38,7 @@ const resultSchema: z.ZodType<GateResult> = z.lazy(() =>
     failedFiles: z.array(z.string()).optional(),
     failedFileTimes: z.record(z.string(), z.number()).optional(),
     failureAttributionComplete: z.boolean().optional(),
+    failureAttributionReason: z.string().optional(),
     testCoverage: z
       .object({
         passedFiles: z.array(z.string()),

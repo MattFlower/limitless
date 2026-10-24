@@ -77,6 +77,7 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
       targetedRetry: Check.optional(),
       failedFiles: z.array(z.string()).optional(),
       failureAttributionComplete: z.boolean().optional(),
+      failureAttributionReason: z.string().optional(),
       failedFileTimes: z.record(z.string(), z.number().finite().nonnegative()).optional(),
       testCoverage: z
         .object({

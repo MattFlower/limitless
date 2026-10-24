@@ -14,7 +14,7 @@ import { formatGateOutput } from "../gates/failures.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
-import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
+import { confinementFailed, type GateResult, retryFailures, targetedRetrySkipReason } from "../gates/run.ts";
 import { gateSlotScope } from "../gates/slots.ts";
 import { cacheGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
@@ -38,6 +38,7 @@ import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
+import { githubIdentity, githubUrlRepo } from "../integrations/github-identity.ts";
 import {
   ciRunsSchema,
   type GitHubPrView,
@@ -285,13 +286,18 @@ export class LandQueue {
     if (repo?.kind !== "github")
       throw new Error(`repository ${match[1]} is not a configured GitHub repository`);
     if (!input.sha?.trim()) throw new Error("a pull request no factory run opened needs --sha <full sha>");
-    const json = await (this.deps.gh ?? runGh)([
-      "pr",
-      "view",
-      input.target,
-      "--json",
-      "url,state,headRefOid,headRefName,baseRefName,title,isCrossRepository",
-    ]);
+    const json = await (this.deps.gh ?? runGh)(
+      [
+        "pr",
+        "view",
+        input.target,
+        "--json",
+        "url,state,headRefOid,headRefName,baseRefName,title,isCrossRepository",
+      ],
+      undefined,
+      undefined,
+      repo.slug,
+    );
     const pr = z
       .object({
         url: z.string(),
@@ -336,7 +342,12 @@ export class LandQueue {
       typeof branch === "string" && isBranchName(branch) && branch !== headBranch;
     if (owner?.sourceRef?.kind !== "review-round" && valid(owner?.baseBranch)) return owner.baseBranch;
     try {
-      const json = await (this.deps.gh ?? runGh)(["pr", "view", prUrl, "--json", "baseRefName"], signal);
+      const json = await (this.deps.gh ?? runGh)(
+        ["pr", "view", prUrl, "--json", "baseRefName"],
+        signal,
+        undefined,
+        (run && this.store.getRepo(run.repoId)?.slug) || githubUrlRepo(prUrl),
+      );
       const view = z.object({ baseRefName: z.string() }).safeParse(JSON.parse(String(json)));
       if (view.success && valid(view.data.baseRefName)) return view.data.baseRefName;
     } catch {
@@ -492,6 +503,8 @@ export class LandQueue {
           (this.deps.gh ?? runGh)(
             ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid,mergedBy,mergedAt"],
             signal,
+            undefined,
+            entry.repo,
           ),
         { signal },
       );
@@ -602,9 +615,14 @@ export class LandQueue {
 
   /** Fresh direct evidence at claim and immediately before merge; saved evidence only while parked. */
   private async approvalEvidence(entry: LandEntry, signal: AbortSignal, saved = false) {
-    const client = this.deps.github ?? ghClient;
+    const client: GitHubClient = (path, body, signal) =>
+      (this.deps.github ?? ghClient)(path, body, signal, entry.repo);
     try {
-      const identity = await client("user", undefined, signal);
+      const factory = await githubIdentity(entry.repo);
+      const identity =
+        factory.kind === "app"
+          ? { status: 200, body: { login: factory.botLogin } }
+          : await client("user", undefined, signal);
       const parsed = z.object({ login: z.string().trim().min(1) }).safeParse(identity.body);
       const login = identity.status === 200 && parsed.success ? parsed.data.login : null;
       if (saved) {
@@ -837,9 +855,12 @@ export class LandQueue {
         const selected = run.setupOk
           ? run.checks.flatMap((original) => {
               const check = findGateCounterpart(original, run.checks, gates.checks);
-              return check?.run === original.command ? [{ check, original }] : [];
+              return check && redactGateOutput(check.run) === redactGateOutput(original.command)
+                ? [{ check, original }]
+                : [];
             })
           : [];
+        const skipped = new Map<GateResult, string>();
         const retries = await retryFailures(
           selected,
           cwd,
@@ -857,6 +878,7 @@ export class LandQueue {
           },
           true,
           gateExecutor?.freshCheckoutFor?.(entry.repo),
+          (original, reason) => skipped.set(original, reason),
         );
         signal.throwIfAborted();
         const failed = [...run.setup, ...run.checks].filter((c) => {
@@ -864,6 +886,17 @@ export class LandQueue {
           const result = retries.get(c) ?? c;
           return !result.ok || result.timedOut || confinementFailed(result);
         });
+        for (const c of failed) {
+          if (retries.has(c) && !skipped.has(c)) continue;
+          const reason = run.setup.includes(c)
+            ? `setup failures are not retried; ${targetedRetrySkipReason(c, gates, cwd) ?? "setup failed"}`
+            : !selected.some((s) => s.original === c)
+              ? "check does not match base configuration"
+              : (skipped.get(c) ?? "targeted retry returned no check result");
+          const message = redactGateOutput(`Land ${entry.id} ${c.name}: no targeted retry: ${reason}`);
+          appendFileSync(log, `${message}\n`);
+          if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "warn", message });
+        }
         if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
         for (const check of run.checks) {
           if (check.docsOnly?.mode !== "targeted") continue;
@@ -1020,7 +1053,7 @@ export class LandQueue {
             this.store,
             pr,
             snap,
-            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal),
+            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal, entry.repo),
             this.deps.ciReruns !== false && !rerun,
             current,
             current,
