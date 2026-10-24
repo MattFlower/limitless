@@ -1,12 +1,13 @@
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { headSha } from "../src/git/repos.ts";
-import { fakeHarness } from "../src/harness/fake.ts";
+import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import {
@@ -28,7 +29,7 @@ import { findingEvidence } from "./review-support.ts";
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start } = pipelineSetup({
+const { start, githubFixture, registerGithub } = pipelineSetup({
   get home() {
     return home;
   },
@@ -599,6 +600,119 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
   expect(await waitFor(factory, run.id, ["succeeded", "needs_human", "failed"])).toBe("succeeded");
   expect(ids).toEqual(["beta/m", "beta/other"]);
 });
+
+test.each([
+  ["authentication", "quota"],
+  ["confinement", "authentication"],
+] as const)(
+  "worker %s fallback retires before local %s and the next candidate",
+  async (workerFailure, localFailure) => {
+    const bare = await githubFixture();
+    const implementers: string[] = [];
+    let adopted: RunState | undefined;
+    let reloaded: RunState | undefined;
+    const handler = (s: AgentSpec): FakeReply => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      implementers.push(s.target.provider);
+      if (s.target.provider === "alpha")
+        return {
+          files: { "partial.txt": "keep these edits\n" },
+          ...(localFailure === "quota"
+            ? { status: "quota", error: "Quota exhausted" }
+            : { status: "unavailable", failureClass: "authentication", error: "Login rejected" }),
+        };
+      expect(readFileSync(join(s.cwd, "partial.txt"), "utf8")).toBe("keep these edits\n");
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler, false, false, {
+      providers: providers.map((p) => ({ ...p, harness: "claude" })),
+      harnesses: { claude: fakeHarness(handler) },
+      agentExecutor: {
+        kind: "test",
+        async run(call, local) {
+          if (call.role !== "implement") return local();
+          const hooks = call.publication;
+          if (!hooks) throw new Error("Missing publication hooks");
+          call.publication = {
+            ...hooks,
+            async adopt(sha, request) {
+              await hooks.adopt(sha, request);
+              adopted = f.store.getRunState<RunState>(call.runId) ?? undefined;
+            },
+          };
+          return lanAgentExecutor(f.workers, f.cfg).run(call, async () => {
+            if (call.spec.target.provider === "alpha") {
+              const run = f.store.getRun(call.runId);
+              const repo = run && f.store.getRepo(run.repoId);
+              if (!run || !repo || !adopted?.agentJob) throw new Error("Missing worker state");
+              reloaded = new RunContext(f.deps, run, repo, call.spec.signal).state;
+              expect(f.workers.agentJob(adopted.agentJob.id)).toMatchObject({ state: "done" });
+            }
+            return local();
+          });
+        },
+      },
+    });
+    f.cfg.workers.agents = ["implement"];
+    f.cfg.workers.repos = ["test/repo"];
+    registerGithub(f, bare);
+    const enqueue = f.workers.enqueueAgentJob.bind(f.workers);
+    const queued = spyOn(f.workers, "enqueueAgentJob").mockImplementation((request, id) => {
+      const job = enqueue(request, id);
+      if (!job) throw new Error("Missing worker job");
+      f.store.db.query("UPDATE agent_jobs SET state='leased' WHERE id=?").run(job);
+      expect(
+        f.workers.completeAgentJob(
+          job,
+          {
+            status: "unavailable",
+            ...(workerFailure === "authentication"
+              ? { failureClass: "authentication" }
+              : {
+                  confinement: {
+                    ok: false,
+                    path: null,
+                    version: null,
+                    reason: "probe inconclusive",
+                    exitCode: 1,
+                  },
+                }),
+            error: "Worker could not start",
+            finalText: "",
+            structured: null,
+            sessionId: null,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            numTurns: 0,
+            costUsd: 0,
+            costEquivUsd: 0,
+            quota: null,
+            sha: request.parentSha,
+            parentSha: request.parentSha,
+            branch: request.branch,
+            privateStringsDigest: request.privateStringsDigest,
+          },
+          request.parentSha,
+        ),
+      ).toBe(true);
+      return job;
+    });
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    const status = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
+    expect(f.store.getRun(run.id)?.error).toBeNull();
+    expect(status).toBe("succeeded");
+    expect(implementers).toEqual(["alpha", "beta"]);
+    expect(reloaded).toBeDefined();
+    expect(reloaded?.agentJob).toBeUndefined();
+    expect(reloaded?.publishedSha).toBe(adopted?.publishedSha);
+    expect(reloaded?.workerCommitRound).toBe(adopted?.workerCommitRound);
+    expect(queued).toHaveBeenCalledTimes(1);
+    expect(f.store.listStages(run.id).filter((s) => s.name === "implement")).toMatchObject([
+      { round: 0, status: "succeeded" },
+    ]);
+  },
+);
 
 test("authentication exhaustion fails implementation without consuming a round or checking unchanged code", async () => {
   let before = "";

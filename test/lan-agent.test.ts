@@ -105,6 +105,9 @@ function fixture() {
       async started(id) {
         call.agentJob = { round: 1, id };
       },
+      async retired(id) {
+        if (call.agentJob?.id === id) delete call.agentJob;
+      },
       async resume() {
         return true;
       },
@@ -397,6 +400,48 @@ test("abort when enqueue rejects prevents local fallback", async () => {
   expect(f.counts()).toMatchObject({ locals: 0, jobs: 0 });
 });
 
+test.each(["local", "abort", "reject"])(
+  "local fallback waits for retirement persistence: %s",
+  async (outcome) => {
+    const f = fixture();
+    const hooks = f.call.publication;
+    if (!hooks) throw new Error("Missing hooks");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const retired = hooks.retired;
+    const failure = new Error("Retirement persistence failed");
+    hooks.retired = async (id) => {
+      entered.resolve();
+      await release.promise;
+      if (outcome === "reject") throw failure;
+      await retired(id);
+    };
+    const running = f.run().catch((error: unknown) => error);
+    await f.enqueued;
+    const id = f.job();
+    f.complete(id, {
+      ...(await f.report()),
+      status: "unavailable",
+      failureClass: "authentication",
+      error: "Login rejected",
+    });
+    await entered.promise;
+    const completed = f.workers.agentJob(id);
+    expect(f.call.agentJob?.id).toBe(id);
+    expect(f.counts().locals).toBe(0);
+    if (outcome === "abort") f.controller.abort();
+    release.resolve();
+    const result = await running;
+    if (outcome === "reject") expect(result).toBe(failure);
+    else {
+      expect(result).toMatchObject({ status: outcome === "abort" ? "cancelled" : "ok" });
+      expect(f.call.agentJob).toBeUndefined();
+    }
+    expect(f.counts()).toMatchObject({ adopted: 1, locals: outcome === "local" ? 1 : 0 });
+    expect(f.workers.agentJob(id)).toEqual(completed);
+  },
+);
+
 test.each(["authentication", "confinement", "cancelled session", "failed job", "cancelled job"])(
   "abort during async worker handling prevents local fallback: %s",
   async (reason) => {
@@ -635,6 +680,9 @@ test.each([
   if (reason === "publication")
     f.call.publication = {
       async started() {
+        throw new Error("Unexpected publication");
+      },
+      async retired() {
         throw new Error("Unexpected publication");
       },
       async resume() {

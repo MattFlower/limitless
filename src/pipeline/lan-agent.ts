@@ -54,7 +54,11 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
           quota: null,
         };
       };
-      const fallback = (id?: string) => (spec.signal.aborted ? cancelled(id) : local());
+      const fallback = async (id?: string) => {
+        if (spec.signal.aborted) return cancelled(id);
+        if (id) await publication?.retired(id);
+        return spec.signal.aborted ? cancelled(id) : local();
+      };
       let id = publication && call.agentJob?.round === call.round ? call.agentJob?.id : undefined;
       const open = (state: string) => state === "queued" || state === "leased";
       if (spec.signal.aborted) return cancelled(id);

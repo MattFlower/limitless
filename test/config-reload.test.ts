@@ -335,6 +335,7 @@ test.each(["implement", "review"] as const)(
     if (role === "implement")
       call.publication = {
         started: async () => {},
+        retired: async () => {},
         resume: async () => true,
         prepare: async () => ({
           parentSha: "a".repeat(40),
