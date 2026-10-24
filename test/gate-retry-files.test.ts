@@ -477,32 +477,38 @@ test("incomplete land evidence preserves factory targeted and full retries", asy
   }
 });
 
-test("gate capture retains runner errors before the diagnostic tail", async () => {
-  const f = fixture();
-  try {
-    writeFileSync(
-      join(f.cwd, "runner.ts"),
-      `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(attributedSuite)});
-console.error("1 error");
+test.each(["runner error count", "JUnit error count"])(
+  "gate capture retains %s before the diagnostic tail",
+  async (kind) => {
+    const f = fixture();
+    try {
+      writeFileSync(
+        join(f.cwd, "runner.ts"),
+        `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(kind === "JUnit error count" ? `<testsuites errors="1">${attributedSuite}</testsuites>` : attributedSuite)});
+console.error(${JSON.stringify(kind === "JUnit error count" ? "# Unhandled error between tests" : "1 error")});
 console.error("noise\\n".repeat(2000));
 console.error(${JSON.stringify(runnerSummary)});
 process.exit(1);`,
-    );
-    const run = await confinementScope.run(fakeConfinement, () =>
-      runGates(
-        f.cwd,
-        { ...config, checks: [{ name: "test", run: `'${process.execPath}' ./runner.ts` }] },
-        signal,
-      ),
-    );
-    expect(run.checks[0]?.output).not.toContain("1 error");
-    expect(run.checks[0]?.failedFiles).toEqual(["test/a.test.ts"]);
-    expect(run.checks[0]?.failureAttributionComplete).toBe(false);
-    expect(run.checks[0]?.failureAttributionReason).toBe("1 unattributed error");
-  } finally {
-    f.close();
-  }
-});
+      );
+      const run = await confinementScope.run(fakeConfinement, () =>
+        runGates(
+          f.cwd,
+          { ...config, checks: [{ name: "test", run: `'${process.execPath}' ./runner.ts` }] },
+          signal,
+        ),
+      );
+      expect(run.checks[0]?.output).not.toContain("1 error");
+      expect(run.checks[0]?.output).not.toContain("Unhandled error");
+      expect(run.checks[0]?.failedFiles).toEqual(["test/a.test.ts"]);
+      expect(run.checks[0]?.failureAttributionComplete).toBe(false);
+      expect(run.checks[0]?.failureAttributionReason).toContain("1 unattributed error");
+      if (kind === "JUnit error count")
+        expect(run.checks[0]?.failureAttributionReason).toContain("runner reported an error");
+    } finally {
+      f.close();
+    }
+  },
+);
 
 test("a completed attributed test timeout retries once with a slot and keeps its evidence", async () => {
   const f = fixture();

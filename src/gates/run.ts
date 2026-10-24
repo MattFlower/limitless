@@ -150,7 +150,11 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     ...failedFiles,
     failureAttributionComplete: evidence.agrees(attributedCounts),
     failureAttributionReason:
-      redactGateOutput(evidence.reason(attributedCounts) ?? failureAttributionReason ?? "") || undefined,
+      redactGateOutput(
+        [...new Set([failureAttributionReason, evidence.reason(attributedCounts)].filter(Boolean))].join(
+          "; ",
+        ),
+      ) || undefined,
     ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
