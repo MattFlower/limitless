@@ -7,6 +7,7 @@ import type {
   QuotaWindow,
 } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { MODELS, type ModelDef, type ProviderDef } from "./catalog.ts";
 import { providerKind } from "./config-catalog.ts";
 import { discoversModels, servedIds } from "./discovery.ts";
@@ -25,6 +26,7 @@ interface ProviderRuntime {
   exhaustedUntil: number | null;
   exhaustedReason: string | null;
   consecutiveFailures: number;
+  failureReason?: string | null;
   circuitOpenUntil: number | null;
   healthy: boolean; // for local servers: last probe result
   inFlight: number;
@@ -716,6 +718,7 @@ export class ProviderTracker {
         );
       }
     } else if (status === "unavailable" || status === "timeout") {
+      p.failureReason = detail?.error ? redactCredentials(detail.error).slice(0, 300) : null;
       p.consecutiveFailures++;
       if (p.consecutiveFailures >= CIRCUIT_THRESHOLD) {
         const backoff = Math.min(60, 2 ** (p.consecutiveFailures - CIRCUIT_THRESHOLD)) * 60_000;
@@ -723,6 +726,7 @@ export class ProviderTracker {
       }
     } else if (status === "ok" || status === "error" || status === "declined") {
       // "error" is a task-level failure; "declined" is an answer the caller chose not to use.
+      p.failureReason = null;
       p.consecutiveFailures = 0;
       p.circuitOpenUntil = null;
       if (p.exhaustedUntil && p.exhaustedUntil < now) p.exhaustedUntil = null;
@@ -813,7 +817,10 @@ export class ProviderTracker {
       supportsFast: id === "codex" || id === "claude",
       fastModeUnavailableReason: p.fast ? (p.fastModeUnavailableReason ?? null) : null,
       state,
-      reason,
+      reason:
+        p.consecutiveFailures > 0 && p.failureReason
+          ? [reason, p.failureReason].filter(Boolean).join(": ")
+          : reason,
       until: p.exhaustedUntil ?? p.circuitOpenUntil,
       windows: Object.fromEntries(
         Object.entries(p.windows).map(([name, window]) => [
