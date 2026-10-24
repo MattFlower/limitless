@@ -61,7 +61,10 @@ it runs the trusted base gate setup in the actual reader checkout, before starti
 preview needs setup, its existing preparation runs before the concurrent readers and is reused.
 Detached LAN/shadow reviewers run that same setup in their own checkout. The shared helper uses
 `runLocalGates`: confined subprocesses, scrubbed environments and private disposable caches. Setup
-failure stops the reader; no incompatible ancestor import is accepted. No reader gets write access
+success is followed by the existing hardened `discardChanges` cleanup before any reader starts:
+tracked source is restored while ignored installed dependencies remain. This applies to coordinator,
+detached LAN and shadow checkouts through the shared helper. Setup failure stops the reader; no
+incompatible ancestor import is accepted. No reader gets write access
 to its checkout or shared package directories. Production changes stay within the requested budget.
 
 Explicit blocked statuses, reasons and evidence remain persisted, and verification remains failed.
@@ -83,3 +86,17 @@ setup failed four dependency regressions; removing worker setup failed both harn
 removing LAN setup forwarding failed the end-to-end reviewer test; removing blocked counts failed
 four summary cases. Removing the existing blocked-feedback filter failed the extended pure feedback
 case. Local/in-place dependency cases are positive controls for the already-working reuse path.
+
+The follow-up regression makes offline setup rewrite a tracked source module without changing HEAD.
+Every dependency probe now imports that module as well as the expected package, requiring its
+committed value. A separate shadow layout also requires the detached shadow review to complete.
+Removing the cleanup made the coordinator LAN-gate, detached worker and shadow-layout regressions
+fail; restoring it passes them. The complete production diff is 52 added and 7 removed lines,
+within the approximate 60-line budget; additional coverage and this report are separate.
+
+Follow-up validation: `bun test --parallel=4` across `pipeline-reader-dependencies`,
+`pipeline-agent-executor`, `pipeline-lan-agent`, `pipeline-shadow`, `pipeline-verification`,
+`pipeline-preview`, `verification`, `workers`, `workers-http`, `harness` and `sandbox`
+(all under `test/`, with `.test.ts` suffix) passed 683 tests, with 23 existing platform/confinement
+skips and no failures. Changed-file `bunx biome check`, `bunx tsc --noEmit` and
+`git diff --check` also passed.

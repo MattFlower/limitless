@@ -3,6 +3,7 @@ import type { AgentJobRequest } from "../db/workers.ts";
 import type { FactoryGateHandler, TestWait } from "../gates/agent-tests.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { runLocalGates } from "../gates/run.ts";
+import { discardChanges } from "../git/repos.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { withSlottedCommands } from "../harness/slotted.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
@@ -75,6 +76,7 @@ export async function prepareReaderCheckout(cwd: string, setup: string[], signal
     const failed = result.setup.find((r) => !r.ok);
     throw new Error(redactGateOutput(`Reader setup failed: $ ${failed?.command}\n${failed?.output}`));
   }
+  await discardChanges(cwd);
 }
 
 /** One lifecycle for tool-enabled sessions, on the coordinator or a worker. */

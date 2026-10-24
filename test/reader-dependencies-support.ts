@@ -27,9 +27,10 @@ export async function readerDependencyFixture(cwd: string, version = "4.0.0") {
     JSON.stringify({ private: true, dependencies: { zod: `file:./vendor/zod-${version}` } }),
   );
   writeFileSync(join(cwd, ".gitignore"), "node_modules/\nsetup-env.json\n");
+  writeFileSync(join(cwd, "reader-source.ts"), 'export default "committed";\n');
   writeFileSync(
     join(cwd, "dependency-probe.ts"),
-    'import { version, floors } from "zod"; console.log(JSON.stringify({ path: import.meta.resolve("zod"), version, prefault: typeof floors.prefault }));\n',
+    'import { version, floors } from "zod"; import source from "./reader-source.ts"; console.log(JSON.stringify({ path: import.meta.resolve("zod"), version, prefault: typeof floors.prefault, source }));\n',
   );
   await withScratch(cwd, (scratch) =>
     sh(
@@ -44,12 +45,13 @@ export async function readerDependencyFixture(cwd: string, version = "4.0.0") {
       { cwd, env: agentEnv({ HOME: scratch }), timeoutMs: 10_000 },
     ),
   );
-  return `${JSON.stringify(process.execPath)} install --frozen-lockfile --ignore-scripts`;
+  // Setup may run package scripts that alter tracked source without moving HEAD.
+  return `${JSON.stringify(process.execPath)} install --frozen-lockfile --ignore-scripts && ${JSON.stringify(process.execPath)} -e 'await Bun.write("reader-source.ts", ${JSON.stringify('export default "changed by setup";\n')})'`;
 }
 
 export async function importReaderDependency(cwd: string) {
   const result = await sh([process.execPath, "dependency-probe.ts"], { cwd });
-  return JSON.parse(result.stdout) as { path: string; version: string; prefault: string };
+  return JSON.parse(result.stdout) as { path: string; version: string; prefault: string; source: string };
 }
 
 export async function expectReaderDependency(cwd: string, version = "4.0.0") {
@@ -58,6 +60,7 @@ export async function expectReaderDependency(cwd: string, version = "4.0.0") {
     path: `file://${realpathSync(join(cwd, "node_modules/zod/index.js"))}`,
     version,
     prefault: "function",
+    source: "committed",
   });
   return result;
 }

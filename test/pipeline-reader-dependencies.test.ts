@@ -66,6 +66,7 @@ for (const [harness, layout] of [
   ["claude", "lan"],
   ["codex", "changed-lockfile"],
   ["codex", "resumed"],
+  ["codex", "shadow"],
   ["codex", "failure"],
 ] as const) {
   test(`reader dependencies: ${harness} ${layout}`, async () => {
@@ -101,7 +102,7 @@ for (const [harness, layout] of [
       if (role === "spec") return { structured: spec };
       if (role === "holdout") return { structured: holdout };
       if (role === "review" || role === "verify") {
-        readers.push(role);
+        readers.push(basename(s.cwd) === "shadow" ? "shadow" : role);
         expect(s.target.harness).toBe(harness);
         await expectReaderDependency(s.cwd, layout === "changed-lockfile" ? "4.1.0" : "4.0.0");
         expectPrivateSetup(s.cwd);
@@ -118,6 +119,11 @@ for (const [harness, layout] of [
     });
     const controller = new AbortController();
     let executor: Promise<void> | undefined;
+    if (layout === "shadow") {
+      f.cfg.reviewShadow = "panel";
+      for (const { id } of providers)
+        f.tracker.observeWindows(id, { five_hour: { utilization: 0, resetsAt: null } });
+    }
     if (layout === "inplace") {
       f.deps.gateExecutor = gateExecutorFor("local", f.workers, [], true);
       f.store.setSetting("executor.daemonRelease", "test-build");
@@ -143,6 +149,12 @@ for (const [harness, layout] of [
       if (layout === "failure") {
         expect(readers).toEqual([]);
         expect(f.store.getRun(run.id)?.error).toContain("Reader setup failed");
+      } else if (layout === "shadow") {
+        expect(readers.filter((role) => role !== "shadow").sort()).toEqual(["review", "verify"]);
+        expect(readers).toContain("shadow");
+        expect(JSON.parse(f.store.getArtifact(run.id, "review-0.shadow.json") ?? "null")).toMatchObject({
+          status: "completed",
+        });
       } else expect(readers.sort()).toEqual(["review", "verify"]);
       expect(readFileSync(ancestor, "utf8")).toBe(before);
     } finally {
