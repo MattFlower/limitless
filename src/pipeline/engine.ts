@@ -503,7 +503,10 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 // ---------------------------------------------------------------------------
 // prepare: repo cache, worktree, gate detection, baseline
 
-function gateEvents(ctx: RunContext, label?: string): Required<Omit<GateHooks, "onLocalSetup" | "env">> {
+function gateEvents(
+  ctx: RunContext,
+  label?: string,
+): Required<Omit<GateHooks, "onLocalSetup" | "env" | "fallbackSetup">> {
   return {
     priority: "finish",
     skipGateSlot: false,
@@ -661,7 +664,7 @@ async function prepare(ctx: RunContext): Promise<void> {
                 options?.targeted ? "baseline-retry-targeted" : "baseline-retry",
                 wt.path,
                 retry,
-                { onWait, skipGateSlot: options?.skipGateSlot },
+                { onWait, skipGateSlot: options?.skipGateSlot, fallbackSetup: gates.setup },
                 env,
               ),
             ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
@@ -1598,6 +1601,7 @@ async function oneRound(
                     {
                       onWait: events.onWait,
                       skipGateSlot: options?.skipGateSlot,
+                      fallbackSetup: docs.gates.setup,
                       onLocalSetup:
                         retry.setup.length === gates.setup.length ? events.onLocalSetup : undefined,
                     },
@@ -3223,7 +3227,7 @@ async function mergeForDelivery(
               options?.targeted ? "regression-retry-targeted" : "regression-retry",
               cwd,
               retry,
-              { ...events, skipGateSlot: options?.skipGateSlot },
+              { ...events, skipGateSlot: options?.skipGateSlot, fallbackSetup: docs.gates.setup },
             ),
           ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
           (c) => isSlowRegression(c, initial, reference?.checks ?? []),

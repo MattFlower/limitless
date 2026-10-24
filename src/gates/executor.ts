@@ -39,6 +39,7 @@ export interface GateRequest {
   daemonPort?: number;
   scratch?: string;
   implementerIssue?: boolean;
+  fallbackSetup?: string[];
   runId?: string;
   priority?: GatePriority;
   repo: string;

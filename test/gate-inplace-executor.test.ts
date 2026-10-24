@@ -359,6 +359,66 @@ test("executor crash fallback restores committed bytes after stopping the origin
   });
 });
 
+test.each(["baseline", "initial"])(
+  "a failed %s retry recreates setup output after cleaning for local fallback",
+  async (purpose) => {
+    mkdirSync(join(fixture.home, "cfg"));
+    writeFileSync(join(fixture.home, "cfg", "config.toml"), "[executor]\nenabled = true\n");
+    const counter = join(fixture.home, "first-attempt");
+    const pidFile = join(fixture.home, "retry-pid");
+    const proceed = join(fixture.home, "retry-proceed");
+    const setups = join(fixture.home, "setups");
+    const setup = `mkdir -p node_modules; touch node_modules/token generated-file; echo setup >> '${setups}'`;
+    const selected = purpose === "baseline" ? "! test -f farewell.txt" : "test -f farewell.txt";
+    const command = `test -f node_modules/token && test -f generated-file || exit 9; if ${selected}; then if [ ! -f '${counter}' ]; then touch '${counter}'; exit 1; fi; if [ ! -f '${pidFile}' ]; then echo $$ > '${pidFile}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done; fi; fi`;
+    writeFileSync(join(fixture.repoDir, ".gitignore"), "node_modules/\n");
+    writeFileSync(
+      join(fixture.repoDir, ".limitless.toml"),
+      `[gates]\nsetup = [${JSON.stringify(setup)}]\nchecks = [{ name = "build", run = ${JSON.stringify(command)} }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: fixture.repoDir });
+    await sh(["git", "commit", "-qm", "gate setup prerequisites"], { cwd: fixture.repoDir });
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.store.setSetting("executor.daemonRelease", release);
+    await withExecutor(f, async (workers, crash) => {
+      try {
+        const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell", profile: "quick" });
+        await wait(() => existsSync(pidFile), { timeoutMs: 10_000 });
+        const state = f.store.getRunState<RunContext["state"]>(run.id);
+        expect(state?.gateExecution?.purpose).toBe(
+          purpose === "baseline" ? "baseline-retry" : "regression-retry",
+        );
+        const id = state?.gateExecution?.handle.id ?? "";
+        const request = JSON.parse(workers.job(id)?.request ?? "{}") as GateRequest;
+        expect(request.gates.setup).toEqual([]);
+        expect(request.fallbackSetup).toEqual([setup]);
+        // A healthy in-place retry reused setup; it has not rebuilt these outputs yet.
+        const before = readFileSync(setups, "utf8");
+        expect(before).toBe(purpose === "baseline" ? "setup\n" : "setup\nsetup\n");
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        await crash();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(recoveryProcessStopped(pid)).toBe(true);
+        const result = JSON.parse(workers.job(id)?.result ?? "null");
+        expect(result).toMatchObject({
+          setupOk: true,
+          setup: [{ command: setup, ok: true }],
+          checks: [{ name: "build", ok: true }],
+        });
+        expect(readFileSync(setups, "utf8")).toBe("setup\nsetup\nsetup\n");
+      } finally {
+        writeFileSync(proceed, "");
+        await f.stop();
+        await recoverProcessCleanups(f.store);
+      }
+    });
+  },
+);
+
 test("leftover canonical process records keep the lock and surface needs_human within the bound", async () => {
   mkdirSync(join(fixture.home, "cfg"));
   writeFileSync(join(fixture.home, "cfg", "config.toml"), "[executor]\nenabled = true\n");

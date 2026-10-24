@@ -79,6 +79,8 @@ export interface GateHooks {
   holder?: string;
   /** Only bounded targeted retries may bypass the full-suite queue. */
   skipGateSlot?: boolean;
+  /** Recreate prerequisites if an in-place retry falls back after cleaning its worktree. */
+  fallbackSetup?: string[];
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
   /** Evidence from this process, never from a remote result or cache. */
   onLocalSetup?: () => void;

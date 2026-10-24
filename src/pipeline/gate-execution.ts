@@ -96,6 +96,7 @@ export async function runGateExecution(
         daemonPort: ctx.deps.cfg.port,
         scratch: invocationScratch.getStore(),
         implementerIssue: Boolean(ctx.state.implementerIssue),
+        fallbackSetup: hooks.fallbackSetup,
         runId: ctx.run.id,
         repo: ctx.repo.slug,
         cwd,

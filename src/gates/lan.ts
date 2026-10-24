@@ -130,7 +130,10 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
           if (job.state === "failed") {
             if (inplace) await workers.waitStopped(handle.id, controller.signal);
             const request = JSON.parse(job.request) as GateRequest;
-            if (inplace) await checkoutCommitted(request.cwd, undefined, Boolean(request.implementerIssue));
+            if (inplace) {
+              await checkoutCommitted(request.cwd, undefined, Boolean(request.implementerIssue));
+              request.gates = { ...request.gates, setup: request.fallbackSetup ?? request.gates.setup };
+            }
             workers.event(handle.id, {
               type: "status",
               text: `${inplace ? "In-place" : "LAN"} gates falling back to local execution`,
