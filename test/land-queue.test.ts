@@ -467,6 +467,67 @@ function fakeLandGates(
   return { executor, requests };
 }
 
+test.each(["targeted", "skipped", "mixed", "failure"])("land docs-only selection: %s", async (mode) => {
+  mkdirSync(join(seed, "test"));
+  writeFileSync(join(seed, "test/a.test.ts"), mode === "skipped" ? "unrelated" : "README.md");
+  writeFileSync(join(seed, "test/b.test.ts"), "unrelated");
+  writeFileSync(
+    join(seed, ".limitless.toml"),
+    `[gates]
+docs = ["*.md"]
+retry_files = "bun test {files}"
+checks = [{name="lint",run="fake-lint"}, {name="test",run="bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"}]
+`,
+  );
+  await sh(["git", "add", "."], { cwd: seed });
+  await sh(["git", "commit", "-qm", "docs gates"], { cwd: seed });
+  await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
+  const pr = delivered(1, "pr-1");
+  let head = await pushBranch("pr-1", "README.md", "updated\n");
+  if (mode === "mixed") head = await pushBranch("pr-1", "source.ts", "export {};\n");
+  observe(1, head);
+  approve(1, head);
+  const fake = fakeLandGates((req) =>
+    retryRun(req, mode === "failure" ? { test: { ok: false, exitCode: 1 } } : {}),
+  );
+  const q = queue({ gateExecutor: fake.executor });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === (mode === "failure" ? "blocked" : "landed"));
+    expect(fake.requests.flatMap((r) => r.gates.checks.map((c) => c.run))).toEqual([
+      "fake-lint",
+      ...(mode === "skipped"
+        ? []
+        : [
+            mode !== "mixed"
+              ? "bun test './test/a.test.ts'"
+              : "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+          ]),
+    ]);
+    const log = readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8");
+    expect(log).toContain(`"mode":"${mode === "mixed" ? "full" : mode === "failure" ? "targeted" : mode}"`);
+    if (mode === "targeted") {
+      const message =
+        "test: targeted pass (test/a.test.ts; docs-only change; test source references a changed path or basename";
+      expect(log).toContain(message);
+      expect(store.listEvents(pr.run.id).some((e) => e.type === "gate" && e.message.includes(message))).toBe(
+        true,
+      );
+    }
+    if (mode === "failure") {
+      expect(store.getLandEntry(entry.id)?.reason).toContain("test failed");
+      expect(log).not.toContain("targeted pass");
+      expect(ghCalls("pr merge")).toEqual([]);
+    }
+    if (mode === "skipped") expect(log).toContain("docs-only change; no test reads the changed files");
+    expect(
+      store.listEvents(pr.run.id).some((e) => e.type === "gate" && e.message.includes("Gate selection:")),
+    ).toBe(true);
+  } finally {
+    await q.stop();
+  }
+});
+
 test("a land check pins its executor through fresh-checkout retries; the next entry uses the reload", async () => {
   const { pr } = await retryLandFixture();
   const b = fakeLandGates((req) => retryRun(req));
@@ -1067,7 +1128,9 @@ test.each([
     const round = roundRun(pr.run.id, url(1), head);
     const repo = store.getRepo(pr.run.repoId);
     if (!repo) throw new Error("missing repository");
-    const other = store.createRun(repo, { repo: SLUG, prompt: "other request\nCloses #42" });
+    // Persist an overlapping claim as an older release could, before transactional claiming.
+    const other = store.createRun(repo, { repo: SLUG, prompt: "other request" });
+    store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("other request\nCloses #42", other.id);
     const finishedAt = 123;
     store.updateRun(other.id, { status: "needs_human", prUrl: url(2) });
     const second = roundRun(pr.run.id, url(1), head);

@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -20,8 +21,13 @@ import {
   runCodex,
 } from "../src/harness/codex.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
-import { type ConfinementBackend, confinementScope, verifySeatbelt } from "../src/harness/sandbox.ts";
-import { withScratch } from "../src/harness/scratch.ts";
+import {
+  type ConfinementBackend,
+  confinementScope,
+  seatbeltBackend,
+  verifySeatbelt,
+} from "../src/harness/sandbox.ts";
+import { withScratch, writeRoots } from "../src/harness/scratch.ts";
 import { signalCommand } from "../src/harness/signals.ts";
 import { parseFakeStream } from "../src/harness/stream-fault.ts";
 import {
@@ -1927,6 +1933,151 @@ test("Codex ordinary readers run the verified executable", async () => {
 
 const sandboxCodex = Bun.which("codex");
 const codexSandboxSkip = sandboxCodex ? null : "no codex on PATH";
+
+function slottedInstallation(layout: "local" | "Homebrew") {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "slotted-install-")));
+  const home = join(root, "home"),
+    cwd = join(root, "checkout");
+  const prefix = join(home, "homebrew"),
+    cellar = join(prefix, "Cellar/limitless/test");
+  const executable = layout === "local" ? join(home, ".local/bin/limitless") : join(cellar, "bin/limitless");
+  for (const dir of [dirname(executable), cwd, join(home, ".aws")]) mkdirSync(dir, { recursive: true });
+  writeFileSync(executable, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 });
+  let link = executable;
+  if (layout === "Homebrew") {
+    for (const dir of ["bin", "opt"]) mkdirSync(join(prefix, dir));
+    symlinkSync("../Cellar/limitless/test", join(prefix, "opt/limitless"));
+    link = join(prefix, "bin/limitless");
+    symlinkSync("../opt/limitless/bin/limitless", link);
+  }
+  const secret = join(home, ".aws/token"),
+    unrelated = join(dirname(executable), "unrelated");
+  writeFileSync(secret, "credential-canary");
+  writeFileSync(unrelated, "#!/bin/sh\necho denied\n", { mode: 0o755 });
+  return { root, home, cwd, executable, link, secret, unrelated };
+}
+
+test.each(["local", "Homebrew"] as const)(
+  "slotted binary installation needs no new directory grants (%s)",
+  async (layout) => {
+    const install = slottedInstallation(layout);
+    try {
+      await withScratch(install.cwd, (scratchDir) =>
+        readPolicyScope.run({ home: install.home, environment: {} }, async () => {
+          const spec = {
+            ...installationSpec(install.cwd, scratchDir),
+            denyRead: [install.secret, install.unrelated],
+          };
+          for (const mode of ["edit", "readonly"] as const) {
+            const entries = filesystemEntries(buildCodexArgs({ ...spec, mode }));
+            for (const file of [install.link, realpathSync(install.link)])
+              expect(filesystemAccess(entries, file)).toBe("read");
+            for (const file of [install.secret, install.unrelated])
+              expect(filesystemAccess(entries, file)).toBe("none");
+            expect(entries).not.toContainEqual([dirname(install.executable), "read"]);
+          }
+          const roots = writeRoots(spec.cwd, scratchDir, false, spec.denyRead);
+          expect(roots.allowRead).toBeUndefined();
+          expect(roots.denyRead).toContain(install.unrelated);
+          for (const mode of ["edit", "readonly"] as const) {
+            const args = buildClaudeArgs({ ...spec, mode }, "probe");
+            const filesystem = JSON.parse(args[args.indexOf("--settings") + 1] ?? "{}").sandbox.filesystem;
+            expect(filesystem.allowRead).toBeUndefined();
+            expect(filesystem.denyRead).toContain(install.unrelated);
+            for (const file of [install.link, realpathSync(install.link)])
+              expect(filesystem.denyRead.some((p: string) => file === p || file.startsWith(`${p}/`))).toBe(
+                false,
+              );
+          }
+        }),
+      );
+    } finally {
+      rmSync(install.root, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const sandbox of ["codex-editor", "codex-reader", "claude-editor", "claude-reader"] as const) {
+  const skip = seatbeltSkip ?? (sandbox.startsWith("codex") ? codexSandboxSkip : null);
+  test.skipIf(skip !== null)(
+    `slotted installation execution via ${sandbox} (${skip ?? "available"})`,
+    async () => {
+      for (const layout of ["local", "Homebrew"] as const) {
+        const install = slottedInstallation(layout);
+        try {
+          await withScratch(install.cwd, (scratchDir) =>
+            readPolicyScope.run({ home: install.home, environment: {} }, async () => {
+              const spec = {
+                ...installationSpec(install.cwd, scratchDir),
+                mode: sandbox.endsWith("reader") ? ("readonly" as const) : ("edit" as const),
+                denyRead: [install.secret, install.unrelated],
+              };
+              const execute = async (command: string[]) => {
+                let cmd = command;
+                let extra: NodeJS.ProcessEnv = {};
+                if (sandbox.startsWith("codex")) {
+                  if (!sandboxCodex) throw new Error("no codex on PATH");
+                  cmd = [
+                    sandboxCodex,
+                    "sandbox",
+                    ...installationProfile(buildCodexArgs(spec)),
+                    "--",
+                    ...command,
+                  ];
+                  extra = { CODEX_HOME: scratchDir };
+                } else if (sandbox === "claude-editor")
+                  cmd = seatbeltBackend.wrap(
+                    command,
+                    writeRoots(install.cwd, scratchDir, false, spec.denyRead),
+                  );
+                else {
+                  const args = buildClaudeArgs(spec, "probe");
+                  const filesystem = JSON.parse(args[args.indexOf("--settings") + 1] ?? "{}").sandbox
+                    .filesystem;
+                  await SandboxManager.initialize(
+                    { filesystem, network: { allowedDomains: [], deniedDomains: [] } },
+                    undefined,
+                    false,
+                  );
+                  const wrapped = await SandboxManager.wrapWithSandboxArgv(
+                    command.map((s) => `'${s.replaceAll("'", "'\\''")}'`).join(" "),
+                    "/bin/bash",
+                    undefined,
+                    spec.signal,
+                    install.cwd,
+                  );
+                  cmd = wrapped.argv;
+                  extra = wrapped.env;
+                }
+                return runProcess({
+                  cmd,
+                  cwd: install.cwd,
+                  env: agentEnv({ ...extra, TMPDIR: scratchDir }),
+                  timeoutMs: 5000,
+                });
+              };
+              try {
+                for (const file of [install.link, realpathSync(install.link)]) {
+                  const observed = await execute([file, "installation-ok"]);
+                  expect(observed.exitCode).toBe(0);
+                  expect(observed.stdout.trim()).toBe("installation-ok");
+                }
+                expect((await execute(["/bin/cat", install.secret])).exitCode).not.toBe(0);
+                expect((await execute([install.unrelated])).exitCode).not.toBe(0);
+              } finally {
+                if (sandbox === "claude-reader") await SandboxManager.reset();
+              }
+            }),
+          );
+        } finally {
+          rmSync(install.root, { recursive: true, force: true });
+        }
+      }
+    },
+    30_000,
+  );
+}
+
 test.skipIf(seatbeltSkip !== null || codexSandboxSkip !== null)(
   `Codex installation helper executes while credentials and unrelated home executables stay denied${seatbeltSkip || codexSandboxSkip ? ` (skipped: ${seatbeltSkip ?? codexSandboxSkip})` : ""}`,
   async () => {

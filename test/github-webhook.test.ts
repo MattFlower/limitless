@@ -103,7 +103,10 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
   expect((await h(request(body, "a", false))).status).toBe(401);
   expect((await h(request(`${body} `, "b"))).status).toBe(201);
-  expect((await h(request(body, "c").clone())).status).toBe(201);
+  const claimed = await h(request(body, "c").clone());
+  expect(claimed.status).toBe(200);
+  expect(await claimed.text()).toContain(store.listRuns()[0]?.id ?? "missing run");
+  expect(store.db.query("SELECT status FROM inbox WHERE id = 'c'").get()).toEqual({ status: "ignored" });
   const invalid = request(body, "d");
   invalid.headers.set("x-hub-signature-256", `sha256=${"0".repeat(64)}`);
   expect((await h(invalid)).status).toBe(401);
@@ -122,7 +125,7 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   expect(store.db.query("SELECT status, note, run_id FROM inbox WHERE id = 'e'").get()).toEqual(malformed);
   expect((await h(request("{broken", "e"))).status).toBe(200);
   expect(store.db.query("SELECT status, note, run_id FROM inbox WHERE id = 'e'").get()).toEqual(malformed);
-  expect(store.listRuns()).toHaveLength(2);
+  expect(store.listRuns()).toHaveLength(1);
   expect((await h(new Request("http://localhost/webhooks/github"))).status).toBe(405);
   expect(requests).toHaveLength(2);
 });
@@ -134,7 +137,10 @@ test("signature mismatch audit cannot reserve or overwrite authenticated deliver
   registerCredential("WEBHOOK_AUDIT_TEST", credential);
   for (const validFirst of [false, true]) {
     const id = `${validFirst}-${credential}`;
-    if (validFirst) expect((await h(request(body, id))).status).toBe(201);
+    const payload = JSON.parse(body);
+    payload.issue.number = validFirst ? 43 : 42;
+    const delivery = JSON.stringify(payload);
+    if (validFirst) expect((await h(request(delivery, id))).status).toBe(201);
     const before = store.db.query("SELECT * FROM inbox WHERE id = ?").get(id);
     const runCount = store.listRuns().length;
     // Invalid JSON must still be rejected for its signature before payload processing.
@@ -145,7 +151,7 @@ test("signature mismatch audit cannot reserve or overwrite authenticated deliver
     expect(store.listRuns()).toHaveLength(runCount);
     expect(requests).toHaveLength(runCount);
     expect(store.db.query("SELECT * FROM inbox WHERE id = ?").get(id)).toEqual(before);
-    if (!validFirst) expect((await h(request(body, id))).status).toBe(201);
+    if (!validFirst) expect((await h(request(delivery, id))).status).toBe(201);
     const authenticated = store.db.query("SELECT * FROM inbox WHERE id = ?").get(id);
     expect((await h(request(body, id))).status).toBe(200);
     expect(store.db.query("SELECT * FROM inbox WHERE id = ?").get(id)).toEqual(authenticated);
@@ -580,6 +586,7 @@ test("only owner-authored request text allows audit exemptions, and it persists 
   const send = async (event: string, file: string, edit: (payload: Payload) => void) => {
     const payload = JSON.parse(fixture(file)) as Payload;
     edit(payload);
+    if (event !== "pull_request") payload.issue.number = requests.length + 1;
     const response = await h(request(JSON.stringify(payload), `${event}-${requests.length}`, true, event));
     expect(response.status).toBe(201);
     const id = store.db.query("SELECT run_id FROM inbox ORDER BY rowid DESC LIMIT 1").get() as {

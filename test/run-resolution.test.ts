@@ -31,7 +31,9 @@ const resolve = (id: string, body: unknown, headers: Record<string, string> = {}
   );
 
 function finished(status: RunStatus, prompt = "work", repo = f.repo()) {
-  const run = f.store.createRun(repo, { repo: repo.slug, prompt, title: prompt });
+  // Historical fixtures may contain overlapping claims persisted by older releases.
+  const run = f.store.createRun(repo, { repo: repo.slug, prompt: "work", title: prompt });
+  f.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run(prompt, run.id);
   f.store.updateRun(run.id, { status, error: "review required", finishedAt: 1234 });
   return run.id;
 }
@@ -147,7 +149,8 @@ test("a merge recorded by the pipeline supersedes matching needs_human runs in i
   ];
   const decided = finished("needs_human", "Closes #12");
   f.store.resolveRun(decided, { kind: "wont_do", by: "human" });
-  const merged = f.store.createRun(f.repo(), { repo: "local/feed", prompt: "Fix\n\nCloses #12, Closes #7" });
+  const merged = f.store.createRun(f.repo(), { repo: "local/feed", prompt: "Fix" });
+  f.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("Fix\n\nCloses #12, Closes #7", merged.id);
   const prUrl = "https://github.com/o/r/pull/9";
   f.store.updateRun(merged.id, { prUrl, merged: true });
 
