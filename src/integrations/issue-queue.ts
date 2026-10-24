@@ -236,6 +236,11 @@ export function startIssueQueue(
         const admission = () => {
           if (stopped) return "queue stopped";
           if (factory.scheduler.draining) return "scheduler draining";
+          const eligibility = issueEligibility(issue, q.trusted, {
+            blockers: states,
+            latest: factory.store.latestIssueRun(repo, issue.number),
+          });
+          if (!eligibility.eligible) return eligibility.reason;
           const active = factory.store.listRuns({
             status: ISSUE_CLAIM_STATUSES,
             limit: Number.MAX_SAFE_INTEGER,
@@ -273,11 +278,15 @@ export function startIssueQueue(
     } catch (e) {
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
-      if (!stopped)
-        timer = set(
-          () => void tick(),
-          Math.min(3_600_000, Math.max(q.pollSeconds * 1000, notBefore - now())),
-        );
+      const deadline = Math.max(now() + q.pollSeconds * 1000, notBefore);
+      const schedule = () => {
+        if (!stopped)
+          timer = set(
+            () => (now() < deadline ? schedule() : void tick()),
+            Math.min(3_600_000, Math.max(0, deadline - now())),
+          );
+      };
+      schedule();
     }
   };
   timer = set(() => void tick(), 0);

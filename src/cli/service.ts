@@ -191,6 +191,8 @@ export async function installedUnits(opts: ServiceOptions = {}) {
     const data: Record<string, unknown> = JSON.parse(result.stdout);
     if (!data || !Array.isArray(data.ProgramArguments) || typeof data.Label !== "string") continue;
     const args = data.ProgramArguments;
+    if (data.Program !== undefined && (typeof args[0] !== "string" || !samePath(data.Program, args[0])))
+      continue;
     const executable = basename(String(args[0]));
     const is = (at: number, ...parts: string[]) =>
       parts.every((part, i) => (part.startsWith("/") ? samePath(args[at + i], part) : args[at + i] === part));
