@@ -21,9 +21,11 @@ import {
   ProcessTerminationError,
   processBirth,
   processBirthInspection,
+  processBirthSync,
   processBootInspection,
   processCleanupStore,
   processInspection,
+  processOwnerInspection,
   processRecoveryInspection,
   processScope,
   recoverProcessCleanups,
@@ -201,17 +203,20 @@ test("persisted scope ownership precedes spawn and survives explicit command env
 });
 
 for (const recovery of ["startup", "scoped"] as const) {
-  test(`coordinator ${recovery} crash recovery stops discovery-only descendants before stage work`, async () => {
-    const database = join(directory, "coordinator.db");
-    const ready = join(directory, "children.json");
-    const persisted = join(directory, "persisted");
-    const script = join(directory, "supervisor.ts");
-    const source = (path: string) => JSON.stringify(new URL(path, import.meta.url).pathname);
-    // The shell stays alive alongside its child, with no dependency on its stdout reader.
-    const shell = `/bin/sleep 600 & child=$!; printf '{"shell":%s,"grandchild":%s}' "$$" "$child" > "$1.tmp"; /bin/mv "$1.tmp" "$1"; wait`;
-    writeFileSync(
-      script,
-      `
+  for (const outcome of ["crash", "live"] as const) {
+    test(`coordinator ${recovery} ${outcome} recovery respects discovery ownership`, async () => {
+      const database = join(directory, "coordinator.db");
+      const ready = join(directory, "children.json");
+      const persisted = join(directory, "persisted");
+      const finish = join(directory, "finish");
+      const childReady = join(directory, "child-ready");
+      const script = join(directory, "supervisor.ts");
+      const source = (path: string) => JSON.stringify(new URL(path, import.meta.url).pathname);
+      // The shell stays alive alongside its child, with no dependency on its stdout reader.
+      const shell = `${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.argv[2], ""); setInterval(() => { if (require("fs").existsSync(process.argv[1])) process.exit(0); }, 10)' ${JSON.stringify(finish)} ${JSON.stringify(childReady)} & child=$!; printf '{"shell":%s,"grandchild":%s}' "$$" "$child" > "$1.tmp"; /bin/mv "$1.tmp" "$1"; wait "$child"`;
+      writeFileSync(
+        script,
+        `
       import { writeFileSync, renameSync } from 'node:fs';
       import { Store } from ${source("../src/db/store.ts")};
       import { processScope, processBootInspection, runProcess } from ${source("../src/util/proc.ts")};
@@ -225,63 +230,265 @@ for (const recovery of ["startup", "scoped"] as const) {
         renameSync(${JSON.stringify(`${persisted}.tmp`)}, ${JSON.stringify(persisted)});
       };
       try {
-        await processBootInspection.run(() => 'test-boot', () => processScope.run({
+        const result = await processBootInspection.run(() => 'test-boot', () => processScope.run({
           signal: controller.signal, killGraceMs: 0, children: new Map(), scratchDirs: new Set(),
           runId: 'a', checkout: () => ${JSON.stringify(directory)}, cleanups: store,
         }, () => runProcess({
           cmd: ['/bin/sh', '-c', ${JSON.stringify(shell)}, 'probe', ${JSON.stringify(ready)}],
           cwd: ${JSON.stringify(directory)}, env: {}, timeoutMs: 20000,
         })));
+        if (result.exitCode !== 0) throw new Error('Invocation failed');
       } finally { store.close(); }
     `,
-    );
-    const supervisor = Bun.spawn([process.execPath, script], {
-      cwd: directory,
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "inherit",
-    });
-    let pids: number[] = [];
-    try {
-      await waitFor(() => existsSync(ready) && existsSync(persisted));
-      const members = JSON.parse(readFileSync(ready, "utf8")) as { shell: number; grandchild: number };
-      pids = [members.shell, members.grandchild];
-      supervisor.kill("SIGKILL");
-      await supervisor.exited;
-      expect(recoveryProcessStopped(members.grandchild)).toBe(false);
-      store.close();
-      store = new Store(database);
-      expect(store.listProcessCleanups()).toEqual([]);
-      const discoveries = store.listProcessDiscoveries();
-      if (recovery === "startup") await recoverProcessCleanups(store);
-      else {
-        const sentinel = join(directory, "stage-started");
-        await processScope.run(scope(), async () => {
-          await recoverScopedProcesses();
-          for (const pid of pids) expectProcessStopped(pid);
-          await runProcess({
-            cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
-            cwd: directory,
-            env: {},
-          });
-        });
-        expect(existsSync(sentinel)).toBe(true);
-      }
-      for (const pid of pids) expectProcessStopped(pid);
-      expect(discoveries).toHaveLength(1);
-      expect(store.listProcessCleanups()).toEqual([]);
-      expect(store.listProcessDiscoveries()).toEqual([]);
-    } finally {
-      if (supervisor.exitCode === null) supervisor.kill("SIGTERM");
-      await supervisor.exited;
-      if (existsSync(ready)) {
+      );
+      const supervisor = Bun.spawn([process.execPath, script], {
+        cwd: directory,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "inherit",
+      });
+      let pids: number[] = [];
+      try {
+        await waitFor(() => existsSync(ready) && existsSync(persisted) && existsSync(childReady));
         const members = JSON.parse(readFileSync(ready, "utf8")) as { shell: number; grandchild: number };
         pids = [members.shell, members.grandchild];
+        store.close();
+        store = new Store(database);
+        expect(store.listProcessCleanups()).toEqual([]);
+        const discoveries = store.listProcessDiscoveries();
+        expect(discoveries).toHaveLength(1);
+        const discovery = discoveries[0];
+        if (!discovery) throw new Error("Missing discovery");
+        expect(discovery.ownerId).toEqual(expect.any(String));
+        expect(discovery.ownerPid).toBe(supervisor.pid);
+        expect(discovery.ownerBirth).toBe(processBirthSync(supervisor.pid));
+        if (outcome === "crash") {
+          supervisor.kill("SIGKILL");
+          await supervisor.exited;
+        } else {
+          const birth = await processBirth(members.grandchild);
+          if (!birth) throw new Error("Missing descendant identity");
+          store.recordProcessCleanup({ ...discovery, pid: members.grandchild, birth });
+        }
+        for (const pid of pids) expect(recoveryProcessStopped(pid)).toBe(false);
+        const cleanups = store.listProcessCleanups();
+        const assertRecovered = () => {
+          if (outcome === "crash") for (const pid of pids) expectProcessStopped(pid);
+          else {
+            for (const pid of [supervisor.pid, ...pids]) expect(recoveryProcessStopped(pid)).toBe(false);
+            expect(store.listProcessDiscoveries()).toEqual(discoveries);
+            expect(store.listProcessCleanups()).toEqual(cleanups);
+          }
+        };
+        if (recovery === "startup") await recoverProcessCleanups(store);
+        else {
+          const sentinel = join(directory, "stage-started");
+          await processScope.run(scope(), async () => {
+            await recoverScopedProcesses();
+            assertRecovered();
+            await runProcess({
+              cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+              cwd: directory,
+              env: {},
+            });
+          });
+          expect(existsSync(sentinel)).toBe(true);
+        }
+        assertRecovered();
+        if (outcome === "live") {
+          writeFileSync(finish, "");
+          await waitFor(() => supervisor.exitCode !== null);
+          expect(await supervisor.exited).toBe(0);
+        }
+        for (const pid of pids) expectProcessStopped(pid);
+        expect(store.listProcessCleanups()).toEqual([]);
+        expect(store.listProcessDiscoveries()).toEqual([]);
+      } finally {
+        if (supervisor.exitCode === null) supervisor.kill("SIGKILL");
+        await supervisor.exited;
+        if (existsSync(ready)) {
+          const members = JSON.parse(readFileSync(ready, "utf8")) as { shell: number; grandchild: number };
+          pids = [members.shell, members.grandchild];
+        }
+        for (const pid of pids) if (!recoveryProcessStopped(pid)) process.kill(pid, "SIGKILL");
+        await waitFor(() => pids.every(recoveryProcessStopped));
       }
-      for (const pid of pids) if (!recoveryProcessStopped(pid)) process.kill(pid, "SIGKILL");
-      await waitFor(() => pids.every(recoveryProcessStopped));
+    }, 30_000);
+  }
+}
+
+function discoveryFor(row: ProcessCleanup, owner: ProcessCleanup): ProcessDiscovery {
+  if (!row.discovery) throw new Error("Missing discovery context");
+  return {
+    runId: row.runId,
+    invocation: row.invocation,
+    directory: row.directory,
+    boot: row.boot,
+    createdAt: row.createdAt,
+    discovery: row.discovery,
+    ownerId: crypto.randomUUID(),
+    ownerPid: owner.pid,
+    ownerBirth: processBirthSync(owner.pid),
+  };
+}
+
+for (const kind of ["legacy", "reused PID"] as const) {
+  test(`discovery recovery supports ${kind} owners after reopening`, async () => {
+    store.close();
+    const database = join(directory, "owners.db");
+    store = new Store(database);
+    const owner = await sleeper();
+    const row = await sleeper();
+    const evidence = discoveryFor(row, owner);
+    if (kind === "legacy") {
+      // The previous release's explicit column list must still work after migration.
+      store.db
+        .query(`INSERT INTO process_discoveries
+        (invocation, run_id, directory, boot, created_at, discovery) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(
+          row.invocation,
+          row.runId,
+          row.directory,
+          row.boot,
+          row.createdAt,
+          JSON.stringify(row.discovery),
+        );
+    } else {
+      evidence.ownerBirth = `different-${evidence.ownerBirth}`;
+      store.recordProcessDiscovery(evidence);
     }
-  }, 30_000);
+    store.recordProcessCleanup(row);
+    store.close();
+    store = new Store(database);
+    const saved = store.listProcessDiscoveries()[0];
+    expect(saved).toEqual(
+      kind === "legacy" ? { ...evidence, ownerId: null, ownerPid: null, ownerBirth: null } : evidence,
+    );
+    await recoverProcessCleanups(store);
+    expectProcessStopped(row.pid);
+    expect(recoveryProcessStopped(owner.pid)).toBe(false);
+    expect(processBirthSync(owner.pid)).toBe(evidence.ownerBirth?.replace(/^different-/, "") ?? null);
+    expect(store.listProcessCleanups()).toEqual([]);
+    expect(store.listProcessDiscoveries()).toEqual([]);
+  });
+}
+
+for (const failure of ["throws", "empty", "ownerId", "ownerPid", "ownerBirth"] as const) {
+  test(`owner inspection ${failure} preserves work and warns once per failure episode`, async () => {
+    store.close();
+    store = new Store(join(directory, "inspection.db"));
+    const owner = await sleeper();
+    const row = await sleeper();
+    const healthy = await sleeper();
+    const evidence = discoveryFor(row, owner);
+    const secret = crypto.randomUUID();
+    registerCredential("TEST_CLEANUP_OWNER_SECRET", secret);
+    evidence.ownerId = secret;
+    const partial = failure !== "throws" && failure !== "empty";
+    const retained = { ...evidence, ...(partial ? { [failure]: null } : {}) };
+    store.recordProcessDiscovery(retained);
+    store.recordProcessCleanup(row);
+    const unrelated = await sleeper();
+    const orphan = discoveryFor(healthy, unrelated);
+    orphan.ownerBirth = `different-${orphan.ownerBirth}`;
+    store.recordProcessDiscovery(orphan);
+    store.recordProcessCleanup(healthy);
+    const inspect = (pid: number) => {
+      if (failure === "throws") throw new Error(`inspection unavailable ${secret}`);
+      if (failure === "empty") return "";
+      return processBirthSync(pid);
+    };
+    // The independent orphan is inspectable even while this owner's inspection fails.
+    const failing = (pid: number) => (pid === owner.pid ? inspect(pid) : processBirthSync(pid));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const recoverBoth = async () => {
+      await recoverProcessCleanups(store);
+      await processScope.run(scope(), recoverScopedProcesses);
+    };
+    try {
+      await processOwnerInspection.run(failing, recoverBoth);
+      expectProcessStopped(healthy.pid);
+      expect(recoveryProcessStopped(row.pid)).toBe(false);
+      expect(recoveryProcessStopped(owner.pid)).toBe(false);
+      expect(store.listProcessDiscoveries()).toEqual([retained]);
+      expect(store.listProcessCleanups()).toEqual([row]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(secret);
+      if (failure === "throws")
+        expect(JSON.stringify(warn.mock.calls)).toContain("inspection unavailable [redacted]");
+      // A confirmed live identity ends the failure episode, including repaired partial metadata.
+      store.db
+        .query(
+          "UPDATE process_discoveries SET owner_id = ?, owner_pid = ?, owner_birth = ? WHERE invocation = ?",
+        )
+        .run(
+          evidence.ownerId ?? null,
+          evidence.ownerPid ?? null,
+          evidence.ownerBirth ?? null,
+          row.invocation,
+        );
+      await recoverBoth();
+      expect(recoveryProcessStopped(row.pid)).toBe(false);
+      if (partial)
+        store.db
+          .query(
+            `UPDATE process_discoveries SET ${
+              failure === "ownerId" ? "owner_id" : failure === "ownerPid" ? "owner_pid" : "owner_birth"
+            } = NULL WHERE invocation = ?`,
+          )
+          .run(row.invocation);
+      await processOwnerInspection.run(failing, recoverBoth);
+      expect(warn).toHaveBeenCalledTimes(2);
+      store.db
+        .query(
+          "UPDATE process_discoveries SET owner_id = ?, owner_pid = ?, owner_birth = ? WHERE invocation = ?",
+        )
+        .run(
+          evidence.ownerId ?? null,
+          evidence.ownerPid ?? null,
+          evidence.ownerBirth ?? null,
+          row.invocation,
+        );
+      process.kill(owner.pid, "SIGKILL");
+      await waitFor(() => processBirthSync(owner.pid) === null);
+      await recoverBoth();
+      expectProcessStopped(row.pid);
+      expect(store.listProcessDiscoveries()).toEqual([]);
+      expect(store.listProcessCleanups()).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+}
+
+for (const failure of ["throws", "missing"] as const) {
+  test(`spawn owner identity ${failure} uses persistence failure cleanup`, async () => {
+    const current = scope();
+    let pid: number | undefined;
+    await processOwnerInspection.run(
+      () => {
+        if (failure === "throws") throw new Error("owner inspection unavailable");
+        return null;
+      },
+      () =>
+        processScope.run(current, async () => {
+          const command = runProcess({
+            cmd: [process.execPath, "-e", "setInterval(() => {}, 1000)"],
+            cwd: directory,
+            env: {},
+            timeoutMs: 100,
+          });
+          pid = [...current.children.keys()][0]?.pid;
+          await expect(command).rejects.toThrow(
+            failure === "throws" ? "owner inspection unavailable" : "Process owner identity is unavailable",
+          );
+        }),
+    );
+    if (pid === undefined) throw new Error("Missing spawned process");
+    expectProcessStopped(pid);
+    expect(store.listProcessDiscoveries()).toEqual([]);
+    expect(store.listProcessCleanups()).toEqual([]);
+  });
 }
 
 test("unknown boot requires current ownership before signalling recorded identities", async () => {
@@ -352,7 +559,13 @@ test("discovery context survives reopening and legacy-column inserts remain comp
   store.recordProcessCleanup(row);
   const { pid: _pid, birth: _birth, ...discovery } = row;
   if (!discovery.discovery) throw new Error("Missing discovery");
-  const evidence: ProcessDiscovery = { ...discovery, discovery: discovery.discovery };
+  const evidence: ProcessDiscovery = {
+    ...discovery,
+    discovery: discovery.discovery,
+    ownerId: crypto.randomUUID(),
+    ownerPid: row.pid,
+    ownerBirth: processBirthSync(row.pid),
+  };
   store.recordProcessDiscovery(evidence);
   store.db
     .query(`INSERT INTO process_cleanups
@@ -969,6 +1182,9 @@ for (const failure of ["inspection", "non-quiescence"] as const) {
       boot: row.boot,
       createdAt: row.createdAt,
       discovery: { group: row.pid, started: 0, directories: [], leader: null, spawnedAt: "0" },
+      ownerId: null,
+      ownerPid: null,
+      ownerBirth: null,
     };
     store.recordProcessDiscovery(evidence);
     const current = scope();
@@ -1070,6 +1286,75 @@ test("discovery scope selection respects run IDs, checkout boundaries and missin
   ).toEqual(["shared", "sibling"]);
 });
 
+for (const recovery of ["startup", "scoped"] as const) {
+  test(`same-owner abandoned invocation recovers through ${recovery} in a fresh scope`, async () => {
+    store.close();
+    store = new Store(join(directory, "abandoned.db"));
+    const failed = scope();
+    const sentinel = join(directory, "stage-started");
+    let descendant: number | undefined;
+    try {
+      await processInspection.run(
+        async () => {
+          throw new Error("injected shutdown scan failure");
+        },
+        () =>
+          processScope.run(failed, async () => {
+            await expect(
+              runProcess({
+                cmd: [
+                  process.execPath,
+                  "-e",
+                  `const child = require('node:child_process').spawn(process.execPath,
+                    ['-e', 'console.log("ready"); setInterval(() => {}, 1000)'],
+                    { stdio: ['ignore', 'pipe', 'ignore'] });
+                  child.stdout.once('data', () => {
+                    console.log(child.pid); child.stdout.destroy(); child.unref();
+                  });`,
+                ],
+                cwd: directory,
+                env: {},
+                onStdoutLine: (line) => {
+                  descendant = Number(line);
+                },
+              }),
+            ).rejects.toThrow("injected shutdown scan failure");
+          }),
+      );
+      expect(failed.terminationError).toBeInstanceOf(ProcessTerminationError);
+      if (descendant === undefined) throw new Error("Missing descendant pid");
+      expect(recoveryProcessStopped(descendant)).toBe(false);
+      const evidence = store.listProcessDiscoveries();
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0]?.ownerPid).toBe(process.pid);
+      expect(evidence[0]?.ownerBirth).toBe(processBirthSync(process.pid));
+      expect(store.listProcessCleanups()).toEqual([]);
+      const pid = descendant;
+      await processScope.run(scope(), async () => {
+        if (recovery === "startup") await recoverProcessCleanups(store);
+        else await recoverScopedProcesses();
+        expectProcessStopped(pid);
+        expect(store.listProcessDiscoveries()).toEqual([]);
+        expect(store.listProcessCleanups()).toEqual([]);
+        expect(existsSync(sentinel)).toBe(false);
+        const result = await runProcess({
+          cmd: [process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(sentinel)}, '')`],
+          cwd: directory,
+          env: {},
+        });
+        expect(result.exitCode).toBe(0);
+      });
+      expect(existsSync(sentinel)).toBe(true);
+    } finally {
+      const pid = descendant;
+      if (pid !== undefined && !recoveryProcessStopped(pid)) {
+        process.kill(pid, "SIGKILL");
+        await waitFor(() => recoveryProcessStopped(pid));
+      }
+    }
+  });
+}
+
 test("live parallel discoveries survive scoped and background startup recovery", async () => {
   const controller = new AbortController();
   const current = { ...scope(), signal: controller.signal };
@@ -1093,6 +1378,12 @@ test("live parallel discoveries survive scoped and background startup recovery",
       await waitFor(() => ready === 2);
       const evidence = store.listProcessDiscoveries();
       expect(evidence).toHaveLength(2);
+      expect(new Set(evidence.map((row) => row.ownerId)).size).toBe(1);
+      for (const row of evidence) {
+        expect(row.ownerId).toEqual(expect.any(String));
+        expect(row.ownerPid).toBe(process.pid);
+        expect(row.ownerBirth).toBe(processBirthSync(process.pid));
+      }
       expect(recorded).toHaveBeenCalledTimes(2);
       await Promise.all([recoverProcessCleanups(store), recoverScopedProcesses()]);
       expect(store.listProcessDiscoveries()).toEqual(evidence);
