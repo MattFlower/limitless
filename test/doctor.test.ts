@@ -142,6 +142,13 @@ for (const [id, status, fix, arrange] of cases)
 test("all checks pass without external effects, and outputs stay read-only", async () => {
   const f = setupFixture('[server]\nport = 7400\n[owners]\ngithub = "acme"\n');
   try {
+    const run = f.d.run;
+    f.d.run = async (args) => {
+      const result = await run(args);
+      return args.join(" ") === "gh api user"
+        ? { ...result, stdout: '{"login":"authenticated-owner"}' }
+        : result;
+    };
     writeFileSync(
       join(f.configDir, "secrets.env"),
       "UNUSED_API_KEY=sk-SENTINEL-read-only\nOPENROUTER_API_KEY=sk-SENTINEL-or\nOMLX_API_KEY=sk-SENTINEL-omlx\nREMOTE_API_KEY=sk-SENTINEL-remote\nTYPESAFE_API_KEY=sk-SENTINEL-typesafe\n",
@@ -157,7 +164,12 @@ test("all checks pass without external effects, and outputs stay read-only", asy
     const before = f.snapshot();
     expect(await setupCommand("doctor", { json: true }, f.d)).toBe(0);
     const summary = JSON.parse(f.output[0] ?? "");
-    expect(summary.checks.map((c: { status: string }) => c.status)).toEqual(Array(14).fill("ok"));
+    expect(summary.checks.map((c: { status: string }) => c.status)).toEqual(Array(15).fill("ok"));
+    expect(summary.checks).toContainEqual({
+      id: "github-identity",
+      status: "ok",
+      message: "owner gh login: authenticated-owner",
+    });
     expect(f.snapshot()).toEqual(before);
     expect(f.effects).toEqual([]);
     expect(f.requests.every((r) => r.method === "GET")).toBe(true);
@@ -479,7 +491,9 @@ for (const owner of [undefined, "", "acme"])
         expect(f.snapshot()).toEqual(before);
       }
       expect(f.effects).toEqual([]);
-      expect(f.commands).not.toContain("gh api user");
+      // Each doctor invocation observes the login without configuring the trusted trigger owner.
+      expect(f.commands.filter((c) => c === "gh api user")).toHaveLength(2);
+      expect(f.d.config.githubOwner).toBe(owner || null);
     } finally {
       f.close();
     }

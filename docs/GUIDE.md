@@ -212,6 +212,7 @@ discovers an owner.
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
+| `[executor] enabled` | `false` | Opt run gates with `[gates] executor = "local"` into the foreground `limitless executor` process when it is alive on the same release. Requires a daemon restart; older releases ignore this key. Land checks remain in the daemon. An unacknowledged stop after an executor crash currently requires process recovery before another gate can start. |
 | `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
@@ -508,6 +509,38 @@ replies with a proposal ID; mention it again with `confirm <id>`, or with `edit 
 change the proposal. Quota alerts are posted to the channel.
 
 ### GitHub
+
+By default, factory GitHub API calls use the owner's `gh` login. To give selected repositories
+an independent factory identity, create and install a GitHub App on those repositories. Give it
+repository permissions: **actions, contents, issues, pull requests and workflows read/write**;
+**checks, statuses and metadata read**. Disable its webhook; the App needs no webhook. The
+existing repository webhook below continues to handle triggers.
+
+Save the App's private key in the config directory and run `chmod 0600` on the key file. Configure
+its App ID, installation ID, key file path and repository list in `config.toml`:
+
+```toml
+[github.app]
+app_id = 123456
+installation_id = 789012
+private_key_path = "github-app.pem" # relative to the config directory, or an absolute file path
+repos = ["<owner>/<repo>"]
+```
+
+All four keys are required when the table is present. The key must be a readable regular file
+with no group or other permissions (0600, or owner-read-only 0400); startup refuses other modes.
+The key comes only from that file, never from an environment variable. Repositories are matched
+case-insensitively. Startup refuses a listed repository with discreet mode enabled, because the
+App's `[bot]` author is a factory mark.
+
+For listed repositories, PRs, comments, issues and merges appear as `<slug>[bot]`. The owner's own
+approval can then satisfy the other-reviewer approval gate. Every other repository continues to
+use the owner's login. An App authentication failure stops the GitHub call; it never switches to
+the owner. Pushes and fetches stay over SSH. `limitless doctor` reports the App slug, the
+installation's repositories and whether token exchange works, and fails for any configured
+repository the installation does not cover. Tokens stay in memory and are withheld from agents
+and gates. These settings require a daemon restart when changed. Older releases ignore these
+keys because the `[github]` table isn't checked for unknown keys.
 
 Create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
 `application/json` and the `GITHUB_WEBHOOK_SECRET`, and select the **Issues**, **Issue comments**

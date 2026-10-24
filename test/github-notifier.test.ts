@@ -1756,3 +1756,19 @@ test.each(["issue", "pull_request"] as const)(
     expect(calls).toHaveLength(0);
   },
 );
+
+test("an App bot merge resolves the run with its actual merger login", async () => {
+  const id = needsHuman();
+  await reconcileMergedRuns(store, async () => ({
+    url: prUrl,
+    state: "MERGED",
+    mergedAt: "2026-09-27T20:00:00Z",
+    mergedBy: { login: "factory[bot]" },
+  }));
+  expect(store.getRun(id)).toMatchObject({
+    status: "resolved",
+    merged: true,
+    mergedBy: "factory[bot]",
+    resolution: { kind: "merged", by: "github" },
+  });
+});

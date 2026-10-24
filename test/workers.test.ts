@@ -1853,6 +1853,7 @@ test.each([true, false, undefined])(
       failedFiles: ["test/a.test.ts"],
       failedFileTimes: { "test/a.test.ts": 1 },
       ...(complete === undefined ? {} : { failureAttributionComplete: complete }),
+      ...(complete === false ? { failureAttributionReason: "1 unattributed error" } : {}),
     };
     expect(
       (await call(`/worker/jobs/${id}/events`, { type: "check", phase: "check", result: original }, token))
@@ -1881,6 +1882,7 @@ test.each([true, false, undefined])(
     const result = run.checks[0];
     if (!result) throw new Error("Missing worker check");
     expect(result.failureAttributionComplete).toBe(complete);
+    expect(result.failureAttributionReason).toBe(complete === false ? "1 unattributed error" : undefined);
     const calls: string[] = [];
     const retried = await retryFailures(
       [{ check, original: result }],
