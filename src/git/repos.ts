@@ -17,7 +17,7 @@ import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { GhRunner } from "../integrations/github.ts";
-import { GitHubIdentityError, githubSh } from "../integrations/github-identity.ts";
+import { GitHubIdentityError, githubSh, githubUrlRepo } from "../integrations/github-identity.ts";
 import { checkDiscreetBranch, DiscreetError } from "../pipeline/markers.ts";
 import {
   CommandError,
@@ -129,7 +129,7 @@ type RemoteOpts = {
   timeoutMs?: number;
   budget?: GitHubBudget;
 };
-const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void) =>
+const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void, repo?: string) =>
   withGitHubRetry(
     () =>
       cmd[0] === "git"
@@ -140,7 +140,7 @@ const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void) =>
               throw new GitHubGuardError("Push guard refused", { cause });
             }
           })
-        : githubSh(cmd, opts),
+        : githubSh(cmd, opts, repo),
     opts,
   ).catch((error) => {
     if (error instanceof GitHubGuardError) throw error.cause;
@@ -192,9 +192,12 @@ export async function resolveRepo(store: Store, input: string, merge: MergePolic
   const slug = `${m[1]}/${m[2]}`;
   const found = store.getRepoBySlug(slug);
   if (found) return found;
-  const view = await remoteSh(["gh", "repo", "view", slug, "--json", "defaultBranchRef,sshUrl"], {
-    cwd: process.cwd(),
-  });
+  const view = await remoteSh(
+    ["gh", "repo", "view", slug, "--json", "defaultBranchRef,sshUrl"],
+    { cwd: process.cwd() },
+    undefined,
+    slug,
+  );
   const info = JSON.parse(view.stdout) as { defaultBranchRef: { name: string } | null; sshUrl: string };
   return store.upsertRepo({
     slug,
@@ -403,10 +406,15 @@ export async function createWorktree(
           if (
             repo.kind === "github" &&
             (gh
-              ? await withGitHubRetry(async () => (await gh(prLookup(repo, candidate).slice(1))) ?? "", {
-                  budget,
-                })
-              : (await remoteSh(prLookup(repo, candidate), { cwd: cache, budget })).stdout
+              ? await withGitHubRetry(
+                  async () =>
+                    (await gh(prLookup(repo, candidate).slice(1), undefined, undefined, repo.slug)) ?? "",
+                  {
+                    budget,
+                  },
+                )
+              : (await remoteSh(prLookup(repo, candidate), { cwd: cache, budget }, undefined, repo.slug))
+                  .stdout
             ).trim()
           )
             continue;
@@ -1752,6 +1760,7 @@ async function lookupIdentityPr(
     const res = await githubSh(
       ["gh", "pr", "view", identity.prUrl, "--repo", repo.slug, "--json", "url,headRefOid"],
       { cwd, signal, timeoutMs: 15_000 },
+      repo.slug,
     );
     const pr: unknown = JSON.parse(res.stdout || "null");
     if (!matchesPullRequest(pr, identity) || !isHttpUrl(pr.url))
@@ -1764,6 +1773,7 @@ async function lookupIdentityPr(
   const res = await githubSh(
     ["gh", "api", "--paginate", "--slurp", `repos/${repo.slug}/pulls?head=${head}&state=all&per_page=100`],
     { cwd, signal, timeoutMs: 15_000 },
+    repo.slug,
   );
   // gh follows the Link headers to completion; a failed later page fails the whole command.
   const pages = z
@@ -1803,7 +1813,7 @@ export async function createPullRequest(
   const find = () =>
     opts.identity
       ? lookupIdentityPr(repo, opts.branch, cwd, opts.identity, signal)
-      : githubSh(prLookup(repo, opts.branch), { cwd, signal }).then(
+      : githubSh(prLookup(repo, opts.branch), { cwd, signal }, repo.slug).then(
           (r) => lookupUrl(r.stdout, opts.identity),
           (e) =>
             e instanceof GitHubIdentityError || isTransient(e) || signal?.aborted ? Promise.reject(e) : "",
@@ -1822,7 +1832,7 @@ export async function createPullRequest(
     if (reportedExisting) throw lagging();
     const create = ["gh", "pr", "create", "--repo", repo.slug, "--head", opts.branch, "--base", opts.base];
     const args = [...create, "--title", opts.title, "--body-file", "-", ...(opts.draft ? ["--draft"] : [])];
-    const res = await githubSh(args, { cwd, stdin: opts.body, signal }).catch(async (e) => {
+    const res = await githubSh(args, { cwd, stdin: opts.body, signal }, repo.slug).catch(async (e) => {
       if (!(e instanceof CommandError && e.stderr.includes("already exists"))) throw e;
       reportedExisting = true;
       const again = await find();
@@ -1834,11 +1844,14 @@ export async function createPullRequest(
   }, opts);
   if (!isHttpUrl(url)) throw new Error(`gh pr create returned unexpected output: ${url}`);
   if (existing)
-    await remoteSh(["gh", "pr", "edit", url, "--body-file", "-"], { ...opts, stdin: opts.body }).catch(
-      (e) => {
-        if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
-      },
-    );
+    await remoteSh(
+      ["gh", "pr", "edit", url, "--body-file", "-"],
+      { ...opts, stdin: opts.body },
+      undefined,
+      repo.slug,
+    ).catch((e) => {
+      if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
+    });
   return url;
 }
 
@@ -1859,12 +1872,16 @@ export async function findPullRequest(
   identity?: PullRequestIdentity,
 ): Promise<string | null> {
   if (identity) return (await lookupIdentityPr(repo, branch, cwd, identity, signal)) || null;
-  const res = await githubSh(prLookup(repo, branch, identity), {
-    cwd,
-    signal,
-    timeoutMs: 15_000,
-    allowFail: true,
-  }).catch((e) => {
+  const res = await githubSh(
+    prLookup(repo, branch, identity),
+    {
+      cwd,
+      signal,
+      timeoutMs: 15_000,
+      allowFail: true,
+    },
+    repo.slug,
+  ).catch((e) => {
     if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
     return null;
   });
@@ -1894,6 +1911,7 @@ export async function mergePullRequest(
     onFailure?: (reason: string) => void;
   } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
+  const repo = githubUrlRepo(prUrl);
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
@@ -1906,7 +1924,8 @@ export async function mergePullRequest(
   const landed = async () => {
     blocked = true;
     const view = ["gh", "pr", "view", prUrl, "--json", "state,headRefOid"];
-    const merged = verifiedState(JSON.parse((await githubSh(view, { cwd, signal })).stdout)) === "MERGED";
+    const merged =
+      verifiedState(JSON.parse((await githubSh(view, { cwd, signal }, repo)).stdout)) === "MERGED";
     unsure = false;
     blocked = false;
     return merged;
@@ -1917,7 +1936,7 @@ export async function mergePullRequest(
         if (unsure && (await landed())) return "merged" as const;
         blocked = true;
         const view = ["gh", "pr", "view", prUrl, "--json", "title,body,headRefOid,state"];
-        const input: unknown = JSON.parse((await githubSh(view, { cwd, signal })).stdout);
+        const input: unknown = JSON.parse((await githubSh(view, { cwd, signal }, repo)).stdout);
         if (verifiedState(input) === "MERGED") return "merged" as const;
         const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
         const data = schema.parse(input);
@@ -1937,7 +1956,7 @@ export async function mergePullRequest(
         } catch (cause) {
           throw new GitHubGuardError("Merge guard refused", { cause });
         }
-        return githubSh(cmd, { cwd, signal, stdin: body }).then(
+        return githubSh(cmd, { cwd, signal, stdin: body }, repo).then(
           () => "ok" as const,
           async (e) => {
             if (signal?.aborted || !isTransient(e)) throw e;
@@ -1969,7 +1988,11 @@ export async function mergePullRequest(
 
 /** Turn off a PR's auto-merge, so no later push can land without the factory checking it. */
 export async function disableAutoMerge(prUrl: string, cwd: string, signal?: AbortSignal): Promise<void> {
-  await githubSh(["gh", "pr", "merge", prUrl, "--disable-auto"], { cwd, signal, allowFail: true });
+  await githubSh(
+    ["gh", "pr", "merge", prUrl, "--disable-auto"],
+    { cwd, signal, allowFail: true },
+    githubUrlRepo(prUrl),
+  );
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */

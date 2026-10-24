@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { generateKeyPairSync, randomUUID, verify } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { Factory } from "../src/app.ts";
+import { startDaemon } from "../src/cli/daemon.ts";
 import { doctor } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
@@ -13,14 +15,19 @@ import {
   mergePullRequest,
   resolveRepo,
 } from "../src/git/repos.ts";
+import { homeReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
 import { mapGitHubEvent, runGh } from "../src/integrations/github.ts";
 import {
   configureGitHubIdentity,
   createGitHubIdentity,
+  GitHubIdentityError,
   githubIdentity,
+  githubRepo,
+  githubSh,
 } from "../src/integrations/github-identity.ts";
 import { getGitHubPr } from "../src/integrations/github-notifier.ts";
 import { ghClient, startGitHubPoller } from "../src/integrations/github-poller.ts";
+import { privateReadPaths } from "../src/util/private-reads.ts";
 import * as proc from "../src/util/proc.ts";
 import { pollerHarness } from "./github-poller-support.ts";
 import { setupFixture } from "./setup-support.ts";
@@ -77,6 +84,189 @@ function endpoint(start = Date.parse("2026-10-01T00:00:00Z")) {
     exchanges: () => exchanges,
   };
 }
+
+test.each(["regular", "symlink", "absent", "startup failure"])(
+  "daemon protects the App key before mounting and releases it: %s",
+  async (kind) => {
+    const external = mkdtempSync(join(tmpdir(), "github-key-"));
+    const target = join(external, "key.pem");
+    writeFileSync(target, pem, { mode: 0o600 });
+    const path = kind === "symlink" ? join(external, "link.pem") : target;
+    if (kind === "symlink") symlinkSync(target, path);
+    const cfg = config(kind === "absent" ? null : { ...appTable(), private_key_path: path });
+    cfg.port = 0;
+    const store = new Store(":memory:");
+    const factory = new Factory(cfg, { store, models: [], providers: [], bootSha: "f".repeat(40) });
+    const start = spyOn(factory, "start").mockImplementation(() => {});
+    let daemon: Awaited<ReturnType<typeof startDaemon>> | undefined;
+    const spellings = [...new Set([resolve(path), realpathSync(path)])];
+    const check = () => {
+      for (const spelling of spellings) {
+        expect(privateReadPaths().includes(spelling)).toBe(kind !== "absent");
+        const deny = readPolicyScope.run({ home: dir, environment: {} }, () => homeReadPolicy([]));
+        expect(deny.denyRead.includes(spelling)).toBe(kind !== "absent");
+      }
+    };
+    try {
+      const pending = startDaemon(factory, {}, async () => {
+        check();
+        if (kind === "startup failure") throw new Error("mount failed");
+        return { routes: {}, notes: [], stop: async () => {} };
+      });
+      if (kind === "startup failure") await expect(pending).rejects.toThrow("mount failed");
+      else {
+        daemon = await pending;
+        check();
+      }
+    } finally {
+      await daemon?.server.stop(true);
+      start.mockRestore();
+      await factory.stop();
+      store.close();
+      rmSync(external, { recursive: true, force: true });
+    }
+    for (const spelling of spellings) expect(privateReadPaths()).not.toContain(spelling);
+  },
+);
+
+test("repository parser recognizes structured references", () => {
+  for (const args of [
+    ["pr", "view", "--repo", "o/r"],
+    ["pr", "view", "-R", "o/r"],
+    ["pr", "view", "--repo=o/r"],
+    ["pr", "view", "-R=o/r"],
+    ["pr", "view", "https://github.com/o/r/pull/1"],
+    ["repo", "view", "https://github.com/o/r"],
+    ["api", "repos/o/r/issues/1"],
+    ["repo", "view", "o/r"],
+  ])
+    expect(githubRepo(args)).toBe("o/r");
+});
+
+test.each([
+  "--body",
+  "-b",
+  "--body-file",
+  "--subject",
+  "--title",
+  "-t",
+  "-f",
+  "-F",
+  "--field",
+  "--raw-field",
+  "--jq",
+  "-q",
+  "--json",
+  "--template",
+  "--match-head-commit",
+  "--head",
+  "-H",
+  "--header",
+  "--base",
+  "-B",
+  "--state",
+  "--method",
+  "-X",
+  "--input",
+  "--limit",
+  "-L",
+  "--label",
+  "-l",
+  "--search",
+])("repository parser skips %s values", (flag) => {
+  for (const value of [
+    "--repo",
+    "-R",
+    "--repo=x/y",
+    "--repo x/y",
+    "https://github.com/x/y/pull/2",
+    "repos/x/y/issues",
+    "body=--repo x/y",
+  ]) {
+    expect(githubRepo(["pr", "create", flag, value, "--repo", "o/r"])).toBe("o/r");
+    expect(githubRepo(["api", flag, value])).toBeUndefined();
+    expect(githubRepo(["pr", "create", `${flag}=${value}`])).toBeUndefined();
+  }
+});
+
+test("explicit repositories reject conflicting references before gh starts, but ignore field values", async () => {
+  const e = endpoint();
+  configureGitHubIdentity(config().githubApp, e);
+  const runner = spyOn(proc, "runProcess").mockResolvedValue(success(""));
+  try {
+    for (const [repo, other] of [
+      ["o/r", "x/y"],
+      ["x/y", "o/r"],
+    ]) {
+      for (const reference of [
+        [`https://github.com/${other}/pull/1`],
+        ["--repo", other ?? ""],
+        ["-R", other ?? ""],
+        [`--repo=${other}`],
+        [`repos/${other}/issues/1`],
+        ["--repo", repo ?? "", `https://github.com/${other}/pull/1`],
+      ]) {
+        await expect(githubSh(["gh", "pr", "view", ...reference], { cwd: dir }, repo)).rejects.toBeInstanceOf(
+          GitHubIdentityError,
+        );
+      }
+    }
+    expect(runner).not.toHaveBeenCalled();
+    expect(e.exchanges()).toBe(0);
+    await githubSh(["gh", "pr", "view", "https://github.com/o/r/pull/1"], { cwd: dir }, "O/R");
+    for (const value of ["body=--repo x/y", "body=https://github.com/x/y/pull/2"]) {
+      await githubSh(["gh", "api", "repos/o/r/issues/1/comments", "-f", value], { cwd: dir }, "o/r");
+    }
+    for (const [flag, value] of [
+      ["--body", "--repo"],
+      ["--title", "https://github.com/x/y/pull/9"],
+    ]) {
+      await githubSh(
+        ["gh", "pr", "edit", "https://github.com/o/r/pull/1", flag ?? "", value ?? ""],
+        { cwd: dir },
+        "o/r",
+      );
+    }
+    expect(runner).toHaveBeenCalledTimes(5);
+    for (const [opts] of runner.mock.calls) expect(opts.env.GH_TOKEN).toBe(e.token);
+  } finally {
+    runner.mockRestore();
+  }
+});
+
+test.each(["permissions", "symlink", "directory"])("signing refuses a changed key: %s", async (kind) => {
+  const e = endpoint();
+  const app = config().githubApp;
+  if (!app) throw new Error("missing App config");
+  configureGitHubIdentity(app, e);
+  const runner = spyOn(proc, "runProcess").mockResolvedValue(success(""));
+  try {
+    if (kind === "permissions") {
+      await githubSh(["gh", "pr", "view", "1"], { cwd: dir }, "o/r");
+      chmodSync(keyPath, 0o644);
+      e.advance(3300_000);
+    } else {
+      const path = join(dir, "replacement");
+      if (kind === "symlink") symlinkSync(keyPath, path);
+      else mkdirSync(path);
+      configureGitHubIdentity({ ...app, privateKeyPath: path }, e);
+    }
+    runner.mockClear();
+    const requests = e.paths.length;
+    const error = await githubSh(["gh", "pr", "create", "--repo", "o/r"], { cwd: dir }).catch(
+      (error: unknown) => error,
+    );
+    expect(error).toBeInstanceOf(GitHubIdentityError);
+    expect(String(error)).toMatch(
+      kind === "permissions" ? /0644/ : kind === "symlink" ? /symlink/i : /not a regular file/,
+    );
+    expect(String(error)).not.toContain("-----BEGIN");
+    expect(e.paths).toHaveLength(requests);
+    expect(runner).not.toHaveBeenCalled();
+  } finally {
+    runner.mockRestore();
+  }
+});
 
 test("optional App config normalizes IDs, repositories and relative key paths", () => {
   expect(config(null).githubApp).toBeNull();
@@ -199,7 +389,7 @@ test("all gh entry points inject the App token, while owner calls retain their e
           state: "OPEN",
           headRefOid: sha,
           title: "change",
-          body: "body",
+          body: "--repo",
           mergedAt: null,
           mergedBy: null,
         }),
@@ -215,21 +405,23 @@ test("all gh entry points inject the App token, while owner calls retain their e
     await createPullRequest(repo, {
       branch: "change",
       base: "main",
-      title: "change",
-      body: "body",
+      title: "--repo",
+      body: "https://github.com/x/y/pull/9",
       cwd: dir,
     });
     existing = true;
     await createPullRequest(repo, {
       branch: "change",
       base: "main",
-      title: "change",
-      body: "body",
+      title: "--repo",
+      body: "https://github.com/x/y/pull/9",
       cwd: dir,
     });
     await findPullRequest(repo, "change", dir);
     await mergePullRequest(pr, dir, sha, undefined, undefined, [], { auto: false });
     await disableAutoMerge(pr, dir);
+    expect(calls.some((call) => call.cmd[2] === "merge" && call.cmd.includes("--body"))).toBe(true);
+    expect(calls.some((call) => call.cmd[2] === "edit")).toBe(true);
     expect(calls.length).toBeGreaterThan(10);
     for (const call of calls) expect(call.env.GH_TOKEN).toBe(e.token);
     expect(e.exchanges()).toBe(1);
@@ -244,6 +436,38 @@ test("all gh entry points inject the App token, while owner calls retain their e
   } finally {
     store.close();
     runner.mockRestore();
+  }
+});
+
+test("PR recovery and edits refuse a URL outside the helper's known repository", async () => {
+  const e = endpoint();
+  configureGitHubIdentity(config().githubApp, e);
+  const store = new Store(":memory:");
+  const repo = store.upsertRepo({
+    slug: "o/r",
+    kind: "github",
+    url: "git@github.com:o/r.git",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const pr = "https://github.com/x/y/pull/9";
+  const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) =>
+    success(opts.cmd[2] === "view" ? JSON.stringify({ url: pr, headRefOid: "a".repeat(40) }) : pr),
+  );
+  try {
+    await expect(
+      findPullRequest(repo, "change", dir, undefined, { headSha: "a".repeat(40), prUrl: pr }),
+    ).rejects.toBeInstanceOf(GitHubIdentityError);
+    expect(runner).not.toHaveBeenCalled();
+    await expect(
+      createPullRequest(repo, { branch: "change", base: "main", title: "--repo", body: pr, cwd: dir }),
+    ).rejects.toBeInstanceOf(GitHubIdentityError);
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(runner.mock.calls[0]?.[0].cmd[2]).toBe("list");
+  } finally {
+    runner.mockRestore();
+    store.close();
   }
 });
 

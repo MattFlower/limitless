@@ -1,5 +1,5 @@
 import { sign } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import { redactCredentials, registerCredential, sh } from "../util/proc.ts";
@@ -9,6 +9,31 @@ export class GitHubIdentityError extends Error {}
 
 type App = Config["githubApp"];
 type IdentityDeps = { fetch?: (url: string, init?: RequestInit) => Promise<Response>; now?: () => number };
+
+function signingKey(path: string): Buffer {
+  let fd: number;
+  try {
+    // A replacement FIFO must reach the regular-file check without blocking the daemon.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    const reason = (error as NodeJS.ErrnoException).code === "ELOOP" ? "symlink refused" : "cannot open file";
+    throw new GitHubIdentityError(`GitHub App private key ${path}: ${reason}`);
+  }
+  try {
+    const stat = fstatSync(fd);
+    const reason = !stat.isFile()
+      ? "not a regular file"
+      : stat.uid !== process.getuid?.()
+        ? "wrong owner"
+        : stat.mode & 0o077
+          ? `mode 0${(stat.mode & 0o777).toString(8)} permits group or other access`
+          : undefined;
+    if (reason) throw new GitHubIdentityError(`GitHub App private key ${path}: ${reason}`);
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /** Each configured provider owns its cache; concurrent requests share the exchange. */
 export function createGitHubIdentity(app: App, deps: IdentityDeps = {}) {
@@ -61,8 +86,9 @@ export function createGitHubIdentity(app: App, deps: IdentityDeps = {}) {
       const payload = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iss: app.appId, iat: seconds - 30, exp: seconds + 540 })}`;
       let jwt: string;
       try {
-        jwt = `${payload}.${sign("RSA-SHA256", Buffer.from(payload), readFileSync(app.privateKeyPath)).toString("base64url")}`;
-      } catch {
+        jwt = `${payload}.${sign("RSA-SHA256", Buffer.from(payload), signingKey(app.privateKeyPath)).toString("base64url")}`;
+      } catch (error) {
+        if (error instanceof GitHubIdentityError) throw error;
         throw new GitHubIdentityError(
           "GitHub App token exchange failed: HTTP unavailable: cannot read or sign with private key",
         );
@@ -101,24 +127,50 @@ export function configureGitHubIdentity(app: App, deps: IdentityDeps = {}) {
 }
 export const githubIdentity = (repo?: string) => provider(repo);
 
-/** Only structured repository arguments select an identity; GraphQL callers pass the repo explicitly. */
-export function githubRepo(args: string[]): string | undefined {
-  const flag = args.findIndex((a) => a === "--repo" || a === "-R");
-  if (flag >= 0) return args[flag + 1];
-  if (args[0] === "repo" && args[1] === "view") return args[2];
-  for (const arg of args) {
-    const match = /^(?:https:\/\/github\.com\/|\/?repos\/)([^/]+\/[^/?#]+)(?:[/?#]|$)/.exec(arg);
-    if (match) return match[1];
+/** Parse a single repository/PR URL, never arbitrary command text. */
+export const githubUrlRepo = (url: string): string | undefined =>
+  /^https:\/\/github\.com\/([^/]+\/[^/?#]+)(?:[/?#]|$)/i.exec(url)?.[1];
+
+const valueFlags = new Set(
+  `--body -b --body-file --subject --title -t -f -F --field --raw-field --jq -q --json --template
+   --match-head-commit --head -H --header --base -B --state --method -X --input --limit -L
+   --label -l --search --commit --hostname --author --assignee --milestone --project`.split(/\s+/),
+);
+
+function githubRepos(args: string[]): string[] {
+  const flags: string[] = [];
+  const positional: string[] = [];
+  let options = true;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? "";
+    if (options && arg === "--") {
+      options = false;
+      continue;
+    }
+    if (options && arg.startsWith("-")) {
+      const [flag = "", value] = arg.split(/=(.*)/s);
+      if (flag === "--repo" || flag === "-R") {
+        const repo = value ?? args[++i];
+        if (repo) flags.push(repo);
+      } else if (value === undefined && valueFlags.has(flag)) i++;
+      continue;
+    }
+    const repo = githubUrlRepo(arg) ?? /^\/?repos\/([^/]+\/[^/?#]+)(?:[/?#]|$)/.exec(arg)?.[1];
+    if (repo) positional.push(repo);
+    else if (args[0] === "repo" && args[1] === "view" && i >= 2 && /^[\w.-]+\/[\w.-]+$/.test(arg))
+      positional.push(arg);
   }
-  return undefined;
+  return [...flags, ...positional];
 }
 
-export async function githubSh(
-  cmd: string[],
-  opts: Parameters<typeof sh>[1],
-  repo = githubRepo(cmd.slice(1)),
-) {
-  const identity = await githubIdentity(repo);
+/** Only structured repository arguments select an identity; GraphQL callers pass the repo explicitly. */
+export const githubRepo = (args: string[]): string | undefined => githubRepos(args)[0];
+
+export async function githubSh(cmd: string[], opts: Parameters<typeof sh>[1], repo?: string) {
+  const references = githubRepos(cmd.slice(1));
+  if (repo && references.some((ref) => ref.toLowerCase() !== repo.toLowerCase()))
+    throw new GitHubIdentityError(`GitHub repository arguments disagree with explicit repository ${repo}`);
+  const identity = await githubIdentity(repo ?? references[0]);
   return sh(
     cmd,
     identity.kind === "app"

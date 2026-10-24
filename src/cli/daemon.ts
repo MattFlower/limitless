@@ -56,6 +56,7 @@ async function startScopedDaemon(
       mkdirSync(home, { recursive: true, mode: 0o700 });
       for (const file of files) privateFiles.push(protectPrivateFile(join(home, file)));
     }
+    if (factory.cfg.githubApp) privateFiles.push(protectPrivateFile(factory.cfg.githubApp.privateKeyPath));
     workers = await startWorkerListener(factory.workers, factory.cfg.paths, factory.cfg.workers.listen);
     integrations = await mount(factory);
     server = await startHttp(

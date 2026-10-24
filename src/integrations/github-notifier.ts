@@ -5,7 +5,7 @@ import type { Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { type GhRunner, runGh } from "./github.ts";
-import { githubSh } from "./github-identity.ts";
+import { githubSh, githubUrlRepo } from "./github-identity.ts";
 import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
 
 export interface GitHubPrState {
@@ -50,6 +50,7 @@ export const getGitHubPr = async (url: string, signal?: AbortSignal): Promise<Gi
   const { stdout } = await githubSh(
     ["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy,headRefOid,statusCheckRollup"],
     { cwd: process.cwd(), timeoutMs: 30_000, signal },
+    githubUrlRepo(url),
   );
   const view = JSON.parse(stdout) as GhPrView;
   const { ci, failing } = rollup(view.statusCheckRollup);
@@ -93,6 +94,8 @@ export async function getGitHubCiRuns(repo: string, sha: string, signal: AbortSi
       "databaseId,headSha,attempt,status,conclusion",
     ],
     signal,
+    undefined,
+    repo,
   );
   return ciRunsSchema.parse(JSON.parse(String(json))).filter((run) => run.headSha === sha);
 }
@@ -327,7 +330,7 @@ export function startGitHubNotifier(
       body,
     ];
     void track(
-      gh(args, abort.signal).catch((error: unknown) => {
+      gh(args, abort.signal, undefined, ref.repo).catch((error: unknown) => {
         if (!abort.signal.aborted) log(`GitHub comment failed for ${run.id}: ${String(error)}`);
       }),
     );

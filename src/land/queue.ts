@@ -38,7 +38,7 @@ import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
-import { githubIdentity } from "../integrations/github-identity.ts";
+import { githubIdentity, githubUrlRepo } from "../integrations/github-identity.ts";
 import {
   ciRunsSchema,
   type GitHubPrView,
@@ -286,13 +286,18 @@ export class LandQueue {
     if (repo?.kind !== "github")
       throw new Error(`repository ${match[1]} is not a configured GitHub repository`);
     if (!input.sha?.trim()) throw new Error("a pull request no factory run opened needs --sha <full sha>");
-    const json = await (this.deps.gh ?? runGh)([
-      "pr",
-      "view",
-      input.target,
-      "--json",
-      "url,state,headRefOid,headRefName,baseRefName,title,isCrossRepository",
-    ]);
+    const json = await (this.deps.gh ?? runGh)(
+      [
+        "pr",
+        "view",
+        input.target,
+        "--json",
+        "url,state,headRefOid,headRefName,baseRefName,title,isCrossRepository",
+      ],
+      undefined,
+      undefined,
+      repo.slug,
+    );
     const pr = z
       .object({
         url: z.string(),
@@ -337,7 +342,12 @@ export class LandQueue {
       typeof branch === "string" && isBranchName(branch) && branch !== headBranch;
     if (owner?.sourceRef?.kind !== "review-round" && valid(owner?.baseBranch)) return owner.baseBranch;
     try {
-      const json = await (this.deps.gh ?? runGh)(["pr", "view", prUrl, "--json", "baseRefName"], signal);
+      const json = await (this.deps.gh ?? runGh)(
+        ["pr", "view", prUrl, "--json", "baseRefName"],
+        signal,
+        undefined,
+        (run && this.store.getRepo(run.repoId)?.slug) || githubUrlRepo(prUrl),
+      );
       const view = z.object({ baseRefName: z.string() }).safeParse(JSON.parse(String(json)));
       if (view.success && valid(view.data.baseRefName)) return view.data.baseRefName;
     } catch {
@@ -493,6 +503,8 @@ export class LandQueue {
           (this.deps.gh ?? runGh)(
             ["pr", "view", entry.prUrl, "--json", "url,state,isDraft,headRefOid,mergedBy,mergedAt"],
             signal,
+            undefined,
+            entry.repo,
           ),
         { signal },
       );
