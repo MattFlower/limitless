@@ -2294,7 +2294,12 @@ async function oneRound(
         }
       } catch (error) {
         // A reader or cleanup error must not hide a commit moved by its sibling.
-        if (!(error instanceof CancelledError || error instanceof SimulatedTermination))
+        if (
+          !(error instanceof CancelledError || error instanceof SimulatedTermination) &&
+          !(
+            error instanceof NeedsHumanError && error.message.startsWith("Commit changed during verification")
+          )
+        )
           await checkVerifiedHead();
         throw error;
       }

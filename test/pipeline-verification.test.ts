@@ -48,6 +48,7 @@ for (const evidence of [
   "suite",
   "different-sha",
   "different-sha-review-first",
+  "different-sha-reinspection-failed",
   "different-sha-inspection-failed",
   "different-sha-cleanup-failed",
   "different-sha-review-failed",
@@ -130,6 +131,8 @@ afterAll(async () => {
     let attempts = 0;
     let initialGateSha = "";
     const movedCommit = evidence.startsWith("different-sha");
+    const reviewFirst =
+      evidence === "different-sha-review-first" || evidence === "different-sha-reinspection-failed";
     const verifyReady = deferred<void>();
     const reviewFinished = deferred<void>();
     const verifyFinished = deferred<void>();
@@ -137,7 +140,7 @@ afterAll(async () => {
     let failCleanup = false;
     const originalHead = repos.headSha;
     const headInspection =
-      evidence === "different-sha-inspection-failed"
+      evidence === "different-sha-inspection-failed" || evidence === "different-sha-reinspection-failed"
         ? spyOn(repos, "headSha").mockImplementation(async (cwd) => {
             if (failHeadInspection) {
               failHeadInspection = false;
@@ -173,7 +176,7 @@ afterAll(async () => {
         if (movedCommit) {
           initialGateSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
           await verifyReady.promise;
-          if (evidence !== "different-sha-review-first") await verifyFinished.promise;
+          if (!reviewFirst) await verifyFinished.promise;
           await sh(["git", "commit", "--allow-empty", "-qm", "advance after gates"], { cwd: s.cwd });
           failCleanup = evidence === "different-sha-cleanup-failed";
         }
@@ -182,7 +185,7 @@ afterAll(async () => {
       if (role === "verify") {
         attempts++;
         verifyReady.resolve();
-        if (evidence === "different-sha-review-first") await reviewFinished.promise;
+        if (reviewFirst) await reviewFinished.promise;
         failHeadInspection = evidence === "different-sha-inspection-failed";
         return {
           structured: {
@@ -219,7 +222,11 @@ afterAll(async () => {
       if (message.kind === "stage" && message.stage.status === "cancelled") interrupted.resolve();
       if (message.kind === "stage" && message.stage.status !== "running") {
         if (message.stage.name === "review") reviewFinished.resolve();
-        if (message.stage.name === "verify") verifyFinished.resolve();
+        if (message.stage.name === "verify") {
+          // Verification has already observed the moved HEAD; a later inspection is unavailable.
+          if (evidence === "different-sha-reinspection-failed") failHeadInspection = true;
+          verifyFinished.resolve();
+        }
       }
     });
     const run = await f.createRun({
@@ -293,9 +300,7 @@ afterAll(async () => {
         evidence === "different-sha-review-failed" ? "failed" : "succeeded",
       );
       expect(f.store.listStages(run.id).find((stage) => stage.name === "verify")?.status).toBe(
-        evidence === "different-sha-review-first" || evidence === "different-sha-inspection-failed"
-          ? "failed"
-          : "succeeded",
+        reviewFirst || evidence === "different-sha-inspection-failed" ? "failed" : "succeeded",
       );
       return;
     }
