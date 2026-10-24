@@ -7,6 +7,7 @@ import { checkPublicationText } from "../gates/publication.ts";
 import { type GhRunner, runGh } from "./github.ts";
 import { githubSh, githubUrlRepo } from "./github-identity.ts";
 import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
+import { lifecycleManaged } from "./issue-lifecycle.ts";
 
 export interface GitHubPrState {
   url: string;
@@ -242,7 +243,7 @@ export function startGitHubNotifier(
   client: GitHubPrClient = getGitHubPr,
   configDir?: string,
   roots: string[] = [],
-  cfg: Pick<Config, "repos"> = {},
+  cfg: Partial<Pick<Config, "repos" | "githubQueue">> = {},
 ): () => Promise<void> {
   const seen = new Set<string>();
   const abort = new AbortController();
@@ -294,8 +295,8 @@ export function startGitHubNotifier(
       typeof ref.number !== "number"
     )
       return;
-    // Queue issue lifecycle messages wait for Q1b's App identity.
-    if (ref.kind === "issue" && ref.via === "queue") return;
+    // Managed issue comments are durably reconciled by the queue.
+    if (ref.kind === "issue" && (ref.via === "queue" || lifecycleManaged(cfg, ref.repo))) return;
     // A resolution follows the terminal comment already posted for needs_human or failed.
     if (run.status === "resolved") return;
     if (ref.kind === "pull_request" && run.status === "cancelled" && run.error?.startsWith("superseded:"))

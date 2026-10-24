@@ -4,6 +4,7 @@ import type { Run } from "../core/types.ts";
 import { ISSUE_CLAIM_STATUSES } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { type GhRunner, issueRunRequest, runGh } from "./github.ts";
+import { reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
 const actor = z.object({ login: z.string() }).nullable();
@@ -60,6 +61,12 @@ export function issueEligibility(
   const events = issue.timelineItems.nodes
     .filter((e) => e.__typename === "LabeledEvent")
     .filter((e) => priority(e.label.name));
+  const failedAt = Math.max(
+    -Infinity,
+    ...issue.timelineItems.nodes
+      .filter((e) => e.__typename === "LabeledEvent" && e.label.name === "limitless:failed")
+      .map((e) => Date.parse(e.createdAt)),
+  );
   const rename = issue.timelineItems.nodes
     .toReversed()
     .filter((e) => e.__typename === "RenamedTitleEvent")
@@ -84,8 +91,14 @@ export function issueEligibility(
   else if (issue.blockedBy.nodes.some((b) => b.state !== "CLOSED")) reason = "open native blocker";
   else if (blockers(issue.body).some((n) => context.blockers?.get(n) !== "CLOSED"))
     reason = "open or unresolved body blocker";
-  else if (issue.labels.nodes.some((l) => ["limitless:in-progress", "limitless:failed"].includes(l.name)))
+  else if (issue.labels.nodes.some((l) => l.name === "limitless:in-progress"))
     reason = "factory status label";
+  else if (
+    issue.labels.nodes.some((l) => l.name === "limitless:failed") &&
+    (!Number.isFinite(failedAt) ||
+      !events.some((e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > failedAt))
+  )
+    reason = "factory status requires priority re-approval after failure";
   else if (issue.closedByPullRequestsReferences.nodes.some((p) => p.state === "OPEN"))
     reason = "open closing PR";
   else if (
@@ -175,6 +188,7 @@ export function startIssueQueue(
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     try {
+      await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log);
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         try {

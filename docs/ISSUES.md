@@ -7,8 +7,24 @@ budget small enough to review. Issue text is quoted data in agent prompts.
 Apply `priority:0` through `priority:10` to approve an issue for the queue. Lower numbers
 are more urgent: 0 is urgent, 1–3 are everyday work. If several current priority labels
 have trusted applications, the most urgent wins. The factory reserves
-`limitless:in-progress`, `limitless:needs-you`, and `limitless:failed`. Q1b will manage
-these lifecycle labels and comments; this slice makes no GitHub writes.
+`limitless:in-progress`, `limitless:needs-you`, and `limitless:failed`.
+For issue-linked runs in enabled queue repositories, each poll reconciles:
+
+| Event | Labels | Comment |
+|---|---|---|
+| Run starts | in-progress; remove needs-you and failed | Run id and UI link |
+| PR opened | in-progress | PR link; PR body carries `Closes #n` |
+| needs_human | needs-you; remove in-progress | Reason |
+| Failed | failed; remove in-progress | Reason |
+| Cancelled | remove in-progress | Cancellation |
+| PR merged | remove in-progress and needs-you | None; GitHub closes the issue |
+
+These effects have durable checkpoints; restarts do not duplicate comments. Runs created
+before lifecycle support receive no retroactive updates. Discreet repositories receive
+labels without comments. Text is credential-redacted and checked against private strings;
+blocked text is replaced with a fixed message directing readers to the factory UI.
+Writes use the GitHub App identity where `[github.app]` covers the repository, otherwise
+`gh` credentials. Write failures are logged and retried next poll without blocking runs.
 
 An issue with GitHub sub-issues is an epic and is never built itself. Finish each epic
 with an acceptance sub-issue blocked by its other sub-issues (as in #818 and #819).
@@ -43,7 +59,7 @@ checked for unknown keys, so rollback remains supported.
 
 ## Eligibility and ordering
 
-The queue reads open issues through GitHub GraphQL using the existing `gh` credential.
+The queue reads open issues through GitHub GraphQL using the configured repository identity.
 An issue is eligible only when:
 
 - Its author is trusted, and its body was never edited or its last editor is trusted.
@@ -53,7 +69,9 @@ An issue is eligible only when:
 - At least one current priority label's most recent application was by a trusted account.
   Missing application evidence does not approve a label.
 - It has no sub-issues, every native and body blocker is closed, and no open PR closes it.
-- It has neither `limitless:in-progress` nor `limitless:failed`.
+- It has no `limitless:in-progress`. If it has `limitless:failed`, a trusted account
+  must apply a priority label strictly after the most recent failure label application.
+  Missing failure-label timeline evidence keeps it ineligible.
 - No active run claims it.
 - After any finished issue-sourced run (succeeded, resolved, failed or cancelled), a
   trusted account applied a priority label strictly after that latest run's `finishedAt`.
@@ -83,8 +101,8 @@ insertion path. This is single-store coordination; cross-coordinator claim refs 
 
 Queue runs use the same quoted issue request as an owner-labelled webhook. Only owner-authored
 issues parse `Allow:` lines; polling does not confer signed-webhook provenance. Issue source
-references already produce `Closes #n` in PR bodies. The queue adds the optional, additive
-`via: "queue"` source-reference marker, ignored by older releases. Only marked issue runs
-suppress notifier lifecycle comments, even after the queue is disabled. The poller only reads
-GitHub: lifecycle labels and comments, App identity, and GitHub questions and approvals are
-later slices.
+references and non-GitHub `Closes #n` directives produce closing directives in PR bodies.
+The queue adds the optional, additive `via: "queue"` marker, ignored by older releases.
+Managed issue runs use polling lifecycle comments instead of legacy notifier comments.
+Marked queue runs outside managed repositories keep suppressing legacy comments. GitHub
+questions and approvals remain later slices.

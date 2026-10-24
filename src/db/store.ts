@@ -341,6 +341,23 @@ export interface AgentGateRecord {
 export const closedIssues = (prompt: string) =>
   new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
 
+/** Follow admission rules: GitHub prompt text cannot add issue links. */
+export function linkedIssues(
+  run: Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug">,
+): { repo: string; number: number }[] {
+  const ref = run.sourceRef;
+  if (ref?.kind === "issue")
+    return typeof ref.repo === "string" &&
+      typeof ref.number === "number" &&
+      Number.isSafeInteger(ref.number) &&
+      ref.number > 0
+      ? [{ repo: ref.repo, number: ref.number }]
+      : [];
+  return run.source !== "github"
+    ? [...closedIssues(run.prompt)].map((number) => ({ repo: run.repoSlug, number }))
+    : [];
+}
+
 export const ISSUE_CLAIM_STATUSES: RunStatus[] = [
   "queued",
   "waiting",
@@ -1219,6 +1236,31 @@ export class Store {
             : run.source !== "github" && same(run.repoSlug) && closedIssues(run.prompt).has(number),
         ) ?? null
     );
+  }
+
+  issueLifecycleRuns(): Run[] {
+    return (
+      this.db
+        .query(`${RUN_SELECT} WHERE NOT EXISTS
+      (SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id AND e.effect = 'legacy')
+      ORDER BY runs.created_at, runs.rowid`)
+        .all() as Row[]
+    ).map(toRun);
+  }
+
+  issueLifecycleEffect(run: string, repo: string, number: number, effect: string): string | null {
+    const row = this.db
+      .query(`SELECT state FROM issue_lifecycle_effects
+      WHERE run_id = ? AND repo = ? COLLATE NOCASE AND number = ? AND effect = ?`)
+      .get(run, repo, number, effect) as { state: string } | null;
+    return row?.state ?? null;
+  }
+
+  setIssueLifecycleEffect(run: string, repo: string, number: number, effect: string, state: string): void {
+    this.db
+      .query(`INSERT INTO issue_lifecycle_effects VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(run_id, repo, number, effect) DO UPDATE SET state = excluded.state`)
+      .run(run, repo, number, effect, state);
   }
 
   latestIssueRun(repo: string, number: number): Run | null {
